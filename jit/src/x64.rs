@@ -224,6 +224,20 @@ mod simd;
 mod arith;
 mod osr;
 mod deopt_stubs;
+
+/// Test-only switch that makes every inlined body publish deopt metadata.
+///
+/// `try_emit_inline` refuses a splice whose body published any (PGO-02 §3 —
+/// an inlined scope is not representable in deopt metadata, so a point
+/// recorded inside one describes a stack that never existed). A guard nobody
+/// can make fire is a guard nobody has tested, and no production emitter
+/// produces this state today; this is how
+/// `inline_publishing_a_deopt_point_is_refused` produces it deliberately.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INLINE_TEST_PUBLISHES_DEOPT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 mod safepoint;
 mod frames;
 mod operand_stack;
@@ -788,9 +802,9 @@ struct Compiler {
     sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
-    // PGO-02: see the `inline_guard_class_ids` parameter doc on
+    // PGO-02: see the `inline_guard_variants` parameter doc on
     // `compile_with_param_slots`.
-    inline_guard_class_ids: FxHashMap<usize, u32>,
+    inline_guard_variants: FxHashMap<usize, Vec<(u32, crate::InlineSite)>>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
     /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
     /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
@@ -2259,7 +2273,7 @@ impl Compiler {
             sr_monitor_at: FxHashMap::default(),
             sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
-            inline_guard_class_ids: FxHashMap::default(),
+            inline_guard_variants: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),

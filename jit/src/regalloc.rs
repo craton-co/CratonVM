@@ -3532,6 +3532,59 @@ impl RegClass {
     }
 }
 
+/// Who owns which XMM register, in one place.
+///
+/// Three components hand out XMM registers, and until this module existed each
+/// held its own private answer: `ir_lower`'s FP value tier (XMM0/XMM1),
+/// `ir_lower`'s linear-scan file, and `x64::vec_emit`'s vector pool. The three
+/// **overlap**, and the failure that overlap produces is silent — a scalar
+/// `double` living in XMM3 destroyed by a vector region that took XMM3 for a
+/// lane accumulator, with nothing to notice but a wrong number much later.
+///
+/// This module does not remove the overlap; it cannot, because the registers
+/// that would make the pools disjoint (XMM6–XMM15) are callee-saved on Windows
+/// and `ir_lower::emit_prologue` saves no register at all. What it removes is
+/// the *privacy*: the three ranges are declared together, so a wiring that puts
+/// two authorities on one register is a visible fact rather than a discovery,
+/// and `vector_pool_is_encodable` is the half that is enforced.
+///
+/// `docs/jit/vectorization-emitter.md` names this the single highest-risk
+/// prerequisite for wiring `emit_vector_loop`, and
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+/// increment 4 is the item that closes it.
+pub mod xmm_roles {
+    /// `ir_lower`'s FP value tier: the scratch pair every float/double
+    /// arithmetic arm computes in — XMM0 the first operand and the result,
+    /// XMM1 the second.
+    pub const IR_FP_SCRATCH: [u8; 2] = [0, 1];
+
+    /// `ir_lower`'s linear-scan file — the registers a *long-lived* FP value
+    /// may be promoted into for the whole method.
+    ///
+    /// Disjoint from [`IR_FP_SCRATCH`] by construction, which is why residency
+    /// and the arithmetic arms can coexist.
+    pub const IR_LINEAR_SCAN: [u8; 4] = [2, 3, 4, 5];
+
+    /// The widest pool a vector region may be given: caller-saved on **both**
+    /// the SysV and Windows x64 ABIs, so touching one owes no prologue save.
+    ///
+    /// It overlaps both ranges above, completely. A caller therefore has to
+    /// prove the scalar values in the registers it passes are dead across the
+    /// region; `x64::vec_emit::emit_vector_loop` takes the pool as an argument
+    /// precisely so that proof has somewhere to live.
+    pub const VECTOR_REGION_MAX: [u8; 6] = [0, 1, 2, 3, 4, 5];
+
+    /// Is `reg` usable by a vector region without a prologue save area?
+    ///
+    /// XMM6–XMM15 are callee-saved on Windows and `ir_lower::emit_prologue`
+    /// saves nothing, so a region that touched one would corrupt a caller's
+    /// floating-point state on one platform and not the other — the worst
+    /// possible shape for a bug.
+    pub fn vector_pool_is_encodable(reg: u8) -> bool {
+        VECTOR_REGION_MAX.contains(&reg)
+    }
+}
+
 /// One physical register: a bank plus the encoding number the backend uses
 /// (`RAX` = 0 … `R15` = 15 for [`RegClass::Gp`], `XMM0` = 0 … `XMM15` = 15 for
 /// [`RegClass::Xmm`]) — the same numbering as `x64.rs` and `ir_lower.rs`.

@@ -1025,16 +1025,23 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // `set_field_as` with the DECLARED descriptor, so the stored tag depends on
     // that coercion — it is not obviously a stable Int.
     //
-    // Evidence that would settle it (do not guess):
+    // Evidence that would settle it (do not guess) — RUN 2026-08-04, results
+    // inline. The verdict stays `unknown` but is **no longer ranked HIGH**: the
+    // two checks that would have shown live harm both came back clean.
     //   1. Under `--real-jdk`, run a program that reaches
     //      `Class.getConstructor(...)` / `Class.getDeclaredConstructor(...)`
     //      twice on the same class (so the second call takes the
     //      `cachedConstructor != null` fast path) and check whether the
     //      `getfield cachedConstructor` succeeds, returns null, or raises.
+    //      **CLEAN.** Three rounds of `getDeclaredConstructor()` on a nested
+    //      class, interleaved with `String.class.getConstructor(String.class)`,
+    //      all returned the right `Constructor` against a real JDK 21 image.
+    //      Nothing raised, and no `expected object reference, got int(N)`.
     //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the
     //      overlay-corruption hunter in `vm_exec.rs` (`overlay_write_is_destructive`)
     //      exists precisely to report a primitive written to a reference slot,
     //      and this write should appear in its output if the hazard is live.
+    //      **CLEAN.** The hunter reported nothing on that run.
     //   3. Confirm which readers still depend on slot 0: the reverse map
     //      (`class_mirrors_reverse` / `class_id_from_mirror`) is the primary
     //      path, and `mirror_class_id` in `native-builtins/src/lang_class.rs`
@@ -1042,6 +1049,16 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      misses. If the census shows zero fallback hits under a real JDK, the
     //      correct wave-2 fix is to DELETE the slot-0 write (and the slot-1
     //      name read in `mirror_class_name`) rather than relocate it.
+    //      **INSTRUMENTED, not yet answered.** `mirror_class_id` now reports
+    //      its first fallback hit under the same `CRATONVM_DBG_OVERLAY` flag,
+    //      so this is one broad real-JDK run away from decidable. Do not delete
+    //      the overlay on the strength of a small probe: silence over a
+    //      ten-class workload is not silence over Spring Boot.
+    //
+    // What 1 and 2 do and do not establish: they rule out the overlay being
+    // *destructive* on a real image, which was the ranked-HIGH worry. They say
+    // nothing about whether it is still *needed* — that is check 3, and it is
+    // the question whose answer removes code rather than reassuring about it.
     shared
         .mem
         .heap
@@ -1215,6 +1232,14 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // mirror additionally has no legitimate `cachedConstructor` reader, so if
     // the evidence says the overlay is destructive, this site can move to the
     // `primitive_mirrors` side table with no JDK-visible consequence.
+    //
+    // 2026-08-04: the evidence gathered for the sibling site (see its checks 1
+    // and 2, both clean) says the overlay is NOT destructive on a real image,
+    // so the "move it to the side table" branch above is not forced. This site
+    // is nonetheless the easier of the two to retire if check 3 ever comes back
+    // zero, precisely because a primitive mirror has no legitimate reader:
+    // `Int(-1)` is a sentinel nothing but this VM asks for, so relocating it
+    // needs no census of its own — only the sibling's.
     shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.

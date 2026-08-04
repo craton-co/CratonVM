@@ -158,7 +158,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p57_parse_win_root(&p).1.len() as i32;
+        let count = p57_name_elements(&p).len() as i32;
         Ok(Some(Value::Int(count)))
     });
 
@@ -169,7 +169,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         // FIX (finding 4): match the JDK — index < 0 or >= name count throws
         // IllegalArgumentException instead of silently returning an empty path.
         if idx < 0 || idx as usize >= parts.len() {
@@ -194,7 +194,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         let count = parts.len() as i32;
         // FIX (finding 4): match the JDK — beginIndex must be in [0,count),
         // endIndex in (beginIndex,count]; otherwise IllegalArgumentException.
@@ -234,6 +234,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         // Percent-encode the path so chars like `#`/` `/`?` stay part of the path
         // (matches HotSpot's `Path.toUri()` — see the other `toUri` registration).
+        // Per `UnixUriUtils.toUri`/`WindowsUriSupport.toUri`, a Path that
+        // names an existing DIRECTORY renders with a trailing `/`; a file (or a
+        // path that does not exist) does not. `java.io.File.toURI()` below
+        // already applies the same rule. Until `Path` construction normalized
+        // its stored string this was masked for paths the caller happened to
+        // write with a trailing separator, and wrong for every other directory.
+        let abs = if !abs.ends_with('/') && std::path::Path::new(&p).is_dir() {
+            format!("{abs}/")
+        } else {
+            abs
+        };
         let encoded = encode_file_uri_path(&abs);
         let uri_str = format!("file://{encoded}");
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
@@ -271,7 +282,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
@@ -633,7 +644,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let p = p57_read_path(ctx, this);
         // keycloak-15: explicit Windows drive/UNC root parsing (the stored string
         // is '/'-canonical, so the old `[2]==b'\\'` check never matched a drive).
-        match p57_parse_win_root(&p).0 {
+        match p57_parse_root(&p).0 {
             Some(root) => {
                 let result = p57_alloc_path(ctx, &root);
                 Ok(Some(Value::Object(Some(result))))
@@ -2018,11 +2029,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // Returning null is the spec-compliant "no persisted config" answer
     // (readProperties() then returns Collections.emptyMap()).
     //
-    // WAVE-4 REACHABILITY CORRECTION — this registration is INERT in the run
-    // mode the bug was observed in. `register_phase57_nio_file` is reached
-    // only from `register_phase57_natives` -> `register_synthetic_overrides`,
-    // which is `#[cfg(feature = "synthetic-jdk")]` and is never called by the
-    // default real-JDK CLI; Keycloak runs real-JDK. So this shim cannot be
+    // WAVE-4 REACHABILITY CORRECTION, AMENDED 2026-08-04 — the original note
+    // said `register_phase57_nio_file` is reached only from
+    // `register_phase57_natives` -> `register_synthetic_overrides` (which is
+    // `#[cfg(feature = "synthetic-jdk")]` and never called by the default
+    // real-JDK CLI), and therefore that this whole function is inert in
+    // real-JDK mode. THAT IS FALSE, and it cost a later session an hour of
+    // chasing the live `Path` implementation into `native-io` (verified by
+    // instrumenting both allocators and watching which one fires): `vm/src/vm/
+    // vm_init.rs` calls `cratonvm_native_builtins::phases_late::
+    // register_phase57_nio_file` DIRECTLY, in both the synthetic and the
+    // real-JDK arm (vm_init.rs:1788 and :2273). Everything registered in this
+    // function — Path/Paths/Files, the p57 allocator — is live in the shipping
+    // CLI, and it OVERRIDES `native-io`'s same-key registrations. What IS
+    // synthetic-only is the phase-61 block (`register_p61_files_path`), which
+    // vm_init never calls in real-JDK mode. This specific shim still cannot be
     // what makes `start-dev` get past the EOFException today, and it is not
     // currently papering over the `ZipInputStream.readFully`/`readLOC` bug —
     // in real-JDK mode that bug (if still present) is reached through real JDK
@@ -6379,6 +6400,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `file:///…/resource%23test1.txt`; leaving the `#` literal made
         // `toUri().toURL()` drop everything after it (Spring's
         // PathMatchingResourcePatternResolver URL/URI-syntax assertions).
+        // Per `UnixUriUtils.toUri`/`WindowsUriSupport.toUri`, a Path that
+        // names an existing DIRECTORY renders with a trailing `/`; a file (or a
+        // path that does not exist) does not. `java.io.File.toURI()` below
+        // already applies the same rule. Until `Path` construction normalized
+        // its stored string this was masked for paths the caller happened to
+        // write with a trailing separator, and wrong for every other directory.
+        let dir_slash;
+        let slash_p: &str = if !slash_p.ends_with('/') && std::path::Path::new(&p).is_dir() {
+            dir_slash = format!("{slash_p}/");
+            &dir_slash
+        } else {
+            slash_p
+        };
         let encoded = encode_file_uri_path(slash_p);
         let uri_str = format!("file://{}", encoded);
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
@@ -6400,7 +6434,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p57_parse_win_root(&p).1.len();
+        let count = p57_name_elements(&p).len();
         Ok(Some(Value::Int(count as i32)))
     });
 
@@ -6411,7 +6445,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
         if idx < 0 || idx as usize >= parts.len() {
             return Err(RuntimeError::IllegalArgumentException {
@@ -6477,7 +6511,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         // Pin across the Path/iterator allocs below — a moving young GC there
@@ -6507,7 +6541,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_win_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         let count = parts.len() as i32;
         // FIX (finding 4): JDK throws IllegalArgumentException for an out-of-range range.
         if begin < 0 || begin >= count || end <= begin || end > count {
@@ -7245,6 +7279,34 @@ pub(crate) fn p57_trim_path_trailing_separator(path: &str) -> String {
     path.trim_end_matches(['/', '\\']).to_string()
 }
 
+/// Match `UnixPath` construction: `sun.nio.fs.UnixPath`'s constructor stores the
+/// result of `normalizeAndCheck`, which collapses runs of `/` to a single
+/// separator and drops a redundant trailing `/` (the root `/` keeps its own).
+/// That is the same normalization `java.io.File` gets from
+/// `UnixFileSystem.normalize` (see [`file_normalise_path`]) — on this platform
+/// the two APIs share one rule, so the `Path` allocator delegates to it rather
+/// than re-deriving it.
+///
+/// Without this the stored string kept whatever separators the caller wrote.
+/// `Path.toString()` hid that (it renders through `file_normalise_path`), but
+/// every consumer of the raw string saw it: `equals`/`hashCode`/`compareTo`/
+/// `endsWith` disagreed with HotSpot, and the file-IO bridge received a
+/// directory-shaped path — `Files.writeString(root.resolve("one/two/three/"), ...)`
+/// failed with `EISDIR` ("Is a directory", errno 21) instead of creating the
+/// file (Windows reported the same defect as `ERROR_DIRECTORY`/267). See
+/// `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+///
+/// Virtual (jar/jrt) filesystem paths are excluded, exactly as in the Windows
+/// twin: their sentinel-encoded string carries an entry whose trailing `/` is
+/// part of the virtual-entry representation, not a redundant separator.
+#[cfg(not(windows))]
+pub(crate) fn p57_trim_path_trailing_separator(path: &str) -> String {
+    if vfs_decode(path).is_some() {
+        return path.to_string();
+    }
+    file_normalise_path(path)
+}
+
 #[cfg(windows)]
 pub(crate) fn p57_windows_absolute_path_string(path: &str) -> String {
     let s = path.replace('\\', "/");
@@ -7374,6 +7436,105 @@ pub(crate) fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
         return (Some("\\".to_string()), split_names(&work[1..]));
     }
     (None, split_names(work))
+}
+
+/// Root/name parsing for the `Path` accessor natives, in the **host platform's**
+/// path syntax.
+///
+/// [`p57_parse_win_root`] implements `sun.nio.fs.WindowsPath`'s rules: drive
+/// letters, UNC shares, verbatim `\\?\` prefixes. None of those are path syntax
+/// on Unix, where `sun.nio.fs.UnixPath` has exactly one root (`/`), no drive
+/// concept, `\` is an ordinary filename character, and `//server/share` is just
+/// `/server/share`. Running the Windows parser there made
+/// `Paths.get("/tmp").getRoot()` report `\` and `Paths.get("//tmp/x")` report a
+/// UNC root with zero name elements. Dispatch on the target instead.
+///
+/// [`p57_normalize_path`]/[`p57_relativize`] deliberately keep using the Windows
+/// parser on every target: they are documented as operating on the
+/// `/`-canonical internal form as a platform-neutral superset, and their unit
+/// tests pin Windows-syntax expectations that run on every host.
+#[cfg(windows)]
+pub(crate) fn p57_parse_root(s: &str) -> (Option<String>, Vec<String>) {
+    p57_parse_win_root(s)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn p57_parse_root(s: &str) -> (Option<String>, Vec<String>) {
+    let split_names = |rest: &str| -> Vec<String> {
+        rest.split('/')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_string())
+            .collect()
+    };
+    if let Some((_tag, _container, entry)) = vfs_decode(s) {
+        return (
+            Some("/".to_string()),
+            split_names(entry.trim_start_matches('/')),
+        );
+    }
+    match s.strip_prefix('/') {
+        Some(rest) => (Some("/".to_string()), split_names(rest)),
+        None => (None, split_names(s)),
+    }
+}
+
+/// The name elements a `Path` exposes through `getNameCount`/`getName`/
+/// `subpath`/`iterator`.
+///
+/// This is [`p57_parse_root`]'s name list with one correction: the **empty
+/// path** has exactly ONE name element — the empty string — not zero.
+/// `sun.nio.fs.UnixPath`/`WindowsPath` both special-case it that way
+/// (`Paths.get("").getNameCount()` is 1 on HotSpot and `getName(0)` returns the
+/// empty path), because an empty path denotes the default directory and must
+/// still be iterable. `p57_parse_root` splits on separators and filters empty
+/// segments, so it reports 0, and `getName(0)`/`subpath(0,1)`/`iterator()` then
+/// threw `IllegalArgumentException` / yielded nothing where HotSpot hands back
+/// the empty name.
+///
+/// Only the empty string reaches this arm: any other relative input has at
+/// least one non-empty segment, and any rooted input reports a root. Kept
+/// separate from `p57_parse_root` on purpose — [`p57_normalize_path`] and
+/// [`p57_relativize`] must keep seeing zero elements there, since HotSpot's
+/// `Paths.get("").relativize(Paths.get("a"))` is `a`, not `../a`.
+pub(crate) fn p57_name_elements(path: &str) -> Vec<String> {
+    let (root, names) = p57_parse_root(path);
+    if root.is_none() && names.is_empty() {
+        return vec![String::new()];
+    }
+    names
+}
+
+/// POSIX (`sun.nio.fs.UnixPath`) `getParent()` semantics, the Unix twin of
+/// [`p57_win_parent_of`]: a pure last-separator split that keeps `.`/`..` name
+/// elements verbatim. Rust's `std::path::Path::parent()` normalizes a trailing
+/// `.` away first and so over-trims — the parent of `a/b/.` came back as `a`
+/// instead of `a/b`. Returns "" when there is no parent (the caller maps that
+/// to `null`).
+#[cfg(not(windows))]
+pub(crate) fn p57_posix_parent_of(path: &str) -> String {
+    let (root, names) = p57_parse_root(path);
+    let n = names.len();
+    match root {
+        // Rooted path (`/a/b`): one element under the root leaves the root
+        // itself as the parent; the root already carries its separator.
+        Some(r) => {
+            if n == 0 {
+                String::new()
+            } else if n == 1 {
+                r
+            } else {
+                format!("{r}{}", names[..n - 1].join("/"))
+            }
+        }
+        // Relative path (`a/b/c`).
+        None => {
+            if n <= 1 {
+                String::new()
+            } else {
+                names[..n - 1].join("/")
+            }
+        }
+    }
 }
 
 /// keycloak-15: Windows (`sun.nio.fs.WindowsPath`) `isAbsolute()` semantics.
@@ -7521,6 +7682,128 @@ pub(crate) mod p57_win_path_tests {
 }
 
 #[cfg(test)]
+pub(crate) mod p57_name_element_tests {
+    //! The empty path's name list, on every host. HotSpot:
+    //! `Paths.get("").getNameCount()` is 1 and `getName(0)` is the empty path,
+    //! on both `UnixPath` and `WindowsPath`.
+    use super::{p57_name_elements, p57_parse_root};
+
+    #[test]
+    fn the_empty_path_has_one_empty_name_element() {
+        assert_eq!(p57_name_elements(""), vec![String::new()]);
+        // …and `p57_parse_root` must keep reporting zero there, because
+        // `normalize`/`relativize` depend on it: HotSpot's
+        // `Paths.get("").relativize(Paths.get("a"))` is `a`, not `../a`.
+        assert!(p57_parse_root("").1.is_empty());
+    }
+
+    #[test]
+    fn every_other_path_is_unchanged() {
+        // Rooted paths report a root, so the empty-name arm cannot fire even
+        // when they have no name elements.
+        let root = if cfg!(windows) { "C:/" } else { "/" };
+        assert!(p57_name_elements(root).is_empty());
+        assert_eq!(p57_name_elements("a/b"), vec!["a", "b"]);
+        assert_eq!(p57_name_elements("a"), vec!["a"]);
+        assert_eq!(p57_name_elements("a/b/"), vec!["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+pub(crate) mod p57_posix_path_tests {
+    //! POSIX (`sun.nio.fs.UnixPath`) construction / root / parent semantics.
+    //! Pure-function tests (no VM); every expectation was cross-checked against
+    //! the host JDK on Linux (`PathMatrix` repro) — see
+    //! `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+    //! The Windows twin lives in `p57_win_path_tests`.
+    use super::{
+        jarfs_encode, p57_alloc_path, p57_parse_root, p57_posix_parent_of, p57_read_path,
+        p57_trim_path_trailing_separator,
+    };
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    #[test]
+    fn path_construction_normalizes_like_unixpath() {
+        // The defect: an ordinary trailing separator survived into the stored
+        // string, so `Files.writeString` got a directory-shaped path (EISDIR).
+        assert_eq!(p57_trim_path_trailing_separator("/tmp/a/b/"), "/tmp/a/b");
+        assert_eq!(p57_trim_path_trailing_separator("a/b/"), "a/b");
+        assert_eq!(p57_trim_path_trailing_separator("a/b///"), "a/b");
+        // Runs of `/` collapse, exactly as `normalizeAndCheck` does.
+        assert_eq!(p57_trim_path_trailing_separator("//tmp/x"), "/tmp/x");
+        assert_eq!(p57_trim_path_trailing_separator("a//b"), "a/b");
+        // The root keeps its separator; the empty path stays empty.
+        assert_eq!(p57_trim_path_trailing_separator("/"), "/");
+        assert_eq!(p57_trim_path_trailing_separator("//"), "/");
+        assert_eq!(p57_trim_path_trailing_separator(""), "");
+        // `\\` is an ordinary filename character on Unix, never a separator.
+        assert_eq!(p57_trim_path_trailing_separator("a\\b\\"), "a\\b\\");
+        // Encoded virtual-FS paths are left alone: the trailing `/` there is
+        // part of the jar/jrt entry representation.
+        let jar = jarfs_encode("/tmp/x.jar", "dir/");
+        assert_eq!(p57_trim_path_trailing_separator(&jar), jar);
+    }
+
+    #[test]
+    fn alloc_path_stores_the_normalized_string() {
+        // Pins the WIRING, not just the helper. The defect was that
+        // `p57_alloc_path` had no normalization step at all on this platform
+        // (`let stored = path.to_string();`), so a helper-only test would have
+        // stayed green straight through it. Everything that builds a Path —
+        // `Paths.get`, `resolve`, `getParent`, `toAbsolutePath` — funnels here,
+        // and the stored string is what the file-IO bridge syscalls with.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let p = p57_alloc_path(&mut ctx, "/tmp/one/two/three/");
+        assert_eq!(p57_read_path(&mut ctx, p), "/tmp/one/two/three");
+        let root = p57_alloc_path(&mut ctx, "/");
+        assert_eq!(p57_read_path(&mut ctx, root), "/");
+        let collapsed = p57_alloc_path(&mut ctx, "/tmp//x/");
+        assert_eq!(p57_read_path(&mut ctx, collapsed), "/tmp/x");
+    }
+
+    #[test]
+    fn parse_root_uses_posix_syntax() {
+        // Absolute: the one root is `/` (the Windows parser answered `\\`).
+        assert_eq!(p57_parse_root("/tmp/x").0.as_deref(), Some("/"));
+        assert_eq!(p57_parse_root("/").0.as_deref(), Some("/"));
+        assert_eq!(p57_parse_root("/tmp/x").1, vec!["tmp", "x"]);
+        assert_eq!(p57_parse_root("/").1.len(), 0);
+        // Relative: no root.
+        assert_eq!(p57_parse_root("a/b").0, None);
+        assert_eq!(p57_parse_root("a/b").1, vec!["a", "b"]);
+        // A drive letter is NOT syntax here — `C:` is an ordinary name.
+        assert_eq!(p57_parse_root("C:/x").0, None);
+        assert_eq!(p57_parse_root("C:/x").1, vec!["C:", "x"]);
+        // No UNC either: `//tmp/x` is just `/tmp/x` (2 names, not a share).
+        assert_eq!(p57_parse_root("//tmp/x").0.as_deref(), Some("/"));
+        assert_eq!(p57_parse_root("//tmp/x").1, vec!["tmp", "x"]);
+        // `\` is a filename character, so it never splits a name.
+        assert_eq!(p57_parse_root("a\\b").1, vec!["a\\b"]);
+    }
+
+    #[test]
+    fn parent_keeps_curdir_and_root_boundary() {
+        // Trailing `.` must be kept (Rust's Path::parent would over-trim to "a").
+        assert_eq!(p57_posix_parent_of("a/b/."), "a/b");
+        assert_eq!(p57_posix_parent_of("/a/b/."), "/a/b");
+        // Ordinary splits.
+        assert_eq!(p57_posix_parent_of("/tmp/a/b"), "/tmp/a");
+        assert_eq!(p57_posix_parent_of("a/b/c"), "a/b");
+        // A single element under the root leaves the root itself.
+        assert_eq!(p57_posix_parent_of("/foo"), "/");
+        // No parent -> "" (caller maps to null).
+        assert_eq!(p57_posix_parent_of("a"), "");
+        assert_eq!(p57_posix_parent_of("/"), "");
+        assert_eq!(p57_posix_parent_of(""), "");
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod p57_normalize_relativize_tests {
     //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
     //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
@@ -7532,6 +7815,7 @@ pub(crate) mod p57_normalize_relativize_tests {
     };
 
     #[test]
+    #[cfg(windows)]
     fn normalize_preserves_root_and_leading_dotdot() {
         // `..` must not pop above the root.
         assert_eq!(p57_normalize_path("C:/a/../../b"), "C:/b");
@@ -7550,6 +7834,7 @@ pub(crate) mod p57_normalize_relativize_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn relativize_backtracks_with_dotdot() {
         assert_eq!(p57_relativize("C:/a/b", "C:/a/x").as_deref(), Some("../x"));
         assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
@@ -7565,6 +7850,58 @@ pub(crate) mod p57_normalize_relativize_tests {
         // Different roots → None (caller falls back to target).
         assert_eq!(p57_relativize("C:/a", "D:/b"), None);
         assert_eq!(p57_relativize("C:/a", "rel/b"), None);
+    }
+
+    /// The POSIX twins. These are the same two functions on a host where a
+    /// drive prefix and a backslash are NOT path syntax; every expectation was
+    /// cross-checked against the host JDK 25 on Linux (`NormMatrix` repro).
+    #[test]
+    #[cfg(not(windows))]
+    fn normalize_preserves_root_and_leading_dotdot_posix() {
+        // `..` must not pop above the root.
+        assert_eq!(p57_normalize_path("/a/../../b"), "/b");
+        assert_eq!(p57_normalize_path("/.."), "/");
+        // Leading `..` on a relative path is kept.
+        assert_eq!(p57_normalize_path("../../a"), "../../a");
+        assert_eq!(p57_normalize_path("a/../../b"), "../b");
+        // Ordinary collapses.
+        assert_eq!(p57_normalize_path("/a/./b/.."), "/a");
+        assert_eq!(p57_normalize_path("a/./b/.."), "a");
+        assert_eq!(p57_normalize_path("a/../b"), "b");
+        assert_eq!(p57_normalize_path("/a/b"), "/a/b");
+        // A drive prefix is an ordinary NAME here, so `..` cancels it and the
+        // Windows parser's "root" reading (`C:b`) is wrong on this host.
+        assert_eq!(p57_normalize_path("C:a/../b"), "b");
+        assert_eq!(p57_normalize_path("C:/a/../../b"), "b");
+        // `\` is a filename character: `a\b` is ONE name, so the `..` that
+        // follows cancels the whole thing (the Windows parser answered `a/c`).
+        assert_eq!(p57_normalize_path("a\\b/../c"), "c");
+        // No UNC: `//s/sh/a/..` is just `/s/sh`.
+        assert_eq!(p57_normalize_path("//s/sh/a/.."), "/s/sh");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn relativize_backtracks_with_dotdot_posix() {
+        assert_eq!(p57_relativize("/a/b", "/a/x").as_deref(), Some("../x"));
+        assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
+        assert_eq!(p57_relativize("/a/b", "/a/b/c/d").as_deref(), Some("c/d"));
+        assert_eq!(p57_relativize("/a", "/a").as_deref(), Some(""));
+        assert_eq!(p57_relativize("a/b", "a/b/c").as_deref(), Some("c"));
+        // Case-SENSITIVE name matching off Windows.
+        assert_eq!(p57_relativize("/A/b", "/a/x").as_deref(), Some("../../a/x"));
+        // Drive prefixes are ordinary names, so these ARE relativizable here.
+        assert_eq!(
+            p57_relativize("C:/a", "D:/b").as_deref(),
+            Some("../../D:/b")
+        );
+        // `\` never splits a name.
+        assert_eq!(
+            p57_relativize("/a\\b", "/a\\x").as_deref(),
+            Some("../a\\x")
+        );
+        // Absolute vs relative → None (caller falls back to target).
+        assert_eq!(p57_relativize("/a", "rel/b"), None);
     }
 }
 
@@ -7678,8 +8015,12 @@ pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectR
     } else {
         p57_trim_path_trailing_separator(path).replace('\\', "/")
     };
+    // Unix has one separator and one root, so there is nothing to fold — but
+    // the JDK still normalizes at construction (see
+    // `p57_trim_path_trailing_separator`), and skipping that was the whole
+    // trailing-separator defect.
     #[cfg(not(windows))]
-    let stored = path.to_string();
+    let stored = p57_trim_path_trailing_separator(path);
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh Path (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
@@ -9601,12 +9942,15 @@ pub(crate) fn p57_read_to_string(p: &str) -> std::io::Result<String> {
 ///   * a leading `..` on a **relative** path is **kept** (it can't be resolved
 ///     without a base): `..\..\a` → `..\..\a` (not `a`).
 /// Output is `/`-canonical (the internal form; `p57_alloc_path` folds, `toString`
-/// renders the host separator), so this is platform-neutral.
+/// renders the host separator). Roots and name elements are parsed in the HOST
+/// platform's syntax ([`p57_parse_root`]): on Unix `C:a/../b` normalizes to `b`
+/// (the drive prefix is an ordinary name, not a root that a `..` cannot escape)
+/// and `a\b/../c` to `c` (one name element, not two).
 pub(crate) fn p57_normalize_path(path: &str) -> String {
     if let Some((tag, container, entry)) = vfs_decode(path) {
         return vfs_encode(tag, &container, &p57_normalize_path(&entry));
     }
-    let (root, names) = p57_parse_win_root(path);
+    let (root, names) = p57_parse_root(path);
     let has_root = root.is_some();
     let mut stack: Vec<&str> = Vec::new();
     for name in &names {
@@ -9652,8 +9996,8 @@ pub(crate) fn p57_normalize_path(path: &str) -> String {
 /// two paths have different roots / absoluteness, which can't be relativized.
 /// Output is `/`-canonical and relative (no root).
 pub(crate) fn p57_relativize(base: &str, target: &str) -> Option<String> {
-    let (rb, bn) = p57_parse_win_root(base);
-    let (rt, tn) = p57_parse_win_root(target);
+    let (rb, bn) = p57_parse_root(base);
+    let (rt, tn) = p57_parse_root(target);
     // Roots must match (case-insensitively, matching WindowsPath); one absolute
     // and one relative cannot be relativized.
     let norm_root = |r: &Option<String>| r.as_ref().map(|s| s.to_ascii_lowercase());
@@ -9709,17 +10053,31 @@ pub(crate) fn p57_resolve_paths(base: &str, other: &str) -> String {
     if other.is_empty() {
         return base.to_string();
     }
-    // Check if `other` is absolute (Unix or Windows)
-    if other.starts_with('/')
-        || (other.len() >= 2 && other.as_bytes()[1] == b':')
-        || other.starts_with('\\')
-    {
+    // Is `other` absolute? A drive prefix (`C:...`) and a leading `\` are
+    // Windows syntax ONLY. On Unix both are ordinary relative filenames —
+    // `a:b` is a perfectly legal Unix name — and treating them as absolute
+    // made `dir.resolve("a:b")` answer `a:b` instead of `dir/a:b`, silently
+    // dropping the base. Same family as `p57_parse_root`.
+    let other_is_absolute = if cfg!(windows) {
+        other.starts_with('/')
+            || (other.len() >= 2 && other.as_bytes()[1] == b':')
+            || other.starts_with('\\')
+    } else {
+        other.starts_with('/')
+    };
+    if other_is_absolute {
         return other.to_string();
     }
     if base.is_empty() {
         return other.to_string();
     }
-    let sep = if base.contains('\\') { '\\' } else { '/' };
+    // Likewise the join separator: `\` in a Unix path is part of a filename,
+    // never a separator, so it must not select `\` as the joiner.
+    let sep = if cfg!(windows) && base.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    };
     let base_trimmed = base.trim_end_matches(sep);
     format!("{base_trimmed}{sep}{other}")
 }
@@ -9741,20 +10099,13 @@ pub(crate) fn p57_parent_of(path: &str) -> String {
     // Path::parent() normalizes a trailing `.` away and over-trims — see
     // `p57_win_parent_of`. `cfg!(windows)` is a const, so the helper is still
     // compiled (referenced) on every target — no dead-code warning.
-    if cfg!(windows) {
-        return p57_win_parent_of(path);
+    #[cfg(windows)]
+    {
+        p57_win_parent_of(path)
     }
-    match std::path::Path::new(path).parent() {
-        Some(p) => {
-            let s = p.to_string_lossy().to_string();
-            if s.is_empty() && (path.starts_with('/') || path.starts_with('\\')) {
-                // Parent of "/foo" is "/"
-                "/".to_string()
-            } else {
-                s
-            }
-        }
-        None => String::new(),
+    #[cfg(not(windows))]
+    {
+        p57_posix_parent_of(path)
     }
 }
 
@@ -15124,139 +15475,34 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
     );
 
     // --- Path expansion ---
-    let path = "java/nio/file/Path";
-    r.register(
-        path,
-        "getFileName",
-        "()Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let path_str = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // jar-FS aware: operate on the in-jar entry portion.
-            let entry = jarfs_decode(&path_str)
-                .map(|(_, e)| e)
-                .unwrap_or_else(|| path_str.clone());
-            let fname = std::path::Path::new(&entry)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(fname);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    // keycloak-15: route through the shared `p57_parent_of` (jar-FS aware +
-    // Windows last-separator split that keeps `.`/`..`) instead of Rust's
-    // `Path::parent()`, which normalizes a trailing `.` and over-trims. This is
-    // the last-registered (winning) `getParent`; keep it identical to the
-    // earlier registration so behaviour does not depend on phase order.
-    r.register(path, "getParent", "()Ljava/nio/file/Path;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        let parent = p57_parent_of(&p);
-        if parent.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            let result = p57_alloc_path(ctx, &parent);
-            Ok(Some(Value::Object(Some(result))))
-        }
-    });
-    r.register(
-        path,
-        "toAbsolutePath",
-        "()Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let path_str = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            // jar-FS paths are already absolute within the mounted filesystem.
-            let abs = if jarfs_decode(&path_str).is_some() {
-                path_str
-            } else {
-                p57_absolute_path_string(&path_str)
-            };
-            let p = p57_alloc_path(ctx, &abs);
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(
-        path,
-        "resolve",
-        "(Ljava/lang/String;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let base = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let other = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let resolved = if jarfs_decode(&base).is_some() {
-                p57_resolve_paths(&base, &other)
-            } else {
-                std::path::Path::new(&base)
-                    .join(&other)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&resolved);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(
-        path,
-        "resolve",
-        "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let base = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let other = if let Some(Value::Object(Some(o))) = args.get(1) {
-                match ctx.get_field(*o, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                }
-            } else {
-                String::new()
-            };
-            let resolved = if jarfs_decode(&base).is_some() || jarfs_decode(&other).is_some() {
-                p57_resolve_paths(&base, &other)
-            } else {
-                std::path::Path::new(&base)
-                    .join(&other)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&resolved);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(path, "getNameCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path_str = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let entry = vfs_decode(&path_str).map(|(_, _, e)| e).unwrap_or(path_str);
-        // keycloak-15: count name elements after the (explicitly parsed) Windows
-        // drive/UNC root, not std::path components (which mis-count `C:` as a name).
-        let count = p57_parse_win_root(&entry).1.len() as i32;
-        Ok(Some(Value::Int(count.max(0))))
-    });
+    //
+    // NO `java/nio/file/Path` REGISTRATIONS BELONG HERE. This function used to
+    // re-register six of them — `getFileName`, `getParent`, `toAbsolutePath`,
+    // `resolve(String)`, `resolve(Path)`, `getNameCount` — all of which
+    // `register_phase57_nio_file` already owns. `NativeMethodRegistry::register`
+    // overwrites the slot in place, so the LAST registration wins, and phase 61
+    // runs after phase 57 (`register_all_natives`): every one of these silently
+    // took over from the phase-57 implementation wherever that path is used
+    // (synthetic-JDK mode; the shipping real-JDK VM calls
+    // `register_phase57_nio_file` directly from `vm_init.rs` and never gets
+    // here, which is the only reason this went unnoticed).
+    //
+    // They were not equivalent. The `resolve` pair joined with
+    // `std::path::Path::join` and wrote the result straight into the object
+    // instead of going through `p57_alloc_path`, so they skipped the
+    // normalize-at-construction step that `sun.nio.fs.UnixPath`/`WindowsPath`
+    // perform — which is exactly the trailing-separator defect
+    // `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`
+    // was filed for, re-introduced one phase later. `getFileName` used
+    // `jarfs_decode` (missing jrt) and dropped the root/null contract;
+    // `getNameCount` and `getParent` had already been hand-synced to their
+    // phase-57 twins by earlier sessions, which is a standing invitation to
+    // drift.
+    //
+    // Deleting them is strictly better than keeping them identical: there is
+    // one implementation, and phase order stops being load-bearing. See
+    // `p61_registers_no_duplicate_path_natives` in `registry_contracts.rs`,
+    // which fails if any of them come back.
     r.set_category(__prev_cat);
 }
 
@@ -16210,12 +16456,16 @@ pub(crate) fn p98_walk_dir(
                     .file_type()
                     .map(|t| t.is_dir() || (follow_links && t.is_symlink() && ep.is_dir()))
                     .unwrap_or(false);
+                // HOST path (not a virtual-FS sentinel): build it through
+                // `p57_alloc_path` so the stored string is the `/`-canonical
+                // internal form every other Path native expects. Setting field 0
+                // directly left `entry.path()`'s host separators in place, so on
+                // Windows a Path handed to a FileVisitor compared unequal to the
+                // otherwise-identical Path the caller built, and `startsWith`/
+                // `relativize`/`getNameCount` against it all disagreed.
                 if is_dir {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = p57_alloc_path(ctx, &es);
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     if !p98_walk_dir(
                         ctx,
                         &es,
@@ -16228,11 +16478,8 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = p57_alloc_path(ctx, &es);
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     let fa = p98_alloc_basic_file_attributes(
                         ctx,
                         false,

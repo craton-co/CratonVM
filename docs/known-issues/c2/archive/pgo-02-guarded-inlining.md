@@ -1,6 +1,15 @@
 # PGO-02 — speculative inlining needs a guard and a deopt path that can express it
 
-**Status:** not started. **Depends on:** `pgo-01` for static/special sites;
+**Status:** RETIRED 2026-08-04. The first increment shipped 2026-08-03; every
+residual is closed except a deopt-capable guard, which is blocked on
+`deopt::FrameState::caller` being populated and is now refused mechanically
+rather than by convention. Retirement record:
+`../../../internal/pgo-02-guarded-inlining-RETIRED-20260804.md`. Living
+document: `../../../feature-designs/profile-guided-inlining.md`. The brief
+below is kept verbatim as the ORIGINAL ask — including the verification
+requirements it set, all of which are now met.
+
+**Original status:** not started. **Depends on:** `pgo-01` for static/special sites;
 independent of it for virtual sites. **Owns:** `jit/src/lib.rs` (the
 `plan_inline` region), `jit/src/pgo.rs`.
 

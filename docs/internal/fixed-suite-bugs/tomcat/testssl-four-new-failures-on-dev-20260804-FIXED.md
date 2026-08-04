@@ -213,10 +213,13 @@ mid-stream EOF while reading the response back, e.g. `Byte in position
 threads `testPost` starts to POST ~6 MiB each over TLS. No exception is
 printed, so it is the read-loop's own EOF branch, not the `catch`.
 
-This is a pre-existing flake in the TLS suite and wants its own page; it is
-recorded here only so the next person who sees `Failures: 2` on this class
-does not spend the afternoon bisecting it, and so nobody reads a single clean
-`TestSsl` run as proof that a JIT change is safe.
+Filed separately as
+`docs/known-issues/tomcat/testssl-testpost-connection-dies-under-concurrent-bulk-tls-20260804.md`,
+where it is measured properly: 4 failures in 11 CratonVM runs against 0 in 3
+HotSpot runs, and `testPost` taking ~190 s on CratonVM against 3.8 s on
+HotSpot. Kept summarised here so the next person who sees `Failures: 2` on
+this class does not spend the afternoon bisecting it, and so nobody reads a
+single clean `TestSsl` run as proof that a JIT change is safe.
 
 **Not** verified: the four tests were never re-run on the Azure Linux fixture,
 because Windows never reproduced them (that measurement is the section above,
