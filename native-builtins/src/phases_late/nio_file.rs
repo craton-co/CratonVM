@@ -5192,6 +5192,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) => Err(p57_io_error(&e)),
                 };
             }
+            // NOFOLLOW_LINKS has to be answered BEFORE the missing-file
+            // pre-check below, because the two disagree about a *dangling*
+            // symlink: `Path::exists()` is a `stat`, so it reports the link as
+            // absent, and without this the pre-check would return
+            // `NoSuchFileException` — which callers legitimately catch and
+            // recover from — where the kernel's `O_NOFOLLOW` would have said
+            // `ELOOP`. The delegation to `newFileChannel` below carries the same
+            // check for every other case; this one has to be here.
+            if fsp_scan_open_options(ctx, args.get(2).copied()).nofollow {
+                if let Some(refused) = p57_nofollow_reject(&p) {
+                    return Err(refused);
+                }
+            }
             // Preserve the NIO missing-file contract: opening a non-existent
             // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
             // `java.nio.file.NoSuchFileException`, which frameworks catch to treat

@@ -146,6 +146,22 @@ public class RNioNoFollow {
         check(byteChannel.equals("io"), "newByteChannel through a symlink: " + byteChannel);
         check(content(target("e")).equals("target"), "newByteChannel must not touch the target");
 
+        // A READ-only open of a DANGLING link: `Path.exists()` is a stat and
+        // reports it absent, so a missing-file pre-check would answer
+        // NoSuchFileException (which callers catch and recover from) where the
+        // kernel's O_NOFOLLOW answers ELOOP. Both are IOExceptions, so assert
+        // the TYPE, not just that something was thrown.
+        Path dead = link("i", false);
+        String deadType = "none";
+        try (SeekableByteChannel ch = Files.newByteChannel(dead,
+                Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))) {
+            ch.position();
+        } catch (Exception ex) {
+            deadType = ex.getClass().getName();
+        }
+        checks++;
+        System.out.println("CK RNioNoFollow danglingReadOnly=" + deadType);
+
         String fileChannel = outcome(() -> {
             try (FileChannel ch = FileChannel.open(link("f", true), StandardOpenOption.WRITE,
                     StandardOpenOption.CREATE, LinkOption.NOFOLLOW_LINKS)) {
