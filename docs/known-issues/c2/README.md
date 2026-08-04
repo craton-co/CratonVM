@@ -119,9 +119,11 @@ Measured against `origin/dev` at `95152daea`, **with `cov-01` and `cov-02`
 already in it**: invoke refusals **106 → 0**, bodies **778 → 849 (+9%)**, and
 `cov-03`'s `putfield` row grew 45 → **78**, which is now **78 of the 85**
 builder refusals that remain. Correctness: the 79-class Spring Boot regression
-list, both arms interleaved, **zero verdict mismatches** (65 PASS / 12
-pre-existing FAIL, identical sets) — run once per baseline, the second time with
-the fixed arm producing 850 bodies.
+list, both arms interleaved, run once per baseline — **no class changes state in
+either direction** that survives repetition. (Sweep 2 threw one mismatch, in the
+*flattering* direction: a devtools class that failed on base and passed on fix.
+6/6 PASS on re-run, both arms — a known bean-attribute flake. Re-run a mismatch
+that favours you before it becomes a claim.)
 
 Three things to carry into the neighbouring lanes:
 

@@ -215,15 +215,25 @@ Run twice, once per baseline, the second time after `cov-01` and `cov-02` had
 raised the fixed arm to 850 bodies — because "more C2 code executes" is exactly
 the condition under which a miscompile would show:
 
-| verdict | base | fix |
-|---|---:|---:|
-| PASS | 65 | 65 |
-| FAIL (all pre-existing, identical set) | 12 | 12 |
-| NOSUMMARY | 1 | 1 |
-| no classpath built | 1 | 1 |
+| verdict | sweep 1 base | sweep 1 fix | sweep 2 base | sweep 2 fix |
+|---|---:|---:|---:|---:|
+| PASS | 65 | 65 | 64 | 65 |
+| FAIL (pre-existing) | 12 | 12 | 13 | 12 |
+| NOSUMMARY | 1 | 1 | 1 | 1 |
+| no classpath built | 1 | 1 | 1 | 1 |
 
-**Zero verdict mismatches across all 79, both times.** Not one class changes
-state in either direction.
+**Sweep 1: zero mismatches across all 79.** Sweep 2: one, and it is worth
+spelling out because it points the flattering way and is still not a result.
+`DevToolsEmbeddedDataSourceAutoConfigurationTests` failed on the **base** arm
+and passed on the fixed one — i.e. the change appeared to *fix* something. It
+did not: re-run three times per arm, it is **6/6 PASS**, and the base failure is
+a `NoSuchBeanDefinitionException` from the known Spring bean-attribute flake
+family. A mismatch in your favour is a mismatch; re-run it before it becomes a
+claim.
+
+Net: **no class changes state in either direction** that survives repetition,
+across two independent sweeps at two different baselines — the second with the
+fixed arm producing 850 bodies rather than 683.
 
 Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
 
