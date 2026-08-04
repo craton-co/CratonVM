@@ -1,4 +1,4 @@
-# HIR-01 — settle the lowering contract before splitting the IR
+``# HIR-01 — settle the lowering contract before splitting the IR
 
 **Status:** not started. **Blocks:** `hir-02`. **Owns:** `docs/` only —
 this lane writes a contract, not code.
