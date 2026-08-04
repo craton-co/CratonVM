@@ -28,7 +28,8 @@ use crate::deopt::{
 use crate::regalloc::{resolve_parallel_copy, CopyOp, ValueLoc};
 use cratonvm_types::narrow_oop::narrow_base;
 use cratonvm_types::{
-    narrow_oops_enabled, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
+    narrow_oops_enabled, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET,
+    FIELD_CELL_PAYLOAD64_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 
 // ── Header-offset emission sites (arch-2026-07-26 `layout-constant-hazards`) ──
@@ -303,6 +304,19 @@ struct Lowerer<'a> {
     new_object: usize,
     monitor_enter: usize,
     monitor_exit: usize,
+    /// cov-01. `jit_ldc_string(vm, bytes, len) -> ObjectRef` — the interning
+    /// lookup an `Op::ConstString` lowers to. `jit_ldc_class_cp(vm, holder,
+    /// cp_idx) -> mirror | 0` — the resolution an `Op::ConstClass` lowers to.
+    /// `jit_getstatic(vm, class_id, field_index) -> value | i64::MIN` — the
+    /// `<clinit>`-running slow path an `Op::LoadStatic` falls back to when the
+    /// class is not already initialised at compile time.
+    ///
+    /// All three are OptionalPtr in practice (a synthetic unit-test helper
+    /// table leaves them 0), so `lower_inner` refuses a graph that would need
+    /// an absent one rather than emitting a `CALL` through address zero.
+    ldc_string: usize,
+    ldc_class_cp: usize,
+    getstatic: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -710,6 +724,9 @@ impl<'a> Lowerer<'a> {
             new_object: helpers.new_object,
             monitor_enter: helpers.monitor_enter,
             monitor_exit: helpers.monitor_exit,
+            ldc_string: helpers.ldc_string,
+            ldc_class_cp: helpers.ldc_class_cp,
+            getstatic: helpers.getstatic,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -1692,6 +1709,80 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, counter as u64);
         self.buf.emit(&[0xF0, 0x48, 0xFF, 0x00]); // lock inc qword [rax]
         self.buf.emit_byte(0x58); // pop rax
+    }
+
+    /// cov-01 — direct (helper-free) read of a static field, the IR tier's
+    /// mirror of `x64::Compiler::try_emit_inline_getstatic`. Returns `false`
+    /// when the site is not eligible, leaving the caller's helper lowering in
+    /// place.
+    ///
+    /// What is baked is the address of the class's base-POINTER cell, not of
+    /// the statics block: one extra dependent load buys immunity to every
+    /// republication path, because a `StaticsBlock` is a leaked, never-freed
+    /// allocation per class whose *cell* address is stable while the block
+    /// pointer inside it is not.
+    ///
+    /// `resolve_static_base` returning `None` is the whole eligibility test,
+    /// and it is the VM's judgement rather than this file's: it declines a
+    /// class that is not yet initialized (an inline load runs no `<clinit>`),
+    /// `java/lang/System` (the `out`/`err`/`in` bootstrap intercept), anything
+    /// not yet published, and a second VM in this process. Reusing that one
+    /// predicate is what keeps the two tiers from developing different opinions
+    /// about which statics may be read directly.
+    ///
+    /// Only the two type tags the builder admits are emitted — reference
+    /// (64-bit payload) and int-category (`MOVSXD` of the 32-bit payload) —
+    /// because `IrBuilder`'s `0xb2` arm refuses `J`/`D`/`F` outright. A tag
+    /// that reached here anyway would be a builder bug, so it takes the helper
+    /// rather than a plausible-looking wrong width.
+    fn emit_inline_getstatic(
+        &mut self,
+        id: NodeId,
+        class_id: u32,
+        field_index: u32,
+        type_tag: u8,
+        is_volatile: bool,
+    ) -> bool {
+        if !crate::x64::inline_getstatic_enabled() {
+            return false;
+        }
+        let is_ref = matches!(type_tag, b'L' | b'[');
+        if !is_ref && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+            return false;
+        }
+        let Some(base_cell) = crate::x64::resolve_static_base(class_id, field_index as usize) else {
+            return false;
+        };
+        // Cell byte offset within the class's statics block, plus the payload
+        // half of the 16-byte cell — the same arithmetic the single-pass arm
+        // uses, and the same `FIELD_CELL_PAYLOAD*_OFFSET` constants.
+        let Ok(cell_off) = i32::try_from((field_index as usize).saturating_mul(SLOT_SIZE)) else {
+            return false;
+        };
+        let payload = if is_ref {
+            FIELD_CELL_PAYLOAD64_OFFSET as i32
+        } else {
+            FIELD_CELL_PAYLOAD32_OFFSET as i32
+        };
+        let Some(disp) = cell_off.checked_add(payload) else {
+            return false;
+        };
+        let slot = self.alloc_slot(id);
+        // MOV RAX, imm64(&base_cell) ; MOV RAX, [RAX]
+        self.emit_mov_reg_imm64(RAX, base_cell as u64);
+        self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+        self.buf.emit(&0i32.to_le_bytes());
+        if is_ref {
+            self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+        } else {
+            self.buf.emit(&[0x48, 0x63, 0x80]); // MOVSXD RAX, [RAX + disp32]
+        }
+        self.buf.emit(&disp.to_le_bytes());
+        if is_volatile {
+            self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+        }
+        self.store_rax(slot);
+        true
     }
 
     /// Guarded inline read of a compact instance field, with the checked
@@ -3894,6 +3985,155 @@ fn reloc_emit_enabled() -> bool {
                 //    cross-method call path; see `emit_call_return_check`.
                 self.emit_call_return_check(slot, node.ty);
             }
+            // ── cov-01: the constant-pool constants that are calls ───────
+            //
+            // `ldc <String>` and `ldc <Class>`. Both materialise a REFERENCE by
+            // calling the same helper the single-pass backend calls, and both
+            // publish a safepoint map first for the reason the `Op::Call` arm
+            // above spells out: the helper can allocate (interning a literal,
+            // constructing a mirror) and therefore collect, and the map must
+            // describe the frame as it stands BEFORE this node's own result
+            // slot is carved — that slot is not written until the call returns,
+            // so covering it would publish whatever the previous frame left
+            // there as a live reference.
+            //
+            // Neither result needs an `i64::MIN` check, and the difference is
+            // in the helpers, not in an oversight:
+            //
+            //   * `jit_ldc_string` cannot fail into a pending exception. It
+            //     returns 0 only for a null `vm_ptr`/`bytes`, neither of which
+            //     can occur here (the graph is `needs_context`, and the bytes
+            //     are owned by the artifact).
+            //   * `jit_ldc_class_cp` reports a failed resolution as `0` with a
+            //     pending exception published, which is the SAME convention
+            //     `Op::New` uses — so it takes the same zero-test and the same
+            //     conversion to the JIT-wide `i64::MIN` before the shared
+            //     exception epilogue.
+            Op::ConstString { bytes, len } => {
+                let (bytes, len) = (*bytes, *len);
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[1], bytes as u64);
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], len as u64);
+                self.emit_mov_reg_imm64(RAX, self.ldc_string as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                                              // The helper crossed the JIT boundary and may have run a
+                                              // collection, so this frame's mirror and any relocated
+                                              // published value must be restored before anything else
+                                              // reads the frame — the identical obligation
+                                              // `emit_call_return_check` discharges for `Op::Call`, minus
+                                              // the sentinel test this helper has no use for.
+                self.emit_post_call_frame_record();
+                self.emit_shadow_reload();
+                self.store_rax(slot);
+            }
+            Op::ConstClass {
+                holder_class_id,
+                cp_idx,
+            } => {
+                let (holder_class_id, cp_idx) = (*holder_class_id, *cp_idx);
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                // Shared with the deferred-`new` stub: `(vm, holder_class_id,
+                // cp_idx)` in the entry ABI's first three argument registers,
+                // an absolute CALL, then the post-call frame republish. Using
+                // the shared emitter is what keeps this site's ABI from
+                // drifting away from the single-pass one it mirrors.
+                crate::runtime_lowering::emit_ldc_class_cp_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    self.ldc_class_cp,
+                    holder_class_id,
+                    cp_idx,
+                    self.frame_record,
+                );
+                self.emit_shadow_reload();
+                // 0 = resolution failed and published a pending exception.
+                // Convert to the JIT-wide i64::MIN and take the shared
+                // exception epilogue, exactly as the `Op::New` arm does.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ resolved
+                let resolved_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let resolved = self.buf.pos();
+                let rel = resolved as i32 - (resolved_patch as i32 + 4);
+                Self::patch_or_bail(&mut self.buf, resolved_patch, rel);
+                self.store_rax(slot);
+            }
+            // ── cov-01: getstatic ────────────────────────────────────────
+            //
+            // Two lowerings, chosen by the same predicate the single-pass
+            // backend's `0xb2` arm uses (`x64::try_emit_inline_getstatic`), and
+            // deliberately not by a second opinion:
+            //
+            //   * DIRECT — `resolve_static_base` accepted the site, which it
+            //     does only for a class already initialised at compile time and
+            //     published in the lock-free `StaticsIndex`. What is baked is
+            //     the address of the class's base-POINTER cell, never of the
+            //     block: the one extra dependent load is what buys immunity to
+            //     every republication path. An inline load runs no `<clinit>`,
+            //     which is sound only because the class is already initialised
+            //     AND `CompiledMethod::static_init_classes` re-checks at the
+            //     compiled entry.
+            //   * HELPER — everything the resolver declines: a class not yet
+            //     initialised, `java/lang/System`'s bootstrap intercept,
+            //     anything not yet published, and every site when
+            //     `CRATONVM_JIT=getstatic-helper` is set. `jit_getstatic` runs
+            //     `<clinit>` on first touch and, on failure, stashes the Java
+            //     exception and returns the `i64::MIN` deopt sentinel — routed
+            //     through the shared exception epilogue rather than pushed as
+            //     if it were a field value.
+            //
+            // A volatile static takes an MFENCE after the read on both routes
+            // (x86-64 already gives the load itself acquire ordering).
+            Op::LoadStatic {
+                class_id,
+                field_index,
+                type_tag,
+                is_volatile,
+            } => {
+                let (class_id, field_index, type_tag, is_volatile) =
+                    (*class_id, *field_index, *type_tag, *is_volatile);
+                if self.emit_inline_getstatic(id, class_id, field_index, type_tag, is_volatile) {
+                    return;
+                }
+                // The helper can run `<clinit>`, i.e. arbitrary Java. Same
+                // pre-call map obligation as `Op::Call`.
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[1], u64::from(class_id));
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], u64::from(field_index));
+                self.emit_mov_reg_imm64(RAX, self.getstatic as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                self.emit_post_call_frame_record();
+                self.emit_shadow_reload();
+                // `i64::MIN` = the helper published a pending Java exception
+                // (a failed `<clinit>`) instead of a value. The IR builder
+                // admits only int-category and reference statics, for neither
+                // of which `i64::MIN` is a legitimate result, so a plain
+                // compare-and-bail is unambiguous — the same reasoning the
+                // `Op::Load` arm's sentinel check rests on.
+                self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+                self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+                self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+                let exc_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exc_patch);
+                if is_volatile {
+                    self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+                }
+                self.store_rax(slot);
+            }
             // ── FP value tier (inc 30) ───────────────────────────────────
             // A float/double constant is just its IEEE bit pattern written to
             // the result slot via a GPR immediate — no XMM. A float's payload
@@ -5192,6 +5432,17 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
         if matches!(n.op, Op::New { .. }) {
             needs_context = true;
         }
+        // cov-01: all three take the VM context pointer as their helper's arg0.
+        // `Op::LoadStatic` needs it even on the direct route it usually takes,
+        // because the route is chosen per SITE at compile time and a single
+        // helper-served site in the method is enough — deciding it here, from
+        // the graph, keeps the frame layout independent of that choice.
+        if matches!(
+            n.op,
+            Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. }
+        ) {
+            needs_context = true;
+        }
     }
     FrameNeeds {
         needs_context,
@@ -5412,6 +5663,11 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::ArrayLength
             | Op::New { .. }
             | Op::Call { .. }
+            // cov-01: each defines a result slot — a `Ref` for the two `ldc`
+            // constants, the field's value for `getstatic`.
+            | Op::ConstString { .. }
+            | Op::ConstClass { .. }
+            | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
     )
 }
@@ -5857,7 +6113,17 @@ fn plan_slots(
         if matches!(node.op, Op::Phi) {
             pinned[id] = true;
         }
-        if node.ty == IrType::Ref && matches!(node.op, Op::Call { .. }) {
+        // cov-01: `Op::ConstString` / `Op::ConstClass` produce a `Ref` from a
+        // helper call, exactly as `Op::Call` can, and their arms publish the
+        // safepoint map before the call for the same reason. Give them the same
+        // "may donate a colour, may never receive a recycled one" treatment; a
+        // recycled colour here would be a slot the map already named.
+        if node.ty == IrType::Ref
+            && matches!(
+                node.op,
+                Op::Call { .. } | Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. }
+            )
+        {
             fresh_only[id] = true;
         }
     }
@@ -7154,6 +7420,53 @@ pub(crate) fn lower_inner_with_scopes(
             .any(|node| matches!(node.op, Op::New { .. }))
     {
         return None;
+    }
+    // cov-01. The same reasoning as the two guards above, for the three
+    // constant-pool nodes: each lowers to a `CALL` through a helper address,
+    // and a zero there is a call to address 0. Only a synthetic unit-test table
+    // can produce one — `build_helpers` always wires all three — but "only a
+    // test can hit it" is what the monitor guard's history says not to rely on.
+    //
+    // `Op::LoadStatic` is guarded on the helper even though its usual route is
+    // the direct load: which route a site takes is decided per site inside
+    // `emit_inline_getstatic`, and any site the resolver declines falls back to
+    // this helper. Refusing the graph is the only answer that does not depend
+    // on a runtime resolver's answer at emission time.
+    for (helper, present, what) in [
+        (
+            helpers.ldc_string,
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ConstString { .. })),
+            "ldc_string",
+        ),
+        (
+            helpers.ldc_class_cp,
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ConstClass { .. })),
+            "ldc_class_cp",
+        ),
+        (
+            helpers.getstatic,
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::LoadStatic { .. })),
+            "getstatic",
+        ),
+    ] {
+        if helper == 0 && present {
+            return refuse(Bailout::with_context(
+                BailoutReason::UnsupportedShape("constant-pool helper absent"),
+                format!(
+                    "graph contains a cov-01 constant-pool node but the helper table has no \
+                     `{what}` entry; refusing rather than emitting a CALL through address zero"
+                ),
+            ));
+        }
     }
     // Compact field layout (default ON) packs field offsets, so `Op::Load` and
     // `Op::Store`'s inline `HEADER_SIZE + field_index*SLOT_SIZE` displacements
@@ -11400,6 +11713,9 @@ mod tests {
             | Op::ArrayLength
             | Op::New { .. }
             | Op::Call { .. }
+            | Op::ConstString { .. }
+            | Op::ConstClass { .. }
+            | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble => LoweredValue,
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
@@ -11476,6 +11792,23 @@ mod tests {
             ),
             ("NewArray", Op::NewArray { element_type: 10 }),
             ("Call", Op::Call { info_ptr: 0 }),
+            ("ConstString", Op::ConstString { bytes: 0, len: 0 }),
+            (
+                "ConstClass",
+                Op::ConstClass {
+                    holder_class_id: 0,
+                    cp_idx: 0,
+                },
+            ),
+            (
+                "LoadStatic",
+                Op::LoadStatic {
+                    class_id: 0,
+                    field_index: 0,
+                    type_tag: b'I',
+                    is_volatile: false,
+                },
+            ),
             ("LambdaIntToDouble", Op::LambdaIntToDouble),
             ("MonitorEnter", Op::MonitorEnter),
             ("MonitorExit", Op::MonitorExit),
@@ -11530,8 +11863,17 @@ mod tests {
     }
 
     /// Every variant declared in `ir::Op` itself — the ground truth.
+    ///
+    /// The `\r` strip is load-bearing, not tidiness. `include_str!` returns the
+    /// file's bytes verbatim, and a CRLF checkout (the Windows default, and
+    /// what `core.autocrlf=true` produces) makes a `}` line read as `\r\n}\r\n`
+    /// — so the `"\n}\n"` terminator below matches nothing and the "enum block"
+    /// silently runs to the end of `ir.rs`, sweeping up every variant of every
+    /// other enum in the file. That is the whole check reading garbage, and it
+    /// was doing so on Windows before cov-01 (verified against an unmodified
+    /// `dev`); it passed on Linux only because the checkout is LF there.
     fn declared_op_variants() -> std::collections::BTreeSet<String> {
-        let src = include_str!("ir.rs");
+        let src = include_str!("ir.rs").replace("\r\n", "\n");
         let block = src
             .split("\npub enum Op {")
             .nth(1)

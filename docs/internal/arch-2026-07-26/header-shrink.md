@@ -343,6 +343,14 @@ audit the shrink was planned from:
 - `ir_lower.rs:1186` (added 2026-07-31) — `(HEADER_SIZE + packed_body_offset) as i32`,
   the guarded inline compact `getfield` cell address (disp32, so no disp8 hazard;
   it is here because it bakes the header size into emitted machine code)
+- `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
+  `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
+  as a disp32, from the class's **statics block** base. It bakes the field-cell
+  arithmetic but **no** `HEADER_SIZE` term — a statics block has no object
+  header — so it is unaffected by the shrink at either target. Listed because
+  the cell shape it assumes is the same one
+  `types::heap_types::field_cell_layout_matches_value_enum` pins for instance
+  fields.
 
 Plus `jit/src/lib.rs:3210`, `:3236` (was `:3186`, `:3226` — the two closures were
 rewritten by BUG-STRING-CODER-COMPACT-20260726) —

@@ -141,12 +141,12 @@ bash regression-suite/perf/run-cratonbench-gate.sh \
     --results-dir /tmp/hashmap-after
 ```
 
-Each run writes, under `regression-suite/perf/results/v1/<run-id>/`:
+Each run writes, under `regression-suite/perf/results/v2/<run-id>/`:
 
 | File | Contents |
 |---|---|
-| `manifest.tsv` / `manifest.json` | the environment manifest above |
-| `samples.tsv` / `samples.json` | **every raw sample**: ms, checksum, observed CPU, load, throttle delta, frequency min/max, peak RSS, C1/C2/OSR compile counts, deopts, GC young pause count/p50/p99/max, minor/major GC counts, exit code |
+| `manifest.tsv` / `manifest.json` | the environment manifest above, plus one `ir_reach_<phase>` line per phase |
+| `samples.tsv` / `samples.json` | **every raw sample**: ms, checksum, observed CPU, load, throttle delta, frequency min/max, peak RSS, C1/C2/OSR compile counts, deopts, GC young pause count/p50/p99/max, minor/major GC counts, exit code, optimizing-tier requests/admitted/bodies |
 | `summary.tsv` / `summary.json` | per phase: n, min, p50, p90, p99, max, mean, stddev, CV, checksum, baseline, budget, verdict, plus the per-phase maxima of the secondary metrics |
 | `reliability-preflight.*`, `reliability-postflight.*`, `reliability.json` | the reliability gate's decision and every check it ran |
 
@@ -154,12 +154,33 @@ Percentiles are **nearest-rank** (`ceil(p/100 x n)`) everywhere — the runner,
 both reliability gates, `compare.py`, and the VM's own G1 pause summary — so a
 p99 from one means the same as a p99 from another.
 
+### What a phase's numbers are evidence *about*
+
+Schema 2 (2026-08-03) added the **optimizing tier's reach**: per phase, how
+many compile requests reached the admission chain, how many were admitted to
+the optimizing (C2/IR) pipeline, and how many bodies that pipeline actually
+produced. It is in `samples.tsv`/`summary.tsv` as `ir_requests` /
+`ir_admitted` / `ir_bodies`, and in `manifest.tsv` as one `ir_reach_<phase>`
+line per phase.
+
+Read it before quoting a delta as evidence about the JIT. On the seven
+CratonBench phases the tier produces **three** bodies in total, so almost every
+phase's number is a measurement of the single-pass backend and says nothing
+about C2 in either direction — including "the C2 change did no harm". That is
+`docs/known-issues/c2/`'s MEAS-02, and the reach record exists so the fact
+travels with the numbers instead of having to be rediscovered.
+
+`compiles_c2` is a different column and is not a substitute: it counts
+compiles whose requested *tier* was C2, including every one the optimizing
+pipeline declined and handed to the single-pass backend. A phase can report
+`compiles_c2` above zero with `ir_bodies` at zero.
+
 Comparing two runs:
 
 ```bash
 python3 regression-suite/perf/compare.py \
-    regression-suite/perf/results/v1/<before-run-id> \
-    regression-suite/perf/results/v1/<after-run-id>
+    regression-suite/perf/results/v2/<before-run-id> \
+    regression-suite/perf/results/v2/<after-run-id>
 ```
 
 `compare.py` reports p50 **and** p99 deltas with both arms' CV, and **refuses
