@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock, Weak};
 ///
 /// Static reads were the most expensive field access in compiled code (~35 ns
 /// against HotSpot's ~1 — see
-/// `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`). What
+/// `jit-getstatic-costs-a-helper-call-FIXED-20260803.md`). What
 /// was left after trimming the helper is the `RwLock` + hash probe that reaching
 /// a `Vec<Value>` inside an `FxHashMap` requires — and, once this block had a
 /// stable address, the prerequisite for deleting the helper CALL outright:

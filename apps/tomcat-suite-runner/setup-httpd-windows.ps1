@@ -9,7 +9,7 @@
   starts itself via TesterHttpd. Without httpd they all fail with a
   connection-refused to the proxy port - on HotSpot exactly as on CratonVM, so
   the whole family reads like a VM defect when it is only a missing fixture.
-  See docs/internal/tomcat/httpd-proxy-integration-windows-connection-refused.md.
+  See tomcat/httpd-proxy-integration-windows-connection-refused.md.
 
   Two things are needed, and this script does both:
 

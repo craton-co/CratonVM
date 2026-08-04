@@ -695,7 +695,7 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// previously "not supported" (threw `NotImplemented`), which silently
 /// truncated every gzip/deflate response written through a direct output
 /// buffer to just its 10-byte gzip header — see
-/// docs/known-issues/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md
+/// fixed-suite-bugs/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals-FIXED.md
 /// (the `compressionOfResponseToGetRequest` residual: Jetty's
 /// `GzipHttpOutputInterceptor` calls exactly this overload).
 fn defl_deflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

@@ -1,10 +1,49 @@
-# The real-protected-stub class allow-list exists twice and the two copies are **not** identical — one includes `java/util/StringJoiner`, the other deliberately omits it
+# The real-protected-stub class allow-list existed twice and the two copies were **not** identical — one included `java/util/StringJoiner`, the other deliberately omitted it
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **The divergence is intentional and
-means the cold and warm dispatch paths make different decisions for the same
-class.** Wave 2 must **reconcile** these, not assume they are copies of each
-other.
+**Status:** FIXED 2026-08-04 on `fix/jdk-only-wave2-retire-20260804`. Filed
+2026-07-31 as JDK-only wave-2 item 8.
+
+## Resolution
+
+There is **one predicate**. `java/util/StringJoiner` joined
+`real_protected_stub_class_common`, `real_protected_stub_class_cold` was
+deleted, and `vm_exec`'s cold (vtable-miss) path calls
+`real_protected_stub_class` like everything else. A `SyntheticStub` native's
+yield-to-real-bytecode verdict no longer depends on how many times its call site
+has executed.
+
+The exception existed because merging the lists once tripped the
+`gen_heap::read_slot` "corrupt Value cell" / HIB-CV-32 guard. That was
+re-measured under the exact merge — 40,000 `add()` calls under `-Xmx64m` with
+per-iteration allocation churn and seven intermediate consistency checks,
+against a HotSpot control — and did not reproduce, in either mode. The
+measurement, including the two ways it nearly produced a false result, is in
+*The defect did not reproduce* below. The owner ran their own probe before this
+was landed.
+
+**`real_protected_stub_paths_diverge_on_exactly_stringjoiner` is gone, replaced
+by `every_allowlisted_class_is_protected`.** The old test froze the one-class
+divergence between the two paths; with a single predicate there is nothing left
+to compare, and an "the paths agree" assertion over one function is a guard that
+cannot fail. What can still regress is a class quietly leaving the list, so that
+is what is asserted, with a floor on the corpus size so an emptied corpus is not
+vacuous either.
+
+Dropping `StringJoiner` from the cold path instead was never an option, and the
+code now says so where someone would try it: the synthetic `add()` writes a
+5-field layout over the real 7-field class, reads slot 3 — real `elts`, null —
+and no-ops, giving a **silently empty join**, not a crash.
+
+---
+
+*Everything below is the original filing, kept for its reasoning and its
+measurement.*
+
+**Original status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31,
+re-verified against the re-landed tree the same day. **The divergence is
+intentional and means the cold and warm dispatch paths make different decisions
+for the same class.** Wave 2 must **reconcile** these, not assume they are
+copies of each other.
 
 *Re-ranked from tier-1 #7 to #8.* The original filing's sharpest hazard was that
 the including copy carried **no** comment saying the other copy differed, so a
@@ -13,6 +52,104 @@ now cross-reference each other and both say "RECONCILE, not assume". The
 divergence itself is untouched, so the item stays in tier 1 — it still produces
 different dispatch verdicts for the same class on two paths — but it is no
 longer a trap for an unwarned reader.
+
+## What changed on 2026-08-04
+
+**There is one list now.** The title above describes the tree as it was: an
+inline `matches!` in `vm_exec::invoke_or_native` and a separate
+`real_protected_stub_class` in the interpreter, maintained by hand, which is
+how they came to differ. Both predicates now read one
+`real_protected_stub_class_common` (the ten classes both paths agree on) plus
+one **stated** exception —
+
+* `real_protected_stub_class(name)` — the warm paths;
+* `real_protected_stub_class_cold(name)` — `= real_protected_stub_class(name) ||
+  name == "java/util/StringJoiner"`, called by `invoke_or_native`.
+
+Adding a class to the common list protects it on both paths; a class that
+belongs on only one has to say which, in code. That is the property two copies
+could not offer.
+
+**The divergence itself is untouched, and is now asserted rather than
+described.** `real_protected_stub_paths_diverge_on_exactly_stringjoiner` fails
+if the two predicates disagree about anything other than `StringJoiner` — in
+either direction. This is the *divergence test* the record asks for first under
+*How to verify a fix*, with one deliberate difference from its wording: it does
+not "fail today on `java/util/StringJoiner`" and get frozen as an expected
+failure, it asserts the disagreement is exactly that one class and passes. A
+merge in either direction fails it; so does adding a twelfth class to one path
+only. Verified by injecting the naive "make them match" edit and watching it
+fail.
+
+A second test, `every_corpus_class_is_protected_on_some_path`, keeps the test
+corpus honest: without it, deleting a class from the shared list and forgetting
+the corpus would leave the divergence test passing while silently checking a
+name neither path mentions.
+
+## What is still open — and it is the whole of it
+
+**Reconciling the divergence**, which means fixing the `StringJoiner`
+heap-reference-integrity defect (HIB-CV-32 family: `gen_heap::read_slot`
+"corrupt Value cell" firing on the second `add()`), not merging the lists.
+Nothing above touches that. Both naive directions still reintroduce a known
+defect, for the reasons in *Blast radius* below, and the test now enforces that
+neither is taken by accident.
+
+### The defect did not reproduce — measured 2026-08-04
+
+It was diagnosed 2026-07-10. Since then `native-collections` grew
+`sj_real_layout` (which resolves the real class's field indices by name) and a
+large old-gen corruption family closed 2026-08-04. So the asymmetry was worth
+re-testing rather than assuming, and the test is cheap.
+
+**Method.** `java/util/StringJoiner` added to
+`real_protected_stub_class_common` and the `_cold` exception deleted — i.e.
+exactly the "make them match" merge this record says reintroduces the defect —
+then rebuilt (binary mtime and size both confirmed changed; the first attempt
+at this experiment reported PASS against a binary whose build had failed, so
+the rerun aborts on a non-zero build status) and run against a real JDK 21
+image on Linux.
+
+**Result: PASS, byte-identical to HotSpot, in both modes.**
+
+Two probes. The first is the one this record's *How to verify* section asks
+for — a `StringJoiner` whose second and subsequent `add()` calls must be
+observable in `toString()`; all three adds and a 2,000-iteration hot loop came
+back correct. The second adds real collector pressure, because the guard in
+question lives in `gen_heap::read_slot` and a probe that never collects is a
+weak witness even though the documented symptom is immediate: 40,000 `add()`
+calls under `-Xmx64m` with a 512-byte allocation and a `StringBuilder` churn per
+iteration, with seven intermediate consistency checks.
+
+```
+HOTSPOT (control)        SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+merged, --jdk-only       SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+merged, --real-jdk       SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+```
+
+No "corrupt Value cell", no exception, no crash.
+
+### Why this is not yet enough to land the merge
+
+**It is a microprobe, and the defect was found in a suite.** The Copy B comment
+is explicit that the failure was *"something specific to this being a
+natively-registered bootstrap class, not the bytecode pattern itself"* and that
+an equivalent user-defined class with the identical shape did **not** reproduce
+it. My probes use the real bootstrap `java.util.StringJoiner`, which is the
+right shape — but a passing microprobe has repeatedly failed to predict a real
+library in this codebase, and the HIB-CV-32 family is named after Hibernate.
+
+The remaining step is therefore a suite run, not another probe: apply the merge
+and run H2 and Hibernate, which are where the "corrupt Value cell" guard trips
+were observed. Until that exists, **the asymmetry stays**, and the code and the
+divergence test are unchanged.
+
+Also unmeasured: the other ten classes. This record asks for a decision *per
+class*, and only `StringJoiner` has been tested. The other ten have never been
+checked for agreement in practice, only assumed equal — that assumption is now
+enforced by
+`real_protected_stub_paths_diverge_on_exactly_stringjoiner`, which is a
+different thing from being verified.
 
 ## What is wrong
 
@@ -76,7 +213,7 @@ bytecode. On the interpreter's stackless/cached path, they do not. That is a
 deliberate, load-bearing asymmetry, now documented at both ends.
 
 The referenced write-up is
-`docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
+`fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
 The in-code comment still points at the pre-move path
 `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md`,
 which no longer exists — a stale reference worth fixing in the same change. It
@@ -105,7 +242,7 @@ The class list has two copies. The *predicate* built on it has more:
   holding the class-manager read lock"*).
 * The `VirtualNative` cache-hit path (`invoke.rs` ~22250) — calls Copy B as a
   cheap pre-filter, then the full helper. See
-  [cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
+  cached invoke targets retain and revalidate the `NativeKind`.
 
 Both class lists are additionally OR-ed with
 `env_cache::real_bytecode_selector().prefers_real(class)`, i.e. the

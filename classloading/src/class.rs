@@ -2455,7 +2455,7 @@ mod tests {
 
     /// Regression test for the Infinispan `GlobalConfiguration` /
     /// `GlobalConfigurationBuilder` `isClustered()` `NoSuchMethodError` bug
-    /// (docs/known-issues/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+    /// (fixed-suite-bugs/keycloak/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md).
     ///
     /// Two closely-named, UNRELATED classes (no inheritance between them,
     /// both extend plain `Object` — mirroring the real

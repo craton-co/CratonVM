@@ -7,7 +7,7 @@
 //! Flag-skew and header-offset contracts
 //! ---------------------------------------------------------------------------
 //!
-//! Companion doc: `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md`.
+//! Companion doc: `arch-2026-07-26/x64-flag-skew-and-contracts.md`.
 //!
 //! These tests defend two properties that no build error would catch:
 //!
@@ -332,7 +332,7 @@ fn relocates_compiled_frames_implies_moving_young_but_not_conversely() {
 /// moving-young for the whole process as soon as any compiled code exists.
 /// The optimizing tier must therefore NOT be disabled by the moving-young
 /// default — that trade bought nothing. Pins the regression that
-/// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
+/// `jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
 /// describes.
 #[test]
 fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
@@ -686,7 +686,7 @@ fn locals_past_the_bitset_never_receive_a_register_home() {
 
 /// Inventory tripwire for the 32→16-byte `ObjectHeader` shrink. If these
 /// counts change, the site list in
-/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5 is
+/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5 is
 /// stale and the shrink has an unaudited emission site.
 #[test]
 fn header_offset_emission_site_inventory_matches_the_doc() {
@@ -705,7 +705,7 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
             found, expected,
             "{needle} appears {found}x across the x64 backend sources, doc records \
              {expected}x. Update \
-             docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md §5 (the \
+             arch-2026-07-26/x64-flag-skew-and-contracts.md §5 (the \
              header-offset site list) in the same change — it is the map the \
              ObjectHeader 32→16 shrink navigates by."
         );
@@ -761,7 +761,7 @@ fn ir_lower_header_offset_sites_are_inventoried_too() {
             "{needle} appears {found}x in ir_lower.rs, the header-shrink audit \
              records {expected}x. ir_lower.rs emits array/field displacements \
              exactly as x64.rs does; update \
-             docs/internal/arch-2026-07-26/header-shrink.md §6 in the same change."
+             arch-2026-07-26/header-shrink.md §6 in the same change."
         );
     }
 }

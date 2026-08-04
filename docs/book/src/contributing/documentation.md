@@ -15,7 +15,7 @@ or known-issue status has changed but the manual still describes the old tree.
 | `docs/architecture/` | Current architectural design/implementation notes useful outside a single incident. |
 | `docs/feature-designs/` | Forward-looking proposals; not proof that a feature has landed. |
 | `docs/known-issues/` | Only unresolved defects and active investigations. |
-| `docs/internal/` | Historical evidence, fixed-issue reports, audit trails, and non-normative internal notes. |
+| `` | Historical evidence, fixed-issue reports, audit trails, and non-normative internal notes. |
 
 Do not create a second canonical guide for a topic already owned by the book.
 Extend the book and link to a deep standalone reference when the detail would

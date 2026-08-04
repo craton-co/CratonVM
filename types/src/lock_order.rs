@@ -1000,6 +1000,34 @@ impl<T> OrderedPlRwLock<T> {
         })
     }
 
+    /// Try to acquire shared access without blocking **and without consulting
+    /// the lock-order graph**.
+    ///
+    /// [`Self::try_read`] still calls `check_and_acquire_tracked`, which
+    /// *panics* on a descending-order acquisition. That is the right behaviour
+    /// for ordinary code — an out-of-order acquisition is a latent deadlock and
+    /// should fail loudly in development. It is the wrong behaviour for the
+    /// `System.exit` census path, which runs on whichever Java thread called
+    /// `System.exit`, holding whatever locks that thread happened to hold, and
+    /// whose job is to write a diagnostic file and then let the process die.
+    /// Panicking there converts "a diagnostic file is missing" into "the exit
+    /// path aborts".
+    ///
+    /// Skipping the check is sound **only because this cannot block**: the
+    /// order graph exists to rule out wait-for cycles, and a non-blocking
+    /// acquisition adds no edge to that graph. It returns `None` where a
+    /// blocking acquire would have waited. Do not add a blocking sibling of
+    /// this method.
+    #[inline]
+    pub fn try_read_untracked(&self) -> Option<OrderedPlRwLockReadGuard<'_, T>> {
+        let guard = self.inner.try_read()?;
+        Some(OrderedPlRwLockReadGuard {
+            guard,
+            level: self.level,
+            tracked: false,
+        })
+    }
+
     /// Try to acquire exclusive access without blocking.
     #[inline]
     pub fn try_write(&self) -> Option<OrderedPlRwLockWriteGuard<'_, T>> {

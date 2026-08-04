@@ -1701,8 +1701,8 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // bytecode call has cached this method's real-bytecode resolution) left
     // `this.fd == null`, and any subsequent `close()` NPE'd in
     // `FileDescriptor.closeAll` reading it (surfaced as Jasper's JDT
-    // compiler's `FileInputStream.close()` NPE — see docs/known-issues/
-    // tomcat-08-07/jspdocumentparser-saxparse-malformed-markup.md). Only
+    // compiler's `FileInputStream.close()` NPE — see fixed-suite-bugs/tomcat/
+    // jspdocumentparser-saxparse-malformed-markup-FIXED.md). Only
     // mirror into slot 0 when there is no real `FileDescriptor` object,
     // exactly mirroring `fis_set_fd`'s guard.
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
@@ -3103,7 +3103,7 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // runs real bytecode and can trigger a moving GC on every iteration
         // -- an unpinned `ObjectRef` goes stale and the eventual
         // `set_array_element` then writes through a dangling pointer (see
-        // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+        // fixed-suite-bugs/hibernate/hib-jpalargeblobtest-object-read-nosuchmethod.md).
         let this_pin = ctx.pin_native_root(this);
         let buf_pin = ctx.pin_native_root(buf);
         let mut this = this;
@@ -8008,7 +8008,7 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // asynchronously, whenever the background Cleaner thread happened to
     // run -- a real resource-lifecycle correctness gap in its own right
     // (independent of any specific caller), and a contributing factor to
-    // `docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
+    // `docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
     // `OverlappingFileLockException` investigation (that doc's residual
     // occurrences trace to a separate, H2-level chunk-reclaim race --
     // see the doc for the full picture).
@@ -9035,7 +9035,7 @@ fn dis_read_exact(
     // TestJspConfig/TestELInterpreterTagSetters/TestEnvEntry/
     // TestWsWebSocketContainerTimeoutClient hang residual left after the
     // native_dis_read_bytes/dis_read_fully_impl/native_dis_skip_bytes fixes
-    // (see docs/known-issues/tomcat-08-07/elinjsp-socket-read-timeout.md).
+    // (see fixed-suite-bugs/elinjsp-socket-read-timeout.md).
     // Bulk-read instead, preserving the same zero-progress-guard fallback
     // `dis_read_one` had (a stream returning 0 for a non-empty request is a
     // contract violation but tolerated here via a scalar `read()` retry).
@@ -9152,7 +9152,7 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // overhead where real Java does one native syscall, which manifested
     // as an apparent permanent hang (confirmed NOT infinite — it just never
     // finished within a 300s budget) in the STW-takeover-cluster residual
-    // investigation (see docs/known-issues/tomcat-08-07/
+    // investigation (see fixed-suite-bugs/
     // stw-crossthread-jit-takeover-hang-cluster.md and
     // elinjsp-socket-read-timeout.md). `DataInputStream.read(byte[],int,int)`
     // in real JDK is a single delegating call to `in.read(b, off, len)` —
@@ -9494,10 +9494,10 @@ fn eof_exception() -> MethodCallFailed {
 /// O(len) interpreter-dispatch round trips for what real Java does as a
 /// handful of native `read()` calls. Independently root-caused twice the
 /// same day from two different angles: the STW-takeover-cluster residual
-/// investigation (docs/known-issues/tomcat-08-07/
+/// investigation (fixed-suite-bugs/
 /// stw-crossthread-jit-takeover-hang-cluster.md — compiled JSP class
 /// files/JAR entries via Jasper's classloading path) and the jar-signature
-/// investigation (docs/internal/
+/// investigation (fixed-suite-bugs/
 /// inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md —
 /// Spring Boot loader's `JarEntriesStream.assertSameContent()`, once per
 /// up-to-4KB chunk per jar entry). Both turned a sub-millisecond real-JDK
@@ -9725,7 +9725,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // that seeding this field fixes the symptom). Seed it
     // here exactly like the real constructor does, so any current or
     // future not-natively-overridden method that depends on it works.
-    // See docs/known-issues/h2/bug-h2-dataoutputstream-writechars-data-loss.md.
+    // See fixed-suite-bugs/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss-FIXED.md.
     let write_buffer = ctx.new_array(ArrayElementType::Byte, 8);
     ctx.set_field_by_name(this, "writeBuffer", Value::Object(Some(write_buffer)));
     Ok(None)
@@ -11245,7 +11245,7 @@ fn native_files_is_writable(_ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `length()`=0, `read()`=-1, and commons-compress's seek-from-EOF computes a
 /// negative offset ("seek before beginning of file"). The SEGV/Cleaner crashes
 /// that originally justified gating real-RAF behind opt-in are FIXED (see
-/// docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02). Opt back
+/// app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02). Opt back
 /// into the (broken) synthetic path with `CRATONVM_SYNTHETIC_RAF=1`.
 pub(crate) fn real_raf_enabled() -> bool {
     !io_flags().synthetic_raf_forced
@@ -12931,7 +12931,7 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // against for `buf`/`inner`. This is a real, independently-justified
         // fix (verified via 2 full WildFly domain-boot runs: no regression,
         // same subsequent behavior otherwise) — NOTE it was found while
-        // investigating `docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s
+        // investigating `fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md`'s
         // WFLYHC0053 blocker, but is NOT that bug's root cause: the observed
         // byte value (152) that looked like corruption on first read is
         // actually the real WildFly wire protocol's own `CHUNK_START` marker
@@ -13101,7 +13101,7 @@ fn tb_static_object(
 /// Code-less abstract declaration and throws AbstractMethodError unless
 /// registered directly here — same shape as the `get`/`put`/`compact`
 /// registrations already in each loop below. See
-/// docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode.md.
+/// fixed-suite-bugs/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode-FIXED.md.
 macro_rules! tb_abstract_view_fns {
     ($slice_fn:ident, $slice2_fn:ident, $dup_fn:ident, $ro_fn:ident, $order_fn:ident, $cls:literal, $elem:expr, $suffix:literal) => {
         fn $slice_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

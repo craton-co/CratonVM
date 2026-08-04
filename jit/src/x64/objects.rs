@@ -802,7 +802,7 @@ impl Compiler {
         // kind/element_type/gc_age/gc_flags; `IDENTITY_HASH_CODE_OFFSET` (8)
         // names the identity-hash dword. Both were bare literals until the
         // 2026-07-26 header-offset audit — see
-        // `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
+        // `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
         if !zero_elision {
             // identity_hash_code = 0 (lazy-mint contract).

@@ -102,7 +102,7 @@
 //!
 //! ## 1.4 Quiescence is the backstop, not the primary argument
 //!
-//! 2026-08-03 (`docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`):
+//! 2026-08-03 (`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`):
 //! the primary reason a reclamation is safe is **ownership**, not this walk. A
 //! thread inside a compiled body always holds an owning `Arc<CompiledMethod>`
 //! for it — the interpreter's call sites hold one across `try_call`, generated

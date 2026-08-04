@@ -6402,7 +6402,7 @@ pub(crate) fn native_string_check_bounds_off_count(
 // blow past an unrelated 3-second Tomcat connector read-timeout in
 // `org.apache.catalina.core.TestSwallowAbortedUploads`'s `AbortedPOSTClient`
 // tests — see
-// `docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+// `fixed-suite-bugs/tomcat/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 // ("AbortedPOSTClient empty-response bug root-caused") for the full
 // investigation.
 //

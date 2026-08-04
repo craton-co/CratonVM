@@ -22,7 +22,7 @@ pub const HEADER_SIZE: usize = 32;
 // emitted code addresses backwards from the object base. Convert the affected
 // emitters to disp32 before allowing HEADER_SIZE to grow beyond this limit;
 // the authoritative site inventory is
-// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
+// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
 // (the older "jit/src/x64.rs:6690-6813" citation was stale — that range holds
 // loop/BCE analysis, not an emitter).
 const _: () = assert!(
@@ -64,7 +64,7 @@ const _: () = assert!(
 // MARK_INFLATED != 0` test would have aliased FORWARDED onto INFLATED and
 // handed a relocation address to `inflated_monitor()` as a `Monitor*`. Every
 // consumer in `vm/src/threading/monitor.rs` was audited for this before the
-// state was claimed; see `docs/internal/arch-2026-07-26/header-shrink.md` §4.
+// state was claimed; see `arch-2026-07-26/header-shrink.md` §4.
 
 /// Mark word state: no lock held. Identity hash code may live in upper bits
 /// (caller-managed).
@@ -79,7 +79,7 @@ pub const MARK_INFLATED: u64 = 0b10;
 /// **Not yet produced by anything.** This is the encoding half of the
 /// `ObjectHeader` 32→24 shrink; the `forwarding_ptr` field is still the live
 /// mechanism and remains the single source of truth until the consumers listed
-/// in `docs/internal/arch-2026-07-26/header-shrink.md` §6 are migrated in one
+/// in `arch-2026-07-26/header-shrink.md` §6 are migrated in one
 /// atomic change. It is landed now, with round-trip coverage, so the second
 /// pass adopts a tested encoding instead of inventing one.
 pub const MARK_FORWARDED: u64 = 0b11;
@@ -146,13 +146,24 @@ pub const REF_FIELD_SIZE: usize = 8;
 // emits a raw `MOV` against a field cell instead of calling the `jit_getfield`
 // helper, so it needs the byte offset of the payload *within* the cell.
 //
-// `Value` has no `#[repr(...)]`; the layout below is what rustc deterministically
-// chooses for it (a 4-byte discriminant word at offset 0, payload after it).
-// The `field_cell_layout_matches_value_enum` test in this module pins the layout
-// at runtime — if rustc ever changes it, that test fails loudly and the JIT
-// inline path must be revisited (or `Value` given an explicit `#[repr(C)]`).
+// `Value` is `#[repr(u32)]` with explicit `= 0 ..= 6` discriminants, so the
+// layout below is a *language guarantee*, not an observation: the enum is laid
+// out as `#[repr(C)] struct { tag: u32, payload: union { .. } }`, putting a
+// 4-byte discriminant word at offset 0 and each variant's payload at its
+// natural alignment after it.
 //
-// Observed layout (verified by the test below, identical in debug + release):
+// It used to be `#[repr(Rust)]`, with this comment noting the layout was merely
+// "what rustc deterministically chooses" and pointing at the runtime test below
+// as the only pin. That was the weak form of the invariant twice over: a
+// runtime test catches drift only for whoever runs `-p cratonvm-types`, and
+// nothing stopped rustc from moving the tag in the meantime. All four facts are
+// now `const`-asserted in `value.rs` (search `value_tag_word`), so drift is a
+// compile error in this crate rather than a miscompile in the JIT. The explicit
+// discriminants also make the `repr` structurally impossible to delete — E0732
+// rejects explicit discriminants on non-unit variants without one — so the
+// guarantee cannot be silently dropped either.
+//
+// Layout (guaranteed by `#[repr(u32)]`, re-verified by the test below):
 //   bytes 0..4    : discriminant word (Int=0, Long=1, Float=2, Double=3,
 //                   Object=4, ReturnAddress=5, Uninitialized=6)
 //   bytes 4..8    : payload of a 4-byte variant (Int / Float / ReturnAddress)
@@ -223,12 +234,12 @@ pub const FORWARDING_PTR_OFFSET: usize = 16;
 /// Byte offset of the `identity_hash_code` field within [`ObjectHeader`].
 ///
 /// Added per request R3 of
-/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
+/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
 /// the only header field without a named constant, and it is baked as a literal
 /// in at least two places outside `types` (`jit/src/x64.rs` derived its own via
 /// `offset_of!` to avoid one; `vm/src/jit/helpers.rs` still writes a bare
 /// `raw_ptr.add(8)`). Those should re-export this constant — see
-/// `docs/internal/arch-2026-07-26/header-shrink.md` §6.
+/// `arch-2026-07-26/header-shrink.md` §6.
 pub const IDENTITY_HASH_CODE_OFFSET: usize = 8;
 
 // Compile-time check that the offset is correct.
@@ -616,7 +627,7 @@ impl ObjectHeader {
     /// strong `Arc<Monitor>` reference the mark word owns to the destination
     /// copy; it must not be released against the source afterwards, or the
     /// live destination is left with a dangling `Monitor*`. See
-    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.
+    /// `arch-2026-07-26/header-shrink.md` §4.
     #[inline(always)]
     pub fn make_forwarded(target: usize) -> u64 {
         assert!(
@@ -749,9 +760,15 @@ mod tests {
 
     /// Pin the in-memory layout of a `Value` field cell so the JIT's inline
     /// `getfield` codegen (which emits a raw `MOV [recv + FIELD_CELL_*]`)
-    /// stays correct. `Value` has no `#[repr]`; this test reinterprets real
-    /// values and asserts the discriminant / payload land at the documented
-    /// offsets. If rustc ever changes `Value`'s layout this fails loudly.
+    /// stays correct.
+    ///
+    /// `Value` is `#[repr(u32)]` with explicit discriminants, so this is now a
+    /// *second* line of defence rather than the only one — `value.rs` asserts
+    /// the same four facts at compile time (search `value_tag_word`), which is
+    /// what actually protects the JIT. This test survives because it exercises
+    /// the real byte-reinterpretation path the JIT performs, including the
+    /// non-null `Object` case that const-eval cannot express (it would have to
+    /// read pointer provenance).
     #[test]
     fn field_cell_layout_matches_value_enum() {
         use crate::Value;
@@ -775,6 +792,23 @@ mod tests {
         assert_eq!(tag, 1, "Long discriminant must be 1");
         let p64 = i64::from_le_bytes(cell_bytes_at::<8>(&cell, FIELD_CELL_PAYLOAD64_OFFSET));
         assert_eq!(p64, 0x0102_0304_0506_0708_i64, "Long payload at +8");
+
+        // The remaining discriminants. The JIT bakes only `0` (Int) and `4`
+        // (Object) as literals, but it bakes them as *positions in this
+        // sequence* — a reorder that left Int at 0 while moving Object would
+        // still miscompile `x64/objects.rs`. Pin the whole run so any reorder
+        // fails here, not in generated code.
+        for (v, want, name) in [
+            (Value::Float(1.5), 2u32, "Float"),
+            (Value::Double(1.5), 3, "Double"),
+            (Value::Object(None), 4, "Object"),
+            (Value::ReturnAddress(7), 5, "ReturnAddress"),
+            (Value::Uninitialized, 6, "Uninitialized"),
+        ] {
+            let cell = value_cell_bytes(v);
+            let tag = u32::from_le_bytes(cell_bytes_at::<4>(&cell, FIELD_CELL_TAG_OFFSET));
+            assert_eq!(tag, want, "{name} discriminant must be {want}");
+        }
 
         // `Object(None)` (JVM null) must leave the 8-byte payload word zero.
         let cell = value_cell_bytes(Value::Object(None));
@@ -1214,7 +1248,7 @@ mod tests {
     // ---------------------------------------------------------------------
     //  Header-shrink contracts (arch-2026-07-26, slug `header-shrink`)
     //
-    //  See docs/internal/arch-2026-07-26/header-shrink.md. These pin the
+    //  See arch-2026-07-26/header-shrink.md. These pin the
     //  layout arithmetic the shrink depends on and the mark-word encoding it
     //  will adopt, so a wrong offset trips a test instead of miscomputing a
     //  heap address.
