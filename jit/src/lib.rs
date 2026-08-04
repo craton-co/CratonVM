@@ -13552,6 +13552,12 @@ fn try_compile_inner(
         // below, next to the `Op::Call` info boxes, so the pointer cannot
         // outlive its pointee.
         let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // cov-05 increment 1: keep-alive for `instanceof` target class-name
+        // bytes, same obligation as `ir_ldc_strings` immediately above (the
+        // lowered body bakes the ADDRESS as an imm64 argument to
+        // `helpers.instanceof_check`). Populated below, near the `new_info` /
+        // `anewarray_info` construction it shares a resolver with.
+        let mut ir_instanceof_strings: Vec<Box<str>> = Vec::new();
         if !scan.ldc_ops.is_empty() {
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
@@ -13715,6 +13721,49 @@ fn try_compile_inner(
                     }
                 }
                 builder.set_new_info(new_info_map, trivial_init_pcs);
+            }
+        }
+        // cov-05 increment 1: resolve `instanceof` (0xc1) sites for the IR
+        // builder — the largest single whole-method refusal in the survey
+        // (306 events, more than every opcode gap combined:
+        // `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`).
+        //
+        // Admits a site ONLY when its target class is already resolved and
+        // loaded at compile time. `cp_new_resolver` already answers exactly
+        // that question for `new`/`anewarray` — `Resolved` means the
+        // CONSTANT_Class entry's target is loaded, `Deferred`/`None` means it
+        // is not (or the entry is malformed) — and an `instanceof`'s CP entry
+        // is the identical CONSTANT_Class shape, so this reuses that resolver
+        // rather than adding a new one. `num_fields`/the two init flags
+        // `Resolved` also carries are irrelevant here and discarded; only
+        // "loaded or not" is read.
+        //
+        // A site that resolves `Deferred` (or has no resolver at all) is
+        // simply omitted from `instanceof_info`, so the builder's 0xc1 arm
+        // bails THAT site — and so the method — to single-pass, which
+        // resolves lazily via `jit_typecheck_resolve`'s not-yet-loaded slow
+        // path. That path can run a user classloader's
+        // `loadClass`/`findClass`, arbitrary Java this tier does not host
+        // inside a helper call — see the admission comment in `ir.rs`.
+        if !scan.typecheck_ops.is_empty() {
+            if let (Some(new_resolver), Some(name_resolver)) =
+                (cp_new_resolver, cp_class_name_resolver)
+            {
+                let mut im = std::collections::HashMap::with_capacity(scan.typecheck_ops.len());
+                // `scan.typecheck_ops` is `checkcast_ops ∪ instanceof_ops`,
+                // but `ir::ir_compatible` already refused the whole method
+                // upstream if `scan.checkcast_ops` is non-empty — so every pc
+                // reaching this admitted method is an `instanceof` site.
+                for &(pc, cp_idx) in &scan.typecheck_ops {
+                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                        if let Some(name) = name_resolver(cp_idx) {
+                            let boxed: Box<str> = name.into_boxed_str();
+                            im.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
+                            ir_instanceof_strings.push(boxed);
+                        }
+                    }
+                }
+                builder.set_instanceof_info(im);
             }
         }
         // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
@@ -14578,6 +14627,11 @@ fn try_compile_inner(
                         // dropping either list frees memory the emitted code
                         // still names.
                         compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-05: the same keep-alive obligation for an
+                        // `instanceof` target class-name site, whose UTF-8
+                        // bytes' ADDRESS is baked into the body as an imm64
+                        // argument to `helpers.instanceof_check`.
+                        compiled._jit_strings.append(&mut ir_instanceof_strings);
                         // cov-01 / RBC.5: compiled code reads static storage
                         // directly, bypassing the interpreter's
                         // `ensure_class_initialized_shared`, so the declaring

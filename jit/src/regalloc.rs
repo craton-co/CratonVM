@@ -3879,6 +3879,8 @@ fn ir_op_defines_value(op: &Op) -> bool {
             | Op::ConstClass { .. }
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
+            // cov-05 — mirrors `ir_lower::op_defines_result_slot`.
+            | Op::InstanceOf { .. }
     )
 }
 
@@ -3903,6 +3905,9 @@ fn ir_op_is_safepoint(op: &Op) -> bool {
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
             | Op::Guard { .. }
+            // cov-05: `jit_instanceof` can allocate a Class mirror on first
+            // touch, same as the three above.
+            | Op::InstanceOf { .. }
     )
 }
 
@@ -3952,6 +3957,9 @@ fn ir_op_is_call(op: &Op) -> bool {
             | Op::Rem
             | Op::Load(_)
             | Op::Store(_)
+            // cov-05: `MOV RAX,jit_instanceof ; CALL RAX`, returns into the
+            // body — same superset reasoning as the other helper calls above.
+            | Op::InstanceOf { .. }
     )
 }
 
