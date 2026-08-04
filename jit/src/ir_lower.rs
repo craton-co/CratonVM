@@ -8837,9 +8837,13 @@ pub(crate) fn lower_inner_with_scopes(
     // Reported before it is acted on, because a mismatch that only ever shows
     // up as "this method did not compile" is a mismatch nobody can diagnose.
     if lowerer.mir_mode != MirMode::Off {
-        if isel_shadow_reporting() {
+        // Only the disagreements, and only under the debug switch: a corpus run
+        // compiles thousands of methods, and a per-compile line for each would
+        // bury the one line that matters. The totals are printed once at exit
+        // (`vm-cli::maybe_dump_shutdown_reports`).
+        if lowerer.mir_mismatches != 0 && isel_shadow_reporting() {
             eprintln!(
-                "[ir-isel] mir mode={:?} tiles={} mismatches={}",
+                "[ir-isel] mir mode={:?} tiles={} MISMATCHES={}",
                 lowerer.mir_mode, lowerer.mir_tiles, lowerer.mir_mismatches
             );
         }
