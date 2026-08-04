@@ -1075,6 +1075,54 @@ struct MethodPromotionSnapshot {
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
 pub fn dump_method_stats_to_stderr() {
+    // The admission gate and the OSR metadata checks, first and unconditional.
+    //
+    // Every number here was previously computed and stored by a `pub fn` with
+    // **no caller anywhere in the tree** — `jit_bail_shortcircuits`,
+    // `jit_code_cache_cap_refusals`, `osr_contract_violations`,
+    // `stale_install_epoch_refusals`. Each one's own doc says it is "expected
+    // to stay zero" and that a diagnostic nobody enables is how a compiler bug
+    // stays unnoticed; none of them could be enabled at all. Printed before the
+    // `DIAG_CORE` early return so a run with no tiered manager still reports
+    // them.
+    //
+    // How to read the three groups:
+    //
+    //   * `admitted`/`refused` per door — a door whose `admitted` is 0 on a
+    //     workload that clearly used it is not calling the gate.
+    //   * `ungated-backend-entries` — MUST be 0. Non-zero means some path
+    //     reached `x64::compile_with_param_slots` without an admission, which
+    //     is the drift `compile_gate` exists to prevent.
+    //   * `osr-contract-violations` / `osr-coordinate-mismatches` — both MUST
+    //     be 0. Non-zero means an artifact's OSR metadata contradicted itself
+    //     and was dropped, so the method silently lost OSR service.
+    {
+        use crate::compile_gate::{admissions, refusals, ungated_backend_entries, CompileDoor};
+        let doors: Vec<String> = CompileDoor::ALL
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}: admitted={} refused={}",
+                    d.label(),
+                    admissions(*d),
+                    refusals(*d)
+                )
+            })
+            .collect();
+        eprintln!(
+            "[cratonvm] JIT admission gate: {} | ungated-backend-entries={} \
+             | bail-list-shortcircuits={} code-cache-cap-refusals={} \
+             | osr-contract-violations={} osr-coordinate-mismatches={} \
+             stale-install-epoch-refusals={}",
+            doors.join(" | "),
+            ungated_backend_entries(),
+            crate::jit_bail_shortcircuits(),
+            crate::jit_code_cache_cap_refusals(),
+            crate::osr_contract::osr_contract_violations(),
+            crate::osr_coords::osr_coordinate_mismatches(),
+            crate::stale_install_epoch_refusals(),
+        );
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };

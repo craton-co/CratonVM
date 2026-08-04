@@ -329,6 +329,18 @@ pub fn compile_with_param_slots(
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
+    // The drift witness for `compile_gate`. Every production door must hold an
+    // admission token when it gets here; this counts the entries that do not,
+    // which is how a FOURTH door added later announces itself instead of
+    // silently skipping the admission checks the way the OSR and eager
+    // first-call doors did for months. Behaviour-named on purpose: a check that
+    // scanned the source for `compile_with_param_slots(` would have died the
+    // day `x64.rs` was split, as five checks in this repository did.
+    //
+    // Non-zero inside this crate's own tests is expected and meaningless — a
+    // unit test calling the backend is not a door. The assertion that matters
+    // lives in the VM.
+    crate::compile_gate::note_backend_entry();
     // A class-`ldc` calls a helper that takes the VM context as its first
     // argument, exactly like a string-`ldc`, so it forces the context form of
     // the artifact too.

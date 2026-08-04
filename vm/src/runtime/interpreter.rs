@@ -1864,6 +1864,28 @@ pub fn execute(
                             None => None,
                         };
                     }
+                    // ── The admission gate, third door ────────────────────
+                    //
+                    // This block reaches `x64::compile_with_param_slots`
+                    // directly, like `compile_osr_artifact` and unlike
+                    // `jit::try_compile`. It had already been taught the
+                    // kill-switch and the bisect levers by hand (see
+                    // `env_disable_jit` above) but never the permanent
+                    // bail-list, the code-cache cap, or the compile-epoch
+                    // witness — so an eager first-call compile could re-run the
+                    // pipeline on a method the backend had permanently refused,
+                    // commit code past a cap the ordinary door was respecting,
+                    // and publish a body stamped at buffer finalize rather than
+                    // from before the first constant-pool read.
+                    // `compile_gate::admit` asks all of them; the token owns
+                    // the epoch witness and must outlive the resolution below.
+                    let _admission = cratonvm_jit::compile_gate::admit(
+                        &class_name_str,
+                        method_name,
+                        method_descriptor,
+                        cratonvm_jit::compile_gate::CompileDoor::EagerFirstCall,
+                    )
+                    .ok()?;
                     let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
                     let code_len = code_attr.code.len();
                     let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
