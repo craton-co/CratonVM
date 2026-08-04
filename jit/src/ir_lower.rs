@@ -342,12 +342,16 @@ struct Lowerer<'a> {
     ldc_string: usize,
     ldc_class_cp: usize,
     getstatic: usize,
-    /// cov-05 increment 1. `jit_instanceof(vm, obj, name_ptr, name_len) ->
-    /// 0/1` — the SAME `RequiredPtr` helper (jit-api) the single-pass
-    /// backend's 0xc1 arm calls; unlike `ldc_string`/`ldc_class_cp`/
-    /// `getstatic` this one is never absent, so `Op::InstanceOf`'s lowering
-    /// does not need an OptionalPtr guard.
+    /// cov-05. `jit_instanceof(vm, obj, name_ptr, name_len) -> 0/1` — the
+    /// SAME `RequiredPtr` helper (jit-api) the single-pass backend's 0xc1 arm
+    /// calls; unlike `ldc_string`/`ldc_class_cp`/`getstatic` this one is
+    /// never absent, so `Op::InstanceOf`'s lowering does not need an
+    /// OptionalPtr guard.
     instanceof_check: usize,
+    /// cov-05. `jit_checkcast(vm, obj, name_ptr, name_len) -> obj|0|i64::MIN`
+    /// — same `RequiredPtr` status as `instanceof_check` above, the SAME
+    /// helper the single-pass backend's 0xc0 arm calls.
+    checkcast: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -763,6 +767,7 @@ impl<'a> Lowerer<'a> {
             ldc_class_cp: helpers.ldc_class_cp,
             getstatic: helpers.getstatic,
             instanceof_check: helpers.instanceof_check,
+            checkcast: helpers.checkcast,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -4241,6 +4246,31 @@ fn reloc_emit_enabled() -> bool {
                 Self::patch_or_bail(&mut self.buf, resolved_patch, rel);
                 self.store_rax(slot);
             }
+            // ── cov-05: checkcast ──────────────────────────────────────────
+            //
+            // Same ABI as the single-pass backend's 0xc0 arm: `jit_checkcast
+            // (vm_ptr, obj_ptr, name_ptr, name_len) -> obj_ptr | 0 | i64::MIN`
+            // in RAX. Unlike `instanceof`, a definitive refusal stashes a
+            // `ClassCastException` and returns the deopt/exception sentinel —
+            // `emit_call_return_check` is the SAME sentinel-drain-through-the-
+            // shared-epilogue helper `Op::Call` uses for a callee's exception,
+            // so this is not new machinery, just a new caller of it. `Ref` is
+            // never legitimately `i64::MIN` (no plausible heap pointer is),
+            // so it takes that function's simple `CMP ; JE` shape.
+            Op::CheckCast { name_ptr, name_len } => {
+                let (name_ptr, name_len) = (*name_ptr, *name_len);
+                let obj = node.inputs[2];
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
+                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
+                self.emit_mov_reg_imm64(RAX, self.checkcast as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                self.emit_call_return_check(slot, IrType::Ref);
+            }
             // ── cov-05 increment 1: instanceof ────────────────────────────
             //
             // Same ABI as the single-pass backend's 0xc1 arm
@@ -5678,9 +5708,9 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
         ) {
             needs_context = true;
         }
-        // cov-05: `jit_instanceof` takes the VM context pointer as arg0, same
-        // as the three above.
-        if matches!(n.op, Op::InstanceOf { .. }) {
+        // cov-05: `jit_instanceof`/`jit_checkcast` take the VM context
+        // pointer as arg0, same as the three above.
+        if matches!(n.op, Op::InstanceOf { .. } | Op::CheckCast { .. }) {
             needs_context = true;
         }
     }
@@ -5909,8 +5939,10 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::ConstClass { .. }
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
-            // cov-05: `instanceof` defines a result slot — the 0/1 `Int`.
+            // cov-05: `instanceof` defines a result slot — the 0/1 `Int`;
+            // `checkcast` defines one too — the `Ref` result.
             | Op::InstanceOf { .. }
+            | Op::CheckCast { .. }
     )
 }
 
@@ -12187,7 +12219,8 @@ mod tests {
             | Op::ConstClass { .. }
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
-            | Op::InstanceOf { .. } => LoweredValue,
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. } => LoweredValue,
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
             // No arm. Keep in step with `UNLOWERABLE`; the tests check it.
@@ -12284,6 +12317,13 @@ mod tests {
             (
                 "InstanceOf",
                 Op::InstanceOf {
+                    name_ptr: 0,
+                    name_len: 0,
+                },
+            ),
+            (
+                "CheckCast",
+                Op::CheckCast {
                     name_ptr: 0,
                     name_len: 0,
                 },
