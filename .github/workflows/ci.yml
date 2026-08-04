@@ -132,6 +132,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-vm --test no_test_only_public_api -- --nocapture
 
+      # ARCH-2026-08-04 A6. native-builtins is the crate that re-enters the VM
+      # (a native callback calls back into Java, taking the heap and L10
+      # class-manager locks) and it carried 440 raw lock constructions with zero
+      # LockLevels. Converting them all blind would assert an unverified
+      # hierarchy, so this ratchets the count instead while the per-lock audit
+      # proceeds.
+      - name: Lock-discipline ratchet
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p cratonvm-native-builtins --test lock_discipline_ratchet -- --nocapture
+
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
   # it is deliberately NOT in the default set — so every job above compiles the
