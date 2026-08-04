@@ -3306,7 +3306,7 @@ impl OsrEntryPlan {
         // wrong-code bug, and because the check costs one scan of a list with
         // tens of entries on a path that has already taken a deopt.
         let point = match osr_exit::resume_image(&artifact.deopt_points, rframe.bci) {
-            osr_exit::ResumeImage::Unique { index } => &artifact.deopt_points[index],
+            osr_exit::ResumeImage::Unique { index, .. } => &artifact.deopt_points[index],
             osr_exit::ResumeImage::None => {
                 return Err(osr_refusal(
                     OSR_REFUSE_EXIT_REPLAY,
@@ -3517,26 +3517,36 @@ impl CompiledMethod {
         }
         // The lane's "what to refuse", at the only moment refusing is free.
         //
-        // Every resume path that starts from a reconstructed frame finds its
-        // point BY BCI and takes the first match — `resume_after_exit` for the
-        // `semantics`, the OSR-exit reject sink for the de-speculation
-        // `reason`. When two points at one bci disagree on either, that pick is
-        // arbitrary, and "picking the wrong image is a wrong-code bug rather
-        // than a missed optimisation".
+        // `resume_after_exit` finds its point BY BCI and takes the first match,
+        // reading its `semantics` — the field that decides whether the bci is a
+        // place the interpreter may be parked at. Two points at one bci that
+        // disagree there make the resume bci itself arbitrary, and "picking the
+        // wrong image is a wrong-code bug rather than a missed optimisation".
         //
-        // Copies that agree are NOT refused: several native images of one
-        // bytecode is exactly what a loop transform produces, and every
-        // consumer that reconstructs a frame finds its point by native offset
-        // or through the copy's own baked box. See `osr_exit` for the full
-        // agreement predicate and why the per-slot state is excluded from it.
+        // Two things are deliberately NOT refused here, both because refusing
+        // them costs OSR and buys nothing:
+        //
+        //  * Copies that agree. Several native images of one bytecode is
+        //    exactly what a loop transform produces, and every consumer that
+        //    RECONSTRUCTS a frame finds its point by native offset or through
+        //    the copy's own baked box.
+        //  * Images that differ only in `reason`. That is the ordinary shape of
+        //    a compiled counted loop — the loop-boundary exit map and the
+        //    speculative-BCE range guard on the same header bci — and it was
+        //    measured: refusing it took 10 of CratonBench's 11 OSR refusals and
+        //    cost `matrixKernel` its OSR permanently. It is counted instead;
+        //    `osr_exit`'s module note carries the full argument.
+        if osr_exit::has_reason_ambiguous_bci(&self.deopt_points) {
+            metrics::record_osr_event("osr_entry_reason_ambiguous_image");
+        }
         if let Some((bci, i, j)) = osr_exit::first_ambiguous_resume_bci(&self.deopt_points) {
             metrics::record_osr_event("osr_entry_refused_ambiguous_image");
             let (a, b) = (&self.deopt_points[i], &self.deopt_points[j]);
             return Err(osr_refusal(
                 OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE,
                 format!(
-                    "bci {bci} names two resume images that disagree on what the by-bci \
-                     lookups read: +{:#x} ({:?}, {}) vs +{:#x} ({:?}, {})",
+                    "bci {bci} names two resume images whose ResumeSemantics disagree, so the \
+                     resume bci itself is arbitrary: +{:#x} ({:?}, {}) vs +{:#x} ({:?}, {})",
                     a.native_offset, a.reason, a.semantics, b.native_offset, b.reason, b.semantics
                 ),
             ));
@@ -21432,21 +21442,34 @@ mod tests {
     /// only remaining move is the safe reject, which re-runs all of them — the
     /// exact defect this lane exists for. So the test asserts the refusal
     /// happens where nothing has run, and that it is memoable.
+    ///
+    /// The two NON-refusing cases carry as much weight as the refusing one, and
+    /// one of them is here because a measurement put it here: refusing a
+    /// `reason`-only disagreement took 10 of CratonBench's 11 OSR refusals and
+    /// cost `matrixKernel(I)I` its OSR permanently.
     #[test]
     fn an_ambiguous_resume_bci_refuses_the_entry_and_a_copy_does_not() {
         let locals = [0x1234_5678i64, 200, 4950];
 
-        // Two images of the loop header that DISAGREE on the reason. This is
-        // the recorded Groovy `IndyInterface` shape: the de-speculation step
-        // looks the reason up by bci and takes the first, so the wrong policy
-        // is applied to whichever copy it did not pick.
+        // Two images of the loop header that disagree on the SEMANTICS.
+        //
+        // `RETHROW`, not `RESUME`, and the choice is the whole point: a
+        // `RESUME` point anywhere in an artifact is already refused by the
+        // per-point rule above (`osr-entry-unresumable-exit`), so it could
+        // never reach this check. A `RETHROW` point is explicitly ALLOWED to
+        // exist — such points are stashed separately and never routed to a
+        // resume — which is exactly what makes it the reachable disagreement:
+        // `for_reason` answers `RETHROW` for `PendingException` and `REEXECUTE`
+        // for everything else.
         let mut cm = osr_t_artifact(3);
-        let mut trap = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
-        trap.native_offset = 0x90;
-        trap.reason = deopt::DeoptReason::UnreachedCode;
+        let mut other = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        other.native_offset = 0x90;
+        other.reason = deopt::DeoptReason::PendingException;
+        other.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
+        assert_eq!(other.semantics, deopt::ResumeSemantics::RETHROW);
         cm.deopt_points = vec![
             osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
-            trap,
+            other,
         ];
         let err = cm
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
@@ -21457,13 +21480,11 @@ mod tests {
             "the point list is a pure function of the artifact, so the refusal is memoable"
         );
 
-        // …and the over-refusal guard. Several native images of ONE bytecode is
+        // Over-refusal guard 1: several native images of ONE bytecode is
         // exactly what a loop transform produces, and they agree on everything
-        // a by-bci lookup reads, so the pick cannot be wrong. Refusing these
-        // would cost OSR on every transformed method for no soundness gain.
+        // a by-bci lookup reads, so the pick cannot be wrong.
         let mut copies = osr_t_artifact(3);
-        let mut second =
-            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        let mut second = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
         second.native_offset = 0x90;
         let mut third = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
         third.native_offset = 0xE0;
@@ -21476,6 +21497,30 @@ mod tests {
             .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
             .expect("agreeing copies must still admit the entry");
         assert_eq!(plan.exit_policy, OsrExitPolicy::ExactTransfer);
+
+        // Over-refusal guard 2, the measured one: the loop-boundary exit map
+        // and the speculative-BCE range guard on the same header bci. Different
+        // reasons, same `REEXECUTE` semantics — the ordinary shape of a
+        // compiled counted loop, and the resume bci is not in doubt.
+        let mut counted = osr_t_artifact(3);
+        let mut guard = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        guard.native_offset = 0x3c1;
+        guard.reason = deopt::DeoptReason::BoundsCheck;
+        assert_eq!(
+            guard.semantics,
+            deopt::ResumeSemantics::REEXECUTE,
+            "a reason disagreement never implies a semantics one"
+        );
+        counted.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            guard,
+        ];
+        assert!(
+            counted
+                .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                .is_ok(),
+            "refusing this cost CratonBench.matrixKernel its OSR, permanently"
+        );
     }
 
     /// `osr_exit_points` is cross-checked against where exits are actually

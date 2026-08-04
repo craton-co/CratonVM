@@ -47,16 +47,52 @@
 //! guaranteed — unreachable rather than merely rare, which is the same argument
 //! the `MaterializationRequired` guard is landed under.
 //!
-//! # What "the same image" means
+//! # What "the same image" means — and what the measurement changed
 //!
-//! Two deopt points at one bci are interchangeable **for this consumer** when
-//! they agree on the fields the by-bci lookups read without checking them
-//! against anything:
+//! Two deopt points at one bci are interchangeable **for the resume** when they
+//! agree on the one field the resume reads by bci:
 //!
 //! | Field | Read by | Consequence of picking the wrong copy |
 //! |---|---|---|
-//! | `semantics` | [`crate::OsrEntryPlan::resume_after_exit`] | parking the interpreter at a bci that already took effect — the same double-execution one bytecode down |
-//! | `reason` | the de-speculation step at the OSR-exit reject sink | the wrong recompile policy: `OsrExit`'s count-based retry where `UnreachedCode`'s "give up immediately" was meant (the recorded Groovy `IndyInterface` regression) |
+//! | `semantics` | [`crate::OsrEntryPlan::resume_after_exit`] | parking the interpreter at a bci that already took effect — the same double-execution one bytecode down. **Wrong code.** |
+//! | `reason` | the de-speculation step at the OSR-exit *reject* sink | the wrong recompile policy — `OsrExit`'s count-based retry where `UnreachedCode`'s "give up immediately" was meant (the recorded Groovy `IndyInterface` regression). **Wrong policy, on a path admission makes unreachable.** |
+//!
+//! The first draft of this module refused on `(semantics, reason)`, on the
+//! reading that both are picked arbitrarily and both matter. Running it decided
+//! the question the other way, and the measurement is why the predicate is what
+//! it is:
+//!
+//! > `CratonBench`, 2026-08-04: **10 of 11** OSR entry refusals were
+//! > `osr-entry-ambiguous-exit-image` on `CratonBench.matrixKernel(I)I`, at
+//! > `bci 16`, where the loop-boundary map (`+0x37e`, `OsrExit`) and the
+//! > speculative-BCE guard (`+0x3c1`, `BoundsCheck`) sit on the same bci. They
+//! > **agree on `semantics`** — `ResumeSemantics::for_reason` answers
+//! > `REEXECUTE` for everything but `PendingException`, so a reason
+//! > disagreement never implies a semantics one — and the refusal is memoed as
+//! > permanent, so it cost that kernel its OSR entirely, for the life of the
+//! > process.
+//!
+//! A loop header carrying both its exit map and its range guard is the ordinary
+//! shape of a compiled counted loop, not a defect. So:
+//!
+//! * **`semantics` disagreement refuses** the entry. That is the wrong-code
+//!   half, and it is what the lane's "what to refuse" is about.
+//! * **`reason`-only disagreement is counted, not refused**
+//!   ([`ResumeImage::Unique::reason_ambiguous`]). Its only consumer is the
+//!   de-speculation lookup at the OSR-exit *reject* sink, and an admitted entry
+//!   cannot reach that sink — `osr_exit_policy` refuses at admission every
+//!   artifact whose points could land there. Counting it keeps the shape
+//!   visible instead of silently tolerated, which is the difference between a
+//!   decision and an oversight.
+//!
+//! Which `semantics` disagreement is actually reachable is worth stating,
+//! because it is not the obvious one. A `RESUME` point anywhere in an artifact
+//! is refused wholesale by `osr_exit_policy`'s per-point rule (its successor
+//! bci is not computable in this crate), so it never reaches this check. A
+//! `RETHROW` point is explicitly allowed to exist — such points are stashed via
+//! `take_exceptional_frame` and never routed to a resume — so the reachable
+//! disagreement is `REEXECUTE` vs `RETHROW`: a `PendingException` point sharing
+//! a bci with a loop-boundary exit map.
 //!
 //! Everything else about two points at one bci is *supposed* to differ:
 //! `native_offset` by construction (that IS what makes them two images), and
@@ -65,11 +101,6 @@
 //! divergence there is not this check's business —
 //! `x64::loop_rewrite::deopt_point_difference` already draws that same line and
 //! argues it at length.
-//!
-//! So the rule is: group by bci, and refuse only when two points at one bci
-//! disagree on `(semantics, reason)`. An artifact where they agree has one
-//! image *as far as any consumer can tell*, and refusing it would cost OSR for
-//! no soundness gain.
 
 use crate::deopt::{DeoptReason, DeoptimizationPoint, ResumeSemantics};
 
@@ -143,7 +174,7 @@ pub fn classify_exit_site(
     // The reason comes from the point the resume path would pick, so the two
     // answers cannot be derived from different copies.
     let reason = match resume_image(deopt_points, bci) {
-        ResumeImage::Unique { index } => deopt_points[index].reason,
+        ResumeImage::Unique { index, .. } => deopt_points[index].reason,
         // Ambiguous: several images that disagree. Take the first, only to
         // NAME the site — the entry was already refused for this artifact
         // (`osr-entry-ambiguous-exit-image`), so this arm exists so the count
@@ -163,20 +194,34 @@ pub fn classify_exit_site(
 pub enum ResumeImage {
     /// No deopt point at this bci: nothing can describe the frame.
     None,
-    /// Exactly one, or several that agree on `(semantics, reason)` — see the
-    /// module note. `index` is the representative's position in `deopt_points`.
-    Unique { index: usize },
-    /// Two or more that disagree, so a by-bci lookup picks arbitrarily.
-    /// Carries both indices so the diagnostic can name what differs.
+    /// Exactly one, or several that agree on `semantics` — the only field the
+    /// resume reads by bci. `index` is the representative's position in
+    /// `deopt_points`.
+    Unique {
+        index: usize,
+        /// Several images that agree on `semantics` and differ on `reason`.
+        ///
+        /// The ordinary shape of a compiled counted loop: the loop-boundary
+        /// exit map and the speculative-BCE range guard sit on the same header
+        /// bci. Not a refusal — see the module note, and the CratonBench
+        /// measurement that decided it — but counted, because the
+        /// de-speculation lookup at the OSR-exit *reject* sink does pick one
+        /// arbitrarily, and "tolerated" should be visible rather than assumed.
+        reason_ambiguous: bool,
+    },
+    /// Two or more that disagree on `semantics`, so the resume bci itself is
+    /// arbitrary. Carries both indices so the diagnostic can name what differs.
     Ambiguous { first: usize, second: usize },
 }
 
 /// Which resume image `bci` names in `deopt_points`.
 ///
-/// The agreement predicate is `(semantics, reason)` and nothing else; see the
-/// module note for why the per-slot state is deliberately excluded.
+/// The agreement predicate is `semantics` alone; see the module note for why
+/// `reason` is observed rather than refused, and why the per-slot state is not
+/// this check's business at all.
 pub fn resume_image(deopt_points: &[DeoptimizationPoint], bci: u32) -> ResumeImage {
     let mut first: Option<(usize, ResumeSemantics, DeoptReason)> = None;
+    let mut reason_ambiguous = false;
     for (i, p) in deopt_points.iter().enumerate() {
         if p.bci != bci {
             continue;
@@ -184,23 +229,29 @@ pub fn resume_image(deopt_points: &[DeoptimizationPoint], bci: u32) -> ResumeIma
         match first {
             None => first = Some((i, p.semantics, p.reason)),
             Some((j, sem, reason)) => {
-                if sem != p.semantics || reason != p.reason {
+                if sem != p.semantics {
                     return ResumeImage::Ambiguous {
                         first: j,
                         second: i,
                     };
                 }
+                if reason != p.reason {
+                    reason_ambiguous = true;
+                }
             }
         }
     }
     match first {
-        Some((i, _, _)) => ResumeImage::Unique { index: i },
+        Some((i, _, _)) => ResumeImage::Unique {
+            index: i,
+            reason_ambiguous,
+        },
         None => ResumeImage::None,
     }
 }
 
-/// The first bci of this artifact that names more than one resume image, if
-/// any — the admission-time form of the lane's "what to refuse".
+/// The first bci of this artifact whose images disagree on `semantics`, if any
+/// — the admission-time form of the lane's "what to refuse".
 ///
 /// Walks the whole point list rather than only the OSR-exit maps: the entry is
 /// being admitted for a body that can leave through **any** of its deopt
@@ -211,21 +262,45 @@ pub fn resume_image(deopt_points: &[DeoptimizationPoint], bci: u32) -> ResumeIma
 pub fn first_ambiguous_resume_bci(
     deopt_points: &[DeoptimizationPoint],
 ) -> Option<(u32, usize, usize)> {
-    // Quadratic in the number of DISTINCT bcis only because `resume_image`
-    // rescans; artifacts carry tens of points, and this runs once per OSR
-    // admission, not per iteration. A map would be faster and would need an
-    // allocation on a path that today makes none.
-    let mut seen: Vec<u32> = Vec::new();
-    for p in deopt_points {
-        if seen.contains(&p.bci) {
-            continue;
-        }
-        seen.push(p.bci);
-        if let ResumeImage::Ambiguous { first, second } = resume_image(deopt_points, p.bci) {
-            return Some((p.bci, first, second));
+    for (bci, image) in distinct_bci_images(deopt_points) {
+        if let ResumeImage::Ambiguous { first, second } = image {
+            return Some((bci, first, second));
         }
     }
     None
+}
+
+/// Does any bci of this artifact carry images that agree on `semantics` and
+/// differ on `reason`? The observed-not-refused case; the caller counts it.
+pub fn has_reason_ambiguous_bci(deopt_points: &[DeoptimizationPoint]) -> bool {
+    distinct_bci_images(deopt_points).any(|(_, image)| {
+        matches!(
+            image,
+            ResumeImage::Unique {
+                reason_ambiguous: true,
+                ..
+            }
+        )
+    })
+}
+
+/// `(bci, image)` for each DISTINCT bci in `deopt_points`, in first-seen order.
+///
+/// Quadratic in the number of distinct bcis, because `resume_image` rescans;
+/// artifacts carry tens of points and this runs once per OSR admission, not per
+/// iteration. A map would be faster and would allocate on a path that today
+/// does not.
+fn distinct_bci_images(
+    deopt_points: &[DeoptimizationPoint],
+) -> impl Iterator<Item = (u32, ResumeImage)> + '_ {
+    let mut seen: Vec<u32> = Vec::new();
+    deopt_points.iter().filter_map(move |p| {
+        if seen.contains(&p.bci) {
+            return None;
+        }
+        seen.push(p.bci);
+        Some((p.bci, resume_image(deopt_points, p.bci)))
+    })
 }
 
 #[cfg(test)]
@@ -331,9 +406,16 @@ mod tests {
     #[test]
     fn one_point_is_one_image() {
         let pts = vec![point(12, 0x40, DeoptReason::OsrExit)];
-        assert_eq!(resume_image(&pts, 12), ResumeImage::Unique { index: 0 });
+        assert_eq!(
+            resume_image(&pts, 12),
+            ResumeImage::Unique {
+                index: 0,
+                reason_ambiguous: false
+            }
+        );
         assert_eq!(resume_image(&pts, 13), ResumeImage::None);
         assert_eq!(first_ambiguous_resume_bci(&pts), None);
+        assert!(!has_reason_ambiguous_bci(&pts));
     }
 
     /// The loop-transform shape: several copies of one bytecode, each with its
@@ -348,36 +430,70 @@ mod tests {
             point(12, 0x90, DeoptReason::OsrExit),
             point(12, 0xE0, DeoptReason::OsrExit),
         ];
-        assert_eq!(resume_image(&pts, 12), ResumeImage::Unique { index: 0 });
+        assert_eq!(
+            resume_image(&pts, 12),
+            ResumeImage::Unique {
+                index: 0,
+                reason_ambiguous: false
+            }
+        );
         assert_eq!(first_ambiguous_resume_bci(&pts), None);
     }
 
-    /// The one that must refuse. Two points at one bci whose `reason` differs
-    /// is the recorded Groovy `IndyInterface` shape: the de-speculation step
-    /// looks the reason up BY BCI and takes the first, so an `UnreachedCode`
-    /// trap reported as an `OsrExit` gets the count-based recompile-and-retry
-    /// policy instead of "give up immediately", and the method keeps
-    /// re-entering the trap on every call.
+    /// A `reason`-only disagreement is OBSERVED, not refused — and this is the
+    /// test the measurement rewrote.
+    ///
+    /// The shape is `CratonBench.matrixKernel(I)I` at `bci 16`: the
+    /// loop-boundary exit map and the speculative-BCE range guard on the same
+    /// header. The first draft refused it, which cost that kernel its OSR
+    /// permanently (the refusal is memoed) — 10 of the workload's 11 refusals.
+    /// `ResumeSemantics::for_reason` answers `REEXECUTE` for everything but
+    /// `PendingException`, so a reason disagreement never implies a semantics
+    /// one, and the resume bci is not in doubt.
     #[test]
-    fn points_that_disagree_on_the_reason_are_ambiguous() {
+    fn a_reason_only_disagreement_is_counted_and_not_refused() {
         let pts = vec![
-            point(12, 0x40, DeoptReason::OsrExit),
-            point(12, 0x90, DeoptReason::UnreachedCode),
+            point(16, 0x37e, DeoptReason::OsrExit),
+            point(16, 0x3c1, DeoptReason::BoundsCheck),
         ];
         assert_eq!(
-            resume_image(&pts, 12),
-            ResumeImage::Ambiguous {
-                first: 0,
-                second: 1
+            resume_image(&pts, 16),
+            ResumeImage::Unique {
+                index: 0,
+                reason_ambiguous: true
             }
         );
-        assert_eq!(first_ambiguous_resume_bci(&pts), Some((12, 0, 1)));
+        assert_eq!(
+            first_ambiguous_resume_bci(&pts),
+            None,
+            "refusing this costs a compiled counted loop its OSR for no soundness gain"
+        );
+        assert!(has_reason_ambiguous_bci(&pts));
     }
 
-    /// And on the semantics, which is the unsound half: parking the
-    /// interpreter at a bci that already took effect re-executes it.
+    /// The `semantics` disagreement, which is the unsound half — in both the
+    /// reachable spelling and the unreachable one.
+    ///
+    /// `REEXECUTE` vs `RETHROW` is what can actually arrive: a `RESUME` point
+    /// is refused wholesale before this check ever sees it, while a `RETHROW`
+    /// point is explicitly allowed to exist. Both are asserted so a future
+    /// producer that starts emitting `RESUME` does not silently fall out of
+    /// coverage.
     #[test]
     fn points_that_disagree_on_the_semantics_are_ambiguous() {
+        let reachable = vec![
+            point(12, 0x40, DeoptReason::OsrExit),
+            point(12, 0x90, DeoptReason::PendingException),
+        ];
+        assert_eq!(
+            ResumeSemantics::for_reason(DeoptReason::PendingException),
+            ResumeSemantics::RETHROW
+        );
+        assert!(matches!(
+            resume_image(&reachable, 12),
+            ResumeImage::Ambiguous { .. }
+        ));
+
         let mut pts = vec![
             point(12, 0x40, DeoptReason::OsrExit),
             point(12, 0x90, DeoptReason::OsrExit),
@@ -398,7 +514,7 @@ mod tests {
             point(12, 0x40, DeoptReason::OsrExit),
             point(12, 0x90, DeoptReason::OsrExit),
         ];
-        pts[2].reason = DeoptReason::BoundsCheck;
+        pts[2].semantics = ResumeSemantics::RESUME;
         assert_eq!(first_ambiguous_resume_bci(&pts), Some((12, 1, 2)));
     }
 }

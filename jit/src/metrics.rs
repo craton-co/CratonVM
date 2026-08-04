@@ -1376,7 +1376,7 @@ pub fn clear_reports() {
 ///
 /// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
 /// counters, no allocation and no initialization order.
-pub const OSR_EVENTS: [&str; 9] = [
+pub const OSR_EVENTS: [&str; 10] = [
     // An OSR entry was actually taken: the trampoline ran and control reached
     // compiled code at a back edge. The denominator for everything below.
     "osr_entered",
@@ -1423,16 +1423,26 @@ pub const OSR_EVENTS: [&str; 9] = [
     // **Expected to stay zero** — non-zero means a stash reached an artifact
     // that cannot describe it, and the transfer refuses.
     "osr_exit_bci_unrecorded",
-    // The admission-time form of the lane's "what to refuse": the artifact has
-    // a bci naming more than one resume image, and the by-bci lookups the
-    // resume path uses would pick one arbitrarily. Refused at ENTRY, where
-    // nothing has run — refusing at exit would force the safe reject, which
-    // after a committed body re-runs every iteration since entry.
+    // The admission-time form of the lane's "what to refuse": a bci naming two
+    // resume images whose `ResumeSemantics` disagree, so the resume bci itself
+    // is arbitrary. Refused at ENTRY, where nothing has run — refusing at exit
+    // would force the safe reject, which after a committed body re-runs every
+    // iteration since entry. Expected to read zero.
     "osr_entry_refused_ambiguous_image",
+    // The benign neighbour, counted rather than refused: images that agree on
+    // `semantics` and differ on `reason`. The ordinary shape of a compiled
+    // counted loop (the loop-boundary exit map and the speculative-BCE range
+    // guard on one header bci), and NOT expected to be zero — on CratonBench it
+    // is the majority of admitted OSR artifacts. It has a row because the
+    // de-speculation lookup at the OSR-exit *reject* sink does pick one of the
+    // two arbitrarily; admission makes that sink unreachable for an admitted
+    // entry, and a tolerated shape should be visible rather than assumed.
+    "osr_entry_reason_ambiguous_image",
 ];
 
 /// One relaxed counter per [`OSR_EVENTS`] entry.
 static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
