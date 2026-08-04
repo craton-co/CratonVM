@@ -741,6 +741,14 @@ struct Lowerer<'a> {
     /// Byte disagreements between the two paths. Non-zero refuses the compile:
     /// increment 2 is where fail-closed returns.
     mir_mismatches: usize,
+    /// Verify mode only, and it decides whether there is a next increment:
+    /// tiles the encoder can express but is NOT allowed to emit, because their
+    /// bytes are not identical to the per-opcode arm's.
+    mir_shadow_tiles: usize,
+    /// Bytes the per-opcode arms wrote for those tiles' nodes…
+    mir_arm_bytes: usize,
+    /// …and bytes the level-2 encoder would have written instead.
+    mir_enc_bytes: usize,
 }
 
 /// What the level-2 machine list is for on this compile.
@@ -1035,6 +1043,9 @@ impl<'a> Lowerer<'a> {
             mir_mode: MirMode::Off,
             mir_tiles: 0,
             mir_mismatches: 0,
+            mir_shadow_tiles: 0,
+            mir_arm_bytes: 0,
+            mir_enc_bytes: 0,
         }
     }
 
@@ -3401,6 +3412,22 @@ fn reloc_emit_enabled() -> bool {
             MirMode::Verify | MirMode::Emit => self.mir_tile_bytes(block_idx, id),
         };
         let Some(bytes) = bytes else {
+            // Not emittable. In verify mode, still ask what the encoder WOULD
+            // have produced, and price it against what the arm writes — that
+            // difference is the size of the next increment, and it is the one
+            // number that decides whether there should be one.
+            if self.mir_mode == MirMode::Verify {
+                let shadow = self.mir_shadow_tile_bytes(block_idx, id);
+                let before = self.buf.pos();
+                self.lower_data_node(id);
+                let after = self.buf.pos();
+                if let Some(shadow) = shadow {
+                    self.mir_shadow_tiles += 1;
+                    self.mir_arm_bytes += after.saturating_sub(before);
+                    self.mir_enc_bytes += shadow.as_slice().len();
+                }
+                return;
+            }
             self.lower_data_node(id);
             return;
         };
@@ -3482,6 +3509,40 @@ fn reloc_emit_enabled() -> bool {
         self.encode_tile_frame_homed(tile)
     }
 
+    /// What the level-2 encoder *would* emit for `id`, whatever the rule.
+    ///
+    /// Verify mode only, and it emits nothing: this is how the next increment
+    /// gets sized with a number instead of an argument. `mir_tile_bytes` is
+    /// restricted to `Rule::AluReg` because that is the only rule whose bytes
+    /// are provably identical to the per-opcode arm's — and byte equality is
+    /// increment 2's whole oracle. The rules that would *improve* the code
+    /// (`AluImm` drops a frame load) cannot ride that oracle by construction,
+    /// so what they are worth has to be measured separately, against the bytes
+    /// the arms actually wrote.
+    ///
+    /// Restricted to tiles covering exactly their own root, for the same reason
+    /// [`mir_tile_is_emittable`] is: a tile that absorbed other nodes cannot be
+    /// compared against one node's byte range.
+    fn mir_shadow_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
+        let plan = self.mir.as_ref()?;
+        let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
+        if usize::try_from(tb).ok()? != block_idx {
+            return None;
+        }
+        let tile = plan
+            .blocks
+            .get(usize::try_from(tb).ok()?)?
+            .tiles
+            .get(usize::try_from(ti).ok()?)?;
+        if tile.root != id || tile.covered.as_slice() != [id] {
+            return None;
+        }
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.encode_tile_frame_homed(tile)
+    }
+
     /// Encode one tile against the frame-homed allocation.
     ///
     /// "Frame-homed" is not a simplification of a register allocation — it *is*
@@ -3546,6 +3607,36 @@ fn reloc_emit_enabled() -> bool {
                         Operand::Gpr(RCX),
                     ))
                     .ok()?;
+                    out.push_bytes(&sel.encoded.bytes)?;
+                    let mut acc = FrameAccess::new();
+                    enc_frame_store(RAX, self.planned_slot_off(dst).ok()?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = None;
+                }
+                // `dst <- lhs op imm`. Reachable only from the SHADOW path —
+                // `mir_tile_is_emittable` admits `Rule::AluReg` and nothing
+                // else — because this form is not byte-equal to anything: the
+                // per-opcode arm materialises the constant into RCX and uses
+                // the register form, and dropping that load is the whole point.
+                // It is encoded here so the saving can be *measured* before it
+                // is spent.
+                MInst::AluRI {
+                    op,
+                    ty,
+                    dst,
+                    lhs,
+                    imm,
+                    form: _,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    if rax_holds != Some(lhs) {
+                        let mut acc = FrameAccess::new();
+                        enc_frame_load(RAX, self.slot_of_checked(lhs).ok()?, &mut acc);
+                        out.push(&acc)?;
+                    }
+                    let sel = select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
                     out.push_bytes(&sel.encoded.bytes)?;
                     let mut acc = FrameAccess::new();
                     enc_frame_store(RAX, self.planned_slot_off(dst).ok()?, &mut acc);
@@ -7595,11 +7686,23 @@ pub mod mir_totals {
     static METHODS: AtomicU64 = AtomicU64::new(0);
     static TILES: AtomicU64 = AtomicU64::new(0);
     static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    static SHADOW_TILES: AtomicU64 = AtomicU64::new(0);
+    static ARM_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ENC_BYTES: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn record(tiles: usize, mismatches: usize) {
+    pub(super) fn record(
+        tiles: usize,
+        mismatches: usize,
+        shadow_tiles: usize,
+        arm_bytes: usize,
+        enc_bytes: usize,
+    ) {
         METHODS.fetch_add(1, Relaxed);
         TILES.fetch_add(tiles as u64, Relaxed);
         MISMATCHES.fetch_add(mismatches as u64, Relaxed);
+        SHADOW_TILES.fetch_add(shadow_tiles as u64, Relaxed);
+        ARM_BYTES.fetch_add(arm_bytes as u64, Relaxed);
+        ENC_BYTES.fetch_add(enc_bytes as u64, Relaxed);
     }
 
     /// `(methods, tiles, mismatches)` since process start.
@@ -7611,11 +7714,32 @@ pub mod mir_totals {
         )
     }
 
+    /// `(shadow_tiles, arm_bytes, encoder_bytes)` — verify mode's sizing of the
+    /// increment that would emit the rules byte equality cannot cover.
+    ///
+    /// `arm_bytes - encoder_bytes` is what those tiles would save, over exactly
+    /// the nodes they cover, on this workload. A zero `shadow_tiles` means the
+    /// question does not arise; it does not mean the saving is zero.
+    pub fn read_shadow() -> (u64, u64, u64) {
+        (
+            SHADOW_TILES.load(Relaxed),
+            ARM_BYTES.load(Relaxed),
+            ENC_BYTES.load(Relaxed),
+        )
+    }
+
     /// Zero the accumulator. Tests only — hold [`TEST_LOCK`] across the reset
     /// AND the read, or two tests reading one global see each other's counts.
     #[cfg(test)]
     pub fn reset() {
-        for c in [&METHODS, &TILES, &MISMATCHES] {
+        for c in [
+            &METHODS,
+            &TILES,
+            &MISMATCHES,
+            &SHADOW_TILES,
+            &ARM_BYTES,
+            &ENC_BYTES,
+        ] {
             c.store(0, Relaxed);
         }
     }
@@ -8853,7 +8977,13 @@ pub(crate) fn lower_inner_with_scopes(
                 lowerer.mir_mode, lowerer.mir_tiles, lowerer.mir_mismatches
             );
         }
-        mir_totals::record(lowerer.mir_tiles, lowerer.mir_mismatches);
+        mir_totals::record(
+            lowerer.mir_tiles,
+            lowerer.mir_mismatches,
+            lowerer.mir_shadow_tiles,
+            lowerer.mir_arm_bytes,
+            lowerer.mir_enc_bytes,
+        );
         if lowerer.mir_mismatches != 0 {
             return refuse(Bailout::new(BailoutReason::Internal(
                 "ir_lower: the level-2 encoder disagreed with the per-opcode lowering",
