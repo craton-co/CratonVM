@@ -1,53 +1,74 @@
-# `MVStore` cache read returns `java.lang.Object` — an OLD-GEN block reclaimed while still referenced
+# The `ClassId(0)` family — a reference that no longer names what its holder thinks
 
-> The filename still says `nonmoving-sweep` because code comments and a sibling
-> report point at it. The name is wrong; see *Status*.
+> **Consolidated 2026-08-03** from two pages that were tracking one defect:
+> `bug-h2-blocked-frame-classid0-dispatch-miss.md` (the blocked-frame /
+> `Object.hasNext()` face) and
+> `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` (the old-gen
+> face). Both old filenames asserted a mechanism their own contents had already
+> retracted — the second says so in its first paragraph — which is why the new
+> name states only what is actually measured.
 
 ## Status
-**OPEN — one named mechanism closed, the family is not.** Updated 2026-08-03
-on `fix/h2-classid0-close-20260803`.
+**OPEN.** One defect, four faces, two of them measured to opposite verdicts on
+the same question. What is fixed, what is measured, and what is left:
 
-* **A root cause was found, fixed, and differentially tested.** `old_gen_gc`'s
-  root seed asked only ever "is this address an object BASE?", of every root,
-  twice — and a conservative root is frequently an *interior* word. Old gen had
-  no resolution for that at all, so an old-gen object whose only surviving
-  reference was an interior word got **no mark bit**, and the in-place sweep
-  frees purely on `GC_FLAG_MARKED`. The compacting arm was additionally
-  *assumed* unreachable with conservative roots and measured not to be. Full
-  argument, counters and the negative control: `docs/gc/old-sweep-liveness.md`
-  §7. Two regression tests, one per reclamation arm, each verified to FAIL
-  under `CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` — the second with this family's
-  own face, `address 0x… now reads class_id=0`.
-* **It is not the whole defect.** On a 2026-08-03 A/B soak the FIX arm still
-  produced a live occurrence, and the verdict says it was **not** interior-rooted:
+* **Fixed and merged.** An old-gen mark gap (`old_gen_gc`'s root seed had no
+  resolution at all for an INTERIOR conservative root), and separately a JIT
+  miscompile that bound an `invokevirtual` to the compiled entry of its
+  CONSTANT-POOL-resolved method with no receiver guard. The second is not a GC
+  bug at all and is written up in
+  `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`.
+  It mattered here twice over: it made this family's only reproduction
+  (`TestMultiThread`) fail 100 % of runs in 2-9 s so nothing could be measured,
+  and a wrong-object return is **indistinguishable at the reader** from a stale
+  reference, so it is a live alternative explanation for every occurrence
+  recorded before `12769bb23c`.
+* **Still open.** The family reproduces on the fixed binary, on both faces.
 
-  ```
-  receiver is an OLD-GEN block this process RECLAIMED while it was still referenced.
-    obj=0x20028f6a4e8  site="JIT checkcast"  target_class=java/lang/String
-    original_class=java/lang/Object  original_kind=1        <- an ARRAY
-    freed_block="0x20028f691c8+0x2020"  interior_off=4896
-    interior_root_pointed_in=false
-    freed_by="in-place old-gen sweep"   free_seq=1888514
-  ```
+## Why this is one page
 
-  An `Object[]` of ~8 KB, freed by the in-place old sweep under a live
-  reference, then re-served — surfacing to Java as
-  `java.lang.Integer cannot be cast to java.lang.String`. So at least one more
-  mark-phase gap remains, and it is on the in-place arm.
-* **Every earlier measurement in this family needs re-taking.** A JIT
-  miscompile that hands the WRONG OBJECT back from a virtual call was live on
-  `origin/dev` for the whole history of this investigation and is fixed on this
-  branch (`12769bb23c`, see
-  `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`).
-  At the reader end a wrong-object return is **indistinguishable** from a stale
-  reference. It is not the explanation for the verdict quoted above — that one
-  is the heap's own free-list answer, not an inference off a cast — but it is a
-  live alternative explanation for any occurrence recorded without one.
+The old-gen page already establishes that two of the faces are one defect:
+`java.lang.Object cannot be cast to X` is what a freed block wears **while it
+is still on the free list**, and once the allocator re-serves it the same stale
+reference reads a perfectly valid object of an unrelated class. Timing decides
+which face you see, not mechanism.
 
-The root cause of the residual is not known. What this session leaves behind is
-one mechanism closed with tests, a reproduction that still works, verdicts that
-need no prior configuration on three faces instead of one, and the removal of a
-confound that was corrupting the evidence.
+The blocked-frame page's only face that has ever produced a verdict is exactly
+that second one. And the old-gen residual is now measured to have **no referrer
+anywhere in the heap or the root slice** — so whoever reads it later is not
+holding a heap reference either. Both pages therefore describe the same shape:
+*something holds an address that no longer names what it thinks it names.*
+
+### What still differs — do not smooth this over
+
+The two faces disagree on one measured question, and the disagreement is the
+most useful fact on this page:
+
+| | old-gen face | blocked-frame / clone face |
+| --- | --- | --- |
+| `reclaimed_hole_at` | **in a free block** — reclaimed | **not reclaimed** |
+| old-gen reclamation ring | **hit**, names the original class and the freeing collector | **no record at all** |
+| what the reader sees | `Object`→X, or an unrelated live class after re-serve | a live, unrelated `java.lang.Thread` |
+
+So on the old-gen face a collection provably freed something; on the clone face
+there is no evidence any collection freed anything. Either the address reached
+its holder by a route that never involved reclamation (a wrong-object return, a
+stale VM-side cache entry), or the reclamation happened long enough ago that a
+1 M-entry ring had wrapped. Both are testable; neither is established.
+
+## The four faces
+
+Count all four when measuring — the family is ~4x more visible than any single
+face, and this investigation lost three sessions to chasing the one in a page
+title:
+
+1. `NoSuchMethodError` on a `java.lang.Object` receiver (`hasNext()Z`,
+   `next()Ljava/lang/Object;`);
+2. `CloneNotSupportedException` — `java.lang.Object` is not `Cloneable`, and a
+   dispatch that reaches `java.lang.Thread.clone` throws unconditionally;
+3. `ClassCastException` — either `java.lang.Object cannot be cast to X` (block
+   still free) or an unrelated live class (block re-served);
+4. a bare `SIGSEGV` with `slot[rN]` reading eight zero words.
 
 ### The 2026-08-03 A/B, on a binary with the JIT confound removed
 
@@ -261,7 +282,7 @@ same face, and nothing on the failing path told them apart.
 It is now measured, not inferred. The receiver lives in an **old-generation
 free block**.
 
-## Symptom
+## Symptom — the old-gen face
 
 ```
 java.lang.ClassCastException: java.lang.Object cannot be cast to org.h2.mvstore.Page
@@ -297,6 +318,98 @@ By the time the failure happens the cache chain is entirely old→old:
 therefore frees the payload under a live parent — and, unlike the young sweep,
 the in-place old sweep has no side-mark escape hatch: it frees purely on
 `GC_FLAG_MARKED`.
+
+## The blocked-frame face (formerly its own page)
+
+### Its symptom — the face the old page was named after
+
+```
+WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError
+     method="java/lang/Object.hasNext()Z"
+     caller="org/h2/test/db/TestMultiThread.testConcurrentUpdate()V @pc=252"
+
+CRATONVM_DBG_CCE_BT: site=nsme_dispatch method=java/lang/Object.hasNext()Z
+  CCE-BT-STK[3] org/h2/test/db/TestMultiThread.testConcurrentUpdate pc=252
+  CCE-BT-STK[2] org/h2/test/db/TestMultiThread.test pc=28
+  CCE-BT-STK[1] org/h2/test/TestBase.testFromMain pc=11
+  CCE-BT-STK[0] org/h2/test/db/TestMultiThread.main pc=9
+  NSME-RECV addr=0x200625bf088 tid=0 blocked=false epoch=54
+  NSME-RECV SHAPE kind=Object num_fields=0 mirror_of=<not a registered mirror>
+```
+
+`@pc=252` is the `for (Future<Void> job : jobs)` result loop
+(`TestMultiThread.java:381`). The receiver is the synthetic `Iterator` local
+javac emits for that loop — held only by `testConcurrentUpdate`'s frame while
+the thread is parked inside `job.get(5, TimeUnit.MINUTES)`.
+
+`num_fields=0` and a class of `java/lang/Object` are the ambiguous
+`ClassId(0)` face. An `ArrayList$Itr` has fields; this one has none.
+
+A second witness, same loop shape, different method, seen 2026-08-01 on the
+pre-`750a95f8e3` tree:
+
+```
+NoSuchMethodError method="java/lang/Object.next()Ljava/lang/Object;"
+     caller="org/h2/test/db/TestMultiThread.testConcurrentInsert()V @pc=197"
+```
+
+HotSpot emits neither, ever.
+
+### 2026-08-03 campaign — what was measured, and what it eliminated
+
+All on `fix/h2-classid0-close-20260803`, `--Xmx 1g`, 16-core Azure host, two
+workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
+
+| phase | binary | runs | family events | other |
+| --- | --- | --- | --- | --- |
+| 1 | `12769bb23c` (JIT fix, no clone verdict) | 9 | 2 — `CloneNotSupportedException` ×4 in one run, `ClassCastException` ×12 in another | 1 `TimeoutException`, 6 clean |
+| 2 | `583021945b` (+ clone verdict) | 18 | 2 — `CloneNotSupportedException` ×12 **with a verdict**, and `ClassCastException` ×4 | 1 `TimeoutException`, 15 clean |
+
+27 runs, 4 family events, ~1 in 7. `rootdead=0` and `audit=0` on every one of
+the 27.
+
+`TimeoutException` is the separate throughput defect tracked on
+`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+
+#### Eliminated, with measurements
+
+* **The per-bci live-local mask is not the gap.** The synthetic enhanced-for
+  `Iterator` local is read only across the loop's BACK EDGE from after the
+  blocking call, so an analysis that did not reach a fixpoint over that edge
+  would call it dead exactly where the thread parks — and that mask is what
+  `Frame::scan_local_objects` filters the blocked-thread root snapshot with.
+  `local_liveness::tests::enhanced_for_iterator_is_live_at_the_blocking_call`
+  models the real method's bytecode (loop head 7, `Future.get` at 37, the whole
+  range inside a `try` whose handler never reads the slot) and asserts slot 9
+  live at pc 37/42/43. It **passes**, and it is differential: slot 10 (`job`)
+  is correctly dead at pc 42, so the analysis is doing real work rather than
+  returning `ALL_LIVE`.
+* **The young sweep is not dropping a published root.** The new
+  root-in-dead-span invariant compares `roots` + `finalizer_addrs` — the exact
+  set the mark phase was handed — against every span the sweep is about to
+  zero, and RETAINS any span a live (non-forwarded) root points into. It
+  measured **zero** across the whole campaign (`rootdead=0` on all 18 runs).
+  That is an elimination, not a silence: the check runs unconditionally and
+  prints when it fires.
+* **The blocked-frame slot audit found nothing** (`audit=0` on all 18 runs).
+  It checks every live local and stack slot of every frame at blocked-region
+  entry and at wake for `class_id == 0 && kind == Object`, and asks the heap
+  whether such an address is in a reclaimed hole.
+
+#### Instrumentation added (all unconditional)
+
+* `audit_frames_for_reclaimed_slots`, filtered by the collector's OWN liveness
+  mask — a *dead* local pointing into a reclaimed span is the filter working as
+  designed — and gated on `class_id == 0 && kind == Object`, because a
+  primitive array header also carries class id 0 and without the kind test
+  every `long[]` local flags on every wake. Cost is bounded to one frame walk
+  per COLLECTION per thread rather than one per blocking call (`f2a19c30af`).
+* A lock-free **young-span reclamation ring**, one record per COALESCED span.
+  The pre-existing `record_swept` is gated on `CRATONVM_DBG_SWEEP_ZERO`, which
+  also swaps the young collector off its parallel sweep prefix — the instrument
+  changed the thing it measured, which is this family's entire "reproduces
+  plain, never instrumented" history.
+* The **clone-face verdict** described in *Status* (`583021945b`).
 
 ## Repro
 
@@ -490,6 +603,22 @@ In rough order of what the evidence supports.
    cost a build-and-soak cycle; they are recorded with their measurements so
    the next session does not pay for them again.
 
+
+### From the blocked-frame face
+
+5. **Find where the reference goes wrong, not where it is read.** The clone
+   verdict says the receiver is a live `java.lang.Thread` at an address the
+   caller's `long[]` reference should never hold. Work backwards from
+   `BitSetHelper.flip` -> `Arrays.copyOf(long[], int)`: which load produced it?
+   `CRATONVM_JIT_BISECT_ONLY` narrowed the sibling JIT defect to two classes in
+   about ten runs and is the tool for this too.
+6. **Re-take anything measured before `12769bb23c`.** A wrong-object return
+   from a virtual call is not distinguishable, at the reader end, from a stale
+   reference, and that defect was live for this family's whole history.
+7. **Count all four faces**, not one. See *The four faces* above.
+8. **Do not re-derive the eliminations.** Each cost a build-and-soak cycle and
+   each is recorded with its measurement.
+
 ## Handed over from `TestDiskFull` (2026-08-01)
 
 The sibling report `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` was
@@ -516,21 +645,40 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
 0 `SIGSEGV` and 0 `ClassCastException`. `TestMVStoreCacheLoop` is.
 
 ## Related
-- the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
+
+* `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
+  — the JIT miscompile that made this family's reproduction impossible, and the
+  reason a wrong-object return has to be excluded before a stale reference is
+  assumed. **Read this before attributing anything here to GC.**
+* `../../../gc/old-sweep-liveness.md` §7 — the interior-conservative-root fix,
+  its counters and its negative control.
+* `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
+  — array receivers dispatched through their COMPONENT class id, the *other*
+  defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
+  reporter added here exists to tell the two apart.
+* `bug-h2-testmultithread-concurrent-update-timeout.md` — the class the
+  blocked-frame face was found in, whose own problem is throughput, not this.
+* the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
   same signature; see *Handed over from `TestDiskFull`* above.
-- `c0d09e2451`, `b86945eafe` — post-GC reference processing writing through
+* `c0d09e2451`, `b86945eafe` — post-GC reference processing writing through
   stale OLD-GEN addresses, and the same blind spot in its staleness guard.
-  Already on `dev` before the reproduction here, so they do not close this, but
-  they are the same generation and the same shape.
-- `5750caf5f` — *close the live set before the in-place old sweep decides what
-  is dead*: the in-place sweep now runs the compactor's live-set fixpoint, and
-  the seven PRECISE mark push sites stop being screened by a plausibility test
-  written for conservative guesses. Its counters
-  (`OLDMARK_RESCUED_BY_WALK`, `OLD_SWEEP_CLOSURE_RESCUES`,
-  `OLD_SWEEP_ESCAPE_HITS`) are the ones to watch for a recurrence.
-- `7303483521` fixes the old-gen **fragmentation** consequence of the same
-  regime. Unrelated cause, unrelated fix — that part of the original doc was
-  right.
+* `5750caf5f` — *close the live set before the in-place old sweep decides what
+  is dead*; its counters are the ones to watch for a recurrence.
+* `7303483521` — the old-gen **fragmentation** consequence of the same regime.
+  Unrelated cause, unrelated fix.
+
+### Superseded page names
+
+Both former filenames asserted a mechanism the measurements retracted, so
+neither name should be resurrected:
+
+* `bug-h2-blocked-frame-classid0-dispatch-miss.md` — "dispatch miss" and the
+  blocked-frame framing survive only as *one face*; its liveness-mask
+  hypothesis is eliminated with a differential test, and its one verdict says
+  the receiver was never reclaimed at all.
+* `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` — "non-moving
+  sweep" was retracted by that page's own first paragraph; the generation is
+  old gen and the arm is the in-place sweep.
 
 ## A different producer of the same face, found and FIXED (2026-08-02)
 

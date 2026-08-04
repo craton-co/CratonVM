@@ -3514,7 +3514,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         const PROBE_BUDGET: u64 = 200_000;
@@ -22275,7 +22275,7 @@ fn invoke_on_class_shared_inner(
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
                 // docs/known-issues/h2/
-                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
