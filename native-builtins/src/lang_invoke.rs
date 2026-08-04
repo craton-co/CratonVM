@@ -1212,8 +1212,26 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 /// [`vh_field_desc`]). The slot writes are the fallback for VarHandles
 /// allocated outside our path, which by definition do not have our layout
 /// either.
+/// **Ask by NAME, not by field count.** The first version of this predicate was
+/// `object_num_fields(vh) >= VH_FIELD_COUNT` and was completely inert: an A/B
+/// against the pre-fix binary counted the same 8 overlay writes with and
+/// without it. `alloc_concurrent_synthetic` returns an object with at least the
+/// requested slot count either way, so a count test cannot tell the two layouts
+/// apart — it only looks as though it can.
+///
+/// A real `java.lang.invoke.VarHandle` declares an instance field literally
+/// named `vform`; a VM-fabricated stub has generated placeholder fields and
+/// does not. That is the difference, so that is what is tested.
+///
+/// If a future JDK renames `vform`, this reverts to today's behaviour (writing
+/// the slots) rather than to something new, and `CRATONVM_DBG_OVERLAY=1` still
+/// reports it — a loud failure mode, not a silent one.
 fn vh_has_synthetic_layout(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    ctx.object_num_fields(vh) >= VH_FIELD_COUNT
+    let class_id = ctx.class_id_of_object(vh);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "vform")
 }
 
 /// Allocate a VarHandle for an instance field.
