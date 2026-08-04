@@ -10446,7 +10446,7 @@ pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
 /// `IllegalStateException: SSLSocketFactory has no owning SSLContext`
 /// instead of connecting. Converting the idiom rather than each site is what
 /// keeps a future fourth caller from re-introducing it. See
-/// `docs/known-issues/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804.md`.
+/// `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 pub(crate) fn default_ssl_context_or_create(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
 ) -> ObjectRef {

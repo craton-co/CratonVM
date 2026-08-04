@@ -383,8 +383,8 @@ fn watch_service_surface_has_a_single_owner_in_native_io() {
 ///   the pre-fix `field 0 = None` shape. Every Spring Boot test going
 ///   through `ModifiedClassPathClassLoader` (Aether resolving
 ///   `@ClassPathOverrides` coordinates over HTTPS) failed on it. See
-///   `docs/known-issues/springboot/`
-///   `sslsocketfactory-getdefault-aether-resolution-regression-20260804.md`.
+///   `docs/internal/fixed-suite-bugs/springboot/`
+///   `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 ///
 /// So this pins the *surviving owner site*, not merely the count: a duplicate
 /// that changes who wins is the failure mode, and a triple that is legitimately
