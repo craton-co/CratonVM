@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — not bisected. **Azure-Linux-fixture-only: Windows does not reproduce it at either commit** (measured 2026-08-04, see below) |
+| **Status** | RETIRED 2026-08-04 — cause found and fixed (`f9e560dc5`). **The four tests themselves were never re-run on the fixture**; see "Closure" for exactly what is and is not established |
 | **Severity** | high — four TLS tests that were green went red, including a webapp start failure |
 | **HotSpot** | PASS (`OK (21 tests)`) |
 | **CratonVM** | Azure Linux: FAIL ×5 at `dev` `12b8cbdea`; FAIL ×1 at `dev` `48fba3a31`. Windows: FAIL ×1 at **both** `12b8cbdea` and `dev` `1f8b02e74` — i.e. the four never appear here |
@@ -90,7 +90,12 @@ tests still pass — but a native caller computing slot 7 on a 3-slot receiver i
 a real latent defect in the `SSLSocketFactory` → `SSLContext` field walk, and
 deserves its own issue rather than being folded into this one.
 
-## Suggested next step
+## Suggested next step — SUPERSEDED, see "Closure" below
+
+> Left as written for the record. The bisect it proposes was never needed: the
+> cause turned out to be the range's own tip commit, and `14a274085` — the
+> candidate this section says to try first — was **not** it. Everything from
+> here to the Closure is the state of knowledge before the cause was found.
 
 Bisect `48fba3a31..12b8cbdea` on `TestSsl` alone, **on the Azure Linux
 fixture** — per the section above, no other host has been shown to reproduce
@@ -122,3 +127,106 @@ as an exoneration.
 
 Do NOT read the surviving `testClientInitiatedRenegotiation` failure as part of
 this — it is the by-design TLS 1.2 renegotiation gap and predates the range.
+
+---
+
+## Closure (2026-08-04)
+
+### Not the `SSLSocketFactory.getDefault()` duplicate-registration bug
+
+Checked first, because that defect was live in the same subsystem on the same
+day (`docs/internal/fixed-suite-bugs/springboot/`, the
+`sslsocketfactory-getdefault` page). It is **not** this. Two independent
+reasons, either sufficient:
+
+* The duplicate registration in `net_phase_e.rs` dates to the
+  **initial commit, 2026-04-26** (`a6dc911ed`), and `git log
+  48fba3a31..12b8cbdea -- native-builtins/src/net_phase_e.rs` is **empty**. A
+  defect present continuously since April cannot make a suite go from green at
+  `48fba3a31` to red at `12b8cbdea`.
+* `TestSsl` does not acquire its client factory through the static
+  `getDefault()` at all. `TesterSupport.configureClientSsl()` builds one via
+  `SSLContext.getInstance(...).getSocketFactory()` and installs it with
+  `HttpsURLConnection.setDefaultSSLSocketFactory(...)`.
+
+### The cause: COV-07's `athrow` lowering, which is `12b8cbdea` itself
+
+The regression boundary is not merely *inside* the 149-commit range — it **is
+the range's tip**. `12b8cbdea` is `feat(jit): COV-07 — athrow gets a real IR
+lowering`, and that commit introduced a real, now-proven defect:
+
+> An `athrow` compiled by the optimizing tier did not force `has_dispatch`, so
+> the method could be entered through the fast path, which never drains the
+> stashed exception. The throw was silently swallowed and the method returned
+> as though it had completed normally.
+
+Fixed in `f9e560dc5`; the full mechanism, the narrowing and the numbers are in
+that commit message and in `jit/src/lib.rs` at the new `Op::Throw` arm. The
+matching invariant had been held by the single-pass backend since RBC.6; COV-07
+did not carry it across.
+
+Why this shape produces scattered, unrelated-looking failures: a swallowed
+throw is not a crash. Control simply continues past a `throw`, so the damage
+surfaces later and somewhere else — a `finally` that does not run, an error
+path that returns success, a listener that reports started when it failed.
+`testSni`'s `LifecycleException: A child container failed during start` is
+exactly that shape, and the other three are bare `assertTrue` failures with no
+exception detail — the signature of an exception that was thrown and lost.
+
+Why the fixture sees it and Windows does not: the gap governs the
+compiled-callee → **interpreted**-caller edge. Once the caller is compiled too,
+its own JIT-to-JIT routing masks it. In an ordinary run that leaves only the
+window where the callee is compiled and the caller is not yet — so it fires
+about once per run, at a moment whose timing depends on the host. Pinning the
+caller interpreted turns it from ~1-in-300 000 into 99.6% (1 792 397 of
+1 800 000), which is how it was measured. A defect that narrow explains a
+suite that is deterministic on one host and absent on another far better than
+"environmental".
+
+### What is verified, and what is not
+
+Verified:
+
+* the defect reproduces on Windows with a Hibernate-free two-method probe, and
+  is gone after the fix (both the 99.6% arm and the once-per-run arm → 0);
+* the pre-fix binary fails the new regression test (`swallowed=199153` of
+  200 000), the post-fix binary passes it;
+* `cratonvm-jit` 1892 unit tests + all integration targets pass;
+* `TestSsl` on Windows is unchanged before and after: 21 tests, with
+  `testClientInitiatedRenegotiation[JSSE]` the one by-design failure.
+
+One correction to that last line, because the first version of it was too
+clean. `TestSsl.testPost[JSSE]` **flakes**, and it flaked during this work in a
+way that initially looked like a regression from the fix. Measured over 11
+runs on the same host:
+
+| arm | `testPost` failures |
+|---|---|
+| pre-fix (`dev`, no athrow fix) | 2 / 7 |
+| with the athrow fix | 2 / 4 |
+
+So it fails on both arms and is **not** attributable to the fix — the first
+three pre-fix runs simply happened to be clean, which is exactly how a flaky
+test manufactures a false regression. The failure is always the same shape: a
+mid-stream EOF while reading the response back, e.g. `Byte in position
+[5930928] had value [-1] rather than [1]`, from one of the four concurrent
+threads `testPost` starts to POST ~6 MiB each over TLS. No exception is
+printed, so it is the read-loop's own EOF branch, not the `catch`.
+
+This is a pre-existing flake in the TLS suite and wants its own page; it is
+recorded here only so the next person who sees `Failures: 2` on this class
+does not spend the afternoon bisecting it, and so nobody reads a single clean
+`TestSsl` run as proof that a JIT change is safe.
+
+**Not** verified: the four tests were never re-run on the Azure Linux fixture,
+because Windows never reproduced them (that measurement is the section above,
+and it is why this page cannot close on a local green). The causal chain here
+is strong — the regression boundary coincides exactly with the commit that
+introduced a proven exception-swallowing defect, and the failure shapes match —
+but it is a chain, not a direct observation of these four tests passing.
+
+**If a fixture run still shows any of the four, reopen this page rather than
+filing a new one**, and treat the remaining 148 commits in the range as the
+search space; the `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` levers (made
+trustworthy by `d042b0ea2`, inside this same range) are the cheap tool, not a
+rebuild-per-step bisect.
