@@ -154,8 +154,8 @@ const R11: u8 = 11;
 
 // XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
 // XMM0 holds the first operand / result, XMM1 the second operand / a mask.
-const XMM0: u8 = 0;
-const XMM1: u8 = 1;
+const XMM0: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[0];
+const XMM1: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[1];
 
 /// The bytes of one `[RBP - disp]` access, without a heap allocation.
 ///
@@ -7444,7 +7444,13 @@ fn verify_slot_colouring(
 /// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
 /// loop counter gets nothing out of it. That is the price of not touching the
 /// prologue, and it is the first thing to revisit — see the doc.
-const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
+///
+/// The literal lives in `regalloc::xmm_roles`, with the other two XMM
+/// authorities — `ir_lower`'s own scratch pair below and `vec_emit`'s vector
+/// pool — so that a wiring which puts two of them on one register is a visible
+/// fact rather than a discovery. See that module for why the vector pool
+/// overlaps this file completely and cannot yet be separated.
+const IR_LOWER_LS_XMMS: [u8; 4] = crate::regalloc::xmm_roles::IR_LINEAR_SCAN;
 
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
