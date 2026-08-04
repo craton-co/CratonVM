@@ -398,6 +398,11 @@ public class RFieldSiteCache {
             checkEq(s.sum(), 16 * 7000 + 120, "Slots.sum() before definition " + i);
             Class<?> c = Class.forName(names[i]);
             java.lang.reflect.Field f = c.getDeclaredField("v");
+            // `setAccessible` even though this class is a nest-mate of the
+            // target: CratonVM's reflection does not implement JEP 181
+            // nest-based access control for `Field.getInt`, and this vector is
+            // about the site cache, not about that gap.
+            f.setAccessible(true);
             checkEq(f.getInt(null), 100 + i, "freshly defined " + names[i] + ".v");
             checkEq(w.l2, 0x0102030405060708L, "Wide.l2 after definition " + i);
             checkEq(s.sum(), 16 * 7000 + 120, "Slots.sum() after definition " + i);
