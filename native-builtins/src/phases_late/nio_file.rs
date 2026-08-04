@@ -11087,9 +11087,19 @@ pub(crate) fn fs_list_dir(path: &str) -> Option<Vec<String>> {
 /// `String[]` rather than the untyped `Object[]` that
 /// `new_array(ArrayElementType::Reference, ..)` hands back.
 pub(crate) fn string_class_id(ctx: &mut dyn NativeContext) -> ClassId {
-    ctx.ensure_class_initialized("java/lang/String")
+    ref_array_component_id(ctx, "java/lang/String")
+}
+
+/// The `ClassId` for `java/io/File`, for the `[Ljava/io/File;`-returning
+/// natives (`File.listFiles`, `File.listRoots`).
+pub(crate) fn file_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    ref_array_component_id(ctx, "java/io/File")
+}
+
+fn ref_array_component_id(ctx: &mut dyn NativeContext, name: &str) -> ClassId {
+    ctx.ensure_class_initialized(name)
         .ok()
-        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .or_else(|| ctx.class_id_by_name(name))
         .unwrap_or_else(|| ClassId::new(0))
 }
 
@@ -12522,7 +12532,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, names.len());
+                // A typed component class, not the untyped `Object[]` that
+                // `ArrayElementType::Reference` produces — the descriptor's array
+                // type is what the caller's assignment checkcasts against.
+                let component = string_class_id(ctx);
+                let arr = ctx.new_ref_array(component, names.len());
                 // Pin across the create_strings below — a moving young GC
                 // there would relocate the fresh array (native stale-local
                 // family).
@@ -12548,7 +12562,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
+                // A typed component class, not the untyped `Object[]` that
+                // `ArrayElementType::Reference` produces — the descriptor's array
+                // type is what the caller's assignment checkcasts against.
+                let component = file_class_id(ctx);
+                let arr = ctx.new_ref_array(component, paths.len());
                 // Pin across the File allocs below — a moving young GC there
                 // would relocate the fresh array (native stale-local family).
                 let arr_pin = ctx.pin_native_root(arr);
@@ -12610,7 +12628,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     accepted.push((file_pin, file_obj));
                 }
             }
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = file_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             for (i, (pin, orig)) in accepted.iter().enumerate() {
                 let f = ctx.read_native_pin(*pin, *orig);
                 ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -12669,7 +12691,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     accepted.push((ctx.pin_native_root(f_obj), f_obj));
                 }
             }
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = file_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             for (i, (pin, orig)) in accepted.iter().enumerate() {
                 let f = ctx.read_native_pin(*pin, *orig);
                 ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -12721,7 +12747,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 }
             }
             ctx.unpin_native_roots(this_pin);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = string_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             let arr_pin = ctx.pin_native_root(arr);
             for (i, name) in accepted.iter().enumerate() {
                 let s = ctx.create_string(name);
@@ -12901,7 +12931,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         };
         #[cfg(not(windows))]
         let roots: Vec<String> = vec!["/".to_string()];
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, roots.len());
+        // A typed component class, not the untyped `Object[]` that
+        // `ArrayElementType::Reference` produces — the descriptor's array
+        // type is what the caller's assignment checkcasts against.
+        let component = file_class_id(ctx);
+        let arr = ctx.new_ref_array(component, roots.len());
         // Pin across the File allocs below — a moving young GC there would
         // relocate the fresh array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
