@@ -146,13 +146,24 @@ pub const REF_FIELD_SIZE: usize = 8;
 // emits a raw `MOV` against a field cell instead of calling the `jit_getfield`
 // helper, so it needs the byte offset of the payload *within* the cell.
 //
-// `Value` has no `#[repr(...)]`; the layout below is what rustc deterministically
-// chooses for it (a 4-byte discriminant word at offset 0, payload after it).
-// The `field_cell_layout_matches_value_enum` test in this module pins the layout
-// at runtime — if rustc ever changes it, that test fails loudly and the JIT
-// inline path must be revisited (or `Value` given an explicit `#[repr(C)]`).
+// `Value` is `#[repr(u32)]` with explicit `= 0 ..= 6` discriminants, so the
+// layout below is a *language guarantee*, not an observation: the enum is laid
+// out as `#[repr(C)] struct { tag: u32, payload: union { .. } }`, putting a
+// 4-byte discriminant word at offset 0 and each variant's payload at its
+// natural alignment after it.
 //
-// Observed layout (verified by the test below, identical in debug + release):
+// It used to be `#[repr(Rust)]`, with this comment noting the layout was merely
+// "what rustc deterministically chooses" and pointing at the runtime test below
+// as the only pin. That was the weak form of the invariant twice over: a
+// runtime test catches drift only for whoever runs `-p cratonvm-types`, and
+// nothing stopped rustc from moving the tag in the meantime. All four facts are
+// now `const`-asserted in `value.rs` (search `value_tag_word`), so drift is a
+// compile error in this crate rather than a miscompile in the JIT. The explicit
+// discriminants also make the `repr` structurally impossible to delete — E0732
+// rejects explicit discriminants on non-unit variants without one — so the
+// guarantee cannot be silently dropped either.
+//
+// Layout (guaranteed by `#[repr(u32)]`, re-verified by the test below):
 //   bytes 0..4    : discriminant word (Int=0, Long=1, Float=2, Double=3,
 //                   Object=4, ReturnAddress=5, Uninitialized=6)
 //   bytes 4..8    : payload of a 4-byte variant (Int / Float / ReturnAddress)
@@ -749,9 +760,15 @@ mod tests {
 
     /// Pin the in-memory layout of a `Value` field cell so the JIT's inline
     /// `getfield` codegen (which emits a raw `MOV [recv + FIELD_CELL_*]`)
-    /// stays correct. `Value` has no `#[repr]`; this test reinterprets real
-    /// values and asserts the discriminant / payload land at the documented
-    /// offsets. If rustc ever changes `Value`'s layout this fails loudly.
+    /// stays correct.
+    ///
+    /// `Value` is `#[repr(u32)]` with explicit discriminants, so this is now a
+    /// *second* line of defence rather than the only one — `value.rs` asserts
+    /// the same four facts at compile time (search `value_tag_word`), which is
+    /// what actually protects the JIT. This test survives because it exercises
+    /// the real byte-reinterpretation path the JIT performs, including the
+    /// non-null `Object` case that const-eval cannot express (it would have to
+    /// read pointer provenance).
     #[test]
     fn field_cell_layout_matches_value_enum() {
         use crate::Value;
@@ -775,6 +792,23 @@ mod tests {
         assert_eq!(tag, 1, "Long discriminant must be 1");
         let p64 = i64::from_le_bytes(cell_bytes_at::<8>(&cell, FIELD_CELL_PAYLOAD64_OFFSET));
         assert_eq!(p64, 0x0102_0304_0506_0708_i64, "Long payload at +8");
+
+        // The remaining discriminants. The JIT bakes only `0` (Int) and `4`
+        // (Object) as literals, but it bakes them as *positions in this
+        // sequence* — a reorder that left Int at 0 while moving Object would
+        // still miscompile `x64/objects.rs`. Pin the whole run so any reorder
+        // fails here, not in generated code.
+        for (v, want, name) in [
+            (Value::Float(1.5), 2u32, "Float"),
+            (Value::Double(1.5), 3, "Double"),
+            (Value::Object(None), 4, "Object"),
+            (Value::ReturnAddress(7), 5, "ReturnAddress"),
+            (Value::Uninitialized, 6, "Uninitialized"),
+        ] {
+            let cell = value_cell_bytes(v);
+            let tag = u32::from_le_bytes(cell_bytes_at::<4>(&cell, FIELD_CELL_TAG_OFFSET));
+            assert_eq!(tag, want, "{name} discriminant must be {want}");
+        }
 
         // `Object(None)` (JVM null) must leave the 8-byte payload word zero.
         let cell = value_cell_bytes(Value::Object(None));

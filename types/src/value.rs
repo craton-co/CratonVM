@@ -18,34 +18,78 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 /// Represents any value that can be stored in a local variable or on the operand stack.
 /// The JVM specification defines computational types that map to these variants.
 ///
-/// **Layout invariant:** this enum is compile-time asserted below to be
-/// exactly 16 bytes with alignment ≤ 8 on x86-64 / AArch64.  Adding `repr(C)`
-/// would change size to 24 bytes and break JIT slot layout.  The static
-/// asserts at the bottom of this file own the invariant; the `jit` crate
-/// replicates them as belt-and-suspenders.
+/// **Layout invariant — `#[repr(u32)]` is load-bearing, not decoration.**
+///
+/// The JIT does not treat a `Value` as an opaque Rust enum. It emits raw
+/// machine code against this type's in-memory layout: `ir_lower.rs` writes the
+/// `Int` discriminant with `MOV dword [rax + FIELD_CELL_TAG_OFFSET], 0`,
+/// `x64/bytecode_walk.rs` does the same for inline `putfield`, `x64/objects.rs`
+/// recognises an `Object` cell by the literal word `4`, and compiled
+/// `getstatic` loads straight out of a `StaticsBlock` at a baked address. Four
+/// separate facts have to hold for that code to be correct:
+///
+/// | Fact | Consumer |
+/// |------|----------|
+/// | tag is a `u32` at byte 0 | [`FIELD_CELL_TAG_OFFSET`] |
+/// | 4-byte payload at byte 4 | [`FIELD_CELL_PAYLOAD32_OFFSET`] |
+/// | 8-byte payload at byte 8 | [`FIELD_CELL_PAYLOAD64_OFFSET`] |
+/// | discriminants are 0..=6 in declaration order | every baked `0` / `4` above |
+///
+/// `#[repr(u32)]` makes all four a *language guarantee*: the enum is laid out
+/// as `#[repr(C)] struct { tag: u32, payload: union { .. } }`, so the tag is a
+/// `u32` at offset 0, each variant's payload follows at its natural alignment
+/// (4 for `Int`/`Float`/`ReturnAddress`, 8 for `Long`/`Double`/`Object`), and
+/// unassigned discriminants take declaration order from 0.
+///
+/// It was previously `#[repr(Rust)]`, with only `size_of == 16` and
+/// `align_of <= 8` asserted — neither of which pins the tag's *position*, its
+/// *width*, or its *values*, all three of which rustc is free to change for a
+/// `repr(Rust)` enum. The header here used to claim that "adding `repr(C)`
+/// would change size to 24 bytes and break JIT slot layout". That was measured
+/// and is **false**: on rustc 1.97.1 / x86-64, `repr(Rust)`, `repr(u32)` and
+/// `repr(C)` all produce size 16, align 8, tag at byte 0 with values 0..=6,
+/// 32-bit payload at byte 4, 64-bit payload at byte 8, and `Object(None)`
+/// zeroing the pointer word (the `Option<ObjectRef>` niche survives, because
+/// the niche is internal to the payload type and not the enum's own tag).
+/// `repr(u32)` was chosen over `repr(C)` because it names the tag width the
+/// JIT actually encodes.
+///
+/// [`ValueLayout`] pins every one of those facts as a `const` assertion, so a
+/// layout change is a compile error in this crate rather than a miscompile in
+/// the JIT. The `jit` crate replicates the size/align asserts as
+/// belt-and-suspenders.
+///
+/// [`FIELD_CELL_TAG_OFFSET`]: crate::heap_types::FIELD_CELL_TAG_OFFSET
+/// [`FIELD_CELL_PAYLOAD32_OFFSET`]: crate::heap_types::FIELD_CELL_PAYLOAD32_OFFSET
+/// [`FIELD_CELL_PAYLOAD64_OFFSET`]: crate::heap_types::FIELD_CELL_PAYLOAD64_OFFSET
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u32)]
 pub enum Value {
     /// A 32-bit integer (also used for boolean, byte, char, short).
-    Int(i32),
+    ///
+    /// Discriminant `0` — baked into JIT codegen; see the type-level note.
+    Int(i32) = 0,
 
     /// A 64-bit long integer. Occupies two stack/local slots.
-    Long(i64),
+    Long(i64) = 1,
 
     /// A 32-bit IEEE 754 float.
-    Float(f32),
+    Float(f32) = 2,
 
     /// A 64-bit IEEE 754 double. Occupies two stack/local slots.
-    Double(f64),
+    Double(f64) = 3,
 
     /// A reference to an object or array. Represented as a raw pointer internally.
     /// `None` represents the `null` reference.
-    Object(Option<ObjectRef>),
+    ///
+    /// Discriminant `4` — baked into JIT codegen; see the type-level note.
+    Object(Option<ObjectRef>) = 4,
 
     /// A return address for `jsr`/`ret` instructions (used by older `finally` implementations).
-    ReturnAddress(u32),
+    ReturnAddress(u32) = 5,
 
     /// Uninitialized slot placeholder (e.g., second slot of a long/double, or unset local).
-    Uninitialized,
+    Uninitialized = 6,
 }
 
 /// An opaque reference to a heap-allocated Java object.
@@ -1345,6 +1389,117 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::size_of::<ObjectRef>() == std::mem::size_of::<*mut u8>(),
     "ObjectRef must be pointer-sized"
+);
+
+// ---------------------------------------------------------------------------
+// `Value` cell layout — the four facts the JIT bakes into machine code
+// ---------------------------------------------------------------------------
+//
+// `size_of == 16` and `align_of <= 8` above do NOT pin the layout the JIT
+// actually encodes. They say nothing about where the discriminant sits, how
+// wide it is, or what values it takes — and the JIT emits literal `0` (Int) and
+// `4` (Object) tag words at a literal byte offset (`ir_lower.rs`,
+// `x64/bytecode_walk.rs`, `x64/objects.rs`), then loads payloads at literal
+// +4 / +8. Before `Value` became `#[repr(u32)]` those four facts were held only
+// by a runtime unit test in `heap_types.rs`, which catches drift after the fact
+// on whoever happens to run `-p cratonvm-types`; a rustc upgrade that reordered
+// the tag would have shipped a miscompile everywhere else.
+//
+// `#[repr(u32)]` plus the explicit `= 0 .. = 6` discriminants on the variants
+// make all four language guarantees. These assertions verify that the
+// guarantee is the layout the JIT's constants actually name, so a future edit
+// that changes `FIELD_CELL_*_OFFSET`, reorders the variants, or drops the
+// `repr` is a compile error in this crate — not a wrong answer in compiled
+// code. Const-eval reads the tag and payload words directly; that is sound
+// here because both are plain integer bytes with no pointer provenance (the
+// `Object(None)` case is the all-zero niche, never a real address).
+//
+// Keep these in sync with `heap_types::FIELD_CELL_*_OFFSET`; the asserts below
+// reference those constants rather than repeating the numbers, so the two
+// cannot drift apart silently.
+
+/// Read the discriminant word of a `Value` at `FIELD_CELL_TAG_OFFSET`.
+///
+/// SAFETY: `#[repr(u32)]` guarantees a `u32` tag at offset 0, which is
+/// `FIELD_CELL_TAG_OFFSET` (asserted below). The read is of initialized
+/// integer bytes carrying no provenance.
+const fn value_tag_word(v: &Value) -> u32 {
+    unsafe { *(v as *const Value as *const u32) }
+}
+
+/// Read the 4-byte payload of a `Value` at `FIELD_CELL_PAYLOAD32_OFFSET`.
+///
+/// SAFETY: as [`value_tag_word`]; callers below pass only `Int`-like variants,
+/// whose payload at this offset is an initialized `i32`.
+const fn value_payload32(v: &Value) -> i32 {
+    unsafe {
+        *((v as *const Value as *const u8).add(crate::heap_types::FIELD_CELL_PAYLOAD32_OFFSET)
+            as *const i32)
+    }
+}
+
+/// Read the 8-byte payload of a `Value` at `FIELD_CELL_PAYLOAD64_OFFSET`.
+///
+/// SAFETY: as [`value_tag_word`]; callers below pass only `Long` and
+/// `Object(None)`, whose payload at this offset is an initialized integer
+/// word (the `None` niche is all-zero, so no pointer provenance is read).
+const fn value_payload64(v: &Value) -> i64 {
+    unsafe {
+        *((v as *const Value as *const u8).add(crate::heap_types::FIELD_CELL_PAYLOAD64_OFFSET)
+            as *const i64)
+    }
+}
+
+// Fact 1 — the tag is a `u32` at `FIELD_CELL_TAG_OFFSET` (byte 0).
+const _: () = assert!(
+    crate::heap_types::FIELD_CELL_TAG_OFFSET == 0,
+    "FIELD_CELL_TAG_OFFSET must be 0: #[repr(u32)] puts the tag at offset 0, \
+     and the JIT emits `MOV dword [recv + FIELD_CELL_TAG_OFFSET], imm` against it"
+);
+
+// Fact 2 — discriminants are 0..=6 in declaration order. The JIT bakes `0`
+// (Int) and `4` (Object) as literals; the rest are pinned so a reorder that
+// would shift those two is caught even if the JIT's own literals are not
+// touched.
+const _: () = assert!(value_tag_word(&Value::Int(0)) == 0, "Value::Int tag must be 0");
+const _: () = assert!(value_tag_word(&Value::Long(0)) == 1, "Value::Long tag must be 1");
+const _: () = assert!(
+    value_tag_word(&Value::Float(0.0)) == 2,
+    "Value::Float tag must be 2"
+);
+const _: () = assert!(
+    value_tag_word(&Value::Double(0.0)) == 3,
+    "Value::Double tag must be 3"
+);
+const _: () = assert!(
+    value_tag_word(&Value::Object(None)) == 4,
+    "Value::Object tag must be 4 (x64/objects.rs recognises an Object cell by this literal)"
+);
+const _: () = assert!(
+    value_tag_word(&Value::ReturnAddress(0)) == 5,
+    "Value::ReturnAddress tag must be 5"
+);
+const _: () = assert!(
+    value_tag_word(&Value::Uninitialized) == 6,
+    "Value::Uninitialized tag must be 6"
+);
+
+// Fact 3 — a 4-byte payload lands at `FIELD_CELL_PAYLOAD32_OFFSET` (byte 4).
+const _: () = assert!(
+    value_payload32(&Value::Int(0x1234_5678)) == 0x1234_5678,
+    "Value::Int payload must sit at FIELD_CELL_PAYLOAD32_OFFSET"
+);
+
+// Fact 4 — an 8-byte payload lands at `FIELD_CELL_PAYLOAD64_OFFSET` (byte 8),
+// and `Object(None)` zeroes that word. The latter is what lets JIT'd code test
+// a reference field for null with a plain `cmp qword [cell + 8], 0`.
+const _: () = assert!(
+    value_payload64(&Value::Long(0x0102_0304_0506_0708)) == 0x0102_0304_0506_0708,
+    "Value::Long payload must sit at FIELD_CELL_PAYLOAD64_OFFSET"
+);
+const _: () = assert!(
+    value_payload64(&Value::Object(None)) == 0,
+    "Value::Object(None) must zero the payload word (JIT null-tests it directly)"
 );
 // Alignment half of the same invariant. Size alone does not pin the layout:
 // adding `#[repr(align(16))]`, or swapping the field for a type with a
