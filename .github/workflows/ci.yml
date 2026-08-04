@@ -122,6 +122,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
 
+      # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
+      # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an
+      # unwired resolution cache alive that way, through a 2026-07-26 audit that
+      # correctly identified it as dead and left it in place. Ratcheted at the
+      # post-A7 count with zero slack. `--nocapture` so the offender list lands
+      # in the log when it trips — the count alone does not name the regression.
+      - name: Test-only public API ratchet
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p cratonvm-vm --test no_test_only_public_api -- --nocapture
+
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
   # it is deliberately NOT in the default set — so every job above compiles the
