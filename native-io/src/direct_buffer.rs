@@ -1186,7 +1186,7 @@ fn cleaners_pending_count() -> usize {
 // ---------------------------------------------------------------------------
 //
 // PERF (H2 `TestFileSystem.testConcurrent` on `nioMemLZF:`, residual 4 of
-// `docs/known-issues/h2/h2-jitban-residuals-20260726.md`). These two methods
+// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`). These two methods
 // are real-JDK bytecode, and each one expands to a try/finally around five
 // nested invocations:
 //
