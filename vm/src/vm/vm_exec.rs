@@ -14610,7 +14610,7 @@ pub fn invoke_or_native(
     // run its own real `execute()` bytecode here too, or calling `.execute()`
     // on it from native code (via `ctx.invoke_virtual`) recurses back into
     // this same native forever (a real stack overflow, confirmed via gdb).
-    // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // See docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
     // OF 4. The other three are in `vm/src/runtime/interpreter/invoke.rs`
@@ -22568,8 +22568,8 @@ fn invoke_on_class_shared_inner(
         // path from `invoke_or_native` (e.g. reached from the interpreter's
         // reflection/initial-invoke routes) that independently consults
         // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See docs/known-issues/
-        // threadpoolexecutor-execute-npe-on-ctl-regression.md.
+        // copy of the receiver check. See docs/internal/fixed-suite-bugs/
+        // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
         //
         // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
         // COPY 4 OF 4 — and the one that does NOT call

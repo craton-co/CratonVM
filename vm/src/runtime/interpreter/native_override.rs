@@ -3030,8 +3030,8 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // set. Once `execute(Runnable)` (invoked via `invokeinterface
     // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
     // class's own real bytecode, that bytecode reads the never-initialized
-    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
-    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // `ctl` AtomicInteger and NPEs immediately (docs/internal/fixed-suite-bugs/
+    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). Force the
     // registered native (`native_es_execute`) to win for this triple;
     // `intercept_force_registered_native` additionally checks the receiver's
     // real `workers` field so a genuinely real, bytecode-constructed
@@ -5652,7 +5652,7 @@ pub(super) fn intercept_force_registered_native(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
@@ -5825,7 +5825,7 @@ pub(super) fn intercept_force_registered_native_cached(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
@@ -6305,8 +6305,8 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 // the identical bytecode shape and field count/layout (ruled
                 // out via a standalone MicroProbe repro) — something specific
                 // to this being a natively-registered bootstrap class, not the
-                // bytecode pattern itself. See docs/known-issues/
-                // stringjoiner-synthetic-native-real-jdk-field-mismatch.md. Path 2
+                // bytecode pattern itself. See docs/internal/fixed-suite-bugs/
+                // stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md. Path 2
                 // (`invoke_or_native` in vm/src/vm/vm_exec.rs) still protects
                 // StringJoiner via its own, separate, long-standing allowlist
                 // — this only reverts the NEW path-1 (interpreter

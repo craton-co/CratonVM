@@ -3061,7 +3061,7 @@ pub(super) fn populate_virtual_invoke_cache(
         // path below cache `VirtualBytecode`, whose dispatch-time
         // `intercept_force_registered_native` check re-validates the
         // ACTUAL receiver on every hit (not just at population time). See
-        // docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        // docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
         let is_real_tpe_execute = lookup_name == "java/util/concurrent/ThreadPoolExecutor"
             && method_name.as_ref() == "execute"
             && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
@@ -3368,8 +3368,8 @@ pub(super) fn populate_virtual_invoke_cache(
         // bypassing those receiver checks entirely, is what actually poisons
         // this call site's inline cache with `VirtualNative` for a
         // genuinely real ThreadPoolExecutor. Exempt it the same way as the
-        // other call sites. See docs/known-issues/
-        // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        // other call sites. See docs/internal/fixed-suite-bugs/
+        // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
         let is_real_tpe_execute_force = declaring_name == "java/util/concurrent/ThreadPoolExecutor"
             && method_name.as_ref() == "execute"
             && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"

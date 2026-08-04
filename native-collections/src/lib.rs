@@ -26999,7 +26999,7 @@ fn native_comparator_then_comparing_double(
 // size, len, emptyValue) — writing through the legacy indices above then
 // silently lands on the wrong real fields (wrong type too: `elts` is a
 // String[], not an ArrayList). See
-// docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md.
+// docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md.
 // `sj_real_layout` resolves the real class's actual field indices by name
 // when present; every entry point below branches on it. This is
 // intentionally still a full from-scratch Rust reimplementation of

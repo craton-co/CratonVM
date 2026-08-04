@@ -3010,8 +3010,8 @@ pub(super) fn try_stackless_invoke(
     // ThreadPoolExecutor.execute(Runnable): the registered native
     // (`native_es_execute`) is exempted from the real-JDK-mode registration
     // drop (native-api/src/registry.rs) specifically so it stays available
-    // for CratonVM's synthetic-layout Executors.* stand-ins (docs/known-issues/
-    // threadpoolexecutor-execute-npe-on-ctl-regression.md). But this "native
+    // for CratonVM's synthetic-layout Executors.* stand-ins (docs/internal/fixed-suite-bugs/
+    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). But this "native
     // override" step is unconditional -- it has no receiver awareness -- so
     // it was ALSO winning for a genuinely real, bytecode-constructed
     // ThreadPoolExecutor (its own real `workers` field populated), routing
@@ -3019,8 +3019,8 @@ pub(super) fn try_stackless_invoke(
     // "run inline" fallback instead of real async bytecode.
     // `intercept_force_registered_native` above already carries this exact
     // receiver check for the FORCE-native case; mirror it here so a real
-    // receiver's native shadow is dropped too. See docs/known-issues/
-    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+    // receiver's native shadow is dropped too. See docs/internal/fixed-suite-bugs/
+    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 2
     // OF 4. See COPY 1 in `vm/src/vm/vm_exec.rs::invoke_or_native` for the full
@@ -3481,8 +3481,8 @@ pub(super) fn try_stackless_invoke(
             // a genuinely real ThreadPoolExecutor still gets shunted to
             // `native_es_execute`'s inline "run synchronously" fallback right
             // here, even though the real `execute()` bytecode was correctly
-            // found and would otherwise run. See docs/known-issues/
-            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+            // found and would otherwise run. See docs/internal/fixed-suite-bugs/
+            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
             //
             // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape
             // check, COPY 3 OF 4. See COPY 1 in

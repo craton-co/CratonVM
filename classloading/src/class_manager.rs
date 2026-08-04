@@ -2086,6 +2086,36 @@ pub struct ClassManager {
     /// repeats of a handful of names and would be useless as a backlog.
     origin_violations_seen: FxHashSet<String>,
 
+    /// `class name -> owner/Class.method(Desc)` of whoever first caused the
+    /// class to be fabricated, for `ClassOriginEntry::requested_by`.
+    ///
+    /// `ClassManager` is called with a bare name and cannot see the frame, so
+    /// this map is filled from the *outside*, by
+    /// [`Self::attach_origin_requester`], which the VM's class-load choke point
+    /// calls with the frame it was resolving for. Only classes that actually
+    /// produced a violation get an entry, so the map is bounded by the
+    /// violation list, not by the class store.
+    ///
+    /// Keyed by class name rather than `ClassId` because the violation is
+    /// recorded *before* the class exists, and in `JdkOnly` mode no class is
+    /// ever created for it.
+    origin_requesters: FxHashMap<String, String>,
+
+    /// Optional live sink for class-origin violations, installed per VM.
+    ///
+    /// `--trace-jdk-only` used to be a poll of [`Self::origin_violations`],
+    /// which meant every mid-run fabrication surfaced at shutdown, detached
+    /// from the code that caused it. With a sink installed the launcher gets
+    /// each violation at the instant it is recorded.
+    ///
+    /// A field, not a process global: contract §2, and the repo has a history
+    /// of process-global native caches leaking between two VMs in one process.
+    /// Two VMs in one process therefore see only their own violations.
+    ///
+    /// Invoked from [`Self::admit_compatibility_class`] while the manager is
+    /// mutably borrowed, so the sink must not re-enter the class manager.
+    violation_sink: Option<Arc<dyn Fn(&JdkOnlyViolation) + Send + Sync>>,
+
     /// C2 review P1 — VM identity + per-class metadata generation for the
     /// generational handles in [`crate::metadata_handle`].
     ///
@@ -2530,6 +2560,8 @@ impl ClassManager {
             compatibility_mode: CompatibilityMode::Compatible,
             origin_violations: Vec::new(),
             origin_violations_seen: FxHashSet::default(),
+            origin_requesters: FxHashMap::default(),
+            violation_sink: None,
             // Unbound: `ClassManager::new` runs before the owning `SharedVm`
             // exists, so it has no `vm_identity` to record yet. `vm_init` calls
             // `bind_vm_id` as soon as it does.
@@ -2634,17 +2666,25 @@ impl ClassManager {
                 name: c.name.to_string(),
                 origin: c.origin.as_str().to_string(),
                 reason: c.origin.reason().map(|r| r.to_string()),
-                // JDK-ONLY-NOTE: `requested_by` stays `None` here, permanently
-                // as far as this crate is concerned. The requesting
-                // `owner/Class.method(Desc)` is known to the *interpreter* —
-                // it is the frame that ran the `new` / `checkcast` /
-                // `Class.forName` — and is not reachable from `ClassManager`,
-                // which is called with a bare name. Populating it means
-                // threading the current frame through the load path, which
-                // belongs to the interpreter agent's half of the contract
-                // (§7); the field is in `ClassOriginEntry` so that half can
-                // fill it without another schema change.
-                requested_by: None,
+                // The requesting `owner/Class.method(Desc)` is known to the
+                // *interpreter* — it is the frame that ran the `new` /
+                // `checkcast` / `Class.forName` — and is not reachable from
+                // `ClassManager`, which is called with a bare name. Rather
+                // than thread the frame through every load path, the VM's
+                // class-load choke point calls
+                // [`Self::attach_origin_requester`] with the frame it was
+                // resolving for, and that fills this map.
+                //
+                // `None` here therefore means one of three things, and they
+                // are worth telling apart before drawing a conclusion:
+                // the class produced no violation (the common case — nothing
+                // to attribute); or it was fabricated during VM bootstrap,
+                // before any Java frame existed; or it was requested by a
+                // native through the direct `ensure_synthetic_class` API,
+                // which has a Rust caller and no Java frame. Only the last is
+                // a gap, and `registered_by`-style provenance is the right
+                // instrument for it, not this field.
+                requested_by: self.origin_requesters.get(&*c.name).cloned(),
                 real_bytes_found: c.origin.has_real_bytes(),
                 loader_id: c.loader_id.to_native_id(),
             })
@@ -2658,6 +2698,80 @@ impl ClassManager {
     /// `--jdk-only` run would have refused.
     pub fn origin_violations(&self) -> &[JdkOnlyViolation] {
         &self.origin_violations
+    }
+
+    /// How many class-origin violations have been recorded so far.
+    ///
+    /// A `Vec::len`, taken before a load so
+    /// [`Self::attach_origin_requester`] can tell whether that load recorded
+    /// anything. Keeping this separate from `origin_violations()` means the
+    /// caller does not borrow the whole slice just to compare a length.
+    pub fn origin_violation_count(&self) -> usize {
+        self.origin_violations.len()
+    }
+
+    /// Name the Java frame responsible for every violation recorded at or
+    /// after `from`.
+    ///
+    /// Called by the VM's class-load choke point with the count it took
+    /// immediately before the load. **Returns without allocating when the load
+    /// recorded nothing**, which is every load but the handful that fabricate
+    /// — that is why the requester is passed as three borrowed `&str`s rather
+    /// than a formatted `String`: the common path must not pay for a format
+    /// that is then thrown away.
+    ///
+    /// A violation that already names a requester is left alone, so the
+    /// *first* frame to demand a class keeps the attribution even if a nested
+    /// load re-enters. Note that `admit_compatibility_class` dedupes by class
+    /// name, so only the first requester of a given class is ever recorded at
+    /// all; "which call sites depend on this fabrication" needs a different
+    /// instrument.
+    pub fn attach_origin_requester(
+        &mut self,
+        from: usize,
+        owner: &str,
+        method: &str,
+        descriptor: &str,
+    ) {
+        if from >= self.origin_violations.len() {
+            return;
+        }
+        let requester = format!("{owner}.{method}{descriptor}");
+        for violation in &mut self.origin_violations[from..] {
+            if let JdkOnlyViolation::CompatibilityClassRequested {
+                class, requester: slot, ..
+            } = violation
+            {
+                if slot.is_none() {
+                    *slot = Some(requester.clone());
+                    self.origin_requesters
+                        .entry(class.clone())
+                        .or_insert_with(|| requester.clone());
+                }
+            }
+        }
+    }
+
+    /// Install a live sink for class-origin violations (contract §9's
+    /// *"log every violation as it happens"*).
+    ///
+    /// Call once, right after `Vm::new`, before the launcher's first drain.
+    /// Violations recorded during `Vm::new` itself predate the sink and are
+    /// still picked up by that first drain; everything after it arrives live.
+    ///
+    /// Per VM, never process-global (contract §2).
+    pub fn set_violation_sink(&mut self, sink: Arc<dyn Fn(&JdkOnlyViolation) + Send + Sync>) {
+        self.violation_sink = Some(sink);
+    }
+
+    /// Whether a live sink is installed.
+    ///
+    /// The launcher's periodic drain uses this to advance its watermark
+    /// *without* re-printing: with a sink installed, every violation past the
+    /// first drain has already been reported at the instant it happened, and
+    /// printing it again at shutdown would double-report it.
+    pub fn has_violation_sink(&self) -> bool {
+        self.violation_sink.is_some()
     }
 
     /// Decide whether a compatibility class may be fabricated, recording the
@@ -2694,11 +2808,28 @@ impl ClassManager {
                     // debug-asserts it), so the initiating loader is not in
                     // question here.
                     initiating_loader: Some("bootstrap".to_string()),
-                    // JDK-ONLY-NOTE: see `dump_class_origins` — the requesting
-                    // method is the interpreter's to supply, not this crate's.
+                    // Filled in by `attach_origin_requester` once the load
+                    // returns to the VM choke point that knows the frame; see
+                    // `dump_class_origins`. It is deliberately still `None`
+                    // *here*, because this crate is called with a bare name.
                     requester: None,
                     reason: reason.to_string(),
                 });
+            // Live trace (contract §9). Dispatched inside the dedupe branch so
+            // the sink sees exactly the violations the report will list — one
+            // per distinct class — and not the thousands of repeat requests
+            // the dedupe exists to swallow.
+            //
+            // The requester is not attached yet: it arrives a moment later,
+            // from the choke point above this call, once the load unwinds back
+            // to a frame. A live line therefore names the class and the reason
+            // but not the caller; the shutdown census has both. Reporting late
+            // enough to have the requester would defeat the point of the sink.
+            if let Some(sink) = self.violation_sink.clone() {
+                if let Some(violation) = self.origin_violations.last() {
+                    sink(violation);
+                }
+            }
             if self.compatibility_mode.is_jdk_only() {
                 debug!(
                     class = name,

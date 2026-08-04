@@ -5431,8 +5431,8 @@ impl NativeMethodRegistry {
         // `execute()`/`submit()`/`shutdown()` overrides too, sending them
         // straight to real JDK bytecode that dereferences an uninitialized
         // `ctl`/`mainLock` field and NPEs
-        // (`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
-        // `docs/known-issues/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md`).
+        // (`docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `docs/internal/fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
         // A prior narrower fix (merged separately, same day) exempted only
         // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
         // distinction into the interpreter's dispatch layer instead
