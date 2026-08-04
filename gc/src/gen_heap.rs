@@ -126,14 +126,59 @@ fn young_arena_needs_defragmentation(used: usize, capacity: usize, largest_free:
     bump_exhausted && capacity > DEFRAG_LARGEST_FREE_FLOOR && largest_free < DEFRAG_LARGEST_FREE_FLOOR
 }
 
-/// Count of non-moving young sweeps that took the defragmentation escalation.
-/// Diagnostic only; read by the GC summary.
-static DEFRAG_PROMOTE_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Selective-promotion census for the non-moving young sweep.
+///
+/// `tracing::debug!` is compiled out of release builds (the workspace pins
+/// `tracing`'s `release_max_level_info`), so a debug line here would have been
+/// invisible in exactly the builds that run the suites. These counters are the
+/// diagnostic instead, and they answer the one question the aggregate numbers
+/// cannot: when `promoted` stays at 0 for hundreds of cycles, is the pass not
+/// running, running and finding nothing tenurable, or finding candidates and
+/// rejecting every one?
+static SP_CENSUS: SelectivePromotionCensus = SelectivePromotionCensus {
+    sweeps: AtomicU64::new(0),
+    sweeps_selective: AtomicU64::new(0),
+    sweeps_defrag: AtomicU64::new(0),
+    candidates: AtomicU64::new(0),
+    pinned: AtomicU64::new(0),
+    unaged: AtomicU64::new(0),
+    evacuated: AtomicU64::new(0),
+    old_full: AtomicU64::new(0),
+};
 
-/// How many non-moving young sweeps have escalated to defragmentation
-/// (see [`young_arena_needs_defragmentation`]).
-pub fn defrag_promote_cycles() -> u64 {
-    DEFRAG_PROMOTE_CYCLES.load(Ordering::Relaxed)
+/// See [`SP_CENSUS`].
+struct SelectivePromotionCensus {
+    /// Non-moving young sweeps entered.
+    sweeps: AtomicU64,
+    /// …of which ran the selective-promotion pass at all.
+    sweeps_selective: AtomicU64,
+    /// …of which escalated to defragmentation.
+    sweeps_defrag: AtomicU64,
+    /// Marked survivors the evacuation walk examined.
+    candidates: AtomicU64,
+    /// …rejected because a root/finalizer value pinned them.
+    pinned: AtomicU64,
+    /// …rejected because they had not reached `PROMOTION_AGE`.
+    unaged: AtomicU64,
+    /// …actually copied into old gen.
+    evacuated: AtomicU64,
+    /// Evacuations that failed because old gen was full.
+    old_full: AtomicU64,
+}
+
+/// Snapshot of [`SP_CENSUS`] as
+/// `(sweeps, selective, defrag, candidates, pinned, unaged, evacuated, old_full)`.
+pub fn selective_promotion_census() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        SP_CENSUS.sweeps.load(Ordering::Relaxed),
+        SP_CENSUS.sweeps_selective.load(Ordering::Relaxed),
+        SP_CENSUS.sweeps_defrag.load(Ordering::Relaxed),
+        SP_CENSUS.candidates.load(Ordering::Relaxed),
+        SP_CENSUS.pinned.load(Ordering::Relaxed),
+        SP_CENSUS.unaged.load(Ordering::Relaxed),
+        SP_CENSUS.evacuated.load(Ordering::Relaxed),
+        SP_CENSUS.old_full.load(Ordering::Relaxed),
+    )
 }
 
 /// Byte spacing at which the parallel sweep SUBSAMPLES the object grid the
@@ -6669,6 +6714,7 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
+        SP_CENSUS.sweeps.fetch_add(1, Ordering::Relaxed);
         let phase_diag = gc_flags().dbg_gcphase;
         let phase_start = std::time::Instant::now();
         let mut phase_last = phase_start;
@@ -7722,16 +7768,9 @@ impl GenerationalHeap {
                     young_from.capacity(),
                     young_from.largest_free_block(),
                 );
+            SP_CENSUS.sweeps_selective.fetch_add(1, Ordering::Relaxed);
             if defrag_escalate {
-                DEFRAG_PROMOTE_CYCLES.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    "young non-moving sweep: defragmentation escalation — used={} \
-                     capacity={} largest_free={}; tenuring every unpinned survivor \
-                     regardless of age",
-                    sweep_used,
-                    young_from.capacity(),
-                    young_from.largest_free_block(),
-                );
+                SP_CENSUS.sweeps_defrag.fetch_add(1, Ordering::Relaxed);
             }
 
             // (1) Pin set: every root / finalizer value that lands in young.
@@ -8007,6 +8046,17 @@ impl GenerationalHeap {
                     let aged = defrag_escalate || header.gc_age + 1 >= PROMOTION_AGE;
                     let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
                     let marked = header_marked || side_bits.contains(addr);
+                    // Census (see `SP_CENSUS`): classify every marked survivor
+                    // the walk reaches, so a `promoted=0` run says WHICH of the
+                    // three rejections it was.
+                    if marked {
+                        SP_CENSUS.candidates.fetch_add(1, Ordering::Relaxed);
+                        if !aged {
+                            SP_CENSUS.unaged.fetch_add(1, Ordering::Relaxed);
+                        } else if pinned.contains(&addr) {
+                            SP_CENSUS.pinned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if marked && !aged && !header_marked {
                         // Deferred, anchor-verified age bump — applied with
                         // the forwarding installs below. Header-marked
@@ -8075,8 +8125,12 @@ impl GenerationalHeap {
                                     .bytes_promoted
                                     .fetch_add(total_size as u64, Ordering::Relaxed);
                                 self.stats.objects_promoted.fetch_add(1, Ordering::Relaxed);
+                                SP_CENSUS.evacuated.fetch_add(1, Ordering::Relaxed);
                             }
-                            None => old_full = true,
+                            None => {
+                                SP_CENSUS.old_full.fetch_add(1, Ordering::Relaxed);
+                                old_full = true
+                            }
                         }
                     }
                     cursor += total_size;

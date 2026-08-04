@@ -1472,12 +1472,20 @@ pub(super) fn note_gc_productivity(shared: &SharedVm, before_live: usize, before
         // is 70% free reads as "148 MB live" and every diagnosis stops there.
         // `young_largest_free` vs `young_free_list` is the fragmentation face.
         let (y_used, y_free, y_largest, y_cap) = shared.mem.heap.young_occupancy();
+        // Selective-promotion census: `promoted=0` for hundreds of cycles has
+        // at least three very different causes (pass never ran / nothing
+        // tenurable / everything pinned) and the aggregate cannot tell them
+        // apart. See `gen_heap::SP_CENSUS`.
+        let (sw, sel, defrag, cand, pin, unaged, evac, ofull) =
+            cratonvm_gc::gen_heap::selective_promotion_census();
         eprintln!(
             "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
              freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
              old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak} \
              young_used={y_used} young_free_list={y_free} young_largest_free={y_largest} \
-             young_cap={y_cap}"
+             young_cap={y_cap} sp_sweeps={sw} sp_selective={sel} sp_defrag={defrag} \
+             sp_candidates={cand} sp_pinned={pin} sp_unaged={unaged} sp_evacuated={evac} \
+             sp_old_full={ofull}"
         );
     }
 }
