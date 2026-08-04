@@ -6940,6 +6940,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         let own = lax.tiles.iter().find(|t| t.root == cmp).expect("cmp tile");
@@ -7054,6 +7055,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         assert!(
@@ -7072,6 +7074,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         let t = s.tiles.iter().find(|t| t.root == f.add).expect("add tile");
@@ -7280,6 +7283,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         assert_eq!(
