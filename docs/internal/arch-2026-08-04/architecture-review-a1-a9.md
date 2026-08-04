@@ -1,20 +1,24 @@
-# Architecture review A1–A9 — findings, fixes, and three corrections
+# Architecture review A1–A9 — findings, fixes, and four corrections
 
 **Slug:** `architecture-review-a1-a9`
 **Date:** 2026-08-04
 **Status:** LANDED for A1, A3, A4a, A6, A7, A8. **A5 WITHDRAWN** and **A2
 CLOSED** — both rested on claims that measurement did not support, and A2's
 surviving residual was then measured and found negligible (§A5, §A2). **A4b
-PARTLY LANDED**: its correctness half turned out to be a real, unguarded gap in
-CI and is fixed; the interpreter rewrite is deliberately deferred, not
-half-landed. **A9 advisory.**
+RESOLVED**: its correctness half was a real, unguarded CI gap and is fixed; the
+loop-invariant hoist landed; the per-bytecode safepoint poll was *measured* at
+~7% on an interpreter-bound loop; and "122 opcodes implemented twice" turned out
+to overstate the duplication (they are superinstruction fusions). The rewrite
+itself is scoped with a measured justification rather than deferred on a hunch.
+**A9 advisory.**
 
-Three of the nine findings were wrong in whole or in part, and all three errors
-share a shape: a conclusion drawn from the *storage* or from a grep, without
+Four of the nine findings were wrong in whole or in part, and the errors share a
+shape: a conclusion drawn from the *storage* or from a grep, without
 reading the consumer. A5 counted `fn` lines in a file and attributed them to a
 type that has no `impl` block there. A2 asserted a runtime tag load that the
-emitter has never performed. A9 asserted tests do not run that CI does run.
-They are corrected in place below rather than quietly dropped.
+emitter has never performed. A9 asserted tests do not run that CI does run. A4b called
+superinstruction fusions "two implementations" of the same opcodes. They are
+corrected in place below rather than quietly dropped.
 
 ## Tree basis
 
@@ -34,6 +38,7 @@ Files changed:
 - `vm/src/runtime/lockfree_resolve.rs`,
   `vm/tests/no_test_only_public_api.rs` (A7, A8)
 - `difftest/src/main.rs` (A4b — the missing `interp-decoded` gate axis)
+- `vm/src/runtime/interpreter.rs` (A4b — `use_fast_path` hoist)
 - `.github/workflows/ci.yml` (A6, A7 gates)
 
 ---
@@ -46,7 +51,7 @@ Files changed:
 | A2 | "Statics cost a runtime tag load" | **CLOSED — half wrong, rest measured at 2-3 KiB** |
 | A3 | 13 diagnostic gates inline on the native-call funnel | **LANDED** |
 | A4a | Two byte-identical exception-unwind copies in the dispatch loop | **LANDED** |
-| A4b | 122 opcodes with two implementations; per-bytecode safepoint poll | **PARTLY LANDED** — the decoded path was never differentially tested; now is. Rewrite deferred — §A4b |
+| A4b | dual dispatch; per-bytecode safepoint poll | **RESOLVED, rewrite scoped** — gate gap fixed, hoist landed, poll priced at ~7%; "two implementations" overstated — §A4b |
 | A5 | "`SharedVm` has 458 methods" | **WITHDRAWN — wrong** |
 | A6 | Lock hierarchy has 0% adoption in `native-builtins` | **LANDED** (gate + first 2) |
 | A7 | Dead resolution tiers kept alive by their own tests | **LANDED** |
@@ -337,7 +342,7 @@ Verified: `exception_tests` 11 passed, `exception_edge_tests` 19 passed,
 
 ---
 
-# A4b — The dual interpreter dispatch — NOT DONE
+# A4b — RESOLVED: CI gap fixed, hoist landed, poll priced at ~7%; rewrite scoped
 
 ## The finding stands, with one number sharpened
 
@@ -414,7 +419,61 @@ Two notes for whoever takes it, both learned while scoping A4a:
 2. **The safepoint poll's ordering is load-bearing.** The `Acquire` is what
    orders the reads that follow it. Relaxing it in place is not an option.
 
-## The safepoint poll was deliberately left alone
+## What "two implementations" actually means — a fourth correction
+
+The review said "every fix to those 122 opcodes must land twice". Reading the
+arms shows that overstates it. They are **superinstruction fusions** — one arm
+fuses `iload_X; iload_Y; if_icmplt` with inline PGO branch recording and the OSR
+back-edge hook — not re-implementations of the individual opcodes.
+
+A fused sequence is inherently separate code from its components in *any*
+interpreter design, token-threaded included; a rewrite turns these into fused
+*tokens*, it does not merge them away. So the duplication cost is real but far
+smaller than "122 opcodes implemented twice", and the fast path is a normal
+fast/slow split with a shared fallback rather than a second interpreter.
+
+What genuinely remains is the per-bytecode prologue — a pure performance
+question, so it was measured rather than argued.
+
+## The per-bytecode safepoint poll costs ~7%, measured
+
+Two release binaries, identical but for the poll:
+
+- **A** — baseline (with the `use_fast_path` hoist).
+- **B** — the per-bytecode `stw_requested` `Acquire` load removed. Back-edge,
+  invoke, allocation and method-entry polls all retained. *Measurement build
+  only; never committed.*
+
+22 runs of `LicmHoistBench` under `--nojit` (interpreter-bound), interleaved in
+both orders across two blocks, using the program's own `best_ns` so VM startup
+is excluded.
+
+**Pooled means and medians are invalid for this data and are not quoted.** The
+box drifted badly — the same arm produced 9.6 s and 22.7 s, a 2.4× spread, with
+runs climbing to ~17 s mid-block then falling back to ~9.6 s: the monotone-drift
+signature this project's benchmarking rules warn about. An earlier attempt was
+discarded outright after a `cargo build` was allowed to run concurrently with it.
+
+Benchmark noise here is **one-sided upward**, so the minimum is the robust
+estimator. The low ends separate cleanly and never cross:
+
+| Arm | three best runs (s) |
+|---|---|
+| A (poll present) | 9.62, 9.63, 10.09 |
+| B (poll removed) | **8.90, 8.98, 9.04** |
+
+Every one of B's three best beats both of A's two best. Minimum-to-minimum:
+**9.62 → 8.90, ≈7.5% faster**, direction consistent across both blocks.
+
+Call it **6–8% on an interpreter-bound loop**. Directional — one workload, on a
+noisy Windows box rather than the project's Azure Linux suite host — but enough
+to answer what the rewrite needed answered: **the per-bytecode prologue is worth
+real throughput. A4b is not a cleanliness exercise.**
+
+Anyone taking this further should re-measure on the Azure host against a HotSpot
+control before committing to a number.
+
+## The safepoint poll was still not moved
 
 Moving it off the per-bytecode path is the obvious separable win — JVMS only
 requires safepoints at back edges, calls and allocations, all of which are
@@ -727,6 +786,12 @@ The one failure — `native_override::redefine_immunity_tests::layout_immunity_i
 — **was baselined against an unmodified `dev` worktree and fails there
 identically.** It is not caused by this branch.
 
-No performance A/B was run for A3 or A8. Both are argued structurally and the
-nanoseconds are explicitly not claimed; §A3 and §A8 say what would have to be
+No performance A/B was run for **A3 or A8**. Both are argued structurally and
+the nanoseconds are explicitly not claimed; §A3 and §A8 say what would have to be
 measured and under what conditions.
+
+One A/B **was** run, for **A4b**: 22 interleaved `--nojit` runs pricing the
+per-bytecode safepoint poll at ~7% on an interpreter-bound loop (§A4b). Pooled
+means are not quoted from it — the box drifted 2.4× — only the minima, which
+separate cleanly and never cross. An earlier attempt at the same measurement was
+discarded because a `cargo build` was allowed to run alongside it.
