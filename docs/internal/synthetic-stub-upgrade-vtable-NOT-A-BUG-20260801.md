@@ -64,6 +64,11 @@ exist nowhere: `cratonvm/internal/Unmodifiable*`, `cratonvm/stream/LazyOp`,
 `java/util/function/Predicate$$Lambda$*`, `java/util/Comparator$Native`.
 `--dump-class-origins` on a hello-world agrees: 14 stubs, all of that family.
 
+(As of `6ca262993`, `java/util/LinkedHashMap$Node` is no longer among them:
+LinkedHashMap nodes bind to the real `java/util/LinkedHashMap$Entry`, so the
+list is one shorter than measured here. The counts above are left as measured
+on 08-01.)
+
 Two positive controls also failed to trigger it, which is itself informative:
 
 * Planting a real `cratonvm/internal/UnmodifiableList.class` on the app

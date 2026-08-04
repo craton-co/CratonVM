@@ -245,6 +245,28 @@ handler in the inlined frame and none in the caller. The test's control is the
 same call before the method was ever compiled, so it compares the compiled path
 against the interpreter rather than against a hard-coded string.
 
+**The captured stack trace still names the callee.** The brief asked for "same
+exceptions, same stack traces, same `finally` execution", and the stack-trace
+half is the one a spliced body threatens: it has no frame of its own, and
+`FrameState::caller` is populated by nobody, so there is nothing to rebuild a
+callee frame from. Measured on the reachable shape (an implicit
+`ArithmeticException` out of a spliced `idiv`): the trace names one `tag` frame
+compiled and one interpreted. This is a result about that shape, not a general
+proof — but it is the shape this lane can produce, and it is now pinned.
+
+Monitors are the brief's second blocker: every `FrameState` the lowerer builds
+hard-codes an empty monitor list, so a spliced body could carry no monitor
+state to rebuild. The resolver refuses both shapes — a `synchronized` method
+(access flag) and a `synchronized` block (`monitorenter`/`monitorexit`) — and
+the test asserts the refusal CATEGORY, not merely that no splice happened,
+because an unprofiled site also fails to splice and that is a different fact.
+
+`finally` gets the same treatment: a callee with a non-empty exception table is
+never spliced, and the test counts the side effect on both escape routes. The
+brief calls this out for a reason — "this VM has already shipped a JIT-compiled
+`finally` that was not run on three escape routes; inlining multiplies that
+surface".
+
 ## 4. Deopt safety, enforced rather than argued
 
 `deopt::FrameState::caller` exists but **no production site populates it** —
@@ -442,6 +464,9 @@ compiles" is the claim under test.
 | `check_interface_site` | `invokeinterface` with one implementation: correct AND spliced, so a regression to "correct but never inlined" is visible |
 | `check_bimorphic` | two overriding classes evenly mixed; asserts ≥ 12 spliced callee bytecodes, because a one-guard lowering also produces correct answers (the second class just dispatches) |
 | `check_uncaught_from_inlined_frame` | `ArithmeticException` out of a guard-hit inlined frame, compared against the same call before the method compiled |
+| `check_stack_trace_through_an_inlined_frame` | the brief's "same stack traces" requirement: the CAPTURED trace of an exception raised inside a guard-hit spliced body names the callee frame exactly as the interpreted one does (measured 1 vs 1, with a floor so two zeros cannot agree vacuously) |
+| `check_monitor_bearing_callees_are_refused` | the brief's second blocker: a `synchronized` method AND a `synchronized` block are both refused, and the refusal category is asserted so "refused for an unrelated reason" cannot pass |
+| `check_finally_runs_at_a_guard_eligible_site` | the brief's `finally` requirement: a `finally`-bearing callee is never spliced, and the `finally` runs exactly once per call on BOTH escape routes |
 | `check_thrower` | exception + catch control flow through a compiled, guard-eligible site |
 | `check_polymorphic` | 4 types, none dominant: must refuse and must never mis-dispatch |
 | `check_metrics_harvest` | the tally reaches `metrics::compilation_reports()` |
@@ -572,15 +597,19 @@ relied on.
    `InvalidationManager` threaded out from behind `jit_realm`'s mutex. The
    name-keyed channel now has the reach that motivated this, so it would buy
    precision, not correctness.
-5. **A package-private method selected from a class other than the
+5. **The stack-trace equivalence result covers ONE shape.** An implicit
+   `ArithmeticException` out of a spliced `idiv` reconstructs the callee frame;
+   a different escaping shape has not been measured, and there is no mechanism
+   guaranteeing it — the guarantee would be `FrameState::caller`, i.e. item 1.
+6. **A package-private method selected from a class other than the
    constant-pool class is refused** (§3). Deciding it properly needs a second
    constant-pool resolution, which the metadata-bypass ratchet in
    `vm/src/runtime/resolve/guard.rs` does not permit; a `MemberResolver`-based
    answer would.
-6. **Loop-unrolled copies of a guarded site fall back to dispatch.** The guard
+7. **Loop-unrolled copies of a guarded site fall back to dispatch.** The guard
    map is deliberately not replicated across the loop-unroll pc rewrite —
    always correct, just not optimized.
-7. **`jit/src/pgo.rs` is still unwired.** It no longer carries a rival policy:
+8. **`jit/src/pgo.rs` is still unwired.** It no longer carries a rival policy:
    `ReceiverTypeProfile::shape` is a view onto `classify_receiver_shape`, with
    truncation layered on top because the live profile store has no notion of
    it. Give it a recorder before reading anything from it — every counter in it

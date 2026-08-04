@@ -1864,6 +1864,28 @@ pub fn execute(
                             None => None,
                         };
                     }
+                    // ── The admission gate, third door ────────────────────
+                    //
+                    // This block reaches `x64::compile_with_param_slots`
+                    // directly, like `compile_osr_artifact` and unlike
+                    // `jit::try_compile`. It had already been taught the
+                    // kill-switch and the bisect levers by hand (see
+                    // `env_disable_jit` above) but never the permanent
+                    // bail-list, the code-cache cap, or the compile-epoch
+                    // witness — so an eager first-call compile could re-run the
+                    // pipeline on a method the backend had permanently refused,
+                    // commit code past a cap the ordinary door was respecting,
+                    // and publish a body stamped at buffer finalize rather than
+                    // from before the first constant-pool read.
+                    // `compile_gate::admit` asks all of them; the token owns
+                    // the epoch witness and must outlive the resolution below.
+                    let admission = cratonvm_jit::compile_gate::admit(
+                        &class_name_str,
+                        method_name,
+                        method_descriptor,
+                        cratonvm_jit::compile_gate::CompileDoor::EagerFirstCall,
+                    )
+                    .ok()?;
                     let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
                     let code_len = code_attr.code.len();
                     let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
@@ -2632,6 +2654,7 @@ pub fn execute(
                         0
                     };
                     let mut cm = crate::jit::x64::compile_with_param_slots(
+                        &admission,
                         &padded,
                         code_len,
                         param_slots,
@@ -7879,10 +7902,16 @@ fn alloc_multi_array(
         } else {
             ArrayElementType::Reference
         };
+        // SB-LOADER-ZIPCONTENT (2026-08-04): `_full`, not the young-only
+        // variant. `alloc_multi_array` holds already-allocated dimension arrays
+        // in Rust locals across the recursion, so it deliberately never forces
+        // a GC — which leaves it with no second chance at all. Spilling into
+        // old gen is that second chance, and it relocates nothing (see
+        // `try_alloc_array_humongous`), so it is safe from exactly here.
         let arr = shared
             .mem
             .heap
-            .try_alloc_array(level_class_id, element_type, length)
+            .try_alloc_array_full(level_class_id, element_type, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(
@@ -7894,10 +7923,11 @@ fn alloc_multi_array(
         Ok(arr)
     } else {
         // Intermediate dimensions: always Reference (array of arrays)
+        // `_full` for the same reason as the leaf dimension above.
         let arr = shared
             .mem
             .heap
-            .try_alloc_array(level_class_id, ArrayElementType::Reference, length)
+            .try_alloc_array_full(level_class_id, ArrayElementType::Reference, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(

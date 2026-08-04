@@ -1075,32 +1075,79 @@ struct MethodPromotionSnapshot {
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
 pub fn dump_method_stats_to_stderr() {
-    // The OSR lifecycle, first and BEFORE the `DIAG_CORE` early return, so a
-    // run with no tiered manager still reports it.
+    // The admission gate and the OSR metadata checks, first and unconditional.
     //
-    // The `osr-02` lane ungated these counters precisely because *a silent OSR
-    // exit is indistinguishable from never having entered* — and then nothing
-    // printed them, which its own design doc records as the reason they "have
-    // not been read end to end from a live run". A differential that cannot
-    // show its OSR arms actually ENTERED and EXITED is a test of the
-    // interpreter, so the harness this lane adds needs this line to not be
-    // vacuous.
+    // Every number here was previously computed and stored by a `pub fn` with
+    // **no caller anywhere in the tree** — `jit_bail_shortcircuits`,
+    // `jit_code_cache_cap_refusals`, `osr_contract_violations`,
+    // `stale_install_epoch_refusals`. Each one's own doc says it is "expected
+    // to stay zero" and that a diagnostic nobody enables is how a compiler bug
+    // stays unnoticed; none of them could be enabled at all. Printed before the
+    // `DIAG_CORE` early return so a run with no tiered manager still reports
+    // them.
     //
-    // How to read it: never `osr_exited` alone. Against `osr_entered` it is the
-    // livelock shape (every entry paying for a trampoline and a local seed,
-    // then leaving); `osr_entered` at zero under a hot loop means requests are
-    // being refused or declined, and `osr_refused_entry` /
-    // `osr_compile_declined` say which. The four `osr_exit_*` rows partition
-    // the exits that arrived with a reconstructed frame, and two of them —
-    // `osr_exit_map_missing`, `osr_exit_bci_unrecorded` — must read zero.
-    eprintln!(
-        "[cratonvm] OSR lifecycle: {}",
-        crate::metrics::osr_counts()
+    // How to read the three groups:
+    //
+    //   * `admitted`/`refused` per door — a door whose `admitted` is 0 on a
+    //     workload that clearly used it is not calling the gate.
+    //   * `ungated-backend-entries` — MUST be 0. Non-zero means some path
+    //     reached `x64::compile_with_param_slots` without an admission, which
+    //     is the drift `compile_gate` exists to prevent.
+    //   * `osr-contract-violations` / `osr-coordinate-mismatches` — both MUST
+    //     be 0. Non-zero means an artifact's OSR metadata contradicted itself
+    //     and was dropped, so the method silently lost OSR service.
+    {
+        use crate::compile_gate::{admissions, refusals, ungated_backend_entries, CompileDoor};
+        let doors: Vec<String> = CompileDoor::ALL
             .iter()
-            .map(|(n, c)| format!("{n}={c}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+            .map(|d| {
+                format!(
+                    "{}: admitted={} refused={}",
+                    d.label(),
+                    admissions(*d),
+                    refusals(*d)
+                )
+            })
+            .collect();
+        eprintln!(
+            "[cratonvm] JIT admission gate: {} | ungated-backend-entries={} \
+             | bail-list-shortcircuits={} code-cache-cap-refusals={} \
+             | osr-contract-violations={} osr-coordinate-mismatches={} \
+             stale-install-epoch-refusals={}",
+            doors.join(" | "),
+            ungated_backend_entries(),
+            crate::jit_bail_shortcircuits(),
+            crate::jit_code_cache_cap_refusals(),
+            crate::osr_contract::osr_contract_violations(),
+            crate::osr_coords::osr_coordinate_mismatches(),
+            crate::stale_install_epoch_refusals(),
+        );
+        // The OSR lifecycle, on the same line's heels and for the same reason:
+        // the counters were ungated by the `osr-02` lane precisely because "a
+        // silent OSR exit is indistinguishable from never having entered", and
+        // then nothing printed them. This is also the only thing that makes
+        // OVER-refusal visible — a new entry-time refusal that quietly costs a
+        // workload its OSR shows up here as `osr_entered` collapsing while
+        // `osr_refused_entry` rises, and nowhere else. Read `osr_exited`
+        // against `osr_entered`, never alone.
+        //
+        // The four `osr_exit_*` rows partition the exits that arrived carrying
+        // a reconstructed frame, and two of them — `osr_exit_map_missing` and
+        // `osr_exit_bci_unrecorded` — are cross-checks between metadata one
+        // function writes, not classifications, so they MUST read zero.
+        // `regression-suite/perf/osr-exit-differential.sh` parses this line and
+        // fails its run on either of those, or on a forced-exit arm that took
+        // no entry — without which that whole harness would be a test of the
+        // interpreter.
+        eprintln!(
+            "[cratonvm] OSR lifecycle: {}",
+            crate::metrics::osr_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };
