@@ -86,10 +86,39 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   * The **`HashMap` family is the known-benign case** the hunter suppresses by
     default — coercion-to-null lands the real bytecode in the null-initialised
     state it expects. It dominates by volume and says nothing.
-  * **`VarHandle` is the one to look at first.** It mismatches in *both*
-    directions on adjacent slots (`Int` over a reference at 0, an `Object` over
-    a `boolean` at 1), it is not a `Map`, and the benign argument says nothing
-    about it.
+  * **`VarHandle` — FIXED 2026-08-04, and it was the worst of the set.** It
+    mismatched in *both* directions on adjacent slots (`Int` over a reference at
+    0, an `Object` over a `boolean` at 1). The frames say why that mattered:
+    `MhUtil.findVarHandle`, reached from the `<clinit>` of
+    `java.util.concurrent.atomic.AtomicBoolean`, `AtomicReference` and
+    `java.io.ObjectInputFilter$Config`. Those are **real JDK classes whose
+    `static final VarHandle` fields real bytecode uses**, and slot 0 on a real
+    `VarHandle` is `vform` — so the VM was handing the JDK a `VarHandle` with a
+    null `VarForm`. It did not fault only because our natives intercept every
+    `VarHandle` operation and read the WP4.2 side table; the moment §7 step 3
+    routes one of those to real bytecode — the direction this whole feature is
+    going, on a path that already fires 3,344 times per run —
+    `vform.getMethodHandle(…)` is an NPE.
+
+    Fixed by writing the six synthetic slots only when the object actually has
+    our layout. No metadata is lost: `vh_meta_put` runs on every allocation path
+    and every reader consults it first.
+
+    **The first attempt at that guard was inert and nearly shipped.** It tested
+    `object_num_fields(vh) >= VH_FIELD_COUNT`, but `alloc_concurrent_synthetic`
+    returns at least the requested slot count either way, so a count test cannot
+    separate the layouts. It was caught by A/B against the pre-fix binary — 8
+    writes before, 8 after — after a first reading compared a six-run aggregate
+    (52) with a single run (8) and mistook the difference for a fix. The working
+    predicate asks by **name**: a real `VarHandle` declares an instance field
+    called `vform` and a fabricated stub does not. Verified 8 → 0 on the same
+    probe, with both probes still byte-identical to HotSpot in both modes.
+
+    Two lessons for the remaining 22 sites. **Field count does not identify a
+    layout** — ask for a field the real class declares and the stub cannot.
+    And **A/B the same workload against the pre-fix binary**; an aggregate and a
+    single run are not comparable numbers, however much they look like a
+    before/after.
   * **`Properties` writing a `Float` over a reference slot** is in the group
     item 1 calls the highest-risk in `native-collections`, and it is on the
     bootstrap path.
