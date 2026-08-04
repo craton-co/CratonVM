@@ -323,32 +323,38 @@ const TEXT_EXTENSIONS: &[&str] = &[
     ".rs", ".md", ".toml", ".py", ".sh", ".ps1", ".java", ".tsv", ".yml", ".yaml", ".json", ".txt",
 ];
 
-/// Directories with nothing a person wrote in them. Narrower than
-/// [`SKIPPED_DIRS`] on purpose: that list drops `apps/` because it holds Java
-/// harnesses rather than Rust, but those harnesses carry READMEs, run scripts
-/// and result tables that cite records like anything else — and did carry
-/// `docs/internal/` paths when this rule went in.
-const NON_AUTHORED_DIRS: &[&str] = &["target", ".git", "node_modules"];
-
-/// Every text file outside `docs/internal/`, which is the tree this rule is
-/// about and the one place a `docs/internal/` path is still the right answer.
-fn public_text_files(dir: &Path, internal: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if path.is_dir() {
-            if !NON_AUTHORED_DIRS.contains(&name) && !name.starts_with('.') && path != internal {
-                public_text_files(&path, internal, out);
-            }
-        } else if TEXT_EXTENSIONS.iter().any(|e| name.ends_with(e)) {
-            out.push(path);
-        }
-    }
+/// Every tracked text file outside `docs/internal/`.
+///
+/// The list comes from `git ls-files`, not from a directory walk, because the
+/// rule is about what the repository publishes and "tracked" is exactly that.
+/// A walk cannot tell the difference: `apps/` holds suite checkouts and local
+/// bug-report scratch that no one committed, so a walk fails on one machine and
+/// passes on another depending on what happens to be lying there. It is also
+/// the difference between a 90-second test and a fast one.
+///
+/// `apps/` itself must stay in scope — it is skipped by [`SKIPPED_DIRS`] for
+/// the Rust-source walk, but its tracked READMEs, run scripts and result tables
+/// cite records like anything else, and four `docs/internal/` paths were found
+/// in `apps/hib-suite-runner/known-benign-aborts.tsv`.
+fn tracked_text_files(root: &Path) -> Vec<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .expect("`git ls-files` must run: this guard defines \"in the repo\" as \"tracked\"");
+    assert!(
+        out.status.success(),
+        "`git ls-files` failed in {} — failing rather than checking nothing",
+        root.display()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|rel| !rel.is_empty())
+        .filter(|rel| !rel.starts_with("docs/internal/"))
+        .filter(|rel| TEXT_EXTENSIONS.iter().any(|e| rel.ends_with(e)))
+        .map(|rel| root.join(rel))
+        .collect()
 }
 
 /// The target of every `[label](target)` on `line`, skipping URLs and anchors.
@@ -409,12 +415,11 @@ fn no_source_file_links_into_docs_internal() {
         internal.display()
     );
 
-    let mut files = Vec::new();
-    public_text_files(&root, &internal, &mut files);
+    let files = tracked_text_files(&root);
     assert!(
         files.len() > 1000,
-        "only found {} text files under {} — the walk is not reaching the \
-         repository, so this guard would pass vacuously",
+        "only found {} tracked text files in {} — the listing is not reaching \
+         the repository, so this guard would pass vacuously",
         files.len(),
         root.display()
     );
