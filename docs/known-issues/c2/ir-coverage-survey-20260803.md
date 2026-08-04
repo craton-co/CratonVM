@@ -177,8 +177,10 @@ already name twice.
 > Re-measured on the same three workloads with all three in, this whole table
 > is **13 events**, not 273: `newarray` `0xbc` 7, `0x53` 4, `0xb3` 1, `0x5c` 1,
 > and every `cov-01` and `cov-02` row is **zero**. The opcode gap is no longer
-> where the tier loses methods — `cov-03`'s `putfield` is (78 of the 85
-> structural refusals that remain). Do not size anything from these rows.
+> where the tier loses methods — `cov-03`'s `putfield` was (78 of the 85
+> structural refusals that remained). **`cov-03` closed the same day**, so
+> neither is now: on `ConditionalOnPropertyTests` the builder refuses **2**.
+> Do not size anything from these rows.
 
 ### The asymmetry worth staring at
 
@@ -245,17 +247,22 @@ field **write** is most of what object-oriented Java does too.
 > measured — this file is a dated record and rewriting it would destroy the
 > before-half of every later comparison.
 >
-> Re-measured twice on `ConditionalOnPropertyTests`, two rounds per arm with the
-> order reversed. **In isolation**, against `dev` before `cov-01`/`cov-02`: the
-> `putfield` site 33 → 0, the wide `getfield` site 5 → 0, bodies 410 → 445.
-> **On top of `cov-01`+`cov-02`**: 38 → 0 and 5 → 0, bodies **536 → 575**. In
-> both, the `cov-04` invoke rows rose by 4–5 — methods that used to die at
-> `cov-03`'s sites now reach the invoke arms.
+> Re-measured three times on `ConditionalOnPropertyTests`, two rounds per arm
+> with the order reversed, and the answer grew each time as neighbouring lanes
+> landed:
 >
-> Neither includes `cov-04`, which closed while this lane was in flight, and the
-> run that put the `putfield` row at **78** was taken on a tree that does. Every
-> one of these numbers names the tree it was taken on because **none of them is
-> comparable to the others**.
+> | tree measured on | `putfield` | wide `getfield` | builder refusals | bodies |
+> |---|---:|---:|---:|---:|
+> | before `cov-01`/`cov-02` | 33 → 0 | 5 → 0 | 83 → 50 | 410 → 445 |
+> | + `cov-01`, `cov-02` | 38 → 0 | 5 → 0 | 127 → 89 | 536 → 575 |
+> | **+ `cov-04`, i.e. `dev`** | **67 → 0** | **3 → 0** | **72 → 2** | **588 → 660** |
+>
+> The last row describes `dev` (`fb33aa5ac` → `84b519382`) and its two survivors
+> are a `JitNewSite::Deferred` `new` — `cov-06`'s. **No row here is comparable
+> to another**, which is why each names its tree: the lane was sized at 43 and
+> was 70 when it landed, because `cov-04` admitted the constructors that write
+> reference fields. The re-ranking rule this file states corrects **upward** as
+> well as downward.
 >
 > The brief asked which of two candidate reasons the asymmetry actually was.
 > It is **the write barrier**, and the compact-layout candidate was not a reason

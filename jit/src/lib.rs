@@ -1913,6 +1913,15 @@ pub struct CompiledMethod {
     /// into a hot loop forever (instead of one fresh OSR compile) routes
     /// every callee through the slow dispatch helper.
     pub compiled_via_osr: bool,
+    /// The bytecode pc this OSR artifact was COMPILED FOR, when it was.
+    ///
+    /// `osr_pc_to_native` carries an offset for every pc the codegen accepted
+    /// as an entry, so one artifact can legitimately be entered at several loop
+    /// headers — and `can_osr_enter` allows exactly that. This field records
+    /// which pc the compile was actually requested for, so
+    /// `CRATONVM_JIT_OSR_SINGLE_PC=1` can restrict entry to it and answer
+    /// whether a multi-pc entry is sound, without guessing from a trace.
+    pub osr_compiled_entry_pc: Option<usize>,
     /// RBC.5 — raw class ids of the declaring classes of every
     /// getstatic/putstatic site in this method, recorded at compile time
     /// from the already-resolved `static_field_info`. JIT code reads static
@@ -2169,6 +2178,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            osr_compiled_entry_pc: None,
             static_init_classes: Vec::new(),
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
@@ -2237,6 +2247,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            osr_compiled_entry_pc: None,
             static_init_classes: Vec::new(),
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
@@ -2593,6 +2604,20 @@ impl CompiledMethod {
     /// point — and that switch is the documented escape hatch for this
     /// relaxation, so it is exactly the path that wants coverage.
     pub fn can_osr_enter_with(&self, entry_pc: usize, allow_dead_locals: bool) -> bool {
+        // Diagnosis lever, default OFF. `Arrays.sort(long[])` on >=1000
+        // elements throws an AIOOBE with a garbage index under OSR
+        // (`probes/SortProbe.java`), and the trace shows artifacts compiled
+        // for one pc being entered at another (`partitionDualPivot` compiled
+        // at 117, entered at 93; `mixedInsertionSort` compiled at 282, entered
+        // at 368). Restricting entry to the compiled pc separates "the second
+        // entry point is wrong" from "the body is wrong".
+        if osr_single_pc_entry_only() {
+            if let Some(compiled_pc) = self.osr_compiled_entry_pc {
+                if compiled_pc != entry_pc {
+                    return false;
+                }
+            }
+        }
         if !allow_dead_locals
             && self
                 .osr_dead_mask
@@ -3750,6 +3775,18 @@ impl CompiledMethod {
 /// method's own parameter (`String[] args`, local 0) is dead at the loop head.
 /// A once-invoked method with its hot loop inline has no other route into
 /// compiled code.
+/// `CRATONVM_JIT_OSR_SINGLE_PC` — see [`CompiledMethod::osr_compiled_entry_pc`].
+fn osr_single_pc_entry_only() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_SINGLE_PC") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 fn osr_dead_local_entry_allowed() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -10278,13 +10315,20 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 // gate, both of which need monitors to exist before they can decide anything.
 // Wire them in the same change as the variants, not before.
 //
-// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
-// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
-// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
-// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
-// producerless until handler bodies are compiled. Note for whoever does that:
-// `escape_analysis::program_order_proves_dominance` explicitly assumes the
-// absence of exception control flow and must gain a `may_throw` term then.
+// `athrow` ⇒ `EaOp::Throw` — WIRED, cov-07. `ir::Op::Throw` now exists
+// (`IrBuilder::build`'s `0xbf` arm) and maps below with NO operand
+// re-packing: its `[ctrl, mem, exc]` layout is forwarded verbatim by the
+// second pass's default arm, exactly like `Op::Return`'s `[ctrl, val]` — the
+// escape rule at `escape_analysis::Op::Return | Op::Throw` iterates every
+// input and filters by `is_ref_producer`, so the extra non-ref `ctrl`/`mem`
+// inputs are harmless.
+//
+// `escape_analysis::program_order_proves_dominance` was NOT given a
+// `may_throw` term, and does not need one: `Op::Throw` always LEAVES the
+// frame (the compiled body never branches to an in-method handler — see
+// `Op::Throw`'s own doc comment in `ir.rs`), so it cannot create a control
+// edge back to a lower-id load, which is the only thing that predicate
+// guards against. See `docs/internal/cov-07-athrow-RETIRED-*.md`.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -10308,6 +10352,8 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         // attribute the monitor to the memory token.
         ir::Op::MonitorEnter => EaOp::MonitorEnter,
         ir::Op::MonitorExit => EaOp::MonitorExit,
+        // cov-07. No re-packing needed — see the section comment above.
+        ir::Op::Throw => EaOp::Throw,
         ir::Op::New {
             class_id,
             num_fields,
@@ -10394,6 +10440,7 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
         // Everything else pins control at input 0 (when it has one at all).
         ir::Op::Return
+        | ir::Op::Throw
         | ir::Op::If
         | ir::Op::Proj(_)
         | ir::Op::Guard { .. }
@@ -13552,6 +13599,20 @@ fn try_compile_inner(
         // below, next to the `Op::Call` info boxes, so the pointer cannot
         // outlive its pointee.
         let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: keep-alive for `instanceof`/`checkcast` target class-name
+        // bytes, same obligation as `ir_ldc_strings` immediately above (the
+        // lowered body bakes the ADDRESS as an imm64 argument to
+        // `helpers.instanceof_check`/`helpers.checkcast`). Populated below,
+        // near the `new_info` / `anewarray_info` construction they share a
+        // resolver with.
+        let mut ir_instanceof_strings: Vec<Box<str>> = Vec::new();
+        let mut ir_checkcast_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: `jit_checkcast`'s definitive-refusal path constructs a
+        // `ClassCastException` through `jit_thread_mut()` (the JIT_THREAD
+        // TLS), same requirement `jit_getstatic`'s `<clinit>` has — the
+        // `!has_dispatch` fast entry never sets that TLS. Set below, near
+        // where the `getstatic` lane sets the same flag for the same reason.
+        let mut ir_needs_dispatch_for_checkcast = false;
         if !scan.ldc_ops.is_empty() {
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
@@ -13735,6 +13796,65 @@ fn try_compile_inner(
                     }
                 }
                 builder.set_anewarray_info(anewarray_info_map);
+            }
+        }
+        // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
+        // the IR builder — 306 events, the largest single whole-method
+        // refusal in the survey, more than every opcode gap combined:
+        // `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`.
+        //
+        // Admits a site ONLY when its target class is already resolved and
+        // loaded at compile time. `cp_new_resolver` already answers exactly
+        // that question for `new`/`anewarray` — `Resolved` means the
+        // CONSTANT_Class entry's target is loaded, `Deferred`/`None` means it
+        // is not (or the entry is malformed) — and a checkcast/instanceof CP
+        // entry is the identical CONSTANT_Class shape, so this reuses that
+        // resolver rather than adding a new one. `num_fields`/the two init
+        // flags `Resolved` also carries are irrelevant here and discarded;
+        // only "loaded or not" is read.
+        //
+        // A site that resolves `Deferred` (or has no resolver at all) is
+        // simply omitted from `checkcast_info`/`instanceof_info`, so the
+        // builder's 0xc0/0xc1 arm bails THAT site — and so the method — to
+        // single-pass, which resolves lazily via `jit_typecheck_resolve`'s
+        // not-yet-loaded slow path. That path can run a user classloader's
+        // `loadClass`/`findClass`, arbitrary Java this tier does not host
+        // inside a helper call — see the admission comment in `ir.rs`.
+        //
+        // `scan.typecheck_ops` is `checkcast_ops ∪ instanceof_ops`; a pc is
+        // routed to `checkcast_info` iff it is also in `scan.checkcast_ops`,
+        // else to `instanceof_info` — the two are no longer mutually
+        // exclusive at the whole-method level as of cov-05 (a method may
+        // contain both), unlike the pre-cov-05 shape where `checkcast_ops`
+        // non-empty refused the whole method upstream.
+        if !scan.typecheck_ops.is_empty() {
+            if let (Some(new_resolver), Some(name_resolver)) =
+                (cp_new_resolver, cp_class_name_resolver)
+            {
+                let checkcast_pcs: std::collections::HashSet<usize> =
+                    scan.checkcast_ops.iter().map(|&(pc, _)| pc).collect();
+                let mut cc_im = std::collections::HashMap::new();
+                let mut io_im = std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.typecheck_ops {
+                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                        if let Some(name) = name_resolver(cp_idx) {
+                            let boxed: Box<str> = name.into_boxed_str();
+                            let entry = (boxed.as_ptr() as usize, boxed.len());
+                            if checkcast_pcs.contains(&pc) {
+                                cc_im.insert(pc, entry);
+                                ir_checkcast_strings.push(boxed);
+                            } else {
+                                io_im.insert(pc, entry);
+                                ir_instanceof_strings.push(boxed);
+                            }
+                        }
+                    }
+                }
+                if !cc_im.is_empty() {
+                    ir_needs_dispatch_for_checkcast = true;
+                }
+                builder.set_checkcast_info(cc_im);
+                builder.set_instanceof_info(io_im);
             }
         }
         // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
@@ -14628,6 +14748,18 @@ fn try_compile_inner(
                         // dropping either list frees memory the emitted code
                         // still names.
                         compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-05: the same keep-alive obligation for an
+                        // `instanceof`/`checkcast` target class-name site,
+                        // whose UTF-8 bytes' ADDRESS is baked into the body as
+                        // an imm64 argument to `helpers.instanceof_check` /
+                        // `helpers.checkcast`.
+                        compiled._jit_strings.append(&mut ir_instanceof_strings);
+                        compiled._jit_strings.append(&mut ir_checkcast_strings);
+                        // cov-05: see `ir_needs_dispatch_for_checkcast`'s
+                        // declaration above for why.
+                        if ir_needs_dispatch_for_checkcast {
+                            compiled.has_dispatch = true;
+                        }
                         // cov-01 / RBC.5: compiled code reads static storage
                         // directly, bypassing the interpreter's
                         // `ensure_class_initialized_shared`, so the declaring

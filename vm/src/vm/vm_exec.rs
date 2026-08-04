@@ -2647,9 +2647,34 @@ thread_local! {
     /// round-robin working set behind it, same shape as
     /// `gen_heap::compact_field_slot`'s cache. Entries: (vm_key, class_id,
     /// slot, byte); vacant slots have vm_key == 0 (never a real address).
+    /// Direct-mapped, not round-robin, and 64 entries rather than 8.
+    ///
+    /// The 8-entry linear ring was sized for the `String.value`/`coder` +
+    /// `Matcher` scalars rotation. A native that reads a dozen fields across
+    /// four classes per call — `date_format_fast` touches ~14 distinct
+    /// (class, slot) pairs per `format` — overflows it on every call, so every
+    /// access fell through to the `RwLock` + hash tier.
+    /// `resolve_field_descriptor_byte_cached` was then **15.3%** of that
+    /// native in a perf profile, with `coerce_field_value_by_descriptor`
+    /// another 3.6%. Indexing instead of scanning also drops the 8-way compare
+    /// on the common hit.
+    ///
+    /// Eviction stays correctness-neutral: a colliding write simply replaces
+    /// the entry and the next miss re-walks immutable class metadata. The
+    /// stored `(vm_key, class_id, slot)` triple is still verified on every hit,
+    /// so a collision can only cost a re-walk, never return another field's
+    /// descriptor.
     static FIELD_DESCRIPTOR_RING:
-        std::cell::RefCell<([(usize, u32, usize, u8); 8], usize)> =
-        const { std::cell::RefCell::new(([(0, 0, 0, 0); 8], 0)) };
+        std::cell::RefCell<[(usize, u32, usize, u8); 64]> =
+        const { std::cell::RefCell::new([(0, 0, 0, 0); 64]) };
+}
+
+/// Bucket for [`FIELD_DESCRIPTOR_RING`]. Slot indices are small and dense, so
+/// mixing the class id in keeps two classes' slot 0 from colliding.
+#[inline]
+fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
+    // Widening: u32 -> usize (value preserved).
+    ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
 }
 
 /// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
@@ -2658,9 +2683,8 @@ fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, by
     FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
     FIELD_DESCRIPTOR_RING.with(|cell| {
         let mut ring = cell.borrow_mut();
-        let next = ring.1;
-        ring.0[next] = (vm_key, class_id, slot_index, byte);
-        ring.1 = (next + 1) % ring.0.len();
+        let idx = field_descriptor_bucket(class_id, slot_index);
+        ring[idx] = (vm_key, class_id, slot_index, byte);
     });
 }
 
@@ -2697,15 +2721,12 @@ fn resolve_field_descriptor_byte_cached(
     }) {
         return if cached == 0 { None } else { Some(cached) };
     }
-    // Second tier: the round-robin ring (see FIELD_DESCRIPTOR_RING's doc).
+    // Second tier: the direct-mapped table (see FIELD_DESCRIPTOR_RING's doc).
     let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
         let ring = cell.borrow();
-        ring.0
-            .iter()
-            .find(|(vm, cid, slot, _)| {
-                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
-            })
-            .map(|&(_, _, _, byte)| byte)
+        let entry = ring[field_descriptor_bucket(class_id.as_u32(), slot_index)];
+        (entry.0 == vm_key && entry.1 == class_id.as_u32() && entry.2 == slot_index)
+            .then_some(entry.3)
     });
     if let Some(byte) = ring_hit {
         FIELD_DESCRIPTOR_LAST
@@ -3514,7 +3535,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         const PROBE_BUDGET: u64 = 200_000;
@@ -9140,6 +9161,37 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
+        // KINDOF-SENTINEL: `obj` reaches this native accessor from callers
+        // (e.g. `native-collections`' `map_state`, which validates a bucket
+        // array via `heap_kind_of` and then calls this several lines later)
+        // that treat an earlier validation as still good at the point of
+        // use. Observed once with `obj` as the all-ones sentinel
+        // `0xFFFFFFFFFFFFFFFF` — not a stale-but-plausible address, and not
+        // reachable through any conservative-root-scan path (those all
+        // filter through `is_object_address`, which this call chain does
+        // not). `load_and_forward`'s very first read (`header.is_forwarded()`)
+        // dereferences the raw pointer unconditionally, so an invalid `obj`
+        // here is a hard crash rather than a wrong answer. Validate before
+        // touching memory at all, and fall back to the same "not an array"
+        // diagnostic path already used below for a live-but-wrong-kind object.
+        if self
+            .shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)
+            .is_none()
+        {
+            if crate::runtime::env_cache::dbg_arrlen() {
+                let loc = std::panic::Location::caller();
+                eprintln!(
+                    "[ARRAY-LEN-GUARD] obj is not a valid heap address rust-caller={}:{} obj={:?}",
+                    loc.file(),
+                    loc.line(),
+                    obj
+                );
+            }
+            return 0;
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
@@ -14107,7 +14159,7 @@ pub(super) fn convert_element_value(
 // `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
 // proves the VM is dispatching and says nothing about *what*, which is the
 // entire diagnosis: the `nioMemLZF:` residual in
-// `docs/known-issues/h2/h2-jitban-residuals-20260726.md` read as "a long
+// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` read as "a long
 // interpreter tail with no second hot spot to attack" for two revisions purely
 // because nobody had the callee histogram.
 //
@@ -22275,7 +22327,7 @@ fn invoke_on_class_shared_inner(
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
                 // docs/known-issues/h2/
-                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
@@ -23399,6 +23451,43 @@ mod tests {
             new,
             "monitor_on_exit must be forwarded, or the implicit monitorexit \
              releases a vacated address"
+        );
+    }
+
+    /// KINDOF-SENTINEL (2026-08-03): `NativeHeapAccess::array_length` used to
+    /// dereference `obj` unconditionally via `load_and_forward` before ever
+    /// checking it pointed at real heap memory. Observed once in the wild as
+    /// a `native-collections::map_state` bucket-array reference that had
+    /// gone from a validated `ObjectKind::Array` to the all-ones sentinel
+    /// `0xFFFFFFFFFFFFFFFF` by the time this accessor read it — an
+    /// `EXCEPTION_ACCESS_VIOLATION` reading exactly that address. Whatever
+    /// corrupted the value upstream, `array_length` itself must not crash on
+    /// an invalid pointer: it has an established "not an array" fallback
+    /// (returns 0) for a *live* non-array object, and an invalid address
+    /// must take that same safe path rather than a hard fault.
+    #[test]
+    fn array_length_rejects_an_invalid_object_pointer_instead_of_faulting() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7603);
+        let mut thread = JvmThread::new(tid, "kindof-sentinel-test");
+
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        // SAFETY: deliberately constructing an invalid ObjectRef to prove
+        // `array_length` validates before dereferencing — never dereferenced
+        // as a real pointer if the fix holds. 8-byte aligned (unlike the
+        // observed all-ones sentinel) only to clear `ObjectRef::from_raw`'s
+        // `debug_assert_aligned`, which is compiled out in the release build
+        // where the real crash was observed; `is_object_address` rejects
+        // this for being outside every heap region, the same rejection path
+        // an unaligned address takes.
+        let sentinel = unsafe { ObjectRef::from_raw(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8) };
+        assert_eq!(
+            ctx.array_length(sentinel),
+            0,
+            "an invalid pointer must fall back to 0, not fault"
         );
     }
 

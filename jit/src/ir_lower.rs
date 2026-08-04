@@ -353,6 +353,23 @@ struct Lowerer<'a> {
     ldc_string: usize,
     ldc_class_cp: usize,
     getstatic: usize,
+    /// cov-05. `jit_instanceof(vm, obj, name_ptr, name_len) -> 0/1` — the
+    /// SAME `RequiredPtr` helper (jit-api) the single-pass backend's 0xc1 arm
+    /// calls; unlike `ldc_string`/`ldc_class_cp`/`getstatic` this one is
+    /// never absent, so `Op::InstanceOf`'s lowering does not need an
+    /// OptionalPtr guard.
+    instanceof_check: usize,
+    /// cov-05. `jit_checkcast(vm, obj, name_ptr, name_len) -> obj|0|i64::MIN`
+    /// — same `RequiredPtr` status as `instanceof_check` above, the SAME
+    /// helper the single-pass backend's 0xc0 arm calls.
+    checkcast: usize,
+    /// cov-07. `jit_throw_exception(exc_ptr, bci) -> i64::MIN` (always) — the
+    /// SAME `RequiredPtr` helper the single-pass backend's `0xbf` arm calls.
+    /// Unlike `checkcast`/`instanceof` this takes no `vm_ptr`: it looks up the
+    /// current JIT thread from TLS (`jit_thread_mut`), which `execute_jit_call`
+    /// installs around every JIT call regardless of backend — so `Op::Throw`
+    /// needs no `needs_context` plumbing of its own.
+    throw_exception: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -769,6 +786,9 @@ impl<'a> Lowerer<'a> {
             ldc_string: helpers.ldc_string,
             ldc_class_cp: helpers.ldc_class_cp,
             getstatic: helpers.getstatic,
+            instanceof_check: helpers.instanceof_check,
+            checkcast: helpers.checkcast,
+            throw_exception: helpers.throw_exception,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -4319,6 +4339,67 @@ fn reloc_emit_enabled() -> bool {
                 Self::patch_or_bail(&mut self.buf, resolved_patch, rel);
                 self.store_rax(slot);
             }
+            // ── cov-05: checkcast ──────────────────────────────────────────
+            //
+            // Same ABI as the single-pass backend's 0xc0 arm: `jit_checkcast
+            // (vm_ptr, obj_ptr, name_ptr, name_len) -> obj_ptr | 0 | i64::MIN`
+            // in RAX. Unlike `instanceof`, a definitive refusal stashes a
+            // `ClassCastException` and returns the deopt/exception sentinel —
+            // `emit_call_return_check` is the SAME sentinel-drain-through-the-
+            // shared-epilogue helper `Op::Call` uses for a callee's exception,
+            // so this is not new machinery, just a new caller of it. `Ref` is
+            // never legitimately `i64::MIN` (no plausible heap pointer is),
+            // so it takes that function's simple `CMP ; JE` shape.
+            Op::CheckCast { name_ptr, name_len } => {
+                let (name_ptr, name_len) = (*name_ptr, *name_len);
+                let obj = node.inputs[2];
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
+                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
+                self.emit_mov_reg_imm64(RAX, self.checkcast as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                self.emit_call_return_check(slot, IrType::Ref);
+            }
+            // ── cov-05 increment 1: instanceof ────────────────────────────
+            //
+            // Same ABI as the single-pass backend's 0xc1 arm
+            // (`x64/bytecode_walk.rs`): `jit_instanceof(vm_ptr, obj_ptr,
+            // name_ptr, name_len) -> 0/1` in RAX. Reusing that helper is the
+            // point — this node's whole job is to answer the subtype question
+            // the single-pass backend already answers correctly (strict array
+            // rule, loader-dup fallback, every recorded typecheck defect fix
+            // included), not to re-derive one.
+            //
+            // Unlike `Op::ConstClass` this never returns a failure sentinel:
+            // `jit_instanceof` cannot throw (JVMS §6.5 `instanceof`; a null or
+            // unresolvable receiver/target answers `false`, never an
+            // exception), so there is no post-call TEST/JNZ/exception-epilogue
+            // dance here — just the safepoint map (the helper can still
+            // allocate a Class mirror on first touch) and the result in RAX.
+            Op::InstanceOf { name_ptr, name_len } => {
+                let (name_ptr, name_len) = (*name_ptr, *name_len);
+                let obj = node.inputs[2];
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
+                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
+                self.emit_mov_reg_imm64(RAX, self.instanceof_check as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                // Same post-call obligation as `Op::ConstString`: the helper
+                // crossed the JIT boundary and may have run a collection, so
+                // this frame's mirror and any relocated published value must
+                // be restored before anything else reads the frame.
+                self.emit_post_call_frame_record();
+                self.emit_shadow_reload();
+                self.store_rax(slot);
+            }
             // ── cov-01: getstatic ────────────────────────────────────────
             //
             // Two lowerings, chosen by the same predicate the single-pass
@@ -4500,8 +4581,12 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
                 self.fp_store_value(id, slot, XMM0, false);
             }
-            // Control and meta nodes — skip
-            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
+            // Control and meta nodes — skip. `Op::Throw` is a terminator like
+            // `Op::Return`/`Op::If`, handled by `lower_terminator`; it never
+            // reaches this function from a real schedule (`Op::is_control()`
+            // routes it away from ordinary data-node placement).
+            Op::Start | Op::Return | Op::Throw | Op::If | Op::Merge | Op::Region | Op::Proj(_)
+            | Op::Dead => {}
             // No lowering arm. REFUSE the compile; do NOT fall through.
             //
             // This arm used to be `_ => {}` with the comment "bail in
@@ -4567,6 +4652,45 @@ fn reloc_emit_enabled() -> bool {
         }
         let node = &self.graph.nodes[term as usize];
         match &node.op {
+            // ── cov-07: athrow ─────────────────────────────────────────
+            //
+            // Same ABI as the single-pass backend's `0xbf` arm
+            // (`x64/bytecode_walk.rs`): `jit_throw_exception(exc_ptr, bci) ->
+            // i64::MIN` in RAX, always. No `vm_ptr` argument (see the field
+            // doc on `throw_exception`), no post-call CMP — the helper never
+            // returns anything but the sentinel, so this always takes the
+            // exceptional exit. That reuses `emit_call_exc_stub`'s shared
+            // bail stub exactly as every other exceptional `Op::Call`/
+            // `Op::CheckCast` exit does: run the epilogue and propagate
+            // `i64::MIN`, which `execute_jit_call`
+            // (`vm/src/runtime/interpreter/jit_bridge.rs`) then routes
+            // through `route_jit_exception_through_method` — the interpreter
+            // resolves the handler (if any), never this compiled frame.
+            //
+            // `jit_throw_exception` stamps its OWN `bci` argument onto
+            // `JitSignals::athrow_bci` before returning (`set_jit_pending_
+            // exception_with_bci`), which is what gives the routing a real
+            // throw pc for the range test against this method's own
+            // exception table — exactly the RBC.6 fix the single-pass
+            // backend already ships. Nothing else has to stamp it: this is
+            // the ONE terminator whose own helper call does that job, unlike
+            // a nested `Op::Call`'s exceptional exit, which needs a SEPARATE
+            // stamp (`jit_set_throw_bci`) the single-pass backend's shared
+            // exception-check stub emits and the IR tier's `call_exc_patches`
+            // stub does not yet — a pre-existing gap this lane does not own
+            // (see the closeout doc).
+            Op::Throw => {
+                let exc = node.inputs[2];
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
+                let bci = node.bytecode_pc.unwrap_or(0);
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[1], bci as u64);
+                self.emit_mov_reg_imm64(RAX, self.throw_exception as u64);
+                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+            }
             Op::Return => {
                 if node.inputs.len() > 1 {
                     // Has return value — move to RAX
@@ -5725,6 +5849,11 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
         ) {
             needs_context = true;
         }
+        // cov-05: `jit_instanceof`/`jit_checkcast` take the VM context
+        // pointer as arg0, same as the three above.
+        if matches!(n.op, Op::InstanceOf { .. } | Op::CheckCast { .. }) {
+            needs_context = true;
+        }
     }
     FrameNeeds {
         needs_context,
@@ -5952,6 +6081,10 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::ConstClass { .. }
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
+            // cov-05: `instanceof` defines a result slot — the 0/1 `Int`;
+            // `checkcast` defines one too — the `Ref` result.
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. }
     )
 }
 
@@ -12384,9 +12517,8 @@ mod tests {
         match op {
             // Control and terminator nodes: an arm exists and does nothing,
             // because `lower_terminator` owns them.
-            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {
-                LoweredEffect
-            }
+            Op::Start | Op::Return | Op::Throw | Op::If | Op::Merge | Op::Region | Op::Proj(_)
+            | Op::Dead => LoweredEffect,
             // Values.
             Op::Const(_)
             | Op::ConstF(_)
@@ -12429,7 +12561,9 @@ mod tests {
             | Op::ConstString { .. }
             | Op::ConstClass { .. }
             | Op::LoadStatic { .. }
-            | Op::LambdaIntToDouble => LoweredValue,
+            | Op::LambdaIntToDouble
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. } => LoweredValue,
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
             // No arm. Keep in step with `UNLOWERABLE`; the tests check it.
@@ -12529,8 +12663,23 @@ mod tests {
                 },
             ),
             ("LambdaIntToDouble", Op::LambdaIntToDouble),
+            (
+                "InstanceOf",
+                Op::InstanceOf {
+                    name_ptr: 0,
+                    name_len: 0,
+                },
+            ),
+            (
+                "CheckCast",
+                Op::CheckCast {
+                    name_ptr: 0,
+                    name_len: 0,
+                },
+            ),
             ("MonitorEnter", Op::MonitorEnter),
             ("MonitorExit", Op::MonitorExit),
+            ("Throw", Op::Throw),
             ("Guard", Op::Guard { bci: 0 }),
             ("Dead", Op::Dead),
         ]

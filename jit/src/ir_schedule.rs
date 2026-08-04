@@ -430,7 +430,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                         node_to_block[id] = block_idx;
                     }
                 }
-                Op::Return => {
+                Op::Return | Op::Throw => {
                     if !node.inputs.is_empty() && node.inputs[0] == head {
                         blocks[block_idx].terminator = Some(id as NodeId);
                         node_to_block[id] = block_idx;
@@ -464,8 +464,9 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                         }
                     }
                 }
-                Op::Return => {
-                    // No successors
+                Op::Return | Op::Throw => {
+                    // No successors — a throw always leaves the frame, exactly
+                    // like a return (cov-07).
                 }
                 _ => {}
             }

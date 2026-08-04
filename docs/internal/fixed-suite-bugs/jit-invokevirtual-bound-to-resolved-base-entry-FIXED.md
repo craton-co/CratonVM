@@ -149,7 +149,7 @@ Each step is a measurement, on the dev-tip control binary unless stated.
 
 `org.h2.test.db.TestMultiThread` runs to completion again. That class is the
 reproduction vehicle for
-`docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`, which
+`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`, which
 could not be validated at all while every run died in the first four seconds.
 
 ## Verification

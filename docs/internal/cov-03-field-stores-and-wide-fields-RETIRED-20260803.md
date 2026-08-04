@@ -93,52 +93,76 @@ for the absence of a helper it never calls.
 
 ### Coverage — `CRATONVM_DBG=ir-compiles`, `ConditionalOnPropertyTests`
 
-Two rounds, both arms per round, arm order reversed in round 2. **Measured
-twice**, because `cov-01` and `cov-02` merged into `dev` while this lane was in
-flight and neither of their post-measurements includes this one either. The
-second table is the one that describes `dev` today.
+Two rounds, both arms per round, arm order reversed in round 2.
 
-**(a) In isolation, against `dev` before `cov-01`/`cov-02`:**
+**Measured three times, on three different trees, and the answer nearly
+doubled.** `cov-01`, `cov-02` and `cov-04` all landed on `dev` while this lane
+was in flight, and each of them admits methods that then reach *this* lane's
+sites. Every table below therefore names the tree it was taken on, because
+**none of them is comparable to the others** — quoting one against another is
+the exact mistake this directory's own re-ranking rule exists to prevent.
+
+**(a) Against `dev` before `cov-01`/`cov-02`:**
 
 | arm | admitted | bodies | builder refusals |
 |---|---:|---:|---:|
 | base | 693 / 695 | 410 / 410 | 83 / 83 |
 | **fix** | 696 / 694 | **445 / 444** | **50 / 49** |
 
-**(b) On top of `cov-01` + `cov-02`, which is where it landed:**
+**(b) On top of `cov-01` + `cov-02`:**
 
 | arm | admitted | bodies | builder refusals |
 |---|---:|---:|---:|
-| dev base | 695 / 694 | 537 / 536 | 127 / 127 |
-| **merged** | 694 / 696 | **574 / 576** | **89 / 89** |
+| base | 695 / 694 | 537 / 536 | 127 / 127 |
+| **fix** | 694 / 696 | **574 / 576** | **89 / 89** |
 
-Refusal sites for (b) (`ir.rs` line numbers shift by +79 with this edit; the
-mapping is by arm, and every surviving site maps 1:1):
+**(c) THE ONE THAT DESCRIBES `dev` — on `cov-01` + `cov-02` + `cov-04`.**
+Baseline `fb33aa5ac` (dev immediately before this lane merged), fix
+`84b519382`:
 
-| site (dev) | what | dev | site (merged) | merged |
-|---|---|---:|---|---:|
-| `ir.rs:5337` | `putfield` tag not `I/Z/B/C/S` | **38** | `ir.rs:5416` | **0** |
-| `ir.rs:5293` | `getfield` of `long`/`float`/`double` | **5** | `ir.rs:5372` | **0** |
-| `ir.rs:5456` | `invokespecial` (`cov-04`) | 73 | `ir.rs:5535` | 78 |
-| `ir.rs:5516` | invoke with no `invoke_info` (`cov-04`) | 9 | `ir.rs:5595` | 9 |
-| `ir.rs:5471` | (`cov-04`) | 1 | `ir.rs:5550` | 1 |
-| `ir.rs:5381` | `getfield` with no resolved layout | 1 | `ir.rs:5460` | 1 |
+| arm | admitted | bodies | builder refusals |
+|---|---:|---:|---:|
+| base | 690 / 690 | 588 / 588 | **72 / 72** |
+| **fix** | 696 / 695 | **661 / 660** | **2 / 2** |
 
-Both of the lane's sites are gone: **43 events removed, 38 net** (`cov-04`'s
-`invokespecial` absorbs 5), and bodies rise by **38.5**. Tests: 38/38 pass on
-every arm of every run.
+| site (base) | what | base | fix |
+|---|---|---:|---:|
+| `ir.rs:5387` | `putfield` tag not `I/Z/B/C/S` | **67** | **0** |
+| `ir.rs:5343` | `getfield` of `long`/`float`/`double` | **3** | **0** |
+| `ir.rs:5431` | a `new` whose site is `JitNewSite::Deferred` (`cov-06`) | 2 | 2 (now `5510`) |
 
-The reason 43 removed does not become 43 bodies is the same shape `cov-01` and
-`cov-02` both hit: a method that gets past this lane's site dies at the next gap
-it meets. That is not a shortfall to explain away — it is the survey's own
-prediction, and it is why the README says to re-run the survey after ANY lane
-lands.
+**70 of the 72 remaining builder refusals were this lane's, and bodies rose by
+72.5 (+12.3%).** What survives of `IrBuilder::build`'s structural refusals on
+this workload is **two events**, and they belong to `cov-06`. Tests: 38/38 pass
+on every arm of every run of all three measurements.
+
+`cov-04`'s closeout puts the same `putfield` row at **78** and the wide
+`getfield` row at **4**. Those are across the survey's **three** Spring
+workloads; the table above is `ConditionalOnPropertyTests` **alone**, which is
+what `/data/cov03count.sh` runs. 67 + 3 of 78 + 4 on one of three workloads is
+the same measurement, not a disagreement — but it is the kind of pair that
+reads as one, so: **name the corpus next to the count, not just the tree.**
+
+Two things follow, and the second is the one worth carrying:
+
+* The brief was sized at **43** events. It was 43 when the survey was taken and
+  **70** by the time it landed, and the difference is almost entirely `cov-04`:
+  the two whole-method terms that lane removed admitted a population of
+  **constructors**, and a constructor's job is largely writing reference fields.
+  Nobody predicted that; the measurement did. **Do not size a lane from a survey
+  row without re-taking it on the tree you are about to change** — and note that
+  the correction here was *upward*, which is the direction nobody checks.
+* Unlike (a) and (b), (c) loses nothing to a neighbour: every removed refusal
+  became a body. In (a) and (b) the shortfall (43 removed → 38 bodies) was
+  methods falling into `cov-04`'s invoke gap on their way out of this one. With
+  that gap closed there is nowhere left for them to fall, which is what a
+  coverage programme converging looks like.
 
 ### Wall clock — and the fake 1.7x regression on the way there
 
-The `ir-compiles` runs above took 35 s / 33 s (base) against 60 s / 57 s (fix),
-on **both** orderings. That reads as a consistent 1.7x regression and it is not
-one.
+Measurement (a)'s `ir-compiles` runs took 35 s / 33 s (base) against 60 s / 57 s
+(fix), on **both** orderings. That reads as a consistent 1.7x regression and it
+is not one.
 
 Two things were wrong with it, and both are worth carrying forward:
 
@@ -165,6 +189,11 @@ effect resolvable at this sample size on this host. That is the honest finding:
 not "no regression", but "none detectable, and the run-to-run noise is three
 times any difference either statistic claims".
 
+That was on tree (b), where the lane moved 38 methods onto the optimizing tier.
+On tree (c) it moves **70**, so the same caveat applies with more force and the
+same answer stands: unmeasured, and not this lane's to close. See the last
+section.
+
 ### Correctness
 
 * `cargo test -p cratonvm-jit` — **1,875 lib + all integration tests green** on
@@ -182,9 +211,10 @@ times any difference either statistic claims".
   identically on both (pre-existing — `BootJarTests` 43/43,
   `ModifiedClassPathExtension*`, `WebApplicationTypeIntegrationTests` 5/10, and
   the rest of the gradle-plugin group). No class changed status, test count,
-  or failure count in either direction. **Run twice** — once for the isolated
-  change and again for the merge on top of `cov-01`/`cov-02` — with the same
-  66/12 split both times.
+  or failure count in either direction. **Run three times**, once against each
+  of the three baselines above (isolated, on `cov-01`+`cov-02`, and on
+  `cov-01`+`cov-02`+`cov-04`, the last being `fb33aa5ac` vs `84b519382`), with
+  the same 66/12 split every time.
 * `jit/tests/ir_vs_singlepass.rs` — the brief's second verification item.
   `ir_vs_singlepass_reference_putfield_then_getfield` stores a reference field,
   reads it back and returns it; `…_pure_write` stores and never reads. Both run
@@ -220,7 +250,8 @@ methods under test:
 | generational | 46 minor (2 of them MOVING young) | **76,036** | 16,000 | 0 | 0 | 0 |
 | G1 | 15 young, all evacuating (`cset_young`, `cset_old=0`) | — | 16,000 | 0 | 0 | 0 |
 
-(Re-run identically on the post-`cov-01`/`cov-02` merged binary: same counts.)
+(Re-run identically on each of the three trees, including `dev` at
+`84b519382`: same counts every time, to the edge.)
 
 `old_to_young_edges=76036` is the number that makes the run non-vacuous: the
 remembered set genuinely recorded the edges, so the barrier path was on the
@@ -229,8 +260,76 @@ critical path rather than merely present.
 `probes/WideFieldProbe.java` covers the wide half: `Long.MIN_VALUE` and `-0.0d`
 (the two values bit-identical to the deopt sentinel), NaN and both infinities by
 raw bits, guard fields on either side of the wide slots, and a null receiver on
-all six accessors. Green, with all twelve accessors confirmed compiled by the
+all six accessors. Green, with every accessor confirmed compiled by the
 optimizing backend.
+
+### The category-2 slot check the brief asked for
+
+The brief named the bug to be afraid of: *"they carry the category-2 slot
+question, which the IR's parameter model has already been burned by once — see
+the `optimize=false` guard's comment about `boolean eq(long, long)` truncating
+its second parameter."* That defect was the IR laying parameters out by
+JIT-**argument** index while the bytecode reads them by JVM **local slot**: a
+`long` occupies two slots, so the second `long` parameter was read from a slot
+nothing had populated.
+
+A field access is one value on the IR's operand stack whatever its width, so in
+principle a wide field cannot reintroduce it. In principle is not a test. What a
+wide field adds is a new **source** for a category-2 value, and every consumer
+downstream — an `lstore` into a two-slot local, a later local whose slot index
+depends on this one being two wide, a deopt snapshot rebuilding the
+interpreter's two-slot frame — was written when the only sources were
+parameters, constants and calls.
+
+`probes/WideFieldSlotProbe.java` puts a wide field value **next to** other
+category-2 values so a layout that is off by one slot returns garbage instead of
+faulting:
+
+* `mixLong(Box, long, long)` — the `eq(long, long)` shape with a `getfield J` in
+  the middle. Slots `b`=0, `a`=1..2, `c`=3..4, `x`=5..6, `y`=7..8; every index
+  is only right if each preceding category-2 value consumed two.
+* `mixFloat(Box, float, int, float)` — catches a layout that **over**-counts.
+  `float` is category-ONE, and over-counting is as wrong as under-counting.
+* `divGuard(Box, int, int)` — a field-sourced `long` live across a div-by-zero
+  guard in a compiled body.
+
+Green, with all four methods confirmed compiled by the optimizing backend.
+
+Two things this probe cost, both worth keeping:
+
+* **Its first version reported a VM failure that was its own arithmetic.** The
+  float base was `1.5e20f` and it expected `+7` to change it; one ULP up there
+  is ~1e13, so the answer was `0.0f`. The values are now powers of two with
+  exactly-representable arithmetic, so each expected constant is derivable by
+  hand. *An expectation you cannot derive by hand is not an oracle* — and note
+  the failure pointed at the VM, which is the direction that wastes a day.
+* **The one shape that would observe the rebuilt frame is uncompilable.** The
+  first `divGuard` caught the `ArithmeticException` itself, so the interpreter
+  would resume at the handler and the rebuilt `long` could be read back — the
+  case the admission chain's own comment describes. Both backends refuse that
+  method before the admission chain, at `rbc6-handler-reads-unsafe-local`,
+  because the code after the handler reads a non-parameter local. It is
+  refused for reasons that predate and are unrelated to this lane, and a probe
+  written that way reports PASS while exercising the interpreter. Named as a
+  residual below rather than papered over.
+
+### The vacuity gate, demonstrated rather than asserted
+
+`/data/cov03probe.sh` fails a run that shows fewer optimizing bodies than the
+probe has methods under test, or (for the barrier probe) zero collections.
+Rule 5 of the `c2` README asks for the exact edit that would trip each new
+check, so here it is, run rather than described — the same three probes against
+the same binary with `--nojit` appended:
+
+```
+negctl RefPutfieldBarrierProbe rc=0 [refbarrier] PASS c2_bodies=0/2 … => OK/VACUOUS-C2-BODIES-0-of-2
+negctl WideFieldProbe          rc=0 [widefield]  PASS c2_bodies=0/6 … => OK/VACUOUS-C2-BODIES-0-of-6
+negctl WideFieldSlotProbe      rc=0 [wideslot]   PASS c2_bodies=0/4 … => OK/VACUOUS-C2-BODIES-0-of-4
+runner exit=1
+```
+
+Every probe reports `PASS` from Java and the runner rejects all three. That is
+the property the gate exists for: **the Java verdict is not the result.**
 
 Reproduce:
 
@@ -258,8 +357,20 @@ wave lost its residuals (`docs/known-issues/c2/archive/README.md`).
 
 2. **No inline fast path for a wide field READ either.**
    `emit_inline_compact_getfield` refuses `J`/`F`/`D` tags, so every wide read
-   is a helper call plus the `dispatch_threw` cold branch. Six events' worth of
-   sites, so this is unlikely to be worth doing on its own.
+   is a helper call plus the `dispatch_threw` cold branch. A handful of sites,
+   so this is unlikely to be worth doing on its own.
+
+2b. **A wide value's reconstruction at a deopt is not observable from Java.**
+   The only shape that would let a Java probe read back a `long` rebuilt into
+   the interpreter's two-slot frame — catch the div-by-zero in the same method
+   and read the local in the handler's continuation — is refused by BOTH
+   backends at `rbc6-handler-reads-unsafe-local`, before the admission chain.
+   So this lane verified everything up to the guard and nothing past it. The
+   machinery itself is not new (`ir_emit_long` is default-ON and the whole
+   Spring corpus exercises it), and a field-sourced `long` is indistinguishable
+   from any other by the time `frame_value_for` reads `node_slot` and
+   `node.ty` — but that is an argument, not a measurement, and it is recorded
+   here as the latter's absence.
 
 3. **The brief's stated "first increment" is not what landed.** It proposed
    reference `putfield` on the non-compact path only, refusing when compact

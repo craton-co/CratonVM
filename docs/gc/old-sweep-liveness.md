@@ -371,7 +371,7 @@ stranger's identity.
 
 *Added 2026-08-02. This is the root cause of the H2 `MVStore`
 `ClassId(0)` / `java.lang.Object` family — the retired
-`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep` write-up — and the
+`bug-h2-classid0-stale-address-family` write-up — and the
 old-generation twin of `b5fc69a6fc`, which fixed the same defect in the young
 sweep's selective promotion.*
 

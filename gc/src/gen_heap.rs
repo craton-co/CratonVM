@@ -13391,7 +13391,7 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
 /// neither was reachable through `CRATONVM_DBG=` or arrangeable by
 /// `flags::with_thread_overrides`, and the second spelling appeared nowhere
 /// outside this function. Collapsed to the one name a known-issue repro
-/// already uses (`known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
+/// already uses (`known-issues/h2/bug-h2-classid0-stale-address-family.md`).
 fn doomed_referrers_dbg() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWEEP_REFERRERS").is_some()
 }
