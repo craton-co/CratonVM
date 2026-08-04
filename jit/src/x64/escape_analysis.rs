@@ -1814,6 +1814,19 @@ pub(super) fn detect_bulk_byte_loops(
 /// Runs the same detectors over the same loops behind the same flag as the
 /// emission path, so it cannot answer `true` where the backend would then
 /// emit nothing.
+///
+/// **One case where it can, and why it is left alone.** The admission chain
+/// sees the method's ORIGINAL bytecode; the driver re-binds `code` to the
+/// rewritten buffer when the bytecode loop transform applies
+/// (`x64/driver.rs`, `match &loop_xform`). Under
+/// `CRATONVM_JIT='bytecode-loop-xform'` the two can therefore disagree: a
+/// rewrite that destroys the vectorisable shape leaves a method vetoed here
+/// and un-vectorised there, and a rewrite that creates one leaves the IR tier
+/// holding a method this backend would have done better. The transform is
+/// opt-in and off by default, so no shipped configuration is affected, and
+/// both failure modes are worse codegen rather than wrong codegen. Re-derive
+/// this if the transform ever becomes default-on — it is the same
+/// two-conditions-in-two-files shape the factoring above exists to avoid.
 pub(crate) fn single_pass_has_bulk_byte_lowering(
     code: &[u8],
     code_len: usize,
