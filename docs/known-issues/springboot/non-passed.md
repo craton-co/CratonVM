@@ -1,3 +1,22 @@
+> Point-in-time dump of one suite run's non-passing classes. Rows are NOT
+> re-verified when a fix lands, so treat every entry as "was failing when this
+> was captured", not as current status.
+>
+> Known stale as of 2026-08-04: **all six `loader/spring-boot-jarmode-tools`
+> rows below now PASS**, on HotSpot and on CratonVM with JIT and `--nojit`.
+> `ExtractCommandTests`/`ExtractLayersCommandTests` were a real VM defect —
+> `fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
+> The other four were **never CratonVM defects**: HotSpot failed them
+> identically, because this fixture checkout's expected-output resources are
+> CRLF while `println` on Linux emits LF —
+> `fixed-suite-bugs/springboot/jarmode-tools-crlf-fixture-phantom-failures-FIXED.md`.
+>
+> That doc also covers the runner gap that let HotSpot-shared failures be filed
+> as CratonVM defects, now fixed (`BOTH-FAIL`). **A HotSpot control over the
+> whole 32-class residual list found 5 such rows** — the four above plus
+> `ChangelogWriterTests`, which is still red here and still fails on HotSpot
+> too, i.e. it is a fixture failure, not a VM one.
+
 1 CRASH
 Module	Class	Seconds
 module/spring-boot-jetty	SslServerCustomizerTests	1.4
@@ -10,7 +29,7 @@ module/spring-boot-jooq	JooqFlywayDatabaseInitializationTests
 module/spring-boot-http-client	JdkClientHttpRequestFactoryBuilderTests
 module/spring-boot-jackson	JacksonAutoConfigurationTests
 module/spring-boot-kafka	KafkaAutoConfigurationIntegrationTests
-24 FAIL
+23 FAIL
 Module	Class	Seconds
 configuration-metadata/spring-boot-configuration-metadata-changelog-generator	ChangelogWriterTests	0.6
 module/spring-boot-flyway	Flyway110AutoConfigurationTests	2.8
@@ -32,7 +51,6 @@ core/spring-boot	NoSuchMethodFailureAnalyzerTests	9.5
 module/spring-boot-health	DiskSpaceHealthIndicatorTests	3.6
 module/spring-boot-http-client	JdkClientHttpConnectorBuilderTests	8.7
 module/spring-boot-liquibase	Liquibase423AutoConfigurationTests	1.6
-module/spring-boot-webservices	WebServiceMessageSenderFactoryTests	4.2
 test-support/spring-boot-test-support	ModifiedClassPathExtensionOverridesParameterizedTests	2.0
 test-support/spring-boot-test-support	ModifiedClassPathExtensionOverridesTests	1.8
 test-support/spring-boot-test-support	ResourcesTests

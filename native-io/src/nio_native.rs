@@ -1546,7 +1546,7 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     // DatagramChannel (SYNTHETIC, synthetic-jdk only).
     //
     // FLAGGED SyntheticStub: the `t16_dc_*` family fabricates datagram/connect
-    // state (per `S1` in docs/reviews/fable-2026-06-10/native-io.md). Per the
+    // state (per `S1` in reviews/fable-2026-06-10/native-io.md). Per the
     // no-synthetic-stubs policy these overrides are compiled in only under
     // `synthetic-jdk` and tagged `NativeKind::SyntheticStub`. In the default
     // build they are absent, so the real JDK `DatagramChannel`/`sun.nio.ch`

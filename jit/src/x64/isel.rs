@@ -1433,6 +1433,41 @@ pub static PATTERNS: &[Pattern] = &[
         cost: Cost::new(3, 1, 1),
         ..Pattern::BASE
     },
+    // 32-bit `LEA`, the form real Java `int` arithmetic asks for.
+    //
+    // Anchored: `x64.rs`'s small-multiply fast path already emits exactly this
+    // row's bytes — `emit_imul_const` (`x64/arith.rs:790`, `:797`, `:804`)
+    // writes `8D 04 40` / `8D 04 80` / `8D 04 C0`, i.e. `LEA EAX, [RAX+RAX*n]`
+    // with no REX prefix. `rex_w: false` plus `RexMode::IfNeeded` reproduces
+    // that byte-for-byte for registers 0-7 and adds REX only where the encoding
+    // requires it.
+    //
+    // Correct for `int` for the same reason `ADD EAX, ECX` is: a 32-bit `LEA`
+    // computes the effective address in 64 bits, truncates to 32 and
+    // zero-extends into the destination, and address arithmetic is congruent
+    // mod 2^32 — so the low half is Java's wrapping result whatever the
+    // operands' widths. The high half it leaves is the *same* high half the
+    // majority of `ir_lower`'s `Int` arms already leave.
+    Pattern {
+        name: "lea_r32_m",
+        emitter: "x64/arith.rs emit_imul_const `[0x8D, 0x04, 0x40|0x80|0xC0]`",
+        op: Op::Lea,
+        ty: Ty::I32,
+        src: OpKind::Mem,
+        enc: Enc {
+            opcode: Opcode::One(0x8D),
+            reg: RegF::Dst,
+            rm: RmF::Mem,
+            ..Enc::BASE
+        },
+        disp: DispPolicy::Smallest,
+        // LEA reads no memory: it computes the effective address only. Two
+        // bytes, not the 64-bit row's three: no REX. That is the *floor* for a
+        // base-only operand; `MInst::cost` adds the address's own extra bytes,
+        // so the anchored `LEA EAX, [RAX+RAX*n]` still prices at 3.
+        cost: Cost::new(2, 1, 1),
+        ..Pattern::BASE
+    },
     Pattern {
         name: "lea_r64_m_disp32",
         emitter: "emit_lea_r64_mem_disp32",
@@ -1601,6 +1636,165 @@ pub static PATTERNS: &[Pattern] = &[
             ..Enc::BASE
         },
         flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    // ── 32-bit ALU immediates ────────────────────────────────────────
+    //
+    // `Rule::AluImm` fired ZERO times on 850 real Spring Boot compiles before
+    // these rows existed — every attempt came back `Unencodable`, because the
+    // table had only 64-bit immediate forms and Java arithmetic is 32-bit.
+    // That measurement (`docs/feature-designs/jit-machine-level-and-instruction-selection.md`)
+    // is what reordered the lane to put these first.
+    //
+    // Each row reproduces a byte literal `x64.rs`'s constant-folding fast path
+    // ALREADY emits, so the table's one trustworthy property — every row
+    // anchored to hand-written code it matches byte-for-byte — is preserved.
+    // `ir_lower` does not emit these: it materialises the constant into ECX and
+    // uses the register form, which is exactly the round trip these rows drop.
+    //
+    // No REX. The anchors all target EAX (`rex_w: false`, `RexMode::IfNeeded`
+    // leaves the prefix off for registers 0-7), which is what makes them
+    // byte-identical to the literals below rather than merely equivalent.
+    Pattern {
+        name: "add_r32_imm8",
+        emitter: "x64.rs iadd-const fast path `[0x83, 0xC0, imm8]`",
+        op: Op::Add,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(0),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "add_r32_imm32",
+        emitter: "x64.rs iadd-const fast path `[0x81, 0xC0] + imm32`",
+        op: Op::Add,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x81),
+            reg: RegF::Ext(0),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm32,
+        flags: FlagEffect::W,
+        cost: Cost::new(6, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "sub_r32_imm8",
+        emitter: "x64.rs isub-const fast path `[0x83, 0xE8, imm8]`",
+        op: Op::Sub,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(5),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "sub_r32_imm32",
+        emitter: "x64.rs isub-const fast path `[0x81, 0xE8] + imm32`",
+        op: Op::Sub,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x81),
+            reg: RegF::Ext(5),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm32,
+        flags: FlagEffect::W,
+        cost: Cost::new(6, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "and_r32_imm8",
+        emitter: "x64.rs iand-const fast path `[0x83, 0xE0, imm8]`",
+        op: Op::And,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(4),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "or_r32_imm8",
+        emitter: "x64.rs ior-const fast path `[0x83, 0xC8, imm8]`",
+        op: Op::Or,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(1),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "xor_r32_imm8",
+        emitter: "x64.rs ixor-const fast path `[0x83, 0xF0, imm8]`",
+        op: Op::Xor,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(6),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "cmp_r32_imm8",
+        emitter: "x64.rs if_icmp-const fast path `[0x83, 0xF8, imm8]`",
+        op: Op::Cmp,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(7),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
         ..Pattern::BASE
     },
     Pattern {
@@ -2647,6 +2841,7 @@ pub fn render(p: &Pattern, d: &Decoded) -> String {
 // `docs/jit/instruction-selection.md` for what the production wiring has to do
 // and what is still unvalidated.
 
+use crate::ir_schedule::Schedule;
 use crate::ir::{is_memory_token_slot, CmpOp, Graph, IrType, NodeId, Op as IrOp, Reorder,
     ReorderBlock};
 
@@ -3451,6 +3646,7 @@ impl MInst {
             MInst::Move { ty: Ty::I64, .. } => Some("mov_r64_r64"),
             MInst::Move { .. } => None,
             MInst::Lea { ty: Ty::I64, .. } => Some("lea_r64_m"),
+            MInst::Lea { ty: Ty::I32, .. } => Some("lea_r32_m"),
             MInst::Lea { .. } => None,
             MInst::AluRR { op, ty, .. } => match (op, ty) {
                 (Op::Add, Ty::I64) => Some("add_r64_r64"),
@@ -3473,11 +3669,30 @@ impl MInst {
                 (Op::Or, ImmForm::Imm8) => Some("or_r64_imm8"),
                 _ => None,
             },
+            // 32-bit, the forms real Java arithmetic actually asks for. `AluImm`
+            // fired zero times on 850 Spring Boot compiles until these existed:
+            // the rows were missing AND this mapping was, and either alone is
+            // enough to make `require_encodable` discard the tile.
+            MInst::AluRI { op, ty: Ty::I32, form, .. } => match (op, form) {
+                (Op::Add, ImmForm::Imm8) => Some("add_r32_imm8"),
+                (Op::Add, ImmForm::Imm32) => Some("add_r32_imm32"),
+                (Op::Sub, ImmForm::Imm8) => Some("sub_r32_imm8"),
+                (Op::Sub, ImmForm::Imm32) => Some("sub_r32_imm32"),
+                (Op::And, ImmForm::Imm8) => Some("and_r32_imm8"),
+                (Op::Or, ImmForm::Imm8) => Some("or_r32_imm8"),
+                (Op::Xor, ImmForm::Imm8) => Some("xor_r32_imm8"),
+                _ => None,
+            },
             MInst::AluRI { .. } => None,
             MInst::AluRM { .. } => None,
             MInst::CmpRR { ty: Ty::I64, .. } => Some("cmp_r64_r64"),
             MInst::CmpRR { ty: Ty::I32, .. } => Some("cmp_r32_r32"),
             MInst::CmpRR { .. } => None,
+            MInst::CmpRI {
+                ty: Ty::I32,
+                form: ImmForm::Imm8,
+                ..
+            } => Some("cmp_r32_imm8"),
             MInst::CmpRI { .. } => None,
             MInst::TestRR { ty: Ty::I64, .. } => Some("test_r64_r64"),
             MInst::TestRR { ty: Ty::I32, .. } => Some("test_r32_r32"),
@@ -3647,6 +3862,19 @@ pub struct Tile {
     pub rule: Rule,
 }
 
+/// What one operand costs to bring in from its frame word: `MOV r64, [RBP -
+/// disp8]`, four bytes and one micro-op, at a load's latency.
+///
+/// The disp8 form deliberately — it is the common case and the *smaller*
+/// figure, so a cost model that consults this never over-states what an
+/// immediate form saves.
+const FRAME_LOAD_COST: SeqCost = SeqCost {
+    bytes: 4,
+    uops: 1,
+    latency: 4,
+};
+
+
 impl Tile {
     fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
         let cost = insts
@@ -3697,6 +3925,66 @@ impl Tile {
         )
     }
 
+    /// This tile's cost, re-priced for a frame-homed allocation.
+    ///
+    /// [`MInst::cost`] prices instructions. Under
+    /// [`SelectOptions::frame_homed`] an operand that stays a register is also
+    /// a `MOV r64, [RBP - disp]` the consumer has to emit to bring it in, and
+    /// two candidates for one node can need a *different number* of those:
+    /// `ADD EAX, ECX` loads two values where `ADD EAX, 7` loads one. Pricing
+    /// only the instruction hides four bytes and a micro-op, and hands the node
+    /// to the register form every time.
+    ///
+    /// Every tile loads at least one operand — the value it computes from — so
+    /// the first is free here and only the extras are charged. That keeps this
+    /// a *comparison between candidates for one node* rather than an absolute
+    /// figure competing with [`GENERIC_COST`].
+    ///
+    /// The operand set is a set: `x + x` selects an `LEA [x + x]` that loads
+    /// `x` once, and counting edges rather than values would charge it twice.
+    fn frame_homed(mut self) -> Tile {
+        let mut operands: Vec<NodeId> = Vec::new();
+        for inst in &self.insts {
+            let mut note = |id: NodeId| {
+                if !operands.contains(&id) {
+                    operands.push(id);
+                }
+            };
+            match *inst {
+                MInst::Imm { .. } | MInst::Generic { .. } | MInst::Jcc { .. } => {}
+                MInst::Move { src, .. } => note(src),
+                MInst::Lea { addr, .. } => {
+                    if let Some(b) = addr.base {
+                        note(b);
+                    }
+                    if let Some(i) = addr.index {
+                        note(i);
+                    }
+                }
+                MInst::AluRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::AluRI { lhs, .. } => note(lhs),
+                // A folded load's address is the memory node's own, which the
+                // lowering computes; only the kept operand is a frame word.
+                MInst::AluRM { lhs, .. } => note(lhs),
+                MInst::CmpRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::CmpRI { lhs, .. } => note(lhs),
+                MInst::TestRR { reg, .. } => note(reg),
+                // `SETcc` reads flags, not a frame word.
+                MInst::SetCc { .. } => {}
+            }
+        }
+        for _ in 1..operands.len() {
+            self.cost = self.cost.then(FRAME_LOAD_COST);
+        }
+        self
+    }
+
     /// The fall-back tile: one node, lowered the old way.
     pub fn generic(root: NodeId) -> Tile {
         Tile::new(
@@ -3705,6 +3993,19 @@ impl Tile {
             vec![MInst::Generic { node: root }],
             Rule::Generic,
         )
+    }
+
+    /// Build a tile directly. Tests only.
+    ///
+    /// In production only the rules construct tiles, so a tile's cover list and
+    /// its instructions always come from one place. A test that needs to hand a
+    /// *deliberately inconsistent* tile to a consumer — `ir_lower::
+    /// mir_tile_is_emittable`'s absorbed-node guard is the one that does —
+    /// cannot obtain one from a rule by construction, which is exactly why that
+    /// guard needs this.
+    #[cfg(test)]
+    pub fn for_test(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
+        Tile::new(root, covered, insts, rule)
     }
 
     /// Can the pattern table encode every instruction in this tile?
@@ -3737,6 +4038,26 @@ pub struct SelectOptions {
     /// [`AddrSource::Opaque`], so a lowering has to teach the memory operand to
     /// `ir_lower` before this is worth turning on.
     pub fold_loads: bool,
+    /// The consumer will encode these tiles against a **frame-homed**
+    /// allocation: every value lives in its frame word, and an instruction's
+    /// operands are loaded into scratch registers on the spot.
+    ///
+    /// This is not a hint, it is a statement about the allocation, and it
+    /// changes what the cost model is measuring. The two-address fixup — the
+    /// `MInst::Move` that copies a still-live left operand before an x86 ALU
+    /// instruction overwrites it — does not exist under frame homing: the
+    /// destination's register never *held* the left operand, so "copy it there"
+    /// and "load it there" are the same instruction, and the ALU form pays
+    /// nothing for a live left operand.
+    ///
+    /// Off by default, deliberately. Increments 0 and 1 measured coverage with
+    /// it off; flipping the default would silently re-base those figures.
+    ///
+    /// What it decides, concretely: with a live left operand and this `false`,
+    /// `Rule::Lea` outbids `Rule::AluReg` on the strength of a copy the
+    /// consumer would never have emitted, and `a + b` selects an `LEA` that is
+    /// a byte longer than the `ADD` it replaced.
+    pub frame_homed: bool,
 }
 
 impl Default for SelectOptions {
@@ -3744,6 +4065,7 @@ impl Default for SelectOptions {
         SelectOptions {
             require_encodable: true,
             fold_loads: false,
+            frame_homed: false,
         }
     }
 }
@@ -3851,21 +4173,26 @@ fn commutative(op: &IrOp) -> bool {
 /// That is only legal when `lhs` dies at this node — one consumer, and no deopt
 /// frame naming it. Otherwise the tile pays for a `MOV` first, and that cost is
 /// exactly what makes the non-destructive `LEA` win the comparison.
-fn needs_copy(ctx: &SelCtx, lhs: NodeId) -> bool {
-    !ctx.uses.single_use(lhs)
+///
+/// Under [`SelectOptions::frame_homed`] there is no coalescing to protect:
+/// the destination's register never held the left operand, so the consumer
+/// loads it either way and the copy is not a copy. Answering `true` there would
+/// price a `MOV` nobody emits — and that fiction is what makes `LEA` outbid the
+/// `ADD` it is a byte longer than.
+fn needs_copy(ctx: &SelCtx, lhs: NodeId, opts: &SelectOptions) -> bool {
+    !opts.frame_homed && !ctx.uses.single_use(lhs)
 }
 
 /// `LEA` for an add / shift / multiply tree.
 fn tile_lea(ctx: &SelCtx, root: NodeId, claimed: &[bool], notes: &mut Vec<Note>) -> Option<Tile> {
-    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic —
-    // it truncates to 32 bits, which is exactly Java's wrap — but the table has
-    // no row for it, and emitting the 64-bit form instead would leave garbage in
-    // the high half of a slot that `Op::Return` copies out whole. Refuse rather
-    // than guess; see the doc's "still unvalidated" section.
+    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic:
+    // it truncates to 32 bits, which is exactly Java's wrap, and zero-extends
+    // into the destination — the same high half `ADD EAX, ECX` leaves, which is
+    // what `ir_lower`'s `Op::Add`/`Op::Mul` `Int` arms already emit. The row it
+    // encodes through (`lea_r32_m`) is anchored to `emit_imul_const`'s
+    // `8D 04 40` / `8D 04 80` / `8D 04 C0`. Nothing wider than `I64` gets here:
+    // `int_ty` maps only `Int`/`Long`/`Ref`.
     let ty = ctx.int_ty(root)?;
-    if ty != Ty::I64 {
-        return None;
-    }
     let m = match match_address(ctx, root) {
         Ok(m) => m,
         // `NotAnAddress` only means "this rule does not apply to this node",
@@ -3929,7 +4256,7 @@ fn tiles_alu(
     // 64-bit frame slot. Always `Ty::I64`, so the copy has a table row for
     // both `int` and `long` operands.
     let prefix = |lhs: NodeId| -> Vec<MInst> {
-        if needs_copy(ctx, lhs) {
+        if needs_copy(ctx, lhs, opts) {
             vec![MInst::Move {
                 dst: root,
                 ty: Ty::I64,
@@ -4311,6 +4638,11 @@ fn mark_claims(t: &Tile, claimed: &mut [bool]) {
 /// back to the generic lowering instead of being selected into an instruction
 /// nobody can emit.
 fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
+    // The allocation the consumer will encode against changes what a tile
+    // costs, and it changes it differently for different candidates. Applied
+    // here rather than in each rule so that every candidate for a node is
+    // priced the same way — a rule that forgot would look cheap.
+    let t = if opts.frame_homed { t.frame_homed() } else { t };
     if !opts.require_encodable {
         return Some(t);
     }
@@ -4325,6 +4657,318 @@ fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
             None
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Shadow selection — increment 0 of
+// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+// ---------------------------------------------------------------------------
+//
+// Run the tiler over a real compile's blocks, check its own invariant, count
+// what fired, and **throw the result away**. Not one emitted byte changes.
+//
+// Why a pass that emits nothing is the first increment, and not a shortcut to
+// one that does: the contract's three-defect test scored one of three, so the
+// HIR/MIR migration is not justified as a correctness investment. What decides
+// whether to continue is a number nobody has — how much of a real method the
+// pattern table can actually cover — and this is the cheapest honest way to get
+// it. If the answer is small, the right move is to stop and keep the number.
+//
+// Measured on ten synthetic shapes for the contract: 38.2% of scheduled data
+// nodes, with `Rule::AluImm` firing **zero** times because the table has no
+// 32-bit immediate rows. That corpus is not real code — it has no field access,
+// no calls, and `ir_optimize` never ran on it. This pass replaces it with the
+// real population.
+//
+// ## Why this does not refuse the compile
+//
+// Everything else new in this backend fails closed. This deliberately does not,
+// and the reason is that it is a *measurement*: a flag whose only documented
+// effect is a count must not be able to change which methods get compiled, or
+// the number it reports is a number about a different program. So a
+// `covers()` violation — an `isel` bug, and the exact failure the invariant
+// exists to catch — is counted and reported, loudly, and the compile proceeds
+// through the unchanged path.
+//
+// `shadow_selection_changes_no_emitted_byte` is what holds that claim up.
+// Increment 1, which emits tiles, is where fail-closed comes back.
+
+/// One method's shadow-selection result.
+///
+/// Counts only. Nothing here names a node, because nothing downstream may act
+/// on it — see the module note above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShadowStats {
+    /// Blocks the selector was run over.
+    pub blocks: u64,
+    /// Scheduled data nodes offered to it (`Block::nodes`, summed).
+    pub nodes: u64,
+    /// Tiles it produced, including `Rule::Generic` ones.
+    pub tiles: u64,
+    /// Tiles that fired a rule other than [`Rule::Generic`].
+    pub matched_tiles: u64,
+    /// Data nodes covered by a matched tile — the headline figure. A tile's
+    /// `covered` list can hold more than its root (that is what absorption is),
+    /// so this is not `matched_tiles`.
+    pub covered_nodes: u64,
+    /// Blocks where [`BlockSelection::covers`] came back false.
+    ///
+    /// **Always zero, or there is a bug in `isel`.** Counted rather than
+    /// asserted because this pass may not change what compiles.
+    pub coverage_failures: u64,
+    /// Per-rule tile counts, indexed by [`rule_index`].
+    pub rules: [u64; RULE_COUNT],
+    /// Per-note refusal counts, indexed by [`note_index`].
+    pub notes: [u64; NOTE_COUNT],
+}
+
+/// Number of [`Rule`] variants. A new variant is a compile error in
+/// [`rule_index`], which is the point.
+pub const RULE_COUNT: usize = 9;
+/// Number of [`Note`] variants; same discipline as [`RULE_COUNT`].
+pub const NOTE_COUNT: usize = 4;
+
+/// Stable histogram slot for a rule. **Exhaustive on purpose** — adding a
+/// [`Rule`] variant must not silently land in another variant's bucket.
+pub fn rule_index(rule: Rule) -> usize {
+    match rule {
+        Rule::Generic => 0,
+        Rule::Lea => 1,
+        Rule::AluImm => 2,
+        Rule::AluReg => 3,
+        Rule::AluFoldedLoad => 4,
+        Rule::CmpBranch => 5,
+        Rule::TestZeroBranch => 6,
+        Rule::TestBranch => 7,
+        Rule::CmpSetCc => 8,
+    }
+}
+
+/// Human name for histogram slot `i`, parallel to [`rule_index`].
+pub fn rule_name(i: usize) -> &'static str {
+    [
+        "Generic",
+        "Lea",
+        "AluImm",
+        "AluReg",
+        "AluFoldedLoad",
+        "CmpBranch",
+        "TestZeroBranch",
+        "TestBranch",
+        "CmpSetCc",
+    ]
+    .get(i)
+    .copied()
+    .unwrap_or("?")
+}
+
+/// Stable histogram slot for a refusal note. Exhaustive, as [`rule_index`].
+pub fn note_index(note: &Note) -> usize {
+    match note {
+        Note::Address { .. } => 0,
+        Note::Fold { .. } => 1,
+        Note::Unencodable { .. } => 2,
+        Note::WideImmediate { .. } => 3,
+    }
+}
+
+/// Human name for note slot `i`, parallel to [`note_index`].
+pub fn note_name(i: usize) -> &'static str {
+    ["Address", "Fold", "Unencodable", "WideImmediate"]
+        .get(i)
+        .copied()
+        .unwrap_or("?")
+}
+
+impl ShadowStats {
+    /// Fraction of scheduled data nodes a real rule covered, as a percentage.
+    ///
+    /// This is the figure increment 0 exists to produce. Zero nodes reads as
+    /// `0.0` rather than NaN: a method with nothing to select is not 100%
+    /// covered, and a NaN in a summary line is how a metric gets ignored.
+    pub fn coverage_pct(&self) -> f64 {
+        if self.nodes == 0 {
+            return 0.0;
+        }
+        100.0 * self.covered_nodes as f64 / self.nodes as f64
+    }
+
+    /// Fold `other` into `self`. Used by callers aggregating several methods
+    /// without going through the process totals (the tests do this).
+    pub fn add(&mut self, other: &ShadowStats) {
+        self.blocks += other.blocks;
+        self.nodes += other.nodes;
+        self.tiles += other.tiles;
+        self.matched_tiles += other.matched_tiles;
+        self.covered_nodes += other.covered_nodes;
+        self.coverage_failures += other.coverage_failures;
+        for i in 0..RULE_COUNT {
+            self.rules[i] += other.rules[i];
+        }
+        for i in 0..NOTE_COUNT {
+            self.notes[i] += other.notes[i];
+        }
+    }
+
+    /// One line, in the shape the aggregation script reads.
+    pub fn summary_line(&self) -> String {
+        let mut s = format!(
+            "blocks={} nodes={} tiles={} matched={} covered={} ({:.1}%) covfail={}",
+            self.blocks,
+            self.nodes,
+            self.tiles,
+            self.matched_tiles,
+            self.covered_nodes,
+            self.coverage_pct(),
+            self.coverage_failures,
+        );
+        for i in 0..RULE_COUNT {
+            if self.rules[i] != 0 {
+                s.push_str(&format!(" {}={}", rule_name(i), self.rules[i]));
+            }
+        }
+        for i in 0..NOTE_COUNT {
+            if self.notes[i] != 0 {
+                s.push_str(&format!(" note:{}={}", note_name(i), self.notes[i]));
+            }
+        }
+        s
+    }
+}
+
+// The process-wide accumulator.
+//
+// Plain atomics rather than a `Mutex<ShadowStats>`: this runs inside the
+// compiler, on whatever thread the broker picked, and a compile must never
+// block on a diagnostic. Relaxed ordering makes the totals a *sample* — the
+// same contract `bailout::bailout_counts` documents — which is what a coverage
+// figure needs and all it needs.
+mod totals {
+    use super::{NOTE_COUNT, RULE_COUNT};
+    use std::sync::atomic::AtomicU64;
+
+    pub(super) static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NODES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TILES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static MATCHED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static COVERED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static COVFAIL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static METHODS: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RULES: [AtomicU64; RULE_COUNT] = [ZERO; RULE_COUNT];
+    pub(super) static NOTES: [AtomicU64; NOTE_COUNT] = [ZERO; NOTE_COUNT];
+}
+
+/// Methods this process has shadow-selected, and their summed stats.
+pub fn shadow_totals() -> (u64, ShadowStats) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut s = ShadowStats {
+        blocks: totals::BLOCKS.load(Relaxed),
+        nodes: totals::NODES.load(Relaxed),
+        tiles: totals::TILES.load(Relaxed),
+        matched_tiles: totals::MATCHED.load(Relaxed),
+        covered_nodes: totals::COVERED.load(Relaxed),
+        coverage_failures: totals::COVFAIL.load(Relaxed),
+        ..ShadowStats::default()
+    };
+    for i in 0..RULE_COUNT {
+        s.rules[i] = totals::RULES[i].load(Relaxed);
+    }
+    for i in 0..NOTE_COUNT {
+        s.notes[i] = totals::NOTES[i].load(Relaxed);
+    }
+    (totals::METHODS.load(Relaxed), s)
+}
+
+/// **Test support.** Serialises every test that touches the shadow counters.
+///
+/// The accumulator is process-global and the test binary is threaded, so a test
+/// that resets it and then asserts `methods == 1` will read another test's
+/// compile if the two overlap — which is exactly what happened the first time
+/// these were run (`left: 2, right: 1`). Any test that enables
+/// `CRATONVM_JIT_IR_ISEL_SHADOW` or reads [`shadow_totals`] must hold this,
+/// including one that only asserts the counters stayed at zero.
+///
+/// Deliberately its own lock and not `metrics::METRICS_TEST_LOCK`: these tests
+/// have nothing to do with metrics, and a reader should not have to work out
+/// why a byte-comparison test takes a metrics lock.
+#[cfg(test)]
+pub static SHADOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Zero the accumulator. Tests only — two tests reading one global would
+/// otherwise see each other's counts. Hold [`SHADOW_TEST_LOCK`] across the
+/// reset AND the read.
+#[cfg(test)]
+pub fn reset_shadow_totals() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [
+        &totals::BLOCKS,
+        &totals::NODES,
+        &totals::TILES,
+        &totals::MATCHED,
+        &totals::COVERED,
+        &totals::COVFAIL,
+        &totals::METHODS,
+    ] {
+        c.store(0, Relaxed);
+    }
+    for c in totals::RULES.iter().chain(totals::NOTES.iter()) {
+        c.store(0, Relaxed);
+    }
+}
+
+/// Tile one method's blocks, count, discard.
+///
+/// Returns this method's stats and folds them into the process totals. The
+/// caller emits through the unchanged path either way; nothing in the return
+/// value may reach the emitter.
+///
+/// `SelectOptions::default()` is deliberate and not a placeholder: it is
+/// `require_encodable: true` (refuse a tile the table cannot encode) and
+/// `fold_loads: false` (the load-fold gate is sound but its address half is
+/// still `AddrSource::Opaque`). Measuring with `fold_loads: true` would report
+/// coverage no production wiring could take.
+pub fn shadow_select_method(graph: &Graph, schedule: &Schedule) -> ShadowStats {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let opts = SelectOptions::default();
+    let mut m = ShadowStats::default();
+    for block in &schedule.blocks {
+        let sel = select_block(graph, &block.nodes, block.terminator, &opts);
+        m.blocks += 1;
+        m.nodes += block.nodes.len() as u64;
+        m.tiles += sel.tiles.len() as u64;
+        if !sel.covers(&block.nodes) {
+            m.coverage_failures += 1;
+        }
+        for t in &sel.tiles {
+            m.rules[rule_index(t.rule)] += 1;
+            if t.rule != Rule::Generic {
+                m.matched_tiles += 1;
+                m.covered_nodes += t.covered.len() as u64;
+            }
+        }
+        for n in &sel.notes {
+            m.notes[note_index(n)] += 1;
+        }
+    }
+
+    totals::METHODS.fetch_add(1, Relaxed);
+    totals::BLOCKS.fetch_add(m.blocks, Relaxed);
+    totals::NODES.fetch_add(m.nodes, Relaxed);
+    totals::TILES.fetch_add(m.tiles, Relaxed);
+    totals::MATCHED.fetch_add(m.matched_tiles, Relaxed);
+    totals::COVERED.fetch_add(m.covered_nodes, Relaxed);
+    totals::COVFAIL.fetch_add(m.coverage_failures, Relaxed);
+    for i in 0..RULE_COUNT {
+        totals::RULES[i].fetch_add(m.rules[i], Relaxed);
+    }
+    for i in 0..NOTE_COUNT {
+        totals::NOTES[i].fetch_add(m.notes[i], Relaxed);
+    }
+    m
 }
 
 // ---------------------------------------------------------------------------
@@ -4376,6 +5020,9 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                // No `invokedynamic` in this fixture — see the sibling call
+                // site in `x64/tests.rs`.
                 false,
                 Vec::new(),
             );
@@ -6181,6 +6828,101 @@ mod tests {
         assert!(matches!(t.insts.as_slice(), [MInst::Lea { .. }]));
     }
 
+    /// The immediate form wins under frame homing, and loses without it.
+    ///
+    /// Measured, not assumed: with `frame_homed` off the level-2 encoder took
+    /// 39 tiles across CratonBenchC2's three phases and `Rule::AluImm` was
+    /// selected **zero** times — not because the rows were missing (increment 1
+    /// added them) and not because the constant was folded away, but because
+    /// `ADD EAX, ECX` is two bytes and `ADD EAX, 7` is three. The cost model
+    /// prices instructions; under frame homing the register operand also costs
+    /// a `MOV r64, [RBP-disp8]` that the immediate form does not, and pricing
+    /// only the instruction hides four bytes and a micro-op.
+    ///
+    /// The constant is deliberately given a second consumer here, because that
+    /// is what real code looks like: `ValueUses::single_use` requires
+    /// `count == 1` AND not pinned, and a safepoint snapshot names almost every
+    /// live constant — so the tile usually cannot absorb it and the two forms
+    /// really are competing over one node.
+    ///
+    /// The exact edit that trips it: drop the `opts.frame_homed` arm from
+    /// `tiles_alu`'s `extra`. The first assertion flips back to `AluReg`.
+    #[test]
+    fn frame_homing_makes_the_immediate_form_win() {
+        let build = || {
+            let mut graph = g();
+            let p = param(&mut graph, 0);
+            let k = konst(&mut graph, 7);
+            let add = bin(&mut graph, IrOp::Add, p, k);
+            // A second consumer for the CONSTANT only, so it is not absorbable
+            // and both candidates cover exactly the add — and so the left
+            // operand stays single-use, which keeps the two-address copy out of
+            // the comparison. This is a test about operand loads, not copies.
+            let _other = second_use(&mut graph, k);
+            (graph, add)
+        };
+
+        let (graph, add) = build();
+        let block = vec![add];
+        let homed = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &homed);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluImm,
+            "the immediate form drops a frame load the register form pays"
+        );
+        assert_eq!(t.covered.as_slice(), [add], "the constant is still live");
+
+        // And the default is untouched, which is what keeps increments 0 and
+        // 1's coverage figures comparable.
+        let (graph, add) = build();
+        let s = select_block(&graph, &vec![add], None, &SelectOptions::default());
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(t.rule, Rule::AluReg);
+    }
+
+    /// …and under [`SelectOptions::frame_homed`] the copy is *not* real, so the
+    /// same graph selects the `ADD` again.
+    ///
+    /// This is the option earning its keep rather than being a preference. The
+    /// consumer that sets it (`ir_lower`'s level-2 encoder) loads the left
+    /// operand into the destination register whatever the tile says, so a
+    /// `MInst::Move` prefix costs nothing and buys nothing — and priced as
+    /// though it cost something it hands `a + b` an `LEA` a byte longer than
+    /// the `ADD` it replaced.
+    ///
+    /// The exact edit that trips it: drop the `!opts.frame_homed &&` from
+    /// `needs_copy`. Both assertions below flip.
+    #[test]
+    fn frame_homing_removes_the_copy_that_makes_lea_win() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let add = bin(&mut graph, IrOp::Add, p, q);
+        let _keep = second_use(&mut graph, p);
+        let block = vec![add];
+        let opts = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &opts);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluReg,
+            "frame homing means there is no copy to avoid"
+        );
+        assert!(
+            matches!(t.insts.as_slice(), [MInst::AluRR { .. }]),
+            "and no `MInst::Move` prefix either: {:?}",
+            t.insts
+        );
+    }
+
     /// Ranking is micro-ops first. A three-byte `MOV` plus a three-byte `ADD`
     /// is *more* bytes than a four-byte `LEA`, but the point of the ordering is
     /// that it would still lose on micro-ops even if it were shorter.
@@ -6346,6 +7088,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         let own = lax.tiles.iter().find(|t| t.root == cmp).expect("cmp tile");
@@ -6460,6 +7203,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         assert!(
@@ -6478,6 +7222,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         let t = s.tiles.iter().find(|t| t.root == f.add).expect("add tile");
@@ -6686,6 +7431,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         assert_eq!(
@@ -6759,6 +7505,138 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Every 32-bit immediate row reproduces the `x64.rs` byte literal it
+    /// names, exactly.
+    ///
+    /// The table's one trustworthy property is that a row is anchored to
+    /// hand-written code it matches byte-for-byte; eight rows added on the
+    /// strength of a coverage measurement are eight chances to weaken it. Each
+    /// literal below is copied from the constant-folding fast path in `x64.rs`
+    /// (the `iadd`/`isub`/`iand`/`ior`/`ixor`/`if_icmp` const arms), with EAX
+    /// as the destination — which is what those arms use, and why no REX
+    /// prefix appears.
+    ///
+    /// The exact edit that trips it: change any `RegF::Ext(n)` above. The
+    /// `/n` digit is the opcode extension that distinguishes `ADD` from `SUB`
+    /// from `AND` in the shared `0x83` group, and getting it wrong produces a
+    /// valid instruction that computes something else entirely.
+    #[test]
+    fn the_32bit_immediate_rows_reproduce_the_x64_byte_literals() {
+        // `x64.rs` constant-folding fast path, EAX destination — which is why
+        // no REX prefix appears in any of these.
+        assert_eq!(sel(&gpr_imm(Op::Add, Ty::I32, RAX, 7)), vec![0x83, 0xC0, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Add, Ty::I32, RAX, 100_000)),
+            vec![0x81, 0xC0, 0xA0, 0x86, 0x01, 0x00]
+        );
+        assert_eq!(sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 7)), vec![0x83, 0xE8, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 100_000)),
+            vec![0x81, 0xE8, 0xA0, 0x86, 0x01, 0x00]
+        );
+        assert_eq!(sel(&gpr_imm(Op::And, Ty::I32, RAX, 7)), vec![0x83, 0xE0, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Or, Ty::I32, RAX, 7)), vec![0x83, 0xC8, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Xor, Ty::I32, RAX, 7)), vec![0x83, 0xF0, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)), vec![0x83, 0xF8, 0x07]);
+    }
+
+    /// `lea_r32_m` reproduces the three byte literals `emit_imul_const` emits.
+    ///
+    /// `Rule::Lea` fired **zero** times on 850 real Spring Boot compiles
+    /// because `tile_lea` refused every `Ty::I32` root — Java arithmetic is
+    /// 32-bit and the table had only the REX.W form. This is the anchor for the
+    /// row that unblocked it: `x64/arith.rs:790`, `:797`, `:804` already write
+    /// exactly these bytes for `imul` by 3, 5 and 9.
+    ///
+    /// The exact edit that trips it: set `rex_w: true` on the row, or change
+    /// `RexMode::OnDemand` to `RexMode::Always`. Either adds a `0x48` and the
+    /// row stops being the literal it claims.
+    #[test]
+    fn the_32bit_lea_row_reproduces_the_imul_const_byte_literals() {
+        for (scale, want) in [
+            (2u8, vec![0x8Du8, 0x04, 0x40]),
+            (4, vec![0x8D, 0x04, 0x80]),
+            (8, vec![0x8D, 0x04, 0xC0]),
+        ] {
+            let mem = Mem {
+                base: RAX,
+                index: Some(Index { reg: RAX, scale }),
+                disp: 0,
+                force_disp32: false,
+            };
+            let got = sel(&Req::new(
+                Op::Lea,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::Mem(mem),
+            ));
+            assert_eq!(got, want, "LEA EAX, [RAX + RAX*{scale}]");
+        }
+    }
+
+    /// An `int` add/shift/multiply tree becomes one `LEA`, which is the whole
+    /// point of the row above: before it, `tile_lea` returned `None` for every
+    /// `IrType::Int` root and the rule was dead on real code.
+    #[test]
+    fn an_int_address_tree_now_tiles_as_a_lea() {
+        let mut graph = g();
+        let p = graph.add(IrOp::Param(0), IrType::Int, vec![], None);
+        let q = graph.add(IrOp::Param(1), IrType::Int, vec![], None);
+        let k = konst_i32(&mut graph, 2);
+        let shl = graph.add(IrOp::Shl, IrType::Int, vec![q, k], None);
+        let add = graph.add(IrOp::Add, IrType::Int, vec![p, shl], None);
+        let block = vec![k, shl, add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let root = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(root.rule, Rule::Lea, "an int address tree must fold");
+        match root.insts.as_slice() {
+            [MInst::Lea { ty, addr, .. }] => {
+                assert_eq!(*ty, Ty::I32, "an int root must select the 32-bit form");
+                assert_eq!(addr.scale, 4);
+            }
+            other => panic!("expected one LEA, got {other:?}"),
+        }
+        // And the tile the selector produced is one the table can encode —
+        // a rule that fires but cannot encode is discarded by
+        // `require_encodable` and reads as "fired zero times" all over again.
+        for i in &root.insts {
+            i.probe().unwrap_or_else(|e| panic!("{i:?}: {e:?}"));
+        }
+    }
+
+    /// The new rows are reachable through `MInst::probe`, not merely present.
+    ///
+    /// A row the table has but `pattern_name` cannot name is a row
+    /// `SelectOptions::require_encodable` still discards — which is the state
+    /// the whole 850-method measurement was taken in. Both halves or neither.
+    #[test]
+    fn a_32bit_immediate_tile_is_encodable() {
+        for (op, form, imm) in [
+            (Op::Add, ImmForm::Imm8, 7i64),
+            (Op::Add, ImmForm::Imm32, 100_000),
+            (Op::Sub, ImmForm::Imm8, 7),
+            (Op::And, ImmForm::Imm8, 7),
+            (Op::Or, ImmForm::Imm8, 7),
+            (Op::Xor, ImmForm::Imm8, 7),
+        ] {
+            let inst = MInst::AluRI {
+                op,
+                ty: Ty::I32,
+                dst: 0,
+                lhs: 1,
+                imm,
+                form,
+            };
+            assert!(
+                inst.pattern_name().is_some(),
+                "{op:?}/{form:?} at I32 has a row but no `pattern_name` mapping"
+            );
+            inst.probe()
+                .unwrap_or_else(|e| panic!("{op:?}/{form:?} at I32: {e:?}"));
+        }
+    }
+
     /// The instructions the table cannot encode yet, pinned so the gap is a
     /// fact rather than a surprise. Shrinking this list is the next wave's
     /// work; growing it silently is what this test prevents.
@@ -6783,11 +7661,6 @@ mod tests {
                 dst: 0,
                 cc: CmpOp::Eq,
             },
-            MInst::Lea {
-                dst: 0,
-                ty: Ty::I32,
-                addr: IrAddr::empty(),
-            },
             MInst::AluRI {
                 op: Op::Xor,
                 ty: Ty::I64,
@@ -6803,8 +7676,8 @@ mod tests {
         .collect();
         assert_eq!(
             missing.len(),
-            5,
-            "these five instruction shapes have no PATTERNS row; see \
+            4,
+            "these four instruction shapes have no PATTERNS row; see \
              docs/jit/instruction-selection.md"
         );
         // And the ones that DO have rows really resolve to a row.
@@ -6828,6 +7701,16 @@ mod tests {
                     base: Some(1),
                     index: None,
                     scale: 1,
+                    disp: 0,
+                },
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I32,
+                addr: IrAddr {
+                    base: Some(1),
+                    index: Some(1),
+                    scale: 2,
                     disp: 0,
                 },
             },

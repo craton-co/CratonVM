@@ -2694,7 +2694,7 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     // OutOfMemoryError (what HotSpot does) rather than abort the VM. This is
     // the same fallible-allocator idiom as the ArrayList(int)/StringBuilder(int)
     // capacity-constructor family — see
-    // `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
+    // `gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
     // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
     // allocates ~76 MB buffers until the heap is gone.
     let arr = ctx.try_new_array(ArrayElementType::Byte, cap)?;
@@ -2808,7 +2808,7 @@ fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult
 /// BB_ARRAY, Object(arr))` clobbered real `mark` with a coerced,
 /// truncated array-pointer int. `ByteBuffer.allocate(n)` then threw
 /// `ArrayIndexOutOfBoundsException` on the very first bulk put/get (see
-/// docs/known-issues/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md).
+/// fixed-suite-bugs/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md).
 /// Reuse the same `s2_bb_synthetic_layout` discriminator the
 /// 2026-07-11 typed-buffer-view fix uses for the identical slot-5/
 /// segment collision: only apply the indexed fallback when the object
@@ -3116,7 +3116,7 @@ fn s2_bb_heap_base(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
 /// Resolved backing storage of an s2-managed buffer: a heap array plus the
 /// buffer's array-base offset, OR a direct native address. This is the
 /// single storage-view helper the residual doc
-/// (docs/internal/fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md)
+/// (fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md)
 /// called for: every method that used to read `s2_bb_arr` only — and
 /// silently produced empty/zero results on a DIRECT receiver — goes
 /// through here instead.
@@ -3231,7 +3231,7 @@ fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
 /// ~32 KiB through these five methods for every 8 KiB partial message it
 /// delivers (socket → `response` → `inputBuffer` → `messageBufferBinary` →
 /// the defensive `copy` handed to `onMessage`).
-/// See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md` §32.3.
+/// See `fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md` §32.3.
 ///
 /// Returns `false` — having written nothing — when either intrinsic declines
 /// (non-byte array kind, or bounds it refuses); the caller must then fall back
@@ -5613,7 +5613,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // for any of these against that receiver resolves to a Code-less abstract
     // declaration and throws AbstractMethodError unless registered directly
     // here. See
-    // docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode.md
+    // fixed-suite-bugs/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode-FIXED.md
     // (found via `FloatBuffer.order()`/`put(int,float)` on a raw vector slice
     // view — `ES814HnswScalarQuantizedVectorsFormatTests.testRescoreUsesRawVectorSlice`
     // — and `IntBuffer.order()` in `PreconditionerTests`).
@@ -7281,7 +7281,7 @@ mod tests {
                 "ByteBuffer.toString must render the RECEIVER's class: expected a \
                  `{expected_prefix}…` prefix, got `{rendered}`. A hard-coded concrete \
                  class name here is a claim the shim cannot know — see \
-                 docs/known-issues/c2/native-builtins-shim-audit.md."
+                 docs/feature-designs/native-builtins-shim-audit.md."
             );
         }
     }
@@ -7686,7 +7686,7 @@ mod tests {
     // capacity@3/address@4/hb@5/offset@6, per `mock_buffer_field_slot`) must
     // not be clobbered by the legacy BB_* indexed-slot fallback. Regression
     // test for the AIOOBE in
-    // docs/known-issues/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe.md:
+    // fixed-suite-bugs/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md:
     // BB_MARK(4)/BB_ARRAY(0) used to alias real `address`/`mark` and were
     // written unconditionally AFTER the correct by-name writes, silently
     // resetting `address` to -1 and `mark` to a truncated array pointer.

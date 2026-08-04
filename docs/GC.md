@@ -2,7 +2,7 @@
 
 *Last updated 2026-07-27. The historical four-wave G1/ZGC correctness
 audit is retained in
-[the internal fixed-issue archive](internal/fixed-suite-bugs/gc-audit-2026-07-10-open-findings.md).*
+the internal fixed-issue archive.*
 
 CratonVM ships three garbage-collector backends behind one dispatcher
 (`gc/src/vm_heap.rs::VmHeap`). All are stop-the-world at the collection

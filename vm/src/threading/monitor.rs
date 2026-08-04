@@ -1024,6 +1024,31 @@ impl Monitor {
         self.wait_condvar.notify_all();
         Ok(())
     }
+
+    /// Wake every waiter so each re-evaluates its interrupt flag NOW.
+    ///
+    /// This is not `Object.notify` and takes no ownership check: it is the VM
+    /// answering `Thread.interrupt()`, not Java code signalling a condition.
+    /// `Thread.interrupt()` only sets a flag, and `wait()` can therefore
+    /// observe it no sooner than its next 5 ms poll slice — so an interrupt
+    /// aimed at a thread in `Object.wait()` took up to 5 ms to land while the
+    /// `LockSupport.park` path next to it was already woken promptly by
+    /// `park_state.unpark()`. That asymmetry is what this closes.
+    ///
+    /// `notify_all`, not `notify_one`: the interrupted thread is not
+    /// identifiable from here, and a `notify_one` that reached the wrong
+    /// waiter would leave the interrupt un-serviced for another slice while
+    /// also consuming a slot. The other waiters get a spurious wakeup, which
+    /// `Object.wait()` is explicitly specified to permit and which the
+    /// surrounding `while (!condition) wait();` loop absorbs — and unlike a
+    /// real `notify`, this consumes no pending notification, so no waiter can
+    /// lose one.
+    ///
+    /// Taken under the monitor state lock, exactly like `notify`/`notify_all`.
+    pub(crate) fn wake_all_for_interrupt(&self) {
+        let _state = self.state.lock();
+        self.wait_condvar.notify_all();
+    }
 }
 
 /// Monitor operation error.
@@ -1749,6 +1774,34 @@ impl MonitorTable {
                     },
                 ))
             })
+    }
+
+    /// Wake anything parked in `Object.wait()` on `obj_ref` so it re-reads its
+    /// interrupt flag immediately. Called by `Thread.interrupt()`.
+    ///
+    /// Deliberately does **not** inflate: a monitor with no heavyweight
+    /// `Monitor` behind it has never had a `wait()` on it (`wait` goes through
+    /// `ensure_inflated` first), so there is nothing to wake and inflating on
+    /// an interrupt would allocate a monitor for an object that never needed
+    /// one. Returns `true` if a wake was actually delivered — diagnostics and
+    /// tests only.
+    ///
+    /// See [`Monitor::wake_all_for_interrupt`] for why this is a `notify_all`
+    /// and why it cannot swallow a pending `notify`.
+    pub fn wake_waiters_for_interrupt(&self, obj_ref: ObjectRef) -> bool {
+        let header = header_of(obj_ref);
+        let mark = header.mark_word.load(Ordering::Acquire);
+        let monitor = match monitor_arc_from_mark(mark) {
+            Some(m) => m,
+            // Legacy / mark-word-less objects keep their monitor only in the
+            // side index; `wait()` reaches them through `inflate_for_legacy`.
+            None => match self.lookup_indexed(obj_ref) {
+                Some(m) => m,
+                None => return false,
+            },
+        };
+        monitor.wake_all_for_interrupt();
+        true
     }
 
     /// T1.6.7 — Implements `Thread.holdsLock(Object)`.
@@ -2594,6 +2647,169 @@ mod tests {
             "Wait should have blocked for ~50ms"
         );
         table.exit(obj, tid).unwrap();
+    }
+
+    /// The general-bugs TODO's explicit ask for the monitor item: "thread A
+    /// waits with a timeout and thread B notifies — verify no deadlock".
+    ///
+    /// The failure this guards is not a hang but a *silent* one: for a long
+    /// time the timed branch of `Monitor::wait` ignored the condvar's
+    /// "signalled" verdict and always slept out the full timeout, so
+    /// `Thread.join(millis)` and `awaitTermination` looked like they worked
+    /// while burning the entire duration after the event they waited for had
+    /// already happened. Assert on the elapsed time, not just on returning.
+    #[test]
+    fn a_timed_waiter_returns_as_soon_as_it_is_notified() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let table = Arc::new(MonitorTable::new());
+
+        // Long enough that "slept the whole timeout" is unmistakable, short
+        // enough that a genuine deadlock still fails the test in bounded time.
+        const TIMEOUT_MS: u64 = 5_000;
+
+        let waiter_table = table.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_table.enter(obj, ThreadId(1));
+            let start = std::time::Instant::now();
+            waiter_table
+                .wait(obj, ThreadId(1), Some(TIMEOUT_MS), None)
+                .unwrap();
+            let elapsed = start.elapsed();
+            waiter_table.exit(obj, ThreadId(1)).unwrap();
+            elapsed
+        });
+
+        let notifier_table = table.clone();
+        let notifier = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            notifier_table.enter(obj, ThreadId(2));
+            notifier_table.notify(obj, ThreadId(2)).unwrap();
+            notifier_table.exit(obj, ThreadId(2)).unwrap();
+        });
+
+        let elapsed = waiter.join().expect("timed waiter deadlocked");
+        notifier.join().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_millis(TIMEOUT_MS / 2),
+            "timed wait ignored notify() and slept out its timeout ({elapsed:?} \
+             of {TIMEOUT_MS}ms)"
+        );
+    }
+
+    /// `Thread.interrupt()` must be able to end an UNTIMED `Object.wait()`.
+    ///
+    /// `interrupt()` only sets a flag; the wake has to come from somewhere.
+    /// Before `wake_waiters_for_interrupt` the only mechanism was `wait`'s own
+    /// 5 ms poll — the `LockSupport.park` path next door was already unparked
+    /// promptly by `Thread.interrupt0`, and `Object.wait()` was the odd one
+    /// out. This test drives the interrupt exactly as `thread_interrupt` does:
+    /// set the flag, then wake the monitor the target is parked on.
+    #[test]
+    fn an_untimed_waiter_is_released_by_an_interrupt_wake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let table = Arc::new(MonitorTable::new());
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicBool::new(false));
+
+        let waiter_table = table.clone();
+        let waiter_flag = interrupted.clone();
+        let waiter_parked = parked.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_table.enter(obj, ThreadId(1));
+            waiter_parked.store(true, Ordering::Release);
+            // `None` timeout — nothing but the interrupt can end this.
+            let was_interrupted = waiter_table
+                .wait(obj, ThreadId(1), None, Some(&waiter_flag))
+                .unwrap();
+            waiter_table.exit(obj, ThreadId(1)).unwrap();
+            was_interrupted
+        });
+
+        while !parked.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Let the waiter actually reach the condvar before interrupting, so
+        // the wake exercises the parked path rather than racing the entry.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        interrupted.store(true, Ordering::Release);
+        assert!(
+            table.wake_waiters_for_interrupt(obj),
+            "the monitor is inflated (wait() inflates it), so the wake must \
+             have been delivered"
+        );
+
+        assert!(
+            waiter.join().expect("interrupted waiter deadlocked"),
+            "wait() must report that an interrupt is what ended it"
+        );
+    }
+
+    /// The interrupt wake must not steal a pending `notify()`.
+    ///
+    /// It is a `notify_all` on the same condvar `Object.notify` uses, so the
+    /// question is real: a mechanism that consumed notifications would turn
+    /// every interrupt of an unrelated thread into a lost wakeup for a waiter
+    /// that a later `notify()` was meant for. Condvars accumulate no permits,
+    /// so an extra wake cannot be banked — this pins that.
+    #[test]
+    fn an_interrupt_wake_does_not_swallow_a_later_notify() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let table = Arc::new(MonitorTable::new());
+        let condition = Arc::new(AtomicBool::new(false));
+
+        let waiter_table = table.clone();
+        let waiter_cond = condition.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_table.enter(obj, ThreadId(1));
+            // The Java idiom: re-check the predicate on every wakeup, so a
+            // spurious wake (which is all the interrupt wake is, to this
+            // thread) simply re-parks.
+            while !waiter_cond.load(Ordering::Acquire) {
+                waiter_table.wait(obj, ThreadId(1), Some(2_000), None).unwrap();
+            }
+            waiter_table.exit(obj, ThreadId(1)).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for _ in 0..5 {
+            table.wake_waiters_for_interrupt(obj);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        table.enter(obj, ThreadId(2));
+        condition.store(true, Ordering::Release);
+        table.notify(obj, ThreadId(2)).unwrap();
+        table.exit(obj, ThreadId(2)).unwrap();
+
+        waiter.join().expect("notify was lost after an interrupt wake");
+    }
+
+    /// An interrupt aimed at an object that has never been waited on must not
+    /// allocate a monitor for it. `wait()` inflates, so "no monitor" implies
+    /// "no waiter", and inflating here would put a heavyweight monitor on
+    /// every object any interrupted thread happened to be holding.
+    #[test]
+    fn an_interrupt_wake_never_inflates_an_untouched_object() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+
+        assert!(!is_inflated(obj));
+        assert!(
+            !table.wake_waiters_for_interrupt(obj),
+            "there is no monitor, so nothing can have been woken"
+        );
+        assert!(
+            !is_inflated(obj),
+            "an interrupt must not inflate an object that was never waited on"
+        );
+        assert_eq!(monitor_registry_len(&table), 0);
     }
 
     #[test]

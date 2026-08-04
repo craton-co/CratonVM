@@ -61,6 +61,23 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Would [`record_enter`] / [`record_exit`] do any work at all?
+///
+/// `record_enter` has *two* independent gates: the runtime-toggleable ring
+/// ([`enable`]) and the `CRATONVM_TRACK_NATIVE` per-thread native stack, which
+/// is checked first and is a separate env var. A caller that wants to skip the
+/// call entirely on the hot path has to know about both, and `track_enabled`
+/// is private — so ask here rather than approximating with [`is_enabled`],
+/// which would silently disable native tracking.
+///
+/// ARCH-2026-08-04 A3: `safe_native_call_impl` uses this to fold both gates
+/// into its single diagnostic mask, so the common (all-off) native call does
+/// not reach `record_enter` at all.
+#[inline]
+pub fn any_recording_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed) || track_enabled()
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     cb_ptr: usize,

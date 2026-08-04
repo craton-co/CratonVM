@@ -253,4 +253,4 @@ Windows build machine. **Decision (2026-07-31): accepted as a documented
 Windows-only limitation** rather than taking that toolchain cost. The full
 analysis, the ruled-out alternatives, and the exact code change should it ever
 be revisited are in
-`../../../known-issues/springboot/springboot-ldap-dsa-tls-windows-only-gap.md`.
+`../../../known-issues/springboot/!springboot-ldap-dsa-tls-windows-only-gap.md`.

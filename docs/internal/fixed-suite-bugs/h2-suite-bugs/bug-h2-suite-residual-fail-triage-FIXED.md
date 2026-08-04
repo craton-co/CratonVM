@@ -571,7 +571,7 @@ Picked up the 7 items still open after the first follow-up session (worktree
   workload. **Second confirmed instance (2026-07-22, fifth pass)**:
   `TestWeb.testWebApp()`'s `autoCompleteList.do?query=select 'abc`
   empty-body failure — originally tracked as a separate doc
-  (`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, a `RuleElement
+  (`!bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, a `RuleElement
   .link` NPE hypothesis from an incomplete isolated repro that skipped
   `linkStatements()`) — turned out to be this exact same budget-exhaustion
   mechanism for a query with an unclosed string literal; see that doc (now
@@ -1049,7 +1049,7 @@ in well under 5 minutes.
 
 ### `Bnf`/`RuleElement.link` NPE doc — reclassified and closed
 
-Investigated `bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` (the
+Investigated `!bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` (the
 `TestWeb.testWebApp()` autocomplete empty-body finding). The doc's own
 `RuleElement.link` NPE hypothesis turned out to be a red herring from an
 incomplete isolated repro that skipped the required `linkStatements()` call
@@ -1068,7 +1068,7 @@ rebuild" technique already used for `TestBnf` above) to the **exact same
 this query correctly return `{1#anything=Hello World, 1#'='}`. Not a
 dispatch/NPE/loader bug — the same interpreter-throughput performance-margin
 family as `TestBnf`/`TestFileLock`/`TestTransaction`. See the updated
-`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` for the full
+`!bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` for the full
 corrected writeup; no code fix attempted or needed (matches this family's
 existing "no targeted fix, broader interpreter throughput work" stance).
 

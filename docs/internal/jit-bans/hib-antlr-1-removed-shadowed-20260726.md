@@ -32,7 +32,7 @@ Every justification HIB-LONGTAIL.1 still rests on comes from the H2 suite:
 * the ten-class 2026-07-26 A/B regression set, of which three classes
   (`TestStreamStore`, `TestFreeSpace`, `TestNestedJoins`) still hold the
   `org/h2/` half open — see
-  [`h2-jitban-residuals-20260726.md`](../../known-issues/h2/h2-jitban-residuals-20260726.md).
+  [`h2-jitban-longtail1-ban-stays-testmetadata.md`](../../known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md).
 
 The H2 suite never loads an `org/antlr/` class at all — H2's SQL parser is
 hand-written, and no ANTLR artifact is on its classpath. HIB-LONGTAIL.1's own

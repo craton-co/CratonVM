@@ -493,8 +493,8 @@ mod loader_lookup_tests {
 /// linking, verifier hierarchy lookup) by default even though the
 /// interpreter half of the same fix was live — a production desync between
 /// three independently-read env-var copies. See
-/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
-/// and `docs/internal/loader-identity.md` for the consolidation. Flip on
+/// `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
+/// and `fixed-suite-bugs/loader-identity.md` for the consolidation. Flip on
 /// links an enhanced subclass to its same-loader (enhanced) supertype copy
 /// rather than the un-enhanced global one returned by `get_loaded_class_id`.
 ///
@@ -1737,7 +1737,7 @@ pub struct DefineClassOptions {
     /// by the application loader), so the resulting `$ProxyN` type-checks
     /// (`interfaceClass.isInstance(proxy)`) and `Method.invoke` against the
     /// requested interface both fail — see "Residual issue B" in
-    /// `docs/known-issues/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
+    /// `fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
     /// (found via annotation-proxy work but is a general `CRATONVM_REAL_PROXY`
     /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
     /// `ClassLoader`, independent of annotations).
@@ -1796,6 +1796,36 @@ pub struct RedefineOptions {
     /// instance mock fails. Default: `false` (explicit redefine updates the
     /// base, matching HotSpot's `cached_class_file` semantics).
     pub preserve_original_bytes: bool,
+}
+
+/// What the real class-path image says about one native registration's target
+/// method, decided **without loading or defining anything**.
+///
+/// This is the discriminator contract §1.5 turns on: a `Bridge` is what an
+/// `ACC_NATIVE` method binds to, so `acc_native == false` on a `Bridge` row is a
+/// registration nobody adjudicated, and `has_code == true` on one is a native
+/// shadowing concrete bytecode.
+///
+/// Distinct from the native census's `real_declaring_method`, which asks the
+/// *loaded* class store the same question and therefore answers only for classes
+/// the run happened to touch. See
+/// [`ClassManager::adjudicate_natives_against_image`] for why both exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageMethodVerdict {
+    /// The class path (CDS, then bootstrap, extension, application) yields bytes
+    /// for this name. `false` means the image has no such class — which for a
+    /// JDK name is exactly the case where `load_class` would have *fabricated* a
+    /// synthetic stub.
+    pub image_has_class: bool,
+    /// Those bytes declare a method with this exact name and descriptor.
+    pub declared: bool,
+    /// …and it is `ACC_NATIVE`.
+    pub acc_native: bool,
+    /// …and it is neither `native` nor `abstract`, so JVMS §4.6 says it carries
+    /// a `Code` attribute. Read from the access flags rather than from a decoded
+    /// attribute, so a lazy-attribute decode state cannot masquerade as a fact
+    /// about the class.
+    pub has_code: bool,
 }
 
 /// Manages class loading for the VM.
@@ -2085,6 +2115,36 @@ pub struct ClassManager {
     /// container). Without this the violation list would be dominated by
     /// repeats of a handful of names and would be useless as a backlog.
     origin_violations_seen: FxHashSet<String>,
+
+    /// `class name -> owner/Class.method(Desc)` of whoever first caused the
+    /// class to be fabricated, for `ClassOriginEntry::requested_by`.
+    ///
+    /// `ClassManager` is called with a bare name and cannot see the frame, so
+    /// this map is filled from the *outside*, by
+    /// [`Self::attach_origin_requester`], which the VM's class-load choke point
+    /// calls with the frame it was resolving for. Only classes that actually
+    /// produced a violation get an entry, so the map is bounded by the
+    /// violation list, not by the class store.
+    ///
+    /// Keyed by class name rather than `ClassId` because the violation is
+    /// recorded *before* the class exists, and in `JdkOnly` mode no class is
+    /// ever created for it.
+    origin_requesters: FxHashMap<String, String>,
+
+    /// Optional live sink for class-origin violations, installed per VM.
+    ///
+    /// `--trace-jdk-only` used to be a poll of [`Self::origin_violations`],
+    /// which meant every mid-run fabrication surfaced at shutdown, detached
+    /// from the code that caused it. With a sink installed the launcher gets
+    /// each violation at the instant it is recorded.
+    ///
+    /// A field, not a process global: contract §2, and the repo has a history
+    /// of process-global native caches leaking between two VMs in one process.
+    /// Two VMs in one process therefore see only their own violations.
+    ///
+    /// Invoked from [`Self::admit_compatibility_class`] while the manager is
+    /// mutably borrowed, so the sink must not re-enter the class manager.
+    violation_sink: Option<Arc<dyn Fn(&JdkOnlyViolation) + Send + Sync>>,
 
     /// C2 review P1 — VM identity + per-class metadata generation for the
     /// generational handles in [`crate::metadata_handle`].
@@ -2530,6 +2590,8 @@ impl ClassManager {
             compatibility_mode: CompatibilityMode::Compatible,
             origin_violations: Vec::new(),
             origin_violations_seen: FxHashSet::default(),
+            origin_requesters: FxHashMap::default(),
+            violation_sink: None,
             // Unbound: `ClassManager::new` runs before the owning `SharedVm`
             // exists, so it has no `vm_identity` to record yet. `vm_init` calls
             // `bind_vm_id` as soon as it does.
@@ -2634,17 +2696,28 @@ impl ClassManager {
                 name: c.name.to_string(),
                 origin: c.origin.as_str().to_string(),
                 reason: c.origin.reason().map(|r| r.to_string()),
-                // JDK-ONLY-NOTE: `requested_by` stays `None` here, permanently
-                // as far as this crate is concerned. The requesting
-                // `owner/Class.method(Desc)` is known to the *interpreter* —
-                // it is the frame that ran the `new` / `checkcast` /
-                // `Class.forName` — and is not reachable from `ClassManager`,
-                // which is called with a bare name. Populating it means
-                // threading the current frame through the load path, which
-                // belongs to the interpreter agent's half of the contract
-                // (§7); the field is in `ClassOriginEntry` so that half can
-                // fill it without another schema change.
-                requested_by: None,
+                // Two provenances, in one string, in the order they become
+                // known:
+                //
+                // * the **Rust call site**, from `#[track_caller]` on the
+                //   `ensure_*` → `fabricate_class` →
+                //   `admit_compatibility_class` chain. Always available, and
+                //   for a `--jdk-only` boot it is the answer for nearly the
+                //   whole population: compatibility classes come overwhelmingly
+                //   from natives asking for an allocation shape, not from
+                //   constant-pool resolution.
+                // * the **Java frame** — the method that ran the `new` /
+                //   `checkcast` / `Class.forName` — which `ClassManager` cannot
+                //   see (it is called with a bare name) and which the VM's
+                //   class-load choke point supplies afterwards through
+                //   [`Self::attach_origin_requester`]. Rendered as
+                //   `"owner/Class.method(Desc) via <rust site>"`.
+                //
+                // `None` here means the class produced no violation at all —
+                // i.e. nothing to attribute — which is the common case and the
+                // whole point of a census: 400-odd honest rows and a handful
+                // that name who is responsible.
+                requested_by: self.origin_requesters.get(&*c.name).cloned(),
                 real_bytes_found: c.origin.has_real_bytes(),
                 loader_id: c.loader_id.to_native_id(),
             })
@@ -2658,6 +2731,90 @@ impl ClassManager {
     /// `--jdk-only` run would have refused.
     pub fn origin_violations(&self) -> &[JdkOnlyViolation] {
         &self.origin_violations
+    }
+
+    /// How many class-origin violations have been recorded so far.
+    ///
+    /// A `Vec::len`, taken before a load so
+    /// [`Self::attach_origin_requester`] can tell whether that load recorded
+    /// anything. Keeping this separate from `origin_violations()` means the
+    /// caller does not borrow the whole slice just to compare a length.
+    pub fn origin_violation_count(&self) -> usize {
+        self.origin_violations.len()
+    }
+
+    /// Name the Java frame responsible for every violation recorded at or
+    /// after `from`.
+    ///
+    /// Called by the VM's class-load choke point with the count it took
+    /// immediately before the load. **Returns without allocating when the load
+    /// recorded nothing**, which is every load but the handful that fabricate
+    /// — that is why the requester is passed as three borrowed `&str`s rather
+    /// than a formatted `String`: the common path must not pay for a format
+    /// that is then thrown away.
+    ///
+    /// A violation that already names a requester is left alone, so the
+    /// *first* frame to demand a class keeps the attribution even if a nested
+    /// load re-enters. Note that `admit_compatibility_class` dedupes by class
+    /// name, so only the first requester of a given class is ever recorded at
+    /// all; "which call sites depend on this fabrication" needs a different
+    /// instrument.
+    pub fn attach_origin_requester(
+        &mut self,
+        from: usize,
+        owner: &str,
+        method: &str,
+        descriptor: &str,
+    ) {
+        if from >= self.origin_violations.len() {
+            return;
+        }
+        for violation in &mut self.origin_violations[from..] {
+            if let JdkOnlyViolation::CompatibilityClassRequested {
+                class,
+                requester: slot,
+                ..
+            } = violation
+            {
+                // Layered on top of the Rust call site
+                // `admit_compatibility_class` already recorded, giving
+                // `"org/foo/Bar.baz(Desc) via classloading/…:7289"`. Both
+                // halves answer different questions and both are worth
+                // keeping: the Java frame says which application code depends
+                // on the fabrication, the Rust site says which VM code
+                // performed it — and the latter is the work list the
+                // `ensure_synthetic_class` migration needs.
+                let combined = match slot.as_deref() {
+                    Some(site) => format!("{owner}.{method}{descriptor} via {site}"),
+                    None => format!("{owner}.{method}{descriptor}"),
+                };
+                self.origin_requesters
+                    .insert(class.clone(), combined.clone());
+                *slot = Some(combined);
+            }
+        }
+    }
+
+    /// Install a live sink for class-origin violations (contract §9's
+    /// *"log every violation as it happens"*).
+    ///
+    /// Call once, right after `Vm::new`, before the launcher's first drain.
+    /// Violations recorded during `Vm::new` itself predate the sink and are
+    /// still picked up by that first drain; everything after it arrives live.
+    ///
+    /// Per VM, never process-global (contract §2).
+    pub fn set_violation_sink(&mut self, sink: Arc<dyn Fn(&JdkOnlyViolation) + Send + Sync>) {
+        self.violation_sink = Some(sink);
+    }
+
+    /// Whether a live sink is installed.
+    ///
+    /// The launcher's periodic drain uses this to advance its watermark
+    /// *without* re-printing: with a sink installed, every violation past the
+    /// first drain has already been reported at the instant it happened, and
+    /// printing it again at shutdown would double-report it.
+    pub fn has_violation_sink(&self) -> bool {
+        self.violation_sink.is_some()
     }
 
     /// Decide whether a compatibility class may be fabricated, recording the
@@ -2680,12 +2837,32 @@ impl ClassManager {
     /// `NoClassDefFoundError` unchanged. The structured
     /// [`JdkOnlyViolation`] carries the detail an operator needs; the thrown
     /// exception carries what the *program* needs.
+    ///
+    /// # Provenance
+    ///
+    /// `#[track_caller]`, threaded through `fabricate_class` and the three
+    /// `ensure_*` entry points, so the recorded `requester` names the **Rust
+    /// call site** that asked for the fabrication.
+    ///
+    /// That is not a consolation prize for the missing Java frame — it is the
+    /// answer for most of the population. A `--jdk-only` boot's compatibility
+    /// classes come overwhelmingly from natives calling `ensure_synthetic_class`
+    /// directly for an allocation shape, not from constant-pool resolution, and
+    /// those have a Rust caller and no Java frame at all. The Java frame, when
+    /// one exists, is added on top by [`Self::attach_origin_requester`].
+    ///
+    /// Costs one `format!` per *distinct class name*, inside the dedupe branch —
+    /// not per request, which is thousands of times more often.
+    #[track_caller]
     fn admit_compatibility_class(&mut self, name: &str, reason: &str) -> Result<(), VmError> {
         // Deduped by class name: a single missing class is requested over and
         // over (constant-pool resolution, `Class.forName` probes, every
         // allocation of a stub-backed container), and an undeduped list would
         // be thousands of rows of a handful of names.
         if self.origin_violations_seen.insert(name.to_string()) {
+            let site = core::panic::Location::caller();
+            self.origin_requesters
+                .insert(name.to_string(), format!("{}:{}", site.file(), site.line()));
             self.origin_violations
                 .push(JdkOnlyViolation::CompatibilityClassRequested {
                     class: name.to_string(),
@@ -2694,11 +2871,27 @@ impl ClassManager {
                     // debug-asserts it), so the initiating loader is not in
                     // question here.
                     initiating_loader: Some("bootstrap".to_string()),
-                    // JDK-ONLY-NOTE: see `dump_class_origins` — the requesting
-                    // method is the interpreter's to supply, not this crate's.
-                    requester: None,
+                    // The Rust call site. A Java frame, when there is one, is
+                    // added on top by `attach_origin_requester` once the load
+                    // unwinds to the VM choke point that can see it.
+                    requester: Some(format!("{}:{}", site.file(), site.line())),
                     reason: reason.to_string(),
                 });
+            // Live trace (contract §9). Dispatched inside the dedupe branch so
+            // the sink sees exactly the violations the report will list — one
+            // per distinct class — and not the thousands of repeat requests
+            // the dedupe exists to swallow.
+            //
+            // The requester is not attached yet: it arrives a moment later,
+            // from the choke point above this call, once the load unwinds back
+            // to a frame. A live line therefore names the class and the reason
+            // but not the caller; the shutdown census has both. Reporting late
+            // enough to have the requester would defeat the point of the sink.
+            if let Some(sink) = self.violation_sink.clone() {
+                if let Some(violation) = self.origin_violations.last() {
+                    sink(violation);
+                }
+            }
             if self.compatibility_mode.is_jdk_only() {
                 debug!(
                     class = name,
@@ -3144,6 +3337,7 @@ impl ClassManager {
     /// refusal wearing an infallible signature; a caller that can do better
     /// should use [`Self::try_ensure_synthetic_class`], which says so in a
     /// `Result`.
+    #[track_caller]
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         let fabricated = self.fabricate_class(
             name,
@@ -3188,11 +3382,12 @@ impl ClassManager {
     ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
     ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
     ///    modes. See [`Self::classify_loaded_name`] and
-    ///    `docs/known-issues/c2/synthetic-class-fallibility.md`.
+    ///    `docs/feature-designs/synthetic-class-fallibility.md`.
     ///
     /// The two are deliberately different error shapes: a caller retrying with
     /// an initiating loader (the right response to 2) must not confuse it with
     /// a policy refusal it cannot retry out of.
+    #[track_caller]
     pub fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -3231,6 +3426,7 @@ impl ClassManager {
     /// pass a stub origin would reach the ambiguity gate and get an `Err`;
     /// `.expect`ing it would abort the VM for what is a recoverable naming
     /// conflict. The stand-in keeps the failure local to the one allocation.
+    #[track_caller]
     pub fn ensure_generated_class(
         &mut self,
         name: &str,
@@ -3328,18 +3524,33 @@ impl ClassManager {
     //     shape behind every `HashMap`/`LinkedHashMap` node and friends
     //     (`alloc_concurrent_synthetic` in `native-builtins`). It is
     //     `ClassOrigin::VmInternal`: a VM bookkeeping type that never had, and
-    //     never will have, a class file.
+    //     never will have, a class file. **DONE (2026-08-04)** — the minting
+    //     site in `vm_exec::heap_alloc_object` now calls
+    //     [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
+    //     because the class is inert at every `is_synthetic_stub` read site:
+    //     no native is registered on it, neither real-protected-stub allow-list
+    //     names it, and the `Proxy$Instance` / collection-iterator special
+    //     cases below key on the *name*, not the origin.
     //   * `java/lang/reflect/Proxy$Instance` — the synthetic supertype of
     //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). It is
-    //     a generation artefact, not a stand-in for absent bytes.
-    // Classifying either honestly today would flip the derived
-    // `is_synthetic_stub` bool from `true` to `false` for classes that ~160
-    // read sites already reason about — a *Compatible-mode* behaviour change,
-    // which contract §10 forbids in wave 1. So the flavour is kept in the
-    // `reason` string and the fix is deferred: point both callers at
-    // [`Self::ensure_generated_class`] with `VmInternal` / `GeneratedProxy`
-    // respectively, in the same wave that re-audits the `is_synthetic_stub`
-    // readers.
+    //     a generation artefact, not a stand-in for absent bytes. **STILL
+    //     OPEN**, and the original prescription of `GeneratedProxy` was wrong:
+    //     that variant carries `interfaces: Arc<[ClassId]>`, which the shared
+    //     *supertype* has no meaningful value for, and
+    //     `is_generated_proxy_name` in this file already says in terms that
+    //     `Proxy$Instance` "must NOT be counted as a generated proxy". The
+    //     right origin is `VmInternal`. What is not yet established is whether
+    //     flipping it is safe: unlike `AnonymousObject$N` it has a
+    //     NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods`, is
+    //     special-cased twice in this function, and is the superclass every
+    //     `$ProxyN` links against — so it needs the regression suite, not an
+    //     argument.
+    // Classifying either honestly flips the derived `is_synthetic_stub` bool
+    // from `true` to `false` for classes that ~181 read sites already reason
+    // about, which is a *Compatible-mode* behaviour change. That is why the
+    // flavour is also kept in the `reason` string, and why the two are being
+    // migrated one at a time with evidence rather than as a pair.
+    #[track_caller]
     fn fabricate_class(
         &mut self,
         name: &str,
@@ -3410,7 +3621,7 @@ impl ClassManager {
         // one this lane deliberately does not answer.
         //
         // NOT covered, and tracked in
-        // `docs/known-issues/c2/synthetic-class-fallibility.md`: when a built-in
+        // `docs/feature-designs/synthetic-class-fallibility.md`: when a built-in
         // loader *also* has a class under the name, `get_loaded_class_id`
         // returns that copy from the early return above and never reaches this
         // gate. That is the pre-existing built-in-first delegation answer every
@@ -4432,6 +4643,96 @@ impl ClassManager {
         }
     }
 
+    /// Adjudicate a whole registry's worth of `(class, name, descriptor)`
+    /// triples against the bytes on the class path.
+    ///
+    /// ## Why this exists next to the census's `real_declaring_method`
+    ///
+    /// That column answers from the **loaded** class store, so it is a
+    /// measurement of the run: `loaded: false` means "this workload never
+    /// touched the class". That is the honest answer to the question it asks,
+    /// and it is the wrong instrument for adjudicating ~8,000 registrations,
+    /// because the ones most in need of a verdict are precisely the ones no
+    /// single workload exercises. `docs/known-issues/jdk-only/`'s sixteen
+    /// `JDK-ONLY-CLASSIFY: unknown — needs census` verdicts are all blocked on
+    /// this distinction.
+    ///
+    /// ## Why it does not just load the classes
+    ///
+    /// Force-loading every registered name through [`Self::load_class`] would
+    /// **fabricate a synthetic stub for every name the image lacks** (see
+    /// `would_fabricate_synthetic_stub`), which is both a large perturbation of
+    /// the thing being measured and, under `JdkOnly`, several hundred recorded
+    /// violations manufactured by the measurement itself. This reads bytes and
+    /// parses them; nothing is defined, no `ClassId` is allocated, no
+    /// `<clinit>` runs, and `&self` makes that structural rather than a promise.
+    ///
+    /// Parses each distinct class **once**, not once per registration — the
+    /// registry has thousands of rows over roughly a thousand classes. A class
+    /// whose bytes are present but unparseable is reported as
+    /// `image_has_class: true` with everything else `false`, which is
+    /// deliberately indistinguishable from "declares no such method": both mean
+    /// "the image does not give this registration an `ACC_NATIVE` target", and
+    /// that is the only question this answers.
+    pub fn adjudicate_natives_against_image(
+        &self,
+        triples: &[(String, String, String)],
+    ) -> Vec<ImageMethodVerdict> {
+        use std::collections::hash_map::Entry;
+
+        // class name -> (present, methods it declares). `None` for the map
+        // means "bytes absent"; parsing failure yields an empty method set.
+        let mut parsed: FxHashMap<String, Option<FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>>> =
+            FxHashMap::default();
+
+        triples
+            .iter()
+            .map(|(class, name, descriptor)| {
+                let entry = match parsed.entry(class.clone()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(v) => {
+                        let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
+                            match cratonvm_reader::class_reader::read_class(&bytes) {
+                                Ok(cf) => cf
+                                    .methods
+                                    .iter()
+                                    .map(|m| {
+                                        (
+                                            (m.name.clone(), m.descriptor.clone()),
+                                            (m.is_native(), !m.is_native() && !m.is_abstract()),
+                                        )
+                                    })
+                                    .collect(),
+                                Err(_) => FxHashMap::default(),
+                            }
+                        });
+                        v.insert(decoded)
+                    }
+                };
+                match entry {
+                    None => ImageMethodVerdict {
+                        image_has_class: false,
+                        declared: false,
+                        acc_native: false,
+                        has_code: false,
+                    },
+                    Some(methods) => {
+                        let found = methods
+                            .iter()
+                            .find(|((n, d), _)| &**n == name.as_str() && &**d == descriptor.as_str())
+                            .map(|(_, flags)| *flags);
+                        ImageMethodVerdict {
+                            image_has_class: true,
+                            declared: found.is_some(),
+                            acc_native: found.is_some_and(|(is_native, _)| is_native),
+                            has_code: found.is_some_and(|(_, has_code)| has_code),
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Find class bytes using parent delegation.
     fn find_class_bytes_delegated(
         &self,
@@ -5069,7 +5370,7 @@ impl ClassManager {
                 // exposed via reflection. `RuntimeInvisibleAnnotations` carry
                 // @Retention(CLASS) types which JVMS requires NOT be visible
                 // through Class.getAnnotation / isAnnotationPresent — see
-                // docs/gaps/gap-annotation-retention-policy.md.
+                // gaps/gap-annotation-retention-policy.md.
                 Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
@@ -6011,6 +6312,17 @@ impl ClassManager {
     /// Get a mutable reference to a loaded class by its id.
     pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
         self.class_store.get_mut(id)
+    }
+
+    /// Re-parent a loaded class.
+    ///
+    /// Use this instead of writing `class.superclass` through
+    /// [`Self::get_class_mut`]: the store keeps a direct-subclass adjacency
+    /// index (see [`ClassStore::descendants_of`]) that a raw field write
+    /// desynchronises, which would make `recompute_subclass_layouts` blind to
+    /// the class on the next superclass layout change.
+    pub fn set_superclass(&mut self, id: ClassId, superclass: Option<ClassId>) {
+        self.class_store.set_superclass(id, superclass);
     }
 
     /// Atomically detach every class defined by `loader_id` from the live
@@ -7537,7 +7849,7 @@ impl ClassManager {
     /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
     /// cannot break the centrally-run build) — it exists to surface the ~50
     /// remaining external call sites for follow-up migration. See
-    /// `docs/internal/loader-identity.md` for the current per-file tally.
+    /// `fixed-suite-bugs/loader-identity.md` for the current per-file tally.
     ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
@@ -7687,7 +7999,7 @@ impl ClassManager {
     /// falls through to `ClassLoader.loadClass` via
     /// `native-builtins::classloader::defining_loader_for` when this kind
     /// of lookup misses) rather than expecting this crate to resolve it.
-    /// See `docs/internal/loader-identity.md`.
+    /// See `fixed-suite-bugs/loader-identity.md`.
     pub fn find_class_by_name_for_loader(
         &self,
         name: &str,
@@ -8919,13 +9231,20 @@ impl ClassManager {
             },
         };
 
-        // Update the class in-place
+        // Update the class in-place.
+        //
+        // The superclass goes through `ClassStore::set_superclass` rather than
+        // the `get_mut` block below: the store keeps a direct-subclass
+        // adjacency index (see `ClassStore::descendants_of`), and a stub minted
+        // under one superclass whose real bytecode names another must move its
+        // edge, not just its field. A raw `class.superclass = ...` here would
+        // leave `recompute_subclass_layouts` blind to this class.
+        self.class_store.set_superclass(id, superclass_id);
         if let Some(class) = self.class_store.get_mut(id) {
             class.source_file = source_file;
             class.version = class_file.version;
             class.constant_pool = class_file.constant_pool;
             class.access_flags = class_file.access_flags;
-            class.superclass = superclass_id;
             class.interfaces = interface_ids;
             class.fields = class_file.fields;
             class.methods = class_file.methods;
@@ -9017,7 +9336,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `docs/known-issues/c2/classloading-identity-audit.md`.
+        // here — see `docs/feature-designs/classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {
@@ -9181,34 +9500,34 @@ impl ClassManager {
     /// grown (`max(old, new)`): objects already allocated against the
     /// previous layout must not be left with too few slots.
     fn recompute_subclass_layouts(&mut self, changed_id: ClassId) {
-        let class_count = self.class_store.len();
         // Descendants whose `first_field_index` actually shifts: their
         // previously-resolved `(referring-class, cp-index) -> ResolvedField`
         // cache entries are baked against the stale offset and must be evicted
         // (see the post-loop invalidation below).
         let mut changed_descendants: Vec<u32> = Vec::new();
-        for idx in 0..class_count {
-            let cid = ClassId::new(idx as u32);
-            // The changed class itself is already up to date.
-            if cid == changed_id {
-                continue;
-            }
-            let superclass_id = match self.class_store.get(cid) {
-                Some(c) => c.superclass,
-                None => continue,
-            };
-            // Only recompute classes that actually inherit (transitively)
-            // from the changed class. `is_subclass_of` includes the
-            // `superclass == changed_id` case via its own `id == other`
-            // check, so this single probe covers any chain depth.
-            let is_descendant = superclass_id
-                .and_then(|sid| self.class_store.get(sid))
-                .map(|sc| sc.is_subclass_of(changed_id, &self.class_store))
-                .unwrap_or(false);
-            if !is_descendant {
-                continue;
-            }
-            let Some(super_id) = superclass_id else {
+        // `descendants_of` walks the store's direct-subclass adjacency index
+        // breadth-first, so it yields exactly the transitive subclasses of
+        // `changed_id`, parents before children — the topological order the
+        // recompute below needs, since each entry reads its parent's
+        // already-updated `num_total_fields`.
+        //
+        // This replaces a scan of `0..class_store.len()` that probed every
+        // class with `is_subclass_of`. That scan was wrong twice over:
+        //
+        //   * `len()` is the LIVE class count, not the id upper bound —
+        //     `slot_count()` is (see its doc). After any class unload the
+        //     tombstone makes `len() < slot_count()`, so the loop stopped
+        //     short and silently skipped the highest-id subclasses. Those are
+        //     the most recently loaded ones, i.e. precisely the application
+        //     classes that extend a JDK stub. A missed descendant keeps a
+        //     `first_field_index` baked against the pre-upgrade parent and its
+        //     own fields then overlap the parent's — the "out-of-bounds field
+        //     read ... undersized object layout" this function exists to
+        //     prevent.
+        //   * it cost `O(classes x hierarchy depth)` per upgrade, and runs
+        //     once per synthetic-stub upgrade whose layout shifted.
+        for cid in self.class_store.descendants_of(changed_id) {
+            let Some(super_id) = self.class_store.get(cid).and_then(|c| c.superclass) else {
                 continue;
             };
             let parent_total = self
@@ -15814,6 +16133,397 @@ mod tests {
         assert_eq!(child.num_total_fields, 3);
     }
 
+    /// `Class::superclass` may only be written by `ClassStore::set_superclass`.
+    ///
+    /// The store keeps a direct-subclass adjacency index that
+    /// `recompute_subclass_layouts` walks. A raw `class.superclass = ...`
+    /// through `get_mut` compiles, runs, and looks right — and silently
+    /// removes the class from that walk, so the next time its superclass grows
+    /// a field the class keeps a stale `first_field_index` and its own fields
+    /// overlap the parent's. There is no failure at the point of the mistake,
+    /// which is exactly why this is a gate and not a comment.
+    ///
+    /// Scans DIRECTORIES rather than named files: a module split renames
+    /// files, and a gate keyed on file names goes quietly fail-open at the
+    /// moment the code it guards is reorganised. Fails loudly rather than
+    /// vacuously when the workspace root or the sources cannot be found.
+    #[test]
+    fn superclass_is_only_ever_written_through_set_superclass() {
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the classloading crate directory must have a parent")
+            .to_path_buf();
+        assert!(
+            workspace.join("Cargo.toml").is_file(),
+            "workspace root not found at {} — failing rather than scanning nothing",
+            workspace.display()
+        );
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&workspace).expect("workspace root is readable") {
+            let src = entry.expect("readable directory entry").path().join("src");
+            if src.is_dir() {
+                collect_rs(&src, &mut files);
+            }
+        }
+        assert!(
+            files.len() > 100,
+            "only {} source files found under {} — the directory walk is broken",
+            files.len(),
+            workspace.display()
+        );
+
+        // Assembled rather than written as one literal so this file's own
+        // scanner does not match itself.
+        let needle = format!(".{} = ", "superclass");
+        let exempt = [
+            // Owns the field and the index together; `set_superclass` is the
+            // one legitimate writer.
+            "classloading/src/class.rs",
+            // Different type entirely: a CDS archive record whose `superclass`
+            // is the superclass NAME (a `String`), with no index behind it.
+            "native-builtins/src/cds.rs",
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&workspace)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if exempt.iter().any(|e| rel.ends_with(e)) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains(&needle) {
+                    offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "`Class::superclass` written directly, bypassing \
+             `ClassStore::set_superclass` and desynchronising the \
+             direct-subclass index that `recompute_subclass_layouts` walks. \
+             Call `ClassManager::set_superclass` / \
+             `ClassStore::set_superclass` instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Build a minimal loaded class for the layout-propagation tests below.
+    fn layout_fixture_class(
+        id: ClassId,
+        name: &str,
+        superclass: Option<ClassId>,
+        own_fields: usize,
+        first_field_index: usize,
+        num_total_fields: usize,
+    ) -> Class {
+        Class {
+            id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass,
+            interfaces: vec![],
+            fields: (0..own_fields)
+                .map(|i| make_field(&format!("f{i}"), false))
+                .collect(),
+            methods: vec![],
+            first_field_index,
+            num_total_fields,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            origin: ClassOrigin::default(),
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// A subclass whose `ClassId` sits above the store's LIVE class count —
+    /// which is what any prior class unload produces, since ids are never
+    /// reused — must still have its layout recomputed when its superclass
+    /// grows.
+    ///
+    /// `recompute_subclass_layouts` used to iterate `0..class_store.len()`,
+    /// and `len()` is the live count, not the id upper bound (`slot_count()`
+    /// is). One tombstone was therefore enough to make the loop stop one slot
+    /// short and skip the highest-id subclass — the most recently loaded one,
+    /// i.e. exactly the application class that extends the JDK stub being
+    /// upgraded. The skipped class keeps a `first_field_index` computed
+    /// against the pre-upgrade parent, so its own fields overlap the parent's
+    /// and `getfield` reads past the object's slot count.
+    #[test]
+    fn a_subclass_above_the_live_class_count_still_gets_its_layout_recomputed() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Slot 0: loaded, then unloaded — the tombstone that makes
+        // `len() < slot_count()` for the rest of this test.
+        let doomed = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(doomed, "Doomed", None, 0, 0, 0));
+
+        let parent_id = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(parent_id, "Parent", None, 1, 0, 1));
+
+        let child_id = mgr.class_store.next_id();
+        mgr.class_store.add(layout_fixture_class(
+            child_id,
+            "Child",
+            Some(parent_id),
+            1,
+            1,
+            2,
+        ));
+
+        mgr.class_store.remove(doomed);
+        assert!(
+            child_id.as_u32() as usize >= mgr.class_store.len(),
+            "fixture must place Child at or above the live count, else the \
+             old `0..len()` loop would have reached it anyway (live={}, \
+             child={})",
+            mgr.class_store.len(),
+            child_id.as_u32(),
+        );
+
+        // Parent's real bytecode arrives and grows it from 1 field to 2.
+        if let Some(parent) = mgr.class_store.get_mut(parent_id) {
+            parent.fields = vec![make_field("p1", false), make_field("p2", false)];
+            parent.num_total_fields = 2;
+        }
+        mgr.recompute_subclass_layouts(parent_id);
+
+        let child = mgr.class_store.get(child_id).unwrap();
+        assert_eq!(
+            child.first_field_index, 2,
+            "Child's own field must start after Parent's two fields"
+        );
+        assert_eq!(child.num_total_fields, 3);
+    }
+
+    /// The direct-subclass index must survive a stub being re-parented by its
+    /// real bytecode: `upgrade_synthetic_class` moves the superclass edge via
+    /// `ClassStore::set_superclass`, and the descendant walk has to follow it.
+    #[test]
+    fn re_parenting_a_class_moves_its_edge_in_the_subclass_index() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        let a = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(a, "A", None, 1, 0, 1));
+        let b = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(b, "B", None, 1, 0, 1));
+        // Minted under A, as a synthetic stub would be.
+        let c = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(c, "C", Some(a), 1, 1, 2));
+
+        assert_eq!(mgr.class_store.descendants_of(a), vec![c]);
+        assert!(mgr.class_store.descendants_of(b).is_empty());
+
+        // Real bytecode says C actually extends B.
+        mgr.class_store.set_superclass(c, Some(b));
+        assert!(mgr.class_store.descendants_of(a).is_empty());
+        assert_eq!(mgr.class_store.descendants_of(b), vec![c]);
+
+        // And the layout propagation follows the new parent, not the old one.
+        if let Some(bc) = mgr.class_store.get_mut(b) {
+            bc.fields = vec![make_field("b1", false), make_field("b2", false)];
+            bc.num_total_fields = 2;
+        }
+        mgr.recompute_subclass_layouts(b);
+        assert_eq!(mgr.class_store.get(c).unwrap().first_field_index, 2);
+    }
+
+    /// Scaling measurement for the descendant walk, kept reproducible rather
+    /// than quoted from a session that no longer exists.
+    ///
+    /// `#[ignore]` — it is a measurement, not an assertion about the machine
+    /// it runs on. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p cratonvm-classloading --lib -- --ignored --nocapture descendant_walk_scaling
+    /// ```
+    ///
+    /// The shape it reproduces is the real one: a JDK stub being upgraded has
+    /// a handful of descendants among tens of thousands of loaded classes, so
+    /// the old "probe every class with `is_subclass_of`" scan paid the whole
+    /// class count on every upgrade while the answer was a five-element list.
+    #[test]
+    #[ignore]
+    fn descendant_walk_scaling() {
+        const CLASSES: usize = 20_000;
+        const SUBTREE: usize = 5;
+        const UPGRADES: usize = 2_000;
+
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let root = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(root, "Root", None, 1, 0, 1));
+        for i in 0..SUBTREE {
+            let id = mgr.class_store.next_id();
+            mgr.class_store.add(layout_fixture_class(
+                id,
+                &format!("Sub{i}"),
+                Some(root),
+                1,
+                1,
+                2,
+            ));
+        }
+        // The rest are unrelated top-level classes, as most loaded classes are
+        // with respect to any one stub.
+        for i in 0..CLASSES {
+            let id = mgr.class_store.next_id();
+            mgr.class_store
+                .add(layout_fixture_class(id, &format!("Other{i}"), None, 1, 0, 1));
+        }
+
+        let indexed = std::time::Instant::now();
+        let mut visited = 0usize;
+        for _ in 0..UPGRADES {
+            visited += mgr.class_store.descendants_of(root).len();
+        }
+        let indexed = indexed.elapsed();
+
+        // The scan the index replaced, reproduced here so both numbers come
+        // off the same machine in the same run.
+        let scanned = std::time::Instant::now();
+        let mut probes = 0usize;
+        for _ in 0..UPGRADES {
+            for idx in 0..mgr.class_store.slot_count() {
+                let cid = ClassId::new(idx as u32);
+                if cid == root {
+                    continue;
+                }
+                probes += 1;
+                let Some(sup) = mgr.class_store.get(cid).and_then(|c| c.superclass) else {
+                    continue;
+                };
+                let _ = mgr
+                    .class_store
+                    .get(sup)
+                    .is_some_and(|sc| sc.is_subclass_of(root, &mgr.class_store));
+            }
+        }
+        let scanned = scanned.elapsed();
+
+        println!(
+            "descendant walk over {CLASSES} classes x {UPGRADES} upgrades\n  \
+             index : {indexed:?} ({visited} descendants visited)\n  \
+             scan  : {scanned:?} ({probes} classes probed)\n  \
+             ratio : {:.1}x",
+            scanned.as_secs_f64() / indexed.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
+
+    /// `descendants_of` must agree with the brute-force "scan every slot and
+    /// walk its superclass chain" answer the index replaced, and must return
+    /// parents before children so a consumer can recompute in one pass.
+    #[test]
+    fn the_subclass_index_agrees_with_a_full_hierarchy_scan() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // root -> {mid_a, mid_b}; mid_a -> {leaf}; plus an unrelated class
+        // and one tombstone.
+        let root = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(root, "Root", None, 0, 0, 0));
+        let unrelated = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(unrelated, "Unrelated", None, 0, 0, 0));
+        let mid_a = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(mid_a, "MidA", Some(root), 0, 0, 0));
+        let mid_b = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(mid_b, "MidB", Some(root), 0, 0, 0));
+        let leaf = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(leaf, "Leaf", Some(mid_a), 0, 0, 0));
+        let doomed = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(doomed, "Doomed", Some(mid_b), 0, 0, 0));
+        mgr.class_store.remove(doomed);
+
+        let mut brute: Vec<u32> = Vec::new();
+        for idx in 0..mgr.class_store.slot_count() {
+            let cid = ClassId::new(idx as u32);
+            if cid == root {
+                continue;
+            }
+            let Some(sup) = mgr.class_store.get(cid).and_then(|c| c.superclass) else {
+                continue;
+            };
+            if mgr
+                .class_store
+                .get(sup)
+                .is_some_and(|sc| sc.is_subclass_of(root, &mgr.class_store))
+            {
+                brute.push(cid.as_u32());
+            }
+        }
+        brute.sort_unstable();
+
+        let mut via_index: Vec<u32> = mgr
+            .class_store
+            .descendants_of(root)
+            .iter()
+            .map(|c| c.as_u32())
+            .collect();
+        let bfs_order = via_index.clone();
+        via_index.sort_unstable();
+        assert_eq!(via_index, brute, "index and full scan disagree");
+
+        // Parents before children: `Leaf` must not precede `MidA`.
+        let pos = |c: ClassId| bfs_order.iter().position(|&x| x == c.as_u32()).unwrap();
+        assert!(pos(mid_a) < pos(leaf), "order {bfs_order:?} is not topological");
+    }
+
     #[test]
     fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
         let mut manager = ClassManager::new(&[], &[], &[]);
@@ -17673,7 +18383,7 @@ mod tests {
     /// descendant's INHERITED descriptor at the freshly-rebuilt slot.
     ///
     /// Regression test for
-    /// `docs/internal/mockito-spy-outer-invokeinterface-call-not-recorded-
+    /// `mockito-spy-outer-invokeinterface-call-not-recorded-
     /// FIXED-20260801.md`: the descendant's vec is a copy of the
     /// ancestor's, so leaving it stale let a descendant redefined LATER in the
     /// same `retransformClasses` batch rebuild from the pre-redefinition

@@ -18,25 +18,31 @@ as ceremony.
 
 ## 1. Status of the published numbers
 
-> **The headline ratios in [`BENCHMARK.md`](../../BENCHMARK.md) are UNVERIFIED
-> under this protocol. Treat them as prioritisation signals — "String/Regex is
-> probably our worst row" — and not as measurements, until each has been
-> re-measured with the reliability gate enabled.**
+> **Re-measured 2026-08-04.** All seven CPU rows were re-taken in ONE
+> interleaved series on `dev` @ `12b8cbdea` — §2's isolation, pinning,
+> alternating-arm and no-discard rules, 9 pairs per phase, checksum verified
+> against HotSpot on all 126 runs, zero mismatches. They are no longer the
+> four-sessions-across-a-re-provisioned-host set this section was written
+> about, and the rows are comparable **to each other** for the first time.
+>
+> **They are still not gate-certified.** The 1-minute load average was 2.3–4.1
+> and the gate refuses above 2.0, so `reliability-gate.sh` would not sign this
+> run off. Ratios are the durable content; absolute times are this host on
+> this day.
 
-That applies to all seven CPU rows as published:
+| Row | Ratio vs JDK 25 C2 (2026-08-04) | CratonVM CV | was | Status |
+|---|---|---|---|---|
+| Arithmetic (2B ops) | 1.96x | 0.4% | 2.44x | re-measured, not gate-certified |
+| Fibonacci(44) | 5.77x | 1.8% | 2.79x | re-measured; distance from the July figure is unattributed and is **not** `cov-*` (checked against a control) |
+| Sieve (100K x 20,000) | 6.50x | 0.4% | 2.28x | re-measured; **live regression**, attributed to one method the optimizing tier began lowering on 2026-08-03 |
+| Matrix 1280x1280 | **0.99x** | 0.3% | 2.93x | re-measured — parity with C2 |
+| HashMap (10M put/get) | 2.07x | 0.4% | 1.75x | re-measured; the July row this replaced had itself replaced a RETRACTED one |
+| String/Regex (100K) | 5.59x | 1.1% | 7.7x | re-measured — the first honest number for this row since the session that produced 7.7x was discredited |
+| Binary Trees (depth 18) | 9.55x | 7.6% | 8.34x | re-measured; the only row whose CV exceeds the gate's 5% ceiling |
 
-| Row | Published ratio vs JDK 25 C2 | Status under this protocol |
-|---|---|---|
-| Arithmetic (2B ops) | ~2.44x | unverified — not re-measured under the gate |
-| Fibonacci(44) | 2.79x | unverified — not re-measured under the gate |
-| Sieve (100K x 20,000) | 2.28x | unverified — not re-measured under the gate |
-| Matrix 1280x1280 | 2.93x | unverified — not re-measured under the gate |
-| HashMap (10M put/get) | 1.75x | unverified — **the row this table previously carried was RETRACTED** |
-| String/Regex (100K) | 7.7x | unverified — **never re-measured after the session that produced it was discredited** |
-| Binary Trees (depth 18) | 8.34x | unverified — not re-measured under the gate |
-
-Two of those deserve to be named individually, because they are the reason the
-rest are suspect:
+The two rows below are why this section existed, and both are now superseded by
+the series above. They are kept because the *failure modes* they record are the
+reason every check in the reliability gate exists:
 
 - **The retracted HashMap regression.** `BENCHMARK.md` used to record
   `22,077 ms` / `21.2x`, described as "CONFIRMED and bounded to
@@ -46,7 +52,7 @@ rest are suspect:
   recommended has nothing in it. **Why the original readings were ~5x too slow
   was never established** — the obvious candidate (a CPU-13 pin collision with
   another session) was tested directly and showed no difference. Detail:
-  `docs/internal/performance/hashmap-half-gap-20260730.md`.
+  `performance/hashmap-half-gap-20260730.md`.
 - **The un-re-measured String/Regex row.** The `7.7x` figure (from a `3.57x`
   predecessor) comes from the *same 2026-07-25 session* as the retracted
   HashMap number. It has never been re-measured. It survives in the table only
@@ -141,12 +147,12 @@ bash regression-suite/perf/run-cratonbench-gate.sh \
     --results-dir /tmp/hashmap-after
 ```
 
-Each run writes, under `regression-suite/perf/results/v1/<run-id>/`:
+Each run writes, under `regression-suite/perf/results/v2/<run-id>/`:
 
 | File | Contents |
 |---|---|
-| `manifest.tsv` / `manifest.json` | the environment manifest above |
-| `samples.tsv` / `samples.json` | **every raw sample**: ms, checksum, observed CPU, load, throttle delta, frequency min/max, peak RSS, C1/C2/OSR compile counts, deopts, GC young pause count/p50/p99/max, minor/major GC counts, exit code |
+| `manifest.tsv` / `manifest.json` | the environment manifest above, plus one `ir_reach_<phase>` line per phase |
+| `samples.tsv` / `samples.json` | **every raw sample**: ms, checksum, observed CPU, load, throttle delta, frequency min/max, peak RSS, C1/C2/OSR compile counts, deopts, GC young pause count/p50/p99/max, minor/major GC counts, exit code, optimizing-tier requests/admitted/bodies |
 | `summary.tsv` / `summary.json` | per phase: n, min, p50, p90, p99, max, mean, stddev, CV, checksum, baseline, budget, verdict, plus the per-phase maxima of the secondary metrics |
 | `reliability-preflight.*`, `reliability-postflight.*`, `reliability.json` | the reliability gate's decision and every check it ran |
 
@@ -154,12 +160,33 @@ Percentiles are **nearest-rank** (`ceil(p/100 x n)`) everywhere — the runner,
 both reliability gates, `compare.py`, and the VM's own G1 pause summary — so a
 p99 from one means the same as a p99 from another.
 
+### What a phase's numbers are evidence *about*
+
+Schema 2 (2026-08-03) added the **optimizing tier's reach**: per phase, how
+many compile requests reached the admission chain, how many were admitted to
+the optimizing (C2/IR) pipeline, and how many bodies that pipeline actually
+produced. It is in `samples.tsv`/`summary.tsv` as `ir_requests` /
+`ir_admitted` / `ir_bodies`, and in `manifest.tsv` as one `ir_reach_<phase>`
+line per phase.
+
+Read it before quoting a delta as evidence about the JIT. On the seven
+CratonBench phases the tier produces **three** bodies in total, so almost every
+phase's number is a measurement of the single-pass backend and says nothing
+about C2 in either direction — including "the C2 change did no harm". That is
+`docs/known-issues/c2/`'s MEAS-02, and the reach record exists so the fact
+travels with the numbers instead of having to be rediscovered.
+
+`compiles_c2` is a different column and is not a substitute: it counts
+compiles whose requested *tier* was C2, including every one the optimizing
+pipeline declined and handed to the single-pass backend. A phase can report
+`compiles_c2` above zero with `ir_bodies` at zero.
+
 Comparing two runs:
 
 ```bash
 python3 regression-suite/perf/compare.py \
-    regression-suite/perf/results/v1/<before-run-id> \
-    regression-suite/perf/results/v1/<after-run-id>
+    regression-suite/perf/results/v2/<before-run-id> \
+    regression-suite/perf/results/v2/<after-run-id>
 ```
 
 `compare.py` reports p50 **and** p99 deltas with both arms' CV, and **refuses

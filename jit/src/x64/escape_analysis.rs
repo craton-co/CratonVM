@@ -1744,6 +1744,64 @@ pub(super) fn detect_byte_sieve_loop(
     })
 }
 
+/// Every bulk-byte loop lowering the single-pass backend found in one method.
+///
+/// These three detectors are the whole reason `CratonBench`'s `sieve` phase
+/// runs at HotSpot speed: they replace a scalar `boolean[]` element loop with
+/// a vectorised pre-header. They exist only on this backend — the optimizing
+/// (IR) tier lowers the same loops one element at a time.
+pub(super) struct BulkByteLoops {
+    pub(super) zero_fill: Vec<BulkZeroByteFillLoop>,
+    pub(super) set_stride: Vec<BulkSetByteStrideLoop>,
+    pub(super) sieve: Vec<ByteSieveLoop>,
+}
+
+impl BulkByteLoops {
+    pub(super) fn is_empty(&self) -> bool {
+        self.zero_fill.is_empty() && self.set_stride.is_empty() && self.sieve.is_empty()
+    }
+}
+
+/// Run all three bulk-byte detectors over one method's loops.
+///
+/// Factored out of the driver so that "would the single-pass backend
+/// vectorise a loop in this method?" has exactly ONE answer. It is asked in
+/// two places now — here, to emit the pre-headers, and from the optimizing
+/// tier's admission chain to decline a method this backend does better — and
+/// two copies of one predicate in two files is how the frame reservation and
+/// the stub spill drifted 32 registers apart.
+pub(super) fn detect_bulk_byte_loops(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+    bypassable_headers: &FxHashSet<usize>,
+) -> BulkByteLoops {
+    if !bulk_byte_loops_enabled() {
+        return BulkByteLoops {
+            zero_fill: Vec::new(),
+            set_stride: Vec::new(),
+            sieve: Vec::new(),
+        };
+    }
+    BulkByteLoops {
+        zero_fill: loops
+            .iter()
+            .filter_map(|&(h, b)| detect_bulk_zero_byte_fill_loop(code, code_len, h, b))
+            .filter(|f| !bypassable_headers.contains(&f.header_pc))
+            .collect(),
+        set_stride: loops
+            .iter()
+            .filter_map(|&(h, b)| detect_bulk_set_byte_stride_loop(code, code_len, h, b))
+            .filter(|f| !bypassable_headers.contains(&f.header_pc))
+            .collect(),
+        sieve: loops
+            .iter()
+            .filter_map(|&(h, b)| detect_byte_sieve_loop(code, code_len, h, b))
+            .filter(|s| !bypassable_headers.contains(&s.header_pc))
+            .collect(),
+    }
+}
+
 pub(super) fn bulk_byte_loops_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

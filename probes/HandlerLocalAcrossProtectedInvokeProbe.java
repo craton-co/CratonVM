@@ -1,7 +1,7 @@
 /**
  * Regression probe for the exact shape that made
  * `SimpleApplicationEventMulticaster.invokeListener` NPE under CratonVM
- * (docs/internal/fixed-suite-bugs/springboot/springboot-rerun-20260728-small-residuals-cluster.md,
+ * (fixed-suite-bugs/springboot/springboot-rerun-20260728-small-residuals-cluster.md,
  * Case 3): a non-parameter local is assigned BEFORE a `try` region, the region
  * contains a virtual call that throws, and the handler reads that local back.
  *

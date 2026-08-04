@@ -1252,7 +1252,7 @@ mod tests {
         existing.captured_at = "old-capture".into();
         existing.jdk = "old-jdk".into();
         existing.entries[0].first_seen = "old-first-seen".into();
-        existing.entries[0].linked_doc = Some("docs/internal/x.md".into());
+        existing.entries[0].linked_doc = Some("x.md".into());
         existing.entries.push(LedgerEntry {
             id: "div-0001".into(),
             class: "Z".into(),
@@ -1266,7 +1266,7 @@ mod tests {
             hotspot: Observation::empty(),
             status: LedgerStatus::Fixed,
             first_seen: "fixed-first-seen".into(),
-            linked_doc: Some("docs/internal/z.md".into()),
+            linked_doc: Some("z.md".into()),
             jdk_profile: PROFILE_COMPATIBLE.into(),
             jdk_feature: Some(25),
             class_origins: Default::default(),
@@ -1291,12 +1291,12 @@ mod tests {
         assert_eq!(x.id, "div-0000");
         assert_eq!(x.status, LedgerStatus::Known);
         assert_eq!(x.first_seen, "old-first-seen");
-        assert_eq!(x.linked_doc.as_deref(), Some("docs/internal/x.md"));
+        assert_eq!(x.linked_doc.as_deref(), Some("x.md"));
         assert_eq!(x.cratonvm.stdout, "42");
 
         let z = merged.entries.iter().find(|e| e.class == "Z").unwrap();
         assert_eq!(z.status, LedgerStatus::Fixed);
-        assert_eq!(z.linked_doc.as_deref(), Some("docs/internal/z.md"));
+        assert_eq!(z.linked_doc.as_deref(), Some("z.md"));
 
         let y = merged.entries.iter().find(|e| e.class == "Y").unwrap();
         assert_eq!(y.id, "div-0002");
@@ -1444,7 +1444,7 @@ mod tests {
     #[test]
     fn merged_ledger_updates_each_profile_row_independently() {
         let mut existing = ledger_row("X", PROFILE_JDK_ONLY, LedgerStatus::Known, "old");
-        existing.entries[0].linked_doc = Some("docs/internal/x.md".into());
+        existing.entries[0].linked_doc = Some("x.md".into());
         existing.entries[0].first_seen = "old-first-seen".into();
 
         let summary = summary_of(vec![program_with(
@@ -1462,7 +1462,7 @@ mod tests {
         // The pre-existing strict row keeps its triage and gets fresh data.
         assert_eq!(strict.status, LedgerStatus::Known);
         assert_eq!(strict.first_seen, "old-first-seen");
-        assert_eq!(strict.linked_doc.as_deref(), Some("docs/internal/x.md"));
+        assert_eq!(strict.linked_doc.as_deref(), Some("x.md"));
         assert_eq!(strict.cratonvm.stdout, "42");
         // The compatible row is brand new and did not inherit the strict row's
         // triage.

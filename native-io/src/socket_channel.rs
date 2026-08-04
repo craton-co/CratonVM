@@ -1828,8 +1828,15 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
         return Err(ioex(format!("connect denied by outbound policy: {reason}")));
     }
 
+    // Fold IPv4-mapped destinations (`::ffff:a.b.c.d`) to plain IPv4 before
+    // anything vets or dials them: on Windows an AF_INET6 socket cannot reach
+    // one (WSAEADDRNOTAVAIL), and real JDK never produces such a destination
+    // because `InetAddress` collapses the literal to an `Inet4Address`. See
+    // `outbound_policy::normalize_connect_addr`.
     let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
-        Ok(it) => it.collect(),
+        Ok(it) => it
+            .map(crate::outbound_policy::normalize_connect_addr)
+            .collect(),
         Err(e) => return Err(map_err(target, e)),
     };
     if addrs.is_empty() {
@@ -3043,7 +3050,7 @@ fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Opti
 /// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
 /// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
 /// the calling thread, silently killing it. See
-/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #3 — this silently killed HttpClient5's I/O reactor worker
 /// thread mid-connection-setup, before it ever reached `SocketChannel
 /// .connect()`, hanging every request through

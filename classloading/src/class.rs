@@ -1120,6 +1120,14 @@ pub struct ClassStore {
     /// stale ClassId can never alias a subsequently loaded class.
     classes: Vec<Option<Class>>,
     live_count: usize,
+    /// Direct-subclass adjacency: `superclass id -> direct subclass ids`, in
+    /// ascending id (= load) order.
+    ///
+    /// Maintained by [`ClassStore::add`], [`ClassStore::set_superclass`] and
+    /// [`ClassStore::remove`] — the only three places a superclass edge is
+    /// created, moved, or destroyed. See [`ClassStore::descendants_of`] for
+    /// why this index exists.
+    subclasses: rustc_hash::FxHashMap<u32, Vec<u32>>,
 }
 
 impl ClassStore {
@@ -1128,6 +1136,7 @@ impl ClassStore {
         Self {
             classes: Vec::new(),
             live_count: 0,
+            subclasses: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -1151,13 +1160,99 @@ impl ClassStore {
             class.id,
         );
         let id = class.id;
+        let superclass = class.superclass;
         self.classes.push(Some(class));
         self.live_count += 1;
+        // Ids are monotonic, so appending keeps each child list sorted.
+        if let Some(sid) = superclass {
+            self.subclasses.entry(sid.as_u32()).or_default().push(id.as_u32());
+        }
         // Compact reference-field layout: register this class's oop-map / offset
         // table so the heap + GC can place and scan its reference fields as
         // 8-byte pointers. No-op when `CRATONVM_COMPACT_REF_FIELDS=0` opts out.
         self.register_compact_layout_if_enabled(id);
         id
+    }
+
+    /// Re-parent an already-stored class, keeping the direct-subclass index in
+    /// step.
+    ///
+    /// The one caller that needs this is the synthetic-stub → real-bytecode
+    /// upgrade: a stub is minted with whatever superclass its name implies
+    /// (often `None`/`java/lang/Object`), and the real class file may name a
+    /// different one. Writing `class.superclass` through `get_mut` instead
+    /// would silently desynchronise [`ClassStore::descendants_of`].
+    pub fn set_superclass(&mut self, id: ClassId, new_super: Option<ClassId>) {
+        let Some(class) = self.classes.get_mut(id.as_u32() as usize).and_then(Option::as_mut)
+        else {
+            return;
+        };
+        let old_super = class.superclass;
+        if old_super == new_super {
+            return;
+        }
+        class.superclass = new_super;
+        if let Some(old) = old_super {
+            if let Some(kids) = self.subclasses.get_mut(&old.as_u32()) {
+                kids.retain(|&k| k != id.as_u32());
+            }
+        }
+        if let Some(new) = new_super {
+            let kids = self.subclasses.entry(new.as_u32()).or_default();
+            // Keep ascending order: the list is a topological order of a
+            // single hierarchy level, which `descendants_of` relies on.
+            match kids.binary_search(&id.as_u32()) {
+                Ok(_) => {}
+                Err(pos) => kids.insert(pos, id.as_u32()),
+            }
+        }
+    }
+
+    /// Every transitive subclass of `id`, parents before children.
+    ///
+    /// PERF (general-bugs TODO, "layout registry lookup hotspot"): the caller
+    /// this exists for — `ClassManager::recompute_subclass_layouts` — used to
+    /// answer the same question by scanning **every** class in the store and
+    /// walking each one's superclass chain with `is_subclass_of`, i.e.
+    /// `O(classes x depth)` per call. It is called once per synthetic-stub
+    /// upgrade whose layout shifted, and a Spring-Boot-scale run performs
+    /// thousands of those against tens of thousands of classes, so the scan is
+    /// quadratic in the class count. Walking the adjacency index instead costs
+    /// `O(descendants)`.
+    ///
+    /// The returned order is a valid topological order for the superclass
+    /// relation (breadth-first from `id`, children in ascending id within a
+    /// level), so a consumer may recompute each entry using its parent's
+    /// already-updated values — which is exactly what the layout recompute
+    /// requires and what the old ascending-id scan provided.
+    ///
+    /// Depth is bounded by [`MAX_HIERARCHY_DEPTH`] levels, so a corrupt index
+    /// containing a cycle terminates instead of hanging. A class is never its
+    /// own descendant.
+    pub fn descendants_of(&self, id: ClassId) -> Vec<ClassId> {
+        let mut out: Vec<ClassId> = Vec::new();
+        let mut frontier: Vec<u32> = match self.subclasses.get(&id.as_u32()) {
+            Some(kids) => kids.clone(),
+            None => return out,
+        };
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        seen.insert(id.as_u32());
+        let mut level = 0usize;
+        while !frontier.is_empty() && level < MAX_HIERARCHY_DEPTH {
+            let mut next: Vec<u32> = Vec::new();
+            for cid in frontier {
+                if !seen.insert(cid) {
+                    continue;
+                }
+                out.push(ClassId::new(cid));
+                if let Some(kids) = self.subclasses.get(&cid) {
+                    next.extend_from_slice(kids);
+                }
+            }
+            frontier = next;
+            level += 1;
+        }
+        out
     }
 
     /// Rebuild and re-register the compact field layout of **every** loaded
@@ -1325,6 +1420,16 @@ impl ClassStore {
     pub fn remove(&mut self, id: ClassId) -> Option<Class> {
         let class = self.classes.get_mut(id.as_u32() as usize)?.take()?;
         self.live_count = self.live_count.saturating_sub(1);
+        // Drop the unloaded class's edges from the adjacency index. Its own
+        // child list goes too: a live subclass of an unloaded class cannot
+        // exist (the subclass keeps its superclass reachable), so any entry
+        // left here would only ever name tombstones.
+        if let Some(sid) = class.superclass {
+            if let Some(kids) = self.subclasses.get_mut(&sid.as_u32()) {
+                kids.retain(|&k| k != id.as_u32());
+            }
+        }
+        self.subclasses.remove(&id.as_u32());
         cratonvm_types::unregister_class_layout(id.as_u32());
         Some(class)
     }
@@ -2350,7 +2455,7 @@ mod tests {
 
     /// Regression test for the Infinispan `GlobalConfiguration` /
     /// `GlobalConfigurationBuilder` `isClustered()` `NoSuchMethodError` bug
-    /// (docs/known-issues/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+    /// (fixed-suite-bugs/keycloak/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md).
     ///
     /// Two closely-named, UNRELATED classes (no inheritance between them,
     /// both extend plain `Object` — mirroring the real

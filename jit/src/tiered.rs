@@ -51,7 +51,7 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
 /// (constructed very early during VM init, well before any method can reach
 /// a compile threshold). Backs the `elapsed_ms` field of the
 /// `CRATONVM_DBG_TIER_ENQUEUE` diagnostic below -- see
-/// `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` for why
+/// `fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md` for why
 /// "how far into the process's life did this compile trigger" was the key
 /// diagnostic needed to confirm the compile-time-tax mechanism.
 fn process_start() -> &'static std::time::Instant {
@@ -1070,7 +1070,7 @@ struct MethodPromotionSnapshot {
 /// characterize whether a slow run is dominated by code that genuinely never
 /// gets hot enough to promote past the interpreter (as opposed to a stuck
 /// lock, a cache-thrashing hot path, or some other fixable inefficiency) —
-/// see `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+/// see `fixed-suite-bugs/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput-FIXED.md`.
 /// No-op if no [`TieredCompilationManager`] was ever constructed this process
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
@@ -5348,6 +5348,48 @@ mod tests {
 
     // ── Background worker drains an enqueued task off-thread ──────────────
 
+    /// How long a test waits for the background compile thread to reach a
+    /// rendezvous before giving up.
+    ///
+    /// A **liveness** bound, not a latency assertion. None of these tests
+    /// claims anything about how fast a compile is; the budget exists so a
+    /// worker that never runs fails the suite instead of hanging it.
+    ///
+    /// Worth knowing what it is NOT for. All four worker tests below failed on
+    /// this timeout about 1 run in 13 at `--test-threads=32`, which looks
+    /// exactly like an oversubscribed box starving a spawned thread — each test
+    /// starts its own `cratonvm-jit-compiler` (16 MiB stack), so a 32-way run
+    /// has dozens of them. Raising the budget from 5 seconds to 60 changed
+    /// nothing: still 6 failures in 60 runs. The task was not late, it was
+    /// GONE — see [`worker_manager`]. Tuning a timeout is what you do after a
+    /// measurement says it is a timing problem, not instead of measuring.
+    const WORKER_RENDEZVOUS: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A manager for a test that starts a background worker: the same thing
+    /// `TieredCompilationManager::new` builds, with the install epoch PINNED.
+    ///
+    /// A queued task is stamped with the install epoch it was enqueued at, and
+    /// `take_fresh` drops it if the epoch has moved since. That is the
+    /// redefinition rule and it is correct. But `TieredCompilationManager::new`
+    /// reads the epoch from `crate::jit_install_epoch()`, which is
+    /// **process-global**, and every `JitCache::clear_all` anywhere in this test
+    /// binary advances it. So a sibling test clearing its own cache silently
+    /// invalidated this test's queued task; the worker dropped it instead of
+    /// compiling it, and the rendezvous channel never received. The symptom is
+    /// a timeout, which reads as "the worker never ran".
+    ///
+    /// The section below already knew the hazard — "bumping the real
+    /// `crate::JIT_INSTALL_EPOCH` would be non-deterministic (every
+    /// `JitCache::clear_all` anywhere in this test binary advances it)" — and
+    /// injects an epoch source for the tests that are ABOUT epochs. These four
+    /// are not about epochs, which is exactly why nobody pinned theirs.
+    fn worker_manager(policy: CompilationPolicy) -> TieredCompilationManager {
+        TieredCompilationManager::with_install_epoch_source(
+            policy,
+            Some(Arc::new(AtomicU64::new(1))),
+        )
+    }
+
     /// wire-tiered-manager increment 1: crossing the C1 threshold via
     /// `on_method_invocation` enqueues a task, and the background compile thread
     /// dequeues + "compiles" it on a *different* thread, then publishes the tier.
@@ -5368,7 +5410,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         // The compile closure reports (task tier, the thread it ran on) back to
@@ -5405,7 +5447,7 @@ mod tests {
 
         // The worker should pick it up off-thread. Block on the channel (no sleep).
         let (compiled_tier, worker_thread) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must drain the task");
         assert_eq!(compiled_tier, CompilationTier::C1);
         assert_ne!(
@@ -5415,7 +5457,7 @@ mod tests {
 
         // After completion the worker must publish the tier and clear the queue.
         // Spin briefly on the completion counter (bounded, no fixed sleep).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5469,7 +5511,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         let (tx, rx) = mpsc::channel::<CompilationTier>();
@@ -5493,17 +5535,17 @@ mod tests {
         // Worker compiles C1, then the loop auto-enqueues + compiles the C2
         // supersede (Low priority). Deterministic via the channel.
         let first = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("C1 compile must run");
         assert_eq!(first, CompilationTier::C1);
         let second = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("C2 supersede compile must follow a candidate C1 publish");
         assert_eq!(second, CompilationTier::C2);
 
         // Both completions recorded; tier settles at C2; nothing re-queued
         // (request_c2_upgrade is idempotent and gated on current_tier < C2).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() < 2 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5540,7 +5582,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         let mutator_thread = std::thread::current().id();
@@ -5577,7 +5619,7 @@ mod tests {
 
         // Worker drains + compiles off-thread; block on the channel (no sleep).
         let (compiled_tier, optimized, worker_thread) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must drain the task");
         assert_eq!(compiled_tier, CompilationTier::C2);
         assert!(
@@ -5591,7 +5633,7 @@ mod tests {
 
         // After completion the worker publishes the tier (invoke-cache analogue)
         // and clears the queue. Bounded spin on the completion counter.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5650,7 +5692,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         // Rendezvous: worker -> test when it has ENTERED the compile and is
@@ -5695,7 +5737,7 @@ mod tests {
         // The worker has entered the compile and finished its bounded VM-lock
         // critical section; block on the channel (no sleep).
         let seen = entered_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must enter compile and release the VM lock");
         assert_eq!(seen, 0, "worker read the VM-lock-protected state");
 
@@ -5712,7 +5754,7 @@ mod tests {
             stw_tx.send(()).unwrap();
         });
         stw_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("STW initiator must acquire the VM lock while a compile is in-flight");
         stw.join().unwrap();
         assert_eq!(*vm_lock.lock(), 1, "STW path mutated the VM-locked state");
@@ -5725,7 +5767,7 @@ mod tests {
 
         // Let the in-flight compile finish.
         release.wait();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5746,8 +5788,10 @@ mod tests {
     // way to hold it still.
     //
     // The scheduling counters are process-wide, so the tests that assert exact
-    // counts take `crate::metrics::METRICS_TEST_LOCK` and reset the table,
-    // exactly as the metrics tests do.
+    // counts use `crate::metrics::SchedulingCapture` — a per-thread view of the
+    // same recorder. They used to take `METRICS_TEST_LOCK` and reset the table
+    // instead, which does not work: the lock serialises the tests that ASSERT
+    // and the other tests here are the PRODUCERS. See the macro's own doc.
 
     /// A manager reading its install epoch from `epoch` instead of the global.
     fn epoch_driven_manager(epoch: &Arc<AtomicU64>) -> TieredCompilationManager {
@@ -5938,8 +5982,13 @@ mod tests {
 
     #[test]
     fn drops_reach_the_process_wide_scheduling_counters() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Counted PER THREAD. `METRICS_TEST_LOCK` + a reset used to stand here
+        // and did not work: the lock serialises the tests that ASSERT, while
+        // every other `tiered` test that drops a request is a PRODUCER holding
+        // nothing. It failed about 1 run in 20 at `--test-threads=32`,
+        // reporting `Some(5)` for a count of 1. `next_fresh_task` records on
+        // its caller's thread, which is this one.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -5949,19 +5998,19 @@ mod tests {
         assert_eq!(mgr.next_fresh_task(), None);
 
         assert_eq!(
-            crate::metrics::scheduling_count("queue_dropped_stale_install_epoch"),
-            Some(1),
+            counts.count("queue_dropped_stale_install_epoch"),
+            1,
             "the drop must be visible in the metrics idiom, not only on the manager"
         );
-        assert_eq!(crate::metrics::scheduling_dropped_total(), 1);
-
-        crate::metrics::reset_scheduling_counts_for_test();
+        // …and it reaches the GLOBAL table too, which is what a sink reads.
+        // Asserted as a floor, because that table is everyone's.
+        assert!(crate::metrics::scheduling_dropped_total() >= 1);
     }
 
     #[test]
     fn invalidate_class_counts_the_requests_it_discards() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Per thread; see the test above.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -5978,21 +6027,17 @@ mod tests {
         mgr.invalidate_class("craton/test/EpochSubject");
 
         assert_eq!(mgr.queue_size(), 1, "only the unrelated class survives");
-        assert_eq!(
-            crate::metrics::scheduling_count("queue_dropped_class_invalidated"),
-            Some(2),
-        );
+        assert_eq!(counts.count("queue_dropped_class_invalidated"), 2);
         assert_eq!(mgr.dropped_requests(), 2);
         // Still dispatchable: invalidating one class must not gate another.
         assert_eq!(mgr.next_fresh_task(), Some(c1_task(&survivor)));
-
-        crate::metrics::reset_scheduling_counts_for_test();
     }
 
     #[test]
     fn shutdown_counts_the_requests_it_abandons() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Per thread; see `drops_reach_the_process_wide_scheduling_counters`.
+        // `shutdown` drains on the caller's thread — there is no worker here.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -6009,13 +6054,11 @@ mod tests {
 
         assert_eq!(mgr.queue_size(), 0, "shutdown drains rather than leaves");
         assert_eq!(
-            crate::metrics::scheduling_count("queue_shutdown_abandoned"),
-            Some(2),
+            counts.count("queue_shutdown_abandoned"),
+            2,
             "abandoning work at teardown is correct, but it is still countable"
         );
         assert_eq!(mgr.dropped_requests(), 2);
-
-        crate::metrics::reset_scheduling_counts_for_test();
     }
 }
 

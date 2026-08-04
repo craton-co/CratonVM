@@ -515,7 +515,7 @@ pub(super) fn is_global_resolution_namespace(name: &str) -> bool {
 /// unconditionally, without touching the global `CRATONVM_LOADER_AWARE_
 /// RESOLUTION` gate's default (which stays off pending the full Tomcat /
 /// Hibernate / WildFly custom-loader soak it was written for — see
-/// `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`).
+/// `fixed-suite-bugs/hibernate/hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md`).
 ///
 /// Rationale (context.groovy bug cluster): `GroovyShell.evaluate` compiles
 /// each script through its own fresh `GroovyClassLoader$InnerLoader`
@@ -790,6 +790,13 @@ pub(super) fn isolated_loader_class_not_found(
 /// the legacy global [`SharedVm::load_class_concurrent`]. The loader path can
 /// therefore only ever return a *more* correct answer, never a worse failure
 /// than the pre-gate behavior.
+///
+/// Contract §9 `requested_by`: the global fallbacks below go through
+/// [`SharedVm::load_class_concurrent_for`] with [`requesting_frame`], so a
+/// class fabricated to satisfy a constant-pool reference records *which method*
+/// referenced it. The loader-drive branches deliberately do not — a class
+/// resolved by running a user `loadClass` was produced by that loader, not
+/// fabricated, so there is no violation to attribute.
 pub(crate) fn resolve_class_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -814,8 +821,21 @@ pub(crate) fn resolve_class_loader_aware(
     //     through Quarkus's `RunnerClassLoader`.
     //     Strictly additive: it only pre-resolves a component whose global
     //     answer was going to be fabricated anyway.
+    //
+    //     Gated on THIS referencing class having a defining loader, not on the
+    //     process-wide "some loader exists" latch. The whole pre-pass exists to
+    //     feed `drive_defining_loader_load`, which bails immediately without a
+    //     `defining_loader_for(referencing_class_id)` — so for an app- or
+    //     bootstrap-defined referencing class the `would_fabricate_synthetic_stub`
+    //     probe (a class-manager read lock plus a name lookup) could only ever
+    //     lead to a no-op. Same predicate, evaluated per class instead of per
+    //     process; see `class_may_have_defining_loader` for why the difference
+    //     is worth 1.8x on a class-parsing workload.
     if let Some(component) = array_component_class_name(name) {
-        if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        if cratonvm_native_builtins::classloader::defining_loader_for(
+            referencing_class_id.as_u32(),
+        )
+        .is_some()
             && shared
                 .classes
                 .class_manager
@@ -1040,7 +1060,7 @@ pub(crate) fn resolve_class_loader_aware(
             }
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
-        let fallback = shared.load_class_concurrent(name);
+        let fallback = shared.load_class_concurrent_for(name, requesting_frame(thread));
         if dbg_trace {
             let owner = fallback
                 .as_ref()
@@ -1077,7 +1097,16 @@ pub(crate) fn resolve_class_loader_aware(
     // generated Arc bytecode resolved to a stub, which then could not be cast
     // to `io.quarkus.arc.InjectableBean`. Strictly additive -- it only
     // pre-empts an answer that was going to be fake.
-    if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+    //
+    // Reuses `has_registered_defining_loader` (computed once above) rather than
+    // the process-wide "any loader exists" latch, for the same reason as the
+    // (0) pre-pass: the body is a `drive_defining_loader_load`, which needs a
+    // defining loader for THIS referencing class and returns `None` without
+    // one. Every `new`/`checkcast`/`instanceof` of an app-loader class reaches
+    // this line -- resolution is not cached per call site -- so the probe ran
+    // on the hot path of every allocation once any custom loader had ever
+    // defined a class.
+    if has_registered_defining_loader
         && shared
             .classes
             .class_manager
@@ -1091,7 +1120,7 @@ pub(crate) fn resolve_class_loader_aware(
             return Ok(id);
         }
     }
-    match shared.load_class_concurrent(name) {
+    match shared.load_class_concurrent_for(name, requesting_frame(thread)) {
         Ok(id) => {
             if dbg_trace {
                 let cm = shared.classes.class_manager.read();
@@ -1121,7 +1150,7 @@ pub(crate) fn resolve_class_loader_aware(
                 if drive_defining_loader_load(shared, thread, referencing_class_id, component)
                     .is_some()
                 {
-                    if let Ok(id) = shared.load_class_concurrent(name) {
+                    if let Ok(id) = shared.load_class_concurrent_for(name, requesting_frame(thread)) {
                         return Ok(id);
                     }
                 }
@@ -1129,6 +1158,26 @@ pub(crate) fn resolve_class_loader_aware(
             Err(MethodCallFailed::from(e))
         }
     }
+}
+
+/// The `(owner, method, descriptor)` of the frame that is currently executing,
+/// for contract §9's `requested_by` attribution.
+///
+/// Three borrowed `&str`s, so a caller that resolves a class it never
+/// fabricates pays three pointer copies and no allocation; the requester is
+/// only formatted at the recording site, and only when a violation was actually
+/// produced. Call this at the load site rather than binding it early — the
+/// result borrows `thread`, and the resolution paths around it need `thread`
+/// mutably.
+///
+/// `None` on an empty frame stack, which is VM bootstrap: a fabrication there
+/// has no Java requester and the census says so rather than inventing one.
+#[inline]
+pub(crate) fn requesting_frame(thread: &JvmThread) -> Option<(&str, &str, &str)> {
+    thread
+        .frames
+        .last()
+        .map(|f| (f.class_name(), f.method_name(), f.method_descriptor()))
 }
 
 /// Resolve `name` by invoking the `loadClass` of the loader that DEFINED

@@ -1728,7 +1728,7 @@ pub(crate) fn build_client_config(
 /// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
 /// revoked server certificate — exactly the fail-open gap this feature
 /// fixes. See
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
 #[derive(Debug)]
 struct OcspAwareServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -2583,7 +2583,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -2595,7 +2595,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
 
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
-/// see `docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md`.
+/// see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`.
 /// Every call site that used to construct `rustls::crypto::ring::default_provider()`
 /// directly now goes through this instead, so the CBC suites are negotiable
 /// (not just reported) everywhere TLS connections get set up.
@@ -3024,7 +3024,12 @@ pub(crate) fn rustls_client_connect(
     port: u16,
 ) -> Result<i32, String> {
     let addr = format!("{}:{}", host, port);
-    let tcp = TcpStream::connect(&addr).map_err(|e| format!("connect {}: {}", addr, e))?;
+    // Fold IPv4-mapped destinations (`::ffff:a.b.c.d`) to plain IPv4 — on
+    // Windows an AF_INET6 socket cannot reach one (WSAEADDRNOTAVAIL). `host`
+    // itself is left alone: below it is the SNI name, not just a dial target.
+    // See `outbound_policy::normalize_connect_addr`.
+    let tcp = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+        .map_err(|e| format!("connect {}: {}", addr, e))?;
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let server_name = ServerName::try_from(host.to_string())
@@ -4731,7 +4736,7 @@ fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> 
 /// architectural defect already fixed once in this file for
 /// `engine_table`/`sslparams_alpn_table` via `engine_objref_key` (see its
 /// doc comment, and
-/// `docs/internal/fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
+/// `fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
 /// — that earlier fix's scope note explicitly left
 /// `ssl_server_socket_states`, `sock_alpn_table`, `session_peer_certs_table`,
 /// and `SSLSession.getId()`'s seed unfixed; this closes those.
@@ -4811,7 +4816,17 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             if let Some(f) = huc_default_ssl_socket_factory() {
                 return Ok(Some(Value::Object(Some(f))));
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
+            // 20260804): this fallback used to mint a BARE 0-field carrier.
+            // The JDK documents the unset default as
+            // `SSLSocketFactory.getDefault()`, and a caller that takes this
+            // factory to the layered
+            // `createSocket(Socket,String,int,boolean)` overload reads its
+            // field 0 for the owning `SSLContext` — so the bare carrier threw
+            // `IllegalStateException: SSLSocketFactory has no owning
+            // SSLContext`. Hand back the same wired carrier `getDefault()`
+            // does.
+            let obj = default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4986,7 +5001,27 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "getSSLSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
+            // 20260804): same bare-0-field carrier bug as
+            // `getDefaultSSLSocketFactory` above — see that comment.
+            //
+            // The JDK's instance default is whatever
+            // `setDefaultSSLSocketFactory` published, falling back to
+            // `SSLSocketFactory.getDefault()`. Read that back rather than
+            // minting an unrelated placeholder.
+            //
+            // Known remaining gap (NOT this doc's bug, and deliberately not
+            // fixed here): a per-connection `setSSLSocketFactory(...)` is
+            // still not readable back through this getter. That setter
+            // captures the connection's client identity but never stores the
+            // factory object, and storing it needs a new GC-rooted
+            // per-connection table (scan + post-move remap), like
+            // `huc_default_factory_slot` has. Both branches below at least
+            // return a factory that CAN open a layered socket.
+            if let Some(f) = huc_default_ssl_socket_factory() {
+                return Ok(Some(Value::Object(Some(f))));
+            }
+            let obj = default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -6417,6 +6452,218 @@ mod tests {
         assert_eq!(client.negotiated_alpn.as_deref(), Some("h2"));
         assert_eq!(server.negotiated_alpn.as_deref(), Some("h2"));
     }
+
+    /// Drive a client/server `EngineState` pair through a complete loopback
+    /// handshake (same shape as `wp51_loopback_handshake_via_engine_state`) and
+    /// return them, with the client's captured peer chain populated.
+    fn handshaked_pair() -> (super::EngineState, super::EngineState) {
+        let mut client = super::EngineState::default();
+        let mut server = super::EngineState::default();
+        client.is_client = true;
+        client.peer_host = Some("localhost".to_string());
+        client.client_config = Some(
+            super::build_client_config(
+                {
+                    let mut roots = RootCertStore::empty();
+                    for c in parse_cert_chain_pem(CA_CRT_PEM).unwrap() {
+                        roots.add(c).unwrap();
+                    }
+                    roots
+                },
+                &[],
+                None,
+            )
+            .unwrap(),
+        );
+        server.is_client = false;
+        server.server_config = Some(
+            super::build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
+                .unwrap(),
+        );
+        super::engine_begin(&mut client).expect("client begin");
+        super::engine_begin(&mut server).expect("server begin");
+        for _ in 0..32 {
+            let _ = super::engine_wrap_pump(&mut client, &[], 65536);
+            let buf = std::mem::take(&mut client.outbound);
+            if !buf.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut server, &buf);
+            }
+            let _ = super::engine_wrap_pump(&mut server, &[], 65536);
+            let buf2 = std::mem::take(&mut server.outbound);
+            if !buf2.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut client, &buf2);
+            }
+            super::engine_capture_negotiation(&mut client);
+            super::engine_capture_negotiation(&mut server);
+            let done = |s: &super::EngineState| {
+                s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+            };
+            if done(&client) && done(&server) {
+                break;
+            }
+        }
+        (client, server)
+    }
+
+    #[test]
+    fn endpoint_alg_only_https_and_ldaps_verify_identity() {
+        assert!(super::endpoint_alg_verifies_identity("HTTPS"));
+        assert!(super::endpoint_alg_verifies_identity("https"));
+        assert!(super::endpoint_alg_verifies_identity("LDAPS"));
+        // Not an identification algorithm JSSE knows: treat as "no check"
+        // rather than inventing one, so we never reject what JSSE accepts.
+        assert!(!super::endpoint_alg_verifies_identity(""));
+        assert!(!super::endpoint_alg_verifies_identity("NONE"));
+    }
+
+    /// REGRESSION (`TestSecurity2018.testCVE_2018_8034`): a client engine
+    /// configured with `setEndpointIdentificationAlgorithm("HTTPS")` must
+    /// refuse a certificate that does not name the host it dialled — even
+    /// though the chain itself is perfectly trusted and even though the
+    /// application's own `TrustManager` accepts everything.
+    #[test]
+    fn endpoint_identity_is_pending_and_rejects_a_mismatched_host() {
+        let (mut client, _server) = handshaked_pair();
+        assert!(
+            !client.peer_cert_chain_der.is_empty(),
+            "client must have captured the server chain"
+        );
+
+        // 1. No algorithm configured and no TrustManager: nothing pending —
+        //    exactly as cheap as before this fix.
+        client.trust_check_done = false;
+        client.endpoint_id_alg = None;
+        assert!(super::engine_take_pending_trust_check(&mut client).is_none());
+
+        // 2. HTTPS configured: a pending check appears even with no
+        //    TrustManager attached, because JSSE's own default manager is what
+        //    performs identification.
+        client.trust_check_done = false;
+        client.endpoint_id_alg = Some("HTTPS".to_string());
+        client.peer_host = Some("localhost".to_string());
+        let pending =
+            super::engine_take_pending_trust_check(&mut client).expect("identity check pending");
+        assert!(pending.trust_ctx_key.is_none());
+        assert_eq!(
+            pending.endpoint_identity,
+            Some(("HTTPS".to_string(), "localhost".to_string()))
+        );
+        // The host the engine actually dialled matches the leaf: accepted.
+        assert!(crate::x509_manager::check_endpoint_identity(
+            &pending.peer_chain_der,
+            "localhost"
+        )
+        .is_ok());
+
+        // 3. The CVE shape: same trusted chain, different host. The in-tree
+        //    test leaf names localhost/foo.test/bar.test/127.0.0.1, so a host
+        //    outside that set must be refused.
+        assert!(
+            crate::x509_manager::check_endpoint_identity(&pending.peer_chain_der, "evil.test")
+                .is_err(),
+            "a certificate that does not name the dialled host must be refused"
+        );
+
+        // 4. A server engine never runs client-side identification, whatever
+        //    is configured on it.
+        client.trust_check_done = false;
+        client.is_client = false;
+        let pending = super::engine_take_pending_trust_check(&mut client);
+        assert!(pending.is_none(), "server engines do not identify endpoints");
+    }
+
+    #[test]
+    fn wrap_consumes_no_app_data_before_finished_is_reported() {
+        // REGRESSION (websocket-jsse-ssl-bytes-consumed-during-write): rustls
+        // reports `is_handshaking() == false` one flight BEFORE the engine has
+        // told the caller the handshake ended. `handshake_status_of` keeps
+        // answering NEED_WRAP through that window on purpose (the TLS 1.2
+        // server-flight fix), so a caller that correctly obeys NEED_WRAP calls
+        // `wrap(src, dst)` while, from its point of view, it is still
+        // handshaking -- and JSSE's contract says such a wrap consumes NOTHING
+        // from `src`.
+        //
+        // Gating app-data consumption on `!is_handshaking()` alone made the
+        // engine treat `src` as application data in that window. Tomcat's
+        // WebSocket client passes a 16921-byte STATIC
+        // `AsyncChannelWrapperSecure.DUMMY`, so the engine drained 16384 bytes
+        // of zeros out of it, ENCRYPTED them onto the wire mid-upgrade, and
+        // reported bytesConsumed=16384 -- tripping
+        // `AsyncChannelWrapperSecure.checkResult`'s "Bytes were consumed from
+        // the input during a write" and killing every wss:// connect. DUMMY is
+        // never rewound, so the damage leaked into later connections too.
+        let mut client = super::EngineState::default();
+        let mut server = super::EngineState::default();
+        client.is_client = true;
+        client.peer_host = Some("localhost".to_string());
+        client.client_config = Some(
+            super::build_client_config(
+                {
+                    let mut roots = RootCertStore::empty();
+                    for c in parse_cert_chain_pem(CA_CRT_PEM).unwrap() {
+                        roots.add(c).unwrap();
+                    }
+                    roots
+                },
+                &[],
+                None,
+            )
+            .unwrap(),
+        );
+        server.is_client = false;
+        server.server_config = Some(
+            super::build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
+                .unwrap(),
+        );
+        super::engine_begin(&mut client).expect("client begin");
+        super::engine_begin(&mut server).expect("server begin");
+
+        for _ in 0..32 {
+            let _ = super::engine_wrap_pump(&mut client, &[], 65536);
+            let buf = std::mem::take(&mut client.outbound);
+            if !buf.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut server, &buf);
+            }
+            let _ = super::engine_wrap_pump(&mut server, &[], 65536);
+            let buf2 = std::mem::take(&mut server.outbound);
+            if !buf2.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut client, &buf2);
+            }
+            if !client.conn.as_ref().unwrap().is_handshaking() {
+                break;
+            }
+        }
+
+        // The exact window: rustls is done, the caller has NOT been told.
+        // Nothing in the pumps sets `handshake_finished_reported`; only
+        // `do_wrap`/`do_unwrap` do, when they hand a FINISHED result back.
+        assert!(
+            !client.conn.as_ref().unwrap().is_handshaking(),
+            "client handshake did not complete"
+        );
+        assert!(
+            !client.handshake_finished_reported,
+            "precondition: FINISHED has not been reported to the caller yet"
+        );
+
+        let dummy = vec![0u8; 16921];
+        let (consumed, _) = super::engine_wrap_pump(&mut client, &dummy, 65536);
+        assert_eq!(
+            consumed, 0,
+            "wrap() consumed the caller's buffer before reporting FINISHED; \
+             Tomcat's AsyncChannelWrapperSecure asserts bytesConsumed == 0 for \
+             every handshake-time wrap"
+        );
+
+        // Once FINISHED has been reported, an ordinary application write must
+        // still work -- the fix must not wedge the post-handshake path.
+        client.handshake_finished_reported = true;
+        let (consumed_after, _) = super::engine_wrap_pump(&mut client, &dummy, 65536);
+        assert!(
+            consumed_after > 0,
+            "application data must be consumed once the handshake is reported finished"
+        );
+    }
 }
 
 // Temporarily suppress `dead_code` on the inline integration helpers — they
@@ -6580,6 +6827,22 @@ pub(crate) struct EngineState {
     client_config: Option<Arc<ClientConfig>>,
     server_config: Option<Arc<ServerConfig>>,
     peer_host: Option<String>,
+    /// Advisory peer port recorded by `SSLContext.createSSLEngine(host, port)`.
+    /// rustls never needs it (the caller owns the already-connected socket); it
+    /// exists so `SSLEngine.getPeerPort()` can answer what the application asked
+    /// for instead of the uninitialised `-1` of a bare synthetic allocation.
+    peer_port: i32,
+    /// The `SSLParameters.getEndpointIdentificationAlgorithm()` value the
+    /// application configured on this engine ("HTTPS" / "LDAPS"), if any.
+    ///
+    /// This is the switch that turns RFC 2818 / RFC 6125 hostname verification
+    /// ON for a client engine. Real JSSE runs that check inside the engine
+    /// (`X509TrustManagerImpl.checkIdentity`, reached from
+    /// `SSLContextImpl$AbstractTrustManagerWrapper.checkAdditionalTrust`), so it
+    /// applies whether or not the application installed its own `TrustManager`
+    /// — including a deliberately-permissive test one. See
+    /// `engine_check_endpoint_identity`.
+    endpoint_id_alg: Option<String>,
     /// Per-`SSLContext` (cert_pem, key_pem) copied from the context that created
     /// this engine via `createSSLEngine`. When set, `engine_begin` builds the
     /// server (or client) config from THIS identity instead of the process-
@@ -6654,6 +6917,8 @@ impl Default for EngineState {
             client_config: None,
             server_config: None,
             peer_host: None,
+            peer_port: -1,
+            endpoint_id_alg: None,
             identity_override: None,
             trust_roots_override: None,
             plaintext_pending: Vec::new(),
@@ -7010,7 +7275,7 @@ enum BbBacking {
 /// server engine never saw the ClientHello Netty delivered and its first
 /// `unwrap` returned `BUFFER_UNDERFLOW consumed=0`, upon which Netty closed
 /// the connection (client saw "TLS handshake failed: unexpected EOF"). See
-/// `docs/known-issues/reactive-netty-https-sslengine-handshake-underflow.md`.
+/// `fixed-suite-bugs/reactive-netty-https-sslengine-handshake-underflow-FIXED.md`.
 struct BbView {
     backing: BbBacking,
     layout: BbLayout,
@@ -7545,8 +7810,26 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             .peer_host
             .clone()
             .unwrap_or_else(|| "localhost".to_string());
-        let server_name =
-            ServerName::try_from(host).map_err(|e| format!("invalid SNI hostname: {}", e))?;
+        // rustls demands *some* `ServerName`; a host it cannot parse (an
+        // underscore label, say) has no representation, whereas real JSSE
+        // simply omits the SNI extension for one. Keep the historical
+        // `"localhost"` stand-in for that case rather than failing a handshake
+        // that used to work — endpoint identification does NOT read this value
+        // (it matches against `peer_host` directly), so the stand-in cannot
+        // launder a certificate mismatch into a pass.
+        let server_name = match ServerName::try_from(host.clone()) {
+            Ok(sn) => sn,
+            Err(e) => {
+                if crate::nbflags().dbg_tls_auth_ok {
+                    eprintln!(
+                        "[dbg-tls-auth] peer host {host:?} is not a usable SNI name ({e}); \
+                         falling back to \"localhost\" for SNI only"
+                    );
+                }
+                ServerName::try_from("localhost".to_string())
+                    .map_err(|e| format!("invalid SNI hostname: {}", e))?
+            }
+        };
         let cc = ClientConnection::new(config, server_name)
             .map_err(|e| format!("ClientConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Client(cc));
@@ -7586,7 +7869,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // `beginHandshake()` call was ALSO silently discarded on the
                     // CratonVM side even before hitting that rustls wall — see
                     // this crate's
-                    // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-
+                    // `fixed-suite-bugs/tls-ocsp-clientcert-
                     // validation-not-enforced-FIXED.md`, "Residual #2 implementation"
                     // point 2, for the full trace evidence.
                     //
@@ -7820,14 +8103,22 @@ fn engine_wrap_pump(
     app_bytes: &[u8],
     dst_remaining: usize,
 ) -> (usize, usize) {
+    // Read before the `&mut state.conn` borrow below starts.
+    let finished_reported = state.handshake_finished_reported;
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return (0, 0),
     };
 
     // Phase 1: feed app data into rustls writer (post-handshake only).
+    // `handshake_finished_reported` for the same reason `do_wrap`'s
+    // `needs_app_data` uses it: `!is_handshaking()` goes true one flight before
+    // the caller is told the handshake ended, and anything written in that
+    // window is plaintext the peer is not expecting yet. `do_wrap` already
+    // hands us an empty `app_bytes` there; this keeps the invariant local so a
+    // future caller of this helper cannot reintroduce the same bug.
     let mut consumed = 0usize;
-    if !app_bytes.is_empty() && !conn.is_handshaking() {
+    if !app_bytes.is_empty() && finished_reported && !conn.is_handshaking() {
         if let Ok(n) = conn.writer().write(app_bytes) {
             consumed = n;
         }
@@ -7939,8 +8230,25 @@ fn engine_capture_negotiation(state: &mut EngineState) {
 struct PendingTrustCheck {
     is_client: bool,
     peer_chain_der: Vec<Vec<u8>>,
-    trust_ctx_key: u64,
+    /// `None` when the owning `SSLContext` has no `TrustManager[]` attached —
+    /// the pending check can still be worth running for its endpoint-identity
+    /// half, which JSSE performs regardless of which TrustManager is in force.
+    trust_ctx_key: Option<u64>,
     negotiated_cipher_suite_name: Option<String>,
+    /// `(algorithm, peer_host)` when this client engine must perform RFC 2818 /
+    /// RFC 6125 endpoint identification once the chain is accepted.
+    endpoint_identity: Option<(String, String)>,
+}
+
+/// True for the `SSLParameters.setEndpointIdentificationAlgorithm()` values
+/// that mean "verify the peer certificate names the host I dialled".
+///
+/// JSSE recognises `HTTPS` (RFC 2818) and `LDAPS` (RFC 2830); the comparison is
+/// case-insensitive there, and anything else — including the empty string and
+/// `null` — means no identification. We deliberately do NOT treat an unknown
+/// algorithm as "verify anyway": that would reject connections JSSE accepts.
+fn endpoint_alg_verifies_identity(alg: &str) -> bool {
+    alg.eq_ignore_ascii_case("HTTPS") || alg.eq_ignore_ascii_case("LDAPS")
 }
 
 /// Called right after the crypto handshake reports FINISHED for the first
@@ -7964,10 +8272,28 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
         return None;
     }
     state.trust_check_done = true;
-    let trust_ctx_key = state.trust_managers_ctx_key?;
     if state.peer_cert_chain_der.is_empty() {
         // No peer certificate was presented (e.g. optional client auth and
-        // the client declined) — nothing for a TrustManager to check.
+        // the client declined) — nothing for a TrustManager to check, and
+        // nothing to identify either.
+        return None;
+    }
+    let trust_ctx_key = state.trust_managers_ctx_key;
+    // Endpoint identification is a CLIENT-side gate: it matches the server's
+    // certificate against the host this side dialled. A server engine has no
+    // "host it dialled", and JSSE's server-side identification (the LDAPS/HTTPS
+    // algorithm applied to a client certificate) is not something any caller
+    // reaching this path configures.
+    let endpoint_identity = match (&state.endpoint_id_alg, &state.peer_host) {
+        (Some(alg), Some(host))
+            if state.is_client && endpoint_alg_verifies_identity(alg) && !host.is_empty() =>
+        {
+            Some((alg.clone(), host.clone()))
+        }
+        _ => None,
+    };
+    // Neither half has anything to do — stay exactly as cheap as before.
+    if trust_ctx_key.is_none() && endpoint_identity.is_none() {
         return None;
     }
     let cipher_name = state
@@ -7980,6 +8306,7 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
         peer_chain_der: state.peer_cert_chain_der.clone(),
         trust_ctx_key,
         negotiated_cipher_suite_name: cipher_name,
+        endpoint_identity,
     })
 }
 
@@ -7994,20 +8321,30 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
 /// the handshake the same way when a configured `TrustManager` (e.g. one
 /// wrapping OCSP/CRL revocation checking, or a fully custom
 /// `X509TrustManager`) rejects the chain.
+///
+/// Then — and this is a SEPARATE gate, not a consequence of the one above —
+/// runs endpoint identification when the engine was configured with an
+/// identification algorithm. See `engine_check_endpoint_identity`.
 fn engine_run_trust_check(
     ctx: &mut dyn NativeContext,
     pending: PendingTrustCheck,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let trust_managers = ctx_trust_managers_table()
-        .lock()
-        .get(&pending.trust_ctx_key)
-        .cloned()
-        .unwrap_or_default();
+    let trust_managers = match pending.trust_ctx_key {
+        Some(key) => ctx_trust_managers_table()
+            .lock()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     if trust_managers.is_empty() {
         // No custom TrustManager/TrustManagerFactory installed on this
-        // context — rustls's own chain-of-trust check is the only
-        // verification, matching prior (pre-fix) behavior exactly.
-        return Ok(());
+        // context — rustls's own chain-of-trust check is the only chain
+        // verification, matching prior (pre-fix) behavior exactly. Endpoint
+        // identification still applies: in real JSSE it is the DEFAULT
+        // `X509TrustManagerImpl` that performs it, so "no custom manager" is
+        // the case where it is most certainly enforced.
+        return engine_check_endpoint_identity(ctx, &pending);
     }
 
     // Real JSSE authType is the key-exchange/signature algorithm; we don't
@@ -8141,7 +8478,58 @@ fn engine_run_trust_check(
             &format!("TrustManager rejected the peer certificate chain: {detail}"),
         ));
     }
-    Ok(())
+    engine_check_endpoint_identity(ctx, &pending)
+}
+
+/// RFC 2818 / RFC 6125 endpoint identification for a client engine, run after
+/// the chain has been accepted.
+///
+/// ## Why this cannot be folded into the TrustManager consultation
+///
+/// In real JSSE the two are genuinely independent. A plain `X509TrustManager`
+/// supplied by an application is wrapped by
+/// `SSLContextImpl$AbstractTrustManagerWrapper`, which calls the application's
+/// `checkServerTrusted` and THEN `checkAdditionalTrust` →
+/// `X509TrustManagerImpl.checkIdentity`. So an application TrustManager that
+/// accepts everything — the standard test shape, and precisely what Tomcat's
+/// `TestSecurity2018` installs (`TesterSupport.TrustAllCerts`) — does not and
+/// cannot switch hostname verification off. Treating "the TrustManager said
+/// yes" as the end of the story is the CVE-2018-8034 bypass itself: a
+/// certificate issued for `localhost` was accepted for a connection to
+/// `127.0.0.1`.
+///
+/// Symmetrically, when NO application TrustManager is installed, JSSE's own
+/// default `X509TrustManagerImpl` performs the identity check — so this must
+/// run on that path too, which is why the early return in
+/// `engine_run_trust_check` calls here rather than returning `Ok(())`.
+///
+/// A failure aborts the handshake as `SSLHandshakeException`, wrapping the same
+/// text JSSE uses ("No subject alternative names matching ..." shape), which is
+/// what a caller such as Tomcat's `AsyncChannelWrapperSecure` propagates out of
+/// its handshake future.
+fn engine_check_endpoint_identity(
+    ctx: &mut dyn NativeContext,
+    pending: &PendingTrustCheck,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let Some((alg, host)) = pending.endpoint_identity.as_ref() else {
+        return Ok(());
+    };
+    match crate::x509_manager::check_endpoint_identity(&pending.peer_chain_der, host) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let detail =
+                format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
+            if crate::nbflags().dbg_tls_auth_ok {
+                eprintln!("[dbg-tls-auth] {detail}");
+            }
+            set_last_trust_rejection_detail(&detail);
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &detail,
+            ))
+        }
+    }
 }
 
 thread_local! {
@@ -8179,8 +8567,12 @@ pub(crate) fn run_client_trust_check_for_chain(
         PendingTrustCheck {
             is_client: true,
             peer_chain_der,
-            trust_ctx_key,
+            trust_ctx_key: Some(trust_ctx_key),
             negotiated_cipher_suite_name: None,
+            // The native client-socket path performs its own hostname check at
+            // its own layer (`http_url_connection::huc_verify_hostname`); it
+            // does not route endpoint identification through here.
+            endpoint_identity: None,
         },
     )
 }
@@ -8702,7 +9094,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     // reaches the connection's promise), which is why this specific NPE
     // manifested as an indefinite hang/silent-exit crash rather than a
     // visible test failure — see
-    // docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md.
+    // fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md.
     // Real JDK's `getHandshakeSession()` returns the session being
     // negotiated (or null outside a handshake); returning the same
     // best-effort synthetic session `getSession()` already builds (complete
@@ -8924,14 +9316,37 @@ fn do_wrap(
         }
     }
 
-    // Step 1: read app data from src ByteBuffers (only relevant when not handshaking).
+    // Step 1: read app data from src ByteBuffers (only once the handshake is
+    // OVER as far as the CALLER is concerned).
+    //
+    // The gate is `handshake_finished_reported`, not `!conn.is_handshaking()`.
+    // Those two are not the same instant: `handshake_status_of` deliberately
+    // keeps answering NEED_WRAP after `is_handshaking()` flips false, until the
+    // engine's own final flight has been drained (the TLS 1.2 server-flight fix
+    // in `handshake_status_of`). A caller that correctly obeys that NEED_WRAP
+    // calls `wrap(src, dst)` while still handshaking from its point of view --
+    // and JSSE's contract says such a wrap consumes NOTHING from `src`.
+    //
+    // Gating on `!is_handshaking()` alone made that wrap treat `src` as
+    // application data. Tomcat's WebSocket client hands it a 16921-byte
+    // `AsyncChannelWrapperSecure.DUMMY`, so the engine drained 16384 bytes of
+    // zeros out of it, ENCRYPTED them onto the wire mid-upgrade, and reported
+    // `bytesConsumed=16384` -- which is exactly the invariant
+    // `AsyncChannelWrapperSecure.checkResult` asserts, so the connect died with
+    // "Bytes were consumed from the input during a write". `DUMMY` is `static`
+    // and nobody rewinds it, so the position damage leaked into every later
+    // connection in the same JVM (the second engine found only 537 bytes left).
+    //
+    // Tomcat's server-side NIO path passes an empty buffer to its handshake
+    // wraps, which is why nothing but the WebSocket client ever noticed.
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
     let needs_app_data = with_engine(id, |s| {
-        s.conn
-            .as_ref()
-            .map(|c| !c.is_handshaking())
-            .unwrap_or(false)
+        s.handshake_finished_reported
+            && s.conn
+                .as_ref()
+                .map(|c| !c.is_handshaking())
+                .unwrap_or(false)
     })
     .unwrap_or(false);
     if needs_app_data {
@@ -9635,6 +10050,37 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                         s.need_client_auth = false;
                     }
                 });
+                // Endpoint identification — the JSSE switch that turns RFC 2818
+                // hostname verification on. Tomcat's WebSocket client sets it
+                // exactly this way (`WsWebSocketContainer.createSSLEngine`:
+                // `sslParams.setEndpointIdentificationAlgorithm("HTTPS")` then
+                // `engine.setSSLParameters(sslParams)`) — it IS the fix for
+                // CVE-2018-8034. Dropping it here meant the engine never
+                // checked the peer's certificate against the host being
+                // dialled, so a `localhost`-only certificate was accepted for
+                // `127.0.0.1` (`TestSecurity2018.testCVE_2018_8034`).
+                //
+                // Read through the accessor rather than a field slot: in real-
+                // JDK mode this is a genuine `javax.net.ssl.SSLParameters` whose
+                // `identificationAlgorithm` field we must not address by index,
+                // and in synthetic mode `tls.rs`'s native getter answers from
+                // its own 6-field layout. Both spell the value the same way.
+                let alg = match ctx.invoke_virtual(
+                    *p,
+                    "getEndpointIdentificationAlgorithm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                // An explicit empty string / null CLEARS the algorithm — JSSE
+                // treats both as "no endpoint identification" — so mirror the
+                // caller's value exactly instead of only ever setting it.
+                let alg = alg.filter(|a| !a.trim().is_empty());
+                with_engine(id, |s| {
+                    s.endpoint_id_alg = alg.clone();
+                });
             }
             Ok(None)
         },
@@ -9685,6 +10131,26 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => o,
                 _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
             };
+            // Echo back the endpoint-identification algorithm this engine is
+            // configured with. JSSE's contract is a round-trip
+            // (`getSSLParameters` reports what `setSSLParameters` installed);
+            // answering the constructor default here would tell an application
+            // that reads its own configuration back that hostname verification
+            // is off when it is on.
+            let mut p = p;
+            if let Some(alg) = with_engine(id, |s| s.endpoint_id_alg.clone()).flatten() {
+                let p_pin = ctx.pin_native_root(p);
+                let alg_str = ctx.create_string(&alg);
+                p = ctx.read_native_pin(p_pin, p);
+                let _ = ctx.invoke_virtual(
+                    p,
+                    "setEndpointIdentificationAlgorithm",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(alg_str))],
+                );
+                p = ctx.read_native_pin(p_pin, p);
+                ctx.unpin_native_roots(p_pin);
+            }
             // Stash ALPN onto the SSLParameters side-table so getApplicationProtocols echoes it.
             let alpn_list = with_engine(id, |s| {
                 s.alpn_protocols
@@ -9733,6 +10199,49 @@ pub(crate) fn set_engine_identity_override(
             s.trust_roots_override = Some(trust_roots);
         }
     });
+}
+
+/// Record the peer host/port an application named in
+/// `SSLContext.createSSLEngine(host, port)`.
+///
+/// Two things depend on it, and BOTH were silently wrong while this was
+/// dropped on the floor (the `createSSLEngine(String,I)` native ignored its
+/// arguments entirely):
+///
+///   1. **SNI.** `engine_begin` falls back to the literal `"localhost"` when no
+///      peer host is known, so every client engine announced `localhost`
+///      whatever host the caller actually dialled.
+///   2. **Endpoint identification.** RFC 2818 hostname verification has nothing
+///      to match against without the intended host — and "match against
+///      `localhost`" is not a weaker check, it is a *wrong* one: it accepts a
+///      `localhost` certificate for any host in the world. That is exactly the
+///      shape of CVE-2018-8034, which Tomcat's `TestSecurity2018` regression-
+///      tests by dialling `127.0.0.1` with a `localhost`-only certificate.
+///
+/// Also mirrored onto the Java object's own `peerHost`/`peerPort` fields where
+/// they exist, so `SSLEngine.getPeerHost()`/`getPeerPort()` (plain JDK bytecode
+/// reading final fields our synthetic allocation never ran a constructor for)
+/// answer the same values rather than `null`/`-1`.
+pub(crate) fn set_engine_peer_host(
+    ctx: &mut dyn NativeContext,
+    engine_obj: ObjectRef,
+    host: String,
+    port: i32,
+) {
+    let id = engine_id_or_alloc(ctx, engine_obj);
+    with_engine(id, |s| {
+        s.peer_host = Some(host.clone());
+        s.peer_port = port;
+    });
+    // `create_string` allocates, so it can relocate `engine_obj` under a moving
+    // young collection — pin and re-read before the stores (family-1 shape: a
+    // native local held live across an allocation).
+    let pin = ctx.pin_native_root(engine_obj);
+    let host_str = ctx.create_string(&host);
+    let engine_now = ctx.read_native_pin(pin, engine_obj);
+    ctx.set_field_by_name(engine_now, "peerHost", Value::Object(Some(host_str)));
+    ctx.set_field_by_name(engine_now, "peerPort", Value::Int(port));
+    ctx.unpin_native_roots(pin);
 }
 
 /// Copy trust roots selected by the creating SSLContext even when it has no
@@ -9921,6 +10430,50 @@ pub(crate) fn set_runtime_default_ssl_context(ctx_obj: ObjectRef) {
 /// object instead of always allocating a fresh, unconfigured one.
 pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
     *default_ssl_context_slot().lock()
+}
+
+/// The process-wide default `SSLContext`, created and cached on first use.
+///
+/// This is the JDK's documented `SSLContext.getDefault()` lazy-init contract
+/// ("the default context is created if it is not yet created"). It lived
+/// inline in exactly one caller — `phases_late::ssl_security`'s
+/// `SSLSocketFactory.getDefault()` registration — while three other natives
+/// that also hand back a `javax/net/ssl/SSLSocketFactory` minted a *bare*
+/// carrier instead. The layered
+/// `SSLSocketFactory.createSocket(Socket,String,int,boolean)` overload reads
+/// the owning context out of the carrier's field 0, so every one of those
+/// bare factories threw
+/// `IllegalStateException: SSLSocketFactory has no owning SSLContext`
+/// instead of connecting. Converting the idiom rather than each site is what
+/// keeps a future fourth caller from re-introducing it. See
+/// `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+pub(crate) fn default_ssl_context_or_create(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+) -> ObjectRef {
+    if let Some(existing) = get_runtime_default_ssl_context() {
+        return existing;
+    }
+    let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+    let name = ctx.create_string("TLS");
+    ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
+    ctx.set_field(new_ctx, 1, Value::Int(1));
+    set_runtime_default_ssl_context(new_ctx);
+    new_ctx
+}
+
+/// Mint the object `SSLSocketFactory.getDefault()` hands back: the same
+/// 1-slot synthetic carrier `SSLContext.getSocketFactory()` returns, with
+/// field 0 set to the process default `SSLContext`.
+///
+/// `HttpsURLConnection`'s default/instance factory getters use it too — the
+/// JDK documents both as defaulting to `SSLSocketFactory.getDefault()`.
+pub(crate) fn default_ssl_socket_factory_obj(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+) -> ObjectRef {
+    let ssl_ctx = default_ssl_context_or_create(ctx);
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+    ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
+    obj
 }
 
 /// GC root scan for `default_ssl_context_slot` -- mirrors

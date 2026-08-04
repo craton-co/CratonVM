@@ -1,7 +1,7 @@
 # Tomcat suite runner for CratonVM (Linux) - `run-tomcat-suite.sh`
 
-Linux counterpart to the Windows `run-tomcat-suite.ps1` harness (local to the
-Windows box, not git-tracked). Runs the Apache Tomcat JUnit test suite
+Linux counterpart to the Windows `run-tomcat-suite.ps1` harness (now tracked
+alongside it — see §6 for its classpath contract). Runs the Apache Tomcat JUnit test suite
 one-process-per-class against CratonVM or a real-JDK (HotSpot) baseline,
 sharded N ways, with a resumable per-shard `results.csv`.
 
@@ -28,7 +28,21 @@ Needs a Tomcat checkout with:
   (`apt-get install ant`) by hand,
 - a class list at `$TC_ROOT/.suite/all-tests.txt` (one FQCN per line, **no
   CRLF** - if generated on Windows and `scp`'d over, run
-  `sed -i 's/\r$//' all-tests.txt` first or every class name fails to resolve).
+  `sed -i 's/\r$//' all-tests.txt` first or every class name fails to resolve),
+- an **Apache httpd binary** for the 9 `org.apache.tomcat.integration.httpd.*`
+  classes. Each of them starts its own httpd reverse proxy in front of the
+  embedded Tomcat under test; with no binary they all fail with a
+  connection-refused to the proxy port, on HotSpot exactly as on CratonVM.
+  The script passes `-Dtomcat.test.httpd.path="$HTTPD_PATH"`, defaulting to
+  `command -v httpd`. Debian names the binary `apache2`
+  (`apt-get install apache2`), so either symlink it onto `PATH` as `httpd` or
+  set `HTTPD_PATH=/usr/sbin/apache2`. On Windows there is no httpd at all:
+  run `pwsh apps/tomcat-suite-runner/setup-httpd-windows.ps1`, which unpacks a
+  SHA-256-verified Apache Lounge build into a local directory (no service, no
+  `PATH` change) and applies `fixtures/httpd-ready-timeout.patch` - upstream
+  `TesterHttpd` allows httpd 1000 ms to bind its listener, ample on Linux but
+  consistently short of the 1.0-1.5 s that MPM WinNT startup measures, so on
+  Windows all 9 fail ~1 s in even with a good httpd installed.
 
 None of this setup is automated by the script itself (mirrors the `.ps1`
 harness's `-Setup` step, which isn't reproduced here) - reuse an existing
@@ -82,7 +96,7 @@ bigger `-Xmx` than the flat default) rather than CratonVM bugs - these fail
 identically under real JDK 25 in the same fixture. Always run the `hotspot`
 mode over the same class list first (or alongside) and diff: only classes
 that **PASS on hotspot but FAIL/HANG/NOSUMMARY/CRASH on craton** are candidate
-regressions. See `docs/internal/tomcat-suite-bugs/16-full-suite-6shard-rerun-20260721.md`
+regressions. See `tomcat-suite-bugs/16-full-suite-6shard-rerun-20260721.md`
 for a worked example (646-class run, 23 confirmed regressions out of 196
 initial non-PASS classes; the other 172 failed on HotSpot too).
 
@@ -98,3 +112,41 @@ initial non-PASS classes; the other 172 failed on HotSpot too).
 - `nohup`'d background shard launches on a shared host get killed at SSH
   logout unless linger is enabled first: `sudo -n loginctl enable-linger
   $(whoami)`.
+
+## 6. Windows harness: the classpath must be COMPLETE, and it now says so
+
+`run-tomcat-suite.ps1 -Setup` builds `apps\tomcat\.suite\cp.txt` from
+`Build-Classpath`. Two things about it are load-bearing:
+
+- **Each jar is looked up by several names.** Tomcat's `ant download-compile`
+  renames what it downloads (`bouncycastle-provider-1.84.jar`), while the
+  Gradle/Maven caches hold the upstream artifact name
+  (`bcprov-jdk18on-1.84.jar`). Matching only the renamed name is what silently
+  dropped BouncyCastle and EasyMock off this box's classpath for weeks —
+  eleven classes reported `NoClassDefFoundError` and were filed as two
+  separate "CratonVM" known-issues docs. Roots searched, in order:
+  `C:\Users\Victor\tomcat-build-libs`, the Gradle module cache,
+  `~\.m2\repository`, and `apps\tomcat\.suite\lib`.
+- **A miss is now fatal.** Unresolvable jars are printed in red, written to
+  `.suite\cp-missing.txt`, and abort the run unless `-AllowMissingLibs` is
+  passed. Drop the jar into `apps\tomcat\.suite\lib` (any layout) and re-run
+  `-RefreshClasspath`, which rebuilds `cp.txt` + `all-tests.txt` in seconds
+  without the ~20 min `ant deploy && ant test-compile`.
+
+`run-one.ps1` reads the same `cp.txt` and mirrors `Invoke-Mode`'s `$jvmArgs`
+verbatim (4 × `--add-opens`, the `tomcat.test.*` system properties,
+`--nojit`/`-Xint`). Keep the two lists in step: a single-class repro that omits
+`--add-opens=java.base/java.lang` fails every EasyMock-based class for reasons
+that have nothing to do with the VM.
+
+**EasyMock on JDK 25 fails on HotSpot, by design of neither.** EasyMock 5.6.0
+class-mocking needs byte-buddy's `ClassInjector.UsingUnsafe`, which is
+unavailable on JDK 25 under any flag combination; it falls back to a
+`MethodHandles.lookup()` rooted in its own package and dies with "must be
+defined in the same package as `org.easymock.internal.ClassProxyFactory`".
+Eight classes (`TestSSLValve`, `TestJNDIRealm`, `TestPersistentManager`,
+`TestWebappServiceLoader`, `TestCrawlerSessionManagerValve`,
+`TestLoadBalancerDrainingValve`, `TestRequest`, `TestTldScanner`) are therefore
+permanently red in a HotSpot control run and green under CratonVM — expected,
+not a regression. Details:
+`fixed-suite-bugs/tomcat/bouncycastle-easymock-classpath-fixture-gap-FIXED.md`.

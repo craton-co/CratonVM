@@ -37,8 +37,14 @@ pub fn optimize(graph: &mut Graph) {
             break;
         }
     }
-    // Full unrolling of small constant-trip counted loops. Default-OFF behind
-    // `CRATONVM_JIT_UNROLL` (Increment 3 of activate-ir-optimizer). Runs after
+    // Full unrolling of small constant-trip counted loops. Default-**ON**;
+    // `CRATONVM_JIT_UNROLL=0` turns it off (`unroll_enabled` is
+    // `map_or(true, ..)`). This comment said "Default-OFF ... while it soaks"
+    // until 2026-08-04; it had outlived the soak. It matters more than a stale
+    // comment usually does, because the parity audit in
+    // `x64/single_pass_only.rs` decides whether the optimizing tier may take a
+    // method by asking which transforms it has, and this one is the reason the
+    // single-pass native unroller is NOT on that veto list. Runs after
     // the fixed-point cleanup so init/stride/bound are already folded to
     // constants; re-runs the cleanup so the unrolled straight-line code folds
     // (the concrete induction values collapse the per-iteration computation)
@@ -56,9 +62,11 @@ pub fn optimize(graph: &mut Graph) {
             }
         }
     }
-    // SCEV-driven loop-invariant code motion. Default-OFF behind
-    // `CRATONVM_JIT_LICM` while it soaks (Increment 2 of activate-ir-optimizer).
-    // Runs once *after* the fixed-point cleanup so it sees already-folded /
+    // SCEV-driven loop-invariant code motion. Default-**ON**;
+    // `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is `map_or(true, ..)`).
+    // Same correction, same date, same reason as the unroll comment above: it
+    // is why the single-pass `aaload`/FP hoists are not on the veto list in
+    // `x64/single_pass_only.rs`. Runs once *after* the fixed-point cleanup so it sees already-folded /
     // GVN'd invariant expressions, then a final lightweight cleanup re-runs
     // GVN + DCE to dedup any anchor edges it rewrote.
     if licm_enabled() && licm(graph) {
@@ -990,7 +998,10 @@ fn loop_body(
                 continue;
             }
             let op = &graph.nodes[u as usize].op;
-            if op.is_control() && !matches!(op, Op::Return) {
+            // cov-07: `Op::Throw`, like `Op::Return`, always leaves the frame
+            // and never flows control back into the loop body — exclude it
+            // from the forward-reachable set for the same reason.
+            if op.is_control() && !matches!(op, Op::Return | Op::Throw) {
                 if forward.insert(u) {
                     work.push(u);
                 }
@@ -2147,6 +2158,12 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // lowerer's deopt guards), an observable effect, so neither may be deleted
     // even when its result/memory token has no consumer (a `float v = a[i];`
     // whose `v` is unused still performs the bounds check).
+    //
+    // COV-02 adds `Op::ArrayLength` for that reason and no other. It is a pure
+    // read of immutable storage — but it throws NullPointerException on a null
+    // array through the same deopt guard, and that throw is the observable
+    // effect. `int n = a.length;` with `n` unused still has to NPE; deleting it
+    // is not a faster answer, it is a dropped exception.
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
@@ -2155,10 +2172,26 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
             matches!(
                 n.op,
                 Op::Return
+                    // cov-07: a throw is an observable program exit exactly
+                    // like a return — see the seeding comment above `Op::
+                    // Return`. Its exception-ref INPUT is what must stay
+                    // reachable (deleting the throw would silently turn
+                    // `throw e;` into nothing).
+                    | Op::Throw
                     | Op::Store(_)
                     | Op::Call { .. }
+                    // cov-01: all three are observable side effects whose value
+                    // may have no consumer. `ldc <Class>` and `getstatic` can
+                    // run `<clinit>` and throw; `ldc <String>` interns, which
+                    // is observable through `==` on a later literal. Deleting
+                    // one because nothing reads its result would drop the
+                    // class initialisation Java owes at that bytecode.
+                    | Op::ConstString { .. }
+                    | Op::ConstClass { .. }
+                    | Op::LoadStatic { .. }
                     | Op::ArrayLoad(_)
                     | Op::ArrayStore(_)
+                    | Op::ArrayLength
                     // Monitors are observable side effects and must be roots.
                     // Without this, DCE deletes a `monitorenter` whose result
                     // nobody reads — lock elision by liveness sweep, with no
@@ -2640,6 +2673,12 @@ fn unroll(graph: &mut Graph) -> bool {
                 op,
                 Op::Store(_)
                     | Op::Call { .. }
+                    // cov-01: a helper call that may allocate, intern or run
+                    // `<clinit>` is a side effect this pass does not model, so
+                    // a loop containing one is not unrolled.
+                    | Op::ConstString { .. }
+                    | Op::ConstClass { .. }
+                    | Op::LoadStatic { .. }
                     | Op::New { .. }
                     | Op::NewArray { .. }
                     | Op::ArrayLength

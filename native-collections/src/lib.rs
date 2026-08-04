@@ -123,6 +123,21 @@ const CF_BUCKET_MAP_NAME: u16 = 1 << 8;
 /// stale bit is unreachable: `receiver_facts` is only ever asked about the
 /// runtime class of an object that exists.
 const CF_HAS_NAME: u16 = 1 << 9;
+/// `IdentityHashMap` ancestry (exact class or a user subclass).
+///
+/// `IdentityHashMap.get`/`put` are registered straight onto the generic
+/// bucket-map natives (`native_map_get_pub`/`native_map_put_pub` — see
+/// `register_identity_hashmap_natives`), which by default compute the bucket
+/// hash and collision equality via the key's *virtual* `hashCode()`/`equals()`
+/// — content semantics. That happens to coincide with reference semantics for
+/// a key class like `java.lang.Class` that doesn't override either method,
+/// which is why this went unnoticed, but it is not what `IdentityHashMap`'s
+/// contract requires, and every `hashCode()`/`equals()` dispatch it triggers
+/// is a moving-GC window a pure identity computation would not need at all.
+/// `map_hash_key`/`map_keys_equal` consult this flag to skip virtual dispatch
+/// entirely for an identity-map receiver — see `map_hash_key_identity`
+/// and `map_keys_equal_identity`.
+const CF_IDENTITY_MAP: u16 = 1 << 10;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,6 +271,23 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // class necessarily has a name, so the common case skips the call.
     if exact.is_some() || ctx.class_name_of_id(cid).is_some() {
         flags |= CF_HAS_NAME;
+    }
+    // `IdentityHashMap` is not a `WellKnownClass` variant (it participates in
+    // no other family decision here), so a direct name walk is simpler than
+    // adding a 16th variant for this one flag. Paid once per `ClassId`, then
+    // cached forever by `receiver_facts` like every other bit above.
+    {
+        let mut cur = cid;
+        for _ in 0..FACTS_WALK_LIMIT {
+            if ctx.class_name_of_id(cur).as_deref() == Some("java/util/IdentityHashMap") {
+                flags |= CF_IDENTITY_MAP;
+                break;
+            }
+            match ctx.superclass_of(cur) {
+                Some(parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
     }
     ClassFacts(flags)
 }
@@ -969,6 +1001,137 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 #[inline]
 fn pack_obj_key(hash: u32, generation: u32) -> usize {
     (((hash as u64) << 32) | (generation as u64)) as usize
+}
+
+/// Does the object-key registry record `actual_class_id` for `key`'s slot?
+///
+/// The owner index (`overlay_owner_keys`) is keyed by ADDRESS and therefore
+/// cannot tell a live collection from an unrelated object that recycled its
+/// block. The registry slot behind the packed key does carry the registering
+/// collection's `class_id`, which is GC-invariant, so comparing it against the
+/// class actually at the address is a sound identity check — the same one
+/// `widened_obj_key` uses for recycled identity hashes.
+///
+/// Unknown key (no such slot) answers `true`: absence of evidence is not
+/// evidence of a mismatch, and dropping a root on it would be the unsafe
+/// direction. Over-retaining one cycle is the safe one.
+/// OFF BY DEFAULT — measured harmful. Opt in with `CRATONVM_OWNER_CLASS_FILTER=1`.
+///
+/// The defect this guards against is real and unit-proven (see
+/// `marker_owner_lookup_survives_address_recycling_by_a_non_collection`): the
+/// marker's owner→overlay lookup has no identity check, so an ordinary object
+/// that recycles a dead collection's block inherits its references. But
+/// ENFORCING the check costs more than it saves on the workload that motivated
+/// it.
+///
+/// One-binary A/B on `DefaultCatalogAndSchemaTest`, arms alternating, only this
+/// variable differing (`probes/owner-filter-flag-ab-20260801.sh`):
+///
+/// | arm | rc  | stale receivers |
+/// |-----|-----|-----------------|
+/// | off | 139 | 0               |
+/// | on  | 139 | 3641            |
+/// | off | 127 | 0               |
+/// | on  | 139 | 973             |
+///
+/// Dropping a key discards a LIVE collection's roots whenever the recorded and
+/// actual class disagree for any reason OTHER than recycling, and on this
+/// workload they disagree often enough to reclaim thousands of live objects.
+/// Exempting the zeroed-header case (`class_id == 0`, an already-freed owner)
+/// cut it from 5784/637 to 3641/973 but did not close it — so the remaining
+/// mismatches are not just corrupted owners.
+///
+/// It stays a runtime switch, not a second binary, because that is what made
+/// the effect attributable at all: a two-binary comparison had shown only
+/// `found=132` vs `110` and looked like a clean win.
+///
+/// Before re-enabling this, find a discriminator that cannot fire on a live
+/// collection — the recorded class is not one.
+fn owner_class_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_OWNER_CLASS_FILTER").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_OWNER_FILTER=1`: report every key this check DROPS.
+///
+/// A drop is only correct when the address was genuinely recycled. If the
+/// registry's recorded class can disagree with the marker's header class for
+/// any OTHER reason, this filter discards a LIVE collection's roots — the one
+/// direction that turns a diagnostic improvement into a use-after-free. The
+/// counter distinguishes "rare, and each one an aliased address" from
+/// "systematic", which is the difference between a fix and a regression.
+fn owner_filter_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OWNER_FILTER").is_some())
+}
+
+static OWNER_FILTER_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total keys dropped by the owner identity check this process.
+pub fn owner_class_filter_drop_count() -> u64 {
+    OWNER_FILTER_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn owner_key_class_matches(key: usize, actual_class_id: u32, owner_addr: usize) -> bool {
+    let hash = (key >> 32) as u32;
+    let generation = key as u32;
+    let recorded = {
+        let shard = obj_key_shard_for(hash)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match shard.get(&hash) {
+            None => None,
+            Some(slots) => slots
+                .iter()
+                .find(|s| s.generation == generation)
+                .map(|s| (s.class_id, s.last_ptr)),
+        }
+    };
+    match recorded {
+        // Unknown key: absence of evidence is not evidence of a mismatch, and
+        // dropping a root here would be the unsafe direction. Over-retaining
+        // one cycle is the safe one.
+        None => true,
+        Some((recorded_class, last_ptr)) => {
+            if recorded_class == actual_class_id {
+                return true;
+            }
+            // A ZEROED header is not evidence of recycling. It is evidence of
+            // corruption somewhere ELSE, and dropping on it makes that
+            // corruption strictly worse.
+            //
+            // `class_id == 0` is both the all-zero header of an already-freed
+            // block and the legitimate `ClassId(0)` ad-hoc container shape, so
+            // it cannot discriminate. Measured on `DefaultCatalogAndSchemaTest`
+            // with `CRATONVM_DBG_OWNER_FILTER=1`: the drops were dominated by
+            // `recorded_class=64 actual_class=0 same_addr=true` — the owner's
+            // own block had already been freed underneath a live collection.
+            // Dropping its overlay refs there removes the last thing keeping
+            // that collection's CONTENTS marked, turning ONE premature free
+            // into a cascade: 637 and 5784 stale receivers on the two runs that
+            // crashed, against 117 with no filter at all.
+            //
+            // Retaining on an unreadable owner costs one cycle of
+            // over-retention — the same safe direction as the unknown-key arm.
+            if actual_class_id == 0 || recorded_class == 0 {
+                return true;
+            }
+            let n = OWNER_FILTER_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if owner_filter_dbg() && n < 32 {
+                eprintln!(
+                    "[owner-filter] DROP key=0x{key:x} owner=0x{owner_addr:x} \
+                     recorded_class={recorded_class} actual_class={actual_class_id} \
+                     slot_last_ptr=0x{last_ptr:x} same_addr={}",
+                    last_ptr == owner_addr,
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Authoritative lazy store for fresh, exact-class HashMaps with primitive
@@ -1871,7 +2034,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
     // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
     // (same fix pattern as register_blocking_queue_natives above) —
-    // docs/gaps/gap-phaser-real-bytecode-state.md.
+    // gaps/gap-phaser-real-bytecode-state.md.
     #[cfg(feature = "synthetic-jdk")]
     register_phaser_natives(registry);
     register_priority_blocking_queue_natives(registry);
@@ -1885,7 +2048,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // synthetic-jdk only so the self-contained real STPE bytecode runs in
     // real-JDK mode (same fix pattern as register_blocking_queue_natives /
     // register_phaser_natives above). See
-    // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+    // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
     #[cfg(feature = "synthetic-jdk")]
     register_executors_scheduled_natives(registry);
     register_concurrent_completeness_natives(registry);
@@ -3210,7 +3373,7 @@ fn al_ensure_capacity(
     // `stream()`. Every caller of this function hits the exact same hazard on
     // `this` after the call returns (`al_set_size` etc.), so this is `add`/
     // `add(int,Object)`/`addAll`'s shared, hottest allocation site. See
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let old_buf_pin = data.map(|d| ctx.pin_native_root(d)).unwrap_or(usize::MAX);
     let new_buf = alloc_ref_array(ctx, new_cap);
@@ -5208,7 +5371,7 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // live via CRATONVM_DBG_STALE_OBJREF during WildFly
         // parallel-extension-add (same "Family 1" pattern as
         // native_hashmap_get_exact's `map_keys_equal` fix -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
         let d_pin = ctx.pin_native_root(d);
         for i in 0..size {
             let d_cur = ctx.read_native_pin(d_pin, d);
@@ -5719,6 +5882,26 @@ fn enum_set_contains_member(
         }
         _ => None,
     }
+}
+
+/// Pure reference-identity hash, matching `IdentityHashMap`'s documented
+/// contract (`System.identityHashCode`), with the same bit-spread every other
+/// bucket hash in this file applies. Unlike `map_hash_key`, this never
+/// dispatches into Java (`ctx.identity_hash_code` reads the object header),
+/// so it cannot trigger a moving GC — an identity-map lookup/insert needs no
+/// pin around this call.
+#[inline]
+fn map_hash_key_identity(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+    let h = ctx.identity_hash_code(key);
+    h ^ ((h as u32) >> 16) as i32
+}
+
+/// Pure reference-identity equality, matching `IdentityHashMap`'s documented
+/// contract (`==`, not `Object.equals`). Never dispatches into Java, so —
+/// unlike `map_keys_equal` — it cannot trigger a moving GC either.
+#[inline]
+fn map_keys_equal_identity(a: ObjectRef, b: ObjectRef) -> bool {
+    std::ptr::eq(a.as_ptr(), b.as_ptr())
 }
 
 /// Compute hash for a key.
@@ -6937,6 +7120,10 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiFunction;)V",
         native_map_replace_all,
     );
+    // `Map`'s three conditional mutators. `HashMap` overrides all of them with
+    // bucket-walking bodies, so without these the JDK bytecode runs over our
+    // natively-allocated nodes — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(r, c);
     r.set_category(__prev_cat);
 }
 
@@ -7003,7 +7190,7 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // dropping that entry silently empties a live `HashMap<Integer,?>`: `get`
     // returns null, `size()` returns 0, `keySet()` iterates nothing, and no
     // exception is raised anywhere. That is the
-    // `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
+    // `fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
     // failure: Hibernate's `ParameterMetadataImpl.queryParametersByPosition` is
     // exactly this shape (fresh exact-class `HashMap`, boxed-Integer keys, long
     // lived), and losing it reports `No parameter labelled '?1' in query with
@@ -7408,6 +7595,18 @@ fn is_lhm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     receiver_facts(ctx, this).has(CF_LHM)
 }
 
+/// True when `this`'s runtime class is `java/util/IdentityHashMap` or a
+/// subclass. `native_hashmap_get_exact`/`native_map_put_evict_pinned` consult
+/// this to compute the bucket hash/equality via reference identity
+/// (`ctx.identity_hash_code` + pointer equality) instead of the receiver
+/// key's virtual `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+///
+/// PERF: memoized per `ClassId` — see `CF_IDENTITY_MAP`.
+#[inline]
+fn is_identity_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    receiver_facts(ctx, this).has(CF_IDENTITY_MAP)
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -7726,12 +7925,25 @@ fn native_map_put_evict_pinned(
     key_pin: usize,
     value_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: use reference-identity hash/equality
+    // (`CF_IDENTITY_MAP`) instead of virtual `hashCode()`/`equals()` — see
+    // `map_hash_key_identity`. `this` is fresh here (just pinned by the
+    // caller, no GC-triggering call has run yet), so this read is safe.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+
     // Handle null key: hash=0, bucket=0, key field stores null
     // hashCode() can collect before this helper reaches its first field access;
     // refresh the caller's already-pinned key before dispatching it.
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
@@ -7852,7 +8064,13 @@ fn native_map_put_evict_pinned(
             // stored key: `key.equals(k)`, not `k.equals(key)`. The direction
             // is observable for asymmetric equality implementations and was
             // load-bearing for ANTLR DFA-state canonicalization.
-            let eq = map_keys_equal(ctx, key_for_eq, node_key)?;
+            //
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_for_eq, node_key)
+            } else {
+                map_keys_equal(ctx, key_for_eq, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -7903,7 +8121,7 @@ fn native_map_put_evict_pinned(
     // stays valid for this whole function's lifetime, so re-read through
     // it here -- before it is used to seed the new `this_pin` below -- to
     // guarantee `this` is current regardless of how many GCs the walk
-    // triggered. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // triggered. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     this = ctx.read_native_pin(put_pin_base, this);
 
     // Key not found — append at the TAIL of the chain. This matches HotSpot
@@ -8059,13 +8277,20 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Value::Object(Some(key)) = key_val {
-        if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+    // `IdentityHashMap` receiver: the string/int fast paths below key by
+    // content (all equal-content Strings collapse to one entry, ignoring
+    // `==`), which is wrong for an identity map. Skip straight to the
+    // general path, which honours `CF_IDENTITY_MAP` below.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+    if !identity_mode {
+        if let Value::Object(Some(key)) = key_val {
+            if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+                return result;
+            }
+        }
+        if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
             return result;
         }
-    }
-    if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
-        return result;
     }
     let this = materialize_hm_int_fast(ctx, this)?;
 
@@ -8083,12 +8308,19 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // same plain-HashMap bucket code) via
     // native_chm_compute_if_present -> native_map_compute_if_present ->
     // native_map_get -> native_hashmap_get_exact. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8165,7 +8397,12 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -8376,8 +8613,19 @@ fn native_map_remove_pinned(
     remove_pin_base: usize,
     key_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`. `this` is fresh here
+    // (just re-read from its pin by the caller).
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let (hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -8415,6 +8663,7 @@ fn native_map_remove_pinned(
         search_hash: i32,
         key_pin: usize,
         key_fallback: Value,
+        identity_mode: bool,
     ) -> Result<bool, MethodCallFailed> {
         // The node and requested key can both be relocated while this native
         // call is running on a Tomcat worker. Reload the node *before* reading
@@ -8434,6 +8683,11 @@ fn native_map_remove_pinned(
         let Value::Object(Some(k)) = read_pinned_elem(ctx, key_pin, key_fallback) else {
             return Ok(false);
         };
+        // `IdentityHashMap` receiver: reference identity, not `equals()` — and
+        // no Java dispatch means no GC risk, so skip the pin dance below.
+        if identity_mode {
+            return Ok(map_keys_equal_identity(k, nk));
+        }
         // The freshly loaded node key has no caller-owned pin. Retain it
         // together with the already-rooted requested key for every
         // fast-wrapper probe and the eventual Java equals dispatch.
@@ -8453,11 +8707,11 @@ fn native_map_remove_pinned(
         // leaves the plain Rust-local `head`/`buckets` dangling -- observed
         // as `get_field`/`set_field` OOB drops on a genuine, unrelated,
         // freshly-allocated `java/lang/Object` now sitting at the stale
-        // address (docs/known-issues/tomcat-08-07/
-        // dohead-post-fix-sporadic-residuals.md's header-count residual).
+        // address (fixed-suite-bugs/tomcat/
+        // dohead-post-fix-sporadic-residuals-FIXED.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
         let head_matches =
-            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val)?;
+            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -8514,7 +8768,7 @@ fn native_map_remove_pinned(
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
             let curr_matches =
-                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val)?;
+                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val, identity_mode)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
@@ -8537,6 +8791,242 @@ fn native_map_remove_pinned(
     }
 
     Ok(Some(Value::Object(None)))
+}
+
+// ---------------------------------------------------------------------------
+// `Map`'s three conditional mutators: remove(k,v) / replace(k,v) / replace(k,o,n)
+// ---------------------------------------------------------------------------
+//
+// `native_map_init`'s header states the premise this whole layer rests on:
+// "every observable Map method is registered as a native, so JDK bytecode for
+// `HashMap.<method>` does not run". These three were the exception. They are
+// `java.util.Map` *default* methods that `HashMap` and `Hashtable` override
+// with implementations that walk the bucket array directly, so every call ran
+// REAL JDK bytecode over a table whose nodes this native layer allocates —
+// while `ConcurrentHashMap` had all three registered (see the
+// "ConcurrentHashMap-specific methods" block in `register_chm_natives`; they
+// are not CHM-specific at all).
+//
+// On a `LinkedHashMap` that bytecode path is
+// `HashMap.remove(k,v)` -> `HashMap.removeNode` -> `LinkedHashMap.afterNodeRemoval`,
+// whose first statement is `(LinkedHashMap.Entry<K,V>) e`. Our nodes were
+// `java/util/LinkedHashMap$Node` (see `lhm_alloc_node`, which now mints the
+// real `LinkedHashMap$Entry`), so it threw
+// `ClassCastException: java.util.LinkedHashMap$Node cannot be cast to
+// java.util.LinkedHashMap$Entry`. Kafka's
+// `MetadataLoader.removeAndClosePublisher` calls exactly
+// `publishers.remove(name, publisher)` on a `LinkedHashMap` field, which failed
+// embedded-broker shutdown ("Failed to shut down embedded Kafka cluster") in
+// Spring Boot's `KafkaAutoConfigurationIntegrationTests`.
+//
+// The cast is only the loudest symptom. Even where no cast is involved (a plain
+// `HashMap`), the JDK bytecode mutates the real bucket array and `size` field
+// behind the native bookkeeping — `map_state`'s size, the LHM overlay's
+// `size`/`head`/`tail`, the integer fast-path overlay — desyncing the map.
+//
+// Each is implemented exactly as `java.util.Map`'s default: in terms of
+// `get` / `containsKey` / `put` / `remove`, which are registered and which do
+// the receiver routing (LinkedHashMap / TreeMap / ConcurrentHashMap /
+// Hashtable) themselves.
+
+/// `Hashtable` (and `Properties`) reject a null value in all three of these
+/// methods (`Objects.requireNonNull(value)` is the first statement of each);
+/// `HashMap`/`LinkedHashMap` accept null values throughout. One helper so the
+/// three natives below stay a faithful mirror of whichever override the
+/// receiver actually has.
+fn map_kv_reject_null_for_hashtable(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    value: &Value,
+    method: &str,
+) -> Result<(), MethodCallFailed> {
+    if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!("Hashtable.{method}: null value")),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `Map.remove(Object key, Object value)` — remove only if currently mapped to
+/// `value`. Mirrors the JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, value) || (cur == null && !containsKey(key))) return false;
+/// remove(key);
+/// return true;
+/// ```
+fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
+    // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
+    // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
+    // GC — so every receiver/key/value local is re-read from its pin after each
+    // call, the same discipline `native_chm_remove_kv` follows.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let expected_pin = pin_value(ctx, expected);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let expected = read_pinned_elem(ctx, expected_pin, expected);
+        if !values_equal_deep(ctx, &current, &expected)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        // `get` cannot distinguish "absent" from "mapped to null"; only the
+        // null case needs the extra probe.
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V value)` — replace only if the key is currently mapped,
+/// returning the previous value (or `null` when absent). Mirrors the JDK
+/// default: `if (get(key) != null || containsKey(key)) cur = put(key, value);`
+fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        let old = native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?
+            .unwrap_or(Value::Object(None));
+        Ok(Some(old))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V oldValue, V newValue)` — compare-and-set. Mirrors the
+/// JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, oldValue) || (cur == null && !containsKey(key))) return false;
+/// put(key, newValue);
+/// return true;
+/// ```
+fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let old_pin = pin_value(ctx, old_val);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let old_val = read_pinned_elem(ctx, old_pin, old_val);
+        if !values_equal_deep(ctx, &current, &old_val)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// Register `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)` on one
+/// map class. Called for every map family whose JDK class overrides them with
+/// a bucket-walking body (`HashMap`, `LinkedHashMap`, `Hashtable`);
+/// `ConcurrentHashMap` has its own segment-locked versions and `TreeMap` does
+/// not override them at all (its inherited `Map` defaults call the registered
+/// `get`/`containsKey`/`put`/`remove` natives, which is already correct).
+fn register_map_conditional_mutators(r: &mut NativeMethodRegistry, c: &str) {
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_remove_kv,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_replace,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_replace_kv,
+    );
 }
 
 fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8589,6 +9079,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
     // which can trigger a moving GC. Pin `this` and the search key up front
     // and re-read them (plus the bucket-chain `node`) after every such call.
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     this = materialize_hm_int_fast(ctx, this)?;
@@ -8597,7 +9090,14 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     let key_for_hash = key_val;
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8665,7 +9165,11 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -15486,7 +15990,7 @@ fn stream_make_lazy_derived(
     // exactly the "cursor" Iterator bug (`next()` returns `this`; real
     // per-element consumption happens inside the mapper/filter/etc that was
     // about to be appended to the chain) documented in
-    // docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     // The actual drive now happens inline, one element at a time through the
     // FULL chain, the first time a terminal genuinely needs concrete
     // elements (`stream_pull_internal` / `stream_pull_synthetic_downstream`).
@@ -15810,7 +16314,7 @@ fn stream_pull_internal(
         // through `chain`, one `tryAdvance` at a time -- NOT via
         // `stream_source_elems` (which would fully drain the raw source with
         // a dumb append-only collector BEFORE any op in `chain` ever runs).
-        // See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+        // See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
         if let Some(spl) = stream_lazy_spliterator(ctx, stream) {
             let mut emit_stopped = false;
             {
@@ -16138,7 +16642,7 @@ where
 // state change during that disconnected raw drain, so it never returns
 // `false`, and the drain runs until `drain_spliterator_to_array`'s
 // 1,000,000-iteration safety cap. See
-// docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+// fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
 //
 // `drain_spliterator_inline` below fixes this by driving `tryAdvance` itself
 // and running EACH element through the chain from inside the reentrant
@@ -16702,7 +17206,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // `cratonvm/internal/StreamChainCollector` consumer used by
     // `drain_spliterator_inline` to drive a lazy spliterator's elements
     // straight through their downstream op-chain, one `tryAdvance` at a
-    // time. See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // time. See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     r.register(
         STREAM_CHAIN_COLLECTOR_CLASS,
         "accept",
@@ -17589,7 +18093,7 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // resync and can move `this` again via its own allocations. Confirmed
     // live via CRATONVM_DBG_STALE_OBJREF under concurrent stream map/flatMap
     // stress at -Xmx32m; see
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let this = ctx.read_native_pin(this_pin, this);
     let this = resync_values_view(ctx, this);
@@ -17713,7 +18217,7 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// incorrectly-forwarded native root slipped through a moving-GC window — the
 /// exact failure shape suspected (never confirmed) behind the intermittent
 /// `ConfigurationTest::testDatabaseProperties` `ClassCastException`, see
-/// docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md
+/// fixed-suite-bugs/keycloak/keycloak-quarkus-runtime-config-resolution-mismatches.md
 /// ("Residual" section). That race stopped reproducing before this canary could
 /// be validated against it; kept as a near-zero-overhead tripwire (one class-id
 /// comparison per element; no allocation/formatting unless it actually fires,
@@ -18348,7 +18852,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // `spl`/`consumer` and re-read it before that final use. Confirmed
             // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
             // ServiceLoader stream draining -- see
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let this_pin = ctx.pin_native_root(this);
             let spl_pin = ctx.pin_native_root(spl);
             const SAFETY_CAP: usize = 1_000_000;
@@ -19549,7 +20053,7 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // not consulted yet. Validation does happen, but one call later and only
     // partially: the SAM natives (`native_collfn_supplier_get` and friends)
     // check `collector_tag_of` and degrade to an empty list/map rather than
-    // failing. See `docs/known-issues/c2/collections-interception.md`, Residual 1.
+    // failing. See `docs/feature-designs/collections-interception.md`, Residual 1.
     // Left as-is deliberately: there is no way for a native to decline a call
     // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
     // options are to throw — which would break any legitimate default-method
@@ -25959,7 +26463,7 @@ pub fn comparator_compare(
                     // (the second element, computed AFTER that hazard) must
                     // be re-read — `a`/`b` are raw `ObjectRef`-carrying
                     // `Value`s just like `comparator`. See
-                    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
                     let comparator_pin = ctx.pin_native_root(comparator);
                     let b_pin = pin_value(ctx, b);
                     let ia = comparing_key_as_i64(
@@ -26079,7 +26583,7 @@ pub fn comparator_compare(
             // (the key extractor) and trigger a moving GC; `key_fn` AND
             // `b` (the second element, used AFTER that hazard) are both
             // raw `ObjectRef`-carrying `Value`s that must be re-read. See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let key_fn_pin = ctx.pin_native_root(key_fn);
             let b_pin = pin_value(ctx, b);
             let ka = ctx
@@ -26093,8 +26597,8 @@ pub fn comparator_compare(
             let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
             let b = read_pinned_elem(ctx, b_pin, b);
             // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
-            // docs/known-issues/wildfly-remoting-classcastexception-
-            // parallel-extension-add.md): `ka` -- the FIRST extracted key --
+            // fixed-suite-bugs/wildfly/
+            // wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md): `ka` -- the FIRST extracted key --
             // was read raw here and reused below at `natural_compare(ctx,
             // &ka, &kb)`, but the very next line's `invoke_virtual` (computing
             // `kb`) is exactly as GC-capable as the first one that produced
@@ -26150,7 +26654,7 @@ pub fn comparator_compare(
             // fix (class_id 1295/1299 traces via `Comparator.lambda$
             // thenComparing$...` and `ResourceAttributesXMLContentReader
             // .<init>`). See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let comparator_pin = ctx.pin_native_root(comparator);
             let a_pin = pin_value(ctx, a);
             let b_pin = pin_value(ctx, b);
@@ -26233,7 +26737,7 @@ fn compare_with_key_function(
     // `apply` call can run arbitrary interpreted bytecode and trigger a
     // moving GC; `key_fn` AND `b` (used after that hazard) both need
     // re-reading. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let key_fn_pin = ctx.pin_native_root(key_fn);
     let b_pin = pin_value(ctx, b);
     let ka = ctx
@@ -26735,7 +27239,7 @@ fn native_comparator_then_comparing_double(
 // size, len, emptyValue) — writing through the legacy indices above then
 // silently lands on the wrong real fields (wrong type too: `elts` is a
 // String[], not an ArrayList). See
-// docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md.
+// fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md.
 // `sj_real_layout` resolves the real class's actual field indices by name
 // when present; every entry point below branches on it. This is
 // intentionally still a full from-scratch Rust reimplementation of
@@ -29368,8 +29872,8 @@ fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ===========================================================================
 // LinkedHashMap = 5-field synthetic:
 //   0: buckets (Object[]), 1: size (Int), 2: capacity (Int), 3: head (Node), 4: tail (Node)
-// LinkedHashMap$Node = 6-field synthetic:
-//   0: key, 1: value, 2: hash, 3: next (bucket chain), 4: before, 5: after (insertion order)
+// LinkedHashMap$Entry = the REAL 6-field JDK node (see `LHM_NODE_*` below):
+//   0: hash, 1: key, 2: value, 3: next (bucket chain), 4: before, 5: after (insertion order)
 
 const LHM_FIELD_BUCKETS: usize = 0;
 const LHM_FIELD_SIZE: usize = 1;
@@ -29579,13 +30083,16 @@ fn lhm_ptr_cache() -> &'static Mutex<StdHashMap<usize, usize>> {
     C.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-// Real JDK LinkedHashMap$Node layout (extends HashMap$Node{hash,key,value,next}
+// Real JDK LinkedHashMap$Entry layout (extends HashMap$Node{hash,key,value,next}
 // and adds before,after): hash@0, key@1, value@2, next@3, before@4, after@5.
+// Verified with `javap -p --module java.base java.util.LinkedHashMap$Entry` on
+// the JDK 25 the suites run, and `compute_field_layout` lays superclass fields
+// out first, in declaration order — so these indices are the real ones.
 // Using the real slot order (not the historical synthetic key@0/value@1/hash@2)
 // is required so inherited real-JDK `HashMap.writeObject`→`internalWriteEntries`
 // (Java serialization; NOT force-native) reads the right slots — the old order
 // serialized `{k=v}` as `{v=null}`, desyncing peers. Nodes bind to the real
-// LinkedHashMap$Node class, and slot 0 = hash:I now holds an Int, so the
+// LinkedHashMap$Entry class, and slot 0 = hash:I now holds an Int, so the
 // descriptor-aware field writes/reads coincide with each slot's declared type.
 const LHM_NODE_HASH: usize = 0;
 const LHM_NODE_KEY: usize = 1;
@@ -29624,7 +30131,16 @@ fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i
     // Pin+re-read them across the allocation.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Node", LHM_NODE_NUM_FIELDS);
+    // The real JDK's nested node type, NOT the `java/util/LinkedHashMap$Node`
+    // this used to mint. That name does not exist in the JDK, so every piece of
+    // real-JDK bytecode that reached one of our nodes either threw
+    // (`afterNodeRemoval`'s `(LinkedHashMap.Entry) e`, the
+    // `kafka-embedded-kraft-...-FIXED` defect 1) or found no method at all
+    // (`getKey()`/`getValue()`/`setValue()` are declared on the real
+    // `HashMap$Node` and inherited, so on the fake class they were a
+    // `NoSuchMethodError`). The slot layout below was already the real one, so
+    // this is a change of class IDENTITY only — see `LHM_NODE_*`.
+    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Entry", LHM_NODE_NUM_FIELDS);
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -29935,6 +30451,11 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
         native_lhm_compute_if_absent,
     );
+    // `LinkedHashMap` inherits `HashMap`'s bucket-walking overrides of the
+    // three conditional mutators, and `HashMap.removeNode` calls
+    // `LinkedHashMap.afterNodeRemoval`, which casts the node to
+    // `LinkedHashMap$Entry` — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(registry, c);
     registry.set_category(__prev_cat);
 }
 
@@ -30025,7 +30546,7 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // that follows, unpinned otherwise. Confirmed live via
     // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add (same
     // "Family 1" pattern as native_hashmap_get_exact's fix -- see
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
     let this_pin = ctx.pin_native_root(this);
     // Cap the eager bucket-table allocation to what the heap can hold (see
     // `alloc_bucket_table`); `cap` is rebound to the actual table length so
@@ -30242,6 +30763,33 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // A LinkedHashMap value is a REFERENCE: the node's value slot is
+    // `V value` -> `Ljava/lang/Object;` on the real `java/util/HashMap$Node`
+    // that `LinkedHashMap$Entry` extends. Now that `lhm_alloc_node` binds to
+    // that real class, the descriptor-aware `set_field` path coerces a
+    // primitive `Value` in that slot to NULL.
+    //
+    // Our own set layer writes a raw `Value::Int(1)` PRESENT sentinel there
+    // (`native_hs_add`), and `native_hs_add` / `native_hs_remove` decide "was
+    // it already in the set" purely from whether the previous value was null.
+    // Coerced to null, `LinkedHashSet.remove(x)` DELETED the element and still
+    // reported `false` — which broke Jersey's
+    // `Resource.Builder.onBuildMethod`, whose
+    // `checkState(methodBuilders.remove(builder))` then threw
+    // `IllegalStateException` and failed every test that starts the Jersey
+    // filter. `CopyOnWriteArraySet` shares the same backing and broke with it.
+    //
+    // Box it on the way in. A real Java caller can never arrive here with a
+    // primitive — `Map.put`'s descriptor is `(Object,Object)Object`, so the
+    // interpreter has already boxed — so this only ever fires for our own
+    // internal sentinels, and `Integer.valueOf(1)` hands back the JDK's cached
+    // instance rather than allocating. Boxing here, before the pins below, is
+    // deliberate: `box_primitive_result` dispatches `valueOf`, which can GC.
+    let value = match value {
+        Value::Object(_) => value,
+        primitive => box_primitive_result(ctx, primitive),
+    };
+
     // GC-SAFETY: `this` is a bare Rust local read from `args`, not itself a
     // GC root -- only a `pin_native_root`/`read_native_pin` handle survives a
     // moving GC. `map_hash_key` (key.hashCode()), `lhm_resize` (allocates a
@@ -30367,38 +30915,38 @@ fn native_lhm_put_evict(
     }
     if evict && invoke_remove_eldest {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
-            // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
-            // with no real `getKey()`/`getValue()`; an override that inspects
-            // the eldest (e.g. Hibernate's `LRU.removeEldestEntry` calls
-            // `eldest.getKey()`) would hit a NoSuchMethodError. Wrap the head's
-            // key/value in a real `SimpleImmutableEntry` (which has working
-            // `getKey`/`getValue` natives) for the hook call.
+            // Hand the override the REAL head node, exactly as HotSpot's
+            // `LinkedHashMap.afterNodeInsertion` does
+            // (`removeEldestEntry(first)` where `first = head`).
+            //
+            // This used to wrap the head's key/value in a fresh
+            // `AbstractMap$SimpleImmutableEntry`, because the node was a fake
+            // `java/util/LinkedHashMap$Node` whose class declares no methods —
+            // so an override that inspects the eldest (Hibernate's
+            // `LRU.removeEldestEntry` calls `eldest.getKey()`) hit a
+            // `NoSuchMethodError`. `lhm_alloc_node` now mints the real
+            // `java/util/LinkedHashMap$Entry`, which inherits the real
+            // `HashMap$Node.getKey/getValue/setValue/equals/hashCode/toString`
+            // bodies and reads them off the very slots we write, so the copy is
+            // no longer needed — and the copy was itself a deviation: it was
+            // immutable (`setValue` threw `UnsupportedOperationException` where
+            // HotSpot mutates the map) and never `==` the live entry.
+            let head_pin = ctx.pin_native_root(head);
+            // Family-1 fix (cce0079): the key is re-used for the reentrant
+            // remove below, across the hook's virtual dispatch (GC-capable) —
+            // pin it so the remove receives the current address, not a pre-GC
+            // one. Read it BEFORE the dispatch: an override that removes the
+            // eldest reentrantly may leave the node unlinked by the time we
+            // get back.
             let key = ctx.get_field(head, LHM_NODE_KEY);
-            let val = ctx.get_field(head, LHM_NODE_VALUE);
-            // Family-1 fix (cce0079): `key` is re-used for the reentrant
-            // remove below, across BOTH the entry alloc and the hook's
-            // virtual dispatch (each GC-capable) — pin it so the remove
-            // receives the current address, not a pre-GC one.
             let eldest_key_pin = pin_value(ctx, key);
-            let eldest = match ctx.new_object_initialized(
-                "java/util/AbstractMap$SimpleImmutableEntry",
-                "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                &[key, val],
-            )? {
-                Some(Value::Object(Some(e))) => e,
-                _ => {
-                    ctx.unpin_native_roots(this_pin);
-                    return Ok(Some(Value::Object(None)));
-                }
-            };
-            // `new_object_initialized` above allocates and can trigger a
-            // moving GC; refresh `this` before the virtual dispatch below.
             let this = ctx.read_native_pin(this_pin, this);
+            let head = ctx.read_native_pin(head_pin, head);
             let verdict = ctx.invoke_virtual(
                 this,
                 "removeEldestEntry",
                 "(Ljava/util/Map$Entry;)Z",
-                &[Value::Object(Some(eldest))],
+                &[Value::Object(Some(head))],
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
                 // `invoke_virtual` above runs arbitrary Java and can trigger
@@ -34922,12 +35470,38 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
 /// it only after the collection object itself has been found reachable through
 /// ordinary Java roots/fields. The returned copy deliberately releases every
 /// side-table lock before the collector recursively marks the values.
-pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
+/// `owner_class_id` is the class id of the object CURRENTLY at `owner_addr`.
+/// The owner index is keyed by address, and an address is recycled the moment
+/// its previous tenant is reclaimed — so without this check the marker is
+/// handed the DEAD collection's references on behalf of whatever unrelated
+/// object now sits there. `widened_obj_key` already applies exactly this
+/// discriminator on the mutator side (its case 2b re-keys and clears a
+/// different-class recycle), but that only runs when the recycled address is
+/// used as a COLLECTION again; an ordinary object landing there is never
+/// observed, so the stale entry survives indefinitely. `None` skips the check.
+pub fn gc_overlay_roots_for_collection(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+) -> Vec<ObjectRef> {
     let keys = {
         let index = overlay_owner_keys()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         index.get(&owner_addr).cloned().unwrap_or_default()
+    };
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    // Drop any key whose registry slot records a DIFFERENT class than the
+    // object now at this address. A class id is GC-invariant (it travels with
+    // the header), so a mismatch means the registering collection is gone and
+    // this entry belongs to a previous tenant.
+    let keys: Vec<usize> = match owner_class_id {
+        Some(actual) if owner_class_filter_enabled() => keys
+            .into_iter()
+            .filter(|key| owner_key_class_matches(*key, actual, owner_addr))
+            .collect(),
+        _ => keys,
     };
     if keys.is_empty() {
         return Vec::new();
@@ -35037,7 +35611,13 @@ pub fn gc_overlay_roots_for_matching_owners(
     };
     let mut roots = Vec::new();
     for owner in owners {
-        roots.extend(gc_overlay_roots_for_collection(owner));
+        // `None`: this seed is address-based by construction — the predicate
+        // selects owners by generation/range, and no class id is available for
+        // them. It is already a deliberate over-approximation ("retain the
+        // edges of every current owner"), so skipping the recycled-owner check
+        // here only over-retains, which is this path's existing contract. The
+        // precise per-owner rule runs in the BFS, which does pass a class id.
+        roots.extend(gc_overlay_roots_for_collection(owner, None));
     }
     roots
 }
@@ -35532,7 +36112,7 @@ fn tree_compare(
 /// must be re-read after every comparator invocation, not just once at
 /// entry — hence pinning both here and returning their current values
 /// alongside the search result, so callers never reuse a pre-search copy.
-/// See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+/// See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
 fn tm_binary_search(
     ctx: &mut dyn NativeContext,
     owner: ObjectRef,
@@ -35569,7 +36149,7 @@ fn tm_binary_search(
     // array on a miss). This — plus the sibling `a`/`b` reuse inside
     // `comparator_compare`'s own dispatch arms — was the actual root cause
     // of the residual panics that survived the owner/data/comparator-only
-    // fix. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fix. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let mut key = *key;
     let key_pin = pin_value(ctx, key);
     let mut low: usize = 0;
@@ -36958,7 +37538,7 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
 /// `ClassCastException: class java.lang.Object cannot be cast to class
 /// java.lang.Comparable` (the stale key decoded as whatever now occupies the
 /// address); see the sibling
-/// `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
 /// for the same defect in `PriorityBlockingQueue`.
 ///
 /// Pin the whole snapshot once, then read each element back through its pin
@@ -38549,7 +39129,7 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: `tree_compare`/`native_ts_add` can
         // run a user Comparator/lambda and trigger a moving GC. See
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
         let data_pin = ctx.pin_native_root(data);
         let result_pin = ctx.pin_native_root(result);
         let mut data = data;
@@ -38897,7 +39477,7 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // local reused across every iteration, and `elems` (collected up front)
     // sat entirely unpinned in a Rust `Vec` across the whole loop — pin both
     // before the loop starts and refresh on every iteration. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let (_, elem_pins) = pin_value_slice(ctx, &elems);
     let mut changed = false;
@@ -42645,6 +43225,13 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.register(ht, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
     registry.register(ht, "toString", "()Ljava/lang/String;", native_map_to_string);
     registry.register(ht, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+    // `Hashtable` (and `Properties`, which overrides them again) declare their
+    // own bucket-walking `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)`.
+    // Same gap, same fix — see `register_map_conditional_mutators`. The null
+    // rejection those overrides open with is honoured by
+    // `map_kv_reject_null_for_hashtable`.
+    register_map_conditional_mutators(registry, ht);
+    register_map_conditional_mutators(registry, p);
     // Note: `keys()` / `elements()` are registered by
     // `cratonvm-native-builtins::deprecated_io_util::register_*_natives`,
     // which runs AFTER us in `vm_init`'s real-JDK arm. The force-native
@@ -44230,7 +44817,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     // shared loop above so each yielded `Map.Entry` is wrapped in
     // `UnmodifiableMapEntry` (setValue() must throw, not silently mutate the
     // backing map through the "locked" view — see
-    // docs/known-issues/tomcat-08-07/parametermap-immutability-not-locked.md).
+    // fixed-suite-bugs/tomcat/parametermap-immutability-not-locked-FIXED.md).
     {
         let c = UNMOD_ENTRY_SET_CLASS;
         r.register(
@@ -51268,6 +51855,86 @@ mod tests {
 
     // Fix item 1: a recycled identity hash on a different class must not inherit
     // a dead object's slot — `pack_obj_key`/`ObjKeyEntry` carry a class marker.
+    /// Defect 5: the MARKER's owner→overlay edge is unvalidated where the
+    /// MUTATOR's is validated.
+    ///
+    /// `widened_obj_key` guards address recycling with a GC-invariant
+    /// `class_id` comparison (its case 2b re-keys and clears the dead
+    /// collection's overlay when a different class lands on a recycled
+    /// identity hash). But that runs only when the recycled address is used as
+    /// an overlay-backed COLLECTION again. When an ordinary object lands there
+    /// instead, nothing ever clears the entry, and
+    /// `gc_overlay_roots_for_collection` — a bare address lookup with no
+    /// identity check at all — hands the old-gen marker the DEAD collection's
+    /// references on behalf of the unrelated live object now at that address.
+    ///
+    /// Observed in the wild as eight
+    /// `old-gen mark: rejecting external-overlay(BFS owner) candidate … not a
+    /// plausible object base` warnings whose first words decode to ASCII string
+    /// payload (`0x766f206b63617473` = "stack ov"), a raw heap pointer, and an
+    /// interior address — i.e. the marker being handed non-headers for a live,
+    /// already-marked owner.
+    #[test]
+    fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
+        use super::{
+            obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry,
+        };
+        // Tests the PREDICATE directly, not `gc_overlay_roots_for_collection`,
+        // so it documents the defect regardless of whether enforcement is
+        // enabled — which it is NOT by default; see
+        // `owner_class_filter_enabled` for the measurements that disabled it.
+
+        // A never-dereferenced, 8-aligned fake address for the dead collection.
+        const DEAD_HASH: u32 = 0x5EED_BEEF;
+        const LINKED_LIST_CLASS: u32 = 4242;
+        const UNRELATED_CLASS: u32 = 7777;
+        let recycled_addr = 0x5EED_0000usize;
+        let dead_key = pack_obj_key(DEAD_HASH, 0);
+
+        // The registry slot `widened_obj_key` would have created for a live
+        // LinkedList at `recycled_addr`.
+        obj_key_shard_for(DEAD_HASH)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(DEAD_HASH)
+            .or_default()
+            .push(ObjKeyEntry {
+                last_ptr: recycled_addr,
+                generation: 0,
+                class_id: LINKED_LIST_CLASS,
+                vm: 0,
+            });
+
+        // While the collection is alive its own class matches, so its roots
+        // are kept. (A predicate that answered `false` here would drop a live
+        // collection's references — the failure mode that keeps enforcement
+        // switched off by default.)
+        assert!(
+            owner_key_class_matches(dead_key, LINKED_LIST_CLASS, recycled_addr),
+            "a LIVE collection's own overlay keys must be kept"
+        );
+
+        // It dies, and its block is REALLOCATED to an ordinary object of a
+        // different class that never touches an overlay — so `widened_obj_key`
+        // (and therefore case 2b's cleanup) never runs and nothing in the
+        // system observes the handover. The recorded class still names the
+        // dead collection, so the mismatch is detectable.
+        assert!(
+            !owner_key_class_matches(dead_key, UNRELATED_CLASS, recycled_addr),
+            "a recycled address must not inherit the DEAD collection's overlay              keys: the marker has no identity check of its own, while
+             `widened_obj_key` applies exactly this one"
+        );
+
+        // A ZEROED owner header is ambiguous — an already-freed block and the
+        // legitimate `ClassId(0)` container share it — so it must NOT license a
+        // drop. Enforcing there cascades one premature free into every element
+        // the collection holds.
+        assert!(
+            owner_key_class_matches(dead_key, 0, recycled_addr),
+            "class_id 0 is not evidence of recycling and must retain"
+        );
+    }
+
     #[test]
     fn pack_obj_key_roundtrip() {
         use super::pack_obj_key;

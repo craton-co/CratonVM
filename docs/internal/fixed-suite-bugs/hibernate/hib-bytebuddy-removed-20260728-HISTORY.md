@@ -114,5 +114,5 @@ REMOVED. The 2026-06-13 hang does not reproduce on current `dev`.
 
 See also: `vm/src/jit/skip_list.rs`'s (now-removed) `HIB-BYTEBUDDY`
 comment, `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md`,
-and `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md`
+and `docs/known-issues/h2/h2-jitban-longtail1-SUPERSEDED-20260728-ab-record.md`
 (the same-day re-verification methodology applied to `org/h2/`).

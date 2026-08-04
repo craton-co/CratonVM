@@ -24,7 +24,7 @@
 //! `Class.isDirectSubType`: `c.getInterfaces(false)` is an invokespecial, the
 //! callee frame was pushed with `this == null`, and `Class.reflectionData()`'s
 //! registered native answers a null receiver with a null RETURN. See
-//! `docs/internal/fixed-suite-bugs/springboot/`
+//! `fixed-suite-bugs/springboot/`
 //! `sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`.
 //!
 //! The probe deliberately checks the WARM answers — a cold-only test passed
@@ -150,6 +150,26 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
             return None;
         }
     };
+    // javac REJECTED THE ARGUMENTS, not the source: an unsupported `--release`
+    // means this javac is older than the level this probe compiles at, so it never
+    // opened the file. That is a missing-toolchain condition — the same one the
+    // `Err(e)` arm above skips for — not a broken probe. Reporting it as "fix the
+    // source" sends the next reader to edit a correct `.java` file.
+    //
+    // Narrowly keyed on javac's own wording for an unsupported release, so a
+    // genuine source error still reaches the assertion below and still fails loudly
+    // (see `probe_compile_guard.rs` for why that must never become a skip).
+    if !out.status.success() {
+        let stderr_probe = String::from_utf8_lossy(&out.stderr);
+        if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+            eprintln!(
+                "[null_receiver_cached_invoke] javac cannot target --release 21 ({}); skipping. Point \
+                 JAVA_HOME or CRATONVM_JAVA_HOME at a JDK 21+ install.",
+                stderr_probe.lines().next().unwrap_or("").trim()
+            );
+            return None;
+        }
+    }
     assert!(
         out.status.success() && class_file.exists(),
         "[null_receiver_cached] the embedded probe failed to compile — fix PROBE_SRC. \

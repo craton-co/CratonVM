@@ -1098,6 +1098,34 @@ pub(crate) fn mirror_class_id(
     }
     if let Value::Int(v) = ctx.get_field(mirror, 0) {
         if v >= 0 {
+            // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the
+            // slot-0 write in `vm/src/vm/vm_object.rs`. That write is an
+            // *overlay*: a VM-internal `Int` deliberately stored on top of
+            // `java.lang.Class`'s instance field 0, which JDK 25 declares as
+            // `Constructor<T> cachedConstructor` — a **reference** slot.
+            //
+            // The marker's question is not "is this the right slot" but "does
+            // anything still depend on it", and this line is the only reader of
+            // the overlay outside the VM — a fallback behind the reverse map.
+            // If a real-JDK run never reaches here, the wave-2 fix is to delete
+            // the overlay outright rather than relocate it, which is strictly
+            // better than either. Nothing in the tree could answer that, so:
+            // say it, once, under the flag the marker already nominates.
+            //
+            // Free when the flag is unset, and this is already the slow half of
+            // a two-step lookup when it is.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[cratonvm][overlay] class-mirror slot-0 fallback HIT (ClassId {v}): \
+                         `class_id_from_mirror` missed and this read the Int overlay at \
+                         field 0. The overlay in `vm_object.rs` is load-bearing on this \
+                         workload — it cannot simply be deleted."
+                    );
+                }
+            }
             return Some(cratonvm_types::ClassId::new(v as u32));
         }
     }
@@ -2178,8 +2206,8 @@ pub(crate) fn native_class_for_name(
                     }
                 }
                 // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
-                // docs/known-issues/wildfly-remoting-classcastexception-
-                // parallel-extension-add.md): `mirror` -- the `Class` object
+                // fixed-suite-bugs/wildfly/
+                // wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md): `mirror` -- the `Class` object
                 // `invoke_virtual` just handed back from recursively
                 // interpreting `loadClass`'s real bytecode -- is a bare Rust
                 // local at this point, not yet on any interpreter operand
@@ -3149,17 +3177,34 @@ pub(crate) fn native_class_is_primitive(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // WP4.2: real-JDK Class layout stores `primitive:boolean` at instance
-    // slot 7 вЂ” `get_or_create_primitive_mirror` writes Int(1) there for
-    // primitive mirrors. Prefer that over the name-based check, because
-    // the name slot can be observed as a stale Int after early-boot
-    // descriptor-aware coercion runs (the legacy Int(-1) sentinel that
-    // `prim_mirror_create` writes into slot 0 leaks into slot 1 read-back
-    // under some boot orderings, leaving `mirror_class_name` returning
-    // None and primitive `Class.getName()` returning null).
-    if let Value::Int(flag) = ctx.get_field(this, 7) {
-        if flag != 0 {
-            return Ok(Some(Value::Int(1)));
+    // WP4.2, hardened: real-JDK Class layout stores `primitive:boolean` at
+    // some fixed instance slot that `get_or_create_primitive_mirror` writes
+    // Int(1) into for primitive mirrors — prefer that flag over the
+    // name-based check below, because the name slot can be observed as a
+    // stale Int after early-boot descriptor-aware coercion runs (the legacy
+    // Int(-1) sentinel that `prim_mirror_create` writes into slot 0 leaks
+    // into slot 1 read-back under some boot orderings, leaving
+    // `mirror_class_name` returning None and primitive `Class.getName()`
+    // returning null).
+    //
+    // The slot used to be hard-coded as `7`, on the unchecked assumption
+    // that that's where THIS JDK build's compiled `java/lang/Class` happens
+    // to place the `primitive` field — the exact "answering true for a
+    // class that is not primitive" hazard flagged in
+    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-FIXED-20260803.md.
+    // Resolve it the same way the writer does (`resolve_class_mirror_slots`
+    // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
+    // `java/lang/Class`), so reader and writer agree by construction instead
+    // of by coincidence. `java/lang/Class`'s layout is fixed for the process
+    // once loaded, so the resolved index is cached — but never a permanent
+    // `None`, so a call landing before `java/lang/Class` has resolved to its
+    // real (non-stub) form still gets rechecked, rather than falling back to
+    // the name-based check for the rest of the run.
+    if let Some(idx) = primitive_field_slot(ctx) {
+        if let Value::Int(flag) = ctx.get_field(this, idx) {
+            if flag != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
         }
     }
     // Fallback: the legacy synthetic-mode layout where the only signal
@@ -3170,6 +3215,26 @@ pub(crate) fn native_class_is_primitive(
         "int" | "long" | "float" | "double" | "boolean" | "char" | "byte" | "short" | "void"
     );
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
+}
+
+/// Instance-field index of `java/lang/Class.primitive` (a `boolean`),
+/// resolved by name against the loaded class — mirrors
+/// `resolve_class_mirror_slots`'s writer-side resolution in
+/// `vm/src/vm/vm_object.rs` so `native_class_is_primitive` reads the exact
+/// slot `get_or_create_primitive_mirror` wrote, regardless of this JDK
+/// build's actual field order. Cached once resolved (the layout is fixed for
+/// the process lifetime); a `None` (e.g. `java/lang/Class` not yet loaded as
+/// its real, non-stub form) is not cached, so a later call gets a fresh
+/// chance to resolve it.
+fn primitive_field_slot(ctx: &dyn NativeContext) -> Option<usize> {
+    static CACHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let cached = CACHED.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != usize::MAX {
+        return Some(cached);
+    }
+    let idx = ctx.resolve_field_index("java/lang/Class", "primitive")?;
+    CACHED.store(idx, std::sync::atomic::Ordering::Relaxed);
+    Some(idx)
 }
 
 pub(crate) fn native_class_get_superclass(
@@ -5018,7 +5083,7 @@ pub(crate) fn write_field_accessible_external(
 // reads by resolved index (descriptor-decoded) and degrades any non-reference
 // tag to null. `getModifiers` below is `()I` and stays on the by-name read —
 // there `Int(0)` is the correct answer for an unwritten slot.
-// See `docs/known-issues/c2/by-name-field-reads.md`.
+// See `docs/feature-designs/by-name-field-reads.md`.
 pub(crate) fn native_field_get_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5854,7 +5919,7 @@ fn capture_field_descriptor(type_char: char) -> String {
 /// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
 /// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
 /// `class_manager` (they live in `shared.classes.lambda_proxies` instead — see
-/// `docs/internal/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
+/// `fixed-suite-bugs/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
 /// for the same root cause in a sibling `Comparable` check), so
 /// `NativeContext::declared_fields` can't see them and reflective access to
 /// a lambda's captured field (e.g. AssertJ's `extracting("arg$1")` fallback,
@@ -6148,7 +6213,7 @@ pub(crate) fn create_method_object(
     // (500+ module jars) it reproduces deterministically as
     // "Constructor.newInstance: no declaring class" (the analogous
     // `create_constructor_object` bug it shares this pattern with — see
-    // docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md).
+    // fixed-suite-bugs/wildfly/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md).
     // Pin everything now and re-read the forwarded reference right before use.
     let obj_pin = ctx.pin_native_root(obj);
 
@@ -6859,7 +6924,7 @@ fn build_serialized_lambda(
     // are all reused repeatedly across these hazards, unpinned otherwise.
     // Same "Family 1" stale-ObjectRef pattern as `create_method_object`/
     // `create_constructor_object`/`create_field_object` (see
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
     let proxy_pin = ctx.pin_native_root(proxy);
     let capturing_mirror_pin = match capturing_mirror {
         Value::Object(Some(m)) => Some(ctx.pin_native_root(m)),
@@ -7367,7 +7432,7 @@ pub(crate) fn native_method_invoke(
         // own nested `@Configuration` class) while the test body's
         // `Mockito.verify()` ran application-loader bytecode against the
         // application copy of `MockUtil`, whose `mockMakers` map never saw the
-        // mock → `NotAMockException`. See docs/internal/fixed-suite-bugs/
+        // mock → `NotAMockException`. See fixed-suite-bugs/
         // springboot/servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
         let special_result = match mirror_class_id(ctx, declaring_mirror) {
             Some(cid) => ctx.invoke_special_by_class_id(
@@ -8157,10 +8222,25 @@ fn link_isolated_method_signatures(
             _ => return Err(isolated_loader_class_not_found(ctx, name)),
         };
         let mirror_pin = ctx.pin_native_root(mirror);
-        let link_ok = ctx
-            .class_id_from_mirror(mirror)
-            .map(|class_id| ctx.initialize_class(class_id).is_ok())
-            .unwrap_or(true);
+        // Netty CompositeByteBuf clinit bug (20260731): forcing full
+        // initialization here is only safe when this thread is not already
+        // mid-<clinit>. `loadClass` above already proved the type is present
+        // and loadable in this isolated loader's view -- that's all JVMS
+        // §5.5 requires for exposing it as a reflective method's
+        // return/parameter type. Actually running its <clinit> as well is an
+        // extra (originally intended to turn a missing transitive type into
+        // an eager NoClassDefFoundError for OnBeanCondition), but doing so
+        // while this thread is already inside another class's still-running
+        // <clinit> lets the forced class observe THAT class's statics at
+        // their pre-assignment default instead of failing to resolve --
+        // see docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md.
+        let link_ok = if ctx.in_clinit() {
+            true
+        } else {
+            ctx.class_id_from_mirror(mirror)
+                .map(|class_id| ctx.initialize_class(class_id).is_ok())
+                .unwrap_or(true)
+        };
         ctx.unpin_native_roots(mirror_pin);
         if !link_ok {
             return Err(isolated_loader_class_not_found(ctx, name));
@@ -8802,7 +8882,7 @@ pub(crate) fn create_constructor_object(
     let num_fields = base + CONSTRUCTOR_EXTRA_SLOTS;
     let obj = ctx.alloc_object(class_id, num_fields);
     // GC-safety (root cause of
-    // docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md):
+    // fixed-suite-bugs/wildfly/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md):
     // every reflective mirror/array/string built below can trigger classloading
     // (and therefore GC) via `get_class_mirror` / `descriptor_to_class_mirror[_via_loader]`
     // / `build_mirror_array_comp` / `create_string`. A moving collection between
@@ -9242,7 +9322,7 @@ pub(crate) fn native_constructor_new_instance(
                         // `obj` is returned afterward, unpinned otherwise --
                         // exactly the "Constructor.newInstance"-family
                         // stale-ObjectRef pattern documented in
-                        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
                         let obj_pin = ctx.pin_native_root(obj);
                         {
                             // Run the ancestor's no-arg `<init>` (`clazz`);
@@ -9609,7 +9689,7 @@ pub(crate) fn native_class_get_declared_constructor(
 /// triggered by the Nth `create_field_object` call could relocate/reclaim
 /// the first N-1 already-created Field mirrors, since that Vec was not a
 /// GC root. This is the exact residual gap flagged (but never swept) in
-/// `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
+/// `fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
 /// ("collect_public_fields/methods (getFields/getMethods Vec-build)").
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
@@ -10296,8 +10376,8 @@ pub(crate) fn native_class_get_constructor(
 /// Resolve a lambda proxy's functional interface to a `ClassId`, preserving
 /// the bootstrap's exact resolved identity before any host-scoped fallback.
 ///
-/// Residual 4 follow-up (2026-07-20, docs/known-issues/springboot/
-/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md): both
+/// Residual 4 follow-up (2026-07-20, fixed-suite-bugs/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md): both
 /// `native_class_get_interfaces` and `native_class_get_generic_interfaces`
 /// used a bare `ctx.class_id_by_name(&iface_name)` here — loader-blind.
 /// Scoping `typesig_to_real_type`'s LATER resolution (inside the generic
@@ -12136,7 +12216,7 @@ pub(crate) fn annotation_element_to_java_typed(
             if let Some(enum_cid) = enum_cid_opt {
                 // GC-safety (2026-07-16): this is the "enum builder" residual
                 // gap flagged (but never swept) in
-                // docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+                // fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
                 // — `class_mirror` is held in a Rust local across the
                 // allocating `create_string` call (and the `Enum.valueOf`
                 // invocation itself, which can allocate/classload) before
@@ -13687,7 +13767,7 @@ pub(crate) fn native_method_get_parameter_annotations(
     // the forwarded reference each iteration, matching `build_mirror_array`'s
     // established pattern. This is the "getParameterAnnotations" residual gap
     // flagged in
-    // `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`.
+    // `fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`.
     let mut outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
     let outer_pin = ctx.pin_native_root(outer);
     for i in 0..aligned_annotations.len() {
@@ -14172,7 +14252,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             // `Class` for every lambda -- never a `ParameterizedType`, and
             // regardless of how concretely the call site's target type was
             // parameterized (verified against `jdk-25.0.3.9-hotspot`; see
-            // `docs/internal/fixed-suite-bugs/springboot/
+            // `fixed-suite-bugs/springboot/
             // lambda-getgenericinterfaces-fabricates-parameterizedtype-FIXED.md`).
             //
             // A previous session reconstructed a concrete `ParameterizedType`
@@ -14971,7 +15051,7 @@ pub(crate) fn native_class_get_package_name(
 // Arquillian's `EventTestRunnerAdaptor` bootstrap (MOXy JAXB asks
 // `Package.isAnnotationPresent(XmlSchema.class)` on classes from
 // JBoss-vendored jars whose manifests set `Specification-Vendor`). See
-// `docs/known-issues/keycloak-arquillian-package-getannotation-string-linkage.md`.
+// `fixed-suite-bugs/keycloak/keycloak-arquillian-package-getannotation-string-linkage.md`.
 //
 // Consequence of writing by name only: since `Package` has no flat
 // `specTitle`/etc. fields to target by name, `getSpecificationTitle()` and
@@ -17833,7 +17913,7 @@ pub(crate) fn native_class_get_annotated_superclass(
 /// of `AnnotatedParameterizedTypeImpl` вЂ” the same ByteBuddy `AnnotatedType`
 /// dispatch mismatch the ES bytebuddy-annotatedtype fix addressed for
 /// methods/fields/parameters (see
-/// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
+/// `fixed-suite-bugs/elasticsearch-suite/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
 /// just not yet applied here. Mockito's `mock(Path.class)` walks exactly
 /// this path via ByteBuddy's owner-type reader when generating the mock.
 pub(crate) fn native_class_get_annotated_interfaces(
@@ -17967,7 +18047,7 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
 /// `getAnnotatedActualTypeArguments()`, which only that subclass declares)
 /// and fail with a receiver-type mismatch a few frames up the call chain
 /// when handed a plain `AnnotatedTypeBaseImpl` instead вЂ” see
-/// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
+/// `fixed-suite-bugs/elasticsearch-suite/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
 fn annotated_type_impl_class_name(
     ctx: &mut dyn NativeContext,
     backing_type: cratonvm_types::ObjectRef,
@@ -21397,7 +21477,7 @@ Implementation-Title: opensaml-core-api\r\n\
     fn t19_h10_get_package_manifest_writes_do_not_corrupt_module_or_package_info() {
         // Regression test for the `Package.getAnnotation()` ->
         // `NoSuchMethodError: java/lang/String.getAnnotation` crash (see
-        // docs/known-issues/keycloak-arquillian-package-getannotation-string-linkage.md):
+        // fixed-suite-bugs/keycloak/keycloak-arquillian-package-getannotation-string-linkage.md):
         // manifest-attribute writes must land ONLY on their named fields,
         // never on raw slots 1-6. Real JDK 9+ `java.lang.Package` has no
         // flat `specTitle`/`specVersion`/`specVendor`/`implTitle`/

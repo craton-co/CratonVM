@@ -57,19 +57,59 @@ on this shared box it is often the only trustworthy one.
   memory-heavy rows more — so ratios, not absolute times, are the durable
   content across host re-provisionings.
 
-### Current table (2026-07-18; HashMap re-measured 2026-07-30, String/Regex 2026-07-25, Binary Trees re-validated 2026-07-24)
+### Current table (all seven rows re-measured 2026-08-04)
 
-| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio |
-|-----------------------------------|-----------|-----------|-------|
-| Arithmetic (2B ops)               | 2,006 ms  | 4,895 ms  | 2.44x |
-| Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x |
-| Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x |
-| Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get, isolated)   | 1,017 ms  | 1,780 ms  | **1.75x** |
-| String/Regex (100K, isolated)     | 55 ms     | 423 ms    | **7.7x** |
-| Binary Trees (depth 18, isolated) | 176 ms    | 1,468 ms  | 8.34x |
+`dev` @ `12b8cbdea`, Azure EPYC bench host, JDK 25.0.3 both sides, `-Xmx8g`
+both sides, one phase per fresh process pinned to cpu 13, arms **alternated
+with the order flipped on alternate pairs**, 9 pairs per phase, no sample
+discarded, checksum verified against HotSpot on every single run (zero
+mismatches across all 126 runs). 1-minute load average 2.3–4.1 throughout —
+above the gate's own 2.0 ceiling, so the ratios are the durable content and
+the absolutes are this host on this day.
 
-Row notes:
+| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
+|-----------------------------------|-----------|-----------|-----------|---------------|---------------|
+| Arithmetic (2B ops)               | 1,860 ms  | 3,641 ms  | 1.96x     | 0.4% | 2.44x |
+| Fibonacci(44)                     | 1,493 ms  | 8,612 ms  | 5.77x     | 1.8% | 2.79x |
+| Sieve (100K × 20,000)             | 2,412 ms  | 15,680 ms | 6.50x     | 0.4% | 2.28x |
+| Matrix 1280×1280                  | 2,124 ms  | 2,111 ms  | **0.99x** | 0.3% | 2.93x |
+| HashMap (10M put/get, isolated)   | 995 ms    | 2,060 ms  | 2.07x     | 0.4% | **1.75x** |
+| String/Regex (100K, isolated)     | 51 ms     | 285 ms    | 5.59x     | 1.1% | **7.7x** |
+| Binary Trees (depth 18, isolated) | 177 ms    | 1,690 ms  | 9.55x     | 7.6% | 8.34x |
+
+This replaces the 2026-07-18 table, whose rows were taken across four separate
+sessions on a host that has since been re-provisioned, and three of which this
+document already flagged as unverified. Every row above comes from **one**
+interleaved series, so the rows are comparable to each other for the first
+time.
+
+**Sieve is a live regression that landed 2026-08-03 and is not the steady
+state.** The phase measured **2,350 ms** — faster than HotSpot — on the
+immediately preceding build. One method is the whole difference:
+`CratonBench.sieve([ZI)I` is admitted to the optimizing (C2/IR) pipeline on
+both builds, but only the newer one *produces a body* for it; before, it fell
+through to the single-pass backend. The IR body is **6.4x slower than the C1
+body it replaced**:
+
+| build | sieve, 5 interleaved pairs | C2 reach for the phase |
+|---|---|---|
+| before (`cov-02` base) | 2,462 / 2,487 / 2,324 / 2,461 / 2,474 ms | 2 requests, 1 admitted, **0 bodies** |
+| after (`cov-02` arrays) | 15,949 / 15,805 / 15,662 / 15,922 / 15,823 ms | 2 requests, 1 admitted, **1 body** |
+
+Checksums are identical on both, so this is throughput and not correctness. It
+is the case `docs/known-issues/c2/ir-coverage-survey-20260803.md` warns about
+in as many words — *"it does not say lowering these opcodes makes anything
+faster"* — arriving on the day the arms landed. Read the per-phase reach in any
+gate run's `manifest.tsv` (`ir_reach_<phase>`) before attributing a
+CratonBench delta to the optimizing tier; that record is what made this a
+one-step diagnosis.
+
+**Fibonacci is NOT a `cov-*` regression.** Interleaved against the same
+pre-`cov-02` control it measured 8,393–8,572 ms against the merged tree's
+8,402–8,533 ms — identical. Its distance from the July 4,790 ms figure predates
+all of this work and is unattributed.
+
+Row notes (historical, from the table this replaced):
 
 - **RETRACTED 2026-07-30: the HashMap regression this table used to record
   (`22,077 ms`, `21.2x`, "CONFIRMED and bounded to `a36b9d121..e57f0bc7d`")
@@ -91,7 +131,7 @@ Row notes:
   cpu 15) and showed **no difference**: 4131/4004 on cpu 13 against 4063/4042
   on cpu 15. Treat any 07-25-era absolute in this document as unverified until
   re-measured. Full detail:
-  [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+  `hashmap-half-gap-20260730.md`.
 
   String/Regex's 07-25 row is left as recorded — it has not been re-measured
   and it was the *smaller* of the two claims (3.57x → 7.7x), but it came out of
@@ -118,7 +158,7 @@ Row notes:
   proves the recursive caller has no live oops. The merged-binary alternating
   acceptance reduced the HotSpot gap by **71.90%**. Full measurements and
   generated-code evidence are in
-  [`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
+  `fibonacci-half-gap-20260730.md`.
 - **Binary Trees** was measured at `-Xmx8g` as seven alternating
   fresh-process pairs; all fourteen checksums were `68332206`.
   A July 2026 dev regression that temporarily quadrupled this row was
@@ -136,7 +176,7 @@ Row notes:
   "young GC always falls back to non-moving sweep for this workload" defect
   by forcing ~6x more young collections) and was reverted. Full measurement
   history, isolation methodology, and the root-cause writeup are in
-  [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+  `binarytrees-bt18-half-gap-20260730.md`.
 - **Sieve** is three counted `boolean[]` loops, and single-pass BCE refuses
   inclusive (`<=`) loops and non-`arr.length` bounds, so every element kept a
   null and bounds check. A 2026-07-30 change added three fall-through-only
@@ -147,7 +187,7 @@ Row notes:
   runs checksum `9592`) cut the HotSpot gap by **94.35%** and **95.30%**,
   moving the ratio from 1.85x to **1.05x**. Full measurements, the guard
   contract, and the differential probe are in
-  [`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
+  `cratonbench-sieve-half-gap-20260730.md`.
 
 ### The performance gate
 
@@ -281,7 +321,7 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > 2026-07-30 with the same binary alternating cpu 13 and cpu 15, and showed no
 > difference (4131/4004 against 4063/4042). **Do not build on any absolute
 > number in this block without re-measuring it.** See
-> [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+> `hashmap-half-gap-20260730.md`.
 >
 > The original 2026-07-25 text is kept below, unedited, because it documents
 > what was believed and how it was argued.

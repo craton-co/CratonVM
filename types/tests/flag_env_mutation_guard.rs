@@ -11,7 +11,7 @@
 //! silently exercises the developer's ambient environment when it does not,
 //! which is an order-dependent test that presents as a flake. The full
 //! diagnosis is in
-//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+//! `libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 //!
 //! The supported replacements are `flags::with_thread_overrides` (default) and
 //! `flags::with_process_overrides` (when the reader runs on a thread the test

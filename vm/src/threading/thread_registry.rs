@@ -25,7 +25,7 @@ use crate::types::ObjectRef;
 // (`collect_all_root_snapshots`, `alive_count_and_os_tids`,
 // `alive_count_blocked_and_os_tids`). Investigating a CratonVM-specific
 // per-alive-thread VM overhead gap (Cluster B,
-// docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md):
+// fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md):
 // real HotSpot finishes a test class that briefly accumulates ~750 mostly-
 // idle threads in 6s; CratonVM takes 25-300+s for the identical thread
 // count. This measures which of these O(N) walkers actually dominates
@@ -149,7 +149,7 @@ struct ThreadEntry {
     /// lookups (getState/isAlive/interrupt/unpark) therefore prefer this
     /// key over pointer comparison; see `find_thread_id_by_java_tid` and
     /// the aliasing incident writeup in
-    /// docs/known-issues/tomcat-08-07/dohead-residual-http2-midrun-hang.md.
+    /// fixed-suite-bugs/tomcat/dohead-residual-http2-midrun-hang-FIXED.md.
     /// 0 = unknown (synthetic-layout mirror, or registered mid-construction
     /// before the ctor assigned `tid` — backfilled lazily on first lookup).
     java_tid: u64,
@@ -329,7 +329,7 @@ pub struct ThreadRegistry {
     /// collection relocates a mirror: the address the GC vacated. A running
     /// or blocked frame that resumed holding a not-yet-remapped copy of that
     /// OLD address (the frame/operand remap-coverage gap documented in
-    /// `docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md`)
+    /// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`)
     /// can then recover the live mirror instead of reading a zeroed object's
     /// null `holder` and NPEing in `Thread.getThreadGroup` (Tomcat
     /// `TestDigestAuthenticator` et al.). `.0` is the lookup map; `.1` is the
@@ -700,6 +700,7 @@ impl ThreadRegistry {
             roots: usize,
             state: String,
             top: String,
+            full_frames: Vec<String>,
         }
         let mut rows: Vec<SummaryRow> = threads
             .iter()
@@ -726,6 +727,29 @@ impl ThreadRegistry {
                 if top.is_empty() {
                     top.push_str("<no-frame-trace>");
                 }
+                // 2026-08-03 (onclasscondition-join-never-returns) — the
+                // one-line `top` above caps at 3 frames, which is enough to
+                // name a wait site but not to tell "this thread is a live
+                // participant mid-call-chain" from "this is a stale dead
+                // entry that happens to share a wait site with hundreds of
+                // others from earlier per-test JVM reboots". Every alive
+                // thread's COMPLETE deposited chain, oldest frame first (same
+                // order `dump_current_thread_frames` uses), so a hang repro
+                // can be told apart from the accumulated dead-thread noise
+                // without a second run.
+                let full_frames = if e.alive.load(std::sync::atomic::Ordering::Acquire) {
+                    trace
+                        .iter()
+                        .map(|frame| {
+                            format!(
+                                "{}.{}@{}",
+                                frame.class_name, frame.method_name, frame.byte_code_index
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 SummaryRow {
                     tid: tid.0,
                     os_tid: e.os_tid.load(std::sync::atomic::Ordering::Acquire) as u64,
@@ -739,11 +763,12 @@ impl ThreadRegistry {
                     roots: e.root_snapshot.lock().len(),
                     state,
                     top,
+                    full_frames,
                 }
             })
             .collect();
         rows.sort_by_key(|r| r.tid);
-        for row in rows {
+        for row in &rows {
             let _ = writeln!(
                 h,
                 "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} top={}",
@@ -757,6 +782,33 @@ impl ThreadRegistry {
                 row.state,
                 row.top
             );
+        }
+        // Full frame chains, split out from the one-line-per-thread summary
+        // above so that table stays scannable. Restricted to `alive` threads
+        // — the registry retains every thread it has ever seen for the life
+        // of the process, so a long-running multi-class suite run can carry
+        // hundreds of dead entries whose frame chains are pure noise here.
+        let live_with_frames: Vec<&SummaryRow> = rows
+            .iter()
+            .filter(|r| r.alive && !r.full_frames.is_empty())
+            .collect();
+        let _ = writeln!(
+            h,
+            "--- T19.H1 full frame chains: {} alive thread(s) with a deposited snapshot ---",
+            live_with_frames.len()
+        );
+        for row in live_with_frames {
+            let _ = writeln!(
+                h,
+                "  tid={} os_tid={} name={:?} ({} frame(s), oldest first):",
+                row.tid,
+                row.os_tid,
+                row.name,
+                row.full_frames.len()
+            );
+            for (depth, frame) in row.full_frames.iter().enumerate() {
+                let _ = writeln!(h, "    [{depth}] {frame}");
+            }
         }
         let _ = writeln!(h, "--- T19.H1 end thread summary ---");
         let _ = h.flush();
@@ -1237,6 +1289,21 @@ impl ThreadRegistry {
         }
     }
 
+    /// The monitor `thread_id` is currently blocked in `Object.wait()` on, if
+    /// any — without consuming it or closing the JMX wait-time accounting.
+    ///
+    /// Used by `Thread.interrupt()` to wake a target parked in `Object.wait()`.
+    /// The slot is written just before the park and taken just after it, so a
+    /// `Some` here means the target is (or was a moment ago) in the wait, and a
+    /// wake sent to a target that has already left is harmless: `wait()` is
+    /// specified to permit spurious wakeups, and the surrounding Java `while`
+    /// loop re-checks and re-parks.
+    pub fn peek_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
+        let threads = self.threads.read();
+        let monitor = *threads.get(&thread_id)?.jmx_waiting_monitor.lock();
+        monitor
+    }
+
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;
@@ -1483,7 +1550,7 @@ impl ThreadRegistry {
     /// in from `class_store`.
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-2 of
-    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). The published
+    /// `arch-2026-07-26/stackwalk-and-vtable.md`). The published
     /// snapshot is line-less because the *depositor* must stay lock-free; the
     /// *reader* usually does hold a `ClassStore` (cross-thread
     /// `Thread.getStackTrace()`, `dumpThreads()`, the JMX thread dump), so it

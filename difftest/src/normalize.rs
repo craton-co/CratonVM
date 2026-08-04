@@ -6,7 +6,7 @@
 //! A differential harness that hides a regex inside its comparison function is
 //! a harness nobody can audit: the reader cannot tell whether a divergence was
 //! *neutralized* (a nondeterminism the JLS does not fix) or *laundered* (a real
-//! VM bug the harness quietly erased). `docs/internal/` records the failure mode
+//! VM bug the harness quietly erased). `` records the failure mode
 //! from the other side too — a harness that reports its own environment noise as
 //! a VM defect burns a day of bisection on nothing.
 //!

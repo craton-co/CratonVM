@@ -381,7 +381,7 @@ pub struct Frame {
     /// future OSR attempt for that loop forever, even though the next
     /// back-edge ~µs later might well have succeeded.
     ///
-    /// Round-5 fix (audit `docs/round5-vm.md`): track an attempt counter
+    /// Round-5 fix (audit `history/round5-vm.md`): track an attempt counter
     /// per entry PC and use **exponential backoff** — first retry after
     /// `OSR_THRESHOLD` back-edges, second after `2 * OSR_THRESHOLD`,
     /// third after `4 * OSR_THRESHOLD`, etc.  After
@@ -764,7 +764,7 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
             // failures in bc-math-raw's InterleaveTest after the interpreter
             // paths were fixed. Recover the full i64 when the payload proves
             // it cannot be a real int. See
-            // docs/bc-ec-mod-mododdinverse-investigation.md.
+            // gaps/bc-ec-mod-mododdinverse-investigation.md.
             if let Some(raw) = cv.int_tag_collision_long() {
                 (raw as u64, VTAG_LONG)
             } else {
@@ -1712,6 +1712,30 @@ impl Frame {
     /// at a live heap object are correctly excluded.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
         self.scan_local_objects_inner(roots, heap, true);
+    }
+
+    /// The per-bci live-local mask [`Self::scan_local_objects`] filters this
+    /// frame's roots with, at its current pc. Bit `i` set = slot `i` may still
+    /// be read; slots at index >= 64 are outside the mask and always live.
+    ///
+    /// Exposed so a diagnostic can ask the collector's own question instead of
+    /// a weaker one. `audit_frames_for_reclaimed_slots` needs exactly this:
+    /// a frame local that is DEAD and points into a reclaimed span is the
+    /// liveness filter working as designed (the `PreparedStatement` a seed loop
+    /// finished with, still in slot 8 for the rest of the method), and
+    /// reporting it would bury the case that matters — a LIVE local whose
+    /// object the collector took anyway.
+    pub(crate) fn live_locals_mask_here(&self) -> u64 {
+        if crate::runtime::env_cache::no_local_liveness() {
+            crate::runtime::local_liveness::ALL_LIVE
+        } else {
+            crate::runtime::local_liveness::live_locals_mask(
+                &self.code,
+                self.exception_table(),
+                self.max_locals,
+                [self.pc, self.last_instr_pc],
+            )
+        }
     }
 
     /// Variant used by the non-moving ForkJoin stress snapshot path.

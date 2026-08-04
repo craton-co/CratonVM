@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-08-04 The optimizing tier stops taking methods the single-pass backend does better
+
+`cov-02` taught `IrBuilder::build` to lower `bastore`. The side effect was that
+`CratonBench.sieve([ZI)I` stopped falling through to the single-pass backend —
+which *vectorises* its `boolean[]` loops — and started getting a scalar IR
+body. **2,462 ms became 15,823 ms**, on a phase where CratonVM had been faster
+than HotSpot C2, with an unchanged checksum and no failing test.
+
+The general problem: the optimizing tier installs its body whenever it *can*,
+and nothing checks that the body is faster than the one the single-pass backend
+would have installed.
+
+#### Added
+- `jit/src/x64/single_pass_only.rs` — the enumeration of what the single-pass
+  backend can do that the optimizing tier cannot: seven classes, each consumed
+  by a single-pass emitter at a loop header, each without a counterpart in
+  `ir_optimize`/`ir_lower` (three bulk byte-array lowerings, four vectorising
+  ones). The admission chain consults it and its verdict names which lowering
+  it protected. **The IR tier has no vectoriser at all**, so `cov-02` hitting
+  one of these was not bad luck — four more of the same shape were waiting.
+- `CRATONVM_JIT='-c1-vector-veto'` — hand those methods back to the IR tier.
+  Default on; the switch exists so the veto is bisectable and so its blast
+  radius can be measured on one binary rather than argued across two.
+
+#### Changed
+- `x64/driver.rs`'s three inlined bulk-byte detector loops are now one call to
+  `escape_analysis::detect_bulk_byte_loops`, shared with the veto, so the
+  emission path and the admission chain cannot disagree about what the backend
+  would emit.
+- Corrected two stale comments in `ir_optimize.rs`: `unroll` and `licm` are
+  default-**ON**, not "Default-OFF while it soaks". They are why the
+  single-pass unroller and hoists are *not* on the veto list, so the stale
+  claim was load-bearing in the wrong direction.
+
+#### Notes
+- Blast radius, measured with the off-switch on one binary across all ten
+  benchmark phases: **exactly one** IR body, the one that was 6.4x slower.
+- Loop unswitching was in the first draft of the list and is not in it: its
+  emitter's own contract says the sequence is additive and "removing the
+  emission yields identical final state". Vetoing on it would have cost IR
+  bodies for every loop with an invariant branch to protect nothing.
+- Still open: the enumeration catches an advantage somebody wrote down, not one
+  nobody did. Closing that needs a backend-parity harness that compiles a
+  corpus both ways and compares emitted bytes — see
+  `docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`.
+
+### 2026-08-03 Perf gate: it records its own C2 reach, and it can compile its benchmark again
+
+Two changes to `regression-suite/perf/`, from `docs/known-issues/c2/`'s MEAS-02.
+
+**The gate could not compile `bench/CratonBench.java`.** Its own
+`export LC_ALL=C` — correct, for the awk distribution arithmetic — makes a
+`javac` that derives its source encoding from the platform charset (17 on the
+bench host) default to US-ASCII, and the benchmark's header comment has
+em-dashes. Every run died at setup with 30 `unmappable character` errors before
+measuring anything. The bench host's ambient locale is `C.UTF-8`, so the same
+command run by hand succeeded and the failure appeared only inside the gate.
+Pinned with `-encoding UTF-8`.
+
+**Every run now records the optimizing tier's per-phase reach.** Across all
+seven CratonBench phases the C2/IR tier is asked 8 times, admits 3 and produces
+**3** bodies — so the gate measures the single-pass backend, and a CratonBench
+delta is not evidence about C2 in either direction. That fact now travels with
+the numbers instead of having to be rediscovered.
+
+#### Added
+- `ir_requests` / `ir_admitted` / `ir_bodies` in `samples.tsv` and
+  `summary.tsv`; one `ir_reach_<phase>` line per phase in `manifest.tsv`, plus
+  `ir_reach_total`, `ir_reach_recorded` and `ir_reach_scrape_broken`; a reach
+  summary on the console at the end of every run and of every `--calibrate`.
+- `regression-suite/perf/c2-reach.sh` — any workload's C2 reach in one run,
+  with two consistency checks that refuse rather than report a zero when the
+  scrape is reading a log that no longer says what it expects.
+- `bench/CratonBenchC2.java` — a candidate workload with a framework-shaped
+  node mix, reaching the tier 36/17/11 across three phases. Deliberately **not**
+  a gate phase and with no baseline; see
+  `meas-02-bench-suite-c2-reach-RETIRED-20260803.md`.
+
+#### Changed
+- Results schema **1 → 2**; the default results directory is now
+  `regression-suite/perf/results/v2/`. Every existing column kept its name and
+  every consumer resolves columns by name, so a v1 reader reads a v2 directory
+  correctly.
+- `compare.py` reports `C2-tier compiles`, `C2 admitted` and `C2 bodies`
+  separately, and names the phases whose delta is not evidence about the
+  optimizing tier. `compiles_c2` alone never was that number: it counts
+  compiles whose requested *tier* was C2, including every one the optimizing
+  pipeline declined and handed back to the single-pass backend, and including
+  OSR compiles.
+- The gate asks for its VM summaries with the grouped `CRATONVM_DBG=` spelling,
+  so a run no longer opens stderr with a legacy-variable deprecation line.
+
 ### 2026-07-31 JDK-only mode (`--jdk-only`) — provenance instrumentation, wave 1
 
 A new **runtime** compatibility policy: `--jdk-only` declares that real JDK class

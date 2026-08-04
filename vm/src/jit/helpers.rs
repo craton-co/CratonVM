@@ -1362,11 +1362,24 @@ unsafe fn try_call_compiled_entry_reentrant(
     // back to its live CompiledMethod and register the precise frame for the
     // full duration of the nested call.
     let mut needs_ctx = needs_ctx;
-    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
-        // SAFETY: the JIT code-range registry owns this CompiledMethod while
-        // its entry remains callable; the guard is dropped before this helper
-        // returns to the caller that holds the corresponding code cache entry.
-        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    // Pin, don't peek. This is the ONE path into compiled code that used to hold
+    // no owning reference to the body it entered: it resolved a bare `cm_ptr`
+    // out of the code-range registry and dereferenced it, on the argument that
+    // "the registry owns this CompiledMethod while its entry remains callable".
+    // The registry stores a raw address, not an `Arc`, so it owns nothing — and
+    // the caller's keep-alive here is a *thread-local dispatch cache entry*
+    // (`try_mic_rust_cached_entry` reads `entry`/`needs_context` out of the map
+    // and calls the raw pointer). A nested dispatch from the callee re-enters
+    // `flush_raw_entry_dispatch_caches`, whose `clear()` drops exactly that
+    // entry — measured releasing a published body at `active_jit_executions`
+    // = 1 on `BasicErrorControllerIntegrationTests`.
+    //
+    // Holding the pin across the call is what makes the process-wide invariant
+    // true: **a thread inside a compiled body always holds an owning reference
+    // to it**, so a reference count reaching zero is itself a proof that no
+    // thread is inside. One atomic increment (the registry carries a `Weak`).
+    let pinned = cratonvm_jit::pin_jit_code_range_owner(entry);
+    let jit_root_guard = pinned.as_deref().map(|compiled| {
         // cceres2 (WildFly SIGSEGV cores SF2/SF3/SM): the caller-supplied ABI
         // flag can come from a cache whose (entry, needs_context) pair was
         // read non-atomically across a concurrent inline-cache retarget or
@@ -1399,6 +1412,9 @@ unsafe fn try_call_compiled_entry_reentrant(
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
     drop(jit_root_guard);
+    // AFTER the guard: the pin is what keeps the body mapped for the whole
+    // call, so it must outlive both the call and the chain entry naming it.
+    drop(pinned);
     result
 }
 
@@ -1534,7 +1550,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
 /// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
@@ -1955,7 +1971,7 @@ fn publish_mic_rust_cached_entry(
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
-                _owner: Some(owner),
+                _owner: Some(owner.into()),
             },
         );
     });
@@ -1973,7 +1989,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -3070,7 +3086,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: docs/round7-gc.md §3).
+// free (audit: history/round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -3177,6 +3193,22 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
+    // Second attempt, BEFORE forcing a GC — the step `gc_alloc_array` takes and
+    // this helper did not (SB-LOADER-ZIPCONTENT, 2026-08-04). The interpreter
+    // runs `try_alloc_array_full` here, so a young generation that cannot serve
+    // the request spills into old gen and the mutator continues; the spill
+    // itself arms `note_young_spill_pressure`, which schedules the collection at
+    // the next native-call boundary where roots are pinned and remappable.
+    //
+    // Without it the JIT path forced a full STW GC for EVERY array the young
+    // free list could not fit. On `ZipContentTests` that was ~750 forced
+    // collections, one per 8 KB `byte[]`, each freeing ~10 KB — the difference
+    // between "the class is slow" and "the class does not finish". The young
+    // probe above is unchanged, so a healthy heap never reaches this line and
+    // pays nothing.
+    if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        return jit_newarray_finish(obj_ref, atype, length);
+    }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
     // Mirror the interpreter's `gc_alloc_array` (runtime/interpreter.rs:840):
     // retire the TLAB, run an orchestrated STW GC, then retry the fallible
@@ -3210,13 +3242,37 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // `java/lang/OutOfMemoryError` exactly as the interpreter's
     // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
     // (which would abort the process on a real OOM).
-    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): these two retries MUST use the
+    // old-gen-spilling `try_alloc_array_full`, not the young-only
+    // `try_alloc_array`. `gc_alloc_array` states the reason for the
+    // interpreter's identical arm — "once a non-moving JIT-safe sweep has left
+    // the young generation fragmented it can spill the request into old space
+    // ... retrying young-only here used to report OOM for a tiny array while
+    // most of the heap was available as old-generation headroom" — and this
+    // helper was the one primitive-array path that never got the same
+    // treatment (`jit_anewarray_object` already calls `try_alloc_array_full`
+    // and `jit_new_object` already calls `try_alloc_object_full`; see the
+    // `jit_alloc_oom` doc comment, which lists the asymmetry as fact).
+    //
+    // That gap is exactly how `ZipContentTests.nestedZip64CanBeRead` died:
+    // moving-young had fallen back to the non-moving sweep
+    // (`reason=unregistered-jit-frame-on-stack`), the young free list could no
+    // longer serve the compiled `byte[8192]` that assertj's `assertHasContent`
+    // allocates once per ZIP entry, and this arm reported
+    // `OutOfMemoryError: Java heap space (alloc_array length 8192)` with a
+    // 134 MB live set, a 1.5 GiB heap, and **1042 MB of old-generation
+    // headroom** (`CRATONVM_DBG=gc-overhead`: `old_gen_wedged=false`, so the
+    // overhead limit correctly never fired — the heap was not full, the
+    // allocator just refused to look at the free gigabyte). The same class
+    // passed 29/29 under `--nojit`, where every array runs `gc_alloc_array`.
+    let obj_ref = match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
         Some(o) => o,
         None => {
             if !jit_g1_last_ditch_full_cycle(vm) {
                 return jit_newarray_oom(vm, length as usize);
             }
-            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
                 Some(o) => o,
                 None => return jit_newarray_oom(vm, length as usize),
             }
@@ -3275,9 +3331,9 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
     }
 }
 
-/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
-/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
-/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`,
+/// `jit_anewarray_object` (both via `try_alloc_array_full`), and
+/// `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
 /// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
 /// returns the `0`/null sentinel; the alloc codegen site null-checks the result
 /// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
@@ -3819,7 +3875,7 @@ fn jit_cp_alloc_stash_failure(
 /// So a `new` whose target class had not been loaded yet used to bail the whole
 /// compile, permanently, leaving hot methods carrying a cold
 /// `throw new SomeException(...)` in the interpreter forever
-/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+/// (`jit-compile-bail-unresolved-new-cold-class.md`).
 ///
 /// Doing the same resolution HERE is sound for the reason the doc gives: it is
 /// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
@@ -4920,7 +4976,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -5591,6 +5647,87 @@ mod system_class_memo {
 // `System.out`/`err` intercept would fire on whatever class happened to hold
 // that id and never on the real `java/lang/System`. Do not reintroduce it
 // without a `vm_identity` in the key.
+
+/// Record a CONFIRMED class initialization in the lock-free memo.
+///
+/// Called from `finalize_class_init` (the single authoritative end of a
+/// successful `<clinit>`), so the memo answers for every initialized class
+/// rather than only for those a compiled `getstatic` has already missed on.
+/// Idempotent, lock-free, and a no-op for a VM that does not own the table.
+pub fn note_class_initialized(vm: &SharedVm, class_id: ClassId) {
+    class_init_memo::mark_initialized(vm.vm_identity, class_id.as_u32());
+}
+
+/// Compile-time resolver: where does this static field's storage live?
+///
+/// Returns the address of the `AtomicPtr` cell holding the declaring class's
+/// statics base (see `StaticsIndex::base_cell_addr`), or `0` for "not
+/// inlineable — keep the helper". The JIT bakes the returned address as an
+/// immediate and emits two dependent loads instead of a `CALL jit_getstatic`.
+///
+/// # Why every rejection below is required
+///
+/// * **`java/lang/System`** — its `out`/`err`/`in` statics are serviced by the
+///   bootstrap intercept inside [`jit_getstatic`], which returns a synthetic
+///   stream rather than the stored value. A direct load would read the raw
+///   slot and `println` would silently no-op on a null stream.
+/// * **Not yet initialized** — an inline load runs no `<clinit>` (JVMS §5.5).
+///   The helper's init check is the only thing standing between a compiled
+///   first-touch `getstatic` and the zero-initialized placeholder; a site is
+///   therefore only inlined when the class is ALREADY initialized at compile
+///   time, which is also exactly when HotSpot omits its init barrier.
+/// * **Nothing published / index off** — no address to bake.
+///
+/// # Lock discipline
+///
+/// This runs on whichever thread is compiling, including the background
+/// compiler, and takes **no VM lock at all**: three relaxed/acquire atomic
+/// loads. That is deliberate. The compiler is called from inside the
+/// interpreter's tier-up path and from a background thread, and a resolver that
+/// reached for `class_manager.read()` would be one queued writer away from
+/// deadlocking a compile against a class load.
+///
+/// # Safety
+///
+/// `vm_ptr` must be the `SharedVm` pointer the JIT registered alongside this
+/// function (see `set_static_base_resolver`), or 0.
+pub unsafe extern "C" fn jit_resolve_static_base(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+) -> i64 {
+    if vm_ptr == 0 || class_id_raw < 0 || field_index < 0 {
+        return 0;
+    }
+    // SAFETY: `vm_ptr` is the `&SharedVm` the VM registered with the JIT; the
+    // `SharedVm` lives inside an `Arc` for the life of the process.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let raw = class_id_raw as u32;
+    if vm
+        .classes
+        .system_class_id
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == raw
+    {
+        return 0;
+    }
+    if !class_init_memo::is_initialized(vm.vm_identity, raw) {
+        return 0;
+    }
+    if crate::vm::statics_index_disabled() {
+        return 0;
+    }
+    match vm
+        .classes
+        .statics_index
+        .base_cell_addr(ClassId::new(raw), field_index as usize)
+    {
+        // Cast: a user-space address always fits the positive i64 range; `0` is
+        // the sentinel and `base_cell_addr` never returns a null cell address.
+        Some(addr) => addr as i64,
+        None => 0,
+    }
+}
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6723,8 +6860,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
         // which is also the all-zero header the collector leaves over a
         // reclaimed span; free-list membership tells the two apart.
-        // See docs/known-issues/h2/
-        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+        // See docs/gc/old-sweep-liveness.md section 7.
         //
         // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
         // this defect — interpreted `checkcast`, compiled `checkcast`, and an
@@ -6822,7 +6958,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md).
+    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -7354,7 +7490,20 @@ struct DispatchCache {
     entry: usize,
     needs_context: bool,
     /// Owns JIT code while this thread-local raw entry remains published.
-    _owner: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>>,
+    ///
+    /// [`cratonvm_jit::RetainedCode`], not a bare `Arc`, because this map is
+    /// evicted by the very thread that dispatches through it: a generation
+    /// flush (`flush_raw_entry_dispatch_caches`), a class-identity flush, a
+    /// replacement `insert`, or thread exit. Any of those can run while this
+    /// thread is *inside* the body it names — `try_mic_rust_cached_entry` reads
+    /// only `entry`/`needs_context` out of the map and calls the raw pointer, so
+    /// the map entry is the sole owner across the call, and a nested dispatch
+    /// from the callee re-enters the flush. Dropping a bare `Arc` there unmaps
+    /// the code under this thread's own return address; measured on
+    /// `BasicErrorControllerIntegrationTests` at
+    /// `active_jit_executions` = 1. The wrapper releases through
+    /// `defer_jit_owner`, which retains until no thread is in compiled code.
+    _owner: Option<cratonvm_jit::RetainedCode>,
 }
 
 #[derive(Clone, Copy)]
@@ -8139,7 +8288,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                         DispatchCache {
                                             entry,
                                             needs_context,
-                                            _owner: Some(owner),
+                                            _owner: Some(owner.into()),
                                         },
                                     );
                                 });
@@ -8250,7 +8399,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
-                        _owner: Some(compiled.clone()),
+                        _owner: Some(compiled.clone().into()),
                     },
                 );
             });
@@ -8312,7 +8461,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         DispatchCache {
                             entry,
                             needs_context: needs_ctx,
-                            _owner: Some(owner),
+                            _owner: Some(owner.into()),
                         },
                     );
                 });
@@ -9497,8 +9646,13 @@ fn call_integer_native_raw_inner(
                 // boxing-dominated compiled loop keeps spilling wrappers into
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.mem.heap.young_spill_pressure() {
+                    // `|| old_gen_needs_gc()`: same reasoning as the
+                    // `safe_native_call` hook this mirrors — the young trigger
+                    // cannot see pressure that has gone into old gen, which is
+                    // where every spill lands. See `vm_exec.rs`.
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.mem.heap.needs_gc_for_jit_allocation()
+                        && (vm.mem.heap.needs_gc_for_jit_allocation()
+                            || vm.mem.heap.old_gen_needs_gc())
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
@@ -12497,7 +12651,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -13270,7 +13424,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/c2/vm-process-global-state.md`.
+/// `docs/feature-designs/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.
@@ -13300,6 +13454,21 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
     cratonvm_jit::x64::set_disarm_savebase_watch_fn(
         jit_disarm_savebase_watch as *const () as usize,
+    );
+
+    // Compile-time static-slot resolver. Registered through a process-global
+    // setter rather than a `JitRuntimeHelpers` field because it is never called
+    // from generated code — only by the compiler, while emitting — so it needs
+    // no ABI slot, no golden offset and no revision bump. The `SharedVm`
+    // pointer travels with it: the answer is per-VM (`ClassId`s are), and the
+    // setter latches the first VM and permanently disables inlining if a second
+    // one registers, rather than silently resolving VM A's ids against VM B's
+    // statics. A VM-less `build_helpers()` passes 0 and registers nothing.
+    cratonvm_jit::x64::set_static_base_resolver(
+        jit_resolve_static_base as *const () as usize,
+        vm_for_helpers
+            .map(|shared| shared as *const crate::vm::SharedVm as usize)
+            .unwrap_or(0),
     );
 
     // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything

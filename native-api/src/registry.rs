@@ -717,7 +717,7 @@ pub trait NativeClassAccess {
     /// very first time a class is needed under a given loader (the gap that
     /// made two prior lookup-based fix attempts for the H2 `Parser`
     /// loader-collapse bug regress on a fresh session -- see
-    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
+    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md's
     /// eighth-pass section).
     ///
     /// Native overrides that construct or invoke-special a DIFFERENT class
@@ -1274,7 +1274,7 @@ pub trait NativeClassAccess {
     /// `UserDefined(2)` puts the new class in a different runtime package from
     /// its own superclass and silently breaks package-private override
     /// detection — see
-    /// `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`.
+    /// `configproxy-cglib-loaderid-fixed-20260727.md`.
     fn define_class_full(
         &mut self,
         name: &str,
@@ -1484,6 +1484,24 @@ pub trait NativeClassAccess {
     fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
         let _ = class_id;
         Ok(())
+    }
+
+    /// True while the current thread is executing inside some class's
+    /// `<clinit>` (including nested/re-entrant `<clinit>` calls it
+    /// transitively triggers).
+    ///
+    /// Callers that would otherwise force a *different*, unrelated class's
+    /// full initialization as a side effect of reflection (e.g. resolving
+    /// the return type of a `java.lang.reflect.Method` mirror) must check
+    /// this first and skip the eager `initialize_class` call when true --
+    /// JVMS §5.5 never requires initializing a class merely because its
+    /// name shows up in another class's method signature, and doing so
+    /// anyway while genuinely mid-`<clinit>` lets the forced class observe
+    /// the in-progress class's statics before they are assigned. Defaults
+    /// to `false` (preserves prior behavior) for implementors that do not
+    /// track this.
+    fn in_clinit(&self) -> bool {
+        false
     }
 
     /// Return all JPMS `provides` implementation class names for a given service
@@ -1824,7 +1842,7 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     /// class, but the name-based re-resolution picked the APPLICATION-loader
     /// copy whenever an isolating loader (Spring Boot's
     /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
-    /// own copy of that class. See docs/internal/fixed-suite-bugs/springboot/
+    /// own copy of that class. See fixed-suite-bugs/springboot/
     /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
     ///
     /// Default implementation falls back to the name-based
@@ -1959,7 +1977,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// `Generational` GC backend only) to turn a stale read into an immediate,
     /// deterministic panic instead of silent corruption — see
     /// `gc/src/stale_objref_debug.rs` and
-    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
@@ -2840,7 +2858,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// contended wait needs to be excused from an in-flight STW barrier
     /// pause instead of leaving the calling thread counted in its `expected`
     /// set for the whole wait (see
-    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
+    /// `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
     ///
     /// Deliberately NARROW: `monitor_enter` itself stays on its original,
     /// non-GC-blocked path for the other ~80 native call sites that use
@@ -2852,7 +2870,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// path to span a completing (possibly moving) GC pause would expose
     /// all of them to the stale-`ObjectRef`-across-GC bug class this
     /// codebase has repeatedly hit (see
-    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`)
     /// — an unaudited-at-scale regression risk far worse than the original
     /// hang. This method exists so the ONE call site with live-gdb-confirmed
     /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
@@ -3490,8 +3508,8 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
     /// java.lang.Object cannot be cast to
     /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
-    /// `obj_cid=0` — see `docs/known-issues/
-    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
+    /// `obj_cid=0` — see `fixed-suite-bugs/wildfly/
+    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
     /// which documents the same family from WildFly's `parallel-extension-add`
     /// boot step) — one more independent occurrence of that already-tracked
     /// "register-invisible root" / cross-thread GC-root-visibility family,
@@ -4163,7 +4181,7 @@ pub struct StackTraceEntry {
     /// which takes no `ClassStore` by design).
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
-    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// `arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
     /// that *deferred* line-number resolution can be **exact**. `class_name` +
     /// `method_name` + `byte_code_index` are not enough: a class may declare an
     /// overload set under one name, the members have different
@@ -4329,6 +4347,22 @@ pub struct NativeCensusEntry {
     /// Times this slot was dispatched through any path this run. `0` on a
     /// superseded row: the count belongs to whoever currently owns the slot.
     pub invocations: u64,
+    /// Whether [`Self::kind`] was **stated at this registration site**
+    /// (`register_with_kind`) or inherited from an ambient `set_category` in
+    /// some enclosing registrar (`register`).
+    ///
+    /// This is the column the 157-entry reclassification was blocked on.
+    /// `registered_by` says *where* a registration was written; only this says
+    /// whether anybody decided what it is. A `false` here on a `SyntheticStub`
+    /// row means nothing more than "no `set_category` covered this call site",
+    /// since `SyntheticStub` is the default — which is very different from a
+    /// deliberate stub, and the two were previously indistinguishable.
+    ///
+    /// Read it with the direction of the mistake in mind: `false` on a
+    /// `Bridge` row is the *dangerous* one, because `Bridge` is never the
+    /// default and can only have been inherited from a `set_category` line that
+    /// covered more registrations than its author was thinking about.
+    pub kind_stated: bool,
 }
 
 /// Registry of native method implementations.
@@ -4486,6 +4520,22 @@ pub struct NativeMethodRegistry {
     /// The category applied to subsequent `register()` calls. Scoped via
     /// `with_category`. Defaults to `SyntheticStub` (conservative).
     current_category: NativeKind,
+    /// Whether `current_category` was **stated at the registration site**
+    /// ([`NativeMethodRegistry::register_with_kind`]) rather than inherited
+    /// from an ambient `set_category` / `with_category` in an ancestor frame.
+    ///
+    /// Index-parallel copy lands in `kind_stated`. Only ever `true` for the
+    /// duration of one `register_with_kind` call, which sets and restores it
+    /// around the inner `register`.
+    ///
+    /// This is the discriminator the 157-entry reclassification needs: today
+    /// the census can say a registration is a `SyntheticStub` and where it was
+    /// written, but not whether anyone *decided* that. See
+    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    next_kind_stated: bool,
+    /// Per-registration copy of [`Self::next_kind_stated`], index-parallel with
+    /// `registrations` and `categories`.
+    kind_stated: Vec<bool>,
     /// Strict "no synthetic stubs" mode. When true, `register()` DROPS any
     /// registration whose `current_category` is `SyntheticStub` — it is never
     /// inserted, so a call to that method falls through to real JDK bytecode
@@ -4649,6 +4699,8 @@ impl NativeMethodRegistry {
             ),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: NativeKind::SyntheticStub,
+            next_kind_stated: false,
+            kind_stated: Vec::new(),
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
@@ -4812,6 +4864,56 @@ impl NativeMethodRegistry {
         self.current_category = prev;
     }
 
+    /// [`Self::register`], with the kind stated **at the registration site**
+    /// instead of inherited from whatever `set_category` the enclosing
+    /// registrar last ran.
+    ///
+    /// This is the migration target for
+    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// `register` takes four arguments, none of them a kind; the kind comes
+    /// from a mutable field on the registry that some *ancestor* frame set. The
+    /// consequence runs in both directions and is silent at the point of the
+    /// mistake:
+    ///
+    /// * one `set_category(Bridge)` line at the head of
+    ///   `register_collections_natives` tags **1,195 registrations**, not one
+    ///   of which targets an `ACC_NATIVE` method;
+    /// * and a permanent bridge that inherits `SyntheticStub` is *dropped* by
+    ///   the arms below under `CRATONVM_NO_STUBS` / `JdkOnly`, which is the
+    ///   2026-07-14 `java.util.Properties` regression that surfaced minutes
+    ///   later as `InternalError: null property: java.home`.
+    ///
+    /// A registration made through this entry point records
+    /// [`NativeCensusEntry::kind_stated`], so the census can finally separate
+    /// *"someone adjudicated this"* from *"this inherited the default"* —
+    /// which is the evidence the 157-entry reclassification was blocked on.
+    ///
+    /// `#[track_caller]` on both this and `register` so provenance still points
+    /// at the registrar, not at this line.
+    #[track_caller]
+    pub fn register_with_kind(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        callback: NativeCallback,
+        kind: NativeKind,
+    ) {
+        // Set/restore rather than passing `kind` down: `register`'s body reads
+        // `current_category` in a dozen places (the two drop arms and the
+        // `keep_real_*` heuristics), and threading a parameter through all of
+        // them would leave the ambient field authoritative for some of the
+        // decisions and the argument for others — exactly the split this entry
+        // point exists to remove.
+        let prev = self.current_category;
+        let prev_stated = self.next_kind_stated;
+        self.current_category = kind;
+        self.next_kind_stated = true;
+        self.register(class_name, method_name, descriptor, callback);
+        self.current_category = prev;
+        self.next_kind_stated = prev_stated;
+    }
+
     /// The category a native was registered under, or `None` if no native is
     /// registered for this exact triple. O(1).
     #[inline]
@@ -4890,6 +4992,10 @@ impl NativeMethodRegistry {
                     registered_by: prov.map(|p| format!("{}:{}", p.site.file(), p.site.line())),
                     overwrote: prov.and_then(|p| p.overwrote),
                     invocations,
+                    // Same index-parallel discipline (and same conservative
+                    // fallback direction) as `kind` above: a hypothetical
+                    // desync reports "inherited", never a false "adjudicated".
+                    kind_stated: self.kind_stated.get(reg_index).copied().unwrap_or(false),
                 }
             })
             .collect()
@@ -5157,7 +5263,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -5413,8 +5519,8 @@ impl NativeMethodRegistry {
         // `execute()`/`submit()`/`shutdown()` overrides too, sending them
         // straight to real JDK bytecode that dereferences an uninitialized
         // `ctl`/`mainLock` field and NPEs
-        // (`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
-        // `docs/known-issues/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md`).
+        // (`fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
         // A prior narrower fix (merged separately, same day) exempted only
         // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
         // distinction into the interpreter's dispatch layer instead
@@ -5510,6 +5616,10 @@ impl NativeMethodRegistry {
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
         // -`or_insert` semantics of the removed `category_by_key` map.
         self.categories.push(self.current_category);
+        // Index-parallel with `categories`: was that kind stated here, or
+        // inherited? Only `register_with_kind` sets the flag, and only for the
+        // duration of its own inner call.
+        self.kind_stated.push(self.next_kind_stated);
         // Provenance, index-parallel with the two pushes above. `overwrote` is
         // read HERE — before the `match prior_slot` arm below rewrites
         // `slot.kind` in place — because that is the last moment the displaced

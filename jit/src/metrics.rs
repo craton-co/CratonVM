@@ -1364,6 +1364,298 @@ pub fn clear_reports() {
 //     correctness-adjacent event, not a measurement, and it has to be visible
 //     in a default production run where `CRATONVM_JIT_METRICS` is unset.
 
+/// Every OSR lifecycle event, in the fixed order [`osr_counts`] reports.
+///
+/// `docs/feature-designs/jit-osr-exit-and-recompile.md`. The reason these are
+/// ungated and always on: **a silent OSR exit is indistinguishable from never
+/// having entered.** Both leave the method running in the interpreter with a
+/// correct answer and no diagnostic, so an OSR pipeline that enters and
+/// immediately bails on every iteration looks exactly like one that is simply
+/// not triggering — and the second is a tuning question while the first is a
+/// livelock. Nothing in a default run could tell them apart before this.
+///
+/// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
+/// counters, no allocation and no initialization order.
+pub const OSR_EVENTS: [&str; 4] = [
+    // An OSR entry was actually taken: the trampoline ran and control reached
+    // compiled code at a back edge. The denominator for everything below.
+    "osr_entered",
+    // An entered OSR frame bailed back to the interpreter — the compiled body
+    // returned the `i64::MIN` sentinel or signalled a deopt. `osr_exited`
+    // approaching `osr_entered` is the shape the livelock takes: every entry
+    // paying the trampoline and the seed, then leaving immediately.
+    "osr_exited",
+    // A back edge asked to enter and was refused, either because the artifact
+    // publishes no enterable offset for that bci or because
+    // `validate_osr_entry` rejected the live state. Expected to be non-zero;
+    // interesting only next to `osr_entered`.
+    "osr_refused_entry",
+    // The OSR compile produced no artifact at all. Distinct from a refusal:
+    // nothing was built, so no `osr_pc_to_native` verdict exists to memo, and
+    // the per-pc reject memo cannot suppress the next request.
+    "osr_compile_declined",
+];
+
+/// One relaxed counter per [`OSR_EVENTS`] entry.
+static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count one occurrence of `event`.
+///
+/// Infallible, non-blocking, and independent of [`enabled`] — like
+/// [`record_scheduling_event`], and for a stronger reason: this is called from
+/// the interpreter's OSR path on the hot back-edge, where a lock or a panic
+/// would be far worse than a lost count. An unknown name is ignored.
+pub fn record_osr_event(event: &str) {
+    if let Some(idx) = OSR_EVENTS.iter().position(|e| *e == event) {
+        OSR_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Bytecode loop-rewriter admission, counted per compile that reaches
+/// `x64::loop_rewrite::plan_bytecode_loop_xform`.
+///
+/// ## Why the four conditions are counted INDEPENDENTLY
+///
+/// They were once four whole-compile REFUSALS evaluated in a fixed order,
+/// returning on the first — so a "which refusal fired" tally answered a
+/// question nobody asked: `deopt_real` is default-ON and process-wide, so it
+/// would have accounted for **100%** of refusals and hidden the other three
+/// permanently. Counting them independently is what retired three of them:
+/// `DeoptimizationPoint::bci` is now published through the rewrite's own
+/// provenance map (`Compiler::orig_bci`), which removed `deopt_real`, precise
+/// exception frames and `invokedynamic` as refusals in one move. Only
+/// `inline_sites` still refuses.
+///
+/// The four rows stay, still recorded on every compile that reaches the
+/// planner whether or not something else refuses, because they now answer a
+/// different question: how much of the compile population each construct
+/// covers — i.e. how much the translation bought. They **overlap by
+/// construction** — a method with an `invokedynamic` compiled under
+/// `deopt_real` bumps both — and must not be summed. `loop_xform_eligible` is
+/// the count of compiles no whole-compile refusal held for, which today is
+/// exactly `loop_xform_compiles - loop_xform_inline_sites`.
+///
+/// ## They are properties of the METHOD, not of the rewriter
+///
+/// which is why they are meaningful on a default (unarmed) run: "how often does
+/// an `invokedynamic` cost this transform a method" needs nothing armed. The
+/// four loop-level rows below do need it — on an unarmed run
+/// `loop_xform_not_armed` equals `loop_xform_compiles` and the rest are zero,
+/// which is the honest answer rather than a gap.
+///
+/// See `docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`.
+pub const LOOP_XFORM_EVENTS: [&str; 12] = [
+    // Denominator: compiles that reached the planner at all.
+    "loop_xform_compiles",
+    // The four conditions, each counted on every compile it holds for.
+    // Overlapping; do not sum. Only the last of them still REFUSES.
+    "loop_xform_deopt_real",
+    "loop_xform_precise_exception_frames",
+    "loop_xform_invokedynamic",
+    "loop_xform_inline_sites",
+    // No whole-compile refusal held. `compiles - inline_sites` today.
+    "loop_xform_eligible",
+    // …and of those, the ones that got no further because nothing armed the
+    // rewriter. On a default run this equals `loop_xform_compiles`.
+    "loop_xform_not_armed",
+    // Armed and eligible, but no loop passed the profitability band and the
+    // structural admission test.
+    "loop_xform_no_candidate_loop",
+    // Armed and eligible, a loop was selected, and the rewriter refused it for
+    // a structural reason (`LoopXformRefusal`).
+    "loop_xform_planner_refused",
+    // A transform was produced and the emitter compiled rewritten bytecode.
+    "loop_xform_applied",
+    // …and was then DISCARDED, because its recorded deopt points could not be
+    // published as interpreter resume points. Fail-closed: the method stays
+    // interpreted. Any non-zero value here is a defect in the coordinate
+    // change, not a tuning signal — see
+    // `x64::loop_rewrite::rewritten_deopt_points_are_publishable`.
+    "loop_xform_deopt_bci_unpublishable",
+    // Two images of one bytecode published deopt points whose frame SHAPES
+    // differ (a slot's kind, the operand-stack depth, a monitor). Reported, not
+    // refused: the only bci-keyed reader of those fields is the OSR entry
+    // contract, which re-verifies every one of them against the live
+    // interpreter frame. Non-zero is normal — see `PointDifference`.
+    "loop_xform_deopt_frames_diverge",
+];
+
+/// One relaxed counter per [`LOOP_XFORM_EVENTS`] entry.
+static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count one occurrence of `event`.
+///
+/// Infallible, non-blocking and independent of [`enabled`], like
+/// [`record_osr_event`]: the point of this tally is to be readable from a
+/// default run, and a counter that only works when the metrics ring is on
+/// would answer for a configuration nobody runs. An unknown name is ignored.
+pub fn record_loop_xform_event(event: &str) {
+    if let Some(idx) = LOOP_XFORM_EVENTS.iter().position(|e| *e == event) {
+        LOOP_XFORM_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        LoopXformCapture::note(idx, 1);
+    }
+}
+
+/// Define a per-thread capture of one of this module's process-global event
+/// tables, for tests that assert exact counts.
+///
+/// **Why these tables need one.** Every counter here is process-wide and
+/// monotone, which is right for a production run and useless for a test
+/// assertion: Rust runs a crate's tests on a thread pool, so a test asserting
+/// `count == 1` is asserting against every other test's work as well. Two ways
+/// of papering over that have already been tried in this crate and neither
+/// holds:
+///
+///  * **zero the table first.** A sibling can bump it between the reset and the
+///    read, and does.
+///  * **hold a lock while asserting.** That only serialises the tests that
+///    ASSERT. The tests that PRODUCE are elsewhere — `x64::tests` compiles
+///    thousands of methods, `tiered::tests` drops compilation requests — and
+///    none of them takes the lock. This is what made
+///    `drops_reach_the_process_wide_scheduling_counters` fail about 1 run in 20
+///    at `--test-threads=32`, reporting `Some(5)` for a count of 1.
+///
+/// Both failure modes are rare, which is worse than frequent: the symptom is
+/// one unrelated number off by a few, on a test that looks unconnected to
+/// whatever change is being reviewed.
+///
+/// Every producer this matters for runs on its caller's thread, so counting
+/// there is exact and needs no lock at all. The generated struct is a guard:
+/// `start()` installs a fresh per-thread vector, `Drop` removes it, and the
+/// global counters are untouched throughout — a sink reading the real table
+/// still sees every event.
+///
+/// Nothing it generates is compiled outside `#[cfg(test)]` — the macro itself
+/// is unconditional so the invocations below need no `cfg` of their own. The
+/// recorder pays one thread-local check per event in test builds and nothing
+/// in release.
+macro_rules! per_thread_event_capture {
+    (
+        $(#[$meta:meta])*
+        struct $name:ident, events $events:ident, tls $tls:ident
+    ) => {
+        #[cfg(test)]
+        thread_local! {
+            /// Installed by the capture guard; `None` on every thread that has
+            /// not asked to count.
+            static $tls: std::cell::RefCell<Option<Vec<u64>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        $(#[$meta])*
+        #[cfg(test)]
+        pub(crate) struct $name(());
+
+        #[cfg(test)]
+        impl $name {
+            /// Start counting THIS thread's events from zero. Dropping the
+            /// guard stops counting.
+            pub(crate) fn start() -> Self {
+                $tls.with(|c| *c.borrow_mut() = Some(vec![0; $events.len()]));
+                $name(())
+            }
+
+            /// This thread's count for `event`. Panics on an unknown name
+            /// rather than answering zero, which is how a renamed row would
+            /// otherwise pass.
+            pub(crate) fn count(&self, event: &str) -> u64 {
+                let idx = $events
+                    .iter()
+                    .position(|e| *e == event)
+                    .unwrap_or_else(|| panic!("no such counter: {event}"));
+                $tls.with(|c| c.borrow().as_ref().map_or(0, |v| v[idx]))
+            }
+
+            /// Forget everything counted so far and keep counting.
+            #[allow(dead_code)]
+            pub(crate) fn reset(&self) {
+                $tls.with(|c| {
+                    if let Some(v) = c.borrow_mut().as_mut() {
+                        v.iter_mut().for_each(|x| *x = 0);
+                    }
+                });
+            }
+
+            /// Add `n` to this thread's capture of row `idx`, if capturing.
+            /// Called from the recorder, which already resolved the index.
+            fn note(idx: usize, n: u64) {
+                $tls.with(|c| {
+                    if let Some(v) = c.borrow_mut().as_mut() {
+                        v[idx] += n;
+                    }
+                });
+            }
+        }
+
+        #[cfg(test)]
+        impl Drop for $name {
+            fn drop(&mut self) {
+                $tls.with(|c| *c.borrow_mut() = None);
+            }
+        }
+    };
+}
+
+per_thread_event_capture! {
+    /// A per-thread view of [`record_loop_xform_event`]. See
+    /// [`per_thread_event_capture`] for why the global table cannot be
+    /// asserted on directly; the planner runs on its caller's thread, so this
+    /// is exact.
+    struct LoopXformCapture, events LOOP_XFORM_EVENTS, tls LOOP_XFORM_CAPTURE
+}
+
+/// Read every loop-rewriter event's count, including zero-valued ones, in
+/// [`LOOP_XFORM_EVENTS`] order. Relaxed loads: a sample, not an atomic
+/// snapshot.
+pub fn loop_xform_counts() -> Vec<(&'static str, u64)> {
+    LOOP_XFORM_EVENTS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (*name, LOOP_XFORM_COUNTERS[i].load(Ordering::Relaxed)))
+        .collect()
+}
+
+// There is deliberately no `reset_loop_xform_counts_for_test`. Zeroing a
+// process-wide counter that every concurrent test is incrementing does not make
+// a count assertable — see [`LoopXformCapture`], which is what to use instead.
+
+/// Read every OSR event's count, including zero-valued ones, in
+/// [`OSR_EVENTS`] order. Relaxed loads: a sample, not an atomic snapshot.
+pub fn osr_counts() -> Vec<(&'static str, u64)> {
+    OSR_EVENTS
+        .iter()
+        .zip(OSR_COUNTERS.iter())
+        .map(|(name, c)| (*name, c.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// Test support: zero the OSR counters.
+#[cfg(test)]
+pub fn reset_osr_counts() {
+    for c in OSR_COUNTERS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Every scheduling event that discards a compilation request, in the fixed
 /// order [`scheduling_counts`] reports.
 pub const SCHEDULING_EVENTS: [&str; 4] = [
@@ -1426,7 +1718,21 @@ pub fn record_scheduling_events(event: &str, n: u64) {
     }
     if let Some(idx) = scheduling_index(event) {
         SCHEDULING_COUNTERS[idx].fetch_add(n, Ordering::Relaxed);
+        #[cfg(test)]
+        SchedulingCapture::note(idx, n);
     }
+}
+
+per_thread_event_capture! {
+    /// A per-thread view of [`record_scheduling_event`]. See
+    /// [`per_thread_event_capture`].
+    ///
+    /// The producer that matters here is `TieredCompilationManager`'s own
+    /// drain, which runs on the thread that called `next_fresh_task` — so a
+    /// test driving a manager it constructed counts exactly its own drops.
+    /// The compile WORKER thread also records, and a test that means to
+    /// observe a worker's drops must therefore still read the global table.
+    struct SchedulingCapture, events SCHEDULING_EVENTS, tls SCHEDULING_CAPTURE
 }
 
 /// Count one occurrence of `event`.
@@ -1465,8 +1771,13 @@ pub fn scheduling_dropped_total() -> u64 {
         + scheduling_count(SCHEDULING_EVENTS[3]).unwrap_or(0)
 }
 
-/// Zero every scheduling counter, so a test can assert on exact values without
-/// being perturbed by a sibling test in the same process.
+/// Zero every scheduling counter.
+///
+/// Only for a test that must read the GLOBAL table — `summary()` carries that
+/// table, so the summary-plumbing test cannot use [`SchedulingCapture`]. For
+/// "did my own thread's event get counted", use the capture: resetting a
+/// counter every other test is incrementing does not make it assertable, which
+/// is the whole argument in [`per_thread_event_capture`].
 ///
 /// `pub(crate)` and test-only: these counters are monotone by contract in a
 /// real run, and a production reset would make "how many requests has this
@@ -1518,6 +1829,22 @@ pub struct MetricsSummary {
     /// this summary. Same process-wide, metrics-flag-independent semantics as
     /// `bailout_categories`.
     pub scheduling: Vec<(&'static str, u64)>,
+    /// [`osr_counts`] verbatim: the OSR lifecycle, process-wide and
+    /// metrics-flag-independent like the two above.
+    ///
+    /// Read `osr_exited` against `osr_entered`, not on its own. The two being
+    /// close together is the livelock: every entry paying for a trampoline and
+    /// a local seed, then leaving immediately. `osr_entered` at zero with a
+    /// hot loop means the requests are being refused or declined, and the
+    /// other two rows say which.
+    pub osr: Vec<(&'static str, u64)>,
+    /// [`loop_xform_counts`] verbatim: bytecode loop-rewriter admission,
+    /// process-wide and metrics-flag-independent like the three above.
+    ///
+    /// The four refusal-condition rows **overlap** — read each against
+    /// `loop_xform_compiles`, never as a partition, and never by summing them.
+    /// See [`LOOP_XFORM_EVENTS`].
+    pub loop_xform: Vec<(&'static str, u64)>,
 }
 
 /// Aggregate the retained reports.
@@ -1577,6 +1904,8 @@ pub fn summary() -> MetricsSummary {
         phase_runs,
         bailout_categories: crate::bailout::bailout_counts(),
         scheduling: scheduling_counts(),
+        osr: osr_counts(),
+        loop_xform: loop_xform_counts(),
     }
 }
 
@@ -1617,6 +1946,8 @@ impl MetricsSummary {
             pairs(&self.bailout_categories)
         );
         let _ = write!(s, ",\"scheduling\":{}", pairs(&self.scheduling));
+        let _ = write!(s, ",\"osr\":{}", pairs(&self.osr));
+        let _ = write!(s, ",\"loop_xform\":{}", pairs(&self.loop_xform));
         s.push('}');
         s
     }
@@ -2177,6 +2508,46 @@ mod tests {
     }
 
     // ── Scheduling counters ──────────────────────────────────────────
+
+    /// Every OSR event is reported, in a fixed order, including zeros.
+    ///
+    /// The zeros are the point: "this never happened" is information, and a
+    /// summary whose row set changes with the run is one no sink can diff.
+    /// The exact edit that trips it: add a name to `OSR_EVENTS` without
+    /// widening `OSR_COUNTERS`, which is a compile error, or reorder them,
+    /// which this catches.
+    #[test]
+    fn osr_counts_report_every_event_in_a_fixed_order() {
+        let names: Vec<&str> = osr_counts().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, OSR_EVENTS.to_vec());
+        assert_eq!(osr_counts().len(), OSR_COUNTERS.len());
+    }
+
+    /// `record_osr_event` increments its own row and nothing else, and an
+    /// unknown name is ignored rather than panicking — it is called from the
+    /// interpreter's hot back-edge path.
+    #[test]
+    fn record_osr_event_increments_its_row_only() {
+        let _guard = METRICS_TEST_LOCK.lock();
+        reset_osr_counts();
+        record_osr_event("osr_entered");
+        record_osr_event("osr_entered");
+        record_osr_event("osr_exited");
+        record_osr_event("not_an_osr_event");
+        let counts: Vec<(&str, u64)> = osr_counts();
+        for (name, n) in &counts {
+            let want = match *name {
+                "osr_entered" => 2,
+                "osr_exited" => 1,
+                _ => 0,
+            };
+            assert_eq!(*n, want, "{name}");
+        }
+        // And it reaches the summary, which is the surface a run actually
+        // shows — a counter nothing reports is a counter nobody reads.
+        assert!(summary().osr.contains(&("osr_entered", 2)));
+        reset_osr_counts();
+    }
 
     #[test]
     fn scheduling_counts_report_every_event_in_a_fixed_order() {

@@ -37,7 +37,7 @@
 //! entries whose `Reference` OBJECT died, so the scans stay proportional to
 //! *live Reference objects* rather than to every reference ever created. A
 //! `WeakHashMap` with a million live entries still costs a million-entry scan
-//! per collection; see `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md`
+//! per collection; see `arch-2026-07-26/refs-metaspace-unloading.md`
 //! for the "cleared entries could be segregated into a cold list" sketch.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -85,7 +85,7 @@ pub struct ReferenceEntry {
     /// the Reference object died, its recycled address was "remapped" onto
     /// whatever innocent object reused the memory, corrupting it with
     /// perfectly-legal-looking writes (the FixedPointTest `Object(Some(0x4))`
-    /// / silent-null corruption; see docs/internal/h2-testscript-segv-findings.md).
+    /// / silent-null corruption; see gaps/h2-testscript-segv-findings.md).
     /// `clear_emitted`: the referent-null for this entry was already handed out.
     pub clear_emitted: bool,
     /// `action_emitted`: the cleaner action for this entry was already handed out.
@@ -264,7 +264,7 @@ pub struct ReferenceProcessor {
     /// ever be cleared on either VM path**, so soft references behaved exactly
     /// like strong ones and `OutOfMemoryError` was reached with a heap full of
     /// reclaimable soft-reachable objects. (Independently observed in
-    /// `docs/internal/fixed-suite-bugs/springboot/
+    /// `fixed-suite-bugs/springboot/
     /// core39-clusterD-lifecycle-ssl-validation-FIXED.md`: "`process_soft_refs`
     /// never ran even once during the whole failing run".)
     ///
@@ -632,7 +632,7 @@ impl ReferenceProcessor {
         // per-GC re-emission then corrupted that object with valid-looking
         // writes every collection (FixedPointTest `Object(Some(0x4))` /
         // silent-null corruption — proven by hexdump + the NO_REFPROC 6/6
-        // exclusion run; docs/internal/h2-testscript-segv-findings.md).
+        // exclusion run; gaps/h2-testscript-segv-findings.md).
         //
         // Java semantics want each of these EXACTLY ONCE: Reference.enqueue is
         // one-shot, a referent is nulled once, a Cleaner runs once, finalize()
