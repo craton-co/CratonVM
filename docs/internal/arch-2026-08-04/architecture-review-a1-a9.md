@@ -5,7 +5,9 @@
 **Status:** LANDED for A1, A3, A4a, A6, A7, A8. **A5 WITHDRAWN** and **A2
 CLOSED** — both rested on claims that measurement did not support, and A2's
 surviving residual was then measured and found negligible (§A5, §A2). **A4b
-NOT DONE** — scoped below, deliberately not half-landed. **A9 advisory.**
+PARTLY LANDED**: its correctness half turned out to be a real, unguarded gap in
+CI and is fixed; the interpreter rewrite is deliberately deferred, not
+half-landed. **A9 advisory.**
 
 Three of the nine findings were wrong in whole or in part, and all three errors
 share a shape: a conclusion drawn from the *storage* or from a grep, without
@@ -31,6 +33,7 @@ Files changed:
   `native-builtins/tests/lock_discipline_ratchet.rs` (A6)
 - `vm/src/runtime/lockfree_resolve.rs`,
   `vm/tests/no_test_only_public_api.rs` (A7, A8)
+- `difftest/src/main.rs` (A4b — the missing `interp-decoded` gate axis)
 - `.github/workflows/ci.yml` (A6, A7 gates)
 
 ---
@@ -43,16 +46,17 @@ Files changed:
 | A2 | "Statics cost a runtime tag load" | **CLOSED — half wrong, rest measured at 2-3 KiB** |
 | A3 | 13 diagnostic gates inline on the native-call funnel | **LANDED** |
 | A4a | Two byte-identical exception-unwind copies in the dispatch loop | **LANDED** |
-| A4b | 122 opcodes with two implementations; per-bytecode safepoint poll | **NOT DONE** — §A4b |
+| A4b | 122 opcodes with two implementations; per-bytecode safepoint poll | **PARTLY LANDED** — the decoded path was never differentially tested; now is. Rewrite deferred — §A4b |
 | A5 | "`SharedVm` has 458 methods" | **WITHDRAWN — wrong** |
 | A6 | Lock hierarchy has 0% adoption in `native-builtins` | **LANDED** (gate + first 2) |
 | A7 | Dead resolution tiers kept alive by their own tests | **LANDED** |
 | A8 | Second-tier invoke cache is one process-wide lock | **LANDED** |
 | A9 | 45% of the tree is inline test code | Advisory — §A9; the "tests don't run" half was wrong |
 
-Three CI gates were added, all injection-tested rather than inspected:
-`no_test_only_public_api` (A7), `lock_discipline_ratchet` (A6), and the
-compile-time layout assertions in `value.rs` (A1).
+Four CI gates were added or repaired, all injection-tested rather than
+inspected: `no_test_only_public_api` (A7), `lock_discipline_ratchet` (A6), the
+compile-time layout assertions in `value.rs` (A1), and the difftest gate's
+missing `interp-decoded` axis (A4b).
 
 ---
 
@@ -352,12 +356,50 @@ dispatch loop (`interpreter.rs:4306`, inside the loop that opens at 4251);
 method entry has its own polls at 3416 and 3680. The loop also re-derives
 `code_ptr` / `code_len` / the frame pointer each iteration.
 
-## Why it is not landed
+## The correctness half was unguarded — and that IS fixed
 
-This is the largest item in the review and the one with the most upside, but it
-is a rewrite, not a refactor: a token-threaded dispatch over pre-decoded
+Asking "how would such a divergence be caught today?" turned up a concrete gap
+worth more than the rewrite's first increment.
+
+`difftest` already models the decoded path as a first-class axis:
+`Mode::InterpDecoded` is the **only** mode that passes `--noverify`
+(`runner.rs:430`), and `matrix.rs:144` maps it to
+`PathAxis::InterpreterDecoded`, which no other mode claims. It is labelled,
+listed in `Mode::all()`, and listed in `execution_paths()`.
+
+**It was not in the gate's default mode list.** `RunArgs::modes` defaulted to
+`"jit-on,nojit"`, and the CI step runs
+`cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds`
+with no `--modes`. So the semantic differential gate compared the *fast* path
+against HotSpot on every PR and **never ran the decoded path at all** — the
+second implementation of those 122 opcodes had no differential coverage.
+
+`nojit` does not cover it, and is the trap: `matrix.rs:140` maps `Mode::NoJit`
+to `InterpreterFast`. It is the raw superinstruction path with the JIT out of
+the picture, not the decoded one. The two read alike in a mode list.
+
+This repository has already lost 1,522 tests to a configuration nothing
+compiled. An axis that exists, is documented, and is never run is the same
+failure in a different costume.
+
+**Fixed.** The default is now `"jit-on,nojit,interp-decoded"`, and two tests in
+`difftest/src/main.rs` pin it:
+`the_gate_default_covers_both_interpreter_implementations` (both interpreter
+axes must be covered) and `only_interp_decoded_supplies_the_decoded_axis`
+(guards substituting a mode that does not actually disable the raw handlers).
+Injection-tested: reverting the default to `"jit-on,nojit"` fails both.
+
+This converts A4b from a **correctness risk** into a **cost and performance**
+item — a materially different priority.
+
+## Why the rewrite is not landed
+
+It is a rewrite, not a refactor: a token-threaded dispatch over pre-decoded
 instruction words built on the existing `QuickenedCode`, retiring the raw/decoded
-split and moving the safepoint poll to a dispatch-table swap.
+split and moving the safepoint poll to a dispatch-table swap. What remains to
+justify it is the maintenance cost — every fix to those 122 opcodes still lands
+twice — and the per-bytecode prologue. Neither is any longer an unguarded
+correctness hazard.
 
 Two notes for whoever takes it, both learned while scoping A4a:
 
