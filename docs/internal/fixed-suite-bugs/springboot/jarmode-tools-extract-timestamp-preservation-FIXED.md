@@ -73,6 +73,18 @@ is on this path. This was never a regression — it is a platform gap that the
 July verification could not have caught, and the first Linux run of these
 classes exposed it.
 
+The suite history confirms that rather than assuming it. Grepping every run
+under `apps/spring-boot-suite-runner/.suite/results/` for these classes finds
+exactly two pre-fix runs, and both are red with **identical** counts:
+
+| Run | `ExtractCommandTests` | `ExtractLayersCommandTests` |
+|---|---|---|
+| `craton-fullsuite-azure-20260802` (first Linux run covering them) | FAIL 1/22 | FAIL 3/6 |
+| `craton-residual32-20260804` | FAIL 1/22 | FAIL 3/6 |
+
+There is no green Linux run to have regressed from, and no change in the
+failure between the 08-02 and 08-04 runs that a 07-28 commit could explain.
+
 ## The fix
 
 `native-builtins/src/phases_late/nio_file.rs`:
