@@ -5,11 +5,11 @@
 > Known stale as of 2026-08-04: **all six `loader/spring-boot-jarmode-tools`
 > rows below now PASS**, on HotSpot and on CratonVM with JIT and `--nojit`.
 > `ExtractCommandTests`/`ExtractLayersCommandTests` were a real VM defect —
-> `docs/internal/fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
+> `fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
 > The other four were **never CratonVM defects**: HotSpot failed them
 > identically, because this fixture checkout's expected-output resources are
 > CRLF while `println` on Linux emits LF —
-> `docs/internal/fixed-suite-bugs/springboot/jarmode-tools-crlf-fixture-phantom-failures-FIXED.md`.
+> `fixed-suite-bugs/springboot/jarmode-tools-crlf-fixture-phantom-failures-FIXED.md`.
 >
 > That doc also covers the runner gap that let HotSpot-shared failures be filed
 > as CratonVM defects, now fixed (`BOTH-FAIL`). **A HotSpot control over the

@@ -8095,7 +8095,7 @@ pub(crate) fn files_write_string_impl(
 ///
 /// Routing through the same gated open `newOutputStream` already used fixes all
 /// three at once. See
-/// docs/known-issues/springboot/nio-write-ignores-nofollow-links-symlink-20260804.md.
+/// fixed-suite-bugs/springboot/nio-write-ignores-nofollow-links-symlink-20260804-FIXED.md.
 pub(crate) fn p57_files_write_bytes(
     ctx: &mut dyn NativeContext,
     path_obj: ObjectRef,
@@ -14244,7 +14244,7 @@ fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> 
 /// even though `setTimes` had written them to the inode correctly. The
 /// Windows carrier's names (`creationTime`/`lastAccessTime`/`lastWriteTime`)
 /// happen to be genuine, which is why this only ever showed up on Linux.
-/// See docs/known-issues/springboot/jarmode-tools-extract-timestamp-preservation.md.
+/// See fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md.
 fn unix_attr_time_fields(which: &str) -> (&'static str, &'static str, &'static str) {
     match which {
         "creation" => ("st_birthtime_sec", "st_birthtime_nsec", "st_birthtime"),
