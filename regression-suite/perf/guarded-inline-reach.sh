@@ -35,9 +35,22 @@
 #   guarded-inline-reach.sh -Exe "$PWD/target/release/cratonvm" --label bintrees -- \
 #       -Xmx4g -cp /tmp/classes CratonBench bintrees
 #
-# The run sets CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1 itself: with the feature
-# off every virtual site is refused `guard-not-emittable` and the reach
-# question cannot be asked at all. Pass --off to measure the default instead.
+# The run sets TWO flags itself, and it takes both:
+#
+#   CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1  the lowering. Without it every
+#                                          virtual site is refused
+#                                          `guard-not-emittable`.
+#   CRATONVM_TIER_PGO=1                    the EVIDENCE. Receiver-type
+#                                          recording is opt-in
+#                                          (`SharedVm::new` only calls
+#                                          `enable_profiling(true)` under this
+#                                          gate), so without it every virtual
+#                                          site is refused
+#                                          `no-profile-evidence` and the
+#                                          feature reaches exactly nothing —
+#                                          measured, not assumed.
+#
+# Pass --off to measure the default configuration instead.
 
 set -uo pipefail
 
@@ -72,9 +85,9 @@ fi
 OUT="${KEEP:-$(mktemp)}"
 rm -f "$OUT"
 
-env_args=(CRATONVM_JIT_METRICS=1 "CRATONVM_JIT_METRICS_OUT=$OUT")
+env_args=(CRATONVM_JIT_METRICS=1 "CRATONVM_JIT_METRICS_OUT=$OUT" CRATONVM_QUIET_DEPRECATIONS=1)
 if [[ "$FLAG_ON" == "1" ]]; then
-  env_args+=(CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1)
+  env_args+=(CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1 CRATONVM_TIER_PGO=1)
 fi
 
 timeout "$TIMEOUT" env "${env_args[@]}" "$EXE" "$@" >/dev/null 2>&1
@@ -132,7 +145,7 @@ for line in open(path, encoding="utf-8"):
 pct = lambda n, d: f"{100.0 * n / d:5.1f}%" if d else "    - "
 
 print(f"guarded-inline reach — {label}"
-      f"  (CRATONVM_JIT_GUARDED_VIRTUAL_INLINE={'1' if flag_on else 'default'})")
+      f"  ({'GUARDED_VIRTUAL_INLINE=1 TIER_PGO=1' if flag_on else 'default flags'})")
 print(f"  installed bodies         {installed:6d}")
 print(f"  single-pass              {single:6d}  {pct(single, installed)}   <- the only population this feature can reach")
 print(f"  optimizing (IR)          {optimizing:6d}  {pct(optimizing, installed)}   <- out of reach; the IR tier plans no inline")
