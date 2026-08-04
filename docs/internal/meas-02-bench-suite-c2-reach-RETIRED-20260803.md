@@ -194,6 +194,12 @@ Both suites had an array-opcode row before `cov-02` — the candidate one
 line numbers moved with the same change (5204 → 5329, 5085 → 5210): same two
 sites, re-derived, not new ones.
 
+Measured at `50218df9b`, which has `cov-02` and not `cov-01` — `cov-01` landed
+immediately after and takes the `ldc` row with it. Every remaining `cov-*`
+lane will move a row here on the day it lands; that is what they are for. The
+durable part of this lane is not the cell values, it is that re-taking them is
+one command per phase and that the gate now records its own.
+
 ### Sizes, and what sizing them taught
 
 `DISPATCH_REQS` = 400,000, `BIND_REQS` = 2,000,000, `PIPELINE_BATCHES` =

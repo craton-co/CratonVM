@@ -142,6 +142,15 @@ once on `0x54 bastore`. The two `ir.rs` line numbers moved with the same
 change (5204 → 5329, 5085 → 5210); they are the same two sites, re-derived,
 not new ones.
 
+**This table is revision-stamped and expected to go stale.** It is measured at
+`50218df9b`, which has `cov-02` and not `cov-01`; `cov-01` landed immediately
+after and takes the `0x12 ldc` row with it. Every remaining `cov-*` lane will
+move a row here the day it lands — that is the point of them. Do not patch a
+cell: re-take the whole column, which is one command per phase
+(`regression-suite/perf/c2-reach.sh`), and re-stamp the revision. A table with
+one fresh row and six stale ones is the failure this directory's own rules
+already name twice.
+
 ## Where the 390 die: opcodes `IrBuilder::build` has no arm for
 
 273 events. `[ir] IrBuilder::build has no lowering for opcode 0xNN`.
