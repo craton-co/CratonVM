@@ -14571,6 +14571,43 @@ fn try_compile_inner(
                     );
                     drop(metrics_lower);
                     if let Some(mut compiled) = lowered {
+                        // cov-06 residual: a surviving `Op::New` or
+                        // `Op::NewArray` allocation call can fail (OOM, or a
+                        // negative length for an array) and stash a pending
+                        // exception through the SAME `JIT_PENDING_EXCEPTION`
+                        // channel `getstatic`/an invoke uses — see the
+                        // `ir_static_init_classes` `has_dispatch` arm below
+                        // ("the `jit-clinit-gap-has-dispatch` defect") for the
+                        // identical shape. Without `has_dispatch`, the VM's
+                        // fast call entry never drains that pending exception,
+                        // so the allocation helper's `i64::MIN` failure
+                        // sentinel is NOT recognised as a deopt/exception —
+                        // `execute_jit_call`'s `b'[' | b'L'` return arm only
+                        // checks `result == 0`, so `i64::MIN` (`!= 0`) is
+                        // pushed as `Value::Object(Some(ObjectRef::from_raw(
+                        // 0x8000000000000000)))`, an address no live heap
+                        // region contains. Reading it back later degrades
+                        // through the NaN-box plausibility gate to
+                        // `Value::Long` (see `CompactValue::to_value`), and a
+                        // subsequent array/field access on it then reads as
+                        // silently null instead of throwing the real
+                        // OutOfMemoryError/NegativeArraySizeException.
+                        //
+                        // Reached in practice: a hot method that `newarray`s
+                        // in a tight loop under GC/heap pressure eventually
+                        // hits this path (`vm/tests/jit_cov06_array_allocation.rs`
+                        // reproduced it deterministically once the surrounding
+                        // program's memory footprint was large enough to
+                        // trigger it before `--Xmx 32m` was exhausted).
+                        // `Op::New` has the identical gap for plain object
+                        // allocation — same fix, same reasoning.
+                        if graph
+                            .nodes
+                            .iter()
+                            .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }))
+                        {
+                            compiled.has_dispatch = true;
+                        }
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using

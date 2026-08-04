@@ -6370,6 +6370,12 @@ pub(super) fn execute_jit_call(
                 .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
         }
         b'[' | b'L' => {
+            if std::env::var_os("COV06_TRACE").is_some() {
+                eprintln!(
+                    "[COV06-RET] {}.{}{} return_type={} result=0x{:x}",
+                    cached.class_name, cached.method_name, cached.method_descriptor, return_type as char, result
+                );
+            }
             if result == 0 {
                 thread.frames[frame_idx]
                     .stack
@@ -6753,6 +6759,12 @@ pub(super) fn execute_jit_call_decoded(
                 .push_unchecked(Value::Double(d));
         }
         b'[' | b'L' => {
+            if std::env::var_os("COV06_TRACE").is_some() {
+                eprintln!(
+                    "[COV06-RET] {}.{}{} return_type={} result=0x{:x}",
+                    cached.class_name, cached.method_name, cached.method_descriptor, return_type as char, result
+                );
+            }
             if result == 0 {
                 thread.frames[frame_idx]
                     .stack
