@@ -5382,18 +5382,21 @@ fn a_volatile_static_agrees_on_both_backends() {
 // transform the lane must not lose.
 // ---------------------------------------------------------------------------
 
-/// How many times [`counting_new_object`] has been asked for an object. The
-/// elision test asserts this does NOT move; the allocation test asserts it
-/// moves exactly once per invocation.
-static NEW_OBJECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Stands in for the VM heap so a live (escaping) `Op::New` has something to
 /// return. `jit_new_object`'s ABI: `(vm_ptr, class_id, num_fields) -> oop`,
 /// `0` on failure. Zero-initialised, 8-aligned and above the
 /// `TEST_REGION_BOUNDS` floor exactly like [`make_object`]'s buffers, and
 /// deliberately leaked — JIT-emitted code holds the raw address.
-unsafe extern "C" fn counting_new_object(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
-    NEW_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+///
+/// Each test that counts allocations owns its **own** counter and its own
+/// `extern "C"` wrapper around this, declared inside the test body. A single
+/// shared counter is wrong here and was wrong once: `cargo test` runs these
+/// tests on concurrent threads, so a global would have the two allocating tests
+/// incrementing each other's expected values. That is a flaky test, which this
+/// directory's rule 5 rates worse than no test — and it cost a real diagnosis,
+/// because the interference looked exactly like "escape analysis failed to
+/// scalar-replace" until `CRATONVM_DBG_SCALAR_NEW=1` said `1/1`.
+fn leak_zeroed_object(num_fields: i64) -> i64 {
     let words = (HEADER_SIZE + num_fields as usize * SLOT_SIZE)
         .div_ceil(8)
         .max(1);
@@ -5559,27 +5562,35 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
     // `0xb7` arm ahead of the elision branch. The elidable arm then dispatches
     // and `must_not_dispatch` panics.
     //
-    // NOT asserted here, deliberately: that the allocation itself disappears.
-    // It does not — this shape reaches `jit_new_object` once per invocation in
-    // BOTH arms, unchanged by cov-04 (the elidable arm's graph is identical to
-    // the one the pre-cov-04 builder produced, since elision has always won it).
-    // Whether escape analysis ought to scalar-replace a `new` whose only uses
-    // are its own field ops is a question for the EA owner, recorded as a
-    // residual in `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`.
+    // The allocation is asserted too, in both directions, because escape
+    // analysis reports `scalar-replaced 1/1` for the elidable arm and `0/1` for
+    // the control (`CRATONVM_DBG_SCALAR_NEW=1`): with the constructor elided the
+    // object never escapes and the allocation disappears outright; with the
+    // constructor called, the call arg-escapes the receiver and pins it. That
+    // pair is the whole reason the elision must be tried first.
     cratonvm_jit::x64::set_moving_young_override(Some(false));
     unsafe extern "C" fn must_not_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
         panic!("an elidable <init>()V on a fresh `new` was DISPATCHED, not elided");
     }
+    unsafe extern "C" fn must_not_allocate(_vm: i64, _c: i64, _n: i64) -> i64 {
+        panic!("a scalar-replaced `new` reached the allocation helper");
+    }
+    // Test-local, never shared: see `leak_zeroed_object`.
     static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     unsafe extern "C" fn counting_dispatch(_vm: i64, _i: i64, _a: i64, num_args: i64) -> i64 {
         assert_eq!(num_args, 1, "<init>()V takes the receiver and nothing else");
         CTOR_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         0
     }
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = must_not_dispatch as *const () as usize;
-    helpers.new_object = counting_new_object as *const () as usize;
+    helpers.new_object = must_not_allocate as *const () as usize;
     helpers.getfield = legacy_getfield as *const () as usize;
     helpers.putfield_int = legacy_putfield_int as *const () as usize;
     let code = vec![
@@ -5653,19 +5664,22 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         .expect("an elidable trivial-<init> allocation must still compile");
     assert!(ir.used_ir_backend, "this test is about the IR arm");
     for n in [11i64, 0, -4] {
-        // SAFETY: the emitted code touches only the buffer `counting_new_object`
-        // handed it. Reaching `must_not_dispatch` is the failure, not a call.
+        // SAFETY: with the allocation scalar-replaced the emitted code touches
+        // no heap memory at all. Reaching either helper is the failure — both
+        // panic rather than returning something plausible.
         let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
             .unwrap_or_else(|e| panic!("elidable-init method n={n}: {e:?}"));
         assert_eq!(r, n, "the field written is the field read back");
     }
 
     // Arm 2 — the control. Identical bytecode, but the elision analysis
-    // DECLINES the site, so the constructor must be really called. Without this
+    // DECLINES the site, so the constructor must be really called AND the
+    // object really allocated (the call arg-escapes its receiver). Without this
     // arm the test above would also pass on a builder that silently dropped
     // every `<init>`.
     let mut call_helpers = helpers;
     call_helpers.invoke_dispatch = counting_dispatch as *const () as usize;
+    call_helpers.new_object = counting_alloc as *const () as usize;
     let not_elidable = |_cp: u16| -> bool { false };
     let ir2 = compile(&not_elidable, &call_helpers)
         .expect("a non-elidable <init>()V on a fresh `new` must still compile — cov-04");
@@ -5680,6 +5694,12 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
             i + 1,
             "a constructor the elision analysis declines must be CALLED, once \
              per invocation"
+        );
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "and its receiver arg-escapes into that call, so the allocation must \
+             survive — once per invocation, never scalar-replaced"
         );
     }
 }
@@ -5720,9 +5740,15 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
             n => panic!("unexpected arg count {n}"),
         }
     }
+    // Test-local, never shared: see `leak_zeroed_object`.
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = ctor_or_sink as *const () as usize;
-    helpers.new_object = counting_new_object as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
     let code = vec![
         0xbb, 0x00, 0x03, // new #3
         0x59, // dup
@@ -5757,7 +5783,6 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
     };
     // Nothing is elidable here: this is the case the elision analysis DECLINES.
     let elidable = |_cp: u16| -> bool { false };
-    let before = NEW_OBJECT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
     let ir = compile_with_dispatch_and_new(&cm, &helpers, &resolver, &new_resolver, &elidable)
         .expect(
             "a `new X(n)` with a non-elidable constructor must lower through the \
@@ -5767,13 +5792,13 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
     let dummy_vm = [0u8; 64];
     for (i, n) in [3i64, -2, 0, 9].into_iter().enumerate() {
         // SAFETY: every pointer the emitted code touches comes from
-        // `counting_new_object`, which hands out live leaked 8-aligned buffers.
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
         let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
             .unwrap_or_else(|e| panic!("new + non-elidable ctor n={n}: {e:?}"));
         assert_eq!(r, n * 5, "constructor side effect must be visible to `sink`");
         assert_eq!(
-            NEW_OBJECT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + i + 1,
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
             "an object passed to a call arg-escapes: it must be really allocated, \
              once per invocation, not scalar-replaced",
         );

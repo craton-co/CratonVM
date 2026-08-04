@@ -235,11 +235,13 @@ Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
   `new Corpus(n)` then `sink(c)`; the constructor writes `n * 5` and `sink`
   reads it back, and the allocation counter must advance once per invocation.
 * `ir_elidable_trivial_init_on_fresh_new_is_still_elided` — the transform the
-  lane must not lose, as a two-armed comparison: with the site elidable the
-  dispatch helper must never run; with the identical bytecode declined by the
-  elision analysis it must run once per invocation. The second arm exists
-  because the first alone would also pass on a builder that silently dropped
-  every `<init>`.
+  lane must not lose, as a two-armed comparison over identical bytecode. With
+  the site elidable, neither the dispatch helper nor the allocation helper may
+  run (escape analysis scalar-replaces the object outright — both helpers
+  `panic!` rather than returning something plausible). With the site declined by
+  the elision analysis, both must run exactly once per invocation. The second
+  arm exists because the first alone would also pass on a builder that silently
+  dropped every `<init>`.
 
 Each test names the exact edit that trips it, per this directory's rule 5. On
 the merged tree `cargo test --release -p cratonvm-jit --lib` is 1,868 / 0 and
@@ -269,26 +271,39 @@ direction that has nothing to do with moving code.
 
 ## Residuals
 
-* **A `new` whose only uses are its own field ops is still allocated.** Found
-  while writing the elision test; not caused by this lane — with the site
-  elidable the graph is identical to the one the pre-`cov-04` builder produced,
-  because elision has always won that case. Repro is in the test:
-  `new Corpus(); c.f0 = n; return c.f0` with an elidable `<init>` reaches
-  `jit_new_object` once per invocation instead of being scalar-replaced.
-  Whether escape analysis should catch this shape is the EA owner's question;
-  `CRATONVM_DBG_SCALAR_NEW=1` reports what it decided.
 * **`<init>` sites keep helper dispatch**, by choice (increment 1). Binding them
   directly is a measurable follow-up, not a gap.
 * **A constructor with a `long` / `double` / `float` parameter** is still
-  refused by `static_call_shape`, and one refused site still discards
-  `invoke_info` for the whole method. Zero events in this corpus — all four
-  remaining non-emittable reasons scored zero — so there is nothing to size it
-  from.
-* **The all-or-nothing discard itself.** One non-emittable invoke costs the
+  refused by `static_call_shape`, and one refused site would still discard
+  `invoke_info` for the whole method. **Measured at zero** across 669
+  invoke-bearing compiles on the merged tree — as are all four other
+  non-emittable reasons, and `call_eligible` itself. There is nothing left to
+  size this from: the census now prints no `NO invoke_info` line at all.
+* **The all-or-nothing discard itself.** One non-emittable invoke would cost the
   method every other invoke's lowering. It is not *wrong* (the builder bails on
   any invoke it cannot lower, so the method was lost either way), and it now
-  measures at zero, but it is why the two terms this lane removed cost 68 events
+  never fires, but it is why the two terms this lane removed cost 106 events
   rather than being confined to the sites that caused them.
+
+### A residual that turned out not to exist
+
+An earlier draft of this document recorded, as a finding for the escape-analysis
+owner, that *"a `new` whose only uses are its own field ops is still
+allocated"* — the elision test's allocation counter moved when it should not
+have. That was wrong, and the way it was wrong is the useful part.
+
+`CRATONVM_DBG_SCALAR_NEW=1` reports **`scalar-replaced 1/1`** for the elidable
+arm and **`0/1`** for the control. Escape analysis is doing exactly the right
+thing in both. The counter moved because it was a **single `static` shared by
+two `#[test]` functions, which `cargo test` runs on concurrent threads** — the
+other test's allocations were being counted against this one's expectation. A
+flaky assertion, which rule 5 rates worse than no assertion, dressed up as a
+compiler defect and nearly shipped as one.
+
+Both tests now own their counter and their `extern "C"` wrapper, declared inside
+the test body, and the elision test asserts the allocation behaviour in **both**
+directions — gone when the constructor is elided, present once per invocation
+when it is called. Ask the diagnostic before writing the residual.
 
 ## Reproducing
 
