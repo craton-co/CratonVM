@@ -114,7 +114,29 @@ public class JdkOnlyCensusLoadProbe {
         } catch (IOException io) {
             throw new RuntimeException(io);
         }
-        System.out.println("properties n=" + n + " sysprops=" + sys.size());
+        // Count a fixed set of load-bearing keys rather than sys.size().
+        // The raw size is not comparable across VMs -- CratonVM deliberately
+        // publishes some tuning properties HotSpot does not -- so comparing it
+        // makes this line differ forever and trains a reader to skip the diff.
+        // What is worth asserting is that nothing HotSpot guarantees is MISSING.
+        String[] required = {
+            "java.home", "java.version", "java.vendor", "java.class.path",
+            "java.io.tmpdir", "java.library.path", "os.name", "os.arch",
+            "os.version", "file.separator", "path.separator", "line.separator",
+            "user.dir", "user.home", "user.name", "file.encoding",
+            "native.encoding", "java.specification.version",
+            "java.class.version", "java.vm.name", "java.vm.version",
+            "sun.cpu.endian", "sun.io.unicode.encoding", "sun.java.command",
+            "sun.java.launcher", "sun.jnu.encoding",
+        };
+        int present = 0;
+        StringBuilder missing = new StringBuilder();
+        for (String key : required) {
+            if (System.getProperty(key) != null) present++;
+            else missing.append(' ').append(key);
+        }
+        System.out.println("properties n=" + n + " required=" + present + "/" + required.length
+                + " missing=[" + missing.toString().trim() + "]");
     }
 
     static void io() {
