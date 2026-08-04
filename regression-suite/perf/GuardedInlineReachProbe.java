@@ -60,80 +60,67 @@ public class GuardedInlineReachProbe {
         }
     }
 
+    // NOTE ON SHAPE. Every dispatching method below is a LEAF called many
+    // times by `main`, not a loop that dispatches internally. Invocation-count
+    // tiering is what compiles a method; a loop-bearing method called forty
+    // times never reaches the threshold and would only be compiled through
+    // OSR, which is a different door and not the one guarded inlining is
+    // planned at. A first version of this probe got that wrong and measured
+    // ten compiled bodies for a workload doing tens of millions of dispatches.
+
     // Monomorphic interface site: one implementation, forever.
-    static int monomorphicInterface(Op op, int n) {
-        int acc = 0;
-        for (int i = 0; i < n; i++) {
-            acc += op.apply(i);
-        }
-        return acc;
+    static int monomorphicInterface(Op op, int x) {
+        return op.apply(x);
     }
 
     // Bimorphic virtual site: two overriding classes, evenly mixed.
-    static int bimorphicVirtual(Shape a, Shape b, int n) {
-        int acc = 0;
-        for (int i = 0; i < n; i++) {
-            acc += ((i & 1) == 0 ? a : b).area(i & 0xff);
-        }
-        return acc;
+    static int bimorphicVirtual(Shape a, Shape b, int x) {
+        return ((x & 1) == 0 ? a : b).area(x & 0xff);
     }
 
-    // Megamorphic-ish: three implementations in rotation. Under the 92%
-    // two-type bar, so it must be REFUSED — its presence in the histogram is
-    // as informative as the sites that are admitted.
-    static int polymorphicInterface(Op[] ops, int n) {
-        int acc = 0;
-        for (int i = 0; i < n; i++) {
-            acc += ops[i % ops.length].apply(i & 0xffff);
-        }
-        return acc;
+    // Three implementations in rotation. Under the 92% two-type bar, so it
+    // must be REFUSED — its presence in the histogram is as informative as
+    // the sites that are admitted.
+    static int polymorphicInterface(Op[] ops, int x) {
+        return ops[x % ops.length].apply(x & 0xffff);
     }
 
-    static int collections(int n) {
+    // Interface calls into `java.util` through the interface type — the shape
+    // that dominates real framework code.
+    static int collectionStep(java.util.List<Integer> list,
+                              java.util.Map<Integer, Integer> map, int x) {
+        int acc = list.get(x & 0x1ff);
+        map.put(x & 0xff, acc);
+        Integer got = map.get(x & 0xff);
+        return got == null ? acc : acc + (got & 1);
+    }
+
+    static int stringStep(int x) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("row-").append(x).append('/').append(x & 0xff);
+        String s = sb.toString();
+        return s.length() + s.indexOf('/');
+    }
+
+    public static void main(String[] args) {
+        int iterations = args.length > 0 ? Integer.parseInt(args[0]) : 400_000;
+        Op only = new AddOne();
+        Op[] three = {new AddOne(), new Doubler(), new Negate()};
+        Shape sq = new Square();
+        Shape ci = new Circle();
         java.util.List<Integer> list = new java.util.ArrayList<>();
         for (int i = 0; i < 512; i++) {
             list.add(i);
         }
         java.util.Map<Integer, Integer> map = new java.util.HashMap<>();
-        int acc = 0;
-        for (int round = 0; round < n; round++) {
-            for (int i = 0; i < list.size(); i++) {
-                acc += list.get(i);
-            }
-            map.put(round & 0xff, acc);
-            Integer got = map.get(round & 0xff);
-            if (got != null) {
-                acc += got & 1;
-            }
-        }
-        return acc;
-    }
-
-    static int strings(int n) {
-        int acc = 0;
-        for (int i = 0; i < n; i++) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("row-").append(i).append('/').append(i & 0xff);
-            String s = sb.toString();
-            acc += s.length() + s.indexOf('/');
-        }
-        return acc;
-    }
-
-    public static void main(String[] args) {
-        int scale = args.length > 0 ? Integer.parseInt(args[0]) : 4000;
-        Op only = new AddOne();
-        Op[] three = {new AddOne(), new Doubler(), new Negate()};
-        Shape sq = new Square();
-        Shape ci = new Circle();
 
         long acc = 0;
-        for (int round = 0; round < 40; round++) {
-            acc += monomorphicInterface(only, scale);
-            acc += bimorphicVirtual(sq, ci, scale);
-            acc += polymorphicInterface(three, scale);
-            acc += collections(scale / 40);
-            acc += strings(scale / 4);
+        for (int i = 0; i < iterations; i++) {
+            acc += monomorphicInterface(only, i);
+            acc += bimorphicVirtual(sq, ci, i);
+            acc += polymorphicInterface(three, i);
+            acc += collectionStep(list, map, i);
+            acc += stringStep(i);
         }
         // Printed so the whole thing cannot be optimised away, and so a run
         // that produced no work is visibly different from one that did.
