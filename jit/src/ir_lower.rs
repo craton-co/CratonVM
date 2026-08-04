@@ -624,8 +624,18 @@ struct Lowerer<'a> {
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
     args_stage_top_off: i32,
     /// Upper bound (inclusive) for a spill slot's frame offset — excludes the
-    /// shadow space AND the arg-staging region so spills never overlap them.
+    /// shadow space, the arg-staging region AND the callee-saved XMM save area,
+    /// so spills never overlap any of them.
     spill_cap_off: i32,
+    /// Bytes reserved for the callee-saved XMM save area, `[spill_cap_off,
+    /// spill_cap_off + this)`. See [`ir_saved_xmm_bytes`] and
+    /// [`IR_LOWER_SAVED_XMMS`].
+    ///
+    /// Latched at construction rather than re-derived at emission time: the
+    /// frame was *laid out* against this number, and a prologue that recomputed
+    /// it from a flag read a second time would silently write outside its own
+    /// reservation if the two reads ever disagreed.
+    saved_xmm_bytes: i32,
     /// Native offsets of `JE rel32` instructions emitted after each dispatch
     /// call (the exception sentinel check) that jump to the shared bail stub.
     call_exc_patches: Vec<usize>,
@@ -834,8 +844,8 @@ impl<'a> Lowerer<'a> {
         let max_call_args = needs.max_call_args;
 
         // Frame layout (rbp downward): locals, [context slot], five bookkeeping
-        // words, spills, [args staging], 16-byte stack-arg reserve, 32-byte
-        // shadow. Reserve slots for
+        // words, spills, [callee-saved XMM save area], [args staging], 16-byte
+        // stack-arg reserve, 32-byte shadow. Reserve slots for
         // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
@@ -867,12 +877,14 @@ impl<'a> Lowerer<'a> {
         // previously `(graph.nodes.len() as i32) * 8` on a pathological graph
         // could.
         let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
+        let saved_xmm_bytes = ir_saved_xmm_bytes();
         debug_assert_eq!(
             frame_size,
             ((locals_size
                 + context_size
                 + bookkeeping_size
                 + spill_size
+                + saved_xmm_bytes
                 + args_stage_size
                 + shadow
                 + stack_arg_reserve)
@@ -953,7 +965,21 @@ impl<'a> Lowerer<'a> {
         let phi_copy_scratch_slot_off = (base + 4) * 8;
         let first_spill = (base + 5) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
-        let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
+        // The callee-saved XMM save area sits directly ABOVE the spill band and
+        // directly BELOW the outgoing-argument staging, so `callee_saved_lo`
+        // stays exactly `spill_cap_off` and the band the GC verifier skips
+        // (`conservative_roots::band_slot_is_verifiable`) grows to cover it
+        // without any change on the reader side. That placement is not
+        // cosmetic: a register image is precisely "storage this frame does not
+        // resume from", which is what that band means.
+        //
+        // Register `i` occupies offsets `(xmm_saved_lo + 16*i, xmm_saved_lo +
+        // 16*(i+1)]`, so its `MOVUPS` base is `[rbp - (spill_cap_off +
+        // 16*(i+1))]` and the 16 bytes it writes run up to `rbp -
+        // spill_cap_off` exclusive — inside the reservation, never over a
+        // spill.
+        let spill_cap_off =
+            frame_size - shadow - stack_arg_reserve - args_stage_size - saved_xmm_bytes;
 
         Lowerer {
             graph,
@@ -1021,6 +1047,7 @@ impl<'a> Lowerer<'a> {
             next_sp_id: 1,
             args_stage_top_off,
             spill_cap_off,
+            saved_xmm_bytes,
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
@@ -1688,6 +1715,61 @@ fn reloc_emit_enabled() -> bool {
 
     // ── Code emission helpers ────────────────────────────────────────
 
+    /// The callee-saved XMM registers this method actually parked a value in,
+    /// paired with the frame offset each is saved at.
+    ///
+    /// Empty on System V (nothing is callee-saved), empty when the linear-scan
+    /// path is off, and empty for any method whose allocation promoted nothing
+    /// into XMM6/XMM7 — which is the common case even with the flag on. A
+    /// method that uses none of them emits no save, no restore and pays only
+    /// the reserved frame bytes.
+    ///
+    /// Reads the residency plan, which `lower_inner_with_scopes` installs
+    /// BEFORE `lower()` runs (`set_residency`, "installed before the prologue
+    /// and never touched again"). That ordering is what makes a *dynamic* save
+    /// set legal against a *static* frame reservation: the set can only shrink
+    /// relative to `IR_LOWER_SAVED_XMMS`, never grow past it.
+    fn saved_xmm_regs(&self) -> impl Iterator<Item = (u8, i32)> + '_ {
+        let base = self.spill_cap_off;
+        let reserved = self.saved_xmm_bytes;
+        IR_LOWER_SAVED_XMMS
+            .iter()
+            .enumerate()
+            .filter(move |_| reserved > 0)
+            .filter(move |(_, reg)| self.reg_of.iter().any(|r| *r == Some(**reg)))
+            // Cast: `IR_LOWER_SAVED_XMMS` has two elements.
+            .map(move |(i, reg)| (*reg, base + (i as i32 + 1) * 16))
+    }
+
+    /// `MOVUPS [rbp - off], xmm` (save) or `MOVUPS xmm, [rbp - off]` (restore).
+    ///
+    /// Unaligned on purpose: `frame_size` is 16-byte aligned but `rbp` itself is
+    /// only guaranteed 8-byte aligned at entry (the `push rbp` follows the
+    /// caller's `call`), so `MOVAPS` would fault on half the call sites. The
+    /// three-byte cost of the unaligned form is paid once per method.
+    ///
+    /// Both registers are below XMM8, so no REX byte — the same constraint
+    /// `fp_load`/`fp_store` live under, restated here because this function
+    /// would silently encode the wrong register if it were ever handed one.
+    fn emit_xmm_frame_move(&mut self, reg: u8, off: i32, store: bool) {
+        debug_assert!(reg < 8, "xmm{reg} needs REX.R, which this encoding omits");
+        self.buf.emit(&[0x0F, if store { 0x11 } else { 0x10 }]);
+        // ModRM: mod=10 (disp32), reg=xmm, rm=101 (rbp-relative).
+        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+        self.buf.emit(&(-off).to_le_bytes());
+    }
+
+    /// Restore the callee-saved XMM registers. Emitted at every exit, and it
+    /// must not disturb RAX — a method's return value and the `i64::MIN`
+    /// exception/deopt sentinel both travel there — which `MOVUPS` into an XMM
+    /// satisfies for free.
+    fn emit_callee_saved_restore(&mut self) {
+        let restores: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
+        for (reg, off) in restores {
+            self.emit_xmm_frame_move(reg, off, false);
+        }
+    }
+
     fn emit_prologue(&mut self) {
         // push rbp
         self.buf.emit_byte(0x55);
@@ -1696,6 +1778,16 @@ fn reloc_emit_enabled() -> bool {
         // sub rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xEC]);
         self.buf.emit(&self.frame_size.to_le_bytes());
+
+        // Callee-saved XMM save area. FIRST, before the ABI parameter stores:
+        // an incoming floating-point argument arrives in XMM0..XMM3 (Win64) and
+        // nothing here touches those, but ordering the save ahead of every
+        // other prologue step keeps "the caller's registers are preserved" true
+        // across the whole body rather than across most of it.
+        let saves: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
+        for (reg, off) in saves {
+            self.emit_xmm_frame_move(reg, off, true);
+        }
 
         // Store params from ABI registers to local frame slots.
         // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX, R8, R9.
@@ -2469,6 +2561,7 @@ fn reloc_emit_enabled() -> bool {
 
     fn emit_epilogue(&mut self) {
         self.emit_shadow_savetop_restore();
+        self.emit_callee_saved_restore();
         // add rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xC4]);
         self.buf.emit(&self.frame_size.to_le_bytes());
@@ -5845,6 +5938,17 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, fn_addr);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                                       // Epilogue (RAX holds the sentinel returned by ir_deopt_entry).
+                                      //
+                                      // This stub inlines the teardown rather
+                                      // than calling `emit_epilogue` (it must
+                                      // NOT restore the shadow `top` — the
+                                      // deopt entry already unwound it), so the
+                                      // callee-saved restore has to be repeated
+                                      // here. Omitting it returns to the caller
+                                      // with XMM6/XMM7 holding this frame's
+                                      // values, on the one exit that is hardest
+                                      // to notice.
+        self.emit_callee_saved_restore();
         self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
         self.buf.emit(&self.frame_size.to_le_bytes());
         self.buf.emit_byte(0x5D); // pop rbp
@@ -6413,10 +6517,13 @@ fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeed
     let args_stage = needs.max_call_args.saturating_mul(8);
     let shadow = 32usize;
     let stack_arg_reserve = 16usize;
+    // Cast: `ir_saved_xmm_bytes` returns 0 or 32.
+    let saved_xmms = ir_saved_xmm_bytes() as usize;
     let total = locals
         .saturating_add(context)
         .saturating_add(bookkeeping)
         .saturating_add(spills)
+        .saturating_add(saved_xmms)
         .saturating_add(args_stage)
         .saturating_add(shadow)
         .saturating_add(stack_arg_reserve);
@@ -7537,32 +7644,73 @@ fn verify_slot_colouring(
 
 /// The registers this wiring may hand out.
 ///
-/// XMM2–XMM5, and the choice is forced rather than tuned:
+/// XMM2–XMM7, and the ceiling is forced rather than tuned:
 ///
-///   * **Caller-saved on both ABIs.** Win64 makes XMM0–XMM5 volatile and
-///     XMM6–XMM15 non-volatile; System V makes every XMM volatile. The IR
-///     prologue saves NO callee-saved register (`emit_prologue` pushes RBP and
-///     nothing else), so any register the caller expects preserved is unusable
-///     here until that prologue grows a save area — which rules out every
-///     register in `regalloc::RegFile::x86_64` (`LOCAL_REGS` = RBX/R12–R15,
-///     plus R8/R9 and XMM8–XMM15).
 ///   * **Never touched by this emitter.** The FP value tier is XMM0/XMM1; the
 ///     GP tier is RAX/RCX/RDX with R10/R11 as safepoint and shadow-stack
-///     scratch and R8/R9 as call-argument registers. XMM2–XMM5 appear nowhere.
+///     scratch and R8/R9 as call-argument registers. XMM2–XMM7 appear nowhere.
 ///   * **Encodable without REX**, which `fp_load` / `fp_store` / `fp_binop`
 ///     require: they emit ModRM with `(xmm & 7) << 3` and no REX.R, so only
-///     XMM0–XMM7 are addressable by them at all.
+///     XMM0–XMM7 are addressable by them at all. *This* is what stops the file
+///     at XMM7 — raising it is a REX change in those three functions, not a
+///     frame change.
+///   * **Callee-saved registers are now paid for.** Win64 makes XMM0–XMM5
+///     volatile and XMM6–XMM15 non-volatile; System V makes every XMM volatile.
+///     XMM6/XMM7 were unusable here until [`IR_LOWER_SAVED_XMMS`] and the
+///     prologue save area landed (2026-08-04): before that `emit_prologue`
+///     pushed RBP and saved nothing, so a value parked in XMM6 corrupted the
+///     caller's floating-point state on one platform and not the other.
 ///
-/// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
-/// loop counter gets nothing out of it. That is the price of not touching the
-/// prologue, and it is the first thing to revisit — see the doc.
+/// The consequence worth stating plainly: this wiring is still **FP-only**. An
+/// `int` loop counter gets nothing out of it — that needs a GP file, and a GP
+/// file has to discharge the safepoint obligation per site instead of
+/// structurally (`docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+/// "Where the safepoint / oop-map obligation lives").
 ///
 /// The literal lives in `regalloc::xmm_roles`, with the other two XMM
 /// authorities — `ir_lower`'s own scratch pair below and `vec_emit`'s vector
 /// pool — so that a wiring which puts two of them on one register is a visible
-/// fact rather than a discovery. See that module for why the vector pool
-/// overlaps this file completely and cannot yet be separated.
-const IR_LOWER_LS_XMMS: [u8; 4] = crate::regalloc::xmm_roles::IR_LINEAR_SCAN;
+/// fact rather than a discovery. All three are disjoint as of 2026-08-04;
+/// `xmm_roles::disjointness_violation` is the check.
+const IR_LOWER_LS_XMMS: [u8; 6] = crate::regalloc::xmm_roles::IR_LINEAR_SCAN;
+
+/// The XMM registers [`Lowerer::emit_prologue`] saves and every exit restores.
+///
+/// Empty on System V, where the ABI makes every XMM volatile and there is
+/// nothing to save; XMM6/XMM7 on Windows, where it does not.
+///
+/// **This is the prerequisite the level-2 lane was blocked on**, and it is
+/// deliberately its smallest useful form: two registers, saved only when a
+/// method actually parks a value in one, in a frame band the GC verifier
+/// already skips (`callee_saved_lo`). It is what lets [`IR_LOWER_LS_XMMS`]
+/// reach XMM7 and what moved `vec_emit`'s pool off the scalar file entirely.
+///
+/// Sizing is static — the frame is laid out in [`Lowerer::new`], before the
+/// allocation runs — but *emission* is dynamic: [`Lowerer::saved_xmm_regs`]
+/// yields only the registers the residency plan actually used, so a method that
+/// promotes none of them emits no save instruction and no restore.
+const IR_LOWER_SAVED_XMMS: &[u8] = crate::regalloc::xmm_roles::IR_PROLOGUE_SAVED;
+
+/// Bytes the frame reserves for [`IR_LOWER_SAVED_XMMS`].
+///
+/// 16 per register: a caller's value may be a full 128-bit vector, and saving
+/// only its low 64 bits restores a register that is *almost* right — the
+/// failure mode hardest to attribute. `MOVUPS` has no alignment requirement, so
+/// the band needs no padding.
+///
+/// Zero unless the linear-scan path is on, because nothing else can name one of
+/// these registers yet and a frame must not pay 32 bytes for a register it
+/// cannot hand out. [`estimate_frame_bytes`] and [`Lowerer::new`] both go
+/// through this one function for exactly the reason the `bookkeeping_size`
+/// comment gives: two copies of a frame term drift, and the drift is a silent
+/// wrong offset.
+fn ir_saved_xmm_bytes() -> i32 {
+    if IR_LOWER_SAVED_XMMS.is_empty() || !linear_scan_enabled() {
+        return 0;
+    }
+    // Cast: a two-element compile-time constant.
+    IR_LOWER_SAVED_XMMS.len() as i32 * 16
+}
 
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
@@ -7932,7 +8080,25 @@ fn ir_lower_machine_model(
     regs: crate::regalloc::RegFile,
 ) -> crate::regalloc::MachineModel {
     use std::collections::BTreeMap;
-    let all: Vec<crate::regalloc::PhysReg> = regs.specs().iter().map(|s| s.reg).collect();
+    // The back-edge safepoint poll is a CALL site, so what it destroys is the
+    // caller-saved subset — the same rule `MachineModel::for_graph` applies at
+    // an `Op::Call`, applied here because the poll is not a graph node and
+    // `for_graph` therefore never sees it.
+    //
+    // This used to be every register in the file. That was safe but wrong in
+    // the expensive direction: it made a loop-carried value unpromotable into
+    // XMM6/XMM7 even on the target where this frame saves them, which is
+    // exactly the case the save area was built for. The narrowing is sound
+    // because the poll's slow path is `jit_safepoint_slow_path`, an ordinary
+    // `extern "C"` function — Win64 obliges it to preserve XMM6–XMM15, and on
+    // System V no XMM is callee-saved so `IR_LOWER_SAVED_XMMS` is empty and
+    // this set is still the whole file, byte for byte as before.
+    let poll_destroys: Vec<crate::regalloc::PhysReg> = regs
+        .specs()
+        .iter()
+        .filter(|s| s.caller_saved)
+        .map(|s| s.reg)
+        .collect();
     let mut model = crate::regalloc::MachineModel::for_graph(graph, schedule, live, regs);
 
     // `MachineModel::clobbered_at` binary-searches by position, so the list
@@ -7954,7 +8120,10 @@ fn ir_lower_machine_model(
         // terminator position and the edge position. Clobber both, for the same
         // reason `MachineModel::for_graph` makes both safepoints.
         for pos in [edge.saturating_sub(1), edge] {
-            merged.entry(pos).or_default().extend_from_slice(&all);
+            merged
+                .entry(pos)
+                .or_default()
+                .extend_from_slice(&poll_destroys);
         }
     }
     model.clobbers = merged
@@ -8046,9 +8215,20 @@ fn plan_register_residency(
     // ── The register file ────────────────────────────────────────────
     let regs = RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
         reg: PhysReg::xmm(n),
-        // Not "the ABI says so" but "this frame never saves them", which is the
-        // property that matters: a value may not stay in one across a call.
-        caller_saved: true,
+        // Not "the ABI says so" but "does THIS frame save it", which is the
+        // property that matters: a value may stay in a register across a call
+        // exactly when the callee is obliged to give it back.
+        //
+        // XMM2–XMM5 are volatile on both ABIs, so a value in one dies at every
+        // call and `caller_saved: true` is what makes the allocator split it.
+        // XMM6/XMM7 are volatile on System V too — `IR_LOWER_SAVED_XMMS` is
+        // empty there, so they come out `true` as well and nothing changes. On
+        // Windows they are non-volatile AND this prologue saves them, so they
+        // come out `false` and a value CAN live across a call. That is the
+        // whole return on the save area, and it is expressed here rather than
+        // in a platform `cfg` because the two facts that make it true — the
+        // ABI's and this frame's — are both already in `IR_LOWER_SAVED_XMMS`.
+        caller_saved: !IR_LOWER_SAVED_XMMS.contains(&n),
     }));
     let model = ir_lower_machine_model(graph, schedule, &live, regs);
 
@@ -9071,6 +9251,7 @@ pub(crate) fn lower_inner_with_scopes(
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
+    let saved_xmm_bytes = lowerer.saved_xmm_bytes;
     let frame_size = lowerer.frame_size;
 
     // ── Install-time deopt-metadata verification ─────────────────────
@@ -9229,12 +9410,20 @@ pub(crate) fn lower_inner_with_scopes(
     // band the maps and the deopt verifier describe is unchanged by them.
     //
     // `callee_saved_lo` names the start of the region the verifier must NOT
-    // inspect. The IR prologue saves no callee-saved registers (it uses only
-    // caller-saved scratch), so that region here is not a register save area
-    // but the outgoing-argument staging, the stack-arg reserve and the ABI
-    // shadow space — scratch this frame never resumes from, and full of dead
-    // argument words. That is exactly the role the field plays on the reader
-    // side (`band_slot_is_verifiable` skips everything at or above it).
+    // inspect: the callee-saved XMM save area (`IR_LOWER_SAVED_XMMS`, empty on
+    // System V and on every compile with the linear-scan path off), then the
+    // outgoing-argument staging, the stack-arg reserve and the ABI shadow
+    // space. Register images, dead argument words and scratch — storage this
+    // frame never resumes from, which is exactly the role the field plays on
+    // the reader side (`band_slot_is_verifiable` skips everything at or above
+    // it).
+    //
+    // The save area was placed at `spill_cap_off` precisely so this bound did
+    // not have to move: it grew the skipped band from below without changing
+    // either endpoint's meaning, and `conservative_roots` needed no edit. An
+    // XMM save area could never hold a reference in any case — the file is
+    // FP-only — but the band is the right home for it regardless, because
+    // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
     cm.osr_frame_size = frame_size;
@@ -9265,8 +9454,18 @@ pub(crate) fn lower_inner_with_scopes(
         spill_hi: spill_cap_off,
         callee_saved_lo: spill_cap_off,
         callee_saved_hi: frame_size,
-        xmm_saved_lo: 0,
-        xmm_saved_hi: 0,
+        // Named separately as well as covered by the band above, so
+        // `FrameLayout::region_name` reports `xmm-saved` rather than the
+        // catch-all — a frame dump that cannot tell a register image from an
+        // outgoing argument is the one that gets misread during a crash triage.
+        // `hi == lo == 0` when nothing was reserved, which `is_register_image`
+        // already reads as "absent".
+        xmm_saved_lo: if saved_xmm_bytes > 0 { spill_cap_off } else { 0 },
+        xmm_saved_hi: if saved_xmm_bytes > 0 {
+            spill_cap_off + saved_xmm_bytes
+        } else {
+            0
+        },
         reg_spill_lo: 0,
         reg_spill_hi: 0,
         frame_size,
@@ -14222,6 +14421,223 @@ mod tests {
         );
     }
 
+    // ── The callee-saved XMM save area ───────────────────────────────
+    //
+    // `IR_LOWER_SAVED_XMMS` is the prerequisite the level-2 lane was blocked
+    // on, and its failure mode is the quietest one in this file: a caller's
+    // XMM6 comes back holding a callee's `double`, on Windows only, with no
+    // diagnostic anywhere. Nothing downstream checks it — the GC skips the
+    // band by design, the deopt verifier skips it, and the value is a `double`
+    // so it never looks like a bad pointer. So it is checked here, on the
+    // emitted bytes, at every exit.
+
+    /// Build a real `Lowerer` over a trivial graph, with a residency plan that
+    /// names `reg`.
+    ///
+    /// The plan is synthesised rather than allocated, because what is under
+    /// test is the *prologue's* reaction to a plan, not the allocator: a test
+    /// that had to find a graph with five simultaneously live doubles would
+    /// stop testing the save area the moment the allocator's heuristics moved.
+    #[cfg(test)]
+    fn lowerer_with_resident_xmm(buf_cap: usize, reg: Option<u8>) -> Lowerer<'static> {
+        // Leaked so the returned `Lowerer<'static>` can borrow them; a handful
+        // of small allocations per test, in a process that is about to exit.
+        let (graph, schedule) = add_one_graph();
+        let graph: &'static Graph = Box::leak(Box::new(graph));
+        let schedule: &'static Schedule = Box::leak(Box::new(schedule));
+        let plan: &'static SlotPlan = Box::leak(Box::new(plan_slots(graph, schedule, None)));
+        let empty: &'static HashMap<usize, bool> = Box::leak(Box::new(HashMap::new()));
+        let no_direct: &'static HashMap<usize, (usize, bool)> =
+            Box::leak(Box::new(HashMap::new()));
+        let no_ic: &'static HashMap<usize, (usize, usize)> = Box::leak(Box::new(HashMap::new()));
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes: &'static InlineScopeTable = Box::leak(Box::new(InlineScopeTable::new()));
+        let helpers: &'static JitRuntimeHelpers = Box::leak(Box::new(no_helpers()));
+        let buf = ExecutableBuffer::new(buf_cap).expect("executable buffer");
+        let mut lowerer = Lowerer::new(
+            graph,
+            schedule,
+            buf,
+            0,
+            2,
+            plan,
+            helpers,
+            empty,
+            None,
+            no_direct,
+            no_ic,
+            &no_compact,
+            no_scopes,
+        );
+        if let Some(reg) = reg {
+            lowerer.set_residency(RegResidency {
+                reg_of: vec![Some(reg)],
+                promoted: 1,
+                demoted: 0,
+                peak_live: 1,
+            });
+        }
+        lowerer
+    }
+
+    /// `MOVUPS [rbp - disp32], xmm` and its load counterpart, for `reg < 8`.
+    #[cfg(test)]
+    fn movups_frame_needle(reg: u8, store: bool) -> [u8; 3] {
+        [0x0F, if store { 0x11 } else { 0x10 }, 0x85 | ((reg & 7) << 3)]
+    }
+
+    /// **The** invariant: every exit restores exactly what the prologue saved.
+    ///
+    /// All three exits are driven, not one — `emit_deopt_stub` inlines its own
+    /// teardown instead of calling `emit_epilogue` (it must not restore the
+    /// shadow `top`), so it is the one that silently keeps this frame's XMM6 in
+    /// the caller's register file if the restore is left out of it. Deleting
+    /// `emit_callee_saved_restore` from any of the three fails this test.
+    #[test]
+    fn every_exit_restores_exactly_what_the_prologue_saved() {
+        let _flag = LsForce::on();
+        let expect = usize::from(!IR_LOWER_SAVED_XMMS.is_empty());
+        let reg = *IR_LOWER_SAVED_XMMS.first().unwrap_or(&6);
+        let save = movups_frame_needle(reg, true);
+        let restore = movups_frame_needle(reg, false);
+
+        // ── exit 1: the method epilogue ──────────────────────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.emit_epilogue();
+        let code = lo.buf.as_slice().to_vec();
+        let saves = count_seq(&code[..after_prologue], &save);
+        assert_eq!(
+            saves, expect,
+            "the prologue saved {saves} of xmm{reg}, expected {expect} on this target",
+        );
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the epilogue did not restore what the prologue saved",
+        );
+
+        // ── exit 2: the shared call-exception bail stub ──────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.call_exc_patches.push(after_prologue);
+        lo.emit_call_exc_stub();
+        let code = lo.buf.as_slice().to_vec();
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the call-exception bail stub returns the sentinel without \
+             restoring the caller's registers",
+        );
+
+        // ── exit 3: the deopt stub's inlined teardown ────────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(after_prologue);
+        lo.emit_deopt_stub();
+        let code = lo.buf.as_slice().to_vec();
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the deopt stub inlines its own teardown and skipped the restore",
+        );
+    }
+
+    /// A method that parks nothing in a callee-saved register emits no save.
+    ///
+    /// The save area costs frame bytes whenever the flag is on; it must not
+    /// also cost two `MOVUPS` per call in the overwhelmingly common case where
+    /// the allocation used none of them. `reg_of` naming only XMM2 is exactly
+    /// that case.
+    #[test]
+    fn a_method_that_used_no_callee_saved_register_emits_no_save() {
+        let _flag = LsForce::on();
+        for plan in [None, Some(2u8)] {
+            let mut lo = lowerer_with_resident_xmm(4096, plan);
+            lo.emit_prologue();
+            lo.emit_epilogue();
+            let code = lo.buf.as_slice().to_vec();
+            for &reg in IR_LOWER_SAVED_XMMS {
+                assert_eq!(
+                    count_seq(&code, &movups_frame_needle(reg, true)),
+                    0,
+                    "saved xmm{reg} for a plan that never used it ({plan:?})",
+                );
+            }
+        }
+    }
+
+    /// Where the save area sits, stated as the three things it must not
+    /// collide with.
+    ///
+    /// The whole placement argument is that the area lands inside
+    /// `[callee_saved_lo, frame_size)` — the band
+    /// `conservative_roots::band_slot_is_verifiable` already skips — so the
+    /// reader side needed no edit. If it drifted below `spill_cap_off` it would
+    /// overlap a spill and a `MOVUPS` would destroy a live value; if it drifted
+    /// above, it would land in the outgoing-argument staging.
+    #[test]
+    fn the_save_area_lies_between_the_spills_and_the_argument_staging() {
+        let _flag = LsForce::on();
+        let lo = lowerer_with_resident_xmm(4096, Some(6));
+        let bytes = lo.saved_xmm_bytes;
+        assert_eq!(
+            bytes,
+            ir_saved_xmm_bytes(),
+            "the frame was laid out against a different number than the \
+             prologue writes through",
+        );
+        // Cast: a two-element compile-time constant.
+        assert_eq!(bytes, IR_LOWER_SAVED_XMMS.len() as i32 * 16);
+
+        let lo_off = lo.spill_cap_off;
+        let hi_off = lo_off + bytes;
+        assert!(
+            lo.first_spill <= lo_off,
+            "spills ({}) start at or above the save area ({lo_off})",
+            lo.first_spill,
+        );
+        assert!(
+            hi_off <= lo.args_stage_top_off || bytes == 0,
+            "the save area ({lo_off}..{hi_off}) runs into the argument \
+             staging at {}",
+            lo.args_stage_top_off,
+        );
+        assert!(hi_off <= lo.frame_size, "the save area runs off the frame");
+
+        // Every offset the prologue actually writes through, inside the band.
+        for (reg, off) in lo.saved_xmm_regs() {
+            assert!(
+                off > lo_off && off <= hi_off,
+                "xmm{reg} is saved at {off}, outside [{lo_off}, {hi_off}]",
+            );
+        }
+    }
+
+    /// With the linear-scan path off — the default, and every production
+    /// compile today — the frame pays nothing.
+    ///
+    /// A save area that widened every IR frame by 32 bytes for a register
+    /// nothing can hand out is a regression with no upside, and `frame_size`
+    /// feeds `DEFAULT_MAX_FRAME_BYTES`, so it would also decline methods that
+    /// used to compile.
+    #[test]
+    fn the_default_configuration_reserves_no_save_area() {
+        assert_eq!(
+            ir_saved_xmm_bytes(),
+            0,
+            "the flag is off, so the frame must not pay for the save area",
+        );
+        let lo = lowerer_with_resident_xmm(4096, Some(6));
+        assert_eq!(lo.saved_xmm_bytes, 0);
+        assert_eq!(lo.saved_xmm_regs().count(), 0);
+    }
+
     /// The publication interlock, asserted on the source because it is a
     /// property of *which accessor* every read uses, and a behavioural test
     /// cannot reach a lowering that forgot to convert a definition site.
@@ -14259,18 +14675,28 @@ mod tests {
         let allowed = [
             "self.reg_of = residency.reg_of;",
             "self.reg_of.get(id as usize).copied().flatten()",
+            // `saved_xmm_regs` — the prologue/epilogue's "did this method
+            // actually park a value in a callee-saved register" test. A read of
+            // the whole plan rather than of one node's assignment, so it cannot
+            // go through `resident_xmm`, and it is deliberately the ONLY such
+            // read: a second one would mean two answers to "which registers
+            // does this frame owe its caller", and a prologue and an epilogue
+            // that disagree about that corrupt the caller's floating-point
+            // state with nothing to notice.
+            ".filter(move |(_, reg)| self.reg_of.iter().any(|r| *r == Some(**reg)))",
         ];
         for line in &reads {
             assert!(
                 allowed.contains(&line.as_str()),
                 "new read of the register assignment outside `resident_xmm` / \
-                 `assigned_xmm`: {line}"
+                 `assigned_xmm` / `saved_xmm_regs`: {line}"
             );
         }
         assert_eq!(
             reads.len(),
-            3,
-            "expected exactly the install site and the two accessors"
+            4,
+            "expected exactly the install site, the two accessors and the \
+             save-area predicate"
         );
     }
 
