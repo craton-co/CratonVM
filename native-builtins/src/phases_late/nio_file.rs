@@ -6903,6 +6903,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
 
+        // `WinNTFileSystem.canonicalize(String)` is
+        // `getFinalPath(canonicalize0(s))`, so this native's result IS what a
+        // caller reaching real `FileSystem` bytecode gets back. It used to
+        // return `std::fs::canonicalize`'s output verbatim, which on Windows
+        // carries the `\\?\` extended-length prefix that the real
+        // `GetFinalPathNameByHandleW`-based native strips: `canonicalize` came
+        // back as `\\?\C:\...\x.txt` where HotSpot returns `C:\...\x.txt`, so
+        // every `startsWith(canonicalBase)` containment check against a
+        // non-prefixed base failed. `strip_unc` is the same helper
+        // `file_canonicalize_path_uncached` already applies for this reason.
         r.register(
             fs_cls,
             "getFinalPath0",
@@ -6911,7 +6921,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let path_ref = obj_arg(args, 1)?;
                 let p = ctx.read_string(path_ref).unwrap_or_default();
                 let final_path = std::fs::canonicalize(&p)
-                    .map(|c| c.to_string_lossy().to_string())
+                    .map(|c| strip_unc(&c.to_string_lossy()))
                     .unwrap_or(p);
                 let s = ctx.create_string(&final_path);
                 Ok(Some(Value::Object(Some(s))))
