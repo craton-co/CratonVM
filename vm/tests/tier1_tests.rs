@@ -1536,7 +1536,7 @@ fn t9_stub_audit_counts_match_census() {
 /// remaining sites carries such a comment; that is what makes a separate
 /// census document unnecessary. The gaps that once sat behind this surface were
 /// all closed on 2026-07-29 and the tracking file retired to
-/// `docs/internal/native-constant-surface-open-items-closed-20260729.md`; the
+/// `native-constant-surface-open-items-closed-20260729.md`; the
 /// companion gate `t9c_synthetic_field_tables_cover_their_factories` enforces
 /// the one failure mode among them that kept recurring.
 #[test]

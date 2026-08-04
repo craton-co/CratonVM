@@ -1097,7 +1097,7 @@ impl VmHeap {
     /// (`G1Collector::native_alloc_pressure`) — without it, a workload that
     /// allocates only from inside natives never reaches ANY safepoint and G1's
     /// infallible allocator aborts the process on a heap full of garbage (see
-    /// `docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
+    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
     #[inline]
     pub fn young_spill_pressure(&self) -> bool {
         match self {
@@ -1182,6 +1182,25 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.old_gen_capacity().saturating_sub(h.old_gen_used()),
             _ => self.heap_capacity().saturating_sub(self.allocated_bytes()),
+        }
+    }
+
+    /// `(used, free-list bytes, largest free block, capacity)` for the young
+    /// from-space, for diagnostics only.
+    ///
+    /// SB-LOADER-ZIPCONTENT (2026-08-04). `live_bytes_estimate` reports
+    /// `young.used - young.free_list` summed with old, which cannot distinguish
+    /// "young is genuinely full of live objects" from "young was bumped to the
+    /// top once and is now a free list nobody can carve an 8 KB array out of".
+    /// Those two want opposite fixes, and the second is what a run of
+    /// non-moving young sweeps produces — so the number that tells them apart
+    /// belongs next to the overhead-limit numbers that motivated the question.
+    ///
+    /// Non-generational backends have no young from-space; they report zeros.
+    pub fn young_occupancy(&self) -> (usize, usize, usize, usize) {
+        match self {
+            VmHeap::Generational(h) => h.young_from_occupancy(),
+            _ => (0, 0, 0, 0),
         }
     }
 
@@ -1399,7 +1418,7 @@ impl VmHeap {
     /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
     /// threshold; compaction's correctness blocker closed 2026-07-26
-    /// (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+    /// (`fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
     /// and moving-young is now the default. Under a
     /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
@@ -1434,7 +1453,7 @@ impl VmHeap {
     /// `last_observed_clock_ms` field doc there.) Until that lands, the soft-ref
     /// policy runs on a constant 64 MB of assumed headroom and therefore does
     /// not respond to memory pressure at all. Tracked in
-    /// `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md`.
+    /// `arch-2026-07-26/refs-metaspace-unloading.md`.
     pub fn soft_ref_policy_free_mb(&self) -> usize {
         const MB: usize = 1024 * 1024;
         let (young_used, young_cap) = self.young_gen_stats();
@@ -2011,7 +2030,7 @@ impl VmHeap {
             // the young generation never actually copied anything, which is the
             // exact way the 2026-07-01 validation declared moving-young working
             // while it was inert (see
-            // `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // `arch-2026-07-26/moving-young-corruption-rootcause.md`
             // section 6). The histogram then names what stopped it.
             let cycles = crate::gc_quiescence::moving_young_cycle_count();
             eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
@@ -2064,7 +2083,7 @@ impl VmHeap {
             // frame blocks the moving young collector — so a freed block kept
             // answering "live" and no consumer of this predicate ever pruned a
             // dangling old-gen entry. See
-            // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+            // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
             //
             // Young-GC live-reclaim ROOT FIX (2026-07-07): also recognize
             // kept-in-place young survivors of the NON-MOVING sweep (which
@@ -2104,7 +2123,7 @@ impl VmHeap {
     /// victim was the zeroed tail, and a silent dangling-pointer store into a
     /// live object otherwise (`SIGSEGV` /
     /// `gen_heap::read_slot: corrupt Value cell`, the HIB-CV-32 family; see
-    /// `docs/internal/fixed-suite-bugs/h2/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
+    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
     ///
     /// Both old-gen paths now emit an identity `pointer_map` entry for every
     /// watched address that survived without moving, so once
@@ -2186,7 +2205,7 @@ impl VmHeap {
     /// class-lock/condy object with no other reference), it is silently
     /// reclaimed and its memory reused by the very next allocation —
     /// producing a live object that reads back as a DIFFERENT, unrelated
-    /// type. See `docs/known-issues/spb1-springframework-util-investigation.md`'s
+    /// type. See `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`'s
     /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
     /// static field, loaded via a user-defined `ClassLoader`, read back as
     /// an unrelated live object from later in the same `<clinit>`).

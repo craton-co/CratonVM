@@ -361,7 +361,7 @@ pub(super) fn stw_take_over_and_wait(
     // the whole frozen window, and the non-moving sweep zeroed the still-live
     // object in place (WildFly parallel-extension-add: fresh
     // StringBuilder/Reader receivers reading back all-zero — see
-    // docs/internal/fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
+    // fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
     // Walk each frozen peer's interpreter frames directly into `xt_roots`.
     //
     // SAFETY: each address was published by its owning thread with the
@@ -1249,8 +1249,8 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // `OutOfMemoryError` on a heap that is almost entirely garbage. Restores
     // part 3 of a9c580aff, which d8092acba ("fix-tests-real-jdk-contracts")
     // reverted in this file while leaving both accessors in place and
-    // caller-less; see docs/internal/fixed-suite-bugs/tomcat/
-    // 24-stringcache-oom-under-load.md.
+    // caller-less; see fixed-suite-bugs/tomcat/
+    // 24-stringcache-oom-under-load-FIXED.md.
     let before_live = shared.mem.heap.live_bytes_estimate();
     let before_promoted = shared.mem.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
@@ -1465,10 +1465,27 @@ pub(super) fn note_gc_productivity(shared: &SharedVm, before_live: usize, before
         0
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        // `young_*` (SB-LOADER-ZIPCONTENT, 2026-08-04): `before`/`after` are
+        // `live_bytes_estimate`, i.e. `young.used - young.free_list + old.used`.
+        // A run of non-moving young sweeps leaves the young bump cursor pinned
+        // at the top with the reclaimed space in the free list, so a heap that
+        // is 70% free reads as "148 MB live" and every diagnosis stops there.
+        // `young_largest_free` vs `young_free_list` is the fragmentation face.
+        let (y_used, y_free, y_largest, y_cap) = shared.mem.heap.young_occupancy();
+        // Selective-promotion census: `promoted=0` for hundreds of cycles has
+        // at least three very different causes (pass never ran / nothing
+        // tenurable / everything pinned) and the aggregate cannot tell them
+        // apart. See `gen_heap::SP_CENSUS`.
+        let (sw, sel, defrag, cand, pin, unaged, evac, ofull) =
+            cratonvm_gc::gen_heap::selective_promotion_census();
         eprintln!(
             "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
              freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
-             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak}"
+             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak} \
+             young_used={y_used} young_free_list={y_free} young_largest_free={y_largest} \
+             young_cap={y_cap} sp_sweeps={sw} sp_selective={sel} sp_defrag={defrag} \
+             sp_candidates={cand} sp_pinned={pin} sp_unaged={unaged} sp_evacuated={evac} \
+             sp_old_full={ofull}"
         );
     }
 }
@@ -1477,7 +1494,7 @@ pub(super) fn note_gc_productivity(shared: &SharedVm, before_live: usize, before
 /// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
 /// heap while the old generation was too full to absorb that much (both halves
 /// required — see `note_gc_productivity`, and
-/// `docs/internal/fixed-suite-bugs/hibernate/` for the spurious-OOM-at-49%-full
+/// `fixed-suite-bugs/hibernate/` for the spurious-OOM-at-49%-full
 /// report that added the second half).
 /// The allocation-failure paths call this right after `maybe_gc_forced`
 /// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
@@ -1848,7 +1865,7 @@ pub(super) fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
 /// `WeakCache`'s `WeakHashMap.get()` permanently stuck inside
 /// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
 /// `createLayoutFromConfigClass` test). See
-/// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
+/// fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
 pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
     let cm = shared.classes.class_manager.read();
     cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
@@ -1910,7 +1927,7 @@ pub(super) fn process_references_after_gc(
         // collections `is_marked` already agrees are dead.
         //
         // NOTE: this does NOT fully close
-        // `docs/known-issues/tomcat-08-07/defaultinstancemanager-classunloading-count-mismatch.md`.
+        // `fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md`.
         // `roots.rs` step 17 itself has a separate, deeper bug this session
         // found but did not fix: `gc_scan_collection_overlay_roots` roots
         // EVERY element of EVERY overlay-backed collection unconditionally,
@@ -2023,7 +2040,7 @@ pub(super) fn process_references_after_gc(
     // obtainable bytes diverge. Read *before* taking the reference-processor
     // lock: the accessor reaches into the heap's own generation stats, and
     // there is no reason to nest those acquisitions.
-    // See `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
+    // See `arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     // ClassManager is rank L10 and the reference processor is L7, so resolve
     // the JDK field before acquiring the lower-ranked processor lock.
@@ -2067,7 +2084,7 @@ pub(super) fn process_references_after_gc(
     // whatever now occupies the memory: the measured corruption was THIS
     // loop's `Object(None)` referent-clear landing mis-gridded — victim
     // payload = 0x4 (the Object discriminant), next word nulled (hexdump in
-    // docs/internal/h2-testscript-segv-findings.md). The earlier
+    // gaps/h2-testscript-segv-findings.md). The earlier
     // `num_fields < 2` guard was too weak (a phantom header at the stale
     // address can read num_slots >= 2). PRECISE criterion: a pre-GC address
     // in EITHER young semispace that is NOT a pointer-map key did not
@@ -2732,7 +2749,7 @@ static TLAB_SLOWPATH_ENTRIES_SINCE_GC: std::sync::atomic::AtomicU64 =
 /// unaligned TLAB sizes whose free-list split remnants sat off the 8-byte
 /// object grid (plus an untracked `Tlab::new` round-down sliver), derailing
 /// the non-moving walk and truncating the mark oracle. See
-/// docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
+/// fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
 /// now enforces grid alignment end-to-end and the mark oracle fails safe
 /// above a truncated walk's frontier.
 fn tlab_gc_trigger_enabled() -> bool {
@@ -3131,7 +3148,16 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
-    if let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) {
+    // SB-LOADER-ZIPCONTENT (2026-08-04): the post-GC retries use the
+    // old-gen-spilling `try_alloc_object_full`, for the same reason
+    // `gc_alloc_array` gives on the array side — once a non-moving JIT-safe
+    // young sweep has fragmented the young free list, a young-only retry
+    // reports OOM while the old generation still holds most of the heap. (The
+    // first attempt above stays young-only: it is the fast path, and spilling
+    // before a GC has even been attempted would promote ordinary short-lived
+    // objects straight into old gen.) `gc_alloc_array`'s doc comment already
+    // claimed this path behaved that way; it did not.
+    if let Some(obj) = shared.mem.heap.try_alloc_object_full(class_id, num_fields) {
         shared
             .mem
             .bytes_allocated_total
@@ -3145,7 +3171,7 @@ pub(crate) fn alloc_object_shared(
     shared
         .mem
         .heap
-        .try_alloc_object(class_id, num_fields)
+        .try_alloc_object_full(class_id, num_fields)
         .map(|obj| {
             shared
                 .mem

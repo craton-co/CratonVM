@@ -25,7 +25,7 @@
 //! INTERPRETER bcis, and an OSR entry lands on the steady-state copy — the
 //! fallback under versioning — rather than a peeled prefix or a guard.
 //!
-//! `docs/known-issues/c2/loop-01-peeling-and-versioning.md` is the lane, and
+//! `docs/known-issues/c2/archive/loop-01-peeling-and-versioning.md` is the lane, and
 //! `docs/jit/loop-rewriter-wiring.md` the wiring's status of record.
 
 use super::*;
@@ -1181,6 +1181,7 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
 /// takes no `indy_info`, so this goes to `compile_with_param_slots`.
 fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
     compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         code,
         code.len(),
         1,     // num_params: (int n)

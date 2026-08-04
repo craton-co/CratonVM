@@ -12,9 +12,13 @@
 //!
 //! On a `LinkedHashMap` that path is `HashMap.remove(k,v)` ->
 //! `HashMap.removeNode` -> `LinkedHashMap.afterNodeRemoval`, whose first
-//! statement is `(LinkedHashMap.Entry<K,V>) e` — and our nodes are
+//! statement is `(LinkedHashMap.Entry<K,V>) e` — and our nodes were
 //! `java/util/LinkedHashMap$Node`, so it threw `ClassCastException:
 //! java.util.LinkedHashMap$Node cannot be cast to java.util.LinkedHashMap$Entry`.
+//! (That invented node class is fixed too — see `lhm_node_class_identity.rs` —
+//! but these three still have to be natives regardless: the real bodies walk
+//! the bucket array behind the native bookkeeping whether or not the cast
+//! succeeds.)
 //! Kafka's `MetadataLoader.removeAndClosePublisher` calls exactly
 //! `publishers.remove(name, publisher)` on a `LinkedHashMap`, which failed
 //! embedded-broker shutdown in Spring Boot's

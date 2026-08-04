@@ -1728,7 +1728,7 @@ pub(crate) fn build_client_config(
 /// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
 /// revoked server certificate — exactly the fail-open gap this feature
 /// fixes. See
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
 #[derive(Debug)]
 struct OcspAwareServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -2583,7 +2583,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -2595,7 +2595,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
 
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
-/// see `docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md`.
+/// see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`.
 /// Every call site that used to construct `rustls::crypto::ring::default_provider()`
 /// directly now goes through this instead, so the CBC suites are negotiable
 /// (not just reported) everywhere TLS connections get set up.
@@ -4736,7 +4736,7 @@ fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> 
 /// architectural defect already fixed once in this file for
 /// `engine_table`/`sslparams_alpn_table` via `engine_objref_key` (see its
 /// doc comment, and
-/// `docs/internal/fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
+/// `fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
 /// — that earlier fix's scope note explicitly left
 /// `ssl_server_socket_states`, `sock_alpn_table`, `session_peer_certs_table`,
 /// and `SSLSession.getId()`'s seed unfixed; this closes those.
@@ -4801,6 +4801,33 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     // methods.
     let hurl = "javax/net/ssl/HttpsURLConnection";
 
+    /// The factory `HttpsURLConnection`'s default *and* instance getters both
+    /// resolve to when the caller has installed nothing.
+    ///
+    /// Mint-and-publish, once. The real JDK's
+    /// `getDefaultSSLSocketFactory()` assigns to the static
+    /// `defaultSSLSocketFactory` on first use, and the constructor seeds every
+    /// instance's `sslSocketFactory` from it — so an untouched connection
+    /// reports the same object on its first read and forever after. Having
+    /// only the *default* getter publish left the instance getter minting a
+    /// fresh carrier per call, which
+    /// `probes/HucFactoryReadbackProbe.java` catches as an untouched
+    /// connection whose factory changes underneath it.
+    ///
+    /// Publishing into `huc_default_factory_slot` (rather than caching in a
+    /// new static) is what keeps a later explicit `setDefaultSSLSocketFactory`
+    /// winning, and the slot is already a GC root.
+    fn huc_default_factory_or_publish(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ) -> ObjectRef {
+        if let Some(f) = huc_default_ssl_socket_factory() {
+            return f;
+        }
+        let obj = default_ssl_socket_factory_obj(ctx);
+        set_huc_default_ssl_socket_factory(obj);
+        obj
+    }
+
     r.register(
         hurl,
         "getDefaultSSLSocketFactory",
@@ -4813,20 +4840,23 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             // placeholder. Callers that install a configured factory and later
             // read it back (to wrap it, or to restore it in a test teardown)
             // otherwise silently lost their configuration.
-            if let Some(f) = huc_default_ssl_socket_factory() {
-                return Ok(Some(Value::Object(Some(f))));
-            }
             // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
-            // 20260804): this fallback used to mint a BARE 0-field carrier.
-            // The JDK documents the unset default as
+            // 20260804): this used to mint a BARE 0-field carrier when nothing
+            // was published. The JDK documents the unset default as
             // `SSLSocketFactory.getDefault()`, and a caller that takes this
             // factory to the layered
             // `createSocket(Socket,String,int,boolean)` overload reads its
             // field 0 for the owning `SSLContext` — so the bare carrier threw
             // `IllegalStateException: SSLSocketFactory has no owning
-            // SSLContext`. Hand back the same wired carrier `getDefault()`
-            // does.
-            let obj = default_ssl_socket_factory_obj(ctx);
+            // SSLContext`.
+            //
+            // FIX (huc-per-connection-ssf-readback): resolving through
+            // `huc_default_factory_or_publish` also makes the answer STABLE,
+            // which is what the real JDK does here. Measured on JDK 21: two
+            // freshly opened connections report the same default-factory
+            // identity, even though `SSLSocketFactory.getDefault()` itself
+            // returns a new object per call.
+            let obj = huc_default_factory_or_publish(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4878,9 +4908,31 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         // resolver hits the same gap on the READ side, where there is no
         // equivalent fallback. `get_field` is required (M4a, this trait's
         // own doc) to bounds-check and fail safe on an out-of-declared-range
-        // index, so scanning a small fixed range unconditionally is safe:
-        // true out-of-bounds reads just come back `Value::Object(None)` and
-        // are silently skipped, never a bad memory access.
+        // index, so probing past the end is memory-safe: true out-of-bounds
+        // reads come back `Value::Object(None)` and are silently skipped,
+        // never a bad memory access.
+        //
+        // Memory-safe is not the same as free, though, and the unconditional
+        // fixed-range scan this used to do was neither silent nor correct as a
+        // *slot computation*. `gen_heap::get_field`'s guard classifies the
+        // read, and for a receiver whose class layout is fine it takes the arm
+        // that says so outright — "caller used slot index past receiver's
+        // layout ... the bug is in the caller's slot computation". Probing
+        // 0..8 at every node made this resolver that caller: one `TestSsl` run
+        // emitted **90** such warnings, all for
+        // `TesterSupport$ClientSSLSocketFactory` (`num_slots=3`,
+        // `real_field_count=Some(3)`, indices 3..7) — a real bytecode class
+        // whose declared layout was available and simply not consulted.
+        //
+        // So consult it, and keep the fixed range only for the case that
+        // actually needs it. `class_num_total_fields` returns 0 both for "no
+        // fields" and for "metadata not available" (its own doc: 0 if the
+        // class isn't loaded), which is exactly the synthetic-carrier gap
+        // above — a carrier holding 1 real slot reports 0. Treating 0 as
+        // "unknown, fall back to probing" keeps that path byte-for-byte, while
+        // any class that reports a real count is scanned to its own bound and
+        // stops generating warnings. A carrier is never missed, because the
+        // fallback still covers precisely the objects whose count is unknown.
         const FIELD_SCAN_RANGE: usize = 8;
         const MAX_DEPTH: usize = 6;
         const MAX_VISITED: usize = 64;
@@ -4898,7 +4950,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                 if sslcontext_cid == Some(cid) {
                     return Some(obj);
                 }
-                for i in 0..FIELD_SCAN_RANGE {
+                // Bound the probe by the receiver's OWN declared layout when
+                // that layout is known; probe blind only when it is not (see
+                // the `FIELD_SCAN_RANGE` comment above).
+                let declared = ctx.class_num_total_fields(cid);
+                let scan = if declared > 0 {
+                    declared
+                } else {
+                    FIELD_SCAN_RANGE
+                };
+                for i in 0..scan {
                     if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
                         let sub_cid = ctx.class_id_of_object(candidate);
                         if sslcontext_cid == Some(sub_cid) {
@@ -4988,11 +5049,42 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "setSSLSocketFactory",
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
         |ctx, args| {
-            if let (Some(Value::Object(Some(connection))), Some(Value::Object(Some(f)))) =
-                (args.first(), args.get(1))
-            {
-                capture_huc_client_identity(ctx, *f, Some(*connection));
-            }
+            let connection = obj_arg(args, 0)?;
+            // Real JDK: `if (sf == null) throw new IllegalArgumentException`.
+            let factory = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "no SSLSocketFactory specified".to_string(),
+                    }
+                    .into());
+                }
+            };
+            capture_huc_client_identity(ctx, factory, Some(connection));
+            // FIX (huc-per-connection-ssf-readback): this setter used to
+            // capture the connection's client identity and then DROP the
+            // factory object, so `getSSLSocketFactory()` could not read back
+            // what was just installed (the JDK's documented round trip) and
+            // `huc_client_tls_restrictions` could not find an instance-scoped
+            // factory's cipher/protocol restrictions either — an instance
+            // `setSSLSocketFactory` was, in effect, a no-op beyond the
+            // identity capture.
+            //
+            // Store it in the REAL JDK instance field, exactly as
+            // `setHostnameVerifier` below stores into `hostnameVerifier`:
+            // an ordinary object field is already a GC root and is already
+            // remapped by the moving collector, so this needs no new
+            // `ObjectRef`-holding side table (the earlier note here claiming a
+            // GC-rooted per-connection table was required was wrong about the
+            // mechanism — the `hostnameVerifier` precedent in this same file
+            // is the counter-example). It also keeps the setter and
+            // `getSSLSocketFactory` reading one location, so they cannot
+            // drift apart.
+            ctx.set_field_by_name(
+                connection,
+                "sslSocketFactory",
+                Value::Object(Some(factory)),
+            );
             Ok(None)
         },
     );
@@ -5000,28 +5092,33 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         hurl,
         "getSSLSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
-        |ctx, _args| {
+        |ctx, args| {
             // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
             // 20260804): same bare-0-field carrier bug as
             // `getDefaultSSLSocketFactory` above — see that comment.
             //
-            // The JDK's instance default is whatever
-            // `setDefaultSSLSocketFactory` published, falling back to
-            // `SSLSocketFactory.getDefault()`. Read that back rather than
-            // minting an unrelated placeholder.
+            // Precedence is the JDK's, most specific first:
+            //   1. this connection's own `setSSLSocketFactory(...)`, read
+            //      back out of the real `sslSocketFactory` instance field;
+            //   2. whatever `setDefaultSSLSocketFactory` published;
+            //   3. `SSLSocketFactory.getDefault()`.
             //
-            // Known remaining gap (NOT this doc's bug, and deliberately not
-            // fixed here): a per-connection `setSSLSocketFactory(...)` is
-            // still not readable back through this getter. That setter
-            // captures the connection's client identity but never stores the
-            // factory object, and storing it needs a new GC-rooted
-            // per-connection table (scan + post-move remap), like
-            // `huc_default_factory_slot` has. Both branches below at least
-            // return a factory that CAN open a layered socket.
-            if let Some(f) = huc_default_ssl_socket_factory() {
-                return Ok(Some(Value::Object(Some(f))));
+            // (1) is the round trip real JDK 21 exhibits — verified by
+            // `probes/HucFactoryReadbackProbe.java`, which also pins the
+            // isolation half: a SECOND connection must NOT observe the first
+            // one's factory, which is what makes reading a per-connection
+            // field (rather than a process-wide slot) load-bearing.
+            if let Some(connection) = args.first().and_then(|v| match v {
+                Value::Object(Some(c)) => Some(*c),
+                _ => None,
+            }) {
+                if let Value::Object(Some(f)) =
+                    ctx.get_field_by_name(connection, "sslSocketFactory")
+                {
+                    return Ok(Some(Value::Object(Some(f))));
+                }
             }
-            let obj = default_ssl_socket_factory_obj(ctx);
+            let obj = huc_default_factory_or_publish(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -7275,7 +7372,7 @@ enum BbBacking {
 /// server engine never saw the ClientHello Netty delivered and its first
 /// `unwrap` returned `BUFFER_UNDERFLOW consumed=0`, upon which Netty closed
 /// the connection (client saw "TLS handshake failed: unexpected EOF"). See
-/// `docs/known-issues/reactive-netty-https-sslengine-handshake-underflow.md`.
+/// `fixed-suite-bugs/reactive-netty-https-sslengine-handshake-underflow-FIXED.md`.
 struct BbView {
     backing: BbBacking,
     layout: BbLayout,
@@ -7869,7 +7966,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // `beginHandshake()` call was ALSO silently discarded on the
                     // CratonVM side even before hitting that rustls wall — see
                     // this crate's
-                    // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-
+                    // `fixed-suite-bugs/tls-ocsp-clientcert-
                     // validation-not-enforced-FIXED.md`, "Residual #2 implementation"
                     // point 2, for the full trace evidence.
                     //
@@ -9094,7 +9191,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     // reaches the connection's promise), which is why this specific NPE
     // manifested as an indefinite hang/silent-exit crash rather than a
     // visible test failure — see
-    // docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md.
+    // fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md.
     // Real JDK's `getHandshakeSession()` returns the session being
     // negotiated (or null outside a handshake); returning the same
     // best-effort synthetic session `getSession()` already builds (complete
@@ -10446,7 +10543,7 @@ pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
 /// `IllegalStateException: SSLSocketFactory has no owning SSLContext`
 /// instead of connecting. Converting the idiom rather than each site is what
 /// keeps a future fourth caller from re-introducing it. See
-/// `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+/// `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 pub(crate) fn default_ssl_context_or_create(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
 ) -> ObjectRef {
@@ -10470,6 +10567,14 @@ pub(crate) fn default_ssl_context_or_create(
 pub(crate) fn default_ssl_socket_factory_obj(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
 ) -> ObjectRef {
+    // Deliberately a FRESH carrier per call, not a cached singleton.
+    // Measured on real JDK 21: `SSLSocketFactory.getDefault()` hands back a
+    // different object each time (`SSLContextImpl.engineGetSocketFactory`
+    // news up an `SSLSocketFactoryImpl` per call). Caching here was tried and
+    // reverted — it diverges from the JDK, and the stability that callers do
+    // observe belongs one layer up, in
+    // `HttpsURLConnection.getDefaultSSLSocketFactory`, which caches its result
+    // in its own static field (see that registration).
     let ssl_ctx = default_ssl_context_or_create(ctx);
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
     ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));

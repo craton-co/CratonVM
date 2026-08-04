@@ -154,8 +154,154 @@ const R11: u8 = 11;
 
 // XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
 // XMM0 holds the first operand / result, XMM1 the second operand / a mask.
-const XMM0: u8 = 0;
-const XMM1: u8 = 1;
+const XMM0: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[0];
+const XMM1: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[1];
+
+/// The bytes of one `[RBP - disp]` access, without a heap allocation.
+///
+/// Seven is the longest form ([`enc_frame_load`]'s disp32 branch: REX + opcode
+/// + ModRM + four displacement bytes).
+#[derive(Clone, Copy)]
+struct FrameAccess {
+    bytes: [u8; 7],
+    len: usize,
+}
+
+impl FrameAccess {
+    fn new() -> FrameAccess {
+        FrameAccess {
+            bytes: [0; 7],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, b: u8) {
+        if let Some(cell) = self.bytes.get_mut(self.len) {
+            *cell = b;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // `len` only ever advances through `push`, which bounds-checks.
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// The bytes of one whole tile, without a heap allocation.
+///
+/// Bounded on purpose. The widest sequence [`Lowerer::encode_tile_frame_homed`]
+/// can produce is two disp32 frame loads (7 each), a four-byte ALU instruction
+/// and a disp32 store (7) — 25 bytes. A tile that would need more is a tile
+/// this encoder has not been proved byte-equal for, and [`Self::push`] answers
+/// it with `None` rather than with a truncated instruction stream.
+#[derive(Clone, Copy)]
+struct FrameAccessList {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl FrameAccessList {
+    fn new() -> FrameAccessList {
+        FrameAccessList {
+            bytes: [0; 32],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, acc: &FrameAccess) -> Option<()> {
+        self.push_bytes(acc.as_slice())
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+        // An empty push is a refusal, not a no-op: `enc_frame_load` writes
+        // nothing for a register it cannot encode, and swallowing that would
+        // drop the load.
+        if bytes.is_empty() {
+            return None;
+        }
+        let end = self.len.checked_add(bytes.len())?;
+        self.bytes.get_mut(self.len..end)?.copy_from_slice(bytes);
+        self.len = end;
+        Some(())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Make this tile's bytes wrong, on purpose.
+    ///
+    /// The forcing function for the byte-equality oracle: a check that has
+    /// never been shown to fail is a check nobody knows the polarity of. See
+    /// `an_injected_wrong_byte_is_caught_by_the_oracle`.
+    #[cfg(test)]
+    fn corrupt_last_byte(&mut self) {
+        if let Some(last) = self.len.checked_sub(1).and_then(|i| self.bytes.get_mut(i)) {
+            *last ^= 0xFF;
+        }
+    }
+}
+
+/// `MOV reg, [RBP - offset]`, REX.W, smallest displacement form.
+///
+/// Extracted from `Lowerer::load_to_rax` / `load_to_rcx` so the level-2 tile
+/// encoder and the per-opcode emitters produce these bytes from **one** piece
+/// of code rather than from two that agree today. The byte-equality oracle
+/// increment 2 rests on is only as strong as that: two copies of a frame access
+/// can drift, and the drift would be invisible to a test that drives just one
+/// of them.
+///
+/// `reg` must be 0-7. There is no REX.R here — the callers are RAX and RCX,
+/// which is what makes the output identical to the literals it replaced — so a
+/// high register would silently encode as its low counterpart. Rather than
+/// widen the encoding (which would change the bytes) the function refuses: it
+/// writes nothing and the caller sees an empty accessor.
+fn enc_frame_load(reg: u8, offset: i32, out: &mut FrameAccess) {
+    if reg >= 8 {
+        return;
+    }
+    let neg = -offset;
+    out.push(0x48);
+    out.push(0x8B);
+    if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+        // 48 8B 45 disp8 — mod=01, reg=<reg>, r/m=RBP(101)
+        out.push(0x45 | ((reg & 7) << 3));
+        out.push(neg as u8);
+    } else {
+        // 48 8B 85 disp32 — mod=10
+        out.push(0x85 | ((reg & 7) << 3));
+        for b in neg.to_le_bytes() {
+            out.push(b);
+        }
+    }
+}
+
+/// `MOV [RBP - offset], reg`, REX.W, smallest displacement form. The store half
+/// of [`enc_frame_load`]; the same `reg < 8` rule applies for the same reason.
+fn enc_frame_store(reg: u8, offset: i32, out: &mut FrameAccess) {
+    if reg >= 8 {
+        return;
+    }
+    let neg = -offset;
+    out.push(0x48);
+    out.push(0x89);
+    if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+        // 48 89 45 disp8 — mod=01, reg=<reg>, r/m=RBP(101)
+        out.push(0x45 | ((reg & 7) << 3));
+        out.push(neg as u8);
+    } else {
+        // 48 89 85 disp32 — mod=10
+        out.push(0x85 | ((reg & 7) << 3));
+        for b in neg.to_le_bytes() {
+            out.push(b);
+        }
+    }
+}
 
 // Platform C-ABI integer argument registers for the `invoke_dispatch` helper
 // call (Gap B `Op::Call`). The helper's 4 args (vm_ptr, info_ptr, args_ptr,
@@ -478,8 +624,18 @@ struct Lowerer<'a> {
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
     args_stage_top_off: i32,
     /// Upper bound (inclusive) for a spill slot's frame offset — excludes the
-    /// shadow space AND the arg-staging region so spills never overlap them.
+    /// shadow space, the arg-staging region AND the callee-saved XMM save area,
+    /// so spills never overlap any of them.
     spill_cap_off: i32,
+    /// Bytes reserved for the callee-saved XMM save area, `[spill_cap_off,
+    /// spill_cap_off + this)`. See [`ir_saved_xmm_bytes`] and
+    /// [`IR_LOWER_SAVED_XMMS`].
+    ///
+    /// Latched at construction rather than re-derived at emission time: the
+    /// frame was *laid out* against this number, and a prologue that recomputed
+    /// it from a flag read a second time would silently write outside its own
+    /// reservation if the two reads ever disagreed.
+    saved_xmm_bytes: i32,
     /// Native offsets of `JE rel32` instructions emitted after each dispatch
     /// call (the exception sentinel check) that jump to the shared bail stub.
     call_exc_patches: Vec<usize>,
@@ -579,6 +735,66 @@ struct Lowerer<'a> {
     /// register through its home word. Reported as
     /// `CompilationReport::reloads`.
     ls_reloads: usize,
+
+    // ── Level 2: the machine list ────────────────────────────────────
+    //
+    // Empty and `MirMode::Off` unless `CRATONVM_JIT=ir-isel-emit` or
+    // `ir-isel-verify` is set. See [`MirPlan`].
+    /// The selector's output for this method, one entry per scheduled block.
+    mir: Option<MirPlan>,
+    /// What to do with it.
+    mir_mode: MirMode,
+    /// Tiles whose bytes this compile took from the level-2 encoder
+    /// (`MirMode::Emit`) or checked against the per-opcode arms
+    /// (`MirMode::Verify`).
+    mir_tiles: usize,
+    /// Byte disagreements between the two paths. Non-zero refuses the compile:
+    /// increment 2 is where fail-closed returns.
+    mir_mismatches: usize,
+    /// Verify mode only, and it decides whether there is a next increment:
+    /// tiles the encoder can express but is NOT allowed to emit, because their
+    /// bytes are not identical to the per-opcode arm's.
+    mir_shadow_tiles: usize,
+    /// Bytes the per-opcode arms wrote for those tiles' nodes…
+    mir_arm_bytes: usize,
+    /// …and bytes the level-2 encoder would have written instead.
+    mir_enc_bytes: usize,
+}
+
+/// What the level-2 machine list is for on this compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirMode {
+    /// Not built. The default, and every compile that does not set a flag.
+    Off,
+    /// Built, and checked against the per-opcode arms byte for byte. The
+    /// **per-opcode arms still emit** — this mode changes no emitted byte, so a
+    /// disagreement is a diagnosis rather than a wrong instruction. It is the
+    /// method-scale form of the anchoring property each `PATTERNS` row carries
+    /// per row, and it is the gate increment 2 has to pass on a real corpus
+    /// before [`MirMode::Emit`] is worth running.
+    Verify,
+    /// Built, and it emits. The per-opcode arm is not run for a node a tile
+    /// covers.
+    Emit,
+}
+
+/// Level 2 — the machine list, as a value the emitter can consume.
+///
+/// Deliberately not a new IR, a crate or a trait hierarchy: it is the
+/// selector's own `Vec<MInst>` per block, and the two side tables that already
+/// existed (`SlotPlan`, the frame plan; `RegResidency`, the allocation) stay
+/// where they are. That is the whole artifact
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md` says
+/// level 2's first form should be.
+struct MirPlan {
+    /// One selection per scheduled block, in block order.
+    blocks: Vec<crate::x64::isel::BlockSelection>,
+    /// `tile_of[node]` = index into `blocks[b].tiles` of the tile rooted at
+    /// `node`, for the block `b` the node was scheduled into.
+    ///
+    /// A node a tile *absorbed* is deliberately absent: it has no tile of its
+    /// own, and the encoder must never be asked to emit one for it.
+    tile_of: Vec<Option<(u32, u32)>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -628,8 +844,8 @@ impl<'a> Lowerer<'a> {
         let max_call_args = needs.max_call_args;
 
         // Frame layout (rbp downward): locals, [context slot], five bookkeeping
-        // words, spills, [args staging], 16-byte stack-arg reserve, 32-byte
-        // shadow. Reserve slots for
+        // words, spills, [callee-saved XMM save area], [args staging], 16-byte
+        // stack-arg reserve, 32-byte shadow. Reserve slots for
         // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
@@ -661,12 +877,14 @@ impl<'a> Lowerer<'a> {
         // previously `(graph.nodes.len() as i32) * 8` on a pathological graph
         // could.
         let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
+        let saved_xmm_bytes = ir_saved_xmm_bytes();
         debug_assert_eq!(
             frame_size,
             ((locals_size
                 + context_size
                 + bookkeeping_size
                 + spill_size
+                + saved_xmm_bytes
                 + args_stage_size
                 + shadow
                 + stack_arg_reserve)
@@ -747,7 +965,21 @@ impl<'a> Lowerer<'a> {
         let phi_copy_scratch_slot_off = (base + 4) * 8;
         let first_spill = (base + 5) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
-        let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
+        // The callee-saved XMM save area sits directly ABOVE the spill band and
+        // directly BELOW the outgoing-argument staging, so `callee_saved_lo`
+        // stays exactly `spill_cap_off` and the band the GC verifier skips
+        // (`conservative_roots::band_slot_is_verifiable`) grows to cover it
+        // without any change on the reader side. That placement is not
+        // cosmetic: a register image is precisely "storage this frame does not
+        // resume from", which is what that band means.
+        //
+        // Register `i` occupies offsets `(xmm_saved_lo + 16*i, xmm_saved_lo +
+        // 16*(i+1)]`, so its `MOVUPS` base is `[rbp - (spill_cap_off +
+        // 16*(i+1))]` and the 16 bytes it writes run up to `rbp -
+        // spill_cap_off` exclusive — inside the reservation, never over a
+        // spill.
+        let spill_cap_off =
+            frame_size - shadow - stack_arg_reserve - args_stage_size - saved_xmm_bytes;
 
         Lowerer {
             graph,
@@ -815,6 +1047,7 @@ impl<'a> Lowerer<'a> {
             next_sp_id: 1,
             args_stage_top_off,
             spill_cap_off,
+            saved_xmm_bytes,
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
@@ -833,6 +1066,13 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
+            mir: None,
+            mir_mode: MirMode::Off,
+            mir_tiles: 0,
+            mir_mismatches: 0,
+            mir_shadow_tiles: 0,
+            mir_arm_bytes: 0,
+            mir_enc_bytes: 0,
         }
     }
 
@@ -841,6 +1081,13 @@ impl<'a> Lowerer<'a> {
     fn set_residency(&mut self, residency: RegResidency) {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
+    }
+
+    /// Install the level-2 machine list. Called once, after construction and
+    /// before any emission, only when a machine-level flag is on.
+    fn set_mir(&mut self, plan: MirPlan, mode: MirMode) {
+        self.mir = Some(plan);
+        self.mir_mode = mode;
     }
 
     /// The XMM register `id`'s value is CURRENTLY resident in, if any.
@@ -1002,6 +1249,46 @@ impl<'a> Lowerer<'a> {
     /// the nodes `prealloc_phi_slots` and `lower_data_node` allocate for), and
     /// refuses the compile rather than inventing an offset.
     fn alloc_slot_checked(&mut self, id: NodeId) -> CompileResult<i32> {
+        let offset = self.planned_slot_off(id)?;
+        // `planned_slot_off` already proved the offset non-zero and inside the
+        // frame; re-deriving the `NonZeroU32` here keeps the "no zero offsets"
+        // invariant enforced at the write, not merely upstream of it.
+        let located = u32::try_from(offset)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
+                ))
+            })?;
+        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
+            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
+        })?;
+        *cell = Some(located);
+        // Watermark, not a cursor: the highest word any emitted node's slot has
+        // reached. Every safepoint's `live_frame_hi` is read off this, and with
+        // reuse it stops growing once the peak live set is reached.
+        self.spill_high_water = self.spill_high_water.max(offset.saturating_add(8));
+        // Relocation contract: a slot becomes publishable the moment the
+        // emitting code writes it. `alloc_slot` is called at the point of
+        // emission for every node EXCEPT phis, whose slots are reserved up
+        // front by `prealloc_phi_slots` and written later by edge copies —
+        // those are marked separately, after the prologue zeroes them.
+        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
+            self.defined_nodes[id as usize] = true;
+        }
+        Ok(offset)
+    }
+
+    /// The frame offset [`Self::alloc_slot_checked`] *will* assign `id`, without
+    /// assigning it.
+    ///
+    /// Split out so the level-2 tile encoder can encode a store to a
+    /// destination slot before the destination has been allocated, and get the
+    /// same answer the allocating path would — by calling the same code, not by
+    /// repeating the arithmetic. Every refusal below is the allocating path's
+    /// refusal, unchanged; only the three mutations live in the caller.
+    fn planned_slot_off(&self, id: NodeId) -> CompileResult<i32> {
         let color = match self.slot_plan.node_color.get(id as usize).copied().flatten() {
             Some(color) => color,
             None => {
@@ -1044,7 +1331,7 @@ impl<'a> Lowerer<'a> {
         // `first_spill > 0` and colours are non-negative, so this cannot be
         // `None` — but the conversion is where the "no zero offsets" invariant
         // is *enforced* rather than assumed, so it is checked, not asserted.
-        let located = u32::try_from(offset)
+        u32::try_from(offset)
             .ok()
             .and_then(NonZeroU32::new)
             .ok_or_else(|| {
@@ -1052,22 +1339,6 @@ impl<'a> Lowerer<'a> {
                     "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
                 ))
             })?;
-        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
-            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
-        })?;
-        *cell = Some(located);
-        // Watermark, not a cursor: the highest word any emitted node's slot has
-        // reached. Every safepoint's `live_frame_hi` is read off this, and with
-        // reuse it stops growing once the peak live set is reached.
-        self.spill_high_water = self.spill_high_water.max(offset.saturating_add(8));
-        // Relocation contract: a slot becomes publishable the moment the
-        // emitting code writes it. `alloc_slot` is called at the point of
-        // emission for every node EXCEPT phis, whose slots are reserved up
-        // front by `prealloc_phi_slots` and written later by edge copies —
-        // those are marked separately, after the prologue zeroes them.
-        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
-            self.defined_nodes[id as usize] = true;
-        }
         Ok(offset)
     }
 
@@ -1444,6 +1715,61 @@ fn reloc_emit_enabled() -> bool {
 
     // ── Code emission helpers ────────────────────────────────────────
 
+    /// The callee-saved XMM registers this method actually parked a value in,
+    /// paired with the frame offset each is saved at.
+    ///
+    /// Empty on System V (nothing is callee-saved), empty when the linear-scan
+    /// path is off, and empty for any method whose allocation promoted nothing
+    /// into XMM6/XMM7 — which is the common case even with the flag on. A
+    /// method that uses none of them emits no save, no restore and pays only
+    /// the reserved frame bytes.
+    ///
+    /// Reads the residency plan, which `lower_inner_with_scopes` installs
+    /// BEFORE `lower()` runs (`set_residency`, "installed before the prologue
+    /// and never touched again"). That ordering is what makes a *dynamic* save
+    /// set legal against a *static* frame reservation: the set can only shrink
+    /// relative to `IR_LOWER_SAVED_XMMS`, never grow past it.
+    fn saved_xmm_regs(&self) -> impl Iterator<Item = (u8, i32)> + '_ {
+        let base = self.spill_cap_off;
+        let reserved = self.saved_xmm_bytes;
+        IR_LOWER_SAVED_XMMS
+            .iter()
+            .enumerate()
+            .filter(move |_| reserved > 0)
+            .filter(move |(_, reg)| self.reg_of.iter().any(|r| *r == Some(**reg)))
+            // Cast: `IR_LOWER_SAVED_XMMS` has two elements.
+            .map(move |(i, reg)| (*reg, base + (i as i32 + 1) * 16))
+    }
+
+    /// `MOVUPS [rbp - off], xmm` (save) or `MOVUPS xmm, [rbp - off]` (restore).
+    ///
+    /// Unaligned on purpose: `frame_size` is 16-byte aligned but `rbp` itself is
+    /// only guaranteed 8-byte aligned at entry (the `push rbp` follows the
+    /// caller's `call`), so `MOVAPS` would fault on half the call sites. The
+    /// three-byte cost of the unaligned form is paid once per method.
+    ///
+    /// Both registers are below XMM8, so no REX byte — the same constraint
+    /// `fp_load`/`fp_store` live under, restated here because this function
+    /// would silently encode the wrong register if it were ever handed one.
+    fn emit_xmm_frame_move(&mut self, reg: u8, off: i32, store: bool) {
+        debug_assert!(reg < 8, "xmm{reg} needs REX.R, which this encoding omits");
+        self.buf.emit(&[0x0F, if store { 0x11 } else { 0x10 }]);
+        // ModRM: mod=10 (disp32), reg=xmm, rm=101 (rbp-relative).
+        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+        self.buf.emit(&(-off).to_le_bytes());
+    }
+
+    /// Restore the callee-saved XMM registers. Emitted at every exit, and it
+    /// must not disturb RAX — a method's return value and the `i64::MIN`
+    /// exception/deopt sentinel both travel there — which `MOVUPS` into an XMM
+    /// satisfies for free.
+    fn emit_callee_saved_restore(&mut self) {
+        let restores: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
+        for (reg, off) in restores {
+            self.emit_xmm_frame_move(reg, off, false);
+        }
+    }
+
     fn emit_prologue(&mut self) {
         // push rbp
         self.buf.emit_byte(0x55);
@@ -1452,6 +1778,16 @@ fn reloc_emit_enabled() -> bool {
         // sub rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xEC]);
         self.buf.emit(&self.frame_size.to_le_bytes());
+
+        // Callee-saved XMM save area. FIRST, before the ABI parameter stores:
+        // an incoming floating-point argument arrives in XMM0..XMM3 (Win64) and
+        // nothing here touches those, but ordering the save ahead of every
+        // other prologue step keeps "the caller's registers are preserved" true
+        // across the whole body rather than across most of it.
+        let saves: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
+        for (reg, off) in saves {
+            self.emit_xmm_frame_move(reg, off, true);
+        }
 
         // Store params from ABI registers to local frame slots.
         // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX, R8, R9.
@@ -2225,6 +2561,7 @@ fn reloc_emit_enabled() -> bool {
 
     fn emit_epilogue(&mut self) {
         self.emit_shadow_savetop_restore();
+        self.emit_callee_saved_restore();
         // add rsp, frame_size
         self.buf.emit(&[0x48, 0x81, 0xC4]);
         self.buf.emit(&self.frame_size.to_le_bytes());
@@ -2242,41 +2579,23 @@ fn reloc_emit_enabled() -> bool {
     /// within ±128 bytes of RBP, so the disp8 form is the common case
     /// and saves 3 bytes per frame access.
     fn load_to_rax(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 8B 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x8B, 0x45, neg as u8]);
-        } else {
-            // 48 8B 85 disp32 — mod=10
-            self.buf.emit(&[0x48, 0x8B, 0x85]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_load(RAX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV RCX, [RBP - offset]
     fn load_to_rcx(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 8B 4D disp8  — mod=01, reg=RCX(1), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x8B, 0x4D, neg as u8]);
-        } else {
-            // 48 8B 8D disp32 — mod=10
-            self.buf.emit(&[0x48, 0x8B, 0x8D]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_load(RCX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 89 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x89, 0x45, neg as u8]);
-        } else {
-            // 48 89 85 disp32 — mod=10
-            self.buf.emit(&[0x48, 0x89, 0x85]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_store(RAX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV RAX, imm64
@@ -2478,9 +2797,13 @@ fn reloc_emit_enabled() -> bool {
 
         let block = &self.schedule.blocks[block_idx];
 
-        // Emit data nodes
+        // Emit data nodes.
+        //
+        // The level-2 detour is a no-op unless a machine-level flag is on; see
+        // `lower_data_node_through_mir`, which falls through to the per-opcode
+        // arm for every node no tile covers.
         for &node_id in &block.nodes {
-            self.lower_data_node(node_id);
+            self.lower_data_node_through_mir(block_idx, node_id);
         }
 
         // Emit terminator
@@ -3157,6 +3480,296 @@ fn reloc_emit_enabled() -> bool {
             // `Self::patch_or_bail` / `patch_rel32_to_here`.
             Self::patch_or_bail(&mut self.buf, p, rel);
         }
+    }
+
+    // ── Level 2: the machine list, emitting ──────────────────────────────
+    //
+    // Increment 2 of
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`:
+    // the selector's tiles become bytes, through the same `PATTERNS` table
+    // whose every row is anchored to a hand-written emitter, against the
+    // trivial allocation `ir_lower` has always used — every value in its frame
+    // word, RAX the destination, RCX the second operand.
+    //
+    // The whole increment is the byte-equality oracle. `MirMode::Verify` runs
+    // the per-opcode arm AND the tile encoder and compares; `MirMode::Emit`
+    // runs only the encoder. A mismatch in either mode refuses the compile.
+
+    /// The one entry point `lower_block` calls. Falls through to
+    /// [`Self::lower_data_node`] whenever the machine list has nothing to say
+    /// about `id`, which is every node on every compile that has not set a
+    /// machine-level flag.
+    fn lower_data_node_through_mir(&mut self, block_idx: usize, id: NodeId) {
+        let bytes = match self.mir_mode {
+            MirMode::Off => None,
+            MirMode::Verify | MirMode::Emit => self.mir_tile_bytes(block_idx, id),
+        };
+        let Some(bytes) = bytes else {
+            // Not emittable. In verify mode, still ask what the encoder WOULD
+            // have produced, and price it against what the arm writes — that
+            // difference is the size of the next increment, and it is the one
+            // number that decides whether there should be one.
+            if self.mir_mode == MirMode::Verify {
+                let shadow = self.mir_shadow_tile_bytes(block_idx, id);
+                let before = self.buf.pos();
+                self.lower_data_node(id);
+                let after = self.buf.pos();
+                if let Some(shadow) = shadow {
+                    self.mir_shadow_tiles += 1;
+                    self.mir_arm_bytes += after.saturating_sub(before);
+                    self.mir_enc_bytes += shadow.as_slice().len();
+                }
+                return;
+            }
+            self.lower_data_node(id);
+            return;
+        };
+        self.mir_tiles += 1;
+        if self.mir_mode == MirMode::Verify {
+            // The per-opcode arm is still the thing that emits, so this mode
+            // cannot produce a wrong instruction — only a wrong verdict.
+            let before = self.buf.pos();
+            self.lower_data_node(id);
+            let after = self.buf.pos();
+            let agreed = self
+                .buf
+                .as_slice()
+                .get(before..after)
+                .is_some_and(|emitted| emitted == bytes.as_slice());
+            if !agreed {
+                self.mir_mismatches += 1;
+            }
+            return;
+        }
+        // `MirMode::Emit`. Everything the per-opcode arm does besides emitting
+        // has to happen here too, in the same order: the bci anchor is read at
+        // the position the first byte lands on, and the slot allocation is what
+        // publishes the node to `defined_nodes` and moves the spill watermark.
+        if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
+            let here = self.buf.pos();
+            self.bci_native
+                .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        let slot = self.alloc_slot(id);
+        // The encoder wrote its store against `planned_slot_off`; if the
+        // allocating path just disagreed, the artifact is already wrong and no
+        // later check would notice. Refuse.
+        if self.planned_slot_off(id).ok() != Some(slot) {
+            self.mir_mismatches += 1;
+            self.latch_bailout(Bailout::new(BailoutReason::Internal(
+                "ir_lower: the level-2 encoder and alloc_slot disagreed on a destination slot",
+            )));
+            return;
+        }
+        self.buf.emit(bytes.as_slice());
+    }
+
+    /// The bytes the level-2 encoder produces for the tile rooted at `id`, or
+    /// `None` when there is no such tile or the encoder declines it.
+    ///
+    /// Declining is the normal answer and costs nothing: the caller lowers the
+    /// node the way it always did. What must never happen is a tile that
+    /// *absorbed* other nodes being emitted here — those nodes would then be
+    /// computed nowhere — so the cover list is checked against the root and
+    /// nothing else.
+    fn mir_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
+        let plan = self.mir.as_ref()?;
+        let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
+        if usize::try_from(tb).ok()? != block_idx {
+            return None;
+        }
+        let tile = plan
+            .blocks
+            .get(usize::try_from(tb).ok()?)?
+            .tiles
+            .get(usize::try_from(ti).ok()?)?;
+        if !mir_tile_is_emittable(tile, id) {
+            return None;
+        }
+        self.encode_tile_frame_homed(tile)
+    }
+
+    /// The frame word `id` lives in, **and** the fact that it lives there.
+    ///
+    /// The level-2 encoder's whole premise is that an operand can be read out
+    /// of its frame word. The linear-scan read cache makes that false for a
+    /// value it has published into a register — today only for `Float`/`Double`
+    /// (the file is XMM-only), which no integer tile can name. Asked rather
+    /// than assumed, per operand: the day the allocator grows a GP class, this
+    /// returns `None` and the tile is declined, instead of silently encoding a
+    /// load of a stale word.
+    fn frame_operand(&self, id: NodeId) -> Option<i32> {
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.slot_of_checked(id).ok()
+    }
+
+    /// The frame word a tile will STORE its result into.
+    ///
+    /// `planned_slot_off` rather than `slot_of_checked` because the destination
+    /// has not been allocated yet when the encoder runs — the emit path calls
+    /// `alloc_slot` afterwards and checks the two agree. The residency gate is
+    /// the same one [`Self::frame_operand`] applies, for the same reason: a
+    /// value the allocator publishes into a register is a value whose frame
+    /// word is not the whole truth.
+    fn frame_destination(&self, id: NodeId) -> Option<i32> {
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.planned_slot_off(id).ok()
+    }
+
+    /// What the level-2 encoder *would* emit for `id`, whatever the rule.
+    ///
+    /// Verify mode only, and it emits nothing: this is how the next increment
+    /// gets sized with a number instead of an argument. `mir_tile_bytes` is
+    /// restricted to `Rule::AluReg` because that is the only rule whose bytes
+    /// are provably identical to the per-opcode arm's — and byte equality is
+    /// increment 2's whole oracle. The rules that would *improve* the code
+    /// (`AluImm` drops a frame load) cannot ride that oracle by construction,
+    /// so what they are worth has to be measured separately, against the bytes
+    /// the arms actually wrote.
+    ///
+    /// Restricted to tiles covering exactly their own root, for the same reason
+    /// [`mir_tile_is_emittable`] is: a tile that absorbed other nodes cannot be
+    /// compared against one node's byte range.
+    fn mir_shadow_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
+        let plan = self.mir.as_ref()?;
+        let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
+        if usize::try_from(tb).ok()? != block_idx {
+            return None;
+        }
+        let tile = plan
+            .blocks
+            .get(usize::try_from(tb).ok()?)?
+            .tiles
+            .get(usize::try_from(ti).ok()?)?;
+        if tile.root != id || tile.covered.as_slice() != [id] {
+            return None;
+        }
+        self.encode_tile_frame_homed(tile)
+    }
+
+    /// Encode one tile against the frame-homed allocation.
+    ///
+    /// "Frame-homed" is not a simplification of a register allocation — it *is*
+    /// this backend's allocation, the one `ir_lower::frame_word_off` states by
+    /// returning `Err` for `ValueLoc::Reg`. Every value lives in its frame word;
+    /// RAX carries the tile's destination and RCX its second operand, exactly as
+    /// the per-opcode arms use them. That is what makes byte equality reachable
+    /// at all, and it is why increment 3 (real registers) is a separate step
+    /// with a prologue prerequisite.
+    ///
+    /// The two-address `MInst::Move` prefix costs nothing here and is not
+    /// dropped: "copy the left operand into the destination's register" and
+    /// "load the left operand" are the same instruction when the destination's
+    /// register is RAX, so the tracker below emits it once whether the selector
+    /// asked for the copy or coalesced it away.
+    fn encode_tile_frame_homed(&self, tile: &crate::x64::isel::Tile) -> Option<FrameAccessList> {
+        use crate::x64::isel::{select, MInst, Operand, Req, Ty};
+
+        let mut out = FrameAccessList::new();
+        // Which value RAX currently holds, if the tile has already loaded one.
+        let mut rax_holds: Option<NodeId> = None;
+        for inst in &tile.insts {
+            match *inst {
+                MInst::Move {
+                    dst,
+                    ty: Ty::I64,
+                    src,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    let mut acc = FrameAccess::new();
+                    enc_frame_load(RAX, self.frame_operand(src)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = Some(src);
+                }
+                MInst::AluRR {
+                    op,
+                    ty,
+                    dst,
+                    lhs,
+                    rhs,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    if rax_holds != Some(lhs) {
+                        let mut acc = FrameAccess::new();
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
+                        out.push(&acc)?;
+                    }
+                    let mut acc = FrameAccess::new();
+                    enc_frame_load(RCX, self.frame_operand(rhs)?, &mut acc);
+                    out.push(&acc)?;
+                    // Level 3. `select` refuses rather than inventing an
+                    // encoding, and every row it can answer with names the
+                    // hand-written emitter it reproduces byte for byte.
+                    let sel = select(&Req::new(
+                        op,
+                        ty,
+                        Operand::Gpr(RAX),
+                        Operand::Gpr(RCX),
+                    ))
+                    .ok()?;
+                    out.push_bytes(&sel.encoded.bytes)?;
+                    let mut acc = FrameAccess::new();
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = None;
+                }
+                // `dst <- lhs op imm`. Reachable only from the SHADOW path —
+                // `mir_tile_is_emittable` admits `Rule::AluReg` and nothing
+                // else — because this form is not byte-equal to anything: the
+                // per-opcode arm materialises the constant into RCX and uses
+                // the register form, and dropping that load is the whole point.
+                // It is encoded here so the saving can be *measured* before it
+                // is spent.
+                MInst::AluRI {
+                    op,
+                    ty,
+                    dst,
+                    lhs,
+                    imm,
+                    form: _,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    if rax_holds != Some(lhs) {
+                        let mut acc = FrameAccess::new();
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
+                        out.push(&acc)?;
+                    }
+                    let sel = select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
+                    out.push_bytes(&sel.encoded.bytes)?;
+                    let mut acc = FrameAccess::new();
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = None;
+                }
+                // Anything else is a shape this encoder has not been proved
+                // byte-equal for. Refusing is free; guessing is not.
+                _ => return None,
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        #[cfg(test)]
+        if mir_injecting_a_wrong_byte() {
+            out.corrupt_last_byte();
+        }
+        Some(out)
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -5325,6 +5938,17 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, fn_addr);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                                       // Epilogue (RAX holds the sentinel returned by ir_deopt_entry).
+                                      //
+                                      // This stub inlines the teardown rather
+                                      // than calling `emit_epilogue` (it must
+                                      // NOT restore the shadow `top` — the
+                                      // deopt entry already unwound it), so the
+                                      // callee-saved restore has to be repeated
+                                      // here. Omitting it returns to the caller
+                                      // with XMM6/XMM7 holding this frame's
+                                      // values, on the one exit that is hardest
+                                      // to notice.
+        self.emit_callee_saved_restore();
         self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
         self.buf.emit(&self.frame_size.to_le_bytes());
         self.buf.emit_byte(0x5D); // pop rbp
@@ -5893,10 +6517,13 @@ fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeed
     let args_stage = needs.max_call_args.saturating_mul(8);
     let shadow = 32usize;
     let stack_arg_reserve = 16usize;
+    // Cast: `ir_saved_xmm_bytes` returns 0 or 32.
+    let saved_xmms = ir_saved_xmm_bytes() as usize;
     let total = locals
         .saturating_add(context)
         .saturating_add(bookkeeping)
         .saturating_add(spills)
+        .saturating_add(saved_xmms)
         .saturating_add(args_stage)
         .saturating_add(shadow)
         .saturating_add(stack_arg_reserve);
@@ -7017,26 +7644,73 @@ fn verify_slot_colouring(
 
 /// The registers this wiring may hand out.
 ///
-/// XMM2–XMM5, and the choice is forced rather than tuned:
+/// XMM2–XMM7, and the ceiling is forced rather than tuned:
 ///
-///   * **Caller-saved on both ABIs.** Win64 makes XMM0–XMM5 volatile and
-///     XMM6–XMM15 non-volatile; System V makes every XMM volatile. The IR
-///     prologue saves NO callee-saved register (`emit_prologue` pushes RBP and
-///     nothing else), so any register the caller expects preserved is unusable
-///     here until that prologue grows a save area — which rules out every
-///     register in `regalloc::RegFile::x86_64` (`LOCAL_REGS` = RBX/R12–R15,
-///     plus R8/R9 and XMM8–XMM15).
 ///   * **Never touched by this emitter.** The FP value tier is XMM0/XMM1; the
 ///     GP tier is RAX/RCX/RDX with R10/R11 as safepoint and shadow-stack
-///     scratch and R8/R9 as call-argument registers. XMM2–XMM5 appear nowhere.
+///     scratch and R8/R9 as call-argument registers. XMM2–XMM7 appear nowhere.
 ///   * **Encodable without REX**, which `fp_load` / `fp_store` / `fp_binop`
 ///     require: they emit ModRM with `(xmm & 7) << 3` and no REX.R, so only
-///     XMM0–XMM7 are addressable by them at all.
+///     XMM0–XMM7 are addressable by them at all. *This* is what stops the file
+///     at XMM7 — raising it is a REX change in those three functions, not a
+///     frame change.
+///   * **Callee-saved registers are now paid for.** Win64 makes XMM0–XMM5
+///     volatile and XMM6–XMM15 non-volatile; System V makes every XMM volatile.
+///     XMM6/XMM7 were unusable here until [`IR_LOWER_SAVED_XMMS`] and the
+///     prologue save area landed (2026-08-04): before that `emit_prologue`
+///     pushed RBP and saved nothing, so a value parked in XMM6 corrupted the
+///     caller's floating-point state on one platform and not the other.
 ///
-/// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
-/// loop counter gets nothing out of it. That is the price of not touching the
-/// prologue, and it is the first thing to revisit — see the doc.
-const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
+/// The consequence worth stating plainly: this wiring is still **FP-only**. An
+/// `int` loop counter gets nothing out of it — that needs a GP file, and a GP
+/// file has to discharge the safepoint obligation per site instead of
+/// structurally (`docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+/// "Where the safepoint / oop-map obligation lives").
+///
+/// The literal lives in `regalloc::xmm_roles`, with the other two XMM
+/// authorities — `ir_lower`'s own scratch pair below and `vec_emit`'s vector
+/// pool — so that a wiring which puts two of them on one register is a visible
+/// fact rather than a discovery. All three are disjoint as of 2026-08-04;
+/// `xmm_roles::disjointness_violation` is the check.
+const IR_LOWER_LS_XMMS: [u8; 6] = crate::regalloc::xmm_roles::IR_LINEAR_SCAN;
+
+/// The XMM registers [`Lowerer::emit_prologue`] saves and every exit restores.
+///
+/// Empty on System V, where the ABI makes every XMM volatile and there is
+/// nothing to save; XMM6/XMM7 on Windows, where it does not.
+///
+/// **This is the prerequisite the level-2 lane was blocked on**, and it is
+/// deliberately its smallest useful form: two registers, saved only when a
+/// method actually parks a value in one, in a frame band the GC verifier
+/// already skips (`callee_saved_lo`). It is what lets [`IR_LOWER_LS_XMMS`]
+/// reach XMM7 and what moved `vec_emit`'s pool off the scalar file entirely.
+///
+/// Sizing is static — the frame is laid out in [`Lowerer::new`], before the
+/// allocation runs — but *emission* is dynamic: [`Lowerer::saved_xmm_regs`]
+/// yields only the registers the residency plan actually used, so a method that
+/// promotes none of them emits no save instruction and no restore.
+const IR_LOWER_SAVED_XMMS: &[u8] = crate::regalloc::xmm_roles::IR_PROLOGUE_SAVED;
+
+/// Bytes the frame reserves for [`IR_LOWER_SAVED_XMMS`].
+///
+/// 16 per register: a caller's value may be a full 128-bit vector, and saving
+/// only its low 64 bits restores a register that is *almost* right — the
+/// failure mode hardest to attribute. `MOVUPS` has no alignment requirement, so
+/// the band needs no padding.
+///
+/// Zero unless the linear-scan path is on, because nothing else can name one of
+/// these registers yet and a frame must not pay 32 bytes for a register it
+/// cannot hand out. [`estimate_frame_bytes`] and [`Lowerer::new`] both go
+/// through this one function for exactly the reason the `bookkeeping_size`
+/// comment gives: two copies of a frame term drift, and the drift is a silent
+/// wrong offset.
+fn ir_saved_xmm_bytes() -> i32 {
+    if IR_LOWER_SAVED_XMMS.is_empty() || !linear_scan_enabled() {
+        return 0;
+    }
+    // Cast: a two-element compile-time constant.
+    IR_LOWER_SAVED_XMMS.len() as i32 * 16
+}
 
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
@@ -7060,6 +7734,517 @@ fn isel_shadow_enabled() -> bool {
 /// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
 fn isel_shadow_reporting() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+}
+
+/// `CRATONVM_JIT=ir-isel-verify` — build the level-2 machine list and check the
+/// tile encoder against the per-opcode arms, byte for byte. Default **off**.
+///
+/// Changes no emitted byte: the per-opcode arms still emit, and the encoder's
+/// output is compared against what they wrote. This is the method-scale form of
+/// the anchoring property each `PATTERNS` row carries per row, and it is the
+/// gate [`isel_emit_enabled`] has to pass on a real corpus first.
+fn isel_verify_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(mode) = mir_forced() {
+            return mode == MirMode::Verify;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_VERIFY") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// `CRATONVM_JIT=ir-isel-emit` — the level-2 machine list emits, for the tiles
+/// the encoder covers. Default **off**.
+///
+/// Fail-closed, unlike `ir-isel-shadow`: a block the selector does not cover, a
+/// tile whose bytes disagree with the destination slot the allocator hands out,
+/// or an encoder refusal *after* the tile was admitted all discard the
+/// artifact, and the method runs in a lower tier. That is always valid, and it
+/// is the trade increment 0 was explicitly exempt from because its documented
+/// effect was a count.
+fn isel_emit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(mode) = mir_forced() {
+            return mode == MirMode::Emit;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_EMIT") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the two machine-level flags, so a unit test never
+    /// depends on the process environment. Thread-local, so parallel tests
+    /// cannot see each other's setting.
+    static MIR_FORCE: std::cell::Cell<Option<MirMode>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn mir_forced() -> Option<MirMode> {
+    MIR_FORCE.with(|c| c.get())
+}
+
+/// Scoped override of the machine-level mode for one test.
+#[cfg(test)]
+struct MirForce;
+
+#[cfg(test)]
+impl MirForce {
+    fn set(mode: MirMode) -> MirForce {
+        MIR_FORCE.with(|c| c.set(Some(mode)));
+        MirForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for MirForce {
+    fn drop(&mut self) {
+        MIR_FORCE.with(|c| c.set(None));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make the level-2 encoder produce a deliberately wrong byte,
+    /// so the byte-equality oracle can be observed *failing*. A guard nobody
+    /// has ever seen fail is a guard of unknown polarity.
+    static MIR_INJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn mir_injecting_a_wrong_byte() -> bool {
+    MIR_INJECT.with(|c| c.get())
+}
+
+/// Scoped byte injection for one test.
+#[cfg(test)]
+struct MirInject;
+
+#[cfg(test)]
+impl MirInject {
+    fn on() -> MirInject {
+        MIR_INJECT.with(|c| c.set(true));
+        MirInject
+    }
+}
+
+#[cfg(test)]
+impl Drop for MirInject {
+    fn drop(&mut self) {
+        MIR_INJECT.with(|c| c.set(false));
+    }
+}
+
+/// Process totals for the level-2 machine list, so a corpus run has a number
+/// rather than a stream of per-compile lines.
+///
+/// Read them with [`mir_totals::read`]; the `--dump-jit-stats` style consumers
+/// and the corpus probe both go through it. Plain atomics rather than a mutex:
+/// this runs inside the compile path, on the compiler thread, and a torn read
+/// of a diagnostic counter is not worth a lock.
+pub mod mir_totals {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static METHODS: AtomicU64 = AtomicU64::new(0);
+    static TILES: AtomicU64 = AtomicU64::new(0);
+    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    static SHADOW_TILES: AtomicU64 = AtomicU64::new(0);
+    static ARM_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ENC_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VERIFIED: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VALUES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_UNLOCATED_ROOTS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VACUOUS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_INDESCRIBABLE: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one method's [`super::MirAllocVerdict`], keeping the three states
+    /// apart.
+    ///
+    /// Collapsing them is the specific failure this counter set exists to
+    /// prevent: a corpus where every method came back `NothingToCover` and one
+    /// where every method verified thousands of values are indistinguishable in
+    /// a single "ok" tally, and the first proves nothing at all.
+    pub(super) fn record_alloc(verdict: super::MirAllocVerdict) {
+        match verdict {
+            super::MirAllocVerdict::Verified {
+                located,
+                unlocated_tile_roots,
+            } => {
+                ALLOC_VERIFIED.fetch_add(1, Relaxed);
+                ALLOC_VALUES.fetch_add(located as u64, Relaxed);
+                ALLOC_UNLOCATED_ROOTS.fetch_add(unlocated_tile_roots as u64, Relaxed);
+            }
+            super::MirAllocVerdict::NothingToCover => {
+                ALLOC_VACUOUS.fetch_add(1, Relaxed);
+            }
+            super::MirAllocVerdict::Indescribable(_) => {
+                ALLOC_INDESCRIBABLE.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// One method whose allocation `verify_allocation` REJECTED. A compiler
+    /// bug, and non-zero is a stop-and-look number, not a ratio to watch.
+    pub(super) fn record_alloc_rejected() {
+        ALLOC_REJECTED.fetch_add(1, Relaxed);
+    }
+
+    /// `(verified, values, nothing_to_cover, indescribable, rejected)` — the
+    /// increment-2 allocation verdicts since process start.
+    pub fn read_alloc() -> (u64, u64, u64, u64, u64) {
+        (
+            ALLOC_VERIFIED.load(Relaxed),
+            ALLOC_VALUES.load(Relaxed),
+            ALLOC_VACUOUS.load(Relaxed),
+            ALLOC_INDESCRIBABLE.load(Relaxed),
+            ALLOC_REJECTED.load(Relaxed),
+        )
+    }
+
+    /// Tile roots the allocation could give no home word, summed over every
+    /// verified method.
+    ///
+    /// Increment 3's sizing, taken from real compiles instead of from a
+    /// synthetic shape count: every one of these is a value that must live in a
+    /// register because there is no memory for it to live in.
+    pub fn read_unlocated_tile_roots() -> u64 {
+        ALLOC_UNLOCATED_ROOTS.load(Relaxed)
+    }
+
+    pub(super) fn record(
+        tiles: usize,
+        mismatches: usize,
+        shadow_tiles: usize,
+        arm_bytes: usize,
+        enc_bytes: usize,
+    ) {
+        METHODS.fetch_add(1, Relaxed);
+        TILES.fetch_add(tiles as u64, Relaxed);
+        MISMATCHES.fetch_add(mismatches as u64, Relaxed);
+        SHADOW_TILES.fetch_add(shadow_tiles as u64, Relaxed);
+        ARM_BYTES.fetch_add(arm_bytes as u64, Relaxed);
+        ENC_BYTES.fetch_add(enc_bytes as u64, Relaxed);
+    }
+
+    /// `(methods, tiles, mismatches)` since process start.
+    pub fn read() -> (u64, u64, u64) {
+        (
+            METHODS.load(Relaxed),
+            TILES.load(Relaxed),
+            MISMATCHES.load(Relaxed),
+        )
+    }
+
+    /// `(shadow_tiles, arm_bytes, encoder_bytes)` — verify mode's sizing of the
+    /// increment that would emit the rules byte equality cannot cover.
+    ///
+    /// `arm_bytes - encoder_bytes` is what those tiles would save, over exactly
+    /// the nodes they cover, on this workload. A zero `shadow_tiles` means the
+    /// question does not arise; it does not mean the saving is zero.
+    pub fn read_shadow() -> (u64, u64, u64) {
+        (
+            SHADOW_TILES.load(Relaxed),
+            ARM_BYTES.load(Relaxed),
+            ENC_BYTES.load(Relaxed),
+        )
+    }
+
+    /// Zero the accumulator. Tests only — hold [`TEST_LOCK`] across the reset
+    /// AND the read, or two tests reading one global see each other's counts.
+    #[cfg(test)]
+    pub fn reset() {
+        for c in [
+            &METHODS,
+            &TILES,
+            &MISMATCHES,
+            &SHADOW_TILES,
+            &ARM_BYTES,
+            &ENC_BYTES,
+            &ALLOC_VERIFIED,
+            &ALLOC_VALUES,
+            &ALLOC_UNLOCATED_ROOTS,
+            &ALLOC_VACUOUS,
+            &ALLOC_INDESCRIBABLE,
+            &ALLOC_REJECTED,
+        ] {
+            c.store(0, Relaxed);
+        }
+    }
+
+    /// Serialises the tests that read the counters above. Its own lock, not
+    /// `isel::SHADOW_TEST_LOCK`: these are different globals, and sharing one
+    /// mutex between two unrelated accumulators is how a later test ends up
+    /// holding the wrong one.
+    #[cfg(test)]
+    pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+/// May the level-2 encoder answer for node `id`'s lowering with this tile?
+///
+/// Three conditions, and the third is the one that is not obvious. The caller
+/// skips **every** node a tile covers, so a tile that absorbed a node the
+/// encoder does not actually fold leaves that node computed nowhere — the same
+/// failure `BlockSelection::covers` exists to make unrepresentable, one level
+/// further down. `Rule::AluReg` never absorbs, so today this clause is
+/// insurance rather than a live filter; a rule added to the set below without a
+/// fold is exactly what it is insurance against.
+fn mir_tile_is_emittable(tile: &crate::x64::isel::Tile, id: NodeId) -> bool {
+    use crate::x64::isel::Rule;
+
+    tile.root == id && tile.rule == Rule::AluReg && tile.covered.as_slice() == [id]
+}
+
+/// Build the level-2 machine list for one method, or refuse.
+///
+/// `None` means "do not compile this method through the machine level" and is
+/// returned for exactly one reason: a block the selector did not cover. That is
+/// the invariant `BlockSelection::covers` exists for — a node covered zero times
+/// is a dropped instruction — and increment 0 measured it holding on all 1 911
+/// blocks of a real Spring Boot workload, so a violation here is a compiler bug
+/// and not a shape to work around.
+///
+/// `SelectOptions::default()` for the same reason `shadow_select_method` uses
+/// it: `require_encodable: true`, and `fold_loads: false` because the fold's
+/// address half is still `AddrSource::Opaque`.
+fn build_mir_plan(graph: &Graph, schedule: &Schedule) -> Option<MirPlan> {
+    use crate::x64::isel::{select_block, SelectOptions};
+
+    // `frame_homed: true` is the one departure from `shadow_select_method`'s
+    // options, and it is a statement about the consumer rather than a tuning
+    // knob: `encode_tile_frame_homed` puts every value in its frame word, so
+    // the two-address copy the cost model would otherwise charge the ALU form
+    // does not exist. Left `false` it makes `Rule::Lea` outbid `Rule::AluReg`
+    // on `a + b` whenever `a` is live afterwards, and the `LEA` that wins is a
+    // byte longer than the `ADD` it replaced.
+    let opts = SelectOptions {
+        frame_homed: true,
+        ..SelectOptions::default()
+    };
+    let mut blocks = Vec::with_capacity(schedule.blocks.len());
+    let mut tile_of: Vec<Option<(u32, u32)>> = vec![None; graph.nodes.len()];
+    for (bi, block) in schedule.blocks.iter().enumerate() {
+        let sel = select_block(graph, &block.nodes, block.terminator, &opts);
+        if !sel.covers(&block.nodes) {
+            return None;
+        }
+        let bi = u32::try_from(bi).ok()?;
+        for (ti, tile) in sel.tiles.iter().enumerate() {
+            let ti = u32::try_from(ti).ok()?;
+            if let Some(cell) = tile_of.get_mut(tile.root as usize) {
+                // Two tiles rooted at one node would mean the node is computed
+                // twice; `covers` already refused that, so this is belt and
+                // braces on the index rather than a second policy.
+                if cell.is_some() {
+                    return None;
+                }
+                *cell = Some((bi, ti));
+            }
+        }
+        blocks.push(sel);
+    }
+    Some(MirPlan { blocks, tile_of })
+}
+
+/// What [`verify_mir_allocation`] concluded — the three-valued shape the
+/// design doc requires, not an `Option`.
+///
+/// `emit_safepoint_map` already refuses to conflate "nothing to cover" with
+/// "could not describe it" (an oop-free safepoint publishes
+/// `moving_young_coverage_complete: true`; an indescribable slot publishes
+/// `false` and diverts the cycle). A level-2 form owes the same distinction,
+/// because the two have opposite consequences: one is a healthy compile, the
+/// other is a compile whose allocation nothing proved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirAllocVerdict {
+    /// An allocation was built over the tile list and `verify_allocation`
+    /// accepted it.
+    Verified {
+        /// Values the allocation gives a location to.
+        located: usize,
+        /// Tiles whose root the allocation gives NO location.
+        ///
+        /// Legal, and worth counting rather than refusing: `plan_slots` gives
+        /// no home word to a value nothing reads from memory — the last value
+        /// in `(a + b) * a` is returned straight out of RAX — while
+        /// `select_block` still roots a tile at it, because a tile is about
+        /// *computing* the value, not about storing it. The encoder already
+        /// declines such a tile (`frame_destination(dst)?`) and the per-opcode
+        /// arm emits it instead.
+        ///
+        /// It is a number rather than a silence because it is exactly the
+        /// gap increment 3 closes: a value with no home is a value that MUST
+        /// stay in a register, so this count is the size of the register file's
+        /// first real customer.
+        unlocated_tile_roots: usize,
+    },
+    /// The tile list defines no value that needs a location. Vacuous, and
+    /// counted separately so a run of these cannot be read as coverage.
+    NothingToCover,
+    /// The allocation could not be *described*, before any verifier ran: the
+    /// liveness model did not converge, or it disagrees with `plan_slots` about
+    /// which values want a location.
+    ///
+    /// Not a failure. `plan_register_residency` treats exactly the same
+    /// disagreement as "decline to promote and keep the colourer's answer",
+    /// and the reasoning carries: the colourer's layout is correct on its own
+    /// terms and is the one the frame was built from. What this must not do is
+    /// report itself as `Verified`.
+    Indescribable(&'static str),
+}
+
+/// Build an allocation over the machine list and put it through the **existing**
+/// [`crate::regalloc::verify_allocation`].
+///
+/// This is increment 2 of
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`: "an
+/// allocation over it, verified by `verify_allocation`". Deliberately not a new
+/// verifier — the value of the increment is that the level-2 artifact is
+/// checkable by the allocator's *own* checker, and a second checker written for
+/// it would be a second model to keep in step.
+///
+/// # What the allocation says
+///
+/// Every value lives in its frame home for its entire live range, with an empty
+/// register file. That is not a placeholder: it is exactly what
+/// [`Lowerer::encode_tile_frame_homed`] emits, so the allocation being verified
+/// is the one the encoder actually implements. The register file is empty
+/// rather than XMM-shaped because the MIR encoder holds nothing in a long-lived
+/// register — RAX is reloaded per tile.
+///
+/// # What that buys, given nothing is in a register
+///
+/// The register rules go quiet; four others do not, and they are the ones that
+/// bite a memory-only backend:
+///
+///   * **the timeline covers the live range** — a value the tile list reads
+///     after its recorded death, or defines without a location, is refused
+///     here instead of `?`-ing out silently inside the encoder;
+///   * **no two simultaneously live values share a home word** — checked
+///     against `build_live_model`'s ranges, which are computed *independently*
+///     of `plan_slots`'. Two implementations of one liveness model drifting
+///     apart is precisely how a backend comes to alias two live values, and
+///     the tile list is a third consumer of that model;
+///   * **home pools stay separated** — a word holding a `Ref` for one value and
+///     a pinned primitive for another is the shape a moving collector
+///     misreads;
+///   * **no reference is register-resident at a safepoint** — vacuous today
+///     and the whole point tomorrow: increment 3 swaps the empty `RegFile` for
+///     a real one at this exact call site, and this check is what makes that
+///     swap reviewable rather than an act of faith.
+///
+/// # Failure policy
+///
+/// `Err` only from `verify_allocation`, and only that. A model disagreement is
+/// [`MirAllocVerdict::Indescribable`], not an error, for the reason
+/// `plan_register_residency` gives. The caller decides what an `Err` costs:
+/// `MirMode::Verify` changes no emitted byte and records it, `MirMode::Emit`
+/// refuses the compile, because emitting against an allocation nothing proved
+/// is the trade that has produced silent heap corruption in this VM before.
+fn verify_mir_allocation(
+    graph: &Graph,
+    schedule: &Schedule,
+    plan: &SlotPlan,
+    mir: &MirPlan,
+) -> CompileResult<MirAllocVerdict> {
+    use crate::regalloc::{
+        build_live_model, verify_allocation, Allocation, RegFile, Segment, RegSpec,
+    };
+
+    let live = build_live_model(graph, schedule);
+    if !live.converged {
+        return Ok(MirAllocVerdict::Indescribable("liveness did not converge"));
+    }
+    // The same agreement check `plan_register_residency` runs, and for the same
+    // reason: `build_live_model` re-implements `plan_slots`' position model
+    // rather than calling it, so the two are only interchangeable while they
+    // agree. Checked before either is used.
+    let expected_positions: usize = schedule
+        .blocks
+        .iter()
+        .map(|b| b.nodes.len() + usize::from(b.terminator.is_some()) + 1)
+        .sum();
+    if live.total_positions != expected_positions {
+        return Ok(MirAllocVerdict::Indescribable("position models disagree"));
+    }
+    if live.wants_loc.len() != plan.node_color.len()
+        || live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .any(|(wants, color)| *wants != color.is_some())
+    {
+        return Ok(MirAllocVerdict::Indescribable(
+            "liveness and the colourer disagree about which values want a location",
+        ));
+    }
+
+    let n = graph.nodes.len();
+    let mut segments: Vec<Vec<Segment>> = vec![Vec::new(); n];
+    let mut located = 0usize;
+    for id in 0..n {
+        if !live.wants_loc.get(id).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(range) = live.range.get(id).copied().flatten() else {
+            // `wants_loc` without a range is the model contradicting itself.
+            // Describing it would mean inventing a range, so say so instead.
+            return Ok(MirAllocVerdict::Indescribable(
+                "a value wants a location but has no live range",
+            ));
+        };
+        segments[id].push(Segment { range, reg: None });
+        located += 1;
+    }
+    if located == 0 {
+        return Ok(MirAllocVerdict::NothingToCover);
+    }
+
+    // How many tiles the allocation cannot back. Counted, not refused — see
+    // `MirAllocVerdict::Verified::unlocated_tile_roots` for why a tile rooted
+    // at a homeless value is the normal case rather than a defect.
+    let unlocated_tile_roots = mir
+        .tile_of
+        .iter()
+        .enumerate()
+        .filter(|(id, cell)| {
+            cell.is_some() && segments.get(*id).is_none_or(|s| s.is_empty())
+        })
+        .count();
+
+    let alloc = Allocation {
+        segments,
+        // `Allocation::stack_slot`'s own contract: "a drop-in replacement for
+        // `ir_lower`'s `SlotPlan::node_color` — same numbering, same
+        // Ref/Prim/pinned pool separation". Passing the colourer's answer
+        // rather than a re-derived one is what makes the home-aliasing check
+        // above a check of the *frame the encoder addresses*, not of a
+        // parallel invention.
+        stack_slot: plan.node_color.clone(),
+        stack_slots: plan.slots,
+        spills: 0,
+        reloads: 0,
+        remats: 0,
+        reg_moves: 0,
+        splits: 0,
+        promoted: 0,
+        events: Vec::new(),
+        peak_live: live.peak_live,
+    };
+    let empty_file = RegFile::from_specs(std::iter::empty::<RegSpec>());
+    let model = ir_lower_machine_model(graph, schedule, &live, empty_file);
+    verify_allocation(graph, &live, &model, &alloc)?;
+    Ok(MirAllocVerdict::Verified {
+        located,
+        unlocated_tile_roots,
+    })
 }
 
 /// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
@@ -7155,7 +8340,25 @@ fn ir_lower_machine_model(
     regs: crate::regalloc::RegFile,
 ) -> crate::regalloc::MachineModel {
     use std::collections::BTreeMap;
-    let all: Vec<crate::regalloc::PhysReg> = regs.specs().iter().map(|s| s.reg).collect();
+    // The back-edge safepoint poll is a CALL site, so what it destroys is the
+    // caller-saved subset — the same rule `MachineModel::for_graph` applies at
+    // an `Op::Call`, applied here because the poll is not a graph node and
+    // `for_graph` therefore never sees it.
+    //
+    // This used to be every register in the file. That was safe but wrong in
+    // the expensive direction: it made a loop-carried value unpromotable into
+    // XMM6/XMM7 even on the target where this frame saves them, which is
+    // exactly the case the save area was built for. The narrowing is sound
+    // because the poll's slow path is `jit_safepoint_slow_path`, an ordinary
+    // `extern "C"` function — Win64 obliges it to preserve XMM6–XMM15, and on
+    // System V no XMM is callee-saved so `IR_LOWER_SAVED_XMMS` is empty and
+    // this set is still the whole file, byte for byte as before.
+    let poll_destroys: Vec<crate::regalloc::PhysReg> = regs
+        .specs()
+        .iter()
+        .filter(|s| s.caller_saved)
+        .map(|s| s.reg)
+        .collect();
     let mut model = crate::regalloc::MachineModel::for_graph(graph, schedule, live, regs);
 
     // `MachineModel::clobbered_at` binary-searches by position, so the list
@@ -7177,7 +8380,10 @@ fn ir_lower_machine_model(
         // terminator position and the edge position. Clobber both, for the same
         // reason `MachineModel::for_graph` makes both safepoints.
         for pos in [edge.saturating_sub(1), edge] {
-            merged.entry(pos).or_default().extend_from_slice(&all);
+            merged
+                .entry(pos)
+                .or_default()
+                .extend_from_slice(&poll_destroys);
         }
     }
     model.clobbers = merged
@@ -7269,9 +8475,20 @@ fn plan_register_residency(
     // ── The register file ────────────────────────────────────────────
     let regs = RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
         reg: PhysReg::xmm(n),
-        // Not "the ABI says so" but "this frame never saves them", which is the
-        // property that matters: a value may not stay in one across a call.
-        caller_saved: true,
+        // Not "the ABI says so" but "does THIS frame save it", which is the
+        // property that matters: a value may stay in a register across a call
+        // exactly when the callee is obliged to give it back.
+        //
+        // XMM2–XMM5 are volatile on both ABIs, so a value in one dies at every
+        // call and `caller_saved: true` is what makes the allocator split it.
+        // XMM6/XMM7 are volatile on System V too — `IR_LOWER_SAVED_XMMS` is
+        // empty there, so they come out `true` as well and nothing changes. On
+        // Windows they are non-volatile AND this prologue saves them, so they
+        // come out `false` and a value CAN live across a call. That is the
+        // whole return on the save area, and it is expressed here rather than
+        // in a platform `cfg` because the two facts that make it true — the
+        // ABI's and this frame's — are both already in `IR_LOWER_SAVED_XMMS`.
+        caller_saved: !IR_LOWER_SAVED_XMMS.contains(&n),
     }));
     let model = ir_lower_machine_model(graph, schedule, &live, regs);
 
@@ -7715,7 +8932,7 @@ pub fn lower_with_scalar_deopt(
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -8096,7 +9313,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `docs/internal/fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //
@@ -8163,6 +9380,52 @@ pub(crate) fn lower_inner_with_scopes(
         }
     }
 
+    // ── The level-2 machine list (default OFF) ───────────────────────
+    //
+    // Increment 2. Unlike the shadow pass above this one IS fail-closed, in
+    // both its modes: a method whose blocks the selector cannot cover, or whose
+    // tiles disagree with the per-opcode arms, loses its optimized body rather
+    // than getting one nobody checked.
+    let mir_mode = if isel_emit_enabled() {
+        Some(MirMode::Emit)
+    } else if isel_verify_enabled() {
+        Some(MirMode::Verify)
+    } else {
+        None
+    };
+    if let Some(mode) = mir_mode {
+        match build_mir_plan(graph, schedule) {
+            Some(plan) => {
+                // Increment 2: the machine list gets an allocation, and the
+                // allocation gets `verify_allocation`. Runs BEFORE `set_mir`,
+                // so a plan the verifier rejects is never installed and the
+                // encoder never sees it.
+                match verify_mir_allocation(graph, schedule, &slot_plan, &plan) {
+                    Ok(verdict) => mir_totals::record_alloc(verdict),
+                    Err(bailout) => {
+                        mir_totals::record_alloc_rejected();
+                        // `Verify` mode's contract is that it changes no
+                        // emitted byte, so it must not change which methods
+                        // compile either: record the rejection, report it with
+                        // `CRATONVM_DBG=ir-isel`, and leave the per-opcode arms
+                        // to emit exactly what they always did. `Emit` mode has
+                        // no such licence — its bytes ARE the allocation's, so
+                        // an allocation nothing proved is refused outright.
+                        if mode == MirMode::Emit {
+                            return refuse(bailout);
+                        }
+                    }
+                }
+                lowerer.set_mir(plan, mode)
+            }
+            None => {
+                return refuse(Bailout::new(BailoutReason::Internal(
+                    "ir_lower: instruction selection did not cover a block",
+                )))
+            }
+        }
+    }
+
     lowerer.emit_prologue();
     lowerer.emit_safepoint_poll();
 
@@ -8182,6 +9445,35 @@ pub(crate) fn lower_inner_with_scopes(
     // net, not a mechanism. It is kept, and upgraded from one sticky bit to a
     // structured reason, so that if a future lowering finds a path the
     // pre-checks miss, the compile still fails closed *and* says why.
+    // The byte-equality oracle's verdict, for the whole method.
+    //
+    // Reported before it is acted on, because a mismatch that only ever shows
+    // up as "this method did not compile" is a mismatch nobody can diagnose.
+    if lowerer.mir_mode != MirMode::Off {
+        // Only the disagreements, and only under the debug switch: a corpus run
+        // compiles thousands of methods, and a per-compile line for each would
+        // bury the one line that matters. The totals are printed once at exit
+        // (`vm-cli::maybe_dump_shutdown_reports`).
+        if lowerer.mir_mismatches != 0 && isel_shadow_reporting() {
+            eprintln!(
+                "[ir-isel] mir mode={:?} tiles={} MISMATCHES={}",
+                lowerer.mir_mode, lowerer.mir_tiles, lowerer.mir_mismatches
+            );
+        }
+        mir_totals::record(
+            lowerer.mir_tiles,
+            lowerer.mir_mismatches,
+            lowerer.mir_shadow_tiles,
+            lowerer.mir_arm_bytes,
+            lowerer.mir_enc_bytes,
+        );
+        if lowerer.mir_mismatches != 0 {
+            return refuse(Bailout::new(BailoutReason::Internal(
+                "ir_lower: the level-2 encoder disagreed with the per-opcode lowering",
+            )));
+        }
+    }
+
     if let Some(bailout) = lowerer.take_latched_bailout() {
         return refuse(bailout);
     }
@@ -8241,6 +9533,7 @@ pub(crate) fn lower_inner_with_scopes(
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
+    let saved_xmm_bytes = lowerer.saved_xmm_bytes;
     let frame_size = lowerer.frame_size;
 
     // ── Install-time deopt-metadata verification ─────────────────────
@@ -8399,15 +9692,47 @@ pub(crate) fn lower_inner_with_scopes(
     // band the maps and the deopt verifier describe is unchanged by them.
     //
     // `callee_saved_lo` names the start of the region the verifier must NOT
-    // inspect. The IR prologue saves no callee-saved registers (it uses only
-    // caller-saved scratch), so that region here is not a register save area
-    // but the outgoing-argument staging, the stack-arg reserve and the ABI
-    // shadow space — scratch this frame never resumes from, and full of dead
-    // argument words. That is exactly the role the field plays on the reader
-    // side (`band_slot_is_verifiable` skips everything at or above it).
+    // inspect: the callee-saved XMM save area (`IR_LOWER_SAVED_XMMS`, empty on
+    // System V and on every compile with the linear-scan path off), then the
+    // outgoing-argument staging, the stack-arg reserve and the ABI shadow
+    // space. Register images, dead argument words and scratch — storage this
+    // frame never resumes from, which is exactly the role the field plays on
+    // the reader side (`band_slot_is_verifiable` skips everything at or above
+    // it).
+    //
+    // The save area was placed at `spill_cap_off` precisely so this bound did
+    // not have to move: it grew the skipped band from below without changing
+    // either endpoint's meaning, and `conservative_roots` needed no edit. An
+    // XMM save area could never hold a reference in any case — the file is
+    // FP-only — but the band is the right home for it regardless, because
+    // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
     cm.osr_frame_size = frame_size;
+    // OSR and the save area, stated where the artifact is published.
+    //
+    // `osr_trampoline` builds the frame ITSELF — push rbp, sub
+    // `osr_frame_size`, spill the callee-saved sets at `osr_callee_saved_base`
+    // / `osr_xmm_saved_base` — and jumps to a native offset PAST
+    // `emit_prologue`. An OSR entry into a method with a save area would
+    // therefore never perform the save, while every exit would still perform
+    // the restore: the caller gets two words of uninitialised frame back as
+    // its XMM6/XMM7. A wrong `double` in a caller's register, on Windows only,
+    // with nothing downstream that inspects it.
+    //
+    // It cannot happen today — this backend publishes no `osr_pc_to_native`,
+    // so `osr_enter` refuses at its first `?` (`OSR_REFUSE_NO_ENTRY_TABLE`).
+    // Asserted rather than commented because the edit that breaks it is "wire
+    // OSR into the IR tier", which will not look like it touches the prologue.
+    // The fix then is to publish `osr_callee_saved_xmms` and
+    // `osr_xmm_saved_base` here so the trampoline saves what the epilogue
+    // restores — not to delete this assertion.
+    debug_assert!(
+        saved_xmm_bytes == 0 || cm.osr_pc_to_native.is_none(),
+        "this frame saves {saved_xmm_bytes} bytes of callee-saved XMM in its \
+         prologue but publishes an OSR entry table; the trampoline enters past \
+         the prologue and every exit would restore what was never saved",
+    );
     // Where the reader finds what the emission side published. Without these
     // three, `shadow_window_from_frame` cannot even locate the shadow stack —
     // it returns `None`, `published_shadow_values` yields the empty set, and
@@ -8435,8 +9760,18 @@ pub(crate) fn lower_inner_with_scopes(
         spill_hi: spill_cap_off,
         callee_saved_lo: spill_cap_off,
         callee_saved_hi: frame_size,
-        xmm_saved_lo: 0,
-        xmm_saved_hi: 0,
+        // Named separately as well as covered by the band above, so
+        // `FrameLayout::region_name` reports `xmm-saved` rather than the
+        // catch-all — a frame dump that cannot tell a register image from an
+        // outgoing argument is the one that gets misread during a crash triage.
+        // `hi == lo == 0` when nothing was reserved, which `is_register_image`
+        // already reads as "absent".
+        xmm_saved_lo: if saved_xmm_bytes > 0 { spill_cap_off } else { 0 },
+        xmm_saved_hi: if saved_xmm_bytes > 0 {
+            spill_cap_off + saved_xmm_bytes
+        } else {
+            0
+        },
         reg_spill_lo: 0,
         reg_spill_hi: 0,
         frame_size,
@@ -11194,7 +12529,7 @@ mod tests {
     /// is `false`, so a young collection that meets an unprovable compiled frame
     /// falls back to the non-moving sweep instead of relocating, and an
     /// unpublished root produces no observable stale pointer. See
-    /// `docs/internal/cov-02-array-element-access-RETIRED-20260803.md`. So the
+    /// `cov-02-array-element-access-RETIRED-20260803.md`. So the
     /// property is asserted where it is actually decided.
     ///
     /// **Anti-vacuity, executed rather than argued.** The mutation was run:
@@ -12445,6 +13780,345 @@ mod tests {
             declared.contains(&"CRATONVM_DBG_IR_ISEL"),
             "`CRATONVM_DBG_IR_ISEL` is not in `types/src/flag_groups.rs`"
         );
+        // Increment 2's two flags, same rule.
+        for key in ["CRATONVM_JIT_IR_ISEL_EMIT", "CRATONVM_JIT_IR_ISEL_VERIFY"] {
+            assert!(
+                declared.contains(&key),
+                "`{key}` is not in `types/src/flag_groups.rs`"
+            );
+        }
+    }
+
+    // ── Increment 2: the machine list emits ───────────────────────────
+    //
+    // The oracle is byte equality on a corpus: compile a method both ways and
+    // compare the emitted bytes. Every `PATTERNS` row carries that property per
+    // row — it names the hand-written emitter it reproduces — and these are the
+    // same check at method scale.
+
+    /// `int f(int a, int b) { return (a + b) * a; }` — `iload_0; iload_1;
+    /// iadd; iload_0; imul; ireturn`, and the length is **6**, the whole
+    /// method. (The neighbouring shadow tests pass 4, which truncates after the
+    /// `iload_0` and leaves the multiply out of the graph entirely; that costs
+    /// them nothing because they only count, but it would make every assertion
+    /// below about `Rule::AluReg` vacuous.)
+    #[cfg(test)]
+    const MIR_ALU_CODE: [u8; 8] = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+
+    /// [`MIR_ALU_CODE`] as a graph and a schedule, for the tests that work on
+    /// the machine list directly instead of on the emitted bytes.
+    #[cfg(test)]
+    fn mir_alu_graph() -> (Graph, Schedule) {
+        let builder = IrBuilder::new(2, 2);
+        let graph = builder.build(&MIR_ALU_CODE, 6).expect("build");
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    #[cfg(test)]
+    fn mir_emitted_bytes(mode: Option<MirMode>) -> Vec<u8> {
+        let _force = mode.map(MirForce::set);
+        let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+        // SAFETY: the artifact is alive for the duration of this borrow, and
+        // `code_len` is what the emitter wrote.
+        unsafe {
+            std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()).to_vec()
+        }
+    }
+
+    /// The level-2 encoder reproduces the per-opcode arms **byte for byte**.
+    ///
+    /// This is increment 2's whole deliverable. `Rule::AluReg`'s seven rows are
+    /// anchored to the exact literals `lower_data_node` emits — `01 C8`,
+    /// `29 C8`, `0F AF C1`, `48 21 C8` and so on — and the frame-homed
+    /// allocation the encoder assumes IS this backend's allocation, so equality
+    /// is reachable rather than approximate.
+    ///
+    /// The exact edit that trips it: change any of those literals in
+    /// `lower_data_node`, or change `enc_frame_load`'s displacement-form choice
+    /// on one side only.
+    #[test]
+    fn the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let off = mir_emitted_bytes(None);
+        let emit = mir_emitted_bytes(Some(MirMode::Emit));
+        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert_eq!(off, emit, "the level-2 encoder changed the emitted bytes");
+
+        // Not vacuous: tiles were actually taken. A path that declined every
+        // tile would satisfy the equality above trivially.
+        let (methods, tiles, mismatches) = mir_totals::read();
+        assert_eq!(methods, 1, "exactly one method went through the machine list");
+        assert!(
+            tiles >= 2,
+            "`(a + b) * a` has two AluReg roots; the encoder took {tiles}"
+        );
+        assert_eq!(mismatches, 0);
+    }
+
+    // ── Increment 2: the allocation over the tile list ───────────────
+
+    /// The machine list gets an allocation, and `verify_allocation` accepts it.
+    ///
+    /// The point of the increment is *which* verifier: the allocator's own,
+    /// unmodified. A second checker written for the level-2 form would be a
+    /// second model of the same program, and the whole reason the frame-homed
+    /// allocation is describable at all is that `Allocation` already has a
+    /// shape for "everything in its home word".
+    ///
+    /// Not vacuous by construction — `located` is asserted non-zero, which is
+    /// the difference between "verified" and "there was nothing to verify".
+    #[test]
+    fn the_machine_list_carries_an_allocation_that_verify_allocation_accepts() {
+        let (graph, schedule) = mir_alu_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let mir = build_mir_plan(&graph, &schedule).expect("selection covers every block");
+
+        let verdict =
+            verify_mir_allocation(&graph, &schedule, &plan, &mir).expect("the allocation verifies");
+        match verdict {
+            MirAllocVerdict::Verified { located, .. } => assert!(
+                located >= 3,
+                "`(a + b) * a` has two params and two results; the allocation \
+                 located only {located} values, so this test is close to vacuous"
+            ),
+            other => panic!("expected a verified allocation, got {other:?}"),
+        }
+    }
+
+    /// The verifier is REACHED, and it can say no.
+    ///
+    /// A verification step nothing can fail is indistinguishable from no
+    /// verification step. This one runs over an allocation whose every segment
+    /// is `reg: None` — the arm where most of `verify_allocation`'s rules go
+    /// quiet — so what gets injected against is the rule that does *not* go
+    /// quiet: two values whose live ranges overlap, pointed at one home word.
+    ///
+    /// The violation is planted in the `SlotPlan`, UPSTREAM of
+    /// `verify_mir_allocation`, so the whole path is under test rather than
+    /// `verify_allocation` in isolation. Only the colour's *value* changes,
+    /// never its `Some`-ness, so the liveness-agreement precheck still passes
+    /// and the rejection can only have come from the verifier.
+    ///
+    /// The exact edit that trips it: drop the `verify_allocation` call from
+    /// `verify_mir_allocation`.
+    #[test]
+    fn an_aliased_home_word_is_rejected_by_the_allocation_verifier() {
+        use crate::regalloc::build_live_model;
+
+        let (graph, schedule) = mir_alu_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let mir = build_mir_plan(&graph, &schedule).expect("selection covers every block");
+        // Precondition: unaliased, this graph verifies. Without it a broken
+        // fixture would make the rejection below meaningless.
+        assert!(
+            matches!(
+                verify_mir_allocation(&graph, &schedule, &plan, &mir),
+                Ok(MirAllocVerdict::Verified { .. })
+            ),
+            "the fixture must verify BEFORE the injection"
+        );
+
+        // Two values genuinely live at the same position, so the rejection is
+        // the aliasing rule and not some other one.
+        let live = build_live_model(&graph, &schedule);
+        let located: Vec<usize> = (0..graph.nodes.len())
+            .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+            .filter(|&id| live.range.get(id).copied().flatten().is_some())
+            .collect();
+        let mut pair = None;
+        'outer: for (i, &a) in located.iter().enumerate() {
+            let ra = live.range[a].expect("located");
+            for &b in &located[i + 1..] {
+                let rb = live.range[b].expect("located");
+                if ra.lo <= rb.hi && rb.lo <= ra.hi {
+                    pair = Some((a, b));
+                    break 'outer;
+                }
+            }
+        }
+        let (a, b) = pair.expect("this graph has two simultaneously live values");
+
+        let mut aliased = plan_slots(&graph, &schedule, None);
+        aliased.node_color[b] = aliased.node_color[a];
+        let err = verify_mir_allocation(&graph, &schedule, &aliased, &mir)
+            .expect_err("two values live together in one home word");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("home word") || text.contains("slot pools"),
+            "rejected for the wrong reason: {text}"
+        );
+    }
+
+    /// Emit mode refuses a compile whose allocation the verifier rejected;
+    /// verify mode does not.
+    ///
+    /// Asserted as a property of the two modes rather than by forcing a
+    /// rejection, because the only way to force one on a real graph is to
+    /// introduce the compiler bug it exists to catch. What is checkable without
+    /// that is the ASYMMETRY, and the asymmetry is the whole policy: verify
+    /// mode's contract is that it changes no emitted byte, which it would break
+    /// by also changing which methods compile.
+    #[test]
+    fn verify_mode_records_the_allocation_and_emit_mode_stakes_the_compile_on_it() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+
+        for mode in [MirMode::Verify, MirMode::Emit] {
+            mir_totals::reset();
+            let bytes = mir_emitted_bytes(Some(mode));
+            assert!(!bytes.is_empty(), "{mode:?} must still produce a body");
+            let (verified, values, vacuous, indescribable, rejected) = mir_totals::read_alloc();
+            assert_eq!(rejected, 0, "{mode:?}: the allocation was rejected");
+            assert_eq!(
+                verified, 1,
+                "{mode:?}: one method, one verdict — got verified={verified} \
+                 nothing_to_cover={vacuous} indescribable={indescribable}"
+            );
+            assert!(
+                values > 0,
+                "{mode:?}: the verdict was `Verified` over zero values, which \
+                 is `NothingToCover` wearing the wrong label"
+            );
+        }
+    }
+
+    /// Verify mode is the same oracle without the risk: the per-opcode arms
+    /// still emit, and the encoder's answer is compared against what they wrote.
+    #[test]
+    fn verify_mode_agrees_and_changes_no_emitted_byte() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let off = mir_emitted_bytes(None);
+        let verify = mir_emitted_bytes(Some(MirMode::Verify));
+        assert_eq!(off, verify, "verify mode must not change an emitted byte");
+
+        let (methods, tiles, mismatches) = mir_totals::read();
+        assert_eq!(methods, 1);
+        assert!(tiles >= 2, "verify mode checked {tiles} tiles");
+        assert_eq!(mismatches, 0, "the two paths disagreed");
+    }
+
+    /// The oracle can FAIL. Injected, because a guard nobody has seen fail is a
+    /// guard of unknown polarity — and this one's whole job is to be believed
+    /// when it stays silent over a corpus.
+    ///
+    /// Both halves matter: verify mode must *count* the disagreement, and the
+    /// compile must be *refused* rather than shipped with a body nothing
+    /// checked. Increment 2 is where fail-closed returns.
+    #[test]
+    fn an_injected_wrong_byte_is_caught_by_the_oracle() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let _inject = MirInject::on();
+        let _force = MirForce::set(MirMode::Verify);
+        let refused = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2);
+        assert!(
+            refused.is_none(),
+            "a disagreeing method must lose its optimized body, not ship it"
+        );
+        let (_, _, mismatches) = mir_totals::read();
+        assert!(
+            mismatches >= 1,
+            "the byte-equality oracle did not notice a corrupted tile"
+        );
+    }
+
+    /// With both flags off — the default, and every compile today — the machine
+    /// list is not built at all.
+    ///
+    /// The counter, not the bytes: "changed no byte" and "did not execute" are
+    /// different claims, and the equality tests above would pass vacuously on a
+    /// path that never ran.
+    #[test]
+    fn the_machine_level_is_off_by_default() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+
+        assert_eq!(
+            mir_totals::read(),
+            (0, 0, 0),
+            "the machine list was built without being asked"
+        );
+    }
+
+    /// A tile that absorbed another node must never reach the encoder.
+    ///
+    /// `Rule::AluReg` covers exactly its own root, so this guard is insurance
+    /// against a future rule rather than a live filter — which is precisely why
+    /// it is tested directly instead of through a compile. Driven through one it
+    /// would be vacuous: the rules that DO absorb (`Lea`, `AluImm`, the fused
+    /// branches) are already refused a line earlier, by rule.
+    ///
+    /// What it prevents: the caller skips every node a tile covers, so a tile
+    /// that absorbed a node the encoder does not actually fold leaves that node
+    /// computed nowhere. That is the same failure `BlockSelection::covers`
+    /// exists to make unrepresentable, one level lower down.
+    ///
+    /// The exact edit that trips it: delete the `covered.as_slice() == [id]`
+    /// clause from `mir_tile_is_emittable`.
+    #[test]
+    fn the_encoder_refuses_a_tile_that_absorbed_another_node() {
+        use crate::x64::isel::{MInst, Op as SelOp, Rule, Tile, Ty};
+
+        let alu = |dst: NodeId, lhs: NodeId, rhs: NodeId| MInst::AluRR {
+            op: SelOp::Add,
+            ty: Ty::I32,
+            dst,
+            lhs,
+            rhs,
+        };
+        // The shape the encoder handles: one root, nothing absorbed.
+        let plain = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluReg);
+        assert!(mir_tile_is_emittable(&plain, 5));
+
+        // The same tile, having absorbed node 4.
+        let absorbing = Tile::for_test(5, vec![5, 4], vec![alu(5, 3, 4)], Rule::AluReg);
+        assert!(
+            !mir_tile_is_emittable(&absorbing, 5),
+            "a tile that absorbed node 4 would leave it computed nowhere"
+        );
+
+        // And a rule the encoder has not been proved byte-equal for, however
+        // ordinary its cover list.
+        let other = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluImm);
+        assert!(!mir_tile_is_emittable(&other, 5));
+        // A tile rooted somewhere else is never this node's answer.
+        assert!(!mir_tile_is_emittable(&plain, 4));
+    }
+
+    /// The two frame-access encoders are the ONE producer of these bytes.
+    ///
+    /// `load_to_rax` / `load_to_rcx` / `store_rax` delegate to them, so the
+    /// level-2 encoder and the per-opcode arms cannot drift apart. This pins the
+    /// literals those methods used to hold inline, in both displacement forms.
+    #[test]
+    fn the_frame_access_encoders_reproduce_the_inline_literals() {
+        let bytes = |f: fn(u8, i32, &mut FrameAccess), reg: u8, off: i32| -> Vec<u8> {
+            let mut a = FrameAccess::new();
+            f(reg, off, &mut a);
+            a.as_slice().to_vec()
+        };
+        // disp8: mod=01, r/m=RBP(101).
+        assert_eq!(bytes(enc_frame_load, RAX, 8), vec![0x48, 0x8B, 0x45, 0xF8]);
+        assert_eq!(bytes(enc_frame_load, RCX, 8), vec![0x48, 0x8B, 0x4D, 0xF8]);
+        assert_eq!(bytes(enc_frame_store, RAX, 8), vec![0x48, 0x89, 0x45, 0xF8]);
+        // disp32: mod=10.
+        let mut want = vec![0x48u8, 0x8B, 0x85];
+        want.extend_from_slice(&(-4096i32).to_le_bytes());
+        assert_eq!(bytes(enc_frame_load, RAX, 4096), want);
+        let mut want = vec![0x48u8, 0x89, 0x85];
+        want.extend_from_slice(&(-4096i32).to_le_bytes());
+        assert_eq!(bytes(enc_frame_store, RAX, 4096), want);
+        // A register these encodings cannot express is a refusal, not a
+        // silently truncated `reg & 7` — which would encode R8 as RAX.
+        assert!(bytes(enc_frame_load, 8, 8).is_empty());
+        assert!(bytes(enc_frame_store, 8, 8).is_empty());
     }
 
     // ── The three `ir::Op` enumerations, checked against each other ──
@@ -13189,6 +14863,243 @@ mod tests {
         );
     }
 
+    // ── The callee-saved XMM save area ───────────────────────────────
+    //
+    // `IR_LOWER_SAVED_XMMS` is the prerequisite the level-2 lane was blocked
+    // on, and its failure mode is the quietest one in this file: a caller's
+    // XMM6 comes back holding a callee's `double`, on Windows only, with no
+    // diagnostic anywhere. Nothing downstream checks it — the GC skips the
+    // band by design, the deopt verifier skips it, and the value is a `double`
+    // so it never looks like a bad pointer. So it is checked here, on the
+    // emitted bytes, at every exit.
+
+    /// Build a real `Lowerer` over a trivial graph, with a residency plan that
+    /// names `reg`.
+    ///
+    /// The plan is synthesised rather than allocated, because what is under
+    /// test is the *prologue's* reaction to a plan, not the allocator: a test
+    /// that had to find a graph with five simultaneously live doubles would
+    /// stop testing the save area the moment the allocator's heuristics moved.
+    #[cfg(test)]
+    fn lowerer_with_resident_xmm(buf_cap: usize, reg: Option<u8>) -> Lowerer<'static> {
+        // Leaked so the returned `Lowerer<'static>` can borrow them; a handful
+        // of small allocations per test, in a process that is about to exit.
+        let (graph, schedule) = add_one_graph();
+        let graph: &'static Graph = Box::leak(Box::new(graph));
+        let schedule: &'static Schedule = Box::leak(Box::new(schedule));
+        let plan: &'static SlotPlan = Box::leak(Box::new(plan_slots(graph, schedule, None)));
+        let empty: &'static HashMap<usize, bool> = Box::leak(Box::new(HashMap::new()));
+        let no_direct: &'static HashMap<usize, (usize, bool)> =
+            Box::leak(Box::new(HashMap::new()));
+        let no_ic: &'static HashMap<usize, (usize, usize)> = Box::leak(Box::new(HashMap::new()));
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes: &'static InlineScopeTable = Box::leak(Box::new(InlineScopeTable::new()));
+        let helpers: &'static JitRuntimeHelpers = Box::leak(Box::new(no_helpers()));
+        let buf = ExecutableBuffer::new(buf_cap).expect("executable buffer");
+        let mut lowerer = Lowerer::new(
+            graph,
+            schedule,
+            buf,
+            0,
+            2,
+            plan,
+            helpers,
+            empty,
+            None,
+            no_direct,
+            no_ic,
+            &no_compact,
+            no_scopes,
+        );
+        if let Some(reg) = reg {
+            lowerer.set_residency(RegResidency {
+                reg_of: vec![Some(reg)],
+                promoted: 1,
+                demoted: 0,
+                peak_live: 1,
+            });
+        }
+        lowerer
+    }
+
+    /// `MOVUPS [rbp - disp32], xmm` and its load counterpart, for `reg < 8`.
+    #[cfg(test)]
+    fn movups_frame_needle(reg: u8, store: bool) -> [u8; 3] {
+        [0x0F, if store { 0x11 } else { 0x10 }, 0x85 | ((reg & 7) << 3)]
+    }
+
+    /// **The** invariant: every exit restores exactly what the prologue saved.
+    ///
+    /// All three exits are driven, not one — `emit_deopt_stub` inlines its own
+    /// teardown instead of calling `emit_epilogue` (it must not restore the
+    /// shadow `top`), so it is the one that silently keeps this frame's XMM6 in
+    /// the caller's register file if the restore is left out of it. Deleting
+    /// `emit_callee_saved_restore` from any of the three fails this test.
+    #[test]
+    fn every_exit_restores_exactly_what_the_prologue_saved() {
+        let _flag = LsForce::on();
+        let expect = usize::from(!IR_LOWER_SAVED_XMMS.is_empty());
+        let reg = *IR_LOWER_SAVED_XMMS.first().unwrap_or(&6);
+        let save = movups_frame_needle(reg, true);
+        let restore = movups_frame_needle(reg, false);
+
+        // ── exit 1: the method epilogue ──────────────────────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.emit_epilogue();
+        let code = lo.buf.as_slice().to_vec();
+        let saves = count_seq(&code[..after_prologue], &save);
+        assert_eq!(
+            saves, expect,
+            "the prologue saved {saves} of xmm{reg}, expected {expect} on this target",
+        );
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the epilogue did not restore what the prologue saved",
+        );
+
+        // ── exit 2: the shared call-exception bail stub ──────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.call_exc_patches.push(after_prologue);
+        lo.emit_call_exc_stub();
+        let code = lo.buf.as_slice().to_vec();
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the call-exception bail stub returns the sentinel without \
+             restoring the caller's registers",
+        );
+
+        // ── exit 3: the deopt stub's inlined teardown ────────────────
+        let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
+        lo.emit_prologue();
+        let after_prologue = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(after_prologue);
+        lo.emit_deopt_stub();
+        let code = lo.buf.as_slice().to_vec();
+        assert_eq!(
+            count_seq(&code[after_prologue..], &restore),
+            saves,
+            "the deopt stub inlines its own teardown and skipped the restore",
+        );
+    }
+
+    /// A method that parks nothing in a callee-saved register emits no save.
+    ///
+    /// The save area costs frame bytes whenever the flag is on; it must not
+    /// also cost two `MOVUPS` per call in the overwhelmingly common case where
+    /// the allocation used none of them. `reg_of` naming only XMM2 is exactly
+    /// that case.
+    #[test]
+    fn a_method_that_used_no_callee_saved_register_emits_no_save() {
+        let _flag = LsForce::on();
+        for plan in [None, Some(2u8)] {
+            let mut lo = lowerer_with_resident_xmm(4096, plan);
+            lo.emit_prologue();
+            lo.emit_epilogue();
+            let code = lo.buf.as_slice().to_vec();
+            for &reg in IR_LOWER_SAVED_XMMS {
+                assert_eq!(
+                    count_seq(&code, &movups_frame_needle(reg, true)),
+                    0,
+                    "saved xmm{reg} for a plan that never used it ({plan:?})",
+                );
+            }
+        }
+    }
+
+    /// Where the save area sits, stated as the three things it must not
+    /// collide with.
+    ///
+    /// The whole placement argument is that the area lands inside
+    /// `[callee_saved_lo, frame_size)` — the band
+    /// `conservative_roots::band_slot_is_verifiable` already skips — so the
+    /// reader side needed no edit. If it drifted below `spill_cap_off` it would
+    /// overlap a spill and a `MOVUPS` would destroy a live value; if it drifted
+    /// above, it would land in the outgoing-argument staging.
+    #[test]
+    fn the_save_area_lies_between_the_spills_and_the_argument_staging() {
+        let _flag = LsForce::on();
+        let lo = lowerer_with_resident_xmm(4096, Some(6));
+        let bytes = lo.saved_xmm_bytes;
+        assert_eq!(
+            bytes,
+            ir_saved_xmm_bytes(),
+            "the frame was laid out against a different number than the \
+             prologue writes through",
+        );
+        // Cast: a two-element compile-time constant.
+        assert_eq!(bytes, IR_LOWER_SAVED_XMMS.len() as i32 * 16);
+
+        let lo_off = lo.spill_cap_off;
+        let hi_off = lo_off + bytes;
+        assert!(
+            lo.first_spill <= lo_off,
+            "spills ({}) start at or above the save area ({lo_off})",
+            lo.first_spill,
+        );
+        assert!(
+            hi_off <= lo.args_stage_top_off || bytes == 0,
+            "the save area ({lo_off}..{hi_off}) runs into the argument \
+             staging at {}",
+            lo.args_stage_top_off,
+        );
+        assert!(hi_off <= lo.frame_size, "the save area runs off the frame");
+
+        // Every offset the prologue actually writes through, inside the band.
+        for (reg, off) in lo.saved_xmm_regs() {
+            assert!(
+                off > lo_off && off <= hi_off,
+                "xmm{reg} is saved at {off}, outside [{lo_off}, {hi_off}]",
+            );
+        }
+    }
+
+    /// A method with a save area publishes no OSR entry table.
+    ///
+    /// The trampoline enters *past* `emit_prologue` and builds the frame
+    /// itself, so an OSR-entered method would restore XMM6/XMM7 from words the
+    /// save never wrote. The `debug_assert!` at the publication site states the
+    /// invariant; this is the behavioural half, on a method compiled with the
+    /// linear-scan path on — because a `debug_assert` in a release build is a
+    /// comment, and this is the one place the two paths could be wired together
+    /// by someone who never reads either.
+    #[test]
+    fn an_ir_artifact_never_offers_an_osr_entry_the_save_area_would_break() {
+        let _flag = LsForce::on();
+        let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+        assert!(
+            cm.osr_pc_to_native.is_none(),
+            "the IR tier published an OSR entry table; `osr_callee_saved_xmms` \
+             and `osr_xmm_saved_base` must be published with it",
+        );
+    }
+
+    /// With the linear-scan path off — the default, and every production
+    /// compile today — the frame pays nothing.
+    ///
+    /// A save area that widened every IR frame by 32 bytes for a register
+    /// nothing can hand out is a regression with no upside, and `frame_size`
+    /// feeds `DEFAULT_MAX_FRAME_BYTES`, so it would also decline methods that
+    /// used to compile.
+    #[test]
+    fn the_default_configuration_reserves_no_save_area() {
+        assert_eq!(
+            ir_saved_xmm_bytes(),
+            0,
+            "the flag is off, so the frame must not pay for the save area",
+        );
+        let lo = lowerer_with_resident_xmm(4096, Some(6));
+        assert_eq!(lo.saved_xmm_bytes, 0);
+        assert_eq!(lo.saved_xmm_regs().count(), 0);
+    }
+
     /// The publication interlock, asserted on the source because it is a
     /// property of *which accessor* every read uses, and a behavioural test
     /// cannot reach a lowering that forgot to convert a definition site.
@@ -13203,8 +15114,21 @@ mod tests {
     fn the_register_read_path_is_gated_on_publication() {
         // Only the emitter, not this module: the assertion below quotes the
         // very strings it looks for.
+        //
+        // The boundary is the test module, NAMED. It used to be "everything up
+        // to the first `#[cfg(test)]`", which is a position rather than a
+        // boundary: the first test-only helper added anywhere above
+        // `set_residency` truncates the scanned region and the count silently
+        // collapses to zero — a gate that fails open. (`FrameAccessList::
+        // corrupt_last_byte` is the one that did it.) The precondition below is
+        // the other half: a scan whose corpus went missing must say so.
         let src = include_str!("ir_lower.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+        assert!(
+            body.contains("fn resident_xmm"),
+            "the scanned region no longer contains the emitter — the test \
+             module boundary moved"
+        );
         let reads: Vec<String> = body
             .lines()
             .map(|l| l.trim().to_string())
@@ -13213,18 +15137,28 @@ mod tests {
         let allowed = [
             "self.reg_of = residency.reg_of;",
             "self.reg_of.get(id as usize).copied().flatten()",
+            // `saved_xmm_regs` — the prologue/epilogue's "did this method
+            // actually park a value in a callee-saved register" test. A read of
+            // the whole plan rather than of one node's assignment, so it cannot
+            // go through `resident_xmm`, and it is deliberately the ONLY such
+            // read: a second one would mean two answers to "which registers
+            // does this frame owe its caller", and a prologue and an epilogue
+            // that disagree about that corrupt the caller's floating-point
+            // state with nothing to notice.
+            ".filter(move |(_, reg)| self.reg_of.iter().any(|r| *r == Some(**reg)))",
         ];
         for line in &reads {
             assert!(
                 allowed.contains(&line.as_str()),
                 "new read of the register assignment outside `resident_xmm` / \
-                 `assigned_xmm`: {line}"
+                 `assigned_xmm` / `saved_xmm_regs`: {line}"
             );
         }
         assert_eq!(
             reads.len(),
-            3,
-            "expected exactly the install site and the two accessors"
+            4,
+            "expected exactly the install site, the two accessors and the \
+             save-area predicate"
         );
     }
 

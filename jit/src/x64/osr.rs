@@ -214,7 +214,17 @@ pub(super) fn publish_entry_metadata(
     // sentinel wherever there is no valid image (the unrolled back-edge gap),
     // where entering compiled code is not valid at all and `can_osr_enter`
     // must refuse. The identity — the same vector, moved — when unarmed.
-    let osr_entry_native = match loop_xform {
+    //
+    // Both arms land in `crate::osr_coords::BciIndexed`, the type that means
+    // "indexed by interpreter bci", reachable only through a conversion that
+    // checks the length the ORIGINAL bytecode implies. The identity arm is the
+    // one that needed it: it used to be a bare `None => osr_entry_native`, an
+    // assumption stated nowhere and true only because `code_len ==
+    // orig_code_len` when the rewriter is unarmed. A mismatch is treated
+    // exactly like a contract violation at the end of this function — no OSR
+    // metadata at all — because it is the same trade for the same reason.
+    let mut coordinates_agree = true;
+    let entry_in_bci_space = match loop_xform {
         Some(x) => {
             let mut v = x.rebuild_pc_to_native(&osr_entry_native, orig_code_len);
             // Enforce the refusal independently of who filled the vector.
@@ -238,9 +248,18 @@ pub(super) fn publish_entry_metadata(
                     *slot = -1;
                 }
             }
-            v
+            crate::osr_coords::BciIndexed::from_translated(v, orig_code_len, "osr_pc_to_native")
         }
-        None => osr_entry_native,
+        None => crate::osr_coords::OutPcIndexed::new(osr_entry_native, "osr_pc_to_native")
+            .into_bci_by_identity(orig_code_len),
+    };
+    let osr_entry_native: Vec<i32> = match entry_in_bci_space {
+        Ok(t) => t.into_inner(),
+        Err(m) => {
+            crate::osr_coords::note_mismatch(&m, method_label);
+            coordinates_agree = false;
+            Vec::new()
+        }
     };
     cm.osr_pc_to_native = if kernel_reg_homes && !kernel_reg_homes_osr_requested {
         // Method-entry kernel homes: same length, every entry -1 —
@@ -363,7 +382,7 @@ pub(super) fn publish_entry_metadata(
     // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
     // avoided clobbering the live owner, but the resulting coalesced state
     // transition was not proven safe -- see
-    // docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
     // hazard that argument rests on is *sharing*: a dead local whose register
     // is also some live local's home. A dead local that owns its register
     // outright has no coalesced state to reconstruct -- nothing reads it before
@@ -449,7 +468,15 @@ pub(super) fn publish_entry_metadata(
     // a local that IS live at the entry it actually takes. A bci with no
     // steady-state image keeps a zero mask, which is never read: the entry is
     // already refused by the `-1` in `osr_pc_to_native`.
-    let osr_dead_mask = match loop_xform {
+    //
+    // Same typed conversion as the entry table: the identity arm is checked
+    // against `orig_code_len` rather than assumed. Sizing THIS vector from the
+    // output code length while the entry table is rebuilt to the original is
+    // the exact edit `osr_contract`'s `a_short_dead_mask_is_refused` describes,
+    // and it is the one that is silently *unsound* downstream —
+    // `can_osr_enter_with` reads the mask through `unwrap_or(0)`, so a short
+    // mask reads as "no dead locals" for every bci in the tail.
+    let mask_in_bci_space = match loop_xform {
         Some(x) => {
             let mut rebuilt = vec![0u64; orig_code_len + 1];
             for (bci, slot) in rebuilt.iter_mut().enumerate() {
@@ -457,9 +484,22 @@ pub(super) fn publish_entry_metadata(
                     *slot = osr_dead_mask.get(image).copied().unwrap_or(0);
                 }
             }
-            rebuilt
+            crate::osr_coords::BciIndexed::from_translated(
+                rebuilt,
+                orig_code_len,
+                "osr_dead_mask",
+            )
         }
-        None => osr_dead_mask,
+        None => crate::osr_coords::OutPcIndexed::new(osr_dead_mask, "osr_dead_mask")
+            .into_bci_by_identity(orig_code_len),
+    };
+    let osr_dead_mask: Vec<u64> = match mask_in_bci_space {
+        Ok(t) => t.into_inner(),
+        Err(m) => {
+            crate::osr_coords::note_mismatch(&m, method_label);
+            coordinates_agree = false;
+            Vec::new()
+        }
     };
     // ── The OSR entry-metadata contract ──────────────────────────────
     //
@@ -479,14 +519,21 @@ pub(super) fn publish_entry_metadata(
     // `can_osr_enter_with` reads the dead mask through `.unwrap_or(0)`, so a
     // short mask reads as "no dead locals" for every bci in the tail and admits
     // entries that must be refused. Nothing downstream can notice.
-    let osr_metadata_agrees = crate::osr_contract::check_at_publication(
-        cm.osr_pc_to_native.as_deref().unwrap_or(&[]),
-        &osr_dead_mask,
-        &osr_local_assignments,
-        &osr_xmm_assignments,
-        num_locals,
-        method_label,
-    );
+    //
+    // `coordinates_agree` is checked FIRST and short-circuits: a vector that
+    // failed its coordinate conversion above was replaced with an empty one, so
+    // running the contract check on it would report a length mismatch that is a
+    // consequence of the coordinate bug, not a second independent finding — and
+    // would count the same artifact in both counters.
+    let osr_metadata_agrees = coordinates_agree
+        && crate::osr_contract::check_at_publication(
+            cm.osr_pc_to_native.as_deref().unwrap_or(&[]),
+            &osr_dead_mask,
+            &osr_local_assignments,
+            &osr_xmm_assignments,
+            num_locals,
+            method_label,
+        );
     //
     // Clearing the fields rather than returning early: everything below this
     // point publishes NON-OSR state (oop maps, deopt points, frame layout, the

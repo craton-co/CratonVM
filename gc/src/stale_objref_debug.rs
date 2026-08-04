@@ -4,8 +4,8 @@
 //! `CRATONVM_DBG_STALE_OBJREF` — hard-panic assertion for stale native
 //! `ObjectRef` reads (gated, default-inert).
 //!
-//! See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md
-//! and docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md for
+//! See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
+//! and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md for
 //! the full writeup of the bug class this catches and the design rationale.
 //!
 //! In one sentence: a native Rust function that captures a raw `ObjectRef`

@@ -211,12 +211,28 @@ in the JIT were recently converted to checked ones for exactly this bug class.
 
 ## Registers
 
-`jit/src/regalloc.rs` has no vector register class, and adding one was out of
-scope for this change. `vec_emit.rs` therefore carries a self-contained pool:
+`jit/src/regalloc.rs` has no vector register *class*, but since 2026-08-04 it
+does have the **authority**: `regalloc::xmm_roles` declares all three XMM
+ranges in one place — `ir_lower`'s FP scratch pair (XMM0/XMM1), its linear-scan
+file (XMM2–XMM7) and the widest pool a vector region may be given. The pool is
+an **argument**, `VecEmitRequest::vector_pool`, because which registers are free
+is a fact about the surrounding method:
 
-* **XMM0..XMM5** only. Those six are caller-saved under *both* the SysV and the
-  Windows x64 ABIs. XMM6..XMM15 are callee-saved on Windows, so using one would
-  owe a save/restore in the method prologue that this module does not emit.
+* **XMM8..XMM15** is the pool, and since 2026-08-04 it is **disjoint** from both
+  scalar ranges. A vector region can no longer destroy a scalar `double` a
+  caller left live, so the "prove your scalars are dead" obligation is gone.
+  What replaced it is narrower and mechanical: every register in the pool is
+  non-volatile on Windows, so a caller must say which ones its own prologue
+  saves (`VecEmitRequest::frame_saved_xmms`) and a pool it does not save
+  refuses the whole region (`VecEmitRefusal::UnusableVectorPool`) rather than
+  being quietly narrowed. On System V every XMM is volatile and the field is
+  ignored.
+* The pool is XMM8..XMM15 rather than the low half because `vec_emit` encodes
+  with VEX, which carries the high register bit for free. The constraint that
+  pins `IR_LINEAR_SCAN` to XMM0..XMM7 — `fp_load`/`fp_store`/`fp_binop` emit no
+  REX — does not apply here.
+* An **empty pool is legal** and refuses at the first allocation. That is the
+  right answer for a caller that has done no analysis.
 * Lowest-free-index allocation, freed at each value's last use.
 * Binary steps free their dead sources *before* allocating the destination — the
   VEX three-operand form reads both sources before writing, so reusing a source's
@@ -247,10 +263,21 @@ Everything below is honestly untested, because nothing calls this module yet:
   against hand-derived encodings and against the AVX2 helpers already in
   `x64.rs`; none of them run the bytes. An end-to-end execution test needs the
   call site.
-* **No integration with the scalar register allocator.** The XMM pool is
-  independent of `regalloc.rs` and nothing reconciles the two. Unifying them is
-  the first follow-up, and it must happen before wire-up: a scalar FP value
-  living in XMM0..XMM5 across the vector region would be silently destroyed.
+* ~~**Partial integration with the scalar register allocator.**~~ **CLOSED
+  2026-08-04 (second half).** The first half declared the three XMM authorities
+  together in `regalloc::xmm_roles` and made the pool a caller-supplied
+  argument. The residual was that the pool still overlapped both scalar ranges
+  completely, so the caller's "these are dead" proof was real work — and it
+  could not be fixed here, because the only registers that would separate them
+  are callee-saved on Windows and `ir_lower::emit_prologue` saved nothing.
+
+  That prerequisite landed: `ir_lower::IR_LOWER_SAVED_XMMS` is a callee-saved
+  XMM save area, emitted in the prologue and restored at all three exits. The
+  scalar file moved to XMM2..XMM7 and this pool moved to XMM8..XMM15, and
+  `regalloc::xmm_roles::disjointness_violation` now returns `None`.
+  `vec_emit::tests::the_three_xmm_authorities_are_disjoint` replaced the test
+  that used to assert the overlap — which said in its own doc comment that it
+  would fail the day a save area landed, and did.
 * **No call site.** `x64.rs` does not call `emit_vector_loop`, and no producer
   builds a `VecLoopShape` from the IR. The gate's `VecPlan` is `NodeId`-based;
   something has to lower those nodes to registers and steps.

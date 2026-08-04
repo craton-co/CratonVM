@@ -180,7 +180,7 @@ Current product limits:
 
 Closed GPU follow-ups, including asynchronous completion and the JIT-caller
 admission gate, are retained as
-[historical evidence](docs/internal/fixed-suite-bugs/gpu-offload-followups-20260711.md).
+historical evidence.
 
 Longer-horizon:
 

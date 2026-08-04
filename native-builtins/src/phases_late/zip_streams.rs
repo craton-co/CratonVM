@@ -1198,20 +1198,46 @@ fn native_sb_zip_inflater_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // run concrete Java bytecode. `available = -1` is the documented
         // ZipInflaterInputStream fallback that delegates to its superclass.
         let buffer_size = args.get(3).and_then(Value::as_int).unwrap_or(1).max(1);
+        // `this` crosses a re-entrant call that allocates (the superclass
+        // constructor allocates its own inflate buffer), so it must be pinned
+        // and read back — same stale-`ObjectRef` family as the `in` field
+        // below. Writing `available` through the pre-collection reference would
+        // leave the real stream at `available = 0`, i.e. silently reporting
+        // end-of-stream on a bulk-drainable entry.
+        let this_pin = ctx.pin_native_root(this);
         ctx.invoke_special(
             "java/util/zip/InflaterInputStream",
             "<init>",
             "(Ljava/io/InputStream;Ljava/util/zip/Inflater;I)V",
             &[args[0], args[1], args[2], Value::Int(buffer_size)],
         )?;
+        let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this, "available", Value::Int(-1));
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
 
     let this_pin = ctx.pin_native_root(this);
-    let source = drain_input_stream_bulk(ctx, source);
+    // Pin the SOURCE stream too, and read it back below.
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): `this` was pinned and re-read, but the
+    // stream went into `this.in` straight out of `args[1]` — a raw `ObjectRef`
+    // captured before `drain_input_stream_bulk` and `new_array`, either of which
+    // can run a moving young collection. When one did, `in` was set to the
+    // stream's PRE-collection address, so `InflaterInputStream.close()` closed
+    // whatever occupied that slot afterwards and never closed the real
+    // `DataBlockInputStream` — leaving its `FileDataBlock` reference count
+    // permanently above zero, and the file channel with it.
+    //
+    // That is why `SecurityInfoTests.getWhenJarIsSigned` and
+    // `NestedJarFileTests.verifySignedJar` failed with "[open paths] Expecting
+    // empty but was: [bcprov-jdk18on-1.78.1.jar]" while HotSpot passed: of the
+    // 5,370 signed entries those tests stream, 2 to 3 were left open, and WHICH
+    // ones changed between runs — a GC-timing signature, not a logic one.
+    let source_pin = ctx.pin_native_root(source);
+    let drained = drain_input_stream_bulk(ctx, source);
     let mut decoded = Vec::new();
-    let inflated = flate2::read::DeflateDecoder::new(source.as_slice())
+    let inflated = flate2::read::DeflateDecoder::new(drained.as_slice())
         .read_to_end(&mut decoded)
         .is_ok();
     if !inflated {
@@ -1220,7 +1246,8 @@ fn native_sb_zip_inflater_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decoded.len());
     ctx.write_byte_array_from(bytes, 0, &decoded);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field_by_name(this, "in", args[1]);
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.set_field_by_name(this, "in", Value::Object(Some(source)));
     ctx.set_field_by_name(this, "buf", Value::Object(Some(bytes)));
     ctx.set_field_by_name(this, "len", Value::Int(decoded.len() as i32));
     ctx.set_field_by_name(this, "available", Value::Int(decoded.len() as i32));
@@ -3258,6 +3285,73 @@ fn inflater_init(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> Met
     Ok(None)
 }
 
+/// Decide the new input cursor and finished flag after one `decompress` call.
+/// Pure so the no-progress rule below is testable without a VM.
+///
+/// The third case is the one that matters. zlib returns `Z_BUF_ERROR`
+/// (`flate2::Status::BufError`, an `Ok` status, not an error) when it can make
+/// no progress at all — every remaining input byte was offered and the output
+/// buffer has room, so the only reading is "this stream is truncated, I need
+/// more input". Leaving `pos` short of the end there kept `needsInput()` false
+/// while `inflate()` returned 0 and `finished()` stayed false, and the JDK's
+/// canonical drain loop
+///
+/// ```text
+/// while ((n = inf.inflate(b, off, len)) == 0) {
+///     if (inf.finished() || inf.needsDictionary()) return -1;
+///     if (inf.needsInput()) fill();
+/// }
+/// ```
+///
+/// then SPUN FOREVER: none of its three exits could ever be taken.
+/// `ImagePackagerTests`/`RepackagerTests` burned the suite's whole 600s
+/// per-class budget inside `AbstractJarWriter.writeLoaderClasses` instead of
+/// failing. Marking the pending bytes consumed makes `needsInput()` true, so
+/// the loop reaches `fill()`, which either supplies more bytes or throws the
+/// JDK's own `EOFException("Unexpected end of ZLIB input stream")`.
+pub(crate) fn inflater_advance(
+    input_len: usize,
+    start: usize,
+    consumed: usize,
+    produced: usize,
+    stream_end: bool,
+) -> (usize, bool) {
+    if stream_end {
+        return (start + consumed, true);
+    }
+    if consumed == 0 && produced == 0 {
+        return (input_len, false);
+    }
+    (start + consumed, false)
+}
+
+#[cfg(test)]
+mod inflater_advance_tests {
+    use super::inflater_advance;
+
+    #[test]
+    fn ordinary_progress_advances_the_cursor() {
+        assert_eq!(inflater_advance(10, 0, 4, 100, false), (4, false));
+        assert_eq!(inflater_advance(10, 4, 6, 20, false), (10, false));
+    }
+
+    #[test]
+    fn stream_end_marks_finished_without_swallowing_the_tail() {
+        // A concatenated stream (jar entry followed by the next LOC header)
+        // must leave the unconsumed bytes for the caller to re-read.
+        assert_eq!(inflater_advance(10, 0, 6, 50, true), (6, true));
+    }
+
+    #[test]
+    fn no_progress_consumes_the_pending_input_so_needsinput_turns_true() {
+        // The spin: bytes pending, nothing produced, not finished. `pos` must
+        // reach the end or `InflaterInputStream.read` loops forever.
+        assert_eq!(inflater_advance(10, 2, 0, 0, false), (10, false));
+        // Already drained: unchanged, still not finished.
+        assert_eq!(inflater_advance(10, 10, 0, 0, false), (10, false));
+    }
+}
+
 fn inflater_inflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if is_real_layout(ctx, this, "zsRef") {
@@ -3295,10 +3389,18 @@ fn inflater_inflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> 
                 .map_err(|e| RuntimeError::IOException {
                     message: format!("Inflater: invalid compressed data: {e}"),
                 })?;
-            *pos = start + (stream.total_in() - before_in) as usize;
+            let consumed = (stream.total_in() - before_in) as usize;
             let produced = (stream.total_out() - before_out) as usize;
             *adler = adler32_update(*adler, &scratch[..produced]);
-            if matches!(status, flate2::Status::StreamEnd) {
+            let (new_pos, done) = inflater_advance(
+                input.len(),
+                start,
+                consumed,
+                produced,
+                matches!(status, flate2::Status::StreamEnd),
+            );
+            *pos = new_pos;
+            if done {
                 *finished = true;
             }
             produced

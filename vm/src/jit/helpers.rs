@@ -1550,7 +1550,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
 /// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
@@ -1989,7 +1989,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -3086,7 +3086,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: docs/round7-gc.md §3).
+// free (audit: history/round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -3193,6 +3193,22 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
+    // Second attempt, BEFORE forcing a GC — the step `gc_alloc_array` takes and
+    // this helper did not (SB-LOADER-ZIPCONTENT, 2026-08-04). The interpreter
+    // runs `try_alloc_array_full` here, so a young generation that cannot serve
+    // the request spills into old gen and the mutator continues; the spill
+    // itself arms `note_young_spill_pressure`, which schedules the collection at
+    // the next native-call boundary where roots are pinned and remappable.
+    //
+    // Without it the JIT path forced a full STW GC for EVERY array the young
+    // free list could not fit. On `ZipContentTests` that was ~750 forced
+    // collections, one per 8 KB `byte[]`, each freeing ~10 KB — the difference
+    // between "the class is slow" and "the class does not finish". The young
+    // probe above is unchanged, so a healthy heap never reaches this line and
+    // pays nothing.
+    if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        return jit_newarray_finish(obj_ref, atype, length);
+    }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
     // Mirror the interpreter's `gc_alloc_array` (runtime/interpreter.rs:840):
     // retire the TLAB, run an orchestrated STW GC, then retry the fallible
@@ -3226,13 +3242,37 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // `java/lang/OutOfMemoryError` exactly as the interpreter's
     // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
     // (which would abort the process on a real OOM).
-    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): these two retries MUST use the
+    // old-gen-spilling `try_alloc_array_full`, not the young-only
+    // `try_alloc_array`. `gc_alloc_array` states the reason for the
+    // interpreter's identical arm — "once a non-moving JIT-safe sweep has left
+    // the young generation fragmented it can spill the request into old space
+    // ... retrying young-only here used to report OOM for a tiny array while
+    // most of the heap was available as old-generation headroom" — and this
+    // helper was the one primitive-array path that never got the same
+    // treatment (`jit_anewarray_object` already calls `try_alloc_array_full`
+    // and `jit_new_object` already calls `try_alloc_object_full`; see the
+    // `jit_alloc_oom` doc comment, which lists the asymmetry as fact).
+    //
+    // That gap is exactly how `ZipContentTests.nestedZip64CanBeRead` died:
+    // moving-young had fallen back to the non-moving sweep
+    // (`reason=unregistered-jit-frame-on-stack`), the young free list could no
+    // longer serve the compiled `byte[8192]` that assertj's `assertHasContent`
+    // allocates once per ZIP entry, and this arm reported
+    // `OutOfMemoryError: Java heap space (alloc_array length 8192)` with a
+    // 134 MB live set, a 1.5 GiB heap, and **1042 MB of old-generation
+    // headroom** (`CRATONVM_DBG=gc-overhead`: `old_gen_wedged=false`, so the
+    // overhead limit correctly never fired — the heap was not full, the
+    // allocator just refused to look at the free gigabyte). The same class
+    // passed 29/29 under `--nojit`, where every array runs `gc_alloc_array`.
+    let obj_ref = match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
         Some(o) => o,
         None => {
             if !jit_g1_last_ditch_full_cycle(vm) {
                 return jit_newarray_oom(vm, length as usize);
             }
-            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
                 Some(o) => o,
                 None => return jit_newarray_oom(vm, length as usize),
             }
@@ -3291,9 +3331,9 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
     }
 }
 
-/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
-/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
-/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`,
+/// `jit_anewarray_object` (both via `try_alloc_array_full`), and
+/// `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
 /// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
 /// returns the `0`/null sentinel; the alloc codegen site null-checks the result
 /// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
@@ -3835,7 +3875,7 @@ fn jit_cp_alloc_stash_failure(
 /// So a `new` whose target class had not been loaded yet used to bail the whole
 /// compile, permanently, leaving hot methods carrying a cold
 /// `throw new SomeException(...)` in the interpreter forever
-/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+/// (`jit-compile-bail-unresolved-new-cold-class.md`).
 ///
 /// Doing the same resolution HERE is sound for the reason the doc gives: it is
 /// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
@@ -4936,7 +4976,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -6918,7 +6958,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md).
+    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -9606,8 +9646,13 @@ fn call_integer_native_raw_inner(
                 // boxing-dominated compiled loop keeps spilling wrappers into
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.mem.heap.young_spill_pressure() {
+                    // `|| old_gen_needs_gc()`: same reasoning as the
+                    // `safe_native_call` hook this mirrors — the young trigger
+                    // cannot see pressure that has gone into old gen, which is
+                    // where every spill lands. See `vm_exec.rs`.
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.mem.heap.needs_gc_for_jit_allocation()
+                        && (vm.mem.heap.needs_gc_for_jit_allocation()
+                            || vm.mem.heap.old_gen_needs_gc())
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
@@ -12606,7 +12651,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -13379,7 +13424,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/c2/vm-process-global-state.md`.
+/// `docs/feature-designs/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.

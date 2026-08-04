@@ -15,12 +15,17 @@ import java.util.Map;
  * {@code native-collections} allocates. On a {@code LinkedHashMap} that path is
  * {@code HashMap.removeNode} -> {@code LinkedHashMap.afterNodeRemoval}, whose
  * first statement casts the node to {@code LinkedHashMap.Entry}, and CratonVM's
- * nodes are {@code java.util.LinkedHashMap$Node}:
+ * nodes were {@code java.util.LinkedHashMap$Node}:
  *
  * <pre>
  * ClassCastException: java.util.LinkedHashMap$Node cannot be cast to
  *                     java.util.LinkedHashMap$Entry
  * </pre>
+ *
+ * <p>(The invented node class is fixed too — see
+ * {@code LinkedHashMapNodeProbe} — but these three still have to be natives
+ * regardless: the real bodies walk the bucket array behind the native
+ * bookkeeping whether or not the cast succeeds.)
  *
  * <p>Kafka's {@code MetadataLoader.removeAndClosePublisher} calls exactly
  * {@code publishers.remove(name, publisher)} on a {@code LinkedHashMap}, which

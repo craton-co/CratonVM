@@ -104,7 +104,22 @@ pub fn compile(
     inline_sites: HashMap<usize, crate::InlineSite>,
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
+    // This wrapper does NOT take an admission token, and that is deliberate.
+    //
+    // It is the legacy test entry point — its "arg index == JVM slot"
+    // assumption is wrong for any method with a `long`/`double` parameter, so
+    // no production path can use it, and none does (the only callers outside
+    // this crate are two `#[cfg(test)]` fixtures in `vm/src/vm.rs`). Threading
+    // a token through it would have meant editing ~140 unit-test call sites to
+    // gate a function production cannot use.
+    //
+    // The escape it leaves is still visible: `for_backend_test` does not open
+    // the thread scope, so anything reaching the backend this way is counted by
+    // `compile_gate::ungated_backend_entries()`, which the VM asserts is zero
+    // over a real run. `compile_with_param_slots` — the entry point the three
+    // real doors use — is the one that requires the token.
     compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         code,
         code_len,
         num_params,
@@ -243,6 +258,24 @@ pub(super) fn gc_inert_selfrec_candidate(
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
+    // ── The admission gate, enforced by the type system ───────────────
+    //
+    // Proof that the caller passed `compile_gate::admit` — the kill switch,
+    // the permanent bail-list, the bisect levers, the code-cache cap, and the
+    // compile-epoch witness opened BEFORE any constant-pool read. There are
+    // three doors into this function and for a long time only one of them
+    // asked all of that; the other two carried hand-copied subsets, each added
+    // after its own bug. `osr-01`'s brief asked for the paths to be unable to
+    // "drift again", and this parameter is what makes a fourth door written
+    // without the gate a *compile error* rather than a red test.
+    //
+    // The `jit` crate's own tests are not doors — they hand this function
+    // hand-built bytecode with no method identity to admit — and they use
+    // `CompileAdmission::for_backend_test()`, which is deliberately still
+    // visible to `compile_gate::ungated_backend_entries()`.
+    //
+    // Unused in the body on purpose: it is a capability, not data.
+    admission: &crate::compile_gate::CompileAdmission,
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -291,14 +324,22 @@ pub fn compile_with_param_slots(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
-    // PGO-02: guard_class_id for every Monomorphic-admitted virtual/interface
-    // inline site, keyed by the same pc as `inline_sites`. See
-    // `docs/feature-designs/profile-guided-inlining.md`. Deliberately NOT
-    // threaded through the loop-unroll pc-replication tuple a few lines below
-    // (unlike `inline_sites` itself) — a replicated pc without an entry here
-    // just falls back to normal dispatch for that unrolled copy, which is
-    // always correct, only not optimized.
-    inline_guard_class_ids: HashMap<usize, u32>,
+    // PGO-02: the guarded variants of a speculative virtual/interface inline
+    // site — `(receiver class id, the body THAT CLASS dispatches to)`, in guard
+    // order, keyed by the same pc as `inline_sites`. One entry is a Monomorphic
+    // plan, two are a Bimorphic one. See
+    // `docs/feature-designs/profile-guided-inlining.md`.
+    //
+    // Element `[0]` is ALSO the `inline_sites` entry for that pc (the primary
+    // body), so the buffer/frame reservations below count it exactly once and
+    // `try_emit_inline(pc)` finds it where it has always been; element `[1]`
+    // exists only here and is added to those reservations explicitly.
+    //
+    // Deliberately NOT threaded through the loop-unroll pc-replication tuple a
+    // few lines below (unlike `inline_sites` itself) — a replicated pc without
+    // an entry here just falls back to normal dispatch for that unrolled copy,
+    // which is always correct, only not optimized.
+    inline_guard_variants: HashMap<usize, Vec<(u32, crate::InlineSite)>>,
     // Compile-time resolved `java/lang/String` field layout for the String
     // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
     // layout unavailable" — String-intrinsic codegen (added by a later
@@ -329,6 +370,25 @@ pub fn compile_with_param_slots(
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
+    // The drift witness for `compile_gate`. Every production door must hold an
+    // admission token when it gets here; this counts the entries that do not,
+    // which is how a FOURTH door added later announces itself instead of
+    // silently skipping the admission checks the way the OSR and eager
+    // first-call doors did for months. Behaviour-named on purpose: a check that
+    // scanned the source for `compile_with_param_slots(` would have died the
+    // day `x64.rs` was split, as five checks in this repository did.
+    //
+    // Non-zero inside this crate's own tests is expected and meaningless — a
+    // unit test calling the backend is not a door. The assertion that matters
+    // lives in the VM.
+    //
+    // Kept even though `admission` is now required by the signature: the two
+    // layers fail differently. The parameter stops a door written *without*
+    // the gate; this counter stops a door written *with*
+    // `CompileAdmission::for_backend_test()`, which the type system cannot
+    // tell apart from a real one.
+    let _ = admission;
+    crate::compile_gate::note_backend_entry();
     // A class-`ldc` calls a helper that takes the VM context as its first
     // argument, exactly like a string-`ldc`, so it forces the context form of
     // the artifact too.
@@ -613,8 +673,20 @@ pub fn compile_with_param_slots(
     // one-shot thread-local staging requests before the buffer is allocated,
     // and re-entering it would find them gone. The estimate has to be right the
     // first time here, so it errs high.
+    // PGO-02 (bimorphic): a two-guard site splices a SECOND body at the same
+    // pc, and that body is not in `inline_sites`. Both this buffer estimate
+    // and the spill reservation below must see it — this backend cannot retry
+    // a short buffer, and an unreserved inlined body writes past the spill
+    // region into the callee-saved area. Skip variant `[0]`, which IS the
+    // `inline_sites` entry and is already counted.
+    let extra_guard_bodies = || {
+        inline_guard_variants
+            .values()
+            .flat_map(|variants| variants.iter().skip(1).map(|(_, s)| s))
+    };
     let inline_extra: usize = inline_sites
         .values()
+        .chain(extra_guard_bodies())
         .map(|s| s.callee_code_len.saturating_mul(64))
         .sum();
     let estimated_size = code_len
@@ -660,6 +732,7 @@ pub fn compile_with_param_slots(
     // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
     let inline_stack_reserve: usize = inline_sites
         .values()
+        .chain(extra_guard_bodies())
         .map(|s| {
             let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
             s.callee_max_locals
@@ -1560,7 +1633,7 @@ pub fn compile_with_param_slots(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
-    compiler.inline_guard_class_ids = inline_guard_class_ids.into_iter().collect();
+    compiler.inline_guard_variants = inline_guard_variants.into_iter().collect();
     // String call-site intrinsics: hand the resolved String field layout to
     // the compiler so intrinsic codegen can emit inline field loads.
     compiler.string_layout = string_layout;
@@ -1688,7 +1761,7 @@ pub fn compile_with_param_slots(
         // Name the target. `pc` here is the branch target with no native
         // offset and `op` the byte at it — enough to check against a `javap -c`
         // listing whether the target really is off-boundary (it usually is
-        // not: see `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
+        // not: see `jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
         let (target, nearest) = compiler.unresolved_branch_target.unwrap_or((0, -1));
         let target_op = code.get(target).copied().unwrap_or(0);
         crate::note_jit_bail_site_at(
@@ -1720,7 +1793,7 @@ pub fn compile_with_param_slots(
         // Name the method and the shortfall. A silent bail here is
         // indistinguishable from "the JIT chose not to compile this", which is
         // how a whole class of invoke-heavy methods came to stop being compiled
-        // unnoticed (`docs/internal/resolvabletype-equals-jit-...`): the only
+        // unnoticed (`resolvabletype-equals-jit-...`): the only
         // visible symptom was a flood of anonymous `try_patch_*: offset out of
         // bounds` warnings with no method attached to any of them.
         tracing::warn!(

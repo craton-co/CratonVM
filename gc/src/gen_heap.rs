@@ -85,6 +85,102 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// turning every near-capacity refill into an allocation-failure collection.
 const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
 
+/// Largest free block below which the non-moving young sweep declares its
+/// arena defragmentable — see [`young_arena_needs_defragmentation`].
+///
+/// 64 KiB, chosen to sit well above what a single allocation asks for and well
+/// below anything a healthy arena has: the request that exposed this was an
+/// 8 KiB `byte[]`, and a young generation that cannot find eight times that
+/// contiguously has stopped being an allocation arena. Deliberately absolute
+/// rather than a fraction of capacity — the harm is "this specific request no
+/// longer fits", which does not scale with heap size.
+const DEFRAG_LARGEST_FREE_FLOOR: usize = 64 * 1024;
+
+/// Fraction of capacity the bump cursor must have consumed before the sweep
+/// will consider defragmenting: `used >= capacity - capacity/64`, i.e. 98.4 %.
+/// Below that there is still bump room, so a small largest-free-block says
+/// nothing — the arena has simply not been carved up yet.
+const DEFRAG_BUMP_EXHAUSTED_RECIPROCAL: usize = 64;
+
+/// Has the young from-space degenerated into a free list nobody can allocate a
+/// modest contiguous object out of?
+///
+/// Both halves are required, and each rules out a different false positive:
+///
+/// * **bump-exhausted** — while the cursor still has room, `largest_free_block`
+///   is small simply because nothing has been freed yet. Escalating there would
+///   promote a young nursery's entire contents on its first collection.
+/// * **largest hole below the floor** — a big `free_list_bytes` with a big
+///   largest block is a perfectly healthy swept arena. The fragmentation face is
+///   specifically *many bytes free, none of them together*.
+///
+/// Pure, and split out from the sweep, because the sweep is 3,000 lines long
+/// and this predicate decides whether hundreds of megabytes get tenured.
+fn young_arena_needs_defragmentation(used: usize, capacity: usize, largest_free: usize) -> bool {
+    if capacity == 0 {
+        return false;
+    }
+    let bump_exhausted = used >= capacity.saturating_sub(capacity / DEFRAG_BUMP_EXHAUSTED_RECIPROCAL);
+    // A tiny arena (the unit tests') can have a capacity below the floor; there
+    // "no 64 KiB block" is not a defect, so require the floor to be meaningful.
+    bump_exhausted && capacity > DEFRAG_LARGEST_FREE_FLOOR && largest_free < DEFRAG_LARGEST_FREE_FLOOR
+}
+
+/// Selective-promotion census for the non-moving young sweep.
+///
+/// `tracing::debug!` is compiled out of release builds (the workspace pins
+/// `tracing`'s `release_max_level_info`), so a debug line here would have been
+/// invisible in exactly the builds that run the suites. These counters are the
+/// diagnostic instead, and they answer the one question the aggregate numbers
+/// cannot: when `promoted` stays at 0 for hundreds of cycles, is the pass not
+/// running, running and finding nothing tenurable, or finding candidates and
+/// rejecting every one?
+static SP_CENSUS: SelectivePromotionCensus = SelectivePromotionCensus {
+    sweeps: AtomicU64::new(0),
+    sweeps_selective: AtomicU64::new(0),
+    sweeps_defrag: AtomicU64::new(0),
+    candidates: AtomicU64::new(0),
+    pinned: AtomicU64::new(0),
+    unaged: AtomicU64::new(0),
+    evacuated: AtomicU64::new(0),
+    old_full: AtomicU64::new(0),
+};
+
+/// See [`SP_CENSUS`].
+struct SelectivePromotionCensus {
+    /// Non-moving young sweeps entered.
+    sweeps: AtomicU64,
+    /// …of which ran the selective-promotion pass at all.
+    sweeps_selective: AtomicU64,
+    /// …of which escalated to defragmentation.
+    sweeps_defrag: AtomicU64,
+    /// Marked survivors the evacuation walk examined.
+    candidates: AtomicU64,
+    /// …rejected because a root/finalizer value pinned them.
+    pinned: AtomicU64,
+    /// …rejected because they had not reached `PROMOTION_AGE`.
+    unaged: AtomicU64,
+    /// …actually copied into old gen.
+    evacuated: AtomicU64,
+    /// Evacuations that failed because old gen was full.
+    old_full: AtomicU64,
+}
+
+/// Snapshot of [`SP_CENSUS`] as
+/// `(sweeps, selective, defrag, candidates, pinned, unaged, evacuated, old_full)`.
+pub fn selective_promotion_census() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        SP_CENSUS.sweeps.load(Ordering::Relaxed),
+        SP_CENSUS.sweeps_selective.load(Ordering::Relaxed),
+        SP_CENSUS.sweeps_defrag.load(Ordering::Relaxed),
+        SP_CENSUS.candidates.load(Ordering::Relaxed),
+        SP_CENSUS.pinned.load(Ordering::Relaxed),
+        SP_CENSUS.unaged.load(Ordering::Relaxed),
+        SP_CENSUS.evacuated.load(Ordering::Relaxed),
+        SP_CENSUS.old_full.load(Ordering::Relaxed),
+    )
+}
+
 /// Byte spacing at which the parallel sweep SUBSAMPLES the object grid the
 /// allocator records (`arena.rs`). Small enough that a multi-hundred-megabyte
 /// young gen yields far more chunks than workers (so a chunk that stops early
@@ -732,7 +828,7 @@ pub static OLD_FREE_LIST_OVERLAPS: AtomicU64 = AtomicU64::new(0);
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
 ///
-/// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 /// A non-zero value here means a side table is holding a dangling old-gen
 /// address, or a reference slot holds a non-base word.
 pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
@@ -819,7 +915,7 @@ fn promo_seed_dbg() -> bool {
 }
 
 /// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
-/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
 /// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
 /// collector) is permitted to run at all. Default **disabled** —
 /// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
@@ -1212,8 +1308,8 @@ pub struct GenerationalHeap {
     /// worse, a same-slot-reused unrelated object) once that memory is
     /// actually reclaimed. Ordered oldest-first; the front arena's grace
     /// period has elapsed and its memory is the next to be reused. See
-    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md
-    /// and docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md.
+    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
+    /// and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md.
     quarantine: Mutex<VecDeque<Arena>>,
     /// Lock-free cached address bounds `[base, end)` of the three storage
     /// regions (young from-space, young to-space, old gen), published whenever
@@ -1591,7 +1687,7 @@ impl GenerationalHeap {
     /// `gc_quiescence`'s `missing-exact-rbp` fallback), so shrinking the
     /// semispace just multiplies how often that expensive fallback fires,
     /// which costs more than the page-fault savings recoup. See
-    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md`.
+    /// `performance/binarytrees-bt18-half-gap-20260730.md`.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
         // Young takes 1/2 of total, split across from+to semi-spaces (so
@@ -2433,7 +2529,7 @@ impl GenerationalHeap {
         // caller is holding a raw `ObjectRef` local across a GC-triggering
         // call without `pin_native_root`/`read_native_pin` — exactly the
         // "Family 1" stale-ObjectRef pattern documented in
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
         // Only reachable when the quarantine dance in `collect_garbage_inner`
         // is active (see the `quarantine` field), since without it the
         // evacuated memory would already have been zeroed by the time a
@@ -2591,7 +2687,7 @@ impl GenerationalHeap {
                  kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
-                 docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.\
+                 fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.\
                  \nHolder scan:{holders}",
                 obj_ref.as_ptr(),
                 fwd_ptr,
@@ -2639,7 +2735,7 @@ impl GenerationalHeap {
     /// `VarHandle` root dedup in `vm_exec.rs`) would otherwise have to
     /// derive one from the object's current address — which silently goes
     /// stale the moment a moving GC relocates the object. See
-    /// `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
+    /// `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
         let existing = self.get_header(obj_ref).identity_hash_code;
         if existing != 0 {
@@ -3488,7 +3584,7 @@ impl GenerationalHeap {
         debug_assert!(index < self.get_header(obj_ref).num_slots() as usize);
         // FIELD-WATCH (TestUpgrade RootReference/MVMap residual, software
         // watchpoint — see cratonvm_types::field_watch and
-        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md).
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md).
         // Zero cost unless CRATONVM_DBG_FIELD_WATCH is set AND obj_ref was
         // explicitly registered via field_watch::watch() at construction.
         // Every write is reported (not deduped) — a count reaching 2 for a
@@ -3685,7 +3781,7 @@ impl GenerationalHeap {
                 // Offsets come from the named header constants, not literals:
                 // this diagnostic prints what a heap walker would have decoded,
                 // so it must follow the header layout if it ever shifts (see
-                // docs/internal/arch-2026-07-26/header-shrink.md).
+                // arch-2026-07-26/header-shrink.md).
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
                     let kind_byte = *obj_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET);
@@ -4160,7 +4256,7 @@ impl GenerationalHeap {
     /// reclaims dead blocks IN PLACE, during a YOUNG collection, whenever a live
     /// JIT frame blocks the moving young collector — and it does not zero what
     /// it frees. Use this predicate for liveness; see
-    /// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     pub fn is_live_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().is_allocated_addr(addr as *const u8)
     }
@@ -4428,6 +4524,20 @@ impl GenerationalHeap {
         let young_live = from.used().saturating_sub(from.free_list_bytes());
         drop(from);
         young_live + self.old_gen.lock().used()
+    }
+
+    /// `(used, free-list bytes, largest free block, capacity)` for the young
+    /// from-space — the numbers behind [`live_bytes_estimate`]'s young term,
+    /// unaggregated. See [`crate::vm_heap::VmHeap::young_occupancy`] for why
+    /// the aggregate alone cannot answer the question it gets asked.
+    pub fn young_from_occupancy(&self) -> (usize, usize, usize, usize) {
+        let from = self.young_from.lock();
+        (
+            from.used(),
+            from.free_list_bytes(),
+            from.largest_free_block(),
+            from.capacity(),
+        )
     }
 
     /// Publish the denominators [`crate::gc_metrics::gc_metrics_report`]
@@ -6604,6 +6714,7 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
+        SP_CENSUS.sweeps.fetch_add(1, Ordering::Relaxed);
         let phase_diag = gc_flags().dbg_gcphase;
         let phase_start = std::time::Instant::now();
         let mut phase_last = phase_start;
@@ -7609,6 +7720,59 @@ impl GenerationalHeap {
             let sweep_free_blocks = merge_skips(young_from.free_blocks_sorted());
             let sweep_used = young_from.used();
 
+            // ----- Defragmentation escalation (SB-LOADER-ZIPCONTENT, 2026-08-04)
+            //
+            // The age gate below is right for a nursery that gets compacted:
+            // short-lived survivors stay in young, die there, and the *next*
+            // moving cycle slides everything back together. This sweep never
+            // slides anything. So on a process that stays on the non-moving
+            // path — which is every process with a live JIT frame the coverage
+            // proof cannot clear — young degenerates monotonically:
+            //
+            //   * the bump cursor reaches the top once and never resets (a
+            //     survivor anywhere in the arena forbids a reset), so every
+            //     later allocation is a free-list carve;
+            //   * each cycle's survivors are a DIFFERENT few MB scattered over
+            //     the whole arena, and almost none of them live to
+            //     `PROMOTION_AGE`, so `promoted` stays at 0 forever;
+            //   * the coalescer merges only ADJACENT holes, and a survivor
+            //     between two holes is a wall it cannot cross.
+            //
+            // Measured on `ZipContentTests` (`CRATONVM_DBG=gc-overhead`): after
+            // ~700 cycles the young from-space read `used=536,866,904`
+            // (= capacity), `free_list=529,026,112` — **98.5 % of the arena
+            // free** — and `largest_free=9,608`. Not a full heap; a heap whose
+            // largest contiguous hole had fallen below the 8 KB array that
+            // assertj allocates once per ZIP entry. Every such allocation then
+            // forced a GC that freed ~10 KB, and the run either crawled or
+            // (before the `try_alloc_array_full` fix in `jit/helpers.rs`) died
+            // with `OutOfMemoryError` next to a gigabyte of old-gen headroom.
+            //
+            // The escalation: once the arena is bump-exhausted AND its largest
+            // hole can no longer serve a modest contiguous request, tenure
+            // every unpinned survivor regardless of age. That is the drain
+            // selective promotion already implements and already argues safe —
+            // pinning is BY RAW SLOT VALUE, so a conservative false positive
+            // pins some object rather than mis-relocating one, and the age
+            // gate was never part of that safety argument. With the survivors
+            // gone the coalescer's walls come down and the free list collapses
+            // back to a few huge spans.
+            //
+            // Self-limiting by construction: after one escalated cycle
+            // `largest_free_block` is enormous, so the predicate is false again
+            // — it cannot degenerate into promote-everything-always, which
+            // would flood old gen with objects that die immediately.
+            let defrag_escalate = !gc_flags().no_defrag_promote
+                && young_arena_needs_defragmentation(
+                    sweep_used,
+                    young_from.capacity(),
+                    young_from.largest_free_block(),
+                );
+            SP_CENSUS.sweeps_selective.fetch_add(1, Ordering::Relaxed);
+            if defrag_escalate {
+                SP_CENSUS.sweeps_defrag.fetch_add(1, Ordering::Relaxed);
+            }
+
             // (1) Pin set: every root / finalizer value that lands in young.
             //
             // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
@@ -7879,9 +8043,20 @@ impl GenerationalHeap {
                     // young then wedged the heap into the old-gen-spill →
                     // abort path that the native-alloc boundary GC exists to
                     // relieve).
-                    let aged = header.gc_age + 1 >= PROMOTION_AGE;
+                    let aged = defrag_escalate || header.gc_age + 1 >= PROMOTION_AGE;
                     let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
                     let marked = header_marked || side_bits.contains(addr);
+                    // Census (see `SP_CENSUS`): classify every marked survivor
+                    // the walk reaches, so a `promoted=0` run says WHICH of the
+                    // three rejections it was.
+                    if marked {
+                        SP_CENSUS.candidates.fetch_add(1, Ordering::Relaxed);
+                        if !aged {
+                            SP_CENSUS.unaged.fetch_add(1, Ordering::Relaxed);
+                        } else if pinned.contains(&addr) {
+                            SP_CENSUS.pinned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if marked && !aged && !header_marked {
                         // Deferred, anchor-verified age bump — applied with
                         // the forwarding installs below. Header-marked
@@ -7950,8 +8125,12 @@ impl GenerationalHeap {
                                     .bytes_promoted
                                     .fetch_add(total_size as u64, Ordering::Relaxed);
                                 self.stats.objects_promoted.fetch_add(1, Ordering::Relaxed);
+                                SP_CENSUS.evacuated.fetch_add(1, Ordering::Relaxed);
                             }
-                            None => old_full = true,
+                            None => {
+                                SP_CENSUS.old_full.fetch_add(1, Ordering::Relaxed);
+                                old_full = true
+                            }
                         }
                     }
                     cursor += total_size;
@@ -10255,7 +10434,7 @@ impl GenerationalHeap {
         //
         // ADDITIVE, and on the shadow only. Two things went wrong the first
         // time this was attempted (defect 4 in
-        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`):
+        // `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`):
         // rewriting the CALLER's slice corrupted a root snapshot that outlives
         // this call, and seeding destinations was itself destabilising because
         // that seed loop did not validate what it marked. The second cause is
@@ -10323,8 +10502,8 @@ impl GenerationalHeap {
     ) -> HashMap<usize, usize> {
         // See `oldgen_compact_enabled`: compaction is disabled by default as
         // of 2026-08-03 pending root-cause attribution of the corruption it
-        // was found to cause (docs/known-issues/hibernate/
-        // map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+        // was found to cause (fixed-suite-bugs/hibernate/
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
         Self::old_gen_gc(
             roots,
             young_from,
@@ -10401,7 +10580,7 @@ impl GenerationalHeap {
         // in `old_gen_mark_candidate_plausible` and EVERY push site into the
         // mark worklist goes through it, because the seven that did not were
         // still doing exactly what the paragraph above describes — see
-        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         //
         // NOTE this predicate deliberately does NOT require a non-zero first
         // header word (unlike `mark_young`'s zero-word0 side-mark split):
@@ -10740,7 +10919,7 @@ impl GenerationalHeap {
             // This sweep decided liveness purely from `GC_FLAG_MARKED`, and the
             // mark that set it has NINE worklist push sites of which only two
             // validate their input (see
-            // docs/known-issues/gc-old-gen-mark-accepts-unvalidated-addresses.md).
+            // fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
             // If the mark misses a root, this loop hands a still-referenced
             // block back to the free list and the damage surfaces only much
             // later, at whichever unlucky reader dereferences it next — exactly
@@ -11302,7 +11481,7 @@ impl GenerationalHeap {
         // discriminant was never an object base: some push site handed us a
         // dangling or interior address. This was long COUNTED but not
         // rejected here — see
-        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
+        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
         // which explicitly deferred the reject as follow-up work. Deferring it
         // left the door open for the exact hazard that doc's Half 2 fix was
         // written to close: `gen_object_total_size(header)` below reads
@@ -11313,7 +11492,7 @@ impl GenerationalHeap {
         // (`HIB-DCAST-LATEPHASE.1`: reached this way as a SIGSEGV reading
         // through a garbage `array_length` treated as a slot/byte count).
         // Reject now, mirroring `OldGen::scan_region`'s equivalent fix in
-        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
+        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
         // validate the raw tag bytes through
         // `object_kind_from_tag`/`array_element_type_from_tag` before ever
         // forming a `&ObjectHeader` reference.
@@ -11675,7 +11854,7 @@ impl GenerationalHeap {
         // safety net — leaving an untracked zeroed sliver between the TLAB's
         // filler and the next region that derails the non-moving walk (the
         // trigger-ON bt18 corruption; see
-        // docs/known-issues/tlab-trigger-gc-young-walk-corruption.md).
+        // fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md).
         let actual_size = requested_size.min(available) & !7;
         if actual_size == 0 {
             return None;
@@ -11978,7 +12157,7 @@ impl GenerationalHeap {
         // bytes through `object_kind_from_tag`/`array_element_type_from_tag`
         // — the same fix already applied to `OldGen::scan_region` and
         // `scan_object_for_old_refs` (see
-        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
+        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
         // — before ever reading either field as a typed enum.
         // SAFETY: `old_ptr` is confirmed inside young from-space via
         // `young_object_starts.contains` above, so the two single-byte tag
@@ -13183,7 +13362,7 @@ fn fwd_resolve_strict() -> bool {
 /// loop, and after a possible major GC — printing per-phase counts. A count
 /// that JUMPS at a specific phase localizes the SEEDING collector path
 /// (minor Cheney/promotion vs. major mark-compact) — see
-/// docs/bc-math-ec-gc-0x4-handoff.md §6.4.
+/// gaps/bc-math-ec-gc-0x4-handoff.md §6.4.
 #[inline]
 fn seedhunt_enabled() -> bool {
     gc_flags().dbg_seedhunt
@@ -13315,7 +13494,7 @@ fn seedhunt_scan_young(
 /// object's PAYLOAD (an `int` field `0x41414141` becomes `0x43414141`), and
 /// those payload bytes are decoded as a header, which is how a byte that is not
 /// a valid `ObjectKind` discriminant reaches `gen_object_total_size`. See
-/// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 ///
 /// The root seed and the young->old conservative word scan already defended
 /// themselves (and their comments name this hazard as the reason); this is that
@@ -13759,7 +13938,7 @@ fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
             "old-gen mark: rejecting {} candidate {:p} — not a plausible object \
              base (aligned={}, w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}). A side \
              table or reference slot is holding a stale old-gen address; see \
-             docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
+             fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
             site,
             ptr,
             (ptr as usize) & 7 == 0,
@@ -13803,7 +13982,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
     // still read *as an enum* first. Validate both raw tag bytes through
     // `object_kind_from_tag`/`array_element_type_from_tag` before ever
     // constructing a typed `&ObjectHeader`, mirroring every other fix in
-    // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
+    // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
     // SAFETY: bounds-checked by `old_gen.contains(neighbor)` above.
     let kind_tag = unsafe { *neighbor.add(OBJECT_KIND_OFFSET) };
     let elem_tag = unsafe { *neighbor.add(ARRAY_ELEMENT_TYPE_OFFSET) };
@@ -15051,7 +15230,7 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
     // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`,
     // a non-atomic 16-byte copy that could tear against a concurrent plain
     // `get_field` from another mutator thread -- see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix).
     cratonvm_types::write_value_atomic(ptr as *mut Value, value);
 }
@@ -15866,7 +16045,7 @@ mod tests {
     /// A later attempt (2026-07-30) to additionally cap the *initial* young
     /// semi at 512 MiB (to cut eager-paging RSS on large `-Xmx` heaps) was
     /// measured to be a net wall-clock regression — see
-    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` —
+    /// `performance/binarytrees-bt18-half-gap-20260730.md` —
     /// because this workload's young GC already always falls back to a
     /// non-moving sweep, and a smaller semispace just means more of those
     /// expensive fallbacks. Reverted; `with_capacity`'s *initial* semi stays
@@ -16078,6 +16257,83 @@ mod tests {
         assert_eq!(header.kind, ObjectKind::Object);
         assert_eq!(header.array_length(), 0);
         assert_eq!(header.num_slots(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defragmentation escalation predicate (SB-LOADER-ZIPCONTENT, 2026-08-04)
+    //
+    // `young_arena_needs_defragmentation` decides whether a non-moving young
+    // sweep tenures EVERY unpinned survivor instead of only the aged ones. Both
+    // a false positive (old gen floods with objects that die immediately) and a
+    // false negative (the arena that produced this bug stays wedged) are
+    // expensive, so both directions are pinned here rather than left to the
+    // end-to-end run that motivated it.
+    // -----------------------------------------------------------------------
+
+    /// The measured degenerate state, verbatim from `ZipContentTests` under
+    /// `CRATONVM_DBG=gc-overhead`: a 512 MiB young from-space, bump cursor at
+    /// the top, 98.5 % of it free, and a largest hole of 9,608 bytes — smaller
+    /// than the 8 KiB array whose allocation failure started this.
+    #[test]
+    fn the_measured_zipcontent_arena_is_defragmentable() {
+        assert!(young_arena_needs_defragmentation(
+            536_866_904,
+            536_870_912,
+            9_608
+        ));
+    }
+
+    /// A healthy swept arena: bump-exhausted and mostly free, but its holes are
+    /// merged into multi-megabyte spans. Escalating here would tenure a whole
+    /// nursery for no reason.
+    #[test]
+    fn a_coalesced_arena_is_not_defragmentable() {
+        assert!(
+            !young_arena_needs_defragmentation(536_866_904, 536_870_912, 400 * 1024 * 1024),
+            "many bytes free AND a large largest block is what a working \
+             non-moving sweep looks like",
+        );
+        // And the state one escalated cycle produces, which is what makes the
+        // escalation self-limiting rather than a promote-everything-always.
+        assert!(!young_arena_needs_defragmentation(
+            536_866_904,
+            536_870_912,
+            DEFRAG_LARGEST_FREE_FLOOR
+        ));
+    }
+
+    /// A young generation that has NOT been carved up yet: the cursor still has
+    /// room, so a small largest-free-block only means nothing has been freed.
+    /// Without this half the predicate would fire on the first collection of
+    /// every process.
+    #[test]
+    fn an_arena_with_bump_room_left_is_not_defragmentable() {
+        assert!(
+            !young_arena_needs_defragmentation(1024, 536_870_912, 0),
+            "a fresh arena has no free blocks at all and must not escalate",
+        );
+        // Just below the bump-exhaustion line (98.4 %).
+        let cap = 536_870_912usize;
+        assert!(!young_arena_needs_defragmentation(
+            cap - cap / 64 - 1,
+            cap,
+            8
+        ));
+    }
+
+    /// Degenerate inputs: a zero-capacity arena, and one whose whole capacity
+    /// is below the floor (the unit-test heaps in this very file), must not
+    /// report "defragmentable" — in the second case there is no 64 KiB block
+    /// because there is no 64 KiB.
+    #[test]
+    fn tiny_and_empty_arenas_never_escalate() {
+        assert!(!young_arena_needs_defragmentation(0, 0, 0));
+        assert!(!young_arena_needs_defragmentation(4096, 4096, 0));
+        assert!(!young_arena_needs_defragmentation(
+            DEFRAG_LARGEST_FREE_FLOOR,
+            DEFRAG_LARGEST_FREE_FLOOR,
+            0
+        ));
     }
 
     #[test]
@@ -17835,7 +18091,7 @@ mod tests {
     /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
     /// object, leaving a dangling old-gen address for a later mark to decode.
     ///
-    /// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     /// Fixed by giving `is_addr_live` a free-list-aware old-gen predicate
     /// (`GenerationalHeap::is_live_old_gen_addr` -> `OldGen::is_allocated_addr`).
     /// `is_old_gen_addr` itself is deliberately UNCHANGED: it answers "which

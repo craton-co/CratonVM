@@ -54,4 +54,4 @@ climbed to 6,000,000 across the post-redefine phase (every call interpreted);
 after it, it stays at ~9,000 — the method stays compiled through the
 redefinition.
 
-Full analysis: [`../../../internal/mockito-redefine-makes-every-call-40us-20260726.md`](../../../internal/mockito-redefine-makes-every-call-40us-20260726.md).
+Full analysis: `mockito-redefine-makes-every-call-40us-20260726.md`.

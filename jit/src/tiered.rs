@@ -51,7 +51,7 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
 /// (constructed very early during VM init, well before any method can reach
 /// a compile threshold). Backs the `elapsed_ms` field of the
 /// `CRATONVM_DBG_TIER_ENQUEUE` diagnostic below -- see
-/// `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` for why
+/// `fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md` for why
 /// "how far into the process's life did this compile trigger" was the key
 /// diagnostic needed to confirm the compile-time-tax mechanism.
 fn process_start() -> &'static std::time::Instant {
@@ -1070,11 +1070,75 @@ struct MethodPromotionSnapshot {
 /// characterize whether a slow run is dominated by code that genuinely never
 /// gets hot enough to promote past the interpreter (as opposed to a stuck
 /// lock, a cache-thrashing hot path, or some other fixable inefficiency) —
-/// see `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+/// see `fixed-suite-bugs/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput-FIXED.md`.
 /// No-op if no [`TieredCompilationManager`] was ever constructed this process
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
 pub fn dump_method_stats_to_stderr() {
+    // The admission gate and the OSR metadata checks, first and unconditional.
+    //
+    // Every number here was previously computed and stored by a `pub fn` with
+    // **no caller anywhere in the tree** — `jit_bail_shortcircuits`,
+    // `jit_code_cache_cap_refusals`, `osr_contract_violations`,
+    // `stale_install_epoch_refusals`. Each one's own doc says it is "expected
+    // to stay zero" and that a diagnostic nobody enables is how a compiler bug
+    // stays unnoticed; none of them could be enabled at all. Printed before the
+    // `DIAG_CORE` early return so a run with no tiered manager still reports
+    // them.
+    //
+    // How to read the three groups:
+    //
+    //   * `admitted`/`refused` per door — a door whose `admitted` is 0 on a
+    //     workload that clearly used it is not calling the gate.
+    //   * `ungated-backend-entries` — MUST be 0. Non-zero means some path
+    //     reached `x64::compile_with_param_slots` without an admission, which
+    //     is the drift `compile_gate` exists to prevent.
+    //   * `osr-contract-violations` / `osr-coordinate-mismatches` — both MUST
+    //     be 0. Non-zero means an artifact's OSR metadata contradicted itself
+    //     and was dropped, so the method silently lost OSR service.
+    {
+        use crate::compile_gate::{admissions, refusals, ungated_backend_entries, CompileDoor};
+        let doors: Vec<String> = CompileDoor::ALL
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}: admitted={} refused={}",
+                    d.label(),
+                    admissions(*d),
+                    refusals(*d)
+                )
+            })
+            .collect();
+        eprintln!(
+            "[cratonvm] JIT admission gate: {} | ungated-backend-entries={} \
+             | bail-list-shortcircuits={} code-cache-cap-refusals={} \
+             | osr-contract-violations={} osr-coordinate-mismatches={} \
+             stale-install-epoch-refusals={}",
+            doors.join(" | "),
+            ungated_backend_entries(),
+            crate::jit_bail_shortcircuits(),
+            crate::jit_code_cache_cap_refusals(),
+            crate::osr_contract::osr_contract_violations(),
+            crate::osr_coords::osr_coordinate_mismatches(),
+            crate::stale_install_epoch_refusals(),
+        );
+        // The OSR lifecycle, on the same line's heels and for the same reason:
+        // the counters were ungated by the `osr-02` lane precisely because "a
+        // silent OSR exit is indistinguishable from never having entered", and
+        // then nothing printed them. This is also the only thing that makes
+        // OVER-refusal visible — a new entry-time refusal that quietly costs a
+        // workload its OSR shows up here as `osr_entered` collapsing while
+        // `osr_refused_entry` rises, and nowhere else. Read `osr_exited`
+        // against `osr_entered`, never alone.
+        eprintln!(
+            "[cratonvm] OSR lifecycle: {}",
+            crate::metrics::osr_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };

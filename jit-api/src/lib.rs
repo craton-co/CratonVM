@@ -197,7 +197,7 @@ mod descriptor_contract_tests {
 /// capture path safe. Index verification is by *name*, so a redefinition that
 /// reorders an overload set across the capture/read window is the one case
 /// verification cannot catch, and eager capture has no such window. See
-/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6.
+/// `arch-2026-07-26/cross-owner-closeout.md` §6.
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -270,7 +270,7 @@ pub struct CachedBytecodeMethod {
     /// registry generation instead, so a stale negative self-heals at the cost
     /// of one `u32` compare -- the same argument
     /// [`Self::jit_probe_generation`] below already relies on. See
-    /// `docs/internal/arch-2026-07-26/native-dispatch-memoization.md` §3
+    /// `arch-2026-07-26/native-dispatch-memoization.md` §3
     /// Steps 0 and 2 (sites A1-A3).
     ///
     /// # ONE CELL, ONE TRIPLE
@@ -296,7 +296,7 @@ pub struct CachedBytecodeMethod {
     /// all read `std::sync::OnceLock::new()`, which type-infers unchanged. The
     /// rename to `native_call_site` is a pure mechanical follow-up; see the
     /// cross-owner request in
-    /// `docs/internal/arch-2026-07-26/interpreter-completion.md`.
+    /// `arch-2026-07-26/interpreter-completion.md`.
     ///
     /// # JDK-only: this cell does NOT lose the `NativeKind`
     ///
@@ -1016,7 +1016,7 @@ pub struct JitRuntimeHelpers {
     /// un-taken branch does `throw new SomeException(...)` therefore failed to
     /// compile at all — `resolve_jit_new_site` returned `None` and the whole
     /// compile bailed, permanently after `MAX_TIER_FAIL_RETRIES`
-    /// (docs/internal/jit-compile-bail-unresolved-new-cold-class.md).
+    /// (jit-compile-bail-unresolved-new-cold-class.md).
     ///
     /// This helper moves resolution to run time: the compiler bakes the
     /// *referencing* class id and the CP index, and the helper resolves +
@@ -1385,7 +1385,7 @@ mod tests {
         Ok(None)
     }
 
-    /// Step 0 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    /// Step 0 of `arch-2026-07-26/native-dispatch-memoization.md`
     /// §3: the per-entry native-dispatch memo must be substitutable for
     /// `registry.find(class, method, descriptor)` — on a miss, on a hit, and
     /// warm.

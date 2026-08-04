@@ -19,7 +19,7 @@
 //! for the WHOLE artifact when any one deopt point is unresumable, so a single
 //! `Unsupported` stack entry — at a call-site guard anywhere in the method, even
 //! outside the loop being entered — disabled OSR for every loop in it. See
-//! `docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md`.
+//! `osr-entry-unresumable-exit-FIXED-20260803.md`.
 //!
 //! # What it is
 //!

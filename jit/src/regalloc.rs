@@ -668,7 +668,7 @@ fn build_cfg_with_leaders(
         // `jit/src/lib.rs::local_handler_reads_unsafe_local`, so the method is
         // refused before it can be miscompiled — this fix removes the reliance
         // on that coincidence and is a prerequisite for relaxing it (see
-        // `docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md`).
+        // `arch-2026-07-26/jit-regalloc-and-deopt.md`).
         //
         // Direction of the change is monotone-safe: more block starts ⇒ more
         // blocks ⇒ strictly MORE code covered by gen/kill and interference.
@@ -1537,7 +1537,7 @@ impl SafepointPublishPlan {
     /// This is the exact predicate the x64 backend's
     /// `can_elide_self_call_register_spill` should test instead of
     /// `local_assignments.iter().any(Option::is_some)`; see the cross-owner
-    /// request in `docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md`.
+    /// request in `arch-2026-07-26/jit-regalloc-and-deopt.md`.
     pub fn no_reference_in_registers(&self) -> bool {
         self.register_homed_reference_locals == 0
     }
@@ -1682,7 +1682,7 @@ pub fn allocate_registers_with_handlers(
 /// rejected OSR-exit snapshot falls back to "continue interpreting the
 /// pre-OSR-entry frame", which re-runs every loop iteration the OSR-compiled
 /// code already executed — silently duplicating side effects (see
-/// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+/// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
 /// Knowing a local is dead at the snapshot bci lets the caller substitute a
 /// safe placeholder instead of rejecting outright.
 ///
@@ -3529,6 +3529,126 @@ impl RegClass {
             IrType::Float | IrType::Double => Some(RegClass::Xmm),
             IrType::Void | IrType::Control | IrType::Memory => None,
         }
+    }
+}
+
+/// Who owns which XMM register, in one place.
+///
+/// Three components hand out XMM registers, and until this module existed each
+/// held its own private answer: `ir_lower`'s FP value tier (XMM0/XMM1),
+/// `ir_lower`'s linear-scan file, and `x64::vec_emit`'s vector pool. The three
+/// **overlap**, and the failure that overlap produces is silent — a scalar
+/// `double` living in XMM3 destroyed by a vector region that took XMM3 for a
+/// lane accumulator, with nothing to notice but a wrong number much later.
+///
+/// The overlap is **gone as of 2026-08-04**: `ir_lower::emit_prologue` now
+/// carries a callee-saved XMM save area ([`IR_PROLOGUE_SAVED`]), which bought
+/// the two registers that let the scalar file grow and moved the vector pool
+/// entirely out of the scalar range. What this module keeps is the property
+/// that made the fix checkable — the ranges are declared *together*, so a
+/// wiring that puts two authorities on one register is a visible fact rather
+/// than a discovery, and [`disjointness_violation`] is the enforced half.
+///
+/// `docs/jit/vectorization-emitter.md` names this the single highest-risk
+/// prerequisite for wiring `emit_vector_loop`, and
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+/// increment 4 is the item that closed it.
+pub mod xmm_roles {
+    /// `ir_lower`'s FP value tier: the scratch pair every float/double
+    /// arithmetic arm computes in — XMM0 the first operand and the result,
+    /// XMM1 the second.
+    pub const IR_FP_SCRATCH: [u8; 2] = [0, 1];
+
+    /// `ir_lower`'s linear-scan file — the registers a *long-lived* FP value
+    /// may be promoted into for the whole method.
+    ///
+    /// Disjoint from [`IR_FP_SCRATCH`] by construction, which is why residency
+    /// and the arithmetic arms can coexist.
+    ///
+    /// XMM6/XMM7 are here because [`IR_PROLOGUE_SAVED`] pays for them. The
+    /// ceiling is XMM7, not register pressure: `ir_lower`'s `fp_load` /
+    /// `fp_store` / `fp_binop` emit ModRM with `(xmm & 7) << 3` and **no REX**,
+    /// so XMM8 and up are not addressable by that emitter at all. Raising the
+    /// ceiling is a REX change in those three functions, not a save-area
+    /// change.
+    pub const IR_LINEAR_SCAN: [u8; 6] = [2, 3, 4, 5, 6, 7];
+
+    /// The XMM registers `ir_lower::emit_prologue` saves and every exit
+    /// restores — empty on System V, where the ABI makes every XMM volatile
+    /// and there is nothing to save.
+    ///
+    /// This is the list that makes the two ranges above and below able to
+    /// coexist with a *caller*. Win64 makes XMM6–XMM15 non-volatile; without a
+    /// save area, any use of one silently corrupts the caller's floating-point
+    /// state on one platform and not the other — the worst possible shape for
+    /// a bug, and the reason `IR_LINEAR_SCAN` stopped at XMM5 until now.
+    ///
+    /// Only XMM6/XMM7 appear, not XMM6–XMM15: they are what `IR_LINEAR_SCAN`
+    /// can address (see above), and a frame does not pay 16 bytes to save a
+    /// register nothing can name. [`VECTOR_REGION_MAX`] is XMM8–XMM15 and owes
+    /// its own save area — see [`vector_pool_is_encodable`].
+    #[cfg(windows)]
+    pub const IR_PROLOGUE_SAVED: &[u8] = &[6, 7];
+    /// System V: every XMM is caller-saved, so the prologue saves none.
+    #[cfg(not(windows))]
+    pub const IR_PROLOGUE_SAVED: &[u8] = &[];
+
+    /// The widest pool a vector region may be given.
+    ///
+    /// **Disjoint from [`IR_FP_SCRATCH`] and [`IR_LINEAR_SCAN`]**, which is the
+    /// whole point: a vector region can no longer destroy a scalar `double` a
+    /// caller left live, so `emit_vector_loop`'s caller owes no
+    /// prove-the-scalars-are-dead argument. It owes a different one, stated by
+    /// [`vector_pool_is_encodable`]: on Windows every register here is
+    /// callee-saved, so a frame that hands one out must save it.
+    ///
+    /// XMM8–XMM15 rather than the low half because `vec_emit` encodes with VEX,
+    /// which carries the high bit for free — the constraint that pins
+    /// `IR_LINEAR_SCAN` to XMM0–XMM7 does not apply here.
+    pub const VECTOR_REGION_MAX: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+
+    /// May a vector region take `reg`, given the set of XMM registers the
+    /// calling frame's prologue saves?
+    ///
+    /// Two conditions, and the second is the one that used to be prose:
+    ///
+    ///   1. `reg` is in [`VECTOR_REGION_MAX`] — no other register is the
+    ///      vector pool's to give;
+    ///   2. it is caller-saved on this target, **or** `frame_saved` says the
+    ///      caller's prologue saved it. On System V (1) implies (2); on
+    ///      Windows every register in the pool is non-volatile, so a caller
+    ///      that saves nothing gets an empty pool and `emit_vector_loop`
+    ///      refuses — which is the correct answer, not a missed optimization.
+    pub fn vector_pool_is_encodable(reg: u8, frame_saved: &[u8]) -> bool {
+        if !VECTOR_REGION_MAX.contains(&reg) {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            frame_saved.contains(&reg)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = frame_saved;
+            true
+        }
+    }
+
+    /// The first register claimed by two of the three authorities, if any.
+    ///
+    /// The invariant this module exists to make checkable, as a value rather
+    /// than a paragraph. `None` is the healthy answer and
+    /// `the_three_xmm_authorities_are_disjoint` pins it.
+    pub fn disjointness_violation() -> Option<u8> {
+        for reg in 0u8..16 {
+            let claims = u8::from(IR_FP_SCRATCH.contains(&reg))
+                + u8::from(IR_LINEAR_SCAN.contains(&reg))
+                + u8::from(VECTOR_REGION_MAX.contains(&reg));
+            if claims > 1 {
+                return Some(reg);
+            }
+        }
+        None
     }
 }
 

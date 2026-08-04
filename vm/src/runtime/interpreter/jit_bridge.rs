@@ -114,22 +114,27 @@ pub(super) fn compile_osr_artifact(
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
-    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
-    // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
-    // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
-    // CRATONVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
-    if crate::runtime::env_cache::disable_jit() {
-        return None;
-    }
-    // Same reasoning one gate down, for the BISECT levers.
-    // `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` were applied only inside
-    // `cratonvm_jit::try_compile`, and this function reaches
-    // `x64::compile_with_param_slots` directly (see the "calls the backend
-    // directly instead of going through `try_compile`" note further down), so
-    // an OSR body could be force-interpreted by neither lever. A bisect step
-    // that cannot actually stop the compile reads as an exoneration — see
-    // `cratonvm_jit::jit_force_interpret`.
-    if cratonvm_jit::jit_force_interpret(&class_name, &method_name) {
+    // The two whole-method vetoes that must also stop a CACHED artifact from
+    // being reused, not merely stop a new compile:
+    //
+    //   * `CRATONVM_DISABLE_JIT=1` forces interpreter-only execution. OSR is a
+    //     JIT entry point distinct from `try_jit_compile_callee` /
+    //     `try_jit_upgrade_with_gate`, so the user-facing flag has to be asked
+    //     here for it to disable all three.
+    //   * the BISECT levers. `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY`
+    //     were applied only inside `cratonvm_jit::try_compile`, and this
+    //     function reaches `x64::compile_with_param_slots` directly, so an OSR
+    //     body could be force-interpreted by neither. A bisect step that cannot
+    //     actually stop the compile reads as an exoneration — see
+    //     `cratonvm_jit::jit_force_interpret`.
+    //
+    // Both now come from `compile_gate`, so this door and `try_compile` cannot
+    // disagree about them. The rest of the admission chain (the permanent
+    // bail-list, the code-cache cap, the compile-epoch witness) is asked at the
+    // compile itself, further down — refusing to *reuse* a body that is already
+    // committed on either of those grounds would cost throughput and buy
+    // nothing.
+    if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -237,15 +242,37 @@ pub(super) fn compile_osr_artifact(
         cached_osr
     } else {
         (|| -> Option<_> {
-            // RBC.2 — honor the permanent bail-list here too. This OSR path
-            // calls `x64::compile` directly (not `jit::try_compile`), so it
-            // used to bypass the bail-list short-circuit and re-ran the FULL
-            // compile pipeline on every OSR trigger of a permanently
-            // uncompilable hot method (observed: 35,923 wasted pipelines on
-            // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
-            if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
-                return None;
-            }
+            // ── The admission gate ────────────────────────────────────────
+            //
+            // The ONE door. This path reaches `x64::compile_with_param_slots`
+            // directly rather than through `jit::try_compile`, and for a long
+            // time that meant it applied whatever subset of `try_compile`'s
+            // admission chain someone had noticed was missing:
+            //
+            //   * RBC.2 — the permanent bail-list, hand-copied here after the
+            //     full compile pipeline re-ran on every OSR trigger of a
+            //     permanently uncompilable hot method (35,923 wasted pipelines
+            //     on `Nat.inc`'s dup_x2 bail in one crypto-prng suite run);
+            //   * the bisect levers, hand-copied after every bisect step on the
+            //     annotation-scan SIGSEGV read "no effect" while 11 methods
+            //     kept compiling;
+            //   * the code-cache cap, never copied at all — an OSR compile
+            //     could commit code past a cap the ordinary door respected.
+            //
+            // `compile_gate::admit` asks all of them, in one place, for all
+            // three doors, and the token it returns owns the compile-epoch
+            // witness. That witness used to be opened ~1,000 lines below, after
+            // every class load and constant-pool read this function performs:
+            // a redefinition landing in that window produced a body stamped
+            // with the CURRENT epoch, which the install barrier then accepted.
+            // Holding the token from here is what closes it.
+            let admission = cratonvm_jit::compile_gate::admit(
+                &class_name,
+                &method_name,
+                &method_descriptor,
+                cratonvm_jit::compile_gate::CompileDoor::Osr,
+            )
+            .ok()?;
             // A previous compile for exactly this back-edge produced a body
             // whose `osr_dead_mask` refuses entry there. That verdict is a pure
             // function of a deterministic compile, so re-running the pipeline
@@ -304,7 +331,7 @@ pub(super) fn compile_osr_artifact(
             // the OSR'd code) get silently RE-EXECUTED by the interpreter from
             // the stale resume state — e.g. an `ArrayList` ending up with extra
             // duplicate elements with no exception anywhere. See
-            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
@@ -793,7 +820,7 @@ pub(super) fn compile_osr_artifact(
             // indy uncommon trap: the bail resumes the pre-OSR interpreter
             // frame at the stale back-edge, silently re-running a loop whose
             // side effects already committed (see
-            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
             // Admit only sites lowered by the StringConcatFactory bridge, which
             // emits a direct call and never deopts at the indy bci. `indy_info`
             // drops sites it cannot resolve, so a length mismatch also means
@@ -1193,13 +1220,14 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
-            // Stamp this artifact's install epoch from HERE, not from the
-            // `put_osr` below. This path calls the backend directly instead of
-            // going through `try_compile`, so without the witness it is stamped
-            // at finalize and a redefine that lands mid-compile would not be
-            // caught by the install barrier.
-            let _compile_epoch = cratonvm_jit::open_compile_epoch_witness();
+            // This artifact's install epoch was stamped by the `compile_gate`
+            // admission at the top of this closure — before the class loading
+            // and constant-pool resolution above, not here. A witness opened at
+            // this line covered only the backend call, so a redefinition that
+            // landed while the resolvers ran produced a body the install
+            // barrier could not tell from a current one.
             let mut cm = crate::jit::x64::compile_with_param_slots(
+                &admission,
                 &code,
                 code_len,
                 param_slots,
@@ -1228,7 +1256,7 @@ pub(super) fn compile_osr_artifact(
                 &helpers,
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
-                std::collections::HashMap::new(), // inline_guard_class_ids (PGO-02, no guarded plan from this scan-based fast path)
+                std::collections::HashMap::new(), // inline_guard_variants (PGO-02, no guarded plan from this scan-based fast path)
                 None, // string_layout — String intrinsics land in a later wave
                 &param_jvm_slots,
                 param_slot_span,
@@ -2089,7 +2117,7 @@ pub(super) fn is_elidable_construction(
     // different order than an interpreter-created one holding the same keys —
     // found as a json-smart parse/serialize/re-parse round-trip mismatch at the
     // exact iteration `JSONParserBase.readObject` tiered up
-    // (docs/internal/jsonsmart-parser-jit-retired-20260727.md). The companion
+    // (jsonsmart-parser-jit-retired-20260727.md). The companion
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
     if shared
@@ -2866,6 +2894,20 @@ pub(super) fn try_jit_upgrade_with_gate(
         cm.get_class(cratonvm_types::ClassId::new(cid))
             .map(|c| c.name.to_string())
     };
+    // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a site
+    // declared `(cp_class, name, desc)` — what a guard admitting that class may
+    // splice. See `resolve_receiver_inline_site` for why the constant-pool
+    // callee is the wrong body here.
+    let receiver_inline_resolver = |cid: u32, cp_class: &str, name: &str, desc: &str| {
+        resolve_receiver_inline_site(
+            shared,
+            cached.declaring_class_id,
+            cid,
+            cp_class,
+            name,
+            desc,
+        )
+    };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
     // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
     // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
@@ -3319,6 +3361,14 @@ pub(super) fn try_jit_upgrade_with_gate(
                 cm.get_class(cratonvm_types::ClassId::new(cid))
                     .map(|c| c.name.to_string())
             };
+            // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a
+            // site declared `(cp_class, name, desc)`. The guard admits a runtime
+            // class, so this — not the constant-pool callee — is what may be
+            // spliced behind it. See `resolve_receiver_inline_site`.
+            let c_receiver_inline_resolver =
+                |cid: u32, cp_class: &str, name: &str, desc: &str| {
+                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc)
+                };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -3468,6 +3518,11 @@ pub(super) fn try_jit_upgrade_with_gate(
                 Some(&c_indy_descriptor_resolver),
                 if crate::runtime::env_cache::jit_guarded_virtual_inline() {
                     Some(&c_class_id_namer)
+                } else {
+                    None
+                },
+                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                    Some(&c_receiver_inline_resolver)
                 } else {
                     None
                 },
@@ -3621,6 +3676,11 @@ pub(super) fn try_jit_upgrade_with_gate(
         Some(&indy_descriptor_resolver),
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&class_id_namer)
+        } else {
+            None
+        },
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&receiver_inline_resolver)
         } else {
             None
         },
@@ -4371,6 +4431,19 @@ pub(super) fn try_jit_compile_callee_slow(
         cm.get_class(cratonvm_types::ClassId::new(namer_cid))
             .map(|c| c.name.to_string())
     };
+    // PGO-02 R0: see the sibling resolver in `try_jit_compile` — the body a
+    // receiver of exactly this class id dispatches to, which is the only body a
+    // guard admitting that class may splice.
+    let receiver_inline_resolver = |rcv_cid: u32, cp_class: &str, name: &str, desc: &str| {
+        resolve_receiver_inline_site(
+            shared,
+            cached.declaring_class_id,
+            rcv_cid,
+            cp_class,
+            name,
+            desc,
+        )
+    };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
     let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -4659,6 +4732,11 @@ pub(super) fn try_jit_compile_callee_slow(
         Some(&indy_descriptor_resolver),
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&class_id_namer)
+        } else {
+            None
+        },
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&receiver_inline_resolver)
         } else {
             None
         },
@@ -5226,9 +5304,80 @@ pub fn jit_panic_to_exception(
 /// - Bytecode length <= MAX_INLINE_BYTECODE_SIZE (35)
 /// - No exception handlers, not synchronized
 /// - No unsupported bytecodes (new, checkcast, instanceof, invoke*, etc.)
+///
+/// Resolution starts at the CONSTANT-POOL class, which is the right answer for
+/// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
+/// interface site — see [`resolve_receiver_inline_site`].
 pub(super) fn resolve_inline_site(
     shared: &SharedVm,
     requesting_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        None,
+        callee_class,
+        callee_method,
+        callee_desc,
+    )
+}
+
+/// Resolve the body a receiver of EXACTLY `receiver_class_id` dispatches to at
+/// a call site declared `(cp_class, callee_method, callee_desc)` — PGO-02's
+/// guarded-inline resolver.
+///
+/// A guarded inline compares the receiver's class id against a class taken
+/// from the receiver-type profile, then runs a spliced body. Those two only
+/// agree if the body is the one that class actually dispatches to. Resolving
+/// from `cp_class` instead — the receiver expression's STATIC type — splices
+/// the superclass's method behind a guard that just certified the subclass,
+/// which is silent wrong code at every overriding site. Starting the JVMS
+/// selection walk at the runtime receiver is also what gives `invokeinterface`
+/// any reach at all: an interface's own declaration has no `Code`.
+///
+/// Fail-closed on every shape where "the method found by walking up from the
+/// receiver" might NOT be the method real dispatch selects:
+///
+/// * the receiver class must be a loaded, non-interface, non-array class;
+/// * the selected method must not be `private` (a private method is never
+///   inherited, so a walk that finds one from a subclass receiver found
+///   something dispatch would not);
+/// * and if the selected method is declared somewhere OTHER than where the
+///   constant-pool reference resolves, it must be genuinely an override:
+///   `public`/`protected`, or package-private within the same runtime package.
+///   A package-private method in a different package does NOT override
+///   (JVMS §5.4.5), and the walk cannot tell the difference on its own.
+pub(super) fn resolve_receiver_inline_site(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    receiver_class_id: u32,
+    cp_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        Some(ClassId::new(receiver_class_id)),
+        cp_class,
+        callee_method,
+        callee_desc,
+    )
+}
+
+/// Shared core of [`resolve_inline_site`] and [`resolve_receiver_inline_site`].
+///
+/// `receiver_class_id` selects which of the two contracts applies: `None`
+/// resolves from `callee_class` (constant-pool resolution), `Some` starts the
+/// selection walk at that runtime class and applies the override-legality
+/// checks documented on [`resolve_receiver_inline_site`].
+fn resolve_inline_site_from(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    receiver_class_id: Option<ClassId>,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
@@ -5252,15 +5401,56 @@ pub(super) fn resolve_inline_site(
         return None;
     }
 
+    // Taken BEFORE the class-manager guard. Holding two of this subsystem's
+    // locks at once is a lock-order obligation, and every other reader of
+    // `lambda_proxies` here takes it without `class_manager` held; a proxy's
+    // dispatch is synthesised elsewhere entirely, so one is never inlineable.
+    if let Some(receiver_id) = receiver_class_id {
+        if shared
+            .classes
+            .lambda_proxies
+            .read()
+            .contains_key(&receiver_id)
+        {
+            return None;
+        }
+    }
+
     let cm = shared.classes.class_manager.read();
-    let callee_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
+    let cp_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
+    // Where the JVMS method-selection walk starts. For a guarded site that is
+    // the RUNTIME receiver class; `find_method_recursive` performs the
+    // maximally-specific default-method selection only when handed the
+    // receiver, which is the same reason the interpreter's own dispatch
+    // redirects to the receiver id for interface calls.
+    let search_start = receiver_class_id.unwrap_or(cp_class_id);
+    if let Some(receiver_id) = receiver_class_id {
+        let receiver = store.get(receiver_id)?;
+        // A guard admits an EXACT class, so an interface or an array class is
+        // never a class a receiver can have here.
+        if receiver.is_interface() || receiver.name.starts_with('[') {
+            return None;
+        }
+    }
     let (method, declaring_id) = crate::classloading::find_method_recursive(
-        callee_class_id,
+        search_start,
         callee_method,
         callee_desc,
         store,
     )?;
+    if let Some(receiver_id) = receiver_class_id {
+        if !receiver_resolution_is_dispatch_faithful(
+            store,
+            receiver_id,
+            cp_class_id,
+            declaring_id,
+            method,
+            callee_method,
+        ) {
+            return None;
+        }
+    }
     // Same rule for an inherited native: resolution may start at a subclass
     // while the executable override is registered on the declaring class.
     // Checking exactly the declaring class still permits a real bytecode
@@ -5276,6 +5466,17 @@ pub(super) fn resolve_inline_site(
     {
         return None;
     }
+    // The class the SPLICED BODY belongs to, which is what an invalidation
+    // dependency must name. For a constant-pool resolution this stays the
+    // declared name (unchanged behaviour); for a receiver resolution the
+    // declared name is a supertype that may own no body at all, so naming it
+    // would record a dependency on a class whose redefinition cannot affect
+    // the code, and miss the one whose redefinition can.
+    let inlined_body_class_name = if receiver_class_id.is_some() {
+        declaring_class_name.to_string()
+    } else {
+        callee_class.to_string()
+    };
 
     if method.is_synchronized() {
         return None;
@@ -5616,11 +5817,112 @@ pub(super) fn resolve_inline_site(
         ldc_info,
         ldc2w_info,
         needs_heap,
-        class_name: callee_class.to_string(),
+        class_name: inlined_body_class_name,
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,
     })
+}
+
+/// Whether a method reached by walking up from the RUNTIME RECEIVER is the
+/// method real dispatch would select at a site declared against `cp_class_id`.
+///
+/// `find_method_recursive` implements JVMS selection, but selection is only
+/// defined relative to a resolved method: a candidate overrides the resolved
+/// method only if it is accessible to it (JVMS §5.4.5). A package-private
+/// method in a *different* runtime package has the same name and descriptor and
+/// is NOT an override — dispatch runs the resolved method, the walk finds the
+/// impostor. Everything below is a fail-closed check for that class of
+/// disagreement; a `false` answer means "do not inline", never "inline
+/// something else".
+#[allow(clippy::too_many_arguments)]
+fn receiver_resolution_is_dispatch_faithful(
+    store: &crate::classloading::ClassStore,
+    receiver_id: ClassId,
+    cp_class_id: ClassId,
+    declaring_id: ClassId,
+    method: &cratonvm_reader::method::ClassFileMethod,
+    callee_method: &str,
+) -> bool {
+    // A virtual/interface site never dispatches to a static method, and a
+    // private method is never inherited — a walk that reached one from a
+    // subclass receiver found something dispatch could not.
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    if method.is_static()
+        || method
+            .access_flags
+            .contains(MethodAccessFlags::PRIVATE)
+        || method.is_abstract()
+    {
+        return false;
+    }
+    // `<init>`/`<clinit>` are not virtually dispatched at all.
+    if callee_method.starts_with('<') {
+        return false;
+    }
+    // The receiver must actually be a subtype of the declared class, or the
+    // profile handed us a class id from a different site entirely.
+    if !class_is_assignable_to(store, receiver_id, cp_class_id) {
+        return false;
+    }
+    // Is the selected method genuinely an OVERRIDE of what the constant-pool
+    // reference resolves to? Two sufficient conditions, both answerable from
+    // what is already in hand — deliberately NOT by resolving the CP reference
+    // as well. `vm/src/runtime/resolve/guard.rs` ratchets the interpreter's
+    // metadata-table bypass budget downward and nothing raises it; a second
+    // `find_method_recursive` here would, and the cheaper rules below cost
+    // only reach, never correctness.
+    //
+    //  1. `public`/`protected` overrides anything with the same name and
+    //     descriptor it inherits, in any package (JVMS §5.4.5).
+    //  2. Otherwise, the method must be declared on the CONSTANT-POOL CLASS
+    //     itself — in which case CP resolution stops there and the selected
+    //     method IS the resolved method, so there is no override question to
+    //     answer.
+    //
+    // What this refuses is the remaining shape: a PACKAGE-PRIVATE method found
+    // by walking up from the receiver, declared somewhere other than the CP
+    // class. It may or may not override — a package-private method in a
+    // different runtime package does NOT (dispatch runs the resolved method,
+    // while the walk found the impostor) — and telling those apart needs the
+    // CP-side resolution this deliberately does without. Refusing costs a
+    // package-private virtual site its inline; guessing costs a wrong body.
+    if method
+        .access_flags
+        .intersects(MethodAccessFlags::PUBLIC | MethodAccessFlags::PROTECTED)
+    {
+        return true;
+    }
+    declaring_id == cp_class_id
+}
+
+/// Whether `sub` is `sup` or inherits/implements it.
+fn class_is_assignable_to(
+    store: &crate::classloading::ClassStore,
+    sub: ClassId,
+    sup: ClassId,
+) -> bool {
+    if sub == sup {
+        return true;
+    }
+    let mut stack = vec![sub];
+    let mut seen: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == sup {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(class) = store.get(id) else {
+            continue;
+        };
+        stack.extend(class.interfaces.iter().copied());
+        if let Some(sc) = class.superclass {
+            stack.push(sc);
+        }
+    }
+    false
 }
 
 /// Get the bytecode length of an instruction from its opcode ALONE (for the
@@ -5897,7 +6199,7 @@ pub(super) fn execute_jit_call(
     //     NaN-tag int space (BC safegcd 0xFFFC_… accumulator) was decoded by
     //     the prior unconditional `to_value()` as `Value::Int`, truncating to
     //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
-    //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
+    //     i64 bit-exact. See gaps/bc-ec-mod-mododdinverse-investigation.md.
     let is_static = cached.is_static;
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See

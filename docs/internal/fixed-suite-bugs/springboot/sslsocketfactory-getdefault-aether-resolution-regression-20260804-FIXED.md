@@ -1,17 +1,12 @@
 # `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — FIXED
 
+**Status: OPEN — REGRESSED 2026-08-04.** Previously fixed and closed
+2026-07-26 (see `spring-boot-core39-residual-clusters-20260723.md`,
 **Status: FIXED 2026-08-04** — see "STATUS 2026-08-04: FIXED AND CLOSED" at the
 end of this page for the runtime confirmation, the fix, the two residuals it
 also closed, the five additional affected classes a cold-cache rerun found, and
 the guards. Everything above that section is the original investigation, left
 as written.
-
-Previously OPEN — REGRESSED 2026-08-04. Previously fixed and closed
-2026-07-26 (see `docs/internal/spring-boot-core39-residual-clusters-20260723.md`,
-"Cluster C" item 1, under "STATUS 2026-07-26: all four clusters closed").
-The exact same exception, with the exact same mechanism, reappeared in a
-2026-08-04 residual rerun across 3 classes in 3 different modules.
-
 ## Symptom
 
 Any test that uses Spring Boot test-support's `@ClassPathExclusions`/
@@ -270,6 +265,19 @@ artefact we already emit, that a working implementation was replaced.
    wired carrier. Confirmed independently by `probes/SsfSurfaceProbe.java`,
    which fails **all three** entry points on the baseline binary and passes
    all three on the fixed one.
+
+   *Follow-up, same day:* the "known remaining gap" this section originally
+   left open — a per-connection `setSSLSocketFactory` not being readable back
+   — is **also closed now**, and its stated reason was wrong. It claimed the
+   fix needed "a new GC-rooted per-connection table (scan + post-move
+   remap)". It did not: the factory belongs in the real JDK
+   `sslSocketFactory` instance field, which is an ordinary object field and
+   therefore already a GC root and already remapped by the moving collector.
+   The counter-example was in the same file all along —
+   `setHostnameVerifier`/`getHostnameVerifier` store into the real
+   `hostnameVerifier` instance field for exactly that reason, and say so.
+   See the `huc-per-connection-ssf-readback` commit and
+   `probes/HucFactoryReadbackProbe.java`.
 4. **`ssl_security.rs`** — the layered
    `createSocket(Socket,String,int,boolean)` overload no longer converts a
    lost field 0 into a hard `IllegalStateException`. There is no such thing

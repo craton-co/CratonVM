@@ -4,7 +4,7 @@
 //! T11 — Safety & Hardening conformance test suite.
 //!
 //! Verifies that CratonVM satisfies all T11 safety requirements from
-//! `docs/roadmap-100.md`.  Each test checks a specific structural or
+//! `history/roadmap-100.md`.  Each test checks a specific structural or
 //! behavioral invariant rather than exercising runtime semantics.
 //!
 //!     cargo test -p cratonvm-vm --test t11_safety_conformance -- --nocapture

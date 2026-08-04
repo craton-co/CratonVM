@@ -27,6 +27,29 @@ No doc was moved or newly filed for any of these three — do not re-open them
 as regressions on a future ABORTED sighting without first checking whether
 HotSpot aborts the same tests for the same reason.
 
+**2026-08-04 re-verification, plus the temporal siblings:** the same fresh
+50-class residual rerun (`apps/hib-suite-runner/runs/run-20260804-113511-custom/`)
+reported ABORTED again for the three classes above (identical
+found/ok/aborted counts) plus three `type.temporal` classes with the same
+"JUnit `Assumptions` self-skip baked into the test" shape:
+`InstantTests` (`found=204 ok=112 aborted=92`, matching the fully-fixed
+baseline in `hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md`),
+`LocalDateTimeTest` (`found=162 ok=90 aborted=72`, matching
+`hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md`), and
+`OffsetTimeTest` (`found=396 ok=176 aborted=88 skipped=132`, confirmed
+byte-identical against a direct real-HotSpot `CratonRunner` re-run the same
+day — not previously documented since the finding is "matches its temporal
+siblings", not a new defect).
+
+These six classes are now tracked in
+`apps/hib-suite-runner/known-benign-aborts.tsv` (force-added past the `apps/`
+gitignore, same as `class-overrides.tsv`), which `run-hib.sh categorize`
+consults so a class listed there is routed to `passed.txt` instead of
+`others.txt` — but **only** when its found/ok/aborted counts match the
+table's recorded baseline exactly, so a future ABORTED sighting with
+different counts still surfaces as a residual. Check the table with
+`run-hib.sh benign-aborts`.
+
 ## HANG classes in the fresh 4548-class run (2026-07-31) — one harness gap (now fixed, and hiding two real VM defects), two stale-binary/contention margins
 
 Four more classes report `HANG` (`process-died rc=124`) in the same
@@ -43,7 +66,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `132/132 failed=0` three runs for three against base `32f9db9a2` — but it was
   **not green on the `dev` tip**, and neither was any other collector arm. A
   fourth, older fault — the class was
-  [intermittently unstable in every arm](../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md),
+  intermittently unstable in every arm,
   including on `dev` with no local changes at all — was **FIXED 2026-08-03**:
   nine distinct GC old-gen mark/sweep/compact defects (one family — trusting
   `ObjectHeader` fields before validating them), found via `CRATONVM_SYMBOLIZE`
@@ -62,7 +85,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
   - JIT on (the suite's lane) — `OutOfMemoryError` on a 49 %-full heap at
     ~41 min. **FIXED 2026-07-31**, retired to
-    [`../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
+    `fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`.
     It was **not** a manifestation of the moving-young gap, as first reported: it
     was an independent regression in which the non-moving sweep's selective
     promotion — the young generation's only drain — had been switched off by a
@@ -74,7 +97,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     behind the OOM: selective promotion was evacuating roots published as
     "movable" precise-JIT roots on cycles whose coverage proof had *failed*.
     Also **FIXED**, retired to
-    [`../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
+    `fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`.
     With both fixes the class reaches **`132/132 failed=0`, 3 runs for 3**
     against base `32f9db9a2` — but see the late-phase instability doc above
     before treating that as green on the `dev` tip.
@@ -84,7 +107,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
     throughput tax, and it stays there.
   - `--nojit` — **FIXED 2026-08-03**, retired to
-    [`../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
+    `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`.
     The `map_resize_inner` attribution below was RETRACTED early in that doc's
     life; the actual writer turned out to be `OldGen::compact` (the sliding
     old-gen compactor), which is now disabled by default. The class completes
@@ -132,7 +155,32 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   moving-young tax, not reopened. See the hib-120s doc's own 2026-07-30/31
   recurrence section for the full A/B table.
 
-## Resolved (2026-07-30) — retired to `docs/internal/fixed-suite-bugs/hibernate/`
+  **Correction (2026-08-04):** a fresh 50-class residual run
+  (`run-20260804-113511-custom`) shows these two classes have diverged.
+  `BatchTest` no longer belongs in this bullet at all — it failed 100% of the
+  time with a genuine, JIT-only `ConstraintViolationException` (a unique-index
+  collision), not a timeout. **That defect is now FIXED** (same day): the root
+  cause was CratonVM injecting `Unsafe.ARRAY_*_BASE_OFFSET` — `long` fields in
+  JDK 25 — as a 32-bit value, which the interpreter tolerated and JIT-compiled
+  code read as garbage, making `Arrays.equals(long[],long[])` return `true` for
+  arrays that differ. Write-up and evidence:
+  `../../internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+  `BatchTest` is now `ok=3 failed=1` under JIT with zero unique-index
+  violations; the remaining failure is `testBatchInsertUpdate` (`N=5000`) on
+  this cluster's own 120s throughput margin — which that doc measures at 273s
+  solo on a quiet box against a 5.6s HotSpot control, i.e. ~2.6x worse than the
+  101-107s recorded for the same method on 2026-07-17. **That regression is
+  unattributed and still open**, and is the only part of `BatchTest` this
+  bullet still covers.
+  `DynamicBatchFetchTest` still trips the same internal 120s `TimeoutException`
+  as before, but its log now shows 8-9 `[moving-young] fallback` events during
+  `testMultiLoad` where the 07-30/31 table above recorded **zero** `[GC]`
+  lines — the "moving-young mechanism cannot be involved because it's never
+  even requested" argument no longer holds as literally stated (though the
+  overall throughput-margin verdict was not retested/overturned). See the
+  hib-120s doc's own new 2026-08-04 correction section for detail.
+
+## Resolved (2026-07-30) — retired to `fixed-suite-bugs/hibernate/`
 
 - **HIB-BYTEBUDDY ban removed for good.** The 302-class crash spike was an older runtime
   unmapping a compiled body while a live frame still executed it — an instruction-fetch fault
@@ -142,7 +190,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   fixes on `dev` and no blanket guard, the exact 302-class manifest passes in **both** modes:
   301 PASS / 1 assumption-abort / 0 FAIL / 0 CRASH / 0 HANG, identical counts in each. A
   `skip_list` unit test now fails the build if a blanket `net/bytebuddy/` guard is ever re-added.
-  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`.
+  Full write-up: `fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`.
 
 - **Native ANTLR intrinsics lose object roots under the moving young collector** — FIXED
   2026-07-31. `ASTParserLoadingTest` rejected valid HQL nondeterministically because
@@ -155,7 +203,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   gone, replaced by `NativeHandleScope` / `NativeHandle`; config sets are walked by index out of
   the rooted set; a guard test keeps the raw API out. Eleven further groups of live unrooted sites
   (~29 functions) were fixed on the way through. Full write-up:
-  `docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
+  `fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
 
 - **A user lambda could be routed to the collector natives under the JIT** — FIXED
   2026-07-31, closing the HQL ordinal-parameter report. `Collector.accumulator()` and its
@@ -172,29 +220,38 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `FunctionalInterfaceHijackProbe.java` is the reduced witness. The report that prompted the
   hunt — a one-in-fourteen `ordinal parameters []` — never reproduced and is **not** attributed
   to this; read the write-up's "What is and is not proven" before citing it.
-  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`.
+  Full write-up: `fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`.
+
+- **`Type.getTypeName()` dispatched on `java/lang/Integer` during a SessionFactory rebuild
+  cascade** — CLOSED 2026-08-04, no longer reproduces. The single witness (2026-07-31) showed a
+  `Class` mirror resolving as the class it DESCRIBES; the doc's own 61 reproduction attempts were
+  already clean before this closure. A fresh 2026-08-04 hunt (~166 forced-cascade runs, ~10 000+
+  SessionFactory bootstraps, across the local Windows box and the Azure Linux shared host, tracer
+  armed throughout) also found zero occurrences. No fix landed under this investigation; strong
+  circumstantial evidence points at the dense cluster of GC-root-correctness fixes
+  (`0b18f15eb`, `638bd1190`, and five siblings) that landed within ~20 hours of the witness,
+  covering exactly this bug's territory (roots — including class-mirror rooting — not correctly
+  published across a moving-young GC cycle). Root cause was never conclusively pinned to one
+  commit; closed on absence of any live reproduction, not on a confirmed fix.
+  Full write-up: `fixed-suite-bugs/hibernate/gettypename-wrong-receiver-sessionfactory-rebuild-cascade-20260804-FIXED.md`.
 
 ## Open
 
-- [`Type.getTypeName()` dispatches on `java/lang/Integer` during a SessionFactory rebuild cascade](gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md)
-  (OPEN, **not reproduced**; rewritten 2026-08-01 after re-reading the witness logs line by line —
-  its first version's causal story was wrong) — a `Class` mirror resolving as the class it
-  DESCRIBES, in `JavaTypeRegistry.addBaselineDescriptor`'s inlined `getTypeName()` call. The
-  cascade is not the consequence of a JUnit timeout: an affected run dies inside
-  `testNumericExpressionReturnTypes` at ~11% of the class, rebuilds, and from the SIXTH bootstrap
-  on **every** rebuild fails at priming before reaching the connection pool — 16 attempts, 2
-  warnings each, zero completed builds, until the wall cap. So it is self-feeding and **permanent**,
-  which rules out a transient race and points at state nothing invalidates. Ruled out by
-  measurement: the `getJavaType()` accessor (810k checks), `getTypeName()` over 30 mirrors (1.8M),
-  `VIRTUAL_TARGET_CACHE` recycling, 35 000 primings (fresh VM and post-suite), and 61 completed runs
-  of the class across dev, the lambda-fix commit and the witness's own era — including forced
-  `CRATONVM_NO_MOVING_YOUNG=1`. The witness era no longer reproduces even its own 103/106 baseline
-  on this host, which is the honest reason for the null result. Next: explain why
-  `testNumericExpressionReturnTypes` stopped — the earliest divergence, and nothing records it.
+- [`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md)
+  (REOPENED 2026-08-04) — moved back here from
+  `../../internal/fixed-suite-bugs/hibernate/` after a fresh 2026-08-04 `dev`
+  tip run (`a43a74ded`) reproduced the exact original 2026-07-07 symptom:
+  `testInPredicate` fails with `TimeoutException ... timed out after 120
+  seconds` under default JIT (155-183s solo repro), while `--nojit` passes
+  cleanly in ~71.5s. The 2026-07-08 "RETIRED" verdict on the original doc was
+  premature — it closed on the strength of one passing run. Root cause not
+  freshly re-confirmed this session (the original dispatch-heavy JIT tier-up
+  analysis is the leading hypothesis, not re-proven); the real fix it points
+  at (lock-free per-hit tier-up dispatch) was never landed.
 
 - ~~Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`~~
   — `HIB-MAPRESIZE-STALE.1`, **FIXED 2026-08-03**, retired to
-  [`../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
+  `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`.
   Four tangled defects, three fixed earlier; the residual corruption's actual writer
   was `OldGen::compact` (the sliding old-gen compactor), found by bisection after code
   review of its own Phase 1-3 came up empty. Disabled by default
@@ -205,7 +262,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 - ~~Spurious `OutOfMemoryError` with 570 MB free~~ — `HIB-GCOVERHEAD-HALFFULL.1`,
   **FIXED 2026-07-31**, retired to
-  [`../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
+  `fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`.
   The report's `promoted=0`-on-every-cycle observation was the whole story, and it
   was **not** downstream of the moving-young fallback as that report concluded: the
   non-moving sweep's selective promotion, the young generation's only young→old
@@ -219,7 +276,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   HotSpot's `UseGCOverheadLimit` as a safety net so the next drain defect is slow
   rather than fatal.
 
-- [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
+- `action.queue` GRAPH-default tests — blocked by flush-planner throughput
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
   `hibernate.flush.queue.type` to `legacy`, which gates **19 of the 25
   `action.queue` classes**: 2 fail outright and 17 self-abort via
@@ -252,10 +309,10 @@ identical to HotSpot**. Re-verified 2026-07-28 on dev `d0a6c7987`: 117/117 acros
 20 lighter classes on both VMs, plus 6/6 for the heavy
 `OracleInlineMutationStrategyIdTest` once the harness's 120 s-per-method cap is lifted,
 plus 16/16 shapes matching HotSpot in a new Hibernate-free JDBC probe
-(`docs/internal/repros/h2-groupdata-window-20260728/`), whose pre-fix control binary
+(`repros/h2-groupdata-window-20260728/`), whose pre-fix control binary
 reproduces every symptom shape on the same commit.
 
-Retired to `docs/internal/fixed-suite-bugs/hibernate/`:
+Retired to `fixed-suite-bugs/hibernate/`:
 
 - `bulkid-mutationstrategy-insertselect-lastrow-duplicate-20260727-FIXED.md` (11 classes)
 - `size-groupby-aggregate-last-group-value-leak-20260727-FIXED.md` (2 classes)

@@ -58,6 +58,49 @@ fn maybe_dump_shutdown_reports() {
         return;
     }
 
+    // `CRATONVM_DBG=ir-isel` — the instruction selector's process totals.
+    //
+    // Its own switch, not `jit.method_stats`: these are two different
+    // measurements and a run that wants one rarely wants the other. At exit
+    // rather than per compile because the population is every method the
+    // optimizing tier produced a body for — 850 of them across the two Spring
+    // Boot classes this was first measured over — and summing that many stderr
+    // lines by hand is how a coverage figure gets mis-transcribed.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some() {
+        let (methods, stats) = cratonvm_jit::x64::isel::shadow_totals();
+        if methods != 0 {
+            eprintln!("[ir-isel] TOTALS methods={methods} {}", stats.summary_line());
+        }
+        let (mir_methods, tiles, mismatches) = cratonvm_jit::ir_lower::mir_totals::read();
+        if mir_methods != 0 {
+            // `shadow_tiles` / `arm_bytes` / `enc_bytes` are verify mode's
+            // sizing of the increment byte equality cannot cover: what the
+            // encoder would have written for the tiles it is not allowed to
+            // emit, against what the per-opcode arms did write.
+            let (shadow, arm_bytes, enc_bytes) =
+                cratonvm_jit::ir_lower::mir_totals::read_shadow();
+            eprintln!(
+                "[ir-isel] MIR TOTALS methods={mir_methods} tiles={tiles} \
+                 mismatches={mismatches} shadow_tiles={shadow} \
+                 arm_bytes={arm_bytes} enc_bytes={enc_bytes}"
+            );
+        }
+        // Increment 2's verdict tally. Printed on its own line and with the
+        // three states kept apart on purpose: `verified` methods with a zero
+        // `values` total and `nothing_to_cover` methods look identical in any
+        // collapsed "ok" count, and only the first is evidence. `rejected` is
+        // not a ratio — any non-zero value is a compiler bug.
+        let (verified, values, vacuous, indescribable, rejected) =
+            cratonvm_jit::ir_lower::mir_totals::read_alloc();
+        if verified + vacuous + indescribable + rejected != 0 {
+            eprintln!(
+                "[ir-isel] MIR ALLOC verified={verified} values={values} \
+                 nothing_to_cover={vacuous} indescribable={indescribable} \
+                 rejected={rejected}"
+            );
+        }
+    }
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and
@@ -65,7 +108,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
+        // (`docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -413,18 +456,22 @@ struct Args {
 
     /// Synthetic-stub census: dump every registered native with its
     /// classification (intrinsic / bridge / synthetic-stub) to the given
-    /// JSON file on VM shutdown. Schema (`schema_version` 2):
-    /// `{ "mode", "counts": {...}, "invocations": {...},
+    /// JSON file on VM shutdown. Schema (`schema_version` 3):
+    /// `{ "mode", "image_adjudication", "counts": {...}, "invocations": {...},
     /// "natives": [{class, name, descriptor, kind, registered_by, overwrote,
-    /// invocations, real_declaring_method}...] }`, sorted by
+    /// invocations, kind_stated, real_declaring_method,
+    /// image_declaring_method}...] }`, sorted by
     /// `(class, name, descriptor)` with a stable sort, so duplicate triples
     /// stay in registration order — the overwrite chronology — and the file is
     /// byte-stable across machines. `counts` counts *registrations* (schema 1's
     /// block, unchanged, so the stub ratchet still reads it); `invocations` is
     /// the separate per-kind dispatch total. Use this to verify the default
     /// build is synthetic-stub-free, and (via `invocations`) that no synthetic
-    /// stub was dispatched. Absolute registration-site paths are redacted
-    /// unless `--explain-jdk-only` is also passed. See
+    /// stub was dispatched. Absolute registration-site paths are redacted, and
+    /// `image_declaring_method` — the per-registration adjudication against the
+    /// bytes on the class path, which is what tells a real `ACC_NATIVE` bridge
+    /// from a registration nobody adjudicated — is `null`, unless
+    /// `--explain-jdk-only` is also passed. See
     /// docs/synthetic-vs-real-explained.md and
     /// docs/feature-designs/jdk-only-mode.md §9.
     #[arg(long = "dump-native-registry", value_name = "FILE")]
@@ -509,7 +556,7 @@ struct Args {
     /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
     /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
     /// `-Xmx` instead of a fixed value. See
-    /// docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
+    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
     #[arg(
         long = "XX:MaxDirectMemorySize",
         value_name = "SIZE",
@@ -2212,16 +2259,27 @@ fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
 
 /// How far each append-only violation log has already been reported.
 ///
-/// JDK-ONLY-NOTE: `--trace-jdk-only` is a **poll**, not a live trace. All five
-/// recording sites (`ClassManager::origin_violations`,
-/// `NativeMethodRegistry::refused_registrations`, and the three process sinks
-/// behind `SharedVm::jdk_only_process_violations`) are append-only vectors, so
-/// the launcher can only drain them at the points it holds the VM: right after
-/// `Vm::new` (which is when registration refusals actually happen — draining
-/// only at shutdown would report them minutes late, after the failure they
-/// caused) and again at shutdown. A genuinely live trace needs a VM-scoped sink
-/// installed at the recording sites themselves; that is a wave-2 change to
-/// `classloading` and `native-api`, not something the launcher can fake.
+/// **Class-origin violations no longer come through here.** They were the one
+/// recording site that fires throughout the run, so polling made every mid-run
+/// fabrication surface at shutdown, detached from the code that caused it —
+/// contract §9 asks for the opposite. `ClassManager` now carries a VM-scoped
+/// `set_violation_sink` that `run()` installs immediately after the `vm-init`
+/// drain, and this drain skips their
+/// *rendering* (but still advances `origins`) once that sink exists, so each
+/// violation is printed exactly once, live.
+///
+/// The remaining four sites are still polled, and for each of them that is the
+/// right answer rather than a deferral:
+///
+/// * `NativeMethodRegistry::refused_registrations` — every refusal happens
+///   inside `Vm::new`, and the `vm-init` drain immediately follows it, so the
+///   poll already reports them at their real time of occurrence.
+/// * The three process sinks behind `SharedVm::jdk_only_process_violations` —
+///   these are JIT/dispatch refusals, and they are *process*-global (see
+///   `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`
+///   §2). Giving them a live sink means giving them a VM first; a per-VM sink
+///   hung off process-global state would report another VM's violations as
+///   this one's, which is worse than reporting them late.
 ///
 /// The three JIT/dispatch sinks are drained on **the same schedule** as the
 /// other two, so a traced run and `--jdk-only-report` name the same set of
@@ -2280,8 +2338,15 @@ fn trace_jdk_only_violations(
     {
         let class_manager = shared.classes.class_manager.read();
         let recorded = class_manager.origin_violations();
-        for violation in recorded.iter().skip(watermark.origins) {
-            lines.push(render_violation(violation, jdk_feature, explain));
+        // Skip the rendering — not the watermark — once the live sink is
+        // installed: every violation past that point has already been printed
+        // at the instant it was recorded, and printing it again here would
+        // double-report it. Before the sink exists (the `vm-init` drain, and
+        // any run without `--trace-jdk-only`) this is still the only reporter.
+        if !class_manager.has_violation_sink() {
+            for violation in recorded.iter().skip(watermark.origins) {
+                lines.push(render_violation(violation, jdk_feature, explain));
+            }
         }
         watermark.origins = recorded.len();
     }
@@ -2357,8 +2422,7 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     {
         return;
     }
-    static WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WRITTEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+    if jdk_only_dumps_written() {
         return;
     }
 
@@ -2387,8 +2451,13 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     if let Some(path) = &args.dump_native_registry {
         match shared.dump_native_census_json(path, verbose) {
             Ok((intrinsic, bridge, stub)) => eprintln!(
-                "[cratonvm] wrote native registry census (schema 2) to {path} \
-                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})"
+                "[cratonvm] wrote native registry census (schema 3{}) to {path} \
+                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})",
+                if verbose {
+                    ", image-adjudicated"
+                } else {
+                    ", no image adjudication — pass --explain-jdk-only"
+                }
             ),
             Err(e) => eprintln!(
                 "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
@@ -2413,6 +2482,89 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
             Err(e) => {
                 eprintln!("[cratonvm] warning: could not write JDK-only report to {path}: {e}")
             }
+        }
+    }
+}
+
+/// Claim the right to write the census artefacts; `true` means someone already
+/// has.
+///
+/// Shared by `write_jdk_only_dumps` (the four unwinding exit paths) and
+/// `write_jdk_only_dumps_on_exit` (the `System.exit` path), so the two cannot
+/// interleave two writes to the same file. First caller wins on purpose — on a
+/// failing run that is the failure path, which is the informative one.
+fn jdk_only_dumps_written() -> bool {
+    static WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    WRITTEN.swap(true, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// The `--dump-*` / `--jdk-only-report` paths, readable from the pre-exit hook.
+///
+/// The hook is a bare `fn(i32)` installed at the top of `run()`, before `Args`
+/// is parsed, so it cannot capture them. This cell is published as soon as they
+/// are known and read back on the `System.exit` path.
+///
+/// **This is launcher state, not VM state.** Contract §2's ban on process
+/// globals is about the feature's *per-VM* state — a policy or a violation sink
+/// that two VMs in one process could confuse. These are the command line of the
+/// one process that parsed them, and they sit alongside the equally
+/// process-global `PRE_EXIT_HOOK` and `write_jdk_only_dumps`' `WRITTEN` latch
+/// that they exist to cooperate with.
+static JDK_ONLY_EXIT_DUMP_PATHS: std::sync::OnceLock<JdkOnlyExitDumpPaths> =
+    std::sync::OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct JdkOnlyExitDumpPaths {
+    class_origins: Option<String>,
+    native_registry: Option<String>,
+    report: Option<String>,
+    verbose: bool,
+}
+
+/// Write the census from the `System.exit` / `Runtime.exit` path.
+///
+/// `System.exit(N)` never unwinds, so none of `finish_jdk_only`'s four callers
+/// runs. Without this a `--jdk-only --jdk-only-report r.json` run of a program
+/// whose error handler exits produced no report at all — and those are the runs
+/// the report exists for. See
+/// `docs/internal/jdk-only-system-exit-census-FIXED-20260804.md`.
+///
+/// Shares `write_jdk_only_dumps`' `WRITTEN` latch, so a `System.exit` racing a
+/// normal shutdown cannot produce two interleaved writes to the same path;
+/// first caller wins, and on this path the first caller is the informative one.
+///
+/// Never blocks: the VM-side writer uses a non-blocking class-manager
+/// acquisition and falls back to labelled partial artefacts. See
+/// `SharedVm::try_write_jdk_only_dumps_for_exit` for why a timeout-and-retry
+/// would be the wrong shape here.
+fn write_jdk_only_dumps_on_exit() {
+    let Some(paths) = JDK_ONLY_EXIT_DUMP_PATHS.get() else {
+        return;
+    };
+    if paths.class_origins.is_none() && paths.native_registry.is_none() && paths.report.is_none() {
+        return;
+    }
+    if jdk_only_dumps_written() {
+        return;
+    }
+    let Some(shared) = cratonvm_vm::native::jni::process_vm() else {
+        return;
+    };
+    let (wrote, partial) = shared.try_write_jdk_only_dumps_for_exit(
+        paths.class_origins.as_deref(),
+        paths.native_registry.as_deref(),
+        paths.report.as_deref(),
+        paths.verbose,
+    );
+    if wrote {
+        if partial {
+            eprintln!(
+                "[cratonvm] wrote PARTIAL JDK-only census on System.exit: the class-manager \
+                 lock was held, so class-origin rows are absent. Each file records this in its \
+                 \"partial_reason\"."
+            );
+        } else {
+            eprintln!("[cratonvm] wrote JDK-only census on System.exit");
         }
     }
 }
@@ -2532,6 +2684,7 @@ fn run() -> Result<()> {
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
         maybe_dump_shutdown_reports();
+        write_jdk_only_dumps_on_exit();
     });
 
     // `java`-launcher positional semantics: insert a `--` separator right
@@ -2581,6 +2734,19 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // Publish the census output paths for the `System.exit` path, which never
+    // returns to `run()` and so cannot see `args`. Done here, immediately after
+    // parsing, because a `System.exit` can happen as early as an agent's
+    // `premain`. Nothing is written unless at least one of the three flags was
+    // given, so a default run publishes three `None`s and the hook returns on
+    // its own guard.
+    let _ = JDK_ONLY_EXIT_DUMP_PATHS.set(JdkOnlyExitDumpPaths {
+        class_origins: args.dump_class_origins.clone(),
+        native_registry: args.dump_native_registry.clone(),
+        report: args.jdk_only_report.clone(),
+        verbose: args.explain_jdk_only,
+    });
 
     // `--dump-phase-report` was already consumed by the launcher — see
     // `launcher_phase_report_path` for why it has to be read that early. What
@@ -3258,6 +3424,51 @@ fn run() -> Result<()> {
     // System properties from -Dkey=value flags
     config.system_properties = system_properties;
 
+    // `sun.java.command` and `sun.java.launcher`, which HotSpot's launcher sets
+    // and this one did not. Measured absent 2026-08-04 by diffing
+    // `System.getProperties()` against HotSpot 25.
+    //
+    // Not cosmetic. `sun.java.command` is how a process identifies itself to
+    // itself: Spring Boot's `ApplicationHome`, log4j/logback default file
+    // naming, JMX `RuntimeMXBean`, and several agent/attach paths read it, and
+    // a `null` there turns into a wrong log path or a silent feature-off rather
+    // than an error. The launcher is the only layer that knows the value, which
+    // is why the property table in `native-builtins` cannot supply it.
+    //
+    // Format follows the launcher: the main class (dotted, as typed) or the jar
+    // path, then the program arguments, space-separated. An explicit `-D` wins,
+    // matching `java -Dsun.java.command=…`.
+    if !config
+        .system_properties
+        .iter()
+        .any(|(k, _)| k == "sun.java.command")
+    {
+        let head = args
+            .jar
+            .clone()
+            .or_else(|| args.class_name.clone())
+            .unwrap_or_default();
+        if !head.is_empty() {
+            let command = if args.args.is_empty() {
+                head
+            } else {
+                format!("{head} {}", args.args.join(" "))
+            };
+            config
+                .system_properties
+                .push(("sun.java.command".to_string(), command));
+        }
+    }
+    if !config
+        .system_properties
+        .iter()
+        .any(|(k, _)| k == "sun.java.launcher")
+    {
+        config
+            .system_properties
+            .push(("sun.java.launcher".to_string(), "SUN_STANDARD".to_string()));
+    }
+
     // Container support (enabled by default, disabled with --XX:-UseContainerSupport)
     if args.disable_container_support {
         config = config.with_container_support(false);
@@ -3335,8 +3546,8 @@ fn run() -> Result<()> {
     // JDK-only: drain the violation logs now, not only at shutdown. Native
     // registration refusals all happen inside `Vm::new`, so this is their real
     // time of occurrence — reporting them at shutdown would print them after
-    // whatever failure they caused. See `ViolationWatermark` for why this is a
-    // poll rather than a live trace.
+    // whatever failure they caused. See `ViolationWatermark` for what this
+    // drain still covers now that class-origin violations arrive live.
     let mut jdk_only_watermark = ViolationWatermark::default();
     if args.trace_jdk_only {
         trace_jdk_only_violations(
@@ -3345,6 +3556,29 @@ fn run() -> Result<()> {
             "vm-init",
             args.explain_jdk_only,
         );
+        // Contract §9 asks `--trace-jdk-only` to *"log every violation as it
+        // happens"*. Class-origin violations occur throughout the run, so a
+        // shutdown-batched drain reports them detached from the code that
+        // caused them. Install a live sink now — after the drain above, so
+        // the violations recorded inside `Vm::new` are reported exactly once,
+        // by that drain, and everything from here on is reported exactly once,
+        // by the sink. `trace_jdk_only_violations` sees the sink and advances
+        // its origin watermark without re-printing.
+        //
+        // The sink is a field on this VM's `ClassManager`, not a process
+        // global (contract §2): two VMs in one process each see only their
+        // own violations.
+        let jdk_feature = detect_jdk_feature(vm.shared.config.java_home.as_deref());
+        let explain = args.explain_jdk_only;
+        vm.shared
+            .classes
+            .class_manager_write()
+            .set_violation_sink(std::sync::Arc::new(move |violation| {
+                eprintln!(
+                    "[cratonvm][jdk-only:live] {}",
+                    render_violation(violation, jdk_feature, explain)
+                );
+            }));
     }
 
     // BUG-03 — publish the main thread's TLAB address now that `vm` is at its
@@ -3905,7 +4139,7 @@ fn run() -> Result<()> {
     // Interpreter intrinsic-table stats. `CRATONVM_INTRINSIC_STATS=1` prints
     // the steady-state intrinsic-dispatch hit count on shutdown — the
     // counter that verifies acceptance criterion §9 of
-    // docs/feature_roadmap_interpreter_intrinsic_table.md.
+    // gaps/feature_roadmap_interpreter_intrinsic_table.md.
     if matches!(
         std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(),
         Ok("1")
@@ -4069,7 +4303,7 @@ fn run() -> Result<()> {
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
             // `throwable_stacks` directly) is roadmap item T2.2.18 — see
-            // `docs/roadmap-100.md` line 471.
+            // `history/roadmap-100.md` line 471.
             //
             // INTENTIONAL (reviewed): omitting the `\tat ...` frames here is an
             // acceptable, honest degradation — NOT a wrong-result stub. The
