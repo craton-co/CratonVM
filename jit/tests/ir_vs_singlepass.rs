@@ -6351,3 +6351,205 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// cov-05 increment 1 — `instanceof` (0xc1) against an already-loaded target
+//
+// `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`. The largest
+// single whole-method refusal in the survey (306 events, more than every
+// opcode gap combined). This lane's whole premise is "give the IR tier the
+// test the other backend already performs" — `Op::InstanceOf` lowers to a
+// CALL to the SAME `jit_instanceof` helper the single-pass backend's 0xc1 arm
+// calls, so this differential harness exists to prove the LOWERING (register
+// ABI, safepoint handling, result plumbing) is faithful, not to re-verify
+// `jit_instanceof`'s own subtype logic — that has its own unit tests in
+// `vm/src/jit/helpers.rs` (loader-dup fallback, the primitive-array vs
+// `Object[]` fix, etc.), which this IR path inherits for free by calling the
+// identical real helper in production.
+// ---------------------------------------------------------------------------
+
+/// `jit_instanceof` stand-in for this harness's synthetic receivers.
+/// `make_object`'s field 0 carries a small "runtime type" tag distinguishing
+/// three synthetic classes: 0 = `pkg/Base`, 1 = `pkg/Sub` (extends `Base`,
+/// implements `pkg/Iface`), 2 = `pkg/Other` (unrelated). This tiny fixed
+/// table is enough to exercise the exact-class / subclass / interface / miss
+/// shapes `cov-05`'s verification list asks for; a real hierarchy walk is
+/// `jit_typecheck_resolve`'s job, already covered elsewhere. Null → 0, per
+/// JVMS §6.5 (`instanceof` on `null` is always `false`, never a fault).
+///
+/// # Safety
+/// `obj` is either 0 or one of [`make_object`]'s live buffers; `name_ptr` /
+/// `name_len` name one of the three literals below.
+unsafe extern "C" fn instanceof_stub(
+    _vm: i64,
+    obj: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+) -> i64 {
+    if obj == 0 {
+        return 0;
+    }
+    // SAFETY: the caller's contract above.
+    let name =
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let at = (obj as *const u8).add(HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
+    // SAFETY: `obj` is a `make_object` buffer with a valid field-0 int cell.
+    let tag = unsafe { std::ptr::read_unaligned(at as *const i32) };
+    let is = matches!(
+        (tag, name),
+        (0, "pkg/Base") | (1, "pkg/Base" | "pkg/Sub" | "pkg/Iface") | (2, "pkg/Other")
+    );
+    is as i64
+}
+
+/// [`try_compile`] with only the two resolvers `instanceof`'s
+/// `instanceof_info` construction (`lib.rs`) needs: `cp_new_resolver`
+/// (answers "is the target loaded") and `cp_class_name_resolver` (names it).
+fn compile_instanceof(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
+    name_resolver: &dyn Fn(u16) -> Option<String>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        Some(name_resolver),
+        None,
+        None,
+        None,
+        None,
+        Some(new_resolver),
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+/// `boolean f(Object o) { return o instanceof <name at cp 1>; }` —
+/// `aload_0; instanceof #1; ireturn`.
+fn instanceof_method() -> CachedBytecodeMethod {
+    let code = vec![0x2a, 0xc1, 0x00, 0x01, 0xac];
+    cached("f", "(Ljava/lang/Object;)Z", code, 1, 1)
+}
+
+/// A `cp_new_resolver` reporting cp 1's target as already loaded — the
+/// admission gate `IrBuilder::build`'s 0xc1 arm requires.
+fn loaded_resolver(cp: u16) -> Option<cratonvm_jit::JitNewSite> {
+    (cp == 1).then_some(cratonvm_jit::JitNewSite::Resolved {
+        class_id: 0x99,
+        num_fields: 0,
+        has_prim_init: false,
+        has_finalizer: false,
+    })
+}
+
+fn name_resolver_for(name: &'static str) -> impl Fn(u16) -> Option<String> {
+    move |cp: u16| (cp == 1).then(|| name.to_string())
+}
+
+/// One (tag, target name, expected) case run through BOTH backends and
+/// asserted equal to each other and to `expected`.
+fn assert_instanceof_case(tag: i32, target: &'static str, expected: bool, label: &str) {
+    let mut helpers = dummy_helpers();
+    helpers.instanceof_check = instanceof_stub as *const () as usize;
+    let cm = instanceof_method();
+    let name_resolver = name_resolver_for(target);
+    let ir = compile_instanceof(&cm, &helpers, true, &loaded_resolver, &name_resolver)
+        .expect("IR instanceof (target reported loaded)");
+    let sp = compile_instanceof(&cm, &helpers, false, &loaded_resolver, &name_resolver)
+        .expect("single-pass instanceof");
+    assert!(
+        ir.used_ir_backend,
+        "cov-05: an instanceof-only method against an already-loaded target \
+         must reach the optimizing backend ({label})"
+    );
+    let buf = make_object(&[tag]);
+    let obj = buf.as_ptr() as i64;
+    let ir_r = call_with_dummy_context(&ir, &[obj]);
+    let sp_r = call_with_dummy_context(&sp, &[obj]);
+    assert_eq!(ir_r, sp_r, "IR and single-pass must agree ({label})");
+    assert_eq!(ir_r, expected as i64, "wrong instanceof answer ({label})");
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_exact_class_hit() {
+    assert_instanceof_case(1, "pkg/Sub", true, "exact class");
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_subclass_hit() {
+    assert_instanceof_case(1, "pkg/Base", true, "subclass");
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_interface_hit() {
+    assert_instanceof_case(1, "pkg/Iface", true, "interface");
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_miss() {
+    assert_instanceof_case(2, "pkg/Sub", false, "miss (unrelated class)");
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_null() {
+    let mut helpers = dummy_helpers();
+    helpers.instanceof_check = instanceof_stub as *const () as usize;
+    let cm = instanceof_method();
+    let name_resolver = name_resolver_for("pkg/Sub");
+    let ir = compile_instanceof(&cm, &helpers, true, &loaded_resolver, &name_resolver)
+        .expect("IR instanceof");
+    let sp = compile_instanceof(&cm, &helpers, false, &loaded_resolver, &name_resolver)
+        .expect("single-pass instanceof");
+    assert!(ir.used_ir_backend);
+    let ir_r = call_with_dummy_context(&ir, &[0]);
+    let sp_r = call_with_dummy_context(&sp, &[0]);
+    assert_eq!(ir_r, 0, "instanceof on null is always false (JVMS 6.5)");
+    assert_eq!(ir_r, sp_r);
+}
+
+#[test]
+fn ir_vs_singlepass_instanceof_not_yet_loaded_refuses_ir() {
+    // cov-05's first-increment gate: a target the resolver reports `Deferred`
+    // (not yet loaded) must NOT reach `Op::InstanceOf` — the not-yet-loaded
+    // resolution path can run a user classloader, arbitrary Java this tier
+    // does not host inside a helper call. The method must fall back to
+    // single-pass, which resolves lazily and still answers correctly (it
+    // always calls the helper, loaded or not).
+    let mut helpers = dummy_helpers();
+    helpers.instanceof_check = instanceof_stub as *const () as usize;
+    let cm = instanceof_method();
+    let deferred_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        (cp == 1).then_some(cratonvm_jit::JitNewSite::Deferred {
+            holder_class_id: 0x77,
+            cp_idx: cp,
+        })
+    };
+    let name_resolver = name_resolver_for("pkg/Sub");
+    let sp = compile_instanceof(&cm, &helpers, true, &deferred_resolver, &name_resolver)
+        .expect("not-yet-loaded target must still compile, via single-pass fallback");
+    assert!(
+        !sp.used_ir_backend,
+        "cov-05: a not-yet-loaded instanceof target must refuse IR admission"
+    );
+    let buf = make_object(&[1]);
+    let obj = buf.as_ptr() as i64;
+    assert_eq!(
+        call_with_dummy_context(&sp, &[obj]),
+        1,
+        "single-pass fallback must still answer correctly"
+    );
+}
