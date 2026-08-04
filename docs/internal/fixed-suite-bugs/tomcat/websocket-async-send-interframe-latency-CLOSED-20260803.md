@@ -10,7 +10,7 @@
 
 This doc opened with "**root cause not found**" and three Next Steps. All three
 are answered below. It is closed on the same basis as
-[29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) and
+[29](../../tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) and
 [32](32-doc04-residual-perf-assertions-CLOSED.md): the investigation is
 finished, the defects it turned up are fixed, and what is left is a VM-wide
 throughput problem that now has a document of its own.

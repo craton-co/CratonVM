@@ -743,7 +743,10 @@ impl Compiler {
         if len >= 2 && (len - 2) <= 127 {
             // JMP rel8 from (start+2) to end; pad the skipped body with NOPs.
             let _ = self.buf.try_patch_byte(start, 0xEB);
-            let _ = self.buf.try_patch_byte(start + 1, (len - 2) as u8); // Cast: rel8, len-2 <= 127
+            // `len - 2 <= 127` is already established by the `if`; the helper
+            // is here so no rel8 displacement in this crate is written by a
+            // hand-rolled cast (see `ExecutableBuffer::patch_rel8_or_bail`).
+            Self::patch_rel8_or_bail(&mut self.buf, start + 1, (len - 2) as i64);
             for i in (start + 2)..end {
                 let _ = self.buf.try_patch_byte(i, 0x90);
             }

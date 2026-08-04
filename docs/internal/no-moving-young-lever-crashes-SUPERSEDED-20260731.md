@@ -1,26 +1,34 @@
 # `CRATONVM_NO_MOVING_YOUNG=1` crashes — the diagnostic lever half the JIT docs measure with
 
-> **SUPERSEDED 2026-07-31** by
-> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](jit/jit-no-moving-young-opt-out-unpublishes-roots.md),
+> **SUPERSEDED 2026-07-31, and the whole lane CLOSED 2026-08-03** by
+> [`jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`](jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md),
 > which root-causes this lane from a Linux Hibernate repro found the same day.
 > Two independent faults, not one: (1) the flag also withdrew shadow-stack root
 > publication — both sides read `flags().jit.shadow_stack ||
-> moving_young_enabled()` — now **FIXED**, the collector term is gone from
-> both; (2) with publication restored the lane takes a one-byte-off control
-> transfer into the safepoint register-spill run (SIGILL) — still **OPEN**, and
-> neutralised by `CRATONVM_NO_PRECISE_REG_SPILL=1`.
+> moving_young_enabled()` — **FIXED** 2026-07-31, the collector term is gone
+> from both; (2) with publication restored the lane took a SIGILL, which turned
+> out to be the inline-PIC cascade's inter-slot `JNE` truncating to `rel8` and
+> branching backwards into the safepoint spill run — **FIXED** the same day by
+> `7f1b1f263`, confirmed by A/B on 2026-08-03 (doc-era build SIGILL 3/3, `dev`
+> clean 6/6).
 >
-> The isolation below stands and adds to it: the raw JIT-to-JIT direct-call
-> gate was ruled out here independently.
+> One caution about the isolation below, which was written before either cause
+> was known: it rules out the raw JIT-to-JIT direct-call gate on the strength of
+> `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` still crashing. That elimination is sound
+> for the SIGSEGV recorded here (fault 1, a withdrawn root publication) but must
+> NOT be carried over to the SIGILL: the truncated `rel8` lived in the PIC
+> cascade the open gate feeds, and closing the gate is one of the things that
+> shrinks a slot body back under 127 bytes. Two faults, one flag — see
+> [reference: an inert lever is not an elimination].
 
-**Status:** 🔴 **OPEN**, found 2026-07-31 while re-deriving
-[tomcat/32](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
+**Status:** 🔴 **OPEN** as filed 2026-07-31, while re-deriving
+[tomcat/32](fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
 
 Not a default-configuration defect — nothing ships with this set. It matters
 because `CRATONVM_NO_MOVING_YOUNG=1` is the **standard A/B lever** for anything
 moving-young-related, named in `moving_young_disables_optimizing_tier`'s own
 warning text and used to produce the cost tables in
-[the retired moving-young gate doc](../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
+[the retired moving-young gate doc](jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
 and in tomcat/32's 07-30 revision. While it crashes, **none of those tables can
 be reproduced or extended**, and any new measurement that reaches for it will
 look like an unrelated failure.

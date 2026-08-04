@@ -1,20 +1,33 @@
 # The original lane briefs, recovered
 
-These files are the lane docs this directory shipped with. The first nine were
-**deleted by the commit that implemented its first increment**, so the brief
-went away at the moment the work stopped being hypothetical — and with it the
-list of what the lane had *not* done. That is the failure this directory exists
-to fix, so a `cov-*` lane now MOVES its brief here instead of deleting it, and
-writes its residuals into a `docs/internal/*-RETIRED-*.md` of its own.
-
-They are here unchanged. Nothing in this directory should be planned from them
-without checking the parent `README.md` first: their "Current state" sections
-describe 2026-08-01 to 2026-08-03, and at least one lane discovered its subject
-already existed.
+**2026-08-03 — three files joined them on the opposite terms**, moved here whole
+rather than deleted by the commit that landed them, because those lanes are
+**finished** rather than first-incremented.
 
 | file | retired by | what is genuinely finished | what is not |
 |---|---|---|---|
-| `cov-03-field-stores-and-wide-fields.md` | moved, not deleted (2026-08-03) | both its sites measured to zero — reference `putfield` and `J`/`F`/`D` on both arms. The brief's open question ("which of the two candidate reasons is the real one?") is answered: the **write barrier**, and the compact-layout candidate was not a reason at all | no barrier-free fast path for a C2 reference store, no inline route for a wide read, and — the one that outlives this lane — no measurement that an optimizing body is FASTER than the single-pass one it replaces. `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md` |
+| `cov-02-array-element-access.md` | [closeout](../../../internal/cov-02-array-element-access-RETIRED-20260803.md) | all seven owned opcodes, plus `laload`/`saload`/`lastore`/`castore`/`sastore` for symmetry. Measured refusals for the seven 79 → **0**; optimizing-backend bodies 591 → **652** across the survey's three Spring Boot workloads | `aastore` (0x53), declined on purpose — it needs the SATB + card write barriers, and the refusal is written into the builder. Two measured events. `dup2` (0x5c), one event, no owner |
+| `meas-02-the-bench-suite-does-not-reach-c2.md` | [closeout](../../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md) | all three of its asks: the gate records per-phase C2 reach, the survey has a C2-reach column, and one candidate (`bench/CratonBenchC2.java`) is characterised. It also found the gate could not compile its own benchmark under its own `LC_ALL=C` | the candidate is not anchored — deliberately, and blocked on a quiet host and on an unexplained 17x run-to-run swing, not on a decision |
+| `cov-03-field-stores-and-wide-fields.md` | [closeout](../../../internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md) | both its sites measured to zero — reference `putfield` and `J`/`F`/`D` on both arms, one shared tag classifier so the two cannot drift again. The brief's open question ("which of the two candidate reasons is the real one?") is answered: the **write barrier**, and the compact-layout candidate was not a reason at all | no barrier-free fast path for a C2 reference store, no inline route for a wide field read, and — the one that outlives this lane — **no measurement that an optimizing body is FASTER than the single-pass one it replaces**, for any `cov-*` lane |
+
+Read the closeouts; these copies of the briefs are here so their reasoning
+stays readable, not because anything in them is still open.
+
+## The other nine
+
+These nine files are the lane docs this directory shipped with. Each was
+**deleted by the commit that implemented its first increment**, so the brief
+went away at the moment the work stopped being hypothetical — and with it the
+list of what the lane had *not* done. That is the failure this directory exists
+to fix, and it is why the three lanes above MOVED their briefs here instead.
+
+They are here unchanged. Nothing in this directory should be planned from them
+without checking the parent `README.md` first: their "Current state" sections
+describe 2026-08-01, and at least one lane discovered its subject already
+existed.
+
+| file | retired by | what is genuinely finished | what is not |
+|---|---|---|---|
 | `seam-01-x64-backend-split.md` | `60e297ec9` | all of it — `x64.rs` 40,588 → 2,539 lines | — |
 | `seam-02-invoke-dispatch-split.md` | `44aabd78b` | all of it — the interpreter's two files 26,775 → 8,158 and 24,817 → 3,941 | — |
 | `hir-01-lowering-contract.md` | `a628e18cb` | the contract is settled; four levels, not three | — |

@@ -356,9 +356,32 @@ fn proxy_lambda_dispatch_preserves_diagnostic_counters() {
     let _ = stats::dispatches();
     let _ = stats::instances_created();
     // Bump and verify monotonic.
+    //
+    // `>=`, not `==`. `PROXY_DISPATCHES` is a process-global `AtomicUsize` and
+    // this thread is not its only writer:
+    // `proxy_lambda_handler_dispatches_single_iface` runs `ProxyProbe.main`
+    // through an IN-PROCESS `Vm` in a sibling test thread, and every proxy
+    // dispatch it performs calls `inc_dispatches()` on the same counter.
+    // `load; inc; load == b + 1` is a read-modify-read race against that, and
+    // an exact delta is not a property this thread can own.
+    //
+    // Observed 2026-08-03 failing 2 of 3 full `cargo test -p cratonvm-vm` runs
+    // (`left: 2, right: 1`) while passing 3 of 3 when the binary is run on its
+    // own — the giveaway that it is scheduling, not behaviour. Anything that
+    // shifts timing changes how often the race loses; what surfaced it was
+    // cov-01 moving more methods to the optimizing tier, so the probe VM ran
+    // at a different speed.
+    //
+    // What this thread CAN prove is what is asserted below: the counter is
+    // monotonic and its own increment is included in the result.
     let b = stats::dispatches();
     stats::inc_dispatches();
-    assert_eq!(stats::dispatches(), b + 1);
+    let after = stats::dispatches();
+    assert!(
+        after >= b + 1,
+        "the dispatch counter must be monotonic and include this thread's \
+         increment: before={b} after={after}"
+    );
 }
 
 #[test]

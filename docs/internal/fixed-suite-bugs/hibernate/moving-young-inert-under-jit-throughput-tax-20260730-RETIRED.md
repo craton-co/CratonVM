@@ -137,7 +137,7 @@ flags every run (`ZonedDateTimeTest` 447/435/391 s, `OffsetDateTimeTest`
 367/308 s, `failed=0` throughout), while `CRATONVM_NO_MOVING_YOUNG=1`
 SIGSEGV'd in 1–3 s on a pristine `origin/dev` build (root-caused and partially
 fixed in
-`docs/known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`) —
+`docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`) —
 the opposite of the original table in both halves.
 
 ### Why the flag was thought to cost anything when both paths sweep
