@@ -140,6 +140,174 @@ fn rel8_patch_out_of_range_bails_instead_of_truncating() {
         127,
         "the bail must leave the displacement byte alone"
     );
+    // Negative displacements are ordinary (every backward branch is one), and
+    // the range is `i8`, not `u8`. `u8::try_from` was the check one site used
+    // and it accepts 128..=255 — which the CPU reads back as -128..=-1, a
+    // backward branch, i.e. the exact failure this helper exists to stop.
+    Compiler::patch_rel8_or_bail(&mut buf, patch, -128);
+    assert_eq!(buf.as_slice()[patch], 0x80, "an in-range negative rel8 fits");
+    let mut buf2 = ExecutableBuffer::new(4096).expect("test buffer");
+    buf2.emit(&[0x75, 0x00]);
+    let p2 = buf2.pos() - 1;
+    Compiler::patch_rel8_or_bail(&mut buf2, p2, 200);
+    assert!(
+        buf2.overflowed(),
+        "200 is not a rel8: `u8::try_from` would have accepted it and encoded -56"
+    );
+}
+
+/// Every `rel8` displacement in this crate is written by the range-checked
+/// helper, in BOTH backends.
+///
+/// The PIC cascade's `rel as u8` was not the only one — `ir_lower` carried
+/// eight more of the identical shape, and `arith`/`deopt_stubs`/`frames` each
+/// hand-rolled their own range check next to a raw cast. A hand-rolled check
+/// is not wrong today; it is a place for the next one to be added without one.
+/// So the rule is mechanical and greppable: in an EMITTER source, a
+/// `try_patch_byte` call may not cast its value. `lib.rs` is deliberately not
+/// scanned — it holds `patch_rel8_or_bail`, the one place the cast is correct
+/// because it sits behind `i8::try_from`.
+///
+/// The scan is [`casting_try_patch_byte_calls`], which walks each call's
+/// ARGUMENT LIST to its balanced `)` rather than testing one line. The first
+/// version tested a single line, and would have missed the offender written as
+///
+/// ```ignore
+/// self.buf.try_patch_byte(
+///     patch,
+///     rel as u8,
+/// );
+/// ```
+///
+/// — a shape rustfmt produces on its own once the arguments get long. The
+/// sites it *did* catch happened to be formatted the one way it understood.
+///
+/// Needles are assembled at runtime so this test's own text does not match.
+#[test]
+fn rel8_displacement_patches_all_go_through_the_range_checked_helper() {
+    let sources: [(&str, &str); 9] = [
+        ("x64.rs", include_str!("../x64.rs")),
+        ("x64/bytecode_walk.rs", include_str!("bytecode_walk.rs")),
+        ("x64/emit.rs", include_str!("emit.rs")),
+        ("x64/arith.rs", include_str!("arith.rs")),
+        ("x64/frames.rs", include_str!("frames.rs")),
+        ("x64/deopt_stubs.rs", include_str!("deopt_stubs.rs")),
+        ("x64/safepoint.rs", include_str!("safepoint.rs")),
+        ("x64/driver.rs", include_str!("driver.rs")),
+        ("ir_lower.rs", include_str!("../ir_lower.rs")),
+    ];
+    let mut offenders: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for (name, src) in sources {
+        let (calls, bad) = casting_try_patch_byte_calls(src);
+        scanned += calls;
+        offenders.extend(bad.into_iter().map(|(line, text)| format!("{name}:{line}: {text}")));
+    }
+    // A source scan that matches nothing passes exactly as happily as one that
+    // matches everything. These files do contain such calls; if the walker
+    // stops finding them, the needle or the file list has rotted and this test
+    // is about to approve anything.
+    assert!(
+        scanned >= 5,
+        "found only {scanned} try_patch_byte call(s) across the emitter sources — the scan \
+         is broken, and it was about to pass without checking anything"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a rel8 displacement must go through `ExecutableBuffer::patch_rel8_or_bail`, which \
+         marks the buffer overflowed (compile discarded) instead of truncating. Truncation \
+         retargets the branch — the inline-PIC cascade's wrapped `JNE -128` landed inside \
+         the pre-call spill run and ran as an infinite shadow push (SIGSEGV), and as a \
+         SIGILL in the CRATONVM_NO_MOVING_YOUNG lane. Offending sites:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// `(calls seen, (1-based line, text) per call whose arguments cast to `u8`)`.
+///
+/// Walks from each `try_patch_byte(` to its balanced `)`, so the check does not
+/// depend on how the call is wrapped across lines. Pure and source-taking, so
+/// [`the_rel8_scan_sees_a_call_split_across_lines`] can prove it is not
+/// vacuous on input that is not whatever the tree happens to look like today.
+fn casting_try_patch_byte_calls(src: &str) -> (usize, Vec<(usize, String)>) {
+    // Assembled so this function's own text does not match.
+    let call = format!("try_patch{}byte(", "_");
+    let cast = format!(" as {}8", "u");
+
+    let bytes = src.as_bytes();
+    let mut calls = 0usize;
+    let mut bad = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(&call) {
+        let open = from + rel + call.len(); // first byte inside the parens
+        calls += 1;
+        let mut depth = 1usize;
+        let mut i = open;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        // `open` and the closing `)` are ASCII, but an UNBALANCED call would
+        // leave `i` at the end of the buffer, which can be mid-character in
+        // these comment-heavy sources. `get` yields None rather than panicking.
+        let end = i.saturating_sub(1).max(open);
+        let args = src.get(open..end).unwrap_or("");
+        if args.contains(&cast) {
+            let line = src[..open].lines().count();
+            let text: String = args.split_whitespace().collect::<Vec<_>>().join(" ");
+            bad.push((line, text));
+        }
+        from = open;
+    }
+    (calls, bad)
+}
+
+/// The scan has to see the offender however rustfmt happened to wrap it.
+///
+/// Asserted on synthetic input: a guard that only ever runs against a tree
+/// that already satisfies it cannot tell "nothing is wrong" from "I am not
+/// looking". The single-line version of this scan passed the middle case here.
+#[test]
+fn the_rel8_scan_sees_a_call_split_across_lines() {
+    let call = format!("try_patch{}byte", "_");
+
+    let one_line = format!("        self.buf.{call}(patch, rel as {}8).ok();\n", "u");
+    let (n, bad) = casting_try_patch_byte_calls(&one_line);
+    assert_eq!(n, 1);
+    assert_eq!(bad.len(), 1, "the one-line form must be caught: {bad:?}");
+
+    let wrapped = format!(
+        "        self.buf.{call}(\n            patch,\n            rel as {}8,\n        );\n",
+        "u"
+    );
+    let (n, bad) = casting_try_patch_byte_calls(&wrapped);
+    assert_eq!(n, 1);
+    assert_eq!(
+        bad.len(),
+        1,
+        "a call wrapped across lines is the same defect and must be caught: {bad:?}"
+    );
+
+    // Nested parens in the argument must not end the walk early.
+    let nested = format!(
+        "        self.buf.{call}(\n            patch,\n            (a - b - 1) as {}8,\n        );\n",
+        "u"
+    );
+    assert_eq!(casting_try_patch_byte_calls(&nested).1.len(), 1);
+
+    // And no false positive: a cast AFTER the call's closing paren is not this
+    // call's argument.
+    let after = format!(
+        "        self.buf.{call}(patch, v).ok();\n        let x = y as {}8;\n",
+        "u"
+    );
+    let (n, bad) = casting_try_patch_byte_calls(&after);
+    assert_eq!(n, 1);
+    assert!(bad.is_empty(), "no false positives: {bad:?}");
 }
 
 /// The relocation-safety gates must ask "can a relocating collection see a

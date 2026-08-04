@@ -73,11 +73,23 @@ Whether an IR body is *faster* than the C1 body it replaces remains unmeasured;
 nothing showed the 1.85x regression this project has on record, which is enough
 to say the programme is not self-defeating and not enough to say it pays.
 
-And one finding about the measurement itself: **CratonBench issues seven
-compile requests to the optimizing tier across all seven phases and gets two
+And one finding about the measurement itself: **CratonBench issues eight
+compile requests to the optimizing tier across all seven phases and gets three
 bodies.** The perf gate measures the single-pass backend. That is `meas-02`,
 and it is why the array-arm asymmetry survived — the suite that would have
 shown it does not reach the tier.
+
+`meas-02` **closed 2026-08-03** — every gate run now records its own per-phase
+reach, so that fact travels with the numbers instead of having to be
+rediscovered, and `compare.py` names the phases whose delta is not evidence
+about the tier. Details, and the two defects the lane turned up on the way,
+in [`docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`](../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md).
+
+Eight and three, not the seven and two the original survey recorded, and the
+record is what caught both: `stringregex` issues a request it did not before,
+and **`cov-02` gave `sieve` a body** by lowering the `0x54 bastore` it used to
+die on. A `cov-*` lane moving the bench suite's own reach is exactly the
+movement the per-phase record exists to make visible.
 
 ## The coverage lanes
 
@@ -94,7 +106,7 @@ read each lane's "first increment".
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
 | [`cov-07`](cov-07-athrow.md) | one `ir_compatible` conjunct | 89 | framed as a question; **"keep the refusal" is a legitimate outcome** |
-| [`meas-02`](meas-02-the-bench-suite-does-not-reach-c2.md) | `regression-suite/perf/`, `bench/` | — | the gate measures C1; do the cheap half first |
+| ~~`meas-02`~~ **closed 2026-08-03** | `regression-suite/perf/`, `bench/` | — | the gate records its own C2 reach now — [`docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`](../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md) |
 
 Three of them (`cov-05`, `cov-06`, `cov-07`) each delete **exactly one**
 conjunct from `ir_compatible`, which is one small function. Four of them

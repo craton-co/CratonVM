@@ -84,18 +84,53 @@ another, both deliberately:
    covers both ends of the range, because a negative index has a huge unsigned
    value. On failure it **deopts**: control leaves for the shared stub, and the
    interpreter re-executes the opcode and throws the real
-   ArrayIndexOutOfBoundsException with the method's own handler semantics. A
-   later `cov-*` lane that wants it elided has `jit/src/x64/bce.rs` as the
-   single-pass answer and it is still not reusable as-is.
+   ArrayIndexOutOfBoundsException with the method's own handler semantics.
+
+   *And what would let a later lane elide it?* The brief says `jit/src/x64/bce.rs`
+   is the single-pass answer and "is not reusable as-is". That is true, and the
+   reason is specific rather than a matter of effort: **every entry point in that
+   file is `pub(super)`** — private to the `x64` module — **and its whole
+   vocabulary is bytecode coordinates**. `find_iv_step_provenance(code, …)`,
+   `classify_local_kinds(code, code_len, num_locals)`, `local_access_at(code, pc)`
+   all reason about *bytecode PCs and JVM local slots*. The IR has neither: its
+   array base is a graph node, and its index is a node, not a local. Making
+   `bce.rs` public would hand the IR path a set of facts keyed to a coordinate
+   space it does not inhabit. The IR's own equivalent already exists and is in
+   the right space — `jit/src/range_analysis.rs` gives `Op::ArrayLength` the
+   `Range::array_length()` lattice element, and an `Op::ArrayLoad`'s index is a
+   node whose range that lattice can already bound. **A `cov-*` lane that wants
+   BCE on the IR path should extend `range_analysis`, not export `bce.rs`.**
 2. **The null check.** Same guard, same deopt. `arraylength` has no index and so
    has only this one fault — and it is the fault this VM has already shipped
    without: a raw `MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]` dereferences low memory
    and SIGSEGVs, because the crash handler dumps an `hs_err` and re-raises rather
    than throwing.
+
+   *And what would let a later lane elide it?* `jit/src/null_check_elim.rs` is
+   in better shape than `bce.rs`: its entry point is `pub fn analyze(code,
+   code_len) -> NullCheckInfo`, already crate-visible, so the IR path can call
+   it today. But its answer is `is_nonnull(pc, local)` — again keyed to a
+   **bytecode pc and a JVM local slot**. An IR `Op::ArrayLoad`'s base is a node.
+   The bridge is therefore not a visibility change but a mapping: at the access's
+   `bytecode_pc`, which local (if any) does this base node come from? The
+   builder knows that when it pops the array off the abstract stack and throws it
+   away. **Nothing in this lane needs it; the next lane that does should thread
+   the local index onto the node rather than try to recover it afterwards.**
 3. **`aaload` is a reference load.** The node is `IrType::Ref`, so
    `emit_safepoint_map`'s scan publishes its spill slot as a rewritable root at
-   every later safepoint. See delta 2 above for what that is and is not worth
-   today.
+   every later safepoint, and `plan_slots` colours it out of the **reference**
+   pool so no primitive can inherit a word an oop map names.
+
+   Delta 2 above says the brief's suggested proof — run it under
+   `CRATONVM_MOVING_YOUNG` — cannot work. So the property is asserted where it
+   is actually decided, in
+   `ir_lower::tests::an_aaload_result_is_reference_typed_and_takes_a_reference_slot`:
+   build the real `aload_0; iload_1; aaload; areturn` bytecode, assert the
+   resulting node is `Op::ArrayLoad(MemKind::Ref)` typed `IrType::Ref`, and
+   assert `plan_slots` gave it `SlotClass::Ref`. The edit that trips it is
+   typing the `0x32` arm `IrType::Int` — which compiles, passes every value
+   differential in `ir_vs_singlepass.rs`, and loses the element at the first
+   relocating collection.
 
 ### Three things worth copying rather than re-deriving
 

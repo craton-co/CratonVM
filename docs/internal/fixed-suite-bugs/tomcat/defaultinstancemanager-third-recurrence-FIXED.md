@@ -204,7 +204,7 @@ reload for the precise-maps path, the shadow reload for the moving path.
 The mirror image of this rot was found on 2026-07-31 at a neighbouring site:
 three root-visibility mechanisms live *only* because the default is on, all
 three withdrawn together by `CRATONVM_NO_MOVING_YOUNG=1`
-(`known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`). Two
+(`internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`). Two
 instances in two days, opposite directions, one root shape: a fix keyed on this
 flag for correlation rather than for meaning. The checklist that follows from
 that now lives on `DEFAULT_MOVING_YOUNG`'s own doc comment and on the
