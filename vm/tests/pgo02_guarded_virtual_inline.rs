@@ -62,7 +62,7 @@ fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
 
 fn method_descriptor(method: &str) -> &'static str {
     match method {
-        "callA" | "callCurrent" | "callThrowerCaught" => "(I)I",
+        "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface" => "(I)I",
         "callPoly" => "(II)I",
         "setCurrent" => "(I)V",
         other => panic!("unknown method: {other}"),
@@ -125,9 +125,95 @@ fn test_pgo02_guarded_virtual_inline() {
 fn run_all_checks() -> Result<(), String> {
     check_guard_hit()?;
     check_guard_miss()?;
+    check_override_receiver()?;
+    check_interface_site()?;
     check_thrower()?;
     check_polymorphic()?;
     Ok(())
+}
+
+/// The constant-pool class and the speculated receiver class disagree.
+///
+/// `callOverride`'s site is `invokevirtual A.tag` (javac uses the receiver
+/// expression's STATIC type) but every receiver is exactly `B`, which
+/// overrides `tag`. The guard is emitted against B's class id, so the body
+/// behind it must be B's. Resolving the callee from the constant-pool class
+/// name instead splices A's body behind a B guard, and every call quietly
+/// returns `x+1` instead of `x+1000`.
+fn check_override_receiver() -> Result<(), String> {
+    let mut vm = test_vm();
+    for i in 0..CALLS {
+        let got = invoke_int(&mut vm, "callOverride", &[Value::Int(i)]);
+        let want = i + 1000;
+        if got != want {
+            return Err(format!(
+                "check_override_receiver: callOverride({i}) = {got}, want {want} (call #{i} of \
+                 {CALLS}) — the guard admitted a receiver of class B and ran a body that is not \
+                 B's `tag`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `invokeinterface` with a single implementation. Resolution that starts at
+/// the constant-pool class finds `Tagger.itag`'s ABSTRACT declaration, which
+/// has no `Code` attribute, so the site can never be spliced; resolution from
+/// the speculated receiver class finds `OnlyImpl.itag` and can. Asserts both
+/// the result and that a speculative site was actually admitted, so a
+/// regression back to "correct but never inlined" is visible.
+fn check_interface_site() -> Result<(), String> {
+    let mut vm = test_vm();
+    for i in 0..CALLS {
+        let got = invoke_int(&mut vm, "callIface", &[Value::Int(i)]);
+        let want = i + 77;
+        if got != want {
+            return Err(format!(
+                "check_interface_site: callIface({i}) = {got}, want {want}"
+            ));
+        }
+    }
+    let tally = compiled_tally(&vm, "callIface")?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_interface_site: callIface compiled but speculative_sites == 0 (tally={tally:?}) \
+             — an interface site with one implementation must be reachable by the guarded \
+             inliner"
+        ));
+    }
+    Ok(())
+}
+
+/// The `inline_tally` of a compiled entry point, with the tier dependency
+/// stated rather than relied on (an IR artifact leaves the tally zeroed, which
+/// is the opposite conclusion from "the guard did not fire").
+fn compiled_tally(vm: &Vm, method: &str) -> Result<cratonvm_jit::InlineDecisionTally, String> {
+    let class_id = vm
+        .shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
+        .ok_or_else(|| "class must be loaded after invoke".to_string())?;
+    let compiled = vm
+        .shared
+        .jit
+        .jit_cache
+        .read()
+        .get(
+            "cratonvm/PgoGuardedVirtualInline",
+            method,
+            method_descriptor(method),
+            class_id,
+        )
+        .ok_or_else(|| format!("{method} never JIT-compiled"))?;
+    if compiled.used_ir_backend {
+        return Err(format!(
+            "{method} was compiled by the OPTIMIZING (IR) backend, which plans no guarded \
+             inlines and records no inline_tally — the tier pin did not take"
+        ));
+    }
+    Ok(compiled.inline_tally.clone())
 }
 
 /// Positive control: a fixed monomorphic-A call site, called past the

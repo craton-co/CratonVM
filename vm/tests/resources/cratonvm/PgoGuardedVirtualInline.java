@@ -44,11 +44,23 @@ public class PgoGuardedVirtualInline {
         }
     }
 
+    interface Tagger {
+        int itag(int x);
+    }
+
+    static class OnlyImpl implements Tagger {
+        @Override
+        public int itag(int x) {
+            return x + 77;
+        }
+    }
+
     private static final A ONLY_A = new A();
     private static final A ONLY_B = new B();
     private static final A ONLY_C = new C();
     private static final A ONLY_D = new D();
     private static final A THROWS_AT_7 = new Thrower();
+    private static final Tagger ONLY_IMPL = new OnlyImpl();
     private static A current = ONLY_A;
 
     public static void setCurrent(int which) {
@@ -75,6 +87,25 @@ public class PgoGuardedVirtualInline {
     // correctly, not silently run A's inlined body against a non-A receiver.
     public static int callCurrent(int x) {
         return current.tag(x);
+    }
+
+    // The constant-pool class and the speculated receiver class DISAGREE.
+    // `ONLY_B`'s static type is `A`, so javac emits `invokevirtual A.tag`, but
+    // every receiver this site ever sees is exactly `B`, which OVERRIDES
+    // `tag`. A guard compares the receiver against B's class id; the body
+    // spliced behind it must therefore be B's, not the one `A.tag` resolves
+    // to. Getting this wrong returns x+1 instead of x+1000 with no crash and
+    // no diagnostic.
+    public static int callOverride(int x) {
+        return ONLY_B.tag(x);
+    }
+
+    // Interface reach: `invokeinterface Tagger.itag`, one implementation.
+    // Resolving from the constant-pool class finds only the ABSTRACT method
+    // (no Code attribute), so this site can never inline unless resolution
+    // starts from the speculated receiver class.
+    public static int callIface(int x) {
+        return ONLY_IMPL.itag(x);
     }
 
     // Exception behavior through a compiled, guard-eligible call site: the
