@@ -6792,10 +6792,10 @@ mod threadpool_receiver_shape_tests {
     /// partial deletion fails here rather than silently leaving half the
     /// duplication enforcing a policy the other half no longer applies.
     ///
-    /// Counts calls to `threadpool_executor_has_real_workers(`, which is now
-    /// the *only* implementation of the probe — the two hand-inlined copies in
-    /// `vm_exec.rs` were folded into it, so a site cannot hide from this scan
-    /// by writing the `workers` lookup out longhand without also tripping
+    /// Counts calls to the probe helper, which is now the *only*
+    /// implementation — the two hand-inlined copies in `vm_exec.rs` were folded
+    /// into it, so a site cannot hide from this scan by writing the `workers`
+    /// lookup out longhand without also tripping
     /// `no_hand_inlined_workers_probe_outside_the_helper` below.
     ///
     /// Deliberately an equality, not a floor: this list only ever shrinks, and
@@ -6811,13 +6811,20 @@ mod threadpool_receiver_shape_tests {
         files.sort_unstable();
         files.dedup();
 
+        // Assembled at runtime so this scanner's own source does not contain
+        // the string it looks for. Spelling the needle as a literal made the
+        // first version of this test count itself — twice, once for the
+        // `match_indices` argument and once for a doc-comment mention. That is
+        // a fine demonstration that the scan works and a poor gate.
+        let needle = format!("{}(", "threadpool_executor_has_real_workers");
+
         let mut total = 0usize;
         for file in &files {
             let src = vm_src(file);
-            // Skip the definition itself (`fn threadpool_executor_has_real_workers(`)
-            // and doc-comment mentions, which carry no `(`.
+            // Skip the definition itself; every other occurrence is a call,
+            // and doc-comment mentions of the name carry no `(`.
             total += src
-                .match_indices("threadpool_executor_has_real_workers(")
+                .match_indices(needle.as_str())
                 .filter(|(i, _)| !src[..*i].ends_with("fn "))
                 .count();
         }
