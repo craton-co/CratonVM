@@ -1150,7 +1150,7 @@ fn native_response_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `buff`, so keying "null" off `buff == null` alone reported a recycled
 /// chunk as empty-but-set and returned `""` where Tomcat returns `null`
 /// (`TestCharChunk.testToString`,
-/// `docs/internal/fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty.md`).
+/// `fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty-FIXED.md`).
 ///
 /// PERF: `end` is tested first and `isSet` is read **only** when `end == 0`,
 /// so the ordinary non-empty path still performs exactly three
@@ -2792,7 +2792,7 @@ fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     // Registered `()Ljava/util/Random;` — reference-typed, so the by-name read
     // must not be returned raw: it answers `Value::Int(0)` for an unwritten
-    // slot. See `docs/known-issues/c2/by-name-field-reads.md`.
+    // slot. See `docs/feature-designs/by-name-field-reads.md`.
     Ok(Some(field_read::ref_field(ctx, this, "random")))
 }
 
@@ -4096,7 +4096,7 @@ pub mod case_map;
 /// `Value::Object(None)` through the indexed `get_field`. Natives that test a
 /// by-name read for null, or return one straight out of a reference-typed
 /// method, are asking the wrong question and get a plausible answer. See
-/// `docs/known-issues/c2/by-name-field-reads.md`.
+/// `docs/feature-designs/by-name-field-reads.md`.
 pub(crate) mod field_read;
 pub mod lang_class;
 pub mod lang_string;
@@ -4145,7 +4145,7 @@ pub mod tls;
 // raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
 // plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
 pub mod tls_deny;
-// Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
+// Step 1 of the limb-based BigInteger rewrite (gaps/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
 pub(crate) mod bigint;
@@ -4482,7 +4482,7 @@ pub mod antlr_intrinsics;
 /// Grouping only — every family below is still registered unconditionally.
 pub mod app_shims;
 /// Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
-/// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+/// See `gaps/feature_roadmap_interpreter_intrinsic_table.md`.
 pub mod intrinsics;
 pub mod logging_shims;
 pub mod lucene_es;
@@ -6407,7 +6407,7 @@ fn populate_real_thread_holder(
     // garbage. Mirrors the identical BUG-03 pin pattern already used by
     // `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs)
     // for the bootstrap main-thread holder construction. See
-    // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
+    // fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md.
     let pin_base = ctx.pin_native_root(this);
     let target_handle = match target {
         Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
@@ -6772,7 +6772,7 @@ pub fn register_essential_natives_with_shims(
     // If a JBoss Marshalling case ever does need one of these, add it back
     // WITHOUT a feature gate and with a test that fails when it is missing — a
     // gated registration on this path is invisible to every suite run. See
-    // docs/internal/fixed-suite-bugs/serialization/ for the retired report.
+    // fixed-suite-bugs/serialization/ for the retired report.
     //
     // The registrar is still used by the synthetic path
     // (`register_serialization_natives`), where there is no JDK bytecode to run.
@@ -6848,7 +6848,7 @@ pub fn register_essential_natives_with_shims(
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
     // than HotSpot (every Matcher step crosses the VM→native String-accessor
-    // boundary — see docs/internal/wildfly-suite-bugs/bug-03). These fast Rust
+    // boundary — see wildfly-suite-bugs/bug-03). These fast Rust
     // `regex`/`fancy-regex` natives are normally registered only by
     // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
     // are absent here by default and the real bytecode runs (the real-Java
@@ -7337,7 +7337,7 @@ pub fn register_essential_natives_with_shims(
             // bytecode entirely (see bug-27 comment above), so it must
             // replicate the check itself or a channel opened FileChannel.open(
             // path, READ) silently truncates the real file instead of
-            // rejecting the call (docs/known-issues/h2/
+            // rejecting the call (
             // bug-h2-files-setposixfilepermissions-FIXED.md residual).
             let writable = !matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0));
             if !writable {
@@ -7893,7 +7893,7 @@ pub fn register_essential_natives_with_shims(
     // investigation went down first). Root-caused via a `while
     // (m.find()) { m.group(N); }`-shaped user benchmark that turned out to
     // reduce to plain `String.substring()` on a large parent string scaling
-    // O(n^2); see docs/internal/fixed-suite-bugs/
+    // O(n^2); see fixed-suite-bugs/
     // substring-large-parent-quadratic-allocation-FIXED.md.
     // `native_string_substring`/`native_string_substring_one` already have a
     // "read only the requested range, don't materialize the whole String
@@ -8429,7 +8429,7 @@ pub fn register_essential_natives_with_shims(
         Ok(Some(Value::Int(i32::from(tty))))
     });
 
-    // JDK 25 residual (docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md):
+    // JDK 25 residual (fixed-suite-bugs/springboot/classutils-forname-platform-loader-false-positive.md):
     // JDK 25's `java.io.Console` no longer has `istty()Z` at all -- it was
     // replaced by `private static native int ttyStatus()`, called once from
     // `<clinit>` and stashed in a static `ttyStatus` field that
@@ -8657,7 +8657,7 @@ pub fn register_essential_natives_with_shims(
     });
     // DIAGNOSTIC (temporary, CRATONVM_TRACE_ARRAYS_HASHCODE-gated):
     // `createLayoutFromConfigClass` (Thymeleaf/Groovy MetaClass hang, see
-    // docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md)
+    // fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md)
     // hangs permanently inside real bytecode `jdk.internal.util.ArraysSupport
     // .hashCode(Object[], int, int, int)`, called from `Arrays.hashCode` on
     // a `ParameterizedTypeImpl`'s `actualTypeArguments`. This native
@@ -8858,8 +8858,8 @@ pub fn register_essential_natives_with_shims(
     // surface (added 2026-07-09 by the WildFly process-controller bootstrap
     // batch, b448f2039) shadowed the real OSW bytecode at every dispatch
     // site (WP0.1 native-override-priority) and REGRESSED the StreamEncoder
-    // commit-threshold fix (1773d3df2, docs/known-issues/
-    // dohead-streamencoder-eager-flush-commit-threshold.md):
+    // commit-threshold fix (1773d3df2, fixed-suite-bugs/tomcat/
+    // dohead-streamencoder-eager-flush-commit-threshold-FIXED.md):
     // `write_bytes_from_output_stream_writer` encodes every `write()` call
     // straight to the wrapped stream — one underlying `write([BII)` per
     // Writer call instead of real StreamEncoder's 512-byte batches — which
@@ -16989,7 +16989,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/util/logging/Level;",
         // Reference-typed return: an unwritten `level` slot reads back as
         // `Value::Int(0)` through the by-name accessor, not `Object(None)`.
-        // See `docs/known-issues/c2/by-name-field-reads.md`.
+        // See `docs/feature-designs/by-name-field-reads.md`.
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(field_read::ref_field(ctx, this, "level")))
@@ -18699,7 +18699,7 @@ pub fn register_essential_natives_with_shims(
                         // (still correct for "UTC"/"GMT"/custom "+HH:MM"
                         // forms `ZoneId.of` handles natively) if this
                         // catalog doesn't recognize it. See
-                        // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
+                        // fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md.
                         // Try the id verbatim first (preserves display
                         // names/behavior for everything that already
                         // worked, e.g. "UTC"/"GMT"/"Zulu"/"+08:00"/plain
@@ -19085,7 +19085,7 @@ pub fn register_essential_natives_with_shims(
     // Superseded by the TZDB-OFFSET fix below, which reads the real
     // historical cutover for every zone directly from tzdb.dat instead of
     // hand-listing one zone at a time — see
-    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
@@ -19272,7 +19272,7 @@ pub fn register_essential_natives_with_shims(
             // "EST5EDT", "MST7MDT", "PST8PDT" — the four POSIX-rule zone
             // names `TimeZone.getAvailableIDs()` itself returns) as bogus,
             // collapsing them to "GMT"/UTC+0 — see
-            // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
+            // fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md.
             // Now backed by the real tzdb.dat catalog (604 zones + legacy
             // aliases), so this matches exactly what real HotSpot resolves.
             let recognized = id == "GMT"
@@ -19414,7 +19414,7 @@ pub fn register_essential_natives_with_shims(
     // `java.time.zone.ZoneRules` (unfloored) would report. Mirrored here so
     // the legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's
     // legacy behavior bug-for-bug, same as it does post-1900 — see
-    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
     const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
 
     fn legacy_offset_and_standard(
@@ -28917,7 +28917,7 @@ fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, Stri
 //
 // The functions below fix a genuine O(n^2) bug in THIS native bridge (full
 // input redecode per `find()`/`group()` call, see
-// `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md` for
+// `fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md` for
 // the corrected writeup) — but because the bridge is dropped by default,
 // this fix currently has NO effect on any real-JDK program. It's kept
 // in case `drop_real_layout_synthetic` is ever narrowed (e.g. once the
@@ -28925,7 +28925,7 @@ fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, Stri
 // non-default config re-enables this bridge. The ACTUAL performance bug a
 // user hits with `Pattern`/`Matcher` on today's default build is upstream of
 // here, in the real JDK bytecode CratonVM's interpreter actually runs — see
-// `docs/known-issues/substring-large-parent-quadratic-allocation.md`.
+// `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`.
 
 /// One cached decode of a `Matcher`'s input `String`, keyed by the
 /// `Matcher` object's own **identity hash**, not its `ObjectRef`
@@ -29360,13 +29360,13 @@ fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
 ///
 /// Confirmed live via `gdb -p <pid> -batch -ex 'thread apply all bt'`
 /// during the Tomcat `TestWsRemoteEndpointImplServerDeadlock` investigation
-/// (2026-07-09, docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md):
+/// (2026-07-09, fixed-suite-bugs/tomcat/wsremoteendpoint-close-delay-near-deadlock-FIXED.md):
 /// every one of ~10 worker threads was piled up inside `native_rl_unlock`'s
 /// `monitor_enter`, all blocked on the same wedged monitor, after a prior
 /// `native_rl_lock` caller hit exactly this leak on a `Thread.interrupt()`.
 /// Only surfaced once real `ScheduledThreadPoolExecutor`/`ThreadPoolExecutor`
 /// contention started reaching these natives (see
-/// `docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
+/// `fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
 fn monitor_wait_release(
     ctx: &mut dyn NativeContext,
     obj: ObjectRef,
@@ -30865,7 +30865,7 @@ fn b64_decode_char(c: u8, variant: i32) -> Option<u32> {
 /// (e.g. Netty's `SelfSignedCertificate` cert file, handed to
 /// `generateCertificate` unparsed) built a cert whose `getEncoded()` was empty →
 /// rustls `invalid peer certificate: BadEncoding` on the server handshake. See
-/// docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+/// fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
 pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
     const BEGIN: &[u8] = b"-----BEGIN";
     // Locate the first `-----BEGIN` line; bail (return input) if absent.
@@ -31290,7 +31290,7 @@ mod base64_tests {
 
     /// Every expectation below is a literal line of `Base64Probe`'s output on
     /// HotSpot 25 — see
-    /// `docs/internal/fixed-suite-bugs/repros/base64-decoder-parity/Base64Probe.java`.
+    /// `fixed-suite-bugs/repros/base64-decoder-parity/Base64Probe.java`.
     fn err(input: &str, variant: i32) -> String {
         b64_decode(input.as_bytes(), variant).expect_err("must reject")
     }
@@ -34389,8 +34389,8 @@ pub(crate) fn locale_populate_full(
             // `NoClassDefFoundError` instead of a fresh error. `baseLocale`
             // is left null; any real-bytecode `Locale` method not natively
             // overridden here (`toString`, `equals`, `hashCode`, …) then
-            // NPEs on `this.baseLocale`. See docs/known-issues/vm/
-            // locale-real-jdk-bootstrap-noclassdeffounderror.md.
+            // NPEs on `this.baseLocale`. See fixed-suite-bugs/
+            // locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md.
             tracing::warn!(
                 "locale_populate: could not initialize sun.util.locale.BaseLocale ({e:?}) — \
                  baseLocale left null on this Locale"

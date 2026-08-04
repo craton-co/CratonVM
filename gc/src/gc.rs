@@ -425,7 +425,7 @@ fn try_forward_object(
     // recoverable — the same defect class already fixed in
     // `gen_heap.rs::forward_object_impl`, `OldGen::scan_region`, and
     // `scan_object_for_old_refs` (see
-    // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`).
+    // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`).
     // Validate the raw tag bytes before ever reading either field as a typed
     // enum.
     // SAFETY: `old_ptr` is confirmed inside `from_space` by the caller, so

@@ -31,8 +31,8 @@ use super::*;
 /// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
 /// candidate, over hundreds of candidates per RSA prime, which dominates
 /// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
-/// the documented RSA non-finish — `docs/comparison-handoff/bug-bc-crypto-
-/// regression-timeout.md`). This intrinsic reads the candidate's magnitude
+/// the documented RSA non-finish — `comparison-handoff/
+/// bug-bc-crypto-regression-timeout.md`). This intrinsic reads the candidate's magnitude
 /// once and computes each `x mod m` with a single Horner pass over the limbs
 /// (zero allocation), returning the method's exact boolean result.
 ///
@@ -10410,7 +10410,7 @@ pub(crate) fn bc_pkcs12_read_state(
     // unwritten slot answers `Value::Int(0)`, which the first arm ACCEPTED, so
     // the `_ => 0` fallback was not even the path that produced the zero. A
     // PKCS#12 KDF run with zero iterations degenerates the derived key. Read by
-    // resolved index and refuse. See `docs/known-issues/c2/by-name-field-reads.md`.
+    // resolved index and refuse. See `docs/feature-designs/by-name-field-reads.md`.
     let iteration_count = match crate::field_read::int_field_strict(ctx, this, "iterationCount") {
         Some(v) if v > 0 => v,
         _ => {

@@ -3285,6 +3285,73 @@ fn inflater_init(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> Met
     Ok(None)
 }
 
+/// Decide the new input cursor and finished flag after one `decompress` call.
+/// Pure so the no-progress rule below is testable without a VM.
+///
+/// The third case is the one that matters. zlib returns `Z_BUF_ERROR`
+/// (`flate2::Status::BufError`, an `Ok` status, not an error) when it can make
+/// no progress at all — every remaining input byte was offered and the output
+/// buffer has room, so the only reading is "this stream is truncated, I need
+/// more input". Leaving `pos` short of the end there kept `needsInput()` false
+/// while `inflate()` returned 0 and `finished()` stayed false, and the JDK's
+/// canonical drain loop
+///
+/// ```text
+/// while ((n = inf.inflate(b, off, len)) == 0) {
+///     if (inf.finished() || inf.needsDictionary()) return -1;
+///     if (inf.needsInput()) fill();
+/// }
+/// ```
+///
+/// then SPUN FOREVER: none of its three exits could ever be taken.
+/// `ImagePackagerTests`/`RepackagerTests` burned the suite's whole 600s
+/// per-class budget inside `AbstractJarWriter.writeLoaderClasses` instead of
+/// failing. Marking the pending bytes consumed makes `needsInput()` true, so
+/// the loop reaches `fill()`, which either supplies more bytes or throws the
+/// JDK's own `EOFException("Unexpected end of ZLIB input stream")`.
+pub(crate) fn inflater_advance(
+    input_len: usize,
+    start: usize,
+    consumed: usize,
+    produced: usize,
+    stream_end: bool,
+) -> (usize, bool) {
+    if stream_end {
+        return (start + consumed, true);
+    }
+    if consumed == 0 && produced == 0 {
+        return (input_len, false);
+    }
+    (start + consumed, false)
+}
+
+#[cfg(test)]
+mod inflater_advance_tests {
+    use super::inflater_advance;
+
+    #[test]
+    fn ordinary_progress_advances_the_cursor() {
+        assert_eq!(inflater_advance(10, 0, 4, 100, false), (4, false));
+        assert_eq!(inflater_advance(10, 4, 6, 20, false), (10, false));
+    }
+
+    #[test]
+    fn stream_end_marks_finished_without_swallowing_the_tail() {
+        // A concatenated stream (jar entry followed by the next LOC header)
+        // must leave the unconsumed bytes for the caller to re-read.
+        assert_eq!(inflater_advance(10, 0, 6, 50, true), (6, true));
+    }
+
+    #[test]
+    fn no_progress_consumes_the_pending_input_so_needsinput_turns_true() {
+        // The spin: bytes pending, nothing produced, not finished. `pos` must
+        // reach the end or `InflaterInputStream.read` loops forever.
+        assert_eq!(inflater_advance(10, 2, 0, 0, false), (10, false));
+        // Already drained: unchanged, still not finished.
+        assert_eq!(inflater_advance(10, 10, 0, 0, false), (10, false));
+    }
+}
+
 fn inflater_inflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if is_real_layout(ctx, this, "zsRef") {
@@ -3322,10 +3389,18 @@ fn inflater_inflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> 
                 .map_err(|e| RuntimeError::IOException {
                     message: format!("Inflater: invalid compressed data: {e}"),
                 })?;
-            *pos = start + (stream.total_in() - before_in) as usize;
+            let consumed = (stream.total_in() - before_in) as usize;
             let produced = (stream.total_out() - before_out) as usize;
             *adler = adler32_update(*adler, &scratch[..produced]);
-            if matches!(status, flate2::Status::StreamEnd) {
+            let (new_pos, done) = inflater_advance(
+                input.len(),
+                start,
+                consumed,
+                produced,
+                matches!(status, flate2::Status::StreamEnd),
+            );
+            *pos = new_pos;
+            if done {
                 *finished = true;
             }
             produced

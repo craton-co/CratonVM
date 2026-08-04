@@ -14,6 +14,79 @@ census.
 > prescribes **`GeneratedProxy`** for `Proxy$Instance`, not `VmInternal` as the
 > original record said.
 
+## What changed on 2026-08-04 — one of the two is done
+
+### `cratonvm/synthetic/AnonymousObject$N` — MIGRATED, and verified
+
+The minting site in `vm_exec`'s allocation path now calls
+`ensure_generated_class(name, n, ClassOrigin::VmInternal)`. This was step 1 of
+*What specifically must change*, and it is done.
+
+Why it was safe to flip ahead of the other one, which is the question the
+deferral turned on: this class is **inert at every `is_synthetic_stub` read
+site**. Nothing is registered as a native on it, neither real-protected-stub
+allow-list names it, and `fabricate_class`'s two by-name special cases
+(`Proxy$Instance`, the collection iterators) key on the *name*, not the origin.
+So the 181 read sites have nothing to observe.
+
+Verified against a real JDK 21 image, `--jdk-only`, before and after:
+
+| | before | after |
+|---|---|---|
+| `compatibility-stub` | 14 | **13** |
+| `vm-internal` | 0 | **1** |
+| total rows | 415 | 415 |
+
+Exactly one class moved, and it is the intended one — which is precisely this
+record's own acceptance criterion (*"must drop by exactly the number of classes
+reclassified — if it drops by more, something else was swept up"*), met
+verbatim. `--dump-class-origins` now reports `vm-internal` for
+`cratonvm/synthetic/AnonymousObject$N`, also as specified.
+
+There is a second, unlisted benefit: the old origin cost a full-classpath rescan
+per fresh field count, hunting a class file that cannot exist
+(`fabricate_class`'s `is_synthetic` branch; `synthetic_upgrade_known_absent`
+memoised it away after the first, but the first still ran).
+
+### `java/lang/reflect/Proxy$Instance` — STILL OPEN, but the design question is answered
+
+The marker prescribed `GeneratedProxy`. **That is wrong, and the corrected
+answer is `VmInternal`.** Two reasons, both already in the tree:
+
+* `ClassOrigin::GeneratedProxy` carries `interfaces: Arc<[ClassId]>`, which the
+  shared *supertype* — as opposed to a concrete `$ProxyN` — has no meaningful
+  value for. The record already flagged this as "an open design question the
+  migration has to answer".
+* `class_manager.rs`'s own `is_generated_proxy_name` says so in terms: *"this
+  VM's own `java/lang/reflect/Proxy$Instance` is exactly that, and must NOT be
+  counted as a generated proxy"*. The `GeneratedProxy` origin belongs to the
+  `$ProxyN` classes it generates.
+
+The in-code marker is corrected to say this.
+
+What is **not** established is whether flipping it is safe, and unlike
+`AnonymousObject$N` it cannot be argued: `Proxy$Instance` has a NATIVE-flagged
+`<init>` from `synthetic_stub_ctor_methods`, is special-cased twice inside
+`fabricate_class` (interfaces and the `h` field, for `ObjectOutputStream`
+round-tripping), and is the superclass every generated `$ProxyN` links against.
+That one needs the regression suite, which is step 4 and is the entire reason
+the work was deferred.
+
+### The `cratonvm/internal/Unmodifiable*` family — adjudicated, and deliberately NOT migrated
+
+The 2026-08-04 `requested_by` census showed these eleven are the largest single
+group of compatibility classes on a strict boot, all from one call site
+(`vm_init.rs:1227`). They are tempting: no class file exists under those names,
+which is the `VmInternal` shape.
+
+**Leave them.** They stand in for `java.util.Collections$UnmodifiableList` and
+friends — the real `Collections.unmodifiableList()` bytecode is not running, and
+that is a compatibility substitution whatever the stand-in is called.
+Reclassifying them is the *dangerous* direction this record's blast-radius
+section describes: it silences the violation, keeps fabricating, and makes the
+zero-stub census report green while the substitution continues. The census
+should keep saying so.
+
 ## What is wrong
 
 Every class minted through `ensure_synthetic_class` is stamped

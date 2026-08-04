@@ -2128,7 +2128,15 @@ pub mod vector_gate {
         /// A reference the memory model knows is a fresh in-method allocation,
         /// so two of them are provably distinct objects.
         fn fresh_array(g: &mut Graph) -> NodeId {
-            g.add(Op::NewArray { element_type: 10 }, IrType::Ref, vec![], None)
+            g.add(
+                Op::NewArray {
+                    element_type: 10,
+                    component_class_id: 0,
+                },
+                IrType::Ref,
+                vec![],
+                None,
+            )
         }
 
         /// A reference of unknown provenance. Two of them may be the same

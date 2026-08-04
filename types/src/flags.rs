@@ -50,7 +50,7 @@
 //! when it wins the race to initialise the snapshot, and quietly measures the
 //! developer's ambient environment when it loses. That is an order-dependent
 //! test that looks like a flake; the diagnosis is written up in
-//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`, and
+//! `libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`, and
 //! `types/tests/flag_env_mutation_guard.rs` fails the build if a new one
 //! appears. (`set_var` is also `unsafe` under Rust 2024, so the override hooks
 //! are what keeps this tree edition-ready.)
@@ -563,13 +563,13 @@ pub enum BlockedAccessMode {
 ///   ROOT-VISIBILITY mechanisms, none of them moving-specific — were live only
 ///   because this default is on, so `CRATONVM_NO_MOVING_YOUNG=1` withdrew all
 ///   three at once and the opt-out lane faulted on a zeroed heap slot within
-///   seconds. See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+///   seconds. See `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 /// * **on, but nominally.** For two days after the flip the constant was `true`
 ///   while every cycle still diverted to the non-moving sweep
 ///   (`cycles=0 coverage_fallbacks=66`). Anything keyed on the FLAG changed
 ///   behaviour immediately; anything keyed on the actual collector decision did
 ///   not. Those are not the same question — see
-///   `docs/internal/default-moving-young-enabled-20260730.md`.
+///   `default-moving-young-enabled-20260730.md`.
 ///
 /// Before changing this value, re-read every site — the sweep is
 /// `rg 'moving_young_enabled\(\)' gc/ vm/ jit/` (8 sites as of 2026-08-01) —
@@ -579,7 +579,7 @@ pub enum BlockedAccessMode {
 /// correlated). Then run a class-unloading lane, not just the throughput and
 /// differential lanes.
 ///
-/// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
+/// See `arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
 /// Whether the JIT publishes a complete, mechanically-enumerable **relocation
@@ -624,7 +624,7 @@ pub const DEFAULT_MOVING_YOUNG: bool = true;
 /// is unreachable. The cost is not theoretical: with the IR gate closed, every
 /// compile falls through to the single-pass backend and the optimizing tier
 /// contributes nothing (see
-/// `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`).
+/// `jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`).
 ///
 /// So the gates read this constant *in addition to* `moving_young`, and the
 /// runtime veto reads it too. One flip re-arms all of them together, which is
@@ -835,7 +835,7 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see docs/internal/fixed-suite-bugs/
+    /// see fixed-suite-bugs/
     /// g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_G1_DBG_PINS`
@@ -2244,7 +2244,7 @@ fn as_raw(cfg: Option<&'static VmFlags>) -> *mut VmFlags {
 /// when it wins the race to initialise the snapshot, and silently exercises
 /// the developer's ambient environment when it loses — the failure mode
 /// documented in
-/// `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+/// `libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 ///
 /// Thread scope is the default because `cargo test` runs tests in parallel
 /// within one binary: an override installed here cannot perturb a concurrent

@@ -828,7 +828,7 @@ pub static OLD_FREE_LIST_OVERLAPS: AtomicU64 = AtomicU64::new(0);
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
 ///
-/// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 /// A non-zero value here means a side table is holding a dangling old-gen
 /// address, or a reference slot holds a non-base word.
 pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
@@ -915,7 +915,7 @@ fn promo_seed_dbg() -> bool {
 }
 
 /// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
-/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
 /// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
 /// collector) is permitted to run at all. Default **disabled** —
 /// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
@@ -1308,8 +1308,8 @@ pub struct GenerationalHeap {
     /// worse, a same-slot-reused unrelated object) once that memory is
     /// actually reclaimed. Ordered oldest-first; the front arena's grace
     /// period has elapsed and its memory is the next to be reused. See
-    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md
-    /// and docs/internal/wildfly-stale-objectref-debug-assertion-scoping.md.
+    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
+    /// and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md.
     quarantine: Mutex<VecDeque<Arena>>,
     /// Lock-free cached address bounds `[base, end)` of the three storage
     /// regions (young from-space, young to-space, old gen), published whenever
@@ -1687,7 +1687,7 @@ impl GenerationalHeap {
     /// `gc_quiescence`'s `missing-exact-rbp` fallback), so shrinking the
     /// semispace just multiplies how often that expensive fallback fires,
     /// which costs more than the page-fault savings recoup. See
-    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md`.
+    /// `performance/binarytrees-bt18-half-gap-20260730.md`.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
         // Young takes 1/2 of total, split across from+to semi-spaces (so
@@ -2529,7 +2529,7 @@ impl GenerationalHeap {
         // caller is holding a raw `ObjectRef` local across a GC-triggering
         // call without `pin_native_root`/`read_native_pin` — exactly the
         // "Family 1" stale-ObjectRef pattern documented in
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
         // Only reachable when the quarantine dance in `collect_garbage_inner`
         // is active (see the `quarantine` field), since without it the
         // evacuated memory would already have been zeroed by the time a
@@ -2687,7 +2687,7 @@ impl GenerationalHeap {
                  kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
-                 docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.\
+                 fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.\
                  \nHolder scan:{holders}",
                 obj_ref.as_ptr(),
                 fwd_ptr,
@@ -2735,7 +2735,7 @@ impl GenerationalHeap {
     /// `VarHandle` root dedup in `vm_exec.rs`) would otherwise have to
     /// derive one from the object's current address — which silently goes
     /// stale the moment a moving GC relocates the object. See
-    /// `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
+    /// `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
         let existing = self.get_header(obj_ref).identity_hash_code;
         if existing != 0 {
@@ -3584,7 +3584,7 @@ impl GenerationalHeap {
         debug_assert!(index < self.get_header(obj_ref).num_slots() as usize);
         // FIELD-WATCH (TestUpgrade RootReference/MVMap residual, software
         // watchpoint — see cratonvm_types::field_watch and
-        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md).
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md).
         // Zero cost unless CRATONVM_DBG_FIELD_WATCH is set AND obj_ref was
         // explicitly registered via field_watch::watch() at construction.
         // Every write is reported (not deduped) — a count reaching 2 for a
@@ -3781,7 +3781,7 @@ impl GenerationalHeap {
                 // Offsets come from the named header constants, not literals:
                 // this diagnostic prints what a heap walker would have decoded,
                 // so it must follow the header layout if it ever shifts (see
-                // docs/internal/arch-2026-07-26/header-shrink.md).
+                // arch-2026-07-26/header-shrink.md).
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
                     let kind_byte = *obj_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET);
@@ -4256,7 +4256,7 @@ impl GenerationalHeap {
     /// reclaims dead blocks IN PLACE, during a YOUNG collection, whenever a live
     /// JIT frame blocks the moving young collector — and it does not zero what
     /// it frees. Use this predicate for liveness; see
-    /// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     pub fn is_live_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().is_allocated_addr(addr as *const u8)
     }
@@ -10434,7 +10434,7 @@ impl GenerationalHeap {
         //
         // ADDITIVE, and on the shadow only. Two things went wrong the first
         // time this was attempted (defect 4 in
-        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`):
+        // `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`):
         // rewriting the CALLER's slice corrupted a root snapshot that outlives
         // this call, and seeding destinations was itself destabilising because
         // that seed loop did not validate what it marked. The second cause is
@@ -10502,8 +10502,8 @@ impl GenerationalHeap {
     ) -> HashMap<usize, usize> {
         // See `oldgen_compact_enabled`: compaction is disabled by default as
         // of 2026-08-03 pending root-cause attribution of the corruption it
-        // was found to cause (docs/known-issues/hibernate/
-        // map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+        // was found to cause (fixed-suite-bugs/hibernate/
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
         Self::old_gen_gc(
             roots,
             young_from,
@@ -10580,7 +10580,7 @@ impl GenerationalHeap {
         // in `old_gen_mark_candidate_plausible` and EVERY push site into the
         // mark worklist goes through it, because the seven that did not were
         // still doing exactly what the paragraph above describes — see
-        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         //
         // NOTE this predicate deliberately does NOT require a non-zero first
         // header word (unlike `mark_young`'s zero-word0 side-mark split):
@@ -10919,7 +10919,7 @@ impl GenerationalHeap {
             // This sweep decided liveness purely from `GC_FLAG_MARKED`, and the
             // mark that set it has NINE worklist push sites of which only two
             // validate their input (see
-            // docs/known-issues/gc-old-gen-mark-accepts-unvalidated-addresses.md).
+            // fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
             // If the mark misses a root, this loop hands a still-referenced
             // block back to the free list and the damage surfaces only much
             // later, at whichever unlucky reader dereferences it next — exactly
@@ -11481,7 +11481,7 @@ impl GenerationalHeap {
         // discriminant was never an object base: some push site handed us a
         // dangling or interior address. This was long COUNTED but not
         // rejected here — see
-        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
+        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
         // which explicitly deferred the reject as follow-up work. Deferring it
         // left the door open for the exact hazard that doc's Half 2 fix was
         // written to close: `gen_object_total_size(header)` below reads
@@ -11492,7 +11492,7 @@ impl GenerationalHeap {
         // (`HIB-DCAST-LATEPHASE.1`: reached this way as a SIGSEGV reading
         // through a garbage `array_length` treated as a slot/byte count).
         // Reject now, mirroring `OldGen::scan_region`'s equivalent fix in
-        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
+        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
         // validate the raw tag bytes through
         // `object_kind_from_tag`/`array_element_type_from_tag` before ever
         // forming a `&ObjectHeader` reference.
@@ -11854,7 +11854,7 @@ impl GenerationalHeap {
         // safety net — leaving an untracked zeroed sliver between the TLAB's
         // filler and the next region that derails the non-moving walk (the
         // trigger-ON bt18 corruption; see
-        // docs/known-issues/tlab-trigger-gc-young-walk-corruption.md).
+        // fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md).
         let actual_size = requested_size.min(available) & !7;
         if actual_size == 0 {
             return None;
@@ -12157,7 +12157,7 @@ impl GenerationalHeap {
         // bytes through `object_kind_from_tag`/`array_element_type_from_tag`
         // — the same fix already applied to `OldGen::scan_region` and
         // `scan_object_for_old_refs` (see
-        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
+        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
         // — before ever reading either field as a typed enum.
         // SAFETY: `old_ptr` is confirmed inside young from-space via
         // `young_object_starts.contains` above, so the two single-byte tag
@@ -13362,7 +13362,7 @@ fn fwd_resolve_strict() -> bool {
 /// loop, and after a possible major GC — printing per-phase counts. A count
 /// that JUMPS at a specific phase localizes the SEEDING collector path
 /// (minor Cheney/promotion vs. major mark-compact) — see
-/// docs/bc-math-ec-gc-0x4-handoff.md §6.4.
+/// gaps/bc-math-ec-gc-0x4-handoff.md §6.4.
 #[inline]
 fn seedhunt_enabled() -> bool {
     gc_flags().dbg_seedhunt
@@ -13494,7 +13494,7 @@ fn seedhunt_scan_young(
 /// object's PAYLOAD (an `int` field `0x41414141` becomes `0x43414141`), and
 /// those payload bytes are decoded as a header, which is how a byte that is not
 /// a valid `ObjectKind` discriminant reaches `gen_object_total_size`. See
-/// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 ///
 /// The root seed and the young->old conservative word scan already defended
 /// themselves (and their comments name this hazard as the reason); this is that
@@ -13938,7 +13938,7 @@ fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
             "old-gen mark: rejecting {} candidate {:p} — not a plausible object \
              base (aligned={}, w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}). A side \
              table or reference slot is holding a stale old-gen address; see \
-             docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
+             fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
             site,
             ptr,
             (ptr as usize) & 7 == 0,
@@ -13982,7 +13982,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
     // still read *as an enum* first. Validate both raw tag bytes through
     // `object_kind_from_tag`/`array_element_type_from_tag` before ever
     // constructing a typed `&ObjectHeader`, mirroring every other fix in
-    // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
+    // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
     // SAFETY: bounds-checked by `old_gen.contains(neighbor)` above.
     let kind_tag = unsafe { *neighbor.add(OBJECT_KIND_OFFSET) };
     let elem_tag = unsafe { *neighbor.add(ARRAY_ELEMENT_TYPE_OFFSET) };
@@ -15230,7 +15230,7 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
     // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`,
     // a non-atomic 16-byte copy that could tear against a concurrent plain
     // `get_field` from another mutator thread -- see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix).
     cratonvm_types::write_value_atomic(ptr as *mut Value, value);
 }
@@ -16045,7 +16045,7 @@ mod tests {
     /// A later attempt (2026-07-30) to additionally cap the *initial* young
     /// semi at 512 MiB (to cut eager-paging RSS on large `-Xmx` heaps) was
     /// measured to be a net wall-clock regression — see
-    /// `docs/internal/performance/binarytrees-bt18-half-gap-20260730.md` —
+    /// `performance/binarytrees-bt18-half-gap-20260730.md` —
     /// because this workload's young GC already always falls back to a
     /// non-moving sweep, and a smaller semispace just means more of those
     /// expensive fallbacks. Reverted; `with_capacity`'s *initial* semi stays
@@ -18091,7 +18091,7 @@ mod tests {
     /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
     /// object, leaving a dangling old-gen address for a later mark to decode.
     ///
-    /// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     /// Fixed by giving `is_addr_live` a free-list-aware old-gen predicate
     /// (`GenerationalHeap::is_live_old_gen_addr` -> `OldGen::is_allocated_addr`).
     /// `is_old_gen_addr` itself is deliberately UNCHANGED: it answers "which

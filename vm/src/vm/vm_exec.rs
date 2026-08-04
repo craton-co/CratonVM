@@ -1493,6 +1493,135 @@ fn youngscan_mark_found() -> bool {
     YOUNGSCAN_FOUND.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// ARCH-2026-08-04 A3 — one mask for every native-funnel diagnostic
+// ---------------------------------------------------------------------------
+//
+// `safe_native_call_impl` is the choke point for essentially every native
+// dispatch in the VM, and prior notes put the per-call floor at ~8.4 ns against
+// HotSpot's ~1. It had accreted **thirteen** independent diagnostic
+// subsystems, each with its own gate function, interleaved with the real work:
+// the pin-underflow guard, dispatch tracing, VM-state publication, the native
+// ring, the straystack thread-local, EC watch, memwatch, the young scan, the
+// linkage dump, stale-objref naming, remap tracing, altrace, and the unpin
+// ring.
+//
+// Every gate was individually cheap — a memoized `OnceLock` read, a lesson
+// already learned here when uncached `getenv` probes measured ~7% of a
+// HashMapOnly-4M run. But thirteen of them are not cheap: thirteen loads,
+// thirteen branches the front end must predict, and a 671-line function body
+// whose cold half sits in the middle of the hot one.
+//
+// This collapses all thirteen into a single `u32`. The common case — every
+// diagnostic off, which is every production run — tests one value once before
+// the callback and once after, and never touches the cold code.
+//
+// **The split is by mutability, and it is not cosmetic.** Eleven gates are
+// startup-static (memoized env reads) and are computed once. Two are *not*:
+// `dispatch_trace::enable()` is called at runtime by the stack-dump watchdog so
+// a hang in native code still leaves a breadcrumb, and `native_ring::enable()`
+// is likewise toggleable. Baking either into the memoized half would silently
+// disable a diagnostic exactly when it is being switched on to chase a hang —
+// so they are re-read on every call, which is what they cost today anyway.
+mod native_diag {
+    // Startup-static bits (memoized env reads).
+    pub const BLOCKGC: u32 = 1 << 0;
+    pub const VM_STATE: u32 = 1 << 1;
+    pub const STRAYSTACK: u32 = 1 << 2;
+    pub const EC_WATCH: u32 = 1 << 3;
+    pub const MEMWATCH: u32 = 1 << 4;
+    pub const YOUNGSCAN: u32 = 1 << 5;
+    pub const LINKAGE: u32 = 1 << 6;
+    pub const ALTRACE: u32 = 1 << 7;
+    pub const UNPIN_RING: u32 = 1 << 8;
+    pub const STALE_OBJREF: u32 = 1 << 9;
+    pub const REMAP_TRACE: u32 = 1 << 10;
+    // Runtime-toggleable bits — re-read every call, never memoized.
+    pub const DISPATCH_TRACE: u32 = 1 << 11;
+    pub const RING: u32 = 1 << 12;
+}
+
+/// The eleven startup-static diagnostic bits, computed once.
+#[inline]
+fn native_diag_static() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        let mut m = 0;
+        if blockgc_dbg() {
+            m |= native_diag::BLOCKGC;
+        }
+        if JvmThread::vm_state_diagnostics_enabled() {
+            m |= native_diag::VM_STATE;
+        }
+        if youngscan_straystack_enabled() {
+            m |= native_diag::STRAYSTACK;
+        }
+        if crate::runtime::ec_watch::native_enabled() {
+            m |= native_diag::EC_WATCH;
+        }
+        if crate::runtime::memwatch::is_watching() {
+            m |= native_diag::MEMWATCH;
+        }
+        if youngscan_enabled() {
+            m |= native_diag::YOUNGSCAN;
+        }
+        if crate::runtime::interpreter::dbg_linkage() {
+            m |= native_diag::LINKAGE;
+        }
+        if crate::memory::gc::altrace_enabled_vm() {
+            m |= native_diag::ALTRACE;
+        }
+        if unpin_ring_enabled() {
+            m |= native_diag::UNPIN_RING;
+        }
+        if cratonvm_gc::stale_objref_debug::enabled() {
+            m |= native_diag::STALE_OBJREF;
+        }
+        if crate::runtime::interpreter::remap_trace_on() {
+            m |= native_diag::REMAP_TRACE;
+        }
+        m
+    })
+}
+
+/// The two runtime-toggleable bits. Two relaxed loads, deliberately not cached.
+#[inline]
+fn native_diag_dynamic() -> u32 {
+    let mut m = 0;
+    if crate::dispatch_trace::is_enabled() {
+        m |= native_diag::DISPATCH_TRACE;
+    }
+    // Covers BOTH of `record_enter`'s gates (the ring and
+    // `CRATONVM_TRACK_NATIVE`); see `native_ring::any_recording_enabled`.
+    if cratonvm_native_api::native_ring::any_recording_enabled() {
+        m |= native_diag::RING;
+    }
+    m
+}
+
+/// Every diagnostic gate on the native funnel, as one word.
+///
+/// Zero on any run with no diagnostics armed, which is the case this exists to
+/// make fast.
+#[inline]
+fn native_diag_mask() -> u32 {
+    native_diag_static() | native_diag_dynamic()
+}
+
+/// Per-call diagnostic state that has to survive across the callback.
+///
+/// All-zero/`None` on the fast path, and constructed without touching any of
+/// the cold code.
+#[derive(Default)]
+struct NativeDiagState {
+    /// Resolved native name, when `CRATONVM_DBG_VM_STATE` is on.
+    vm_state_name: Option<String>,
+    /// Ring token from `record_enter`; `None` when the ring never ran.
+    ring_idx: Option<usize>,
+    /// Whether the straystack thread-local was pushed and must be popped.
+    straystack_pushed: bool,
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1515,56 +1644,90 @@ pub(crate) fn safe_native_call_prevalidated_objects(
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
-fn safe_native_call_impl(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    callback: NativeCallback,
-    args: &[Value],
-    prevalidated_objects: bool,
-) -> MethodCallResult {
-    // DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector. A native that
-    // returns with FEWER pins than it entered with truncated its CALLER's
-    // pins (`unpin_native_roots` is a truncate) — every handle the caller
-    // still holds now dangles and `read_native_pin` silently degrades to the
-    // raw, possibly-stale fallback. The guard fires on every exit path
-    // (including unwind) via Drop and names the culprit at the funnel.
-    struct PinFloorGuard {
-        floor: usize,
-        thread: *const JvmThread,
-        callee_addr: usize,
-    }
-    impl Drop for PinFloorGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard lives strictly within this call frame; the
-            // thread outlives it (debug-only read of a Vec length).
-            let len = unsafe { (*self.thread).native_pin_roots.len() };
-            if len < self.floor {
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
-                    eprintln!(
-                        "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
-                        self.floor,
-                    );
-                }
+/// DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector.
+///
+/// A native that returns with FEWER pins than it entered with truncated its
+/// CALLER's pins (`unpin_native_roots` is a truncate) — every handle the caller
+/// still holds now dangles and `read_native_pin` silently degrades to the raw,
+/// possibly-stale fallback. The guard fires on every exit path (including
+/// unwind) via `Drop` and names the culprit at the funnel.
+///
+/// Lifted out of `safe_native_call_impl` in ARCH-2026-08-04 A3 so the funnel
+/// can construct it behind one mask test rather than its own gate call.
+struct PinFloorGuard {
+    floor: usize,
+    thread: *const JvmThread,
+    callee_addr: usize,
+}
+
+impl Drop for PinFloorGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard lives strictly within one `safe_native_call_impl`
+        // frame; the thread outlives it (debug-only read of a Vec length).
+        let len = unsafe { (*self.thread).native_pin_roots.len() };
+        if len < self.floor {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
+                eprintln!(
+                    "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
+                    self.floor,
+                );
             }
         }
     }
-    let _pin_floor_guard = if blockgc_dbg() {
-        Some(PinFloorGuard {
-            floor: thread.native_pin_roots.len(),
-            thread: thread as *const JvmThread,
-            callee_addr: callback as usize,
+}
+
+/// Resolve a callback's human name, falling back to its address.
+///
+/// Every diagnostic below wants this and none of them are on the fast path, so
+/// it lives here rather than being recomputed inline six times.
+#[cold]
+#[inline(never)]
+fn native_callee_name(callback: NativeCallback) -> String {
+    cratonvm_native_api::native_ring::name_of(callback as usize)
+        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize))
+}
+
+/// Format the top `n` Java frames, one per line, for a diagnostic dump.
+#[cold]
+#[inline(never)]
+fn native_diag_java_stack(thread: &JvmThread, n: usize, prefix: &str) -> String {
+    thread
+        .frames
+        .iter()
+        .rev()
+        .take(n)
+        .map(|f| {
+            format!(
+                "{prefix}{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
         })
-    } else {
-        None
-    };
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Everything the native funnel does *before* the callback when a diagnostic is
+/// armed. Never reached on an all-off run.
+#[cold]
+#[inline(never)]
+fn native_diag_pre_call(
+    diag: u32,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+) -> NativeDiagState {
+    let mut st = NativeDiagState::default();
+
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
     // the top Java frame is the invokevirtual/invokestatic site.
-    if crate::dispatch_trace::is_enabled() {
+    if diag & native_diag::DISPATCH_TRACE != 0 {
         let (cls, mth, des) = match thread.frames.last() {
             Some(f) => (
                 f.class_name().to_string(),
@@ -1582,8 +1745,7 @@ fn safe_native_call_impl(
         // which native is hung when a single bytecode method spins in a
         // tight loop calling natives (e.g. an `Enumeration` that never
         // exhausts). The `des` slot carries the native triple.
-        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        let callee = native_callee_name(callback);
         crate::dispatch_trace::record_native(
             thread.thread_id.0 as usize,
             &cls,
@@ -1591,6 +1753,134 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
+
+    // T19.H1 — record the native into the process-global ring buffer.
+    // `safe_native_call` is the central choke point for nearly every native
+    // dispatch path, so recording here (rather than only at the two interpreter
+    // call sites) means a hang inside *any* native leaves a `STILL-IN-NATIVE`
+    // breadcrumb the watchdog can dump.
+    if diag & native_diag::VM_STATE != 0 {
+        let name = native_callee_name(callback);
+        thread.set_vm_state(format!("native:{name}"));
+        st.vm_state_name = Some(name);
+    }
+    if diag & native_diag::RING != 0 {
+        st.ring_idx = Some(cratonvm_native_api::native_ring::record_enter(
+            callback as usize,
+        ));
+    }
+
+    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
+    // thread-local stack so the stray-receiver dump can name the culprit.
+    if diag & native_diag::STRAYSTACK != 0 {
+        let nm = native_callee_name(callback);
+        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
+        st.straystack_pushed = true;
+    }
+
+    st
+}
+
+/// Everything the native funnel does *after* the callback when a diagnostic is
+/// armed, up to (but not including) result handling. Never reached on an
+/// all-off run.
+#[cold]
+#[inline(never)]
+fn native_diag_post_call(
+    diag: u32,
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    st: &NativeDiagState,
+) {
+    if st.straystack_pushed {
+        CURRENT_NATIVE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+    if let Some(idx) = st.ring_idx {
+        cratonvm_native_api::native_ring::record_exit(idx);
+    }
+    if st.vm_state_name.is_some() {
+        thread.set_vm_state("native:return");
+    }
+
+    // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback is the
+    // suspected raw-writer of `0x4` into an EC reference field. Re-read every
+    // watched EC ref cell now that this native has returned; any that flipped to
+    // a non-zero `<0x1000` value was corrupted by THIS native. Gated separately
+    // (expensive: O(watch-list) per native).
+    if diag & native_diag::EC_WATCH != 0 {
+        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
+        if !hits.is_empty() {
+            let native = native_callee_name(callback);
+            for (holder, idx, expected, now) in hits {
+                eprintln!(
+                    "[ecwatch] CORRUPTED holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}  by NATIVE {native}"
+                );
+            }
+            eprintln!("[ecwatch] Java stack at corruption (top first):");
+            eprintln!("{}", native_diag_java_stack(thread, 24, "[ecwatch]   "));
+        }
+    }
+
+    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of the watched absolute
+    // address after EVERY native return — a HIT here (vs at a bytecode
+    // safepoint) blames the just-returned native directly.
+    if diag & native_diag::MEMWATCH != 0 {
+        crate::runtime::memwatch::poll_with(
+            || format!("native:{}", native_callee_name(callback)),
+            || native_diag_java_stack(thread, 28, "  "),
+        );
+    }
+
+    // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
+    // mutator write. We PROVED the `0x4` is written to a YOUNG object's
+    // reference field between GCs (NOT by the GC: it is present in young at GC
+    // entry — `[small4] PRE-GC YOUNG`). The victim CLASS varies run-to-run
+    // (HexFormat, Level, EC types) so watching specific classes is unreliable;
+    // instead scan the WHOLE young from-space after natives. ONE-SHOT: on the
+    // first `0x4` found, dump the victim + the just-returned native + the full
+    // Java stack (the corruptor is this native, or a bytecode in the top frame
+    // just before it), then stop. STRIDE (CRATONVM_YOUNGSCAN_STRIDE, default 1)
+    // throttles the whole-young walk on slow runs.
+    if diag & native_diag::YOUNGSCAN != 0 && !youngscan_found() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        if n % youngscan_stride() == 0 {
+            if let Some((addr, cid, fld, payload, nbr)) = shared.mem.heap.dbg_first_young_small_ref()
+            {
+                if !youngscan_mark_found() {
+                    let native = native_callee_name(callback);
+                    let is_arr = fld & 0x4000_0000 != 0;
+                    eprintln!(
+                        "[youngscan] FIRST 0x4 in YOUNG: holder@0x{addr:x} cid={cid} {}[{}] -> 0x{payload:x}  nbr_disc=0x{nbr:x}  (just-returned NATIVE {native})",
+                        if is_arr { "arr" } else { "fld" }, fld & 0x3fff_ffff,
+                    );
+                    eprintln!("[youngscan] Java stack (top first):");
+                    eprintln!("{}", native_diag_java_stack(thread, 30, "[youngscan]   "));
+                }
+            }
+        }
+    }
+}
+
+fn safe_native_call_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+    prevalidated_objects: bool,
+) -> MethodCallResult {
+    // ARCH-2026-08-04 A3 — the funnel's thirteen diagnostic gates, as one word.
+    // Zero on every production run; see the `native_diag` module header.
+    let diag = native_diag_mask();
+    let _pin_floor_guard = (diag & native_diag::BLOCKGC != 0).then(|| PinFloorGuard {
+        floor: thread.native_pin_roots.len(),
+        thread: thread as *const JvmThread,
+        callee_addr: callback as usize,
+    });
     // Object arguments have just left the GC-visible operand stack. Refresh
     // forwarded addresses before pinning them: pinning a stale from-space
     // pointer preserves the bug rather than rooting the evacuated object.
@@ -1741,33 +2031,12 @@ fn safe_native_call_impl(
     }
     let native_args = remapped_args.as_deref().unwrap_or(args);
 
-    // T19.H1 — record the native into the process-global ring buffer.
-    // `safe_native_call` is the central choke point for nearly every
-    // native dispatch path, so recording here (rather than only at the
-    // two interpreter call sites) means a hang inside *any* native
-    // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
-    let native_state = if JvmThread::vm_state_diagnostics_enabled() {
-        Some(
-            cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize)),
-        )
+    // Dispatch tracing, VM-state publication, the native ring and the
+    // straystack thread-local all live behind this one test (A3).
+    let diag_state = if diag != 0 {
+        native_diag_pre_call(diag, thread, callback)
     } else {
-        None
-    };
-    if let Some(name) = &native_state {
-        thread.set_vm_state(format!("native:{name}"));
-    }
-    let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
-
-    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
-    // thread-local stack so the stray-receiver dump can name the culprit.
-    let _dbg_native = if youngscan_straystack_enabled() {
-        let nm = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
-        true
-    } else {
-        false
+        NativeDiagState::default()
     };
 
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
@@ -1828,115 +2097,10 @@ fn safe_native_call_impl(
             callback(&mut ctx, native_args)
         }))
     };
-    if _dbg_native {
-        CURRENT_NATIVE_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
-    cratonvm_native_api::native_ring::record_exit(_ring_idx);
-    if native_state.is_some() {
-        thread.set_vm_state("native:return");
-    }
-
-    // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
-    // is the suspected raw-writer of `0x4` into an EC reference field. Re-read
-    // every watched EC ref cell now that this native has returned; any that
-    // flipped to a non-zero `<0x1000` value was corrupted by THIS native.
-    // Gated separately (expensive: O(watch-list) per native).
-    if crate::runtime::ec_watch::native_enabled() {
-        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
-        if !hits.is_empty() {
-            let native = cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-            for (holder, idx, expected, now) in hits {
-                eprintln!(
-                    "[ecwatch] CORRUPTED holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}  by NATIVE {native}"
-                );
-            }
-            eprintln!("[ecwatch] Java stack at corruption (top first):");
-            for f in thread.frames.iter().rev().take(24) {
-                eprintln!(
-                    "[ecwatch]   {}.{}{} pc={}",
-                    f.class_name(),
-                    f.method_name(),
-                    f.method_descriptor(),
-                    f.pc,
-                );
-            }
-        }
-    }
-
-    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of the watched
-    // absolute address after EVERY native return — a HIT here (vs at a
-    // bytecode safepoint) blames the just-returned native directly.
-    {
-        let cb = callback as usize;
-        crate::runtime::memwatch::poll_with(
-            || {
-                let native = cratonvm_native_api::native_ring::name_of(cb)
-                    .unwrap_or_else(|| format!("<cb@{cb:#x}>"));
-                format!("native:{native}")
-            },
-            || {
-                thread
-                    .frames
-                    .iter()
-                    .rev()
-                    .take(28)
-                    .map(|f| {
-                        format!(
-                            "  {}.{}{} pc={}",
-                            f.class_name(),
-                            f.method_name(),
-                            f.method_descriptor(),
-                            f.pc
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            },
-        );
-    }
-
-    // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
-    // mutator write. We PROVED the `0x4` is written to a YOUNG object's
-    // reference field between GCs (NOT by the GC: it is present in young at GC
-    // entry — `[small4] PRE-GC YOUNG`). The victim CLASS varies run-to-run
-    // (HexFormat, Level, EC types) so watching specific classes is unreliable;
-    // instead scan the WHOLE young from-space after natives. ONE-SHOT: on the
-    // first `0x4` found, dump the victim + the just-returned native + the full
-    // Java stack (the corruptor is this native, or a bytecode in the top frame
-    // just before it), then stop. STRIDE (CRATONVM_YOUNGSCAN_STRIDE, default 1)
-    // throttles the whole-young walk on slow runs.
-    if youngscan_enabled() && !youngscan_found() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        if n % youngscan_stride() == 0 {
-            if let Some((addr, cid, fld, payload, nbr)) =
-                shared.mem.heap.dbg_first_young_small_ref()
-            {
-                if !youngscan_mark_found() {
-                    let native = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-                    let is_arr = fld & 0x4000_0000 != 0;
-                    eprintln!(
-                        "[youngscan] FIRST 0x4 in YOUNG: holder@0x{addr:x} cid={cid} {}[{}] -> 0x{payload:x}  nbr_disc=0x{nbr:x}  (just-returned NATIVE {native})",
-                        if is_arr { "arr" } else { "fld" }, fld & 0x3fff_ffff,
-                    );
-                    eprintln!("[youngscan] Java stack (top first):");
-                    for f in thread.frames.iter().rev().take(30) {
-                        eprintln!(
-                            "[youngscan]   {}.{}{} pc={}",
-                            f.class_name(),
-                            f.method_name(),
-                            f.method_descriptor(),
-                            f.pc,
-                        );
-                    }
-                }
-            }
-        }
+    // Straystack pop, ring exit, VM-state reset, EC watch, memwatch and the
+    // young scan all live behind this one test (A3).
+    if diag != 0 {
+        native_diag_post_call(diag, shared, thread, callback, &diag_state);
     }
 
     let mut out: MethodCallResult = match result {
@@ -2057,10 +2221,9 @@ fn safe_native_call_impl(
     // hands its caller something that is only catchable if the caller's
     // dispatch arm converts it. Name the native and the Java call site here,
     // at the boundary, so the routing can be followed from its origin.
-    if crate::runtime::interpreter::dbg_linkage() {
+    if diag & native_diag::LINKAGE != 0 {
         if let Err(MethodCallFailed::InternalError(VmError::Linkage(l))) = &out {
-            let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+            let callee = native_callee_name(callback);
             crate::runtime::interpreter::dbg_linkage_dump(
                 thread,
                 "native return",
@@ -2083,9 +2246,8 @@ fn safe_native_call_impl(
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
                 let healed = shared.mem.heap.load_and_forward(*o);
-                if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
-                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                if healed.as_ptr() != o.as_ptr() && diag & native_diag::STALE_OBJREF != 0 {
+                    let callee = native_callee_name(callback);
                     // The cached-dispatch callback pointer often has no ring
                     // name; the top Java frame names the method this native
                     // implements, which is the actionable identity.
@@ -2114,7 +2276,7 @@ fn safe_native_call_impl(
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
-                if crate::runtime::interpreter::remap_trace_on() {
+                if diag & native_diag::REMAP_TRACE != 0 {
                     let site = thread
                         .frames
                         .last()
@@ -2127,10 +2289,9 @@ fn safe_native_call_impl(
                     );
                 }
             }
-            if crate::memory::gc::altrace_enabled_vm() {
+            if diag & native_diag::ALTRACE != 0 {
                 if let Value::Object(Some(o)) = v {
-                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let callee = native_callee_name(callback);
                     let cid = shared.mem.heap.class_id_of(*o);
                     let cname = shared
                         .classes
@@ -2171,9 +2332,8 @@ fn safe_native_call_impl(
     // an exception ref has already gone stale, a native may leave the live
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
-    if unpin_ring_enabled() && pin_base < thread.native_pin_roots.len() {
-        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+    if diag & native_diag::UNPIN_RING != 0 && pin_base < thread.native_pin_roots.len() {
+        let callee = native_callee_name(callback);
         UNPIN_RING.with(|r| {
             let mut r = r.borrow_mut();
             if r.len() >= 6 {
@@ -3040,7 +3200,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         .threads
         .thread_registry
         .set_tlab_addr(tid, &thread.tlab as *const cratonvm_gc::Tlab as usize);
-    // REMOUNT FIXUP (2026-07-26, `docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md`).
+    // REMOUNT FIXUP (2026-07-26, `arch-2026-07-26/vt-resume-gc-fixup.md`).
     //
     // This used to be a bare
     //     gc_block_state.in_blocked_region.store(false, Release)
@@ -8101,7 +8261,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             // warmup concurrently with the main thread's own bean/class
             // initialization, and making this heavier path the hot path
             // for every virtual call from both threads deadlocked them
-            // (see docs/internal/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
+            // (see fixed-suite-bugs/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
             // Keep it scoped to the two cases that actually need it: the
             // original loader-identity divergence this mechanism was built
             // for, and the specific anonymous-`toString()` shape the
@@ -8865,7 +9025,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // allocation sites). Any per-object identity-keyed side table built
         // on the old, address-derived value would silently stop finding its
         // own entries after the first GC move — see
-        // `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
+        // `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
         // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
         //
         // What remains here is now just a last-resort guard against a 0
@@ -9821,14 +9981,45 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     stack.join("\n")
                 );
             }
+            // `ensure_generated_class`, not `ensure_synthetic_class`: this is a
+            // VM bookkeeping type, not a compatibility substitution. There is
+            // no `cratonvm/synthetic/AnonymousObject$N` class file anywhere and
+            // there never will be — it is the untyped allocation shape behind
+            // every `HashMap`/`LinkedHashMap` node and friends, and contract §1
+            // item 6 makes it legitimate in **both** modes.
+            //
+            // Stamping it `CompatibilityStub` (which `ensure_synthetic_class`
+            // hard-codes) made contract §11's zero-stub acceptance criterion
+            // unachievable by construction: a strict boot reported a
+            // `compatibility-class-requested` violation for a class the
+            // contract explicitly permits, so the census could never reach
+            // zero however much real work was done. It also cost a
+            // full-classpath rescan per fresh field count, looking for a class
+            // file that cannot exist (the `is_synthetic` branch in
+            // `fabricate_class`; `synthetic_upgrade_known_absent` memoised it
+            // away after the first, but the first still ran).
+            //
+            // The deferral this replaces was correct at the time: the origin
+            // feeds the derived `is_synthetic_stub` bool, and flipping it for a
+            // class ~181 read sites reason about is a `Compatible`-mode
+            // behaviour change wave 1 could not validate. What makes it safe
+            // *here* is that this class is inert at every one of those sites —
+            // nothing is registered as a native on it, neither
+            // real-protected-stub allow-list names it, and `fabricate_class`'s
+            // `Proxy$Instance` / collection-iterator special cases key on the
+            // name, not the origin.
             let cid = self
                 .shared
                 .classes
                 .class_manager
                 .write()
-                .ensure_synthetic_class(&name, num_fields);
+                .ensure_generated_class(
+                    &name,
+                    num_fields,
+                    cratonvm_classloading::class_origin::ClassOrigin::VmInternal,
+                );
             // Cache for the lock-free fast path above. Races are benign:
-            // `ensure_synthetic_class` is idempotent, so any racing thread
+            // `ensure_generated_class` is idempotent, so any racing thread
             // stores the same id.
             if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 self.shared.classes.anon_class_cache[num_fields]
@@ -10291,7 +10482,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // STW-TAKEOVER-FIX (2026-07-13) follow-up: this reasoning IS the
         // root cause of the WildFly `parallel-extension-add` STW-barrier
         // deadlock (see
-        // `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`)
+        // `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`)
         // for the one call site proven live via gdb to hit it
         // (`CountDownLatch`'s polling loop). An earlier version of this fix
         // switched THIS method wholesale to `monitor_enter_blocking`, but a
@@ -10303,7 +10494,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // GC-pausable wait at once would trade one hang for a batch of new,
         // unaudited stale-`ObjectRef`-across-GC bugs (this codebase's most
         // recurring defect class, see
-        // `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`).
+        // `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`).
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
@@ -11408,7 +11599,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
-        // CR-CLO-1 (`docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6).
+        // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers
         // were resolved "now that we hold the ClassStore" — and then called the
@@ -12116,7 +12307,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // pool was disjoint from the real carriers, so the release freed no
         // carrier (this OS thread stays blocked in `park_interruptible`
         // either way — see §7.2 of
-        // `docs/internal/arch-2026-07-26/virtual-threads.md`), while the
+        // `arch-2026-07-26/virtual-threads.md`), while the
         // post-park `acquire()` was a live hang risk. Nothing else in the tree
         // acquires from that pool, so with more concurrently-parked virtual
         // threads than `carrier_count`, the surplus acquirers blocked on a
@@ -13031,7 +13222,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // ensure_synthetic_class` hands back a distinctly-named, correctly
         // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
         // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/known-issues/c2/synthetic-class-fallibility.md` for the migration
+        // `docs/feature-designs/synthetic-class-fallibility.md` for the migration
         // that removes this method's callers.
         self.shared
             .classes
@@ -14625,43 +14816,36 @@ pub fn invoke_or_native(
     // run its own real `execute()` bytecode here too, or calling `.execute()`
     // on it from native code (via `ctx.invoke_virtual`) recurses back into
     // this same native forever (a real stack overflow, confirmed via gdb).
-    // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // See fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
-    // OF 4. The other three are in `vm/src/runtime/interpreter/invoke.rs`
-    // (`try_stackless_invoke` step 1, `try_stackless_invoke` step 6, and the
-    // `!is_native` forced-native block of `invoke_on_class_shared_inner` below
-    // — which inlines the `workers`-field probe a fourth time rather than
-    // calling `threadpool_executor_has_real_workers`). Each dispatch path
-    // carries its own copy because each reaches the native by a different
-    // route; all four must be removed together or the paths disagree about the
-    // same receiver. What must replace them: `native_es_execute` is only
-    // correct for CratonVM's synthetic 2-field `Executors.new*ThreadPool()`
-    // stand-in, so under `--jdk-only` (where that stand-in cannot exist) the
-    // registration itself is a `SyntheticStub` that never dispatches, and the
-    // receiver probe becomes unreachable.
+    // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+    // `vm/src/runtime/interpreter/native_override.rs` for the full census, for
+    // the ninth (receiver-blind) site these eight exist to override, and for
+    // why all nine have to go together.
+    //
+    // The wave-1 markers named four of eight, and got one of those wrong. The
+    // hazard that undercount creates is specific: a mechanical "delete every
+    // marked `ThreadPoolExecutor` site" sweep leaves the four unmarked ones
+    // enforcing a policy the other four no longer apply, which is the same
+    // cold-path/warm-path split as the forced-native `String` lists.
+    //
+    // This copy also used to inline the `workers`-field probe by hand rather
+    // than calling `threadpool_executor_has_real_workers`, making three
+    // implementations of one predicate — and it took a plain `read()` where the
+    // helper documents why `read_recursive()` is required at these call sites.
     if effective_class == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && descriptor == "(Ljava/lang/Runnable;)V"
     {
-        if let Some(Value::Object(Some(recv))) = args.first() {
-            let recv_class_id = shared.mem.heap.class_id_of(*recv);
-            let has_real_workers = {
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| {
-                        matches!(
-                            shared.mem.heap.get_field(*recv, idx),
-                            Value::Object(Some(_))
-                        )
-                    })
-                    .unwrap_or(false)
-            };
-            if has_real_workers {
+        if let Some(recv_value @ Value::Object(Some(recv))) = args.first() {
+            if crate::runtime::interpreter::threadpool_executor_has_real_workers(
+                shared, recv_value,
+            ) {
                 return invoke_on_class_shared(
                     shared,
                     thread,
-                    recv_class_id,
+                    shared.mem.heap.class_id_of(*recv),
                     method_name,
                     descriptor,
                     args,
@@ -14693,34 +14877,25 @@ pub fn invoke_or_native(
         // single native dispatch VM-wide. `find_with_kind` above folds both
         // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native = native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
-        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 1 OF 2.
-        // The other copy is `real_protected_stub_class` in
-        // `vm/src/runtime/interpreter/invoke.rs`, and the two are NOT identical:
-        // this one includes `java/util/StringJoiner`, that one deliberately
-        // omits it (see the long comment there — yielding StringJoiner's stub
-        // to real bytecode on the interpreter path trips a heap-reference
-        // integrity defect). Wave 2 must RECONCILE them, not assume they are
-        // the same list and delete one; deleting either without the other
-        // desynchronises the two dispatch paths for this exact class.
-        // What must replace it: `NativeKind` alone. Under `--jdk-only` a
-        // `SyntheticStub` never dispatches, so no class needs "protecting"
-        // from one and the whole allow-list becomes dead.
+        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, cold path.
+        //
+        // This was an inline `matches!` maintained by hand alongside a second
+        // copy in `real_protected_stub_class`, and the two had drifted: this
+        // one listed `java/util/StringJoiner`, the other deliberately omitted
+        // it — so a `SyntheticStub` native's yield-to-real-bytecode verdict
+        // depended on how many times its call site had executed. The copies
+        // were centralised into one list plus one stated exception, and the
+        // exception was retired on 2026-08-04 once the defect that forced it
+        // was measured not to reproduce. Both paths now call the one predicate.
+        //
+        // Do NOT re-inline a copy here. The divergence this replaced is exactly
+        // what the contract §7 centralisation exists to prevent.
+        //
+        // What must ultimately replace the list: `NativeKind` alone — under
+        // `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
+        // "protecting" from one and the whole allow-list becomes dead.
         let real_protected_stub = synthetic_stub_native
-            && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
-                || matches!(
-                    effective_class,
-                    "java/util/concurrent/locks/ReentrantLock"
-                        | "java/util/concurrent/LinkedBlockingDeque"
-                        | "java/util/concurrent/atomic/AtomicBoolean"
-                        | "java/util/EnumSet"
-                        | "java/time/Instant"
-                        | "java/time/ZonedDateTime"
-                        | "java/util/StringJoiner"
-                        | "java/io/FileInputStream"
-                        | "java/lang/ref/Cleaner"
-                        | "java/lang/ref/Cleaner$Cleanable"
-                        | "java/lang/management/ManagementFactory"
-                ));
+            && crate::runtime::interpreter::real_protected_stub_class(effective_class);
         let has_real = real_protected_stub && {
             let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
@@ -15481,7 +15656,7 @@ fn invoke_special_shared_impl(
 /// `invoke_virtual_bytecode_only(this, "shutdown", ...)` call resolved the
 /// declaring class from the STPE receiver's DYNAMIC class -- re-finding
 /// STPE's own overriding shutdown() and looping forever. See
-/// docs/internal/threadpoolexecutor-shutdown-super-call-self-recursion-FIXED.md.
+/// fixed-suite-bugs/threadpoolexecutor-shutdown-super-call-self-recursion-FIXED.md.
 pub fn invoke_special_bytecode_only_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -18466,7 +18641,7 @@ fn invoke_on_class_shared_inner(
     // ACTUAL RECEIVER is one of our synthetic Path values. Check the
     // receiver's real class directly, independent of the resolved
     // `class_name`. Same family as
-    // `docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
+    // `fixed-suite-bugs/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
     // (which covered this exact call shape) — this hunk went missing from
     // `invoke_on_class_shared_inner` somewhere between that fix landing
     // (a6ce01fe2, 2026-07-19) and dev tip; re-added 2026-07-21 after
@@ -20023,48 +20198,20 @@ fn invoke_on_class_shared_inner(
                         // permanent fix.
                         //
                         // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
-                        // policy, POSITIVE FORM (21 methods). Its twin is the
-                        // INVERTED-EXCLUSION form in
-                        // `vm/src/runtime/interpreter/invoke.rs::force_native_over_real_jdk_bytecode`
-                        // (`class == "java/lang/String" && !matches!(..7 shapes..)
-                        // => return false`). This arm is the COLD path
-                        // (`invoke_on_class_shared_inner`, first call at a
-                        // site); that one is the WARM path (memoized
-                        // force-native gate). THEY MUST BE DELETED TOGETHER:
-                        // removing one alone makes cold and warm dispatch
-                        // disagree about which implementation of `String.equals`
-                        // / `hashCode` / `substring` runs, and the observable
-                        // behaviour of a String method then depends on how many
-                        // times its call site has executed. What must replace
-                        // both: nothing — these natives are registered as
-                        // `Intrinsic`, so `resolve_dispatch` step 2 takes them
-                        // on their own merit with no class-name list at all;
-                        // any that are NOT intrinsic-grade are `SyntheticStub`s
-                        // shadowing real `String` bytecode and must go.
+                        // policy, POSITIVE FORM (21 method names, matched
+                        // descriptor-blind). The list itself now lives in
+                        // `cold_forced_native_string_name`, beside the WARM
+                        // path's inverted-exclusion twin
+                        // (`warm_forced_native_string_candidate`), so the two
+                        // halves of one policy can be compared by a test
+                        // instead of by a reader diffing two files — see that
+                        // function for the RKC16N.6 defect they both work
+                        // around, for the five entries that were statically
+                        // unreachable until 2026-08-04, and for why they must
+                        // be deleted together.
                         || (class_name == "java/lang/String"
-                            && matches!(
+                            && crate::runtime::interpreter::cold_forced_native_string_name(
                                 method_name,
-                                "charAt"
-                                | "length"
-                                | "isEmpty"
-                                | "equals"
-                                | "hashCode"
-                                | "indexOf"
-                                | "lastIndexOf"
-                                | "substring"
-                                | "startsWith"
-                                | "endsWith"
-                                | "trim"
-                                | "toString"
-                                | "concat"
-                                | "replace"
-                                | "toLowerCase"
-                                | "toUpperCase"
-                                | "compareTo"
-                                | "compareToIgnoreCase"
-                                | "equalsIgnoreCase"
-                                | "contains"
-                                | "split"
                             ))
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
@@ -21378,7 +21525,7 @@ fn invoke_on_class_shared_inner(
                         // bookkeeping in an identity-hash side table
                         // (jul_file_handler_state_table, logging_shims.rs)
                         // rather than real instance field slots -- see
-                        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                        // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
                         // Without this override, real FileHandler bytecode
                         // (loaded from java.base) is concrete/non-abstract,
                         // so the default rule above ran its REAL
@@ -22583,24 +22730,21 @@ fn invoke_on_class_shared_inner(
         // path from `invoke_or_native` (e.g. reached from the interpreter's
         // reflection/initial-invoke routes) that independently consults
         // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See docs/known-issues/
-        // threadpoolexecutor-execute-npe-on-ctl-regression.md.
+        // copy of the receiver check. See fixed-suite-bugs/
+        // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
         //
         // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
-        // COPY 4 OF 4 — and the one that does NOT call
-        // `threadpool_executor_has_real_workers`, it re-inlines the
-        // `workers`-field probe. See COPY 1 in `invoke_or_native` above for the
-        // full note and what must replace all four.
+        // COPY 2 OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+        // `vm/src/runtime/interpreter/native_override.rs` for the census.
+        //
+        // This one re-inlined the `workers`-field probe rather than calling
+        // `threadpool_executor_has_real_workers` — with a plain `read()`, where
+        // the helper documents why `read_recursive()` is needed.
         let force_native_receiver_exempt = class_name_for_force
             == "java/util/concurrent/ThreadPoolExecutor"
             && method_name == "execute"
-            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
-                let recv_class_id = shared.mem.heap.class_id_of(*recv);
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.mem.heap.get_field(*recv, idx), Value::Object(Some(_))))
-                    .unwrap_or(false)
-            });
+            && matches!(args.first(), Some(recv) if
+                crate::runtime::interpreter::threadpool_executor_has_real_workers(shared, recv));
         // §7 routing. This site's whole purpose is "force the registered native
         // in front of real JDK bytecode", so the pre-existing condition IS
         // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
@@ -22715,20 +22859,21 @@ fn invoke_on_class_shared_inner(
     };
     let args = synchronized_args.as_deref().unwrap_or(args);
 
-    let result = if is_native {
-        // Look up native implementation.
-        //
-        // §7 routing. `is_native` here is NOT the same thing as
-        // `method.is_native()`: the `check_override` chain above also sets it
-        // for concrete methods whose real bytecode we deliberately shadow. So
-        // this site can be about to run a native in front of real bytes —
-        // exactly the §1.4 question — and it is the only place that can answer
-        // it, because it is the only place holding `declaring_class_id`.
-        //
-        // The answer is recovered from the SAME class-manager read that was
-        // already being taken for `class_name`: no extra lock, no extra
-        // hierarchy walk. It is computed only under `JdkOnly`, so a default
-        // `--real-jdk` run pays one `is_jdk_only()` bool test and nothing else.
+    // §7 routing, hoisted OUT of the `if is_native` arm below — see
+    // `bytecode_wins_under_strict` for why it cannot be decided inside it.
+    //
+    // `is_native` here is NOT the same thing as `method.is_native()`: the
+    // `check_override` chain above also sets it for concrete methods whose real
+    // bytecode we deliberately shadow. So this site can be about to run a native
+    // in front of real bytes — exactly the §1.4 question — and it is the only
+    // place that can answer it, because it is the only place holding
+    // `declaring_class_id`.
+    //
+    // The answer is recovered from the SAME class-manager read that was already
+    // being taken for `class_name`: no extra lock, no extra hierarchy walk. It
+    // is computed only under `JdkOnly`, so a default `--real-jdk` run pays one
+    // `is_jdk_only()` bool test and nothing else.
+    let (class_name, native_shadows_bytecode, registry_native) = if is_native {
         let policy = dispatch_policy(shared);
         let strict = policy.is_jdk_only();
         let (class_name, native_shadows_bytecode) = {
@@ -22768,14 +22913,45 @@ fn invoke_on_class_shared_inner(
                 }
                 Some(decision) => decision.native_callback(),
                 // JdkOnly, §7 step 3: this "native" is a bridge standing in
-                // front of concrete bytecode. Fall through to the JNI chain,
-                // and past it to the bytecode path, exactly as an unregistered
-                // native would have.
+                // front of concrete bytecode, and the bytecode wins.
                 None => None,
             },
             None => None,
         };
+        (class_name, native_shadows_bytecode, registry_native)
+    } else {
+        (String::new(), false, None)
+    };
 
+    // §7 step 3, the part the code did not previously implement.
+    //
+    // The `if is_native` arm below has THREE outcomes — registry native, JNI
+    // function pointer, or `UnsatisfiedLinkError`. It has no path to the
+    // bytecode. So when §7 step 3 declined a shadowing native above, the old
+    // code did not "fall through to the bytecode path exactly as an
+    // unregistered native would have", as its comment claimed: it fell through
+    // to the *link error*, for a method whose `Code` attribute is sitting right
+    // there. Measured 2026-08-04 on JDK 25: `--jdk-only` could not start a
+    // single `java.lang.Thread` — `UnsatisfiedLinkError: java/lang/Thread.run()V`,
+    // whose real bytecode the class-path image plainly declares — so every
+    // `new Thread(…)` and every `ExecutorService` was dead, and any workload
+    // that joined on one hung rather than failed.
+    //
+    // Deciding it here, before the `if`, is what makes the bytecode branch
+    // reachable at all.
+    //
+    // `Compatible` is bit-for-bit unchanged: `native_shadows_bytecode` is
+    // `false` unless the policy is `JdkOnly`, so this whole term folds away.
+    //
+    // Genuinely unimplemented natives still raise. If `is_native` came from
+    // `method.is_native()` then `native_shadows_bytecode` is `false` by
+    // construction (`!m.is_native()` is one of its conjuncts), so an
+    // `ACC_NATIVE` method with nothing behind it takes the error arm exactly as
+    // before — including one a host library would have served over JNI, since a
+    // `RegisterNatives` target is `ACC_NATIVE` too.
+    let is_native = is_native && !(registry_native.is_none() && native_shadows_bytecode);
+
+    let result = if is_native {
         // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
         // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
         // function pointers are not ABI-compatible with CratonVM's libffi
@@ -23303,6 +23479,223 @@ impl Drop for JniImplicitFrameGuard {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod native_diag_tests {
+    use super::*;
+
+    /// Serialises the tests that toggle `native_ring`'s process-global
+    /// `ENABLED`.
+    ///
+    /// libtest runs these on parallel threads and the flag is global, so
+    /// without this one test's `enable(false)` lands between another's
+    /// `enable(true)` and its assertion. That is a genuinely flaky failure that
+    /// looks exactly like the bug the assertion is written to catch, which is
+    /// the worst kind: it would have been "fixed" by weakening the assertion.
+    static RING_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The memoized half must contain ONLY startup-static gates.
+    ///
+    /// ARCH-2026-08-04 A3 folded thirteen diagnostic gates on the native funnel
+    /// into one word, computing eleven of them once. Two —
+    /// `dispatch_trace::enable()` (called at runtime by the stack-dump watchdog
+    /// so a hang in native code still leaves a breadcrumb) and
+    /// `native_ring::enable()` — are toggleable *after* the first native call.
+    /// Memoizing either would silently disable a diagnostic at exactly the
+    /// moment someone switched it on to chase a hang, and nothing in the
+    /// funnel's behaviour would reveal it. Pin the split.
+    #[test]
+    fn the_memoized_half_never_holds_a_runtime_toggleable_bit() {
+        let stat = native_diag_static();
+        assert_eq!(
+            stat & native_diag::DISPATCH_TRACE,
+            0,
+            "DISPATCH_TRACE is toggled at runtime by the stack-dump watchdog; \
+             it must be re-read per call, not memoized"
+        );
+        assert_eq!(
+            stat & native_diag::RING,
+            0,
+            "RING is toggled at runtime via native_ring::enable(); it must be \
+             re-read per call, not memoized"
+        );
+    }
+
+    /// Toggling the ring at runtime must move the mask, both directions.
+    ///
+    /// This is the behavioural half of the test above: it proves the dynamic
+    /// bit is actually re-read rather than merely absent from the memo.
+    #[test]
+    fn the_ring_bit_tracks_runtime_toggling() {
+        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = cratonvm_native_api::native_ring::is_enabled();
+
+        // Keep the window in which the process-global is flipped as short as
+        // physically possible — sample both masks, restore, and only THEN
+        // assert. libtest runs the rest of the suite on parallel threads and
+        // `RING.lock()` is process-wide; asserting inside the window would
+        // hold the ring on across panic/formatting machinery and perturb
+        // timing-sensitive neighbours.
+        cratonvm_native_api::native_ring::enable(true);
+        let on_mask = native_diag_mask();
+        cratonvm_native_api::native_ring::enable(false);
+        let off_mask = native_diag_mask();
+        let track_on = cratonvm_native_api::native_ring::any_recording_enabled();
+        cratonvm_native_api::native_ring::enable(was);
+
+        assert_ne!(
+            on_mask & native_diag::RING,
+            0,
+            "enabling the ring must set RING in the mask; if it does not, the \
+             funnel will skip record_enter/record_exit and the watchdog's \
+             STILL-IN-NATIVE breadcrumb is lost"
+        );
+        // `any_recording_enabled` also covers CRATONVM_TRACK_NATIVE, a
+        // separate env gate — only assert the bit clears when that is off too.
+        if !track_on {
+            assert_eq!(
+                off_mask & native_diag::RING,
+                0,
+                "disabling the ring must clear RING in the mask"
+            );
+        }
+    }
+
+    /// Every bit is distinct.
+    ///
+    /// Thirteen hand-assigned shifts collapsed from thirteen hand-written gate
+    /// calls. A duplicated shift would silently alias two diagnostics — arming
+    /// one would arm the other, and disarming one would disarm both — with no
+    /// symptom until somebody chased a hang with the wrong dump in hand.
+    #[test]
+    fn every_diagnostic_bit_is_distinct() {
+        let bits = [
+            ("BLOCKGC", native_diag::BLOCKGC),
+            ("VM_STATE", native_diag::VM_STATE),
+            ("STRAYSTACK", native_diag::STRAYSTACK),
+            ("EC_WATCH", native_diag::EC_WATCH),
+            ("MEMWATCH", native_diag::MEMWATCH),
+            ("YOUNGSCAN", native_diag::YOUNGSCAN),
+            ("LINKAGE", native_diag::LINKAGE),
+            ("ALTRACE", native_diag::ALTRACE),
+            ("UNPIN_RING", native_diag::UNPIN_RING),
+            ("STALE_OBJREF", native_diag::STALE_OBJREF),
+            ("REMAP_TRACE", native_diag::REMAP_TRACE),
+            ("DISPATCH_TRACE", native_diag::DISPATCH_TRACE),
+            ("RING", native_diag::RING),
+        ];
+        let mut seen = 0u32;
+        for (name, bit) in bits {
+            assert_eq!(bit.count_ones(), 1, "{name} must be a single bit");
+            assert_eq!(seen & bit, 0, "{name} aliases an earlier diagnostic bit");
+            seen |= bit;
+        }
+        assert_eq!(seen.count_ones(), bits.len() as u32);
+    }
+
+    /// The pre-call helper acts on exactly the bits it is given.
+    ///
+    /// The other half of the A3 transcription risk: the mask can be composed
+    /// correctly and still be *consumed* with the wrong bit at a use site. This
+    /// drives `native_diag_pre_call` with synthetic masks and checks that each
+    /// bit produces its own effect and no other — which the armed-flag route
+    /// cannot check, because these diagnostics are all fire-on-anomaly and
+    /// print nothing on a healthy run.
+    #[test]
+    fn pre_call_acts_only_on_the_bits_it_is_given() {
+        fn probe(_ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+            Ok(None)
+        }
+        let cb: NativeCallback = probe;
+        let mut thread = JvmThread::new(ThreadId(4242), "a3-pre-call-probe");
+
+        // Nothing armed: no ring token, no straystack push, no vm-state name.
+        let st = native_diag_pre_call(0, &mut thread, cb);
+        assert!(st.ring_idx.is_none(), "mask 0 must not enter the ring");
+        assert!(!st.straystack_pushed, "mask 0 must not push straystack");
+        assert!(st.vm_state_name.is_none(), "mask 0 must not name the callee");
+
+        // RING alone: a token, and nothing else.
+        //
+        // Deliberately does NOT enable the ring. `record_enter` returns its
+        // `DISABLED_TOKEN` when recording is off, so `ring_idx` is still
+        // `Some(..)` and the assertion still proves the bit reached
+        // `record_enter` — which is the entire claim. Enabling it would flip a
+        // *process-global* that libtest's other threads observe, and
+        // `RING.lock()` is process-wide, so this test would perturb every
+        // timing-sensitive test running beside it. `record_exit` on the
+        // disabled token is an explicit no-op.
+        let st = native_diag_pre_call(native_diag::RING, &mut thread, cb);
+        assert!(
+            st.ring_idx.is_some(),
+            "the RING bit must reach native_ring::record_enter"
+        );
+        assert!(!st.straystack_pushed);
+        assert!(st.vm_state_name.is_none());
+        if let Some(idx) = st.ring_idx {
+            cratonvm_native_api::native_ring::record_exit(idx);
+        }
+
+        // STRAYSTACK alone: a push, and nothing else. Pop it back.
+        let st = native_diag_pre_call(native_diag::STRAYSTACK, &mut thread, cb);
+        assert!(
+            st.straystack_pushed,
+            "the STRAYSTACK bit must push the thread-local native stack"
+        );
+        assert!(st.ring_idx.is_none());
+        assert!(st.vm_state_name.is_none());
+        CURRENT_NATIVE_STACK.with(|s| {
+            assert_eq!(
+                s.borrow().len(),
+                1,
+                "STRAYSTACK must have pushed exactly one entry"
+            );
+            s.borrow_mut().pop();
+        });
+
+        // VM_STATE alone: a resolved name, and nothing else.
+        let st = native_diag_pre_call(native_diag::VM_STATE, &mut thread, cb);
+        assert!(
+            st.vm_state_name.is_some(),
+            "the VM_STATE bit must resolve the callee name"
+        );
+        assert!(st.ring_idx.is_none());
+        assert!(!st.straystack_pushed);
+    }
+
+    /// With no diagnostics armed the mask is zero — the fast path is real.
+    ///
+    /// A default `cargo test` process sets none of the thirteen env vars, so
+    /// this is the shape every production run takes. If this ever starts
+    /// failing, some gate acquired a default-on reading and every native call
+    /// in the VM is now paying for the cold path.
+    #[test]
+    fn a_default_process_arms_nothing() {
+        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = cratonvm_native_api::native_ring::is_enabled();
+        cratonvm_native_api::native_ring::enable(false);
+        if cratonvm_native_api::native_ring::any_recording_enabled()
+            || crate::dispatch_trace::is_enabled()
+        {
+            // Another test in this process armed a dynamic gate; the static
+            // half is still the meaningful assertion.
+            assert_eq!(
+                native_diag_static(),
+                0,
+                "no CRATONVM_DBG_* var is set in a default test process, so \
+                 every memoized diagnostic bit must be clear"
+            );
+        } else {
+            assert_eq!(
+                native_diag_mask(),
+                0,
+                "no diagnostic is armed in a default test process, so the \
+                 native funnel's mask must be zero"
+            );
+        }
+        cratonvm_native_api::native_ring::enable(was);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -25121,7 +25514,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // CR-CLO-1 — `thread_stack_trace`'s cross-thread arm
-    // (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §1)
+    // (`arch-2026-07-26/vm-exec-closeout.md` §1)
     // -----------------------------------------------------------------------
 
     fn line_less_entry(class_id: ClassId, method: &str, bci: i32) -> StackTraceEntry {

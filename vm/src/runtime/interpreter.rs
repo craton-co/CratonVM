@@ -1919,10 +1919,15 @@ pub fn execute(
                         let class = cm_lock.get_class(class_id)?;
                         for &(pc, cp_idx) in &scan.typecheck_ops {
                             let class_name = class.constant_pool.get_class_name(cp_idx)?;
-                            let boxed: Box<str> = class_name.to_string().into_boxed_str();
-                            let ptr = boxed.as_ptr();
-                            let len = boxed.len();
-                            owned_jit_strings.push(boxed);
+                            // Interned for the life of the process rather than
+                            // owned by this compilation: `jit_checkcast` /
+                            // `jit_instanceof` memoize on the `(ptr, len)` pair
+                            // in thread-locals that outlive the compiled
+                            // method, so a recycled address would answer for
+                            // the class that used to live there. See
+                            // `cratonvm_jit::intern_typecheck_class_name`.
+                            let (ptr, len) =
+                                cratonvm_jit::intern_typecheck_class_name(class_name);
                             typecheck_info.push((pc, ptr, len));
                         }
                     }
@@ -4241,6 +4246,30 @@ fn execute_frame_from_index(
     // cannot be freed and recycled by a different method while `quick` is
     // `Some`. When `quick` is `None` a recycled address can only mislabel
     // another method as un-quickened -- a pessimisation, never a miscompare.
+    // ARCH-2026-08-04 A4b — hoisted out of the dispatch loop.
+    //
+    // `VmConfig` is immutable after `SharedVm::new`: `with_skip_verification` /
+    // `with_xverify_mode` are `mut self -> Self` builders that run before
+    // construction, so this is loop-invariant for the whole `execute()` call
+    // (indeed for the process). It was re-read once per bytecode as a
+    // `shared -> config -> bool` pointer chase.
+    //
+    // What it selects, and why it is a whole-mode switch rather than a
+    // per-opcode one: the fast-path local-access handlers (`lload`/`dload`,
+    // `istore`/`fstore`, `astore`, `lstore`/`dstore`, and the
+    // `get_local_compact_unchecked` / `set_local_compact_unchecked` helpers the
+    // `iload`/`iadd` fusions use) index `frame.locals` with the raw bytecode
+    // operand, relying on the verifier having proven `operand < max_locals`.
+    // Under `-noverify` / `-Xverify:none` that proof is gone. Note the indexing
+    // is ordinary Rust `Vec` indexing, so the failure is a *panic*, not memory
+    // unsafety — but a panic is still not an acceptable answer to a valid
+    // command line, hence the fallback to the bounds-checked decoded path.
+    //
+    // That fallback is what makes `--noverify` select a different
+    // implementation for all 122 fast-path arms at once, which is why
+    // `difftest`'s `interp-decoded` axis has to run (it did not until A4b; see
+    // `difftest/src/main.rs`).
+    let use_fast_path = !shared.config.skip_verification;
     let mut quick: Option<Arc<cratonvm_reader::QuickenedCode>> = None;
     let mut quick_code_ptr: *const u8 = std::ptr::null();
     // (The former `quick_hint` local is gone: `QuickenedCode` now resolves any
@@ -4255,51 +4284,18 @@ fn execute_frame_from_index(
         // yet. Polling first can let STW reclaim the Throwable before a caller
         // catch handler stores it.
         if let Some((exc, invoke_pc)) = pending_java_exception.take() {
-            let mut exc_pc = invoke_pc;
-            // GC-root gap: this loop can pop MANY frames while searching for a
-            // handler (unwinding all the way out of the method if none is
-            // found), and `find_exception_handler` -> `find_exception_handler_impl`
-            // lazily loads an unresolved catch-type class on a cache miss
-            // (`load_class_concurrent`, which runs <clinit> and can allocate/
-            // trigger a GC). Once a frame is popped it no longer roots the
-            // propagating exception, and nothing else does until a handler is
-            // found (pushed onto a frame's stack) or the method returns it as
-            // an Err - pin it in `native_pin_roots` for the whole walk so a GC
-            // mid-unwind can't reclaim it.
-            let pin_base = thread.native_pin_roots.len();
-            thread.native_pin_roots.push(exc);
-            loop {
-                let current_exc = thread.native_pin_roots[pin_base];
-                match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
-                {
-                    Some((handler_pc, exc_ref)) => {
-                        thread.frames[frame_idx].stack.clear();
-                        thread.frames[frame_idx]
-                            .stack
-                            .push(Value::Object(Some(exc_ref)))
-                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
-                        thread.frames[frame_idx].pc = handler_pc;
-                        fire_jvmti_exception_catch(
-                            shared.vm_identity,
-                            &thread.frames[frame_idx],
-                            handler_pc,
-                        );
-                        thread.native_pin_roots.truncate(pin_base);
-                        break;
-                    }
-                    None => {
-                        if frame_idx > initial_frame_idx {
-                            pop_and_recycle_frame_with_reason(shared, thread, true);
-                            frame_idx -= 1;
-                            exc_pc = thread.frames[frame_idx].last_instr_pc;
-                        } else {
-                            let current_exc = thread.native_pin_roots[pin_base];
-                            thread.native_pin_roots.truncate(pin_base);
-                            return Err(MethodCallFailed::ExceptionThrown(current_exc));
-                        }
-                    }
-                }
-            }
+            // The handler walk and its GC pin live in
+            // `exception_dispatch::unwind_to_handler` — shared with the
+            // `pending_runtime_error` arm below, which used to carry a
+            // byte-identical copy (ARCH-2026-08-04 A4a).
+            unwind_to_handler(
+                shared,
+                thread,
+                &mut frame_idx,
+                initial_frame_idx,
+                exc,
+                invoke_pc,
+            )?;
             continue;
         }
 
@@ -4322,7 +4318,7 @@ fn execute_frame_from_index(
         }
 
         // T19.H7 diag — opcode counter. Removed; documented findings in
-        // docs/roadmap-100.md T19.H7 section. Last localization:
+        // history/roadmap-100.md T19.H7 section. Last localization:
         // `org/jboss/modules/Main.main` pc=1306 dispatched, then a native
         // call from that opcode never returns (interpreter loop never
         // re-entered).
@@ -4360,59 +4356,20 @@ fn execute_frame_from_index(
             let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    let mut exc_pc = invoke_pc;
-                    // GC-root gap: see the identical pin in the
-                    // `pending_java_exception` arm above — this loop has the
-                    // same unpinned-across-frame-pops-and-lazy-class-load hazard.
-                    let pin_base = thread.native_pin_roots.len();
-                    thread.native_pin_roots.push(exc);
-                    loop {
-                        let current_exc = thread.native_pin_roots[pin_base];
-                        match find_exception_handler(
-                            shared,
-                            &thread.frames[frame_idx],
-                            exc_pc,
-                            current_exc,
-                        ) {
-                            Some((handler_pc, exc_ref)) => {
-                                thread.frames[frame_idx].stack.clear();
-                                thread.frames[frame_idx]
-                                    .stack
-                                    .push(Value::Object(Some(exc_ref)))
-                                    .map_err(|e| {
-                                        MethodCallFailed::InternalError(VmError::Runtime(e))
-                                    })?;
-                                thread.frames[frame_idx].pc = handler_pc;
-                                fire_jvmti_exception_catch(
-                                    shared.vm_identity,
-                                    &thread.frames[frame_idx],
-                                    handler_pc,
-                                );
-                                thread.native_pin_roots.truncate(pin_base);
-                                break;
-                            }
-                            None => {
-                                if frame_idx > initial_frame_idx {
-                                    // T17.Δ — exception-unwind.
-                                    pop_and_recycle_frame_with_reason(shared, thread, true);
-                                    frame_idx -= 1;
-                                    exc_pc = thread.frames[frame_idx].last_instr_pc;
-                                } else {
-                                    // Perf: the previous `exc_class` / `caller` /
-                                    // `mname` bindings here each took a
-                                    // `class_manager.read()` RwLock + `to_string()`
-                                    // allocation on every top-frame exception
-                                    // unwind, but their values were never used
-                                    // (no trace site consumed them). Dropped —
-                                    // behaviour is identical (pure, discarded
-                                    // computations).
-                                    let current_exc = thread.native_pin_roots[pin_base];
-                                    thread.native_pin_roots.truncate(pin_base);
-                                    return Err(MethodCallFailed::ExceptionThrown(current_exc));
-                                }
-                            }
-                        }
-                    }
+                    // Same walk as the `pending_java_exception` arm above, and
+                    // now literally the same code (ARCH-2026-08-04 A4a). The
+                    // two copies had already drifted in comments only, but the
+                    // GC pin they share is subtle enough that a fix landing in
+                    // one and not the other is a use-after-free reproducing on
+                    // just one of the two throw paths.
+                    unwind_to_handler(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        exc,
+                        invoke_pc,
+                    )?;
                     continue;
                 }
                 other => return Err(other),
@@ -4473,22 +4430,12 @@ fn execute_frame_from_index(
         // throughput. Unsupported opcodes and guarded edge cases still fall
         // through to the shared decoded handler below.
         //
-        // H7: the fast-path local-access handlers (lload/dload, istore/fstore,
-        // astore, lstore/dstore — and the `_unchecked` get/set helpers used by
-        // the iload/iadd/etc. fusions) index `frame.locals` with the raw
-        // bytecode operand WITHOUT a bounds check, relying entirely on the
-        // bytecode verifier having proven the operand `< max_locals`. When
-        // verification is globally disabled (`-noverify` / `-Xverify:none`)
-        // that invariant no longer holds, so an out-of-range operand would
-        // index out of bounds. Disable the unchecked fast path entirely in
-        // that mode and fall back to the bounds-checked slow path; the
-        // per-site checks below are a second line of defence (e.g. for
-        // per-class `skip_verification` generated classes that this cheap
-        // global flag does not cover). `skip_verification` is a single bool
-        // load — no per-instruction RwLock acquire.
+        // H7: `use_fast_path` is hoisted above the loop (ARCH-2026-08-04 A4b)
+        // — see the note at its binding for what it selects and why the
+        // per-class `skip_verification` case still relies on the per-site
+        // checks below as a second line of defence.
         // SAFETY (every `hot_fp` deref below): see the hoist note above —
         // reads only, no push, no `&mut` reborrow of the stack in between.
-        let use_fast_path = !shared.config.skip_verification;
         // Explicit `&` on the place expression: calling `.len()` directly on
         // `(*hot_fp).code` autorefs through the raw pointer, which the
         // `dangerous_implicit_autorefs` lint denies. The borrow is confined to
@@ -5219,7 +5166,7 @@ fn execute_frame_from_index(
                     // dropping the high bits. Copy the raw CompactValue for
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
-                    // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     //
                     // Underflow guard: an empty operand stack at a value
                     // return means earlier execution desynced the stack

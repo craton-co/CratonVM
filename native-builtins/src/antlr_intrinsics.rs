@@ -22,7 +22,7 @@ use cratonvm_native_api::NativeHandle;
 // memory. Linking one of those back into a config set silently poisons the
 // closure/reach computation, whose result ANTLR memoizes as a DFA edge — so a
 // single mistimed collection breaks every later prediction that reuses the
-// edge (see docs/internal/fixed-suite-bugs/hibernate/
+// edge (see fixed-suite-bugs/hibernate/
 // antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md).
 //
 // The rule for this file, enforced by `raw_pin_api_is_not_used_in_this_module`
@@ -6862,7 +6862,7 @@ mod antlr_prediction_context_tests {
     /// `unpin_native_roots(base)` truncates the pin stack, silently dropping
     /// every root taken after `base`. Both mistakes were made in this file and
     /// both produced the nondeterministic HQL misparse recorded in
-    /// `docs/internal/fixed-suite-bugs/hibernate/`
+    /// `fixed-suite-bugs/hibernate/`
     /// `antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
     /// `NativeHandleScope` + `NativeHandle` are the supported replacement:
     /// a handle is an opaque slot id, not a heap address, and the scope closes

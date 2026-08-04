@@ -149,6 +149,17 @@ foreignWideInt (ARRAY_BYTE_INDEX_SCALE, I)  bad=0
 descriptor declares. This affected far more than ZIP parsing: every JIT-compiled
 `ARRAY_*_BASE_OFFSET` user was reading 8.
 
+**Found twice, independently, on the same day.**
+`fix/hib-batchtest-jit-batch-binding-20260804` reached the same slot from the
+other end — compiled `ArraysSupport.mismatch` handed its intrinsic an offset of
+`0x7ff700000000`, the range check failed, it returned `-1` ("no mismatch"), and
+`Arrays.equals(long[],long[])` answered `true` for arrays that differ, which is
+what made H2 report a unique-index collision that did not exist. That branch's
+version of the coercion (which refuses, loudly, rather than writing a mistyped
+slot when no conversion exists) landed on `dev` first and is the one kept here;
+this branch's duplicate was dropped in the merge. See
+`fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+
 ### 6. An unpinned `ObjectRef` in the Spring `ZipInflaterInputStream` bridge
 
 Pre-existing on `dev`. Cause of the two `--nojit` residual failures found while

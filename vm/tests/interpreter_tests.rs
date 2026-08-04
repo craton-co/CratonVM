@@ -1479,7 +1479,7 @@ fn test_method_handle_type() {
 
 // WP1.6 acceptance: MethodHandle.invokeExact strict-arity round-trip.
 // `findVirtual` + `bindTo` + `invokeExact` is the literal acceptance text
-// in `docs/wildfly-ejbca-roadmap.md` Wave 1 §WP1.6. The pre-existing
+// in `gaps/wildfly-ejbca-roadmap.md` Wave 1 §WP1.6. The pre-existing
 // `test_method_handle_bind_to` exercises the loose `invoke` path; this
 // closes the gap by driving the signature-polymorphic strict-arity path.
 #[test]

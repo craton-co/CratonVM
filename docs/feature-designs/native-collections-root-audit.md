@@ -91,7 +91,7 @@ handing it over.
 Pinned by
 `overlay_owner_liveness_tests::a_chained_pointer_map_does_not_sweep_one_owners_keys_onto_another`,
 verified to FAIL on the old algorithm. Full write-up in
-[`../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md).
+`fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`.
 
 **For the next pass over this table:** a `yes` in `Remapped?` should mean the
 transformation is single-step and order-independent, not merely that a remap

@@ -1550,7 +1550,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
 /// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
@@ -1989,7 +1989,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -3086,7 +3086,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: docs/round7-gc.md §3).
+// free (audit: history/round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -3875,7 +3875,7 @@ fn jit_cp_alloc_stash_failure(
 /// So a `new` whose target class had not been loaded yet used to bail the whole
 /// compile, permanently, leaving hot methods carrying a cold
 /// `throw new SomeException(...)` in the interpreter forever
-/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+/// (`jit-compile-bail-unresolved-new-cold-class.md`).
 ///
 /// Doing the same resolution HERE is sound for the reason the doc gives: it is
 /// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
@@ -4976,7 +4976,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -6958,7 +6958,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md).
+    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -12651,7 +12651,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -13424,7 +13424,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/c2/vm-process-global-state.md`.
+/// `docs/feature-designs/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.

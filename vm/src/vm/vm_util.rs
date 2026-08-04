@@ -30,6 +30,7 @@
 //! escalation gate is still honoured where present, but it is now a no-op for
 //! the swallow path because swallowing no longer happens by default.
 
+use std::sync::Arc;
 use crate::classloading::{find_field_recursive, Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
@@ -2418,27 +2419,34 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
 // Post-clinit fixup for swallowed <clinit> exceptions
 // ---------------------------------------------------------------------------
 
-/// Widen a fixup value to the variant its field's descriptor declares.
+/// Coerce a post-`<clinit>`-fixup value to the `Value` variant a field with
+/// `descriptor` must hold, or `None` when the injected value cannot represent
+/// that type at all.
 ///
-/// The fixups below are written as `Value::Int(n)` because that is how the
-/// numbers read; the field may be declared `J`, `F` or `D`. A cell whose
-/// variant disagrees with the descriptor is a *latent* defect, not an
-/// immediate one: the interpreter's static read coerces, so the wrong variant
-/// is invisible until something reads the cell by descriptor instead — which
-/// the JIT's inline `getstatic` does, by loading the payload word the variant
-/// determines. See the call site for the ZIP-timestamp failure that exposed it.
-///
-/// `Value::Object` and matching variants pass through untouched, so this is a
-/// no-op for every fixup that was already right.
-fn coerce_static_to_descriptor(value: Value, descriptor: &str) -> Value {
-    match (descriptor.as_bytes().first(), &value) {
-        (Some(b'J'), Value::Int(i)) => Value::Long(i64::from(*i)),
-        // Widening: an integer literal into the float/double cell the field
-        // declares. Same intent as the `J` arm; no fixup writes one today, and
-        // the arm exists so adding one cannot reintroduce the defect.
-        (Some(b'F'), Value::Int(i)) => Value::Float(*i as f32),
-        (Some(b'D'), Value::Int(i)) => Value::Double(f64::from(*i)),
-        _ => value,
+/// The fixup call sites write plain integer literals; the field they land in
+/// is whatever the JDK currently declares. When the two disagree the slot ends
+/// up holding a well-formed `Value` of the WRONG width, which the interpreter
+/// silently tolerates (its `getstatic` widens an `Int` where a long is wanted)
+/// and JIT-compiled code does not (a `getstatic …:J` is a 64-bit load of the
+/// slot). See the call site for the `Unsafe.ARRAY_*_BASE_OFFSET` case that
+/// made `Arrays.equals(long[],long[])` return true for unequal arrays.
+fn coerce_static_to_descriptor(descriptor: &str, value: Value) -> Option<Value> {
+    let as_i64 = match value {
+        Value::Int(i) => Some(i as i64),
+        Value::Long(l) => Some(l),
+        _ => None,
+    };
+    match descriptor {
+        "J" => as_i64.map(Value::Long),
+        "I" | "S" | "B" | "C" | "Z" => as_i64.map(|v| Value::Int(v as i32)),
+        "F" => as_i64.map(|v| Value::Float(v as f32)),
+        "D" => as_i64.map(|v| Value::Double(v as f64)),
+        // Reference-typed field: only a reference may be written, and one is
+        // already the right shape (nothing to widen).
+        _ => match value {
+            Value::Object(_) => Some(value),
+            _ => None,
+        },
     }
 }
 
@@ -2461,28 +2469,41 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // were read back as default-zero by the interpreter, surfacing as the
     // "0 0 OK" output and the cascade NPE on signum during BigDecimal
     // <clinit>.
-    // The stored `Value` variant must match the field's DECLARED descriptor,
-    // not merely carry the right number — SB-LOADER-ZIPCONTENT (2026-08-04).
     //
-    // `jdk/internal/misc/Unsafe.ARRAY_*_BASE_OFFSET` is declared `J` on JDK 21+
-    // (`getstatic ... ARRAY_BYTE_BASE_OFFSET:J` in `ZipUtils.get16`'s
-    // bytecode), and the fixup below wrote `Value::Int(16)` into it. The
-    // interpreter reads that leniently and sees 16, so nothing looked wrong for
-    // a month — but the JIT's inline `getstatic` (`try_emit_inline_getstatic`,
-    // the direct-load path added 2026-08-03) dispatches on the descriptor: for
-    // `J` it loads the cell's 64-bit payload word, which an `Int` cell never
-    // wrote. Compiled code therefore read **8** where the interpreter read 16.
+    // EQUALLY CRITICAL, and the same class of defect one level down: the
+    // injected `Value`'s VARIANT must match the field's declared descriptor.
+    // Every caller below writes an integer literal, and `Unsafe`'s nine
+    // `ARRAY_*_BASE_OFFSET` fields are declared `J` (they became `long` in
+    // JDK 25; the sibling `ARRAY_*_INDEX_SCALE` are still `I`), so they were
+    // being handed a `Value::Int(16)`.
     //
-    // `ZipUtils.get16` is `getShortUnaligned(b, off + ARRAY_BYTE_BASE_OFFSET)`,
-    // so every compiled ZIP central-directory parse read from 8 bytes before
-    // the array data and the extra-field walk silently found nothing:
-    // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` saw the DOS
+    // The interpreter tolerated that — its `getstatic` reads the slot's
+    // `Value` and widens an `Int` where a long is wanted — so nothing failed
+    // for the first eighteen months. JIT-compiled code does not: a
+    // `getstatic …:J` lowers to a 64-bit load of the slot, which over an
+    // `Int`-tagged slot reads adjacent memory. Measured: compiled
+    // `jdk.internal.util.ArraysSupport.mismatch(int[],int[],int)` called
+    // `vectorizedMismatch(a, ARRAY_INT_BASE_OFFSET, …)` with an offset of
+    // 0x7ff700000000 instead of 16, the native's range check then failed, it
+    // returned -1 ("no mismatch"), and `Arrays.mismatch`/`Arrays.equals`
+    // reported two DIFFERENT int[]/long[] arrays as equal. See
+    // the internal record
+    // `fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+    //
+    // So coerce here rather than trusting ~30 call sites to keep tracking the
+    // JDK's field types: the descriptor is right there next to the name, and
+    // a fixup that writes the wrong width is worse than no fixup at all
+    // (a swallowed `<clinit>` at least leaves a well-typed zero).
+    //
+    // A second, independent symptom of the same slot, found in parallel on the
+    // Spring Boot loader shard: `java.util.zip.ZipUtils.get16` is
+    // `getShortUnaligned(b, off + ARRAY_BYTE_BASE_OFFSET)`, so compiled ZIP
+    // central-directory parses addressed 8 bytes before the array data and the
+    // extra-field walk silently found nothing —
+    // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` read the DOS
     // fallback 1980-01-01 instead of the extended timestamp's 1970-01-01. It
-    // passes cold and fails once the method is hot, which is the tell.
-    //
-    // Coercing here rather than at each call site keeps every fixup in this
-    // function right by construction: the same mismatch anywhere else would be
-    // just as invisible from the interpreter.
+    // passes cold and fails once the method is hot, which is the tell. See
+    // `fixed-suite-bugs/springboot/spring-boot-loader-residual-20260723-FIXED.md`.
     let set_static_by_name = |field_name: &str, value: Value| {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
@@ -2490,10 +2511,20 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             for f in &cls.fields {
                 if f.is_static() {
                     if &*f.name == field_name {
-                        let descriptor = f.descriptor.clone();
+                        let descriptor = Arc::clone(&f.descriptor);
                         drop(cm);
-                        let value = coerce_static_to_descriptor(value, &descriptor);
-                        super::vm_object::set_static_shared(shared, class_id, static_idx, value);
+                        let Some(typed) = coerce_static_to_descriptor(&descriptor, value) else {
+                            // Refuse rather than write a mistyped slot, and say
+                            // so: the per-class `n/total` warnings below then
+                            // report a shortfall instead of a silent success.
+                            tracing::warn!(
+                                "Post-clinit fixup: refusing to write {class_name}.{field_name} \
+                                 — injected value {value:?} does not fit declared type \
+                                 `{descriptor}`"
+                            );
+                            return false;
+                        };
+                        super::vm_object::set_static_shared(shared, class_id, static_idx, typed);
                         return true;
                     }
                     static_idx += 1;
@@ -3858,7 +3889,7 @@ std::thread_local! {
     /// with the *primordial* thread's frames or none at all — and the two crash
     /// classes that most need a Java stack (virtual-thread resume heap
     /// corruption, STW-takeover deadlock) both fault on workers. See
-    /// `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §6.3.
+    /// `arch-2026-07-26/startup-and-diagnostics.md` §6.3.
     ///
     /// Thread-local rather than a shared registry, deliberately: the crash
     /// handler runs *on the faulting thread* (Rust panic hook, Windows vectored
@@ -3980,69 +4011,6 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
-    }
-
-    // -----------------------------------------------------------------------
-    // Post-clinit fixup value/descriptor agreement
-    // (SB-LOADER-ZIPCONTENT, 2026-08-04)
-    //
-    // `jdk/internal/misc/Unsafe.ARRAY_BYTE_BASE_OFFSET` is declared `J`; the
-    // fixup wrote `Value::Int(16)`. The interpreter coerces on read, so this
-    // was invisible for as long as only the interpreter read it. The JIT's
-    // inline `getstatic` dispatches on the DESCRIPTOR — `J` loads the cell's
-    // 64-bit payload word, which an `Int` cell never wrote — so compiled code
-    // read 8 and every compiled ZIP header parse addressed 8 bytes before the
-    // array data.
-    //
-    // Asserted as a value/descriptor DECISION rather than end to end: the
-    // observable symptom was a wrong ZIP timestamp four libraries away, which
-    // no test would attribute back to here.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn an_int_fixup_widens_into_a_long_field() {
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Int(16), "J"),
-            Value::Long(16),
-            "ARRAY_BYTE_BASE_OFFSET is declared J; an Int cell there reads as 8 \
-             from the JIT's descriptor-dispatched inline getstatic",
-        );
-    }
-
-    #[test]
-    fn a_matching_int_fixup_is_left_alone() {
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Int(1), "I"),
-            Value::Int(1)
-        );
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Int(0), "Z"),
-            Value::Int(0),
-            "booleans ride in Value::Int by convention and must not be widened",
-        );
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Long(7), "J"),
-            Value::Long(7),
-            "an already-correct Long is untouched",
-        );
-    }
-
-    #[test]
-    fn reference_and_fp_descriptors_are_handled() {
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Object(None), "Ljava/lang/Object;"),
-            Value::Object(None),
-            "a reference fixup must pass through — widening it would be a \
-             type-confused cell, the very defect this function exists for",
-        );
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Int(2), "D"),
-            Value::Double(2.0)
-        );
-        assert_eq!(
-            coerce_static_to_descriptor(Value::Int(2), "F"),
-            Value::Float(2.0)
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -4938,5 +4906,74 @@ mod tests {
         });
         assert!(a.join().unwrap().contains("\"A\""));
         assert!(b.join().unwrap().contains("\"B\""));
+    }
+}
+
+#[cfg(test)]
+mod post_clinit_fixup_typing_tests {
+    use super::coerce_static_to_descriptor;
+    use crate::types::Value;
+
+    /// The defect this guards: `Unsafe`'s nine `ARRAY_*_BASE_OFFSET` fields are
+    /// declared `J`, the fixup hands them an integer literal, and a slot
+    /// holding `Value::Int` where a `long` belongs reads back as garbage from
+    /// JIT-compiled code — `Arrays.equals(long[],long[])` answered `true` for
+    /// unequal arrays. Assert on the VARIANT, not just the numeric value: an
+    /// `assert_eq!(as_i64(...), 16)` passes just as happily on the broken one.
+    #[test]
+    fn a_long_field_gets_a_long_even_when_the_call_site_writes_an_int() {
+        assert!(matches!(
+            coerce_static_to_descriptor("J", Value::Int(16)),
+            Some(Value::Long(16))
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("J", Value::Long(16)),
+            Some(Value::Long(16))
+        ));
+    }
+
+    #[test]
+    fn the_narrow_integral_descriptors_stay_int() {
+        // `ARRAY_*_INDEX_SCALE` (I), `String.LATIN1`/`UTF16` (B),
+        // `UnsafeConstants.BIG_ENDIAN` (Z) all share this arm.
+        for d in ["I", "S", "B", "C", "Z"] {
+            assert!(
+                matches!(coerce_static_to_descriptor(d, Value::Int(4)), Some(Value::Int(4))),
+                "descriptor {d}"
+            );
+            // A long-typed literal narrows rather than being refused: the call
+            // sites are integer constants, not user input.
+            assert!(
+                matches!(coerce_static_to_descriptor(d, Value::Long(4)), Some(Value::Int(4))),
+                "descriptor {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn floating_descriptors_convert_and_references_pass_through() {
+        assert!(matches!(
+            coerce_static_to_descriptor("F", Value::Int(2)),
+            Some(Value::Float(f)) if f == 2.0
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("D", Value::Int(2)),
+            Some(Value::Double(d)) if d == 2.0
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("Ljava/lang/Object;", Value::Object(None)),
+            Some(Value::Object(None))
+        ));
+    }
+
+    /// A mismatch the fixup cannot repair must be REFUSED, not written: a
+    /// mistyped slot is worse than the well-typed zero a swallowed `<clinit>`
+    /// leaves behind, and the caller turns `None` into a visible shortfall in
+    /// the `populated (n/18)` warning.
+    #[test]
+    fn an_impossible_coercion_is_refused() {
+        assert!(coerce_static_to_descriptor("Ljava/lang/String;", Value::Int(16)).is_none());
+        assert!(coerce_static_to_descriptor("[I", Value::Long(16)).is_none());
+        assert!(coerce_static_to_descriptor("J", Value::Object(None)).is_none());
     }
 }

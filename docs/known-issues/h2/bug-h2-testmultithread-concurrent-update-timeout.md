@@ -28,7 +28,7 @@ interesting part.
 
 ## The UPDATE path has a real contention component — the INSERT path did not
 
-`docs/internal/repros/h2-insert-scale-20260731/H2UpdateScaleProbe.java` models
+`repros/h2-insert-scale-20260731/H2UpdateScaleProbe.java` models
 `testConcurrentUpdate` exactly (same `NUMBER(18,0)` PK schema, same 10 000-row
 `MERGE` seed, same `UPDATE account SET balance=? WHERE id=?` + `commit` inner
 loop, same `LOCK_TIMEOUT=10000`) with thread and update counts as parameters.

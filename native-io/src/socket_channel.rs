@@ -3050,7 +3050,7 @@ fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Opti
 /// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
 /// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
 /// the calling thread, silently killing it. See
-/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #3 — this silently killed HttpClient5's I/O reactor worker
 /// thread mid-connection-setup, before it ever reached `SocketChannel
 /// .connect()`, hanging every request through

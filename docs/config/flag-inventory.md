@@ -152,7 +152,7 @@ failing on a CI runner that inherits the variable, which reads as a flake.
 
 The mirror-image defect — `set_var` on a flag that *is* declared — has the same
 shape and is already written up:
-`docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+`libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 `flag_env_mutation_guard.rs` catches that one. `flag_declaration_guard.rs`, added
 in this pass, catches this one.
 
