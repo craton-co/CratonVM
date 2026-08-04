@@ -88,7 +88,7 @@ The conversion is `LoopXform::rebuild_pc_to_native` plus the pointwise
 |---|---|---|
 | 1 | `osr_pc_to_native` is bci-indexed by the runtime but output-pc-indexed by the emitter | **Handled and now TYPED apart.** `jit/src/osr_coords.rs` — `OutPcIndexed` / `BciIndexed`, with the identity conversion checked against `orig_code_len`. |
 | 2 | The `-1` refusal sentinel was not enforced as an invariant | **Fixed before this lane.** The publication site re-imposes `-1` at every bci `osr_entry_pc` refuses, "regardless of which producer filled the vector". |
-| 3 | The OSR compile path calls the backend directly, not through `try_compile` | **Fixed 2026-08-04.** `jit/src/compile_gate.rs` is the one door; all three call it, and a backend entry with no admission open is counted. |
+| 3 | The OSR compile path calls the backend directly, not through `try_compile` | **Fixed 2026-08-04.** `jit/src/compile_gate.rs` is the one door; all three call it, the backend *requires* the token (so skipping it is a compile error), and an entry made under the test escape hatch is still counted. It still calls the backend directly — what it can no longer do is skip the admission chain. |
 | 4 | `osr_entry_frame_state` and the deopt frame state are unchecked against each other | **Fixed 2026-08-04.** `CompiledMethod::osr_home_disagreement`, consulted by `validate_osr_entry` before the per-slot loop. |
 
 ---
@@ -215,13 +215,32 @@ does two things:
 It returns a `#[must_use]` RAII token that owns the witness, so dropping it
 early re-narrows the window it exists to widen.
 
-**The drift witness.** `x64::compile_with_param_slots` calls
-`compile_gate::note_backend_entry`, which counts backend entries taken with no
-token open on the thread. A fourth door does not merely miss the checks; it
-moves `ungated_backend_entries()`, which is asserted zero over a real run.
-Behaviour-named rather than source-scanning, because five checks in this
-repository named a *file* where they meant a module and died when that file was
-split.
+**The strengthening: "cannot", not "will be caught".** The brief asks for the
+two paths to be unable to *drift again*, and a counter asserted zero by a test
+is only the second of those. So `x64::compile_with_param_slots` (and the legacy
+`compile` wrapper) **take `&CompileAdmission`**, and the only way to obtain one
+is `compile_gate::admit`. A fourth door written without the gate does not
+compile.
+
+That leaves one hole, deliberately: the `jit` crate's own tests drive the
+backend with hand-built bytecode and no method identity to admit, and an
+integration test under `jit/tests/` is a separate crate, so `#[cfg(test)]`
+cannot serve them. `CompileAdmission::for_backend_test()` is the way in, and it
+is built not to hide anything — it does **not** open the thread scope, so an
+entry made under it is still counted by `ungated_backend_entries()`, which the
+VM asserts is zero over a real run. **The type system stops the accident; the
+counter stops the deliberate misuse; the name makes the latter greppable.**
+
+Both layers are behaviour-named rather than source-scanning, because five checks
+in this repository named a *file* where they meant a module and died when that
+file was split.
+
+What this does **not** do: unify `compile_osr_artifact` and `try_compile_inner`
+into one function. The OSR door still carries ~1,000 lines of its own
+constant-pool resolution, duplicating what `try_compile_inner` does with
+different resolvers. That duplication is real and still open — but it was never
+the drift the brief was about, which was the *admission chain*, and that is now
+impossible to skip.
 
 Two things this deliberately did NOT do. `compile_osr_artifact` asks the two
 whole-method vetoes (kill switch, bisect levers) *before* consulting its

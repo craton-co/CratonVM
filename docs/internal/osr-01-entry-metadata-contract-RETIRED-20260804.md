@@ -13,14 +13,40 @@
 > |---|---|
 > | 1 — nothing typed the two pc spaces apart | `jit/src/osr_coords.rs`. The `OutPcIndexed` → `BciIndexed` conversion, with the **identity** direction checked against `orig_code_len`; it had been a bare `None =>` match arm resting on an unstated assumption. |
 > | 2 — the `-1` refusal sentinel | Already enforced at the publication site before this lane; re-verified. |
-> | 3 — the second compile door | `jit/src/compile_gate.rs`. There turned out to be **three** doors, not two, and neither direct one had ever checked the code-cache cap. The OSR door's compile-epoch witness was also ~1,000 lines too late to cover its own class loading. |
+> | 3 — the second compile door | `jit/src/compile_gate.rs`. There turned out to be **three** doors, not two, and neither direct one had ever checked the code-cache cap. The OSR door's compile-epoch witness was also ~1,000 lines too late to cover its own class loading. The backend now *requires* the admission token, so skipping the gate is a compile error. |
 > | 4 — the two frame views, unchecked | `CompiledMethod::osr_home_disagreement`. The pair that can actually contradict is the precise `FrameState` versus the **register homes** — `osr_entry_frame_state` and "the deopt frame state" are literally the same object. |
-> | "A test where they disagree must fail" | Six synthetic-vector tests in `osr_contract`, five in `osr_coords`, seven in `compile_gate`, seven for the frame-view check — plus `vm-cli/tests/jit_compile_gate_doors.rs`, and three injected defects each shown to trip a distinct check. |
+> | verify §1 — refusals asserted against the *mapping function* over a synthetic vector | `x64::licm::loop_xform_tests::rebuilt_pc_to_native_follows_the_osr_entry_image` is exactly that (`out[pc] = pc*4`, asserted through `osr_entry_pc`). Pre-existing; re-verified rather than rewritten. |
+> | "A test where they disagree must fail" | Six synthetic-vector tests in `osr_contract`, five in `osr_coords`, eight in `compile_gate`, seven for the frame-view check — plus `vm-cli/tests/jit_compile_gate_doors.rs`, and three injected defects each shown to trip a distinct check. |
 >
-> One thing the brief asked for that **cannot be written as stated**: "the three
-> vectors are index-compatible". Two of the three are not in the same space —
-> `osr_local_assignments` is indexed by local index, not by any pc. The design
-> doc's coordinate table is the correction.
+> ## What this brief asked for that cannot be written as stated
+>
+> Three things, kept here rather than quietly dropped, because a future reader
+> comparing brief to code will otherwise conclude the lane stopped early:
+>
+> 1. **"The three vectors are index-compatible."** Two of the three are not in
+>    the same space — `osr_local_assignments` is indexed by *local index*, not
+>    by any pc. Length-compatibility is checked for the two that are bci-indexed
+>    and coverage for the third; the design doc's coordinate table is the
+>    correction.
+> 2. **"…and on which entries are refused."** The `-1` sentinel is enforced at
+>    publication (item 2), but there is deliberately no cross-vector
+>    *refused-set* assertion: the dead mask is filled from basic-block starts
+>    and the entry table from where the emitter allowed an entry, so the two
+>    sets differ legitimately on the untransformed path. Asserting it would
+>    produce a check that fails for reasons unrelated to any defect — the exact
+>    trap this brief's own footnote about the loop-rewriter test warns about.
+> 3. **Item 4 as worded.** `osr_entry_frame_state` *reads* `deopt_points`, so
+>    "check them against each other" is a tautology. The cross-check that has
+>    content is against the register homes, which is what the trampoline
+>    actually seeds through.
+>
+> And one thing done in the weaker of the two forms this brief offered: the two
+> functions are **not** unified. `compile_osr_artifact` still has its own ~1,000
+> lines of constant-pool resolution. The brief permitted that — *"if that means
+> the direct path grows a witness or a wrapper, say so and do it"* — and the
+> admission chain, which is what drifted, is now impossible to skip. The
+> resolution duplication is a separate, still-open piece of work that no lane
+> owns.
 
 **Status:** not started as a lane; several one-off fixes have landed around it.
 **Owns:** `jit/src/lib.rs` (the OSR region), `jit/src/x64.rs` (the OSR
