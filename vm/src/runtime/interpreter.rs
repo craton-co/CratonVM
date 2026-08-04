@@ -3933,6 +3933,24 @@ pub(crate) enum OsrBackoffOutcome {
     ThrowJava(ObjectRef),
 }
 
+/// Back-edges of loop work credited as one method invocation for tier-up.
+///
+/// 512 keeps the accounting cheap (one relaxed atomic per 512 iterations) while
+/// staying well inside the shape that matters: a 300-iteration constant-pool
+/// loop called once per class credits an invocation roughly every other class,
+/// so a few hundred classes carry the method over the threshold.
+const LOOP_WORK_STRIDE: u32 = 512;
+
+/// `CRATONVM_JIT=loop-work-tierup` — count loop iterations towards the method
+/// invocation threshold. Read once and cached; this sits on the interpreter's
+/// back-edge path. Default-OFF → behaviour byte-for-byte unchanged.
+fn loop_work_tierup_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOOP_WORK_TIERUP").is_some()
+    })
+}
+
 /// Run the standard back-edge OSR orchestration: backoff check → try_osr →
 /// rejection bookkeeping. See [`OsrBackoffOutcome`] for the meaning of
 /// each return variant.
@@ -3959,24 +3977,6 @@ pub(crate) enum OsrBackoffOutcome {
 /// safepoint_check(shared, thread);
 /// ```
 #[inline]
-/// Back-edges of loop work credited as one method invocation for tier-up.
-///
-/// 512 keeps the accounting cheap (one relaxed atomic per 512 iterations) while
-/// staying well inside the shape that matters: a 300-iteration constant-pool
-/// loop called once per class credits an invocation roughly every other class,
-/// so a few hundred classes carry the method over the threshold.
-const LOOP_WORK_STRIDE: u32 = 512;
-
-/// `CRATONVM_JIT=loop-work-tierup` — count loop iterations towards the method
-/// invocation threshold. Read once and cached; this sits on the interpreter's
-/// back-edge path. Default-OFF → behaviour byte-for-byte unchanged.
-fn loop_work_tierup_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOOP_WORK_TIERUP").is_some()
-    })
-}
-
 pub(crate) fn try_osr_with_backoff(
     shared: &SharedVm,
     thread: &mut JvmThread,
