@@ -8809,8 +8809,9 @@ fn native_map_remove_pinned(
 //
 // On a `LinkedHashMap` that bytecode path is
 // `HashMap.remove(k,v)` -> `HashMap.removeNode` -> `LinkedHashMap.afterNodeRemoval`,
-// whose first statement is `(LinkedHashMap.Entry<K,V>) e`. Our nodes are
-// `java/util/LinkedHashMap$Node` (see `lhm_alloc_node`), so it threw
+// whose first statement is `(LinkedHashMap.Entry<K,V>) e`. Our nodes were
+// `java/util/LinkedHashMap$Node` (see `lhm_alloc_node`, which now mints the
+// real `LinkedHashMap$Entry`), so it threw
 // `ClassCastException: java.util.LinkedHashMap$Node cannot be cast to
 // java.util.LinkedHashMap$Entry`. Kafka's
 // `MetadataLoader.removeAndClosePublisher` calls exactly
@@ -29871,8 +29872,8 @@ fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ===========================================================================
 // LinkedHashMap = 5-field synthetic:
 //   0: buckets (Object[]), 1: size (Int), 2: capacity (Int), 3: head (Node), 4: tail (Node)
-// LinkedHashMap$Node = 6-field synthetic:
-//   0: key, 1: value, 2: hash, 3: next (bucket chain), 4: before, 5: after (insertion order)
+// LinkedHashMap$Entry = the REAL 6-field JDK node (see `LHM_NODE_*` below):
+//   0: hash, 1: key, 2: value, 3: next (bucket chain), 4: before, 5: after (insertion order)
 
 const LHM_FIELD_BUCKETS: usize = 0;
 const LHM_FIELD_SIZE: usize = 1;
@@ -30082,13 +30083,16 @@ fn lhm_ptr_cache() -> &'static Mutex<StdHashMap<usize, usize>> {
     C.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-// Real JDK LinkedHashMap$Node layout (extends HashMap$Node{hash,key,value,next}
+// Real JDK LinkedHashMap$Entry layout (extends HashMap$Node{hash,key,value,next}
 // and adds before,after): hash@0, key@1, value@2, next@3, before@4, after@5.
+// Verified with `javap -p --module java.base java.util.LinkedHashMap$Entry` on
+// the JDK 25 the suites run, and `compute_field_layout` lays superclass fields
+// out first, in declaration order — so these indices are the real ones.
 // Using the real slot order (not the historical synthetic key@0/value@1/hash@2)
 // is required so inherited real-JDK `HashMap.writeObject`→`internalWriteEntries`
 // (Java serialization; NOT force-native) reads the right slots — the old order
 // serialized `{k=v}` as `{v=null}`, desyncing peers. Nodes bind to the real
-// LinkedHashMap$Node class, and slot 0 = hash:I now holds an Int, so the
+// LinkedHashMap$Entry class, and slot 0 = hash:I now holds an Int, so the
 // descriptor-aware field writes/reads coincide with each slot's declared type.
 const LHM_NODE_HASH: usize = 0;
 const LHM_NODE_KEY: usize = 1;
@@ -30127,7 +30131,16 @@ fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i
     // Pin+re-read them across the allocation.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Node", LHM_NODE_NUM_FIELDS);
+    // The real JDK's nested node type, NOT the `java/util/LinkedHashMap$Node`
+    // this used to mint. That name does not exist in the JDK, so every piece of
+    // real-JDK bytecode that reached one of our nodes either threw
+    // (`afterNodeRemoval`'s `(LinkedHashMap.Entry) e`, the
+    // `kafka-embedded-kraft-...-FIXED` defect 1) or found no method at all
+    // (`getKey()`/`getValue()`/`setValue()` are declared on the real
+    // `HashMap$Node` and inherited, so on the fake class they were a
+    // `NoSuchMethodError`). The slot layout below was already the real one, so
+    // this is a change of class IDENTITY only — see `LHM_NODE_*`.
+    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Entry", LHM_NODE_NUM_FIELDS);
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -30750,6 +30763,33 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // A LinkedHashMap value is a REFERENCE: the node's value slot is
+    // `V value` -> `Ljava/lang/Object;` on the real `java/util/HashMap$Node`
+    // that `LinkedHashMap$Entry` extends. Now that `lhm_alloc_node` binds to
+    // that real class, the descriptor-aware `set_field` path coerces a
+    // primitive `Value` in that slot to NULL.
+    //
+    // Our own set layer writes a raw `Value::Int(1)` PRESENT sentinel there
+    // (`native_hs_add`), and `native_hs_add` / `native_hs_remove` decide "was
+    // it already in the set" purely from whether the previous value was null.
+    // Coerced to null, `LinkedHashSet.remove(x)` DELETED the element and still
+    // reported `false` — which broke Jersey's
+    // `Resource.Builder.onBuildMethod`, whose
+    // `checkState(methodBuilders.remove(builder))` then threw
+    // `IllegalStateException` and failed every test that starts the Jersey
+    // filter. `CopyOnWriteArraySet` shares the same backing and broke with it.
+    //
+    // Box it on the way in. A real Java caller can never arrive here with a
+    // primitive — `Map.put`'s descriptor is `(Object,Object)Object`, so the
+    // interpreter has already boxed — so this only ever fires for our own
+    // internal sentinels, and `Integer.valueOf(1)` hands back the JDK's cached
+    // instance rather than allocating. Boxing here, before the pins below, is
+    // deliberate: `box_primitive_result` dispatches `valueOf`, which can GC.
+    let value = match value {
+        Value::Object(_) => value,
+        primitive => box_primitive_result(ctx, primitive),
+    };
+
     // GC-SAFETY: `this` is a bare Rust local read from `args`, not itself a
     // GC root -- only a `pin_native_root`/`read_native_pin` handle survives a
     // moving GC. `map_hash_key` (key.hashCode()), `lhm_resize` (allocates a
@@ -30875,38 +30915,38 @@ fn native_lhm_put_evict(
     }
     if evict && invoke_remove_eldest {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
-            // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
-            // with no real `getKey()`/`getValue()`; an override that inspects
-            // the eldest (e.g. Hibernate's `LRU.removeEldestEntry` calls
-            // `eldest.getKey()`) would hit a NoSuchMethodError. Wrap the head's
-            // key/value in a real `SimpleImmutableEntry` (which has working
-            // `getKey`/`getValue` natives) for the hook call.
+            // Hand the override the REAL head node, exactly as HotSpot's
+            // `LinkedHashMap.afterNodeInsertion` does
+            // (`removeEldestEntry(first)` where `first = head`).
+            //
+            // This used to wrap the head's key/value in a fresh
+            // `AbstractMap$SimpleImmutableEntry`, because the node was a fake
+            // `java/util/LinkedHashMap$Node` whose class declares no methods —
+            // so an override that inspects the eldest (Hibernate's
+            // `LRU.removeEldestEntry` calls `eldest.getKey()`) hit a
+            // `NoSuchMethodError`. `lhm_alloc_node` now mints the real
+            // `java/util/LinkedHashMap$Entry`, which inherits the real
+            // `HashMap$Node.getKey/getValue/setValue/equals/hashCode/toString`
+            // bodies and reads them off the very slots we write, so the copy is
+            // no longer needed — and the copy was itself a deviation: it was
+            // immutable (`setValue` threw `UnsupportedOperationException` where
+            // HotSpot mutates the map) and never `==` the live entry.
+            let head_pin = ctx.pin_native_root(head);
+            // Family-1 fix (cce0079): the key is re-used for the reentrant
+            // remove below, across the hook's virtual dispatch (GC-capable) —
+            // pin it so the remove receives the current address, not a pre-GC
+            // one. Read it BEFORE the dispatch: an override that removes the
+            // eldest reentrantly may leave the node unlinked by the time we
+            // get back.
             let key = ctx.get_field(head, LHM_NODE_KEY);
-            let val = ctx.get_field(head, LHM_NODE_VALUE);
-            // Family-1 fix (cce0079): `key` is re-used for the reentrant
-            // remove below, across BOTH the entry alloc and the hook's
-            // virtual dispatch (each GC-capable) — pin it so the remove
-            // receives the current address, not a pre-GC one.
             let eldest_key_pin = pin_value(ctx, key);
-            let eldest = match ctx.new_object_initialized(
-                "java/util/AbstractMap$SimpleImmutableEntry",
-                "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                &[key, val],
-            )? {
-                Some(Value::Object(Some(e))) => e,
-                _ => {
-                    ctx.unpin_native_roots(this_pin);
-                    return Ok(Some(Value::Object(None)));
-                }
-            };
-            // `new_object_initialized` above allocates and can trigger a
-            // moving GC; refresh `this` before the virtual dispatch below.
             let this = ctx.read_native_pin(this_pin, this);
+            let head = ctx.read_native_pin(head_pin, head);
             let verdict = ctx.invoke_virtual(
                 this,
                 "removeEldestEntry",
                 "(Ljava/util/Map$Entry;)Z",
-                &[Value::Object(Some(eldest))],
+                &[Value::Object(Some(head))],
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
                 // `invoke_virtual` above runs arbitrary Java and can trigger
