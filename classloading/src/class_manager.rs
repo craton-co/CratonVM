@@ -4719,7 +4719,7 @@ impl ClassManager {
                     Some(methods) => {
                         let found = methods
                             .iter()
-                            .find(|((n, d), _)| &***n == name.as_str() && &***d == descriptor.as_str())
+                            .find(|((n, d), _)| &**n == name.as_str() && &**d == descriptor.as_str())
                             .map(|(_, flags)| *flags);
                         ImageMethodVerdict {
                             image_has_class: true,
