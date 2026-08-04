@@ -5,7 +5,7 @@
 #
 # This script used to export a per-app `CRATONVM_<APP>_REAL=1` for each of the
 # 34 apps below. **Nothing in the VM ever read any of those variables** — the
-# flag census (docs/internal/flag-census.md section 2) lists all 34 as dead —
+# flag census (flag-census.md section 2) lists all 34 as dead —
 # so every run here was a plain run and the results said nothing about the real
 # path. The `run` helper's `"${env_var}=1" && export "${env_var}=1"` line was
 # also a no-op: it tried to *execute* `CRATONVM_HBASE_REAL=1` as a command,

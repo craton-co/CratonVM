@@ -5,7 +5,7 @@
 | **Status** | root-caused and FIXED 2026-08-03. **It does not close the Tomcat classes** — see [§ What this does NOT fix](#what-this-does-not-fix), which is measured, not assumed |
 | **Severity** | medium — a real VM-wide pathology worth 3.5x on a class-parsing probe, but NOT the binding constraint on the deploy classes |
 | **HotSpot** | unaffected — completely flat across the same provocations |
-| **Discovered** | while re-deriving why `docs/internal/tomcat/{04,29,30}` are CLOSED and the tests still hang |
+| **Discovered** | while re-deriving why `tomcat/{04,29,30}` are CLOSED and the tests still hang |
 
 ## The 8 hanging classes, classified
 
@@ -21,7 +21,7 @@ From `apps/tomcat/.suite/results/rerun3-20260803-4shard` (identical set on the
 | `catalina.startup.TestHostConfigAutomaticDeploymentUpdateWarOffline` | embedded deploy |
 | `naming.TestEnvEntry` | embedded start/stop, once per `@Test` |
 | `coyote.http2.TestHttp2Section_8_2` | 6 658 parameterised cases at ~22x HotSpot; 2 043 done in 1 500 s. Not a hang — it needs ~4 900 s |
-| `tomcat.util.http.TestMethodPerformance` | the ~400x charset chain; `docs/internal/tomcat/30-...-CLOSED.md` owns it and is right that it is re-homed |
+| `tomcat.util.http.TestMethodPerformance` | the ~400x charset chain; `tomcat/30-...-CLOSED.md` owns it and is right that it is re-homed |
 
 So **six of the eight are one family**, and none of the three CLOSED documents
 is wrong about the item it closed — they are closed on the *causes they name*.

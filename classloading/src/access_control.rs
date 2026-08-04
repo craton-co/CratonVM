@@ -60,8 +60,8 @@
 //! Wiring this up requires edits in `vm/src/runtime/interpreter.rs`, which this
 //! module's owner does not own; the exact insertion points are recorded under
 //! "cross-owner requests" in
-//! `docs/internal/arch-2026-07-26/classloading-verify-and-resolve.md` and in
-//! `docs/internal/arch-2026-07-26/access-control-and-map-coverage.md`.
+//! `arch-2026-07-26/classloading-verify-and-resolve.md` and in
+//! `arch-2026-07-26/access-control-and-map-coverage.md`.
 //!
 //! # 2026-07-26: the two false-denial defects are FIXED; the checks are safe
 //! to wire
@@ -1561,7 +1561,7 @@ mod tests {
         //     is the check that stops a superclass-typed value from reaching a
         //     protected member, and it is strictly stronger. It is NOT
         //     implemented here and cannot be — this function never sees the
-        //     stack. See `docs/internal/arch-2026-07-26/`.
+        //     stack. See `arch-2026-07-26/`.
         //
         // HotSpot draws the same line: `Reflection::verify_field_access` lists
         // `field_class == resolved_class` as an explicit disjunct, while

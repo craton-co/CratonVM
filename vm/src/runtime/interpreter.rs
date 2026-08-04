@@ -1919,10 +1919,15 @@ pub fn execute(
                         let class = cm_lock.get_class(class_id)?;
                         for &(pc, cp_idx) in &scan.typecheck_ops {
                             let class_name = class.constant_pool.get_class_name(cp_idx)?;
-                            let boxed: Box<str> = class_name.to_string().into_boxed_str();
-                            let ptr = boxed.as_ptr();
-                            let len = boxed.len();
-                            owned_jit_strings.push(boxed);
+                            // Interned for the life of the process rather than
+                            // owned by this compilation: `jit_checkcast` /
+                            // `jit_instanceof` memoize on the `(ptr, len)` pair
+                            // in thread-locals that outlive the compiled
+                            // method, so a recycled address would answer for
+                            // the class that used to live there. See
+                            // `cratonvm_jit::intern_typecheck_class_name`.
+                            let (ptr, len) =
+                                cratonvm_jit::intern_typecheck_class_name(class_name);
                             typecheck_info.push((pc, ptr, len));
                         }
                     }
@@ -4313,7 +4318,7 @@ fn execute_frame_from_index(
         }
 
         // T19.H7 diag — opcode counter. Removed; documented findings in
-        // docs/roadmap-100.md T19.H7 section. Last localization:
+        // history/roadmap-100.md T19.H7 section. Last localization:
         // `org/jboss/modules/Main.main` pc=1306 dispatched, then a native
         // call from that opcode never returns (interpreter loop never
         // re-entered).
@@ -5161,7 +5166,7 @@ fn execute_frame_from_index(
                     // dropping the high bits. Copy the raw CompactValue for
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
-                    // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     //
                     // Underflow guard: an empty operand stack at a value
                     // return means earlier execution desynced the stack

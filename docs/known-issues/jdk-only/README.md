@@ -74,7 +74,7 @@ behaviour** — no exception, no log line, no failing test.
 | 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
 | 8 | [The real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md) | Two copies, 11 classes vs 10: one includes `java/util/StringJoiner`, the other deliberately omits it with a documented heap-corruption reason. Wave 2 must **reconcile**, not merge; both naive directions reintroduce a known defect. *Demoted from 7 to 8:* the re-land added the missing cross-reference to the including copy, so the "a reader who finds one has no way to know the other exists" trap is retired. The divergence itself is untouched. |
 
-Retired item 6: [cached invoke targets retain and revalidate `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md)
+Retired item 6: cached invoke targets retain and revalidate `NativeKind`
 was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
 kind, re-applies central policy, and counts both static and virtual warm hits.
 The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
@@ -143,4 +143,4 @@ The items are not independent. The order that avoids doing work twice:
   "retag JMX" is working from a stale report. `Function$Identity` has a
   *successor* defect instead — see item 1.
 * `docs/known-issues/` holds **unfixed** issues only. A record moves to
-  `docs/internal/` when it is fixed, not when it is planned.
+  `` when it is fixed, not when it is planned.

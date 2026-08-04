@@ -50,8 +50,8 @@
 //! [`capture_frames_no_lines`] do not, and fall back to the (still fail-closed)
 //! unambiguous-name rule.
 //!
-//! See `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md` and
-//! `docs/internal/arch-2026-07-26/cross-owner-closeout.md`.
+//! See `arch-2026-07-26/stackwalk-and-vtable.md` and
+//! `arch-2026-07-26/cross-owner-closeout.md`.
 
 use std::sync::Arc;
 
@@ -393,7 +393,7 @@ pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
             class_id: Some(f.class_id),
             // Deliberately absent: resolving an index requires the ClassStore
             // borrow this deposit path must not take. See CR-CLO-2 in
-            // `docs/internal/arch-2026-07-26/cross-owner-closeout.md` for the
+            // `arch-2026-07-26/cross-owner-closeout.md` for the
             // `Frame`-side change that would make it free.
             method_index: None,
         })
@@ -455,7 +455,7 @@ pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
 /// (`tco-breaks-stacktrace-fidelity`). What the index buys is that such a change
 /// is now *possible* without a fidelity loss; making it is a separate,
 /// measurable step. See
-/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md`.
+/// `arch-2026-07-26/cross-owner-closeout.md`.
 ///
 /// It is a strict *improvement* for [`capture_frames_no_lines`] consumers,
 /// which have no line numbers at all otherwise.

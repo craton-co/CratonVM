@@ -1704,7 +1704,7 @@ pub(crate) fn native_enum_ordinal(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// **Do NOT resolve `"name"` on the RECEIVER's class.** That was tried
 /// (`5bc7458e4`) and is wrong: `resolve_field_index_by_class_id` returns the
 /// MOST-DERIVED declaration (see §6.2 of
-/// `docs/known-issues/by-name-field-reads.md`), and an enum may declare its own
+/// `docs/feature-designs/by-name-field-reads.md`), and an enum may declare its own
 /// field called `name`, which shadows `Enum`'s. Spring Boot's
 /// `WebEndpointTest.Infrastructure` does exactly that — `JERSEY("Jersey")`,
 /// `MVC("WebMvc")`, `WEBFLUX("WebFlux")` — so `name()` answered `"Jersey"`
@@ -2531,7 +2531,7 @@ mod tests {
     /// of the same name declared by the enum subclass.
     ///
     /// `resolve_field_index_by_class_id` returns the MOST-DERIVED declaration
-    /// (§6.2 of `docs/known-issues/by-name-field-reads.md`), so resolving
+    /// (§6.2 of `docs/feature-designs/by-name-field-reads.md`), so resolving
     /// `"name"` on the receiver's class picks the subclass's field whenever an
     /// enum declares one. Spring Boot's `WebEndpointTest.Infrastructure` does
     /// — `JERSEY("Jersey")` — and `name()` then answered `"Jersey"` instead of

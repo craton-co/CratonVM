@@ -3,7 +3,7 @@
 **Status: OPEN.** Originally filed 2026-07-18 as "RESOLVED", but every
 re-run since (2026-07-23, 2026-07-28, and now 2026-08-04 — see below) shows
 the same test still failing; the header was never corrected to match. Moved
-from `docs/internal/fixed-suite-bugs/` to `docs/known-issues/` on 2026-08-04
+from `fixed-suite-bugs/` to `docs/known-issues/` on 2026-08-04
 to stop it being read as closed. The title has also been broadened: the
 2026-08-04 rerun reproduces the identical failure on **Linux**, confirming
 the bug is in CratonVM's `java.nio.file.Path`/`Files` layer generally, not a

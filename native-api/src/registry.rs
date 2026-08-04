@@ -717,7 +717,7 @@ pub trait NativeClassAccess {
     /// very first time a class is needed under a given loader (the gap that
     /// made two prior lookup-based fix attempts for the H2 `Parser`
     /// loader-collapse bug regress on a fresh session -- see
-    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
+    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md's
     /// eighth-pass section).
     ///
     /// Native overrides that construct or invoke-special a DIFFERENT class
@@ -1274,7 +1274,7 @@ pub trait NativeClassAccess {
     /// `UserDefined(2)` puts the new class in a different runtime package from
     /// its own superclass and silently breaks package-private override
     /// detection — see
-    /// `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`.
+    /// `configproxy-cglib-loaderid-fixed-20260727.md`.
     fn define_class_full(
         &mut self,
         name: &str,
@@ -1842,7 +1842,7 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     /// class, but the name-based re-resolution picked the APPLICATION-loader
     /// copy whenever an isolating loader (Spring Boot's
     /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
-    /// own copy of that class. See docs/internal/fixed-suite-bugs/springboot/
+    /// own copy of that class. See fixed-suite-bugs/springboot/
     /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
     ///
     /// Default implementation falls back to the name-based
@@ -1977,7 +1977,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// `Generational` GC backend only) to turn a stale read into an immediate,
     /// deterministic panic instead of silent corruption — see
     /// `gc/src/stale_objref_debug.rs` and
-    /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
@@ -2858,7 +2858,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// contended wait needs to be excused from an in-flight STW barrier
     /// pause instead of leaving the calling thread counted in its `expected`
     /// set for the whole wait (see
-    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
+    /// `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
     ///
     /// Deliberately NARROW: `monitor_enter` itself stays on its original,
     /// non-GC-blocked path for the other ~80 native call sites that use
@@ -2870,7 +2870,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// path to span a completing (possibly moving) GC pause would expose
     /// all of them to the stale-`ObjectRef`-across-GC bug class this
     /// codebase has repeatedly hit (see
-    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`)
     /// — an unaudited-at-scale regression risk far worse than the original
     /// hang. This method exists so the ONE call site with live-gdb-confirmed
     /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
@@ -3508,8 +3508,8 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
     /// java.lang.Object cannot be cast to
     /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
-    /// `obj_cid=0` — see `docs/known-issues/
-    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
+    /// `obj_cid=0` — see `fixed-suite-bugs/wildfly/
+    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
     /// which documents the same family from WildFly's `parallel-extension-add`
     /// boot step) — one more independent occurrence of that already-tracked
     /// "register-invisible root" / cross-thread GC-root-visibility family,
@@ -4181,7 +4181,7 @@ pub struct StackTraceEntry {
     /// which takes no `ClassStore` by design).
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
-    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// `arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
     /// that *deferred* line-number resolution can be **exact**. `class_name` +
     /// `method_name` + `byte_code_index` are not enough: a class may declare an
     /// overload set under one name, the members have different
@@ -5175,7 +5175,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -5431,8 +5431,8 @@ impl NativeMethodRegistry {
         // `execute()`/`submit()`/`shutdown()` overrides too, sending them
         // straight to real JDK bytecode that dereferences an uninitialized
         // `ctl`/`mainLock` field and NPEs
-        // (`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
-        // `docs/known-issues/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md`).
+        // (`fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
         // A prior narrower fix (merged separately, same day) exempted only
         // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
         // distinction into the interpreter's dispatch layer instead

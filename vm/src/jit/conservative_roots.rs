@@ -386,7 +386,7 @@ pub fn shadow_stack_enabled() -> bool {
     // lane faulted on a zeroed heap slot within seconds of real work.
     // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing
     // nothing else made the same runs clean. See
-    // `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+    // `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
     *ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
             || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {
@@ -1024,7 +1024,7 @@ struct JitScanCache {
     /// `(filled_gen, chain_len, collection_count)` happen to match on the
     /// other side, hands VM A's object addresses to VM B's collector as
     /// roots — the `oscache` failure mode from
-    /// `docs/known-issues/c2/vm-process-global-state.md`, but pointed at the mark
+    /// `docs/feature-designs/vm-process-global-state.md`, but pointed at the mark
     /// phase. `collection_count` cannot stand in for this: it is
     /// `heap.collection_count()`, a *different* counter per heap, so two young
     /// heaps trivially agree on it.
@@ -1142,7 +1142,7 @@ fn jit_scan_cache_enabled() -> bool {
         // real bug is a register-resident JIT root that conservative scanning —
         // cached, fresh, or even whole-stack (`CRATONVM_DBG_FULLSTACK_SCAN`) —
         // cannot see; it needs precise oop maps / the shadow stack. See
-        // `docs/wildfly-suite-bugs/bug-06b-jit-scan-cache-unsound.md`.) So the
+        // `fixed-suite-bugs/wildfly/bug-06b-jit-scan-cache-unsound.md`.) So the
         // cache stays enabled for its perf benefit; `collection_count` keying
         // (see `JitScanCache`) keeps it from republishing freed addresses across
         // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
@@ -2209,7 +2209,7 @@ pub fn other_thread_in_jit() -> bool {
 /// deliberately conservative — it means moving-young engages only on cycles
 /// where the initiator is the sole thread in compiled code — and it is the
 /// honest state of the proof until a cross-thread coverage handshake exists
-/// (specified in `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+/// (specified in `arch-2026-07-26/moving-young-precise-roots.md`).
 /// Over-diverting costs compaction; under-diverting costs the heap.
 pub fn refresh_moving_young_coverage_for_collection() -> bool {
     if !moving_young_enabled() {
@@ -2527,7 +2527,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                     // per-call cost climbing from ~13us to ~64us over a
                     // 400k-call `LockTest` run, vs. a flat ~2us with `--nojit`
                     // or with compilation never completing). See
-                    // docs/known-issues/hibernate/hib-misc-residuals-20260716.md's
+                    // fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md's
                     // `LockTest` section for the full investigation.
                     //
                     // Falls back to the original full-range `[search_lo, high)`

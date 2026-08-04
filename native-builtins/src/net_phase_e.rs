@@ -4,7 +4,7 @@
 //! Phase E — Networking natives (roadmap items RE.1 .. RE.10).
 //!
 //! This module implements the ten Phase-E items from
-//! `docs/roadmap-any-java-app.md` as ten self-contained subphases, each with
+//! `history/roadmap-any-java-app.md` as ten self-contained subphases, each with
 //! its own register function. Every function carries a real OS-backed
 //! implementation (TCP, UDP, DNS, HTTP/1.1, TLS, NIO Selector, network-
 //! interface enumeration, and `com.sun.net.httpserver`). There are no stubs:
@@ -195,7 +195,7 @@ const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -233,7 +233,7 @@ pub(crate) struct SockSide {
     // invokes methods on a String receiver instead of a SocketImpl,
     // producing a NoSuchMethodError that names String for a method that
     // plainly does not exist on it (e.g. create(Z)V). See
-    // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
+    // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md.
     pub host: String,
     pub port: i32,
     pub local_port: i32,
@@ -4317,7 +4317,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // `String` and throws a bogus `NoSuchMethodError:
     // java/lang/String.getOption(I)Ljava/lang/Object;` (observed via Apache
     // HttpClient5's connection setup calling this — see
-    // docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+    // fixed-suite-bugs/netty-client-socket-write-after-close-nsme-FIXED.md).
     // We don't track the real local bind IP for this client-side socket
     // (the TLS connect never does an explicit local bind), so return
     // loopback — a real client socket connecting to a loopback server
@@ -5867,7 +5867,7 @@ fn http_build_request(
 /// a fully-framed response (keep-alive) -- reading until EOF unconditionally
 /// hangs forever on such a connection even though the whole response
 /// already arrived. See
-/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #2 (`JdkClientHttpRequestFactoryTests` hang): confirmed via a
 /// live `strace` against a real `MockWebServer` that the server sent a
 /// complete 38-byte `Content-Length`-framed response and went straight back
@@ -8967,7 +8967,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // `antlr_groovy_atn_special_slot`), so `groovy.*` presence is now decided
     // honestly by Spring's bytecode implementation below and `.groovy` bean scripts load
     // through the real `GenericGroovyXmlContextLoader`. See
-    // docs/known-issues/test-context-constructor-param-annotation-offset.md.
+    // fixed-suite-bugs/test-context-constructor-param-annotation-offset.md.
     r.register(
         "org/springframework/util/ClassUtils",
         "isPresent",
@@ -10722,7 +10722,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // `HttpClient.send`) hit `AbstractMethodError: method
     // java/net/http/HttpRequest.method()Ljava/lang/String; has no Code
     // attribute` — see
-    // docs/known-issues/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror.md
+    // fixed-suite-bugs/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror-FIXED.md
     // (Hazelcast's `RestClient.call` calls `request.method()` purely for its
     // own logging/retry bookkeeping after building the request).
     r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
@@ -11724,7 +11724,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // consulting a live KeyManager. Only `http_url_connection::
             // perform` (the path `HttpsURLConnection`/`TestClientCert` uses)
             // does the latter today — see
-            // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+            // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
             // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
             // version-pinned `SSLContext.getInstance(...)` on THIS path.
             // `phases_late::ssl_security` registers the same
@@ -11812,7 +11812,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // own empty-`wanted` fallback) — that would tear down a working
     // connection for no enforcement benefit. Known, currently unclosable gap
     // for TLS 1.2 DHE-suite restriction specifically; see
-    // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+    // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register(
         "javax/net/ssl/SSLSocket",
         "setEnabledCipherSuites",
@@ -12066,16 +12066,34 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(
-        sf,
-        "getDefault",
-        "()Ljavax/net/SocketFactory;",
-        |ctx, _args| {
-            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-            ctx.set_field(f, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(f))))
-        },
-    );
+    // `SSLSocketFactory.getDefault()` is deliberately NOT registered here.
+    //
+    // REGRESSION 2026-08-04: this spot carried a second registration of the
+    // exact triple (`javax/net/ssl/SSLSocketFactory`, `getDefault`,
+    // `()Ljavax/net/SocketFactory;`) that `phases_late::ssl_security`'s
+    // `register_p68_ssl` already owns. `register()` is documented
+    // last-registration-wins on the exact triple (see
+    // `NativeMethodRegistry::register`), and `register_p68_ssl` runs FIRST in
+    // `register_essential_natives_with_shims` — so this later, stale copy,
+    // which set field 0 to `Value::Object(None)`, silently overwrote the
+    // fixed one and every caller got a factory with no owning `SSLContext`.
+    // The layered `createSocket(Socket,String,int,boolean)` overload then
+    // threw `IllegalStateException: SSLSocketFactory has no owning
+    // SSLContext` before any network I/O, which is how a fix that "looked
+    // present and correct" in `ssl_security.rs` had no runtime effect: it
+    // took out every Spring Boot test going through
+    // `ModifiedClassPathClassLoader` (Aether/Apache HttpClient resolving
+    // `@ClassPathOverrides` coordinates against Maven Central over HTTPS).
+    //
+    // The sibling `SSLContext.getDefault()` duplicate in this same function
+    // IS intentional and documented (see `register_re6_ssl_context`) — that
+    // one deliberately relies on the ordering to win. This one never did; it
+    // was simply never updated when the 2026-07-23 fix landed. Same bug shape
+    // as the `TimeZone.getDefault()` duplicate removed 2026-08-03 (see
+    // `native-builtins/src/lib.rs`). Guarded by
+    // `native-builtins/tests/registry_contracts.rs::
+    // ssl_default_factory_and_context_have_the_documented_single_owner`.
+    // See `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 }
 
 // ===========================================================================

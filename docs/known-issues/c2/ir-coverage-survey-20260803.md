@@ -210,7 +210,7 @@ fixture's node mix"* — showing up in the code rather than in a plan.
 
 **The four `cov-04` rows are one cause, not four, and this table says so
 misleadingly.** Closed 2026-08-03 —
-[`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+`cov-04-the-invoke-arms-RETIRED-20260803.md`.
 Every one of the events is an `<init>`: two whole-method terms discarded the
 method's entire `invoke_info` map, and the builder then bailed at whichever
 invoke came first in bytecode order. That is why `5264`'s callees are
@@ -267,7 +267,7 @@ field **write** is most of what object-oriented Java does too.
 > The brief asked which of two candidate reasons the asymmetry actually was.
 > It is **the write barrier**, and the compact-layout candidate was not a reason
 > at all. Details in
-> `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md`.
+> `cov-03-field-stores-and-wide-fields-RETIRED-20260803.md`.
 
 ## The whole-method refusals, before the builder runs
 
@@ -407,7 +407,7 @@ not.
 
 ## Re-measured after `cov-01` landed, same day
 
-`cov-01` closed (`docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md`).
+`cov-01` closed (`cov-01-constants-and-statics-RETIRED-20260803.md`).
 Its three opcodes are at **zero**. Everything below is the same command on the
 same workload — `ConditionalOnPropertyTests`, default configuration,
 `CRATONVM_DBG=ir-compiles` — with the arms **interleaved, two runs each and in
@@ -540,7 +540,7 @@ guarded monomorphic inlining is planned. It now pins that tier explicitly.
 * It does not say lowering these opcodes makes anything **faster**. It says the
   optimizing tier declines to compile 41% of what it admits. Whether an
   optimized body beats the single-pass one for a given method is a separate
-  measurement, and `docs/internal/performance/` has at least one case where it
+  measurement, and `performance/` has at least one case where it
   did not (`reference_c2_tier_slower_because_fields_take_the_helper`).
 * Nine of the ten workloads are Spring-shaped. The bench phases are the only
   counter-sample and they are the row that reaches nothing, so the opcode

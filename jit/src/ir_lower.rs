@@ -7715,7 +7715,7 @@ pub fn lower_with_scalar_deopt(
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -8096,7 +8096,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `docs/internal/fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //
@@ -11194,7 +11194,7 @@ mod tests {
     /// is `false`, so a young collection that meets an unprovable compiled frame
     /// falls back to the non-moving sweep instead of relocating, and an
     /// unpublished root produces no observable stale pointer. See
-    /// `docs/internal/cov-02-array-element-access-RETIRED-20260803.md`. So the
+    /// `cov-02-array-element-access-RETIRED-20260803.md`. So the
     /// property is asserted where it is actually decided.
     ///
     /// **Anti-vacuity, executed rather than argued.** The mutation was run:

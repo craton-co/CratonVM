@@ -243,7 +243,7 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// 14 @GC_STRESS=4096` → `3222190` clean, and the Fork6 GC_STRESS outcome A/B is
 /// 14/15 ALL-OK on == off (the higher young-mark marker count under precise-on is
 /// benign guard-contained over-retention, not worse outcomes). See BUG-01 doc:
-/// `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+/// `fixed-suite-bugs/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
 ///
 /// History: default-OFF (d53c0e96) for BUG-01: the per-invocation
 /// `frame_record` + per-safepoint sp-id/flush codegen was a ~6× throughput tax on
@@ -518,7 +518,7 @@ pub fn inline_getfield_enabled() -> bool {
 /// `is_ref=false` fell into the int-category match arm and got a 32-bit
 /// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
 /// garbage used as a pointer" shape. See
-/// docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// fixed-suite-bugs/wildfly/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
 /// for the full chain. Re-verified clean with
 /// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
 /// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
@@ -880,7 +880,7 @@ pub(super) unsafe fn read_fs_qword(offset: isize) -> usize {
 /// back to a non-moving cycle for any cycle whose coverage is not proven; it
 /// returns the HotSpot checksum at every bintrees depth and heap size measured.
 /// See `docs/feature-designs/default-moving-young-gen.md` and
-/// `docs/internal/default-moving-young-enabled-20260730.md`.
+/// `default-moving-young-enabled-20260730.md`.
 pub fn shadow_stack_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -896,7 +896,7 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // 1-3 s on a pristine dev build, and the Windows `DateSymbolsProbe` repro.
     // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing nothing
     // else made the same runs clean, which is the single-variable proof.
-    // See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+    // See `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
     //
     // The DEFAULT path is unchanged: moving-young is on by default, so this
     // already evaluated true. `CRATONVM_JIT_MY_SHADOW_EMISSION=0` remains the
@@ -1013,7 +1013,7 @@ pub fn moving_young_enabled() -> bool {
 /// fixed — interleaved with a pre-fix positive control that SIGILL'd 2/2 in
 /// the same batch. The term stays because the full-GPR blind spill covers the
 /// non-moving lane conservatively, not because this crashes. See the call site
-/// and `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+/// and `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -1291,7 +1291,7 @@ pub fn resolve_static_base(class_id_raw: u32, field_index: usize) -> Option<usiz
 ///
 /// Every `getstatic` in compiled code used to `CALL jit_getstatic` — ~35 ns
 /// against HotSpot's ~1, where HotSpot emits a plain load
-/// (`docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`).
+/// (`jit-getstatic-costs-a-helper-call-FIXED-20260803.md`).
 /// With the declaring class already initialized at compile time, the helper has
 /// nothing left to decide, so the backend bakes the address of the class's
 /// statics base-pointer cell and emits two dependent loads instead of a call.

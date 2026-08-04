@@ -9,6 +9,10 @@ last red:
 | `all-jit` | **PASS 22/22** (was FAIL 1/22) | **PASS 6/6** (was FAIL 3/6) |
 | `all-nojit` | **PASS 22/22** | **PASS 6/6** |
 
+Re-confirmed on the exact tree that was merged to `dev` (`b6f0ecdb2`, which
+also carries another session's intervening JIT/x64 work):
+`.../jarmodets-merged-20260804/` — both classes PASS.
+
 Runs: `apps/spring-boot-suite-runner/.suite/results/jarmodets-fix1-20260804/`
 and `.../jarmodets-fix1-nojit-20260804/`. Binary
 `/data/data/jarmodets-probe/cratonvm-jarmodets-fix1-20260804`, built from

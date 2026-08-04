@@ -381,7 +381,7 @@ pub struct Frame {
     /// future OSR attempt for that loop forever, even though the next
     /// back-edge ~µs later might well have succeeded.
     ///
-    /// Round-5 fix (audit `docs/round5-vm.md`): track an attempt counter
+    /// Round-5 fix (audit `history/round5-vm.md`): track an attempt counter
     /// per entry PC and use **exponential backoff** — first retry after
     /// `OSR_THRESHOLD` back-edges, second after `2 * OSR_THRESHOLD`,
     /// third after `4 * OSR_THRESHOLD`, etc.  After
@@ -764,7 +764,7 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
             // failures in bc-math-raw's InterleaveTest after the interpreter
             // paths were fixed. Recover the full i64 when the payload proves
             // it cannot be a real int. See
-            // docs/bc-ec-mod-mododdinverse-investigation.md.
+            // gaps/bc-ec-mod-mododdinverse-investigation.md.
             if let Some(raw) = cv.int_tag_collision_long() {
                 (raw as u64, VTAG_LONG)
             } else {

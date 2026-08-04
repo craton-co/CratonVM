@@ -4,7 +4,7 @@ package cratonvm;
  * Differential exercise program for the interpreter intrinsic table.
  *
  * Exercises EVERY method in the intrinsic set defined by
- * docs/internal/intrinsic_table_contract.md, with an edge-case input matrix:
+ * intrinsic_table_contract.md, with an edge-case input matrix:
  *   - Object.getClass / hashCode
  *   - String.length / charAt / isEmpty
  *   - System.arraycopy (normal, overlapping, and the 3 exception cases)
