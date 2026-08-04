@@ -802,7 +802,7 @@ struct Compiler {
     sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
-    // PGO-02: see the `inline_guard_class_ids` parameter doc on
+    // PGO-02: see the `inline_guard_variants` parameter doc on
     // `compile_with_param_slots`.
     inline_guard_variants: FxHashMap<usize, Vec<(u32, crate::InlineSite)>>,
     /// Compile-time resolved `java/lang/String` field layout, for the String

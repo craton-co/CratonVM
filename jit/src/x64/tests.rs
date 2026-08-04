@@ -551,7 +551,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         &helpers,
         std::collections::HashSet::new(),
         HashMap::new(),
-        HashMap::new(), // inline_guard_class_ids (PGO-02)
+        HashMap::new(), // inline_guard_variants (PGO-02)
         None,
         &[0],
         1,
@@ -4584,7 +4584,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             helpers,
             std::collections::HashSet::new(),
             HashMap::new(),
-            HashMap::new(), // inline_guard_class_ids (PGO-02)
+            HashMap::new(), // inline_guard_variants (PGO-02)
             None, // string_layout
             &[],
             0,

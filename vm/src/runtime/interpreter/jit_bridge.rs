@@ -1228,7 +1228,7 @@ pub(super) fn compile_osr_artifact(
                 &helpers,
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
-                std::collections::HashMap::new(), // inline_guard_class_ids (PGO-02, no guarded plan from this scan-based fast path)
+                std::collections::HashMap::new(), // inline_guard_variants (PGO-02, no guarded plan from this scan-based fast path)
                 None, // string_layout — String intrinsics land in a later wave
                 &param_jvm_slots,
                 param_slot_span,

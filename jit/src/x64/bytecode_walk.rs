@@ -6932,11 +6932,11 @@ impl Compiler {
 
                     // PGO-02 (docs/feature-designs/profile-guided-inlining.md):
                     // guarded MONOMORPHIC virtual/interface inline. `inline_sites`
-                    // + `inline_guard_class_ids` are populated TOGETHER, only for
+                    // + `inline_guard_variants` are populated TOGETHER, only for
                     // an admitted `InlineVerdict::Monomorphic` plan, only when
                     // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is on (see
                     // `InlineBackendCaps` in jit/src/lib.rs) — with the flag off
-                    // `inline_guard_class_ids` is always empty and this whole
+                    // `inline_guard_variants` is always empty and this whole
                     // block costs one HashMap probe. Splices the callee body via
                     // the SAME `try_emit_inline` the invokespecial check above
                     // already uses, behind a receiver class-id guard; the miss
