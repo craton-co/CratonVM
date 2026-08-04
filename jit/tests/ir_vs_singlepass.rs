@@ -6553,3 +6553,233 @@ fn ir_vs_singlepass_instanceof_not_yet_loaded_refuses_ir() {
         "single-pass fallback must still answer correctly"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cov-05 — `checkcast` (0xc0), `instanceof`'s throwing sibling
+//
+// A definitive refusal throws `ClassCastException` through the SAME
+// sentinel-drain protocol `Op::ConstClass`'s resolution failure already uses
+// (`Lowerer::emit_call_return_check`) — not athrow's bci-baked exception-table
+// machinery. `ir::ir_compatible`'s own unit tests cover the admission-gate
+// side of that claim; these differential tests cover the CODEGEN side: the
+// right registers, the right sentinel check, the right result type (`Ref`,
+// not `Int`).
+// ---------------------------------------------------------------------------
+
+/// `jit_checkcast` stand-in, same tiny fixed hierarchy as [`instanceof_stub`]
+/// (`make_object`'s field 0: 0 = `pkg/Base`, 1 = `pkg/Sub`, 2 = `pkg/Other`).
+/// Returns `obj` unchanged on a successful cast (lenient — SBR-03's
+/// `Object[]`→`T[]` carve-out is not modelled; this harness has no arrays),
+/// `0` for a null receiver (always a valid cast, JVMS §6.5.checkcast), and
+/// the `i64::MIN` sentinel on a definitive refusal — the real helper stashes
+/// a `ClassCastException` there via `jit_thread_mut()`; this stand-in has no
+/// VM to stash one in, so it only proves the LOWERING detects and propagates
+/// the sentinel, which is the thing this differential harness exists to
+/// check (the helper's own exception construction has its own unit tests in
+/// `vm/src/jit/helpers.rs`).
+///
+/// # Safety
+/// `obj` is either 0 or one of [`make_object`]'s live buffers; `name_ptr` /
+/// `name_len` name one of the three literals below.
+unsafe extern "C" fn checkcast_stub(_vm: i64, obj: i64, name_ptr: *const u8, name_len: i64) -> i64 {
+    if obj == 0 {
+        return 0;
+    }
+    // SAFETY: the caller's contract above.
+    let name =
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let at = (obj as *const u8).add(HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
+    // SAFETY: `obj` is a `make_object` buffer with a valid field-0 int cell.
+    let tag = unsafe { std::ptr::read_unaligned(at as *const i32) };
+    let is = matches!(
+        (tag, name),
+        (0, "pkg/Base") | (1, "pkg/Base" | "pkg/Sub" | "pkg/Iface") | (2, "pkg/Other")
+    );
+    if is {
+        obj
+    } else {
+        i64::MIN
+    }
+}
+
+/// `Object f(Object o) { return (<name at cp 1>) o; }` —
+/// `aload_0; checkcast #1; areturn`.
+fn checkcast_method() -> CachedBytecodeMethod {
+    let code = vec![0x2a, 0xc0, 0x00, 0x01, 0xb0];
+    cached(
+        "f",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        code,
+        1,
+        1,
+    )
+}
+
+/// [`try_compile`] with the same two resolvers [`compile_instanceof`] uses —
+/// `checkcast`'s `checkcast_info` construction (`lib.rs`) needs the same
+/// pair.
+fn compile_checkcast(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
+    name_resolver: &dyn Fn(u16) -> Option<String>,
+) -> Option<CompiledMethod> {
+    compile_instanceof(cm, helpers, optimize, new_resolver, name_resolver)
+}
+
+fn assert_checkcast_case(tag: i32, target: &'static str, succeeds: bool, label: &str) {
+    let mut helpers = dummy_helpers();
+    helpers.checkcast = checkcast_stub as *const () as usize;
+    let cm = checkcast_method();
+    let name_resolver = name_resolver_for(target);
+    let ir = compile_checkcast(&cm, &helpers, true, &loaded_resolver, &name_resolver)
+        .expect("IR checkcast (target reported loaded)");
+    let sp = compile_checkcast(&cm, &helpers, false, &loaded_resolver, &name_resolver)
+        .expect("single-pass checkcast");
+    assert!(
+        ir.used_ir_backend,
+        "cov-05: a checkcast-only method against an already-loaded target \
+         must reach the optimizing backend ({label})"
+    );
+    let buf = make_object(&[tag]);
+    let obj = buf.as_ptr() as i64;
+    let ir_r = call_with_dummy_context(&ir, &[obj]);
+    let sp_r = call_with_dummy_context(&sp, &[obj]);
+    assert_eq!(ir_r, sp_r, "IR and single-pass must agree ({label})");
+    let expected = if succeeds { obj } else { i64::MIN };
+    assert_eq!(ir_r, expected, "wrong checkcast result ({label})");
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_exact_class_succeeds() {
+    assert_checkcast_case(1, "pkg/Sub", true, "exact class");
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_subclass_succeeds() {
+    assert_checkcast_case(1, "pkg/Base", true, "subclass");
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_interface_succeeds() {
+    assert_checkcast_case(1, "pkg/Iface", true, "interface");
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_definitive_refusal_returns_sentinel() {
+    // The result IR/single-pass must agree on is the raw i64::MIN sentinel —
+    // full VM-level exception dispatch (pending-exception drain via
+    // `has_dispatch` + `catch_unwind`) is outside this codegen-focused
+    // harness, exactly as `ir_vs_singlepass_invokestatic_exception_sentinel`
+    // above only checks the sentinel propagates, not the full unwind.
+    assert_checkcast_case(2, "pkg/Sub", false, "miss (unrelated class)");
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_null_always_succeeds() {
+    // JVMS 6.5: a null reference is always a valid checkcast target.
+    let mut helpers = dummy_helpers();
+    helpers.checkcast = checkcast_stub as *const () as usize;
+    let cm = checkcast_method();
+    let name_resolver = name_resolver_for("pkg/Sub");
+    let ir = compile_checkcast(&cm, &helpers, true, &loaded_resolver, &name_resolver)
+        .expect("IR checkcast");
+    let sp = compile_checkcast(&cm, &helpers, false, &loaded_resolver, &name_resolver)
+        .expect("single-pass checkcast");
+    assert!(ir.used_ir_backend);
+    assert_eq!(call_with_dummy_context(&ir, &[0]), 0);
+    assert_eq!(call_with_dummy_context(&sp, &[0]), 0);
+}
+
+#[test]
+fn ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir() {
+    let mut helpers = dummy_helpers();
+    helpers.checkcast = checkcast_stub as *const () as usize;
+    let cm = checkcast_method();
+    let deferred_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        (cp == 1).then_some(cratonvm_jit::JitNewSite::Deferred {
+            holder_class_id: 0x77,
+            cp_idx: cp,
+        })
+    };
+    let name_resolver = name_resolver_for("pkg/Sub");
+    let sp = compile_checkcast(&cm, &helpers, true, &deferred_resolver, &name_resolver)
+        .expect("not-yet-loaded target must still compile, via single-pass fallback");
+    assert!(
+        !sp.used_ir_backend,
+        "cov-05: a not-yet-loaded checkcast target must refuse IR admission"
+    );
+    let buf = make_object(&[1]);
+    let obj = buf.as_ptr() as i64;
+    assert_eq!(call_with_dummy_context(&sp, &[obj]), obj);
+}
+
+#[test]
+fn ir_vs_singlepass_mixed_checkcast_and_instanceof_in_one_method() {
+    // The shape cov-05 newly allows: BOTH opcodes in one method, at two
+    // different pcs referencing the SAME cp index — proving `lib.rs`'s split
+    // of `scan.typecheck_ops` into `checkcast_info`/`instanceof_info` is
+    // keyed by PC, not by cp_idx, and that admitting `checkcast` no longer
+    // refuses a method containing `instanceof` too (the pre-cov-05-checkcast
+    // shape, where ANY checkcast refused the WHOLE method).
+    //
+    //   int f(Object a, Object b) {
+    //     int t = a instanceof <name>;
+    //     <name> unused = (<name>) b;   // discarded; only its side effect
+    //                                    // (throw-or-not) matters
+    //     return t;
+    //   }
+    let code = vec![
+        0x2a, // aload_0 (a)
+        0xc1, 0x00, 0x01, // instanceof #1
+        0x3d, // istore_2 (t)
+        0x2b, // aload_1 (b)
+        0xc0, 0x00, 0x01, // checkcast #1
+        0x57, // pop
+        0x1c, // iload_2
+        0xac, // ireturn
+    ];
+    let cm = cached(
+        "f",
+        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+        code,
+        3,
+        2,
+    );
+    let mut helpers = dummy_helpers();
+    helpers.instanceof_check = instanceof_stub as *const () as usize;
+    helpers.checkcast = checkcast_stub as *const () as usize;
+    let name_resolver = name_resolver_for("pkg/Sub");
+    let ir = compile_instanceof(&cm, &helpers, true, &loaded_resolver, &name_resolver)
+        .expect("IR: a method mixing checkcast and instanceof must still compile");
+    let sp = compile_instanceof(&cm, &helpers, false, &loaded_resolver, &name_resolver)
+        .expect("single-pass: mixed method");
+    assert!(
+        ir.used_ir_backend,
+        "cov-05: a method with BOTH checkcast and instanceof must reach the \
+         optimizing backend — checkcast no longer refuses the whole method"
+    );
+    // a=Sub (tag 1): instanceof pkg/Sub -> true (1). b=Sub (tag 1): checkcast
+    // pkg/Sub succeeds (pop'd, no effect on the result). Expected: 1.
+    let a = make_object(&[1]);
+    let b_ok = make_object(&[1]);
+    let (a_ptr, b_ok_ptr) = (a.as_ptr() as i64, b_ok.as_ptr() as i64);
+    let ir_r = call_with_dummy_context(&ir, &[a_ptr, b_ok_ptr]);
+    let sp_r = call_with_dummy_context(&sp, &[a_ptr, b_ok_ptr]);
+    assert_eq!(ir_r, sp_r);
+    assert_eq!(ir_r, 1, "instanceof true, checkcast succeeds");
+    // Same `a`, but b=Other (tag 2): checkcast pkg/Sub on `b` fails AFTER the
+    // instanceof/istore already ran — the sentinel must override the normal
+    // `iload_2; ireturn` result.
+    let b_bad = make_object(&[2]);
+    let b_bad_ptr = b_bad.as_ptr() as i64;
+    let ir_r2 = call_with_dummy_context(&ir, &[a_ptr, b_bad_ptr]);
+    let sp_r2 = call_with_dummy_context(&sp, &[a_ptr, b_bad_ptr]);
+    assert_eq!(ir_r2, sp_r2);
+    assert_eq!(
+        ir_r2,
+        i64::MIN,
+        "the checkcast failure after the instanceof must still bail the method"
+    );
+}
