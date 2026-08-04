@@ -127,9 +127,11 @@ encoding bug, two crash faces, two documents, neither citing the other.
 * `direct_jit_callee_calls_enabled` no longer consults moving-young at all, so
   the two lanes now emit the same slot bodies.
 
-Same class, `origin/dev` at `63446c7f8`, same host, interleaved with the
-doc-era arm in both orders: **clean 6/6** (`ZonedDateTimeTest` 4×,
-`OffsetDateTimeTest` 2×, `ok=404` / `ok=324`, `failed=0`, 203–343 s each).
+Same classes, `origin/dev` at `63446c7f8` and the branch tip, same host,
+interleaved with the doc-era arm in both orders across three batches:
+**clean 9/9** (`ZonedDateTimeTest` 6×, `OffsetDateTimeTest` 3×, `ok=404` /
+`ok=324`, `failed=0`, 203–349 s each), while the doc-era arm is **SIGILL 7/7**
+— never once in the same direction, and never dependent on which arm ran first.
 
 ### Residual closed with it — the "also tried, and reverted" note
 
@@ -157,8 +159,11 @@ clean arm cannot be a quiet-window artefact. The control fires at ~30 s, so the
 | `dev` + flush unconditional | 2nd, 4th, 6th | no SIGILL **3/3** |
 | `dev` unmodified | 3rd | no SIGILL 1/1 |
 
-Adding the earlier interleaved A/B, the doc-era arm is SIGILL **5/5** and no
-build carrying `7f1b1f263` has SIGILL'd once.
+Adding the other two interleaved batches, the doc-era arm is SIGILL **7/7** and
+no build carrying `7f1b1f263` has SIGILL'd once — including the branch tip
+itself, re-validated after the change with the same control in the batch
+(`ZonedDateTimeTest` 2×, `OffsetDateTimeTest` 1×, all `failed=0`, control
+SIGILL 2/2).
 
 The term still stays, for a reason about the mechanism rather than about a
 crash: in the non-moving lane the full-GPR blind spill
