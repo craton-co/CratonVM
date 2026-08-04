@@ -3494,18 +3494,32 @@ impl ClassManager {
     //     shape behind every `HashMap`/`LinkedHashMap` node and friends
     //     (`alloc_concurrent_synthetic` in `native-builtins`). It is
     //     `ClassOrigin::VmInternal`: a VM bookkeeping type that never had, and
-    //     never will have, a class file.
+    //     never will have, a class file. **DONE (2026-08-04)** — the minting
+    //     site in `vm_exec::heap_alloc_object` now calls
+    //     [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
+    //     because the class is inert at every `is_synthetic_stub` read site:
+    //     no native is registered on it, neither real-protected-stub allow-list
+    //     names it, and the `Proxy$Instance` / collection-iterator special
+    //     cases below key on the *name*, not the origin.
     //   * `java/lang/reflect/Proxy$Instance` — the synthetic supertype of
     //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). It is
-    //     a generation artefact, not a stand-in for absent bytes.
-    // Classifying either honestly today would flip the derived
-    // `is_synthetic_stub` bool from `true` to `false` for classes that ~160
-    // read sites already reason about — a *Compatible-mode* behaviour change,
-    // which contract §10 forbids in wave 1. So the flavour is kept in the
-    // `reason` string and the fix is deferred: point both callers at
-    // [`Self::ensure_generated_class`] with `VmInternal` / `GeneratedProxy`
-    // respectively, in the same wave that re-audits the `is_synthetic_stub`
-    // readers.
+    //     a generation artefact, not a stand-in for absent bytes. **STILL
+    //     OPEN**, and the original prescription of `GeneratedProxy` was wrong:
+    //     that variant carries `interfaces: Arc<[ClassId]>`, which the shared
+    //     *supertype* has no meaningful value for, and
+    //     `is_generated_proxy_name` in this file already says in terms that
+    //     `Proxy$Instance` "must NOT be counted as a generated proxy". The
+    //     right origin is `VmInternal`. What is not yet established is whether
+    //     flipping it is safe: unlike `AnonymousObject$N` it has a
+    //     NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods`, is
+    //     special-cased twice in this function, and is the superclass every
+    //     `$ProxyN` links against — so it needs the regression suite, not an
+    //     argument.
+    // Classifying either honestly flips the derived `is_synthetic_stub` bool
+    // from `true` to `false` for classes that ~181 read sites already reason
+    // about, which is a *Compatible-mode* behaviour change. That is why the
+    // flavour is also kept in the `reason` string, and why the two are being
+    // migrated one at a time with evidence rather than as a pair.
     #[track_caller]
     fn fabricate_class(
         &mut self,

@@ -5249,13 +5249,105 @@ pub(super) fn should_force_registered_native_over_bytecode_precomputed(
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
+/// Every dispatch site that carries the `ThreadPoolExecutor.execute`
+/// receiver-shape check, as `(file, enclosing function)`.
+///
+/// JDK-ONLY-WAVE2. `native_es_execute` is a compatibility stand-in for
+/// CratonVM's synthetic 2-field `Executors.new*ThreadPool()` objects, but it is
+/// registered on `ThreadPoolExecutor.execute`, whose real class bytecode is
+/// **always** loaded — so the general `SyntheticStub` / `CRATONVM_REAL` yield
+/// logic cannot disambiguate it: that logic is *class*-scoped and the question
+/// here is per-*instance*. Hence the receiver-shape probe, once per dispatch
+/// route.
+///
+/// # Why this list exists
+///
+/// The wave-1 markers named **four** of these eight, and misplaced one of the
+/// four. That undercount is the actual hazard: a mechanical "delete every
+/// marked `ThreadPoolExecutor` site" sweep leaves the unmarked half enforcing a
+/// policy the marked half no longer applies — the same cold-path/warm-path
+/// split as the forced-native `String` lists, with a worse failure mode.
+///
+/// # The ninth site
+///
+/// `force_native_over_real_jdk_bytecode` returns `true` for the
+/// `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)` triple with **no
+/// receiver awareness at all**. That is the unconditional decision the eight
+/// exist to override, and it has to be deleted in the same change or the
+/// overrides cannot be.
+///
+/// # What must replace all nine
+///
+/// Per the wave-1 marker, in this order — the order matters, and getting it
+/// wrong aborts the process rather than throwing:
+///
+/// 1. give real `ThreadPoolExecutor` objects correct Java field initialisation
+///    so `Executors.new*ThreadPool()` returns objects built by the real
+///    `<init>` (`docs/jdk-only-runtime-services.md` P1). Until this lands,
+///    reclassifying below **drops** `native_es_execute` under
+///    `CRATONVM_NO_STUBS` / `--jdk-only` and synthetic-receiver executors lose
+///    their only implementation;
+/// 2. reclassify `native_es_execute` as `NativeKind::SyntheticStub` — it is
+///    currently tagged such that the general yield logic does not apply to it;
+/// 3. delete the ninth site;
+/// 4. delete these eight. Contract §7 step 3 ("concrete bytecode beats a
+///    registered `Bridge` or `SyntheticStub`") then produces the same answer
+///    structurally, for every receiver, with no field probe and no class-name
+///    list.
+///
+/// Deleting the eight *before* step 2 restores the `ctx.invoke_virtual`
+/// self-recursion that step 1's `FIXED` doc records: a native stack overflow
+/// and process abort, not a catchable `StackOverflowError`.
+///
+/// # Not in this list
+///
+/// `native-builtins`' own `executor_has_real_workers` (~8 call sites there,
+/// plus a deliberately-separate twin in `native-collections` to avoid a
+/// cross-crate dependency) is defence in depth *inside the callee*, not a
+/// dispatch decision. It is listed here only so a wave-2 grep does not mistake
+/// it for one — and so nobody deletes the check and its backstop in one change.
+#[cfg(test)]
+pub(crate) const THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES: &[(&str, &str)] = &[
+    ("vm/src/vm/vm_exec.rs", "invoke_or_native"),
+    ("vm/src/vm/vm_exec.rs", "invoke_on_class_shared_inner"),
+    (
+        "vm/src/runtime/interpreter/invoke.rs",
+        "try_stackless_invoke step 1",
+    ),
+    (
+        "vm/src/runtime/interpreter/invoke.rs",
+        "try_stackless_invoke step 6",
+    ),
+    (
+        "vm/src/runtime/interpreter/native_override.rs",
+        "intercept_force_registered_native",
+    ),
+    (
+        "vm/src/runtime/interpreter/native_override.rs",
+        "intercept_force_registered_native_cached",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "populate_virtual_invoke_cache",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "populate_virtual_invoke_cache force-native arm",
+    ),
+];
+
 /// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
 /// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
 /// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
 /// Mirrors `native-builtins::executor_has_real_workers` (same check, same
 /// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
 /// -- not a `NativeContext` -- available at this dispatch point.
-pub(super) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
+///
+/// **The single implementation.** Two sites in `vm_exec.rs` used to re-inline
+/// the `workers`-field probe by hand, giving three copies of one predicate —
+/// and both inlined copies took a plain `read()` where the note below explains
+/// why `read_recursive()` is required. They call this now.
+pub(crate) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
     let Value::Object(Some(recv)) = recv else {
         return false;
     };
@@ -6528,6 +6620,86 @@ mod real_protected_stub_tests {
                 real_protected_stub_class_cold(class),
                 "{class} is in REAL_PROTECTED_STUB_CORPUS but no path protects it; \
                  remove it from the corpus or restore it to the allowlist"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod threadpool_receiver_shape_tests {
+    use super::THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES;
+
+    /// The `vm` crate's source root, for the scan below.
+    fn vm_src(rel: &str) -> String {
+        // `rel` is repo-relative (`vm/src/...`) so the census constant reads
+        // the way a `rg` invocation would; strip the crate prefix to get a
+        // path under this crate's manifest dir.
+        let under_crate = rel.strip_prefix("vm/").expect("census paths are vm-crate paths");
+        let path = format!("{}/{under_crate}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+    }
+
+    /// Exactly eight dispatch sites consult the receiver-shape probe, and a
+    /// partial deletion fails here rather than silently leaving half the
+    /// duplication enforcing a policy the other half no longer applies.
+    ///
+    /// Counts calls to `threadpool_executor_has_real_workers(`, which is now
+    /// the *only* implementation of the probe — the two hand-inlined copies in
+    /// `vm_exec.rs` were folded into it, so a site cannot hide from this scan
+    /// by writing the `workers` lookup out longhand without also tripping
+    /// `no_hand_inlined_workers_probe_outside_the_helper` below.
+    ///
+    /// Deliberately an equality, not a floor: this list only ever shrinks, and
+    /// it shrinks all at once. See
+    /// [`THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES`] for the order the removal
+    /// has to happen in.
+    #[test]
+    fn exactly_eight_dispatch_sites_probe_the_threadpool_receiver_shape() {
+        let mut files: Vec<&str> = THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+
+        let mut total = 0usize;
+        for file in &files {
+            let src = vm_src(file);
+            // Skip the definition itself (`fn threadpool_executor_has_real_workers(`)
+            // and doc-comment mentions, which carry no `(`.
+            total += src
+                .match_indices("threadpool_executor_has_real_workers(")
+                .filter(|(i, _)| !src[..*i].ends_with("fn "))
+                .count();
+        }
+        assert_eq!(
+            total,
+            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len(),
+            "found {total} call(s) to the ThreadPoolExecutor receiver-shape probe across {files:?}, \
+             but THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES lists {}. If you deleted some sites, \
+             delete ALL of them together with the receiver-blind ninth site in \
+             `force_native_over_real_jdk_bytecode` — and only after `native_es_execute` is \
+             reclassified, or a native calling `.execute()` on a real executor recurses into \
+             itself and aborts the process. If you ADDED one, add it to the census constant.",
+            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len()
+        );
+    }
+
+    /// Nobody re-inlines the `workers`-field probe by hand.
+    ///
+    /// Two sites used to, which is how the predicate came to have three
+    /// implementations, two of which took a plain `read()` where the helper
+    /// documents that a nested `read_recursive()` is required — a lock-order
+    /// panic in debug builds and a potential deadlock in release.
+    #[test]
+    fn no_hand_inlined_workers_probe_outside_the_helper() {
+        for file in ["vm/src/vm/vm_exec.rs"] {
+            let src = vm_src(file);
+            assert!(
+                !src.contains(r#"resolve_field_index_in_hierarchy(recv_class_id, "workers""#),
+                "{file} hand-inlines the ThreadPoolExecutor `workers` probe again; call \
+                 `threadpool_executor_has_real_workers` instead — it is the one implementation, \
+                 and it takes `read_recursive()` for the reason its doc comment gives"
             );
         }
     }

@@ -9806,14 +9806,45 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     stack.join("\n")
                 );
             }
+            // `ensure_generated_class`, not `ensure_synthetic_class`: this is a
+            // VM bookkeeping type, not a compatibility substitution. There is
+            // no `cratonvm/synthetic/AnonymousObject$N` class file anywhere and
+            // there never will be — it is the untyped allocation shape behind
+            // every `HashMap`/`LinkedHashMap` node and friends, and contract §1
+            // item 6 makes it legitimate in **both** modes.
+            //
+            // Stamping it `CompatibilityStub` (which `ensure_synthetic_class`
+            // hard-codes) made contract §11's zero-stub acceptance criterion
+            // unachievable by construction: a strict boot reported a
+            // `compatibility-class-requested` violation for a class the
+            // contract explicitly permits, so the census could never reach
+            // zero however much real work was done. It also cost a
+            // full-classpath rescan per fresh field count, looking for a class
+            // file that cannot exist (the `is_synthetic` branch in
+            // `fabricate_class`; `synthetic_upgrade_known_absent` memoised it
+            // away after the first, but the first still ran).
+            //
+            // The deferral this replaces was correct at the time: the origin
+            // feeds the derived `is_synthetic_stub` bool, and flipping it for a
+            // class ~181 read sites reason about is a `Compatible`-mode
+            // behaviour change wave 1 could not validate. What makes it safe
+            // *here* is that this class is inert at every one of those sites —
+            // nothing is registered as a native on it, neither
+            // real-protected-stub allow-list names it, and `fabricate_class`'s
+            // `Proxy$Instance` / collection-iterator special cases key on the
+            // name, not the origin.
             let cid = self
                 .shared
                 .classes
                 .class_manager
                 .write()
-                .ensure_synthetic_class(&name, num_fields);
+                .ensure_generated_class(
+                    &name,
+                    num_fields,
+                    crate::classloading::ClassOrigin::VmInternal,
+                );
             // Cache for the lock-free fast path above. Races are benign:
-            // `ensure_synthetic_class` is idempotent, so any racing thread
+            // `ensure_generated_class` is idempotent, so any racing thread
             // stores the same id.
             if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 self.shared.classes.anon_class_cache[num_fields]
@@ -14613,40 +14644,33 @@ pub fn invoke_or_native(
     // See docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
-    // OF 4. The other three are in `vm/src/runtime/interpreter/invoke.rs`
-    // (`try_stackless_invoke` step 1, `try_stackless_invoke` step 6, and the
-    // `!is_native` forced-native block of `invoke_on_class_shared_inner` below
-    // — which inlines the `workers`-field probe a fourth time rather than
-    // calling `threadpool_executor_has_real_workers`). Each dispatch path
-    // carries its own copy because each reaches the native by a different
-    // route; all four must be removed together or the paths disagree about the
-    // same receiver. What must replace them: `native_es_execute` is only
-    // correct for CratonVM's synthetic 2-field `Executors.new*ThreadPool()`
-    // stand-in, so under `--jdk-only` (where that stand-in cannot exist) the
-    // registration itself is a `SyntheticStub` that never dispatches, and the
-    // receiver probe becomes unreachable.
+    // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+    // `vm/src/runtime/interpreter/native_override.rs` for the full census, for
+    // the ninth (receiver-blind) site these eight exist to override, and for
+    // why all nine have to go together.
+    //
+    // The wave-1 markers named four of eight, and got one of those wrong. The
+    // hazard that undercount creates is specific: a mechanical "delete every
+    // marked `ThreadPoolExecutor` site" sweep leaves the four unmarked ones
+    // enforcing a policy the other four no longer apply, which is the same
+    // cold-path/warm-path split as the forced-native `String` lists.
+    //
+    // This copy also used to inline the `workers`-field probe by hand rather
+    // than calling `threadpool_executor_has_real_workers`, making three
+    // implementations of one predicate — and it took a plain `read()` where the
+    // helper documents why `read_recursive()` is required at these call sites.
     if effective_class == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && descriptor == "(Ljava/lang/Runnable;)V"
     {
-        if let Some(Value::Object(Some(recv))) = args.first() {
-            let recv_class_id = shared.mem.heap.class_id_of(*recv);
-            let has_real_workers = {
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| {
-                        matches!(
-                            shared.mem.heap.get_field(*recv, idx),
-                            Value::Object(Some(_))
-                        )
-                    })
-                    .unwrap_or(false)
-            };
-            if has_real_workers {
+        if let Some(recv_value @ Value::Object(Some(recv))) = args.first() {
+            if crate::runtime::interpreter::threadpool_executor_has_real_workers(
+                shared, recv_value,
+            ) {
                 return invoke_on_class_shared(
                     shared,
                     thread,
-                    recv_class_id,
+                    shared.mem.heap.class_id_of(*recv),
                     method_name,
                     descriptor,
                     args,
@@ -22540,20 +22564,17 @@ fn invoke_on_class_shared_inner(
         // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
         //
         // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
-        // COPY 4 OF 4 — and the one that does NOT call
-        // `threadpool_executor_has_real_workers`, it re-inlines the
-        // `workers`-field probe. See COPY 1 in `invoke_or_native` above for the
-        // full note and what must replace all four.
+        // COPY 2 OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+        // `vm/src/runtime/interpreter/native_override.rs` for the census.
+        //
+        // This one re-inlined the `workers`-field probe rather than calling
+        // `threadpool_executor_has_real_workers` — with a plain `read()`, where
+        // the helper documents why `read_recursive()` is needed.
         let force_native_receiver_exempt = class_name_for_force
             == "java/util/concurrent/ThreadPoolExecutor"
             && method_name == "execute"
-            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
-                let recv_class_id = shared.mem.heap.class_id_of(*recv);
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.mem.heap.get_field(*recv, idx), Value::Object(Some(_))))
-                    .unwrap_or(false)
-            });
+            && matches!(args.first(), Some(recv) if
+                crate::runtime::interpreter::threadpool_executor_has_real_workers(shared, recv));
         // §7 routing. This site's whole purpose is "force the registered native
         // in front of real JDK bytecode", so the pre-existing condition IS
         // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
