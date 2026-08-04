@@ -143,11 +143,12 @@ non-`RNioNoFollow` failures are pre-existing on this host and unrelated.
 The new `RNioNoFollow` vector changed *mode* between the two binaries, which is
 the signal:
 
-* baseline — `rc=1`, `java/lang/AssertionError`: the bug, caught.
-* fixed — all 22 checks pass and the class prints `CK RNioNoFollow checks=22`,
-  `CK RNioNoFollow refusals=io,io,io,io,io,io,io,io` and `PASS RNioNoFollow`;
-  the harness then scores it `rc=124` because the VM does not exit after
-  `main()` returns.
+* baseline — `rc=1`, `java/lang/AssertionError: writeString through a symlink:
+  no-exception`: the bug, caught at the first assertion.
+* fixed — all 26 checks pass and the class prints `CK RNioNoFollow checks=26`,
+  `CK RNioNoFollow refusals=io,io,io,io,io,io,io,io` and `PASS RNioNoFollow` —
+  byte-identical to HotSpot's own output for the same class; the harness then
+  scores it `rc=124` because the VM does not exit after `main()` returns.
 
 That trailing hang is **not** this fix. It reproduces on a five-line class whose
 only content is `FileChannel.open(p, READ)` (`[cratonvm] main() returned; VM
@@ -155,6 +156,27 @@ held alive by 2 non-daemon thread(s)`), it does not occur without that call, and
 it is why the pre-existing CORE class `RChannelInterrupt` — which also opens a
 `FileChannel` — scores `rc=124` on this same host. It is a JDK-17-on-Linux
 artifact of this build host, not of the reference environment the suite targets.
+
+### 4. The rewritten write path is byte-exact
+
+`Files.write*` no longer calls `std::fs::write`; it opens through the fd table
+and writes via a buffered writer. `RNioNoFollow` therefore also asserts the
+three things that change can silently break, and CratonVM matches HotSpot on
+all of them: a 4 MiB + 7 byte payload round-trips whole (length **and**
+content), a 3-byte write over that file leaves `Files.size() == 3` (truncation,
+not a stale tail), and `Files.write(path, List.of("alpha", "beta"))` still
+produces exactly `alpha\nbeta\n`.
+
+### 5. Blast radius in the Spring Boot tree
+
+`ApplicationPid` is the **only** place in `core/` or `module/` that passes
+`NOFOLLOW_LINKS` as an `OpenOption`, and the only place that passes any
+`StandardOpenOption` to a `Files.write*` call. `ApplicationTemp` — the one other
+`NOFOLLOW_LINKS` user — uses it purely as a metadata `LinkOption`
+(`Files.exists`, `readAttributes`, `isDirectory`, `getOwner`), a path that was
+already correct and that this change does not touch;
+`ApplicationTempTests` reports `tests=6 failed=0` on HotSpot, on the baseline
+and on the fixed binary alike.
 
 ## Artifacts
 
