@@ -11824,6 +11824,36 @@ pub fn force_c2_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FORCE_C2").is_some()
 }
 
+/// PERF-01: would the single-pass backend vectorise a byte-array loop in this
+/// method?
+///
+/// A thin adapter — it exists to convert this crate's exception table into the
+/// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, which
+/// is the same conversion `set_pending_exception_ranges` does at backend
+/// entry. The decision itself lives in `x64::single_pass_has_bulk_byte_lowering`,
+/// next to the detectors, and is shared with the code that emits the
+/// pre-headers so the two cannot disagree.
+///
+/// Called once per compile request, on the compile path only.
+fn single_pass_vectorises_a_loop(
+    code: &[u8],
+    code_len: usize,
+    cached: &CachedBytecodeMethod,
+) -> bool {
+    let ranges: Vec<(usize, usize, usize)> = cached
+        .exception_table
+        .iter()
+        .map(|e| {
+            (
+                e.start_pc as usize,
+                e.end_pc as usize,
+                e.handler_pc as usize,
+            )
+        })
+        .collect();
+    x64::single_pass_has_bulk_byte_lowering(code, code_len, &ranges)
+}
+
 /// Is per-stage reporting of the optimizing tier's refusals switched on?
 ///
 /// The IR pipeline has four stages that can decline a method — `ir_compatible`,
@@ -13340,6 +13370,10 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
+        } else if single_pass_vectorises_a_loop(code, code_len, cached) {
+            "the single-pass backend vectorises a byte-array loop in this method and the \
+             IR tier would emit a scalar one"
+                .to_string()
         } else {
             let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
             let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
@@ -13384,6 +13418,28 @@ fn try_compile_inner(
         // `moving_young_disables_optimizing_tier` then announces itself again.
         && !moving_young_disables_optimizing_tier()
         && ir::ir_compatible(&scan)
+        // PERF-01. The single-pass backend has three bulk-byte loop lowerings
+        // the IR tier does not: it replaces a scalar `boolean[]`/`byte[]`
+        // element loop with a vectorised pre-header. Where those fire, an IR
+        // body is a DOWNGRADE, not an optimization.
+        //
+        // Measured, not assumed: `CratonBench.sieve([ZI)I` went 2,462 ms ->
+        // 15,823 ms (6.4x) the day `cov-02` taught `IrBuilder::build` to lower
+        // `bastore`, because the method stopped falling through to the backend
+        // that vectorises it. CratonVM had been FASTER than HotSpot C2 on that
+        // phase. Nothing else in CratonBench moved, and the checksum never
+        // changed — it was purely a worse body for the same answer.
+        //
+        // This is the narrow fix, and it is deliberately narrow: it asks the
+        // single-pass backend's OWN detectors, through the one function the
+        // emission path also calls, so it can never veto a method that backend
+        // would not actually vectorise. The general problem it is a special
+        // case of — the optimizing tier replaces a C1 body whenever it CAN,
+        // with no evidence the replacement is faster, and every `cov-*` lane
+        // widens the set of methods that happens to — is written up in
+        // `docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
+        // and is not solved here.
+        && !single_pass_vectorises_a_loop(code, code_len, cached)
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
         // enormous population of ordinary Java and cost ~7x on each of them
