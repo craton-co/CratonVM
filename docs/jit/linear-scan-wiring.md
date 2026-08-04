@@ -30,7 +30,7 @@ frame image is unchanged; only reads get cheaper.
 | Piece | Where |
 |---|---|
 | Flag | `ir_lower::linear_scan_enabled` (`CRATONVM_JIT_IR_LINEAR_SCAN`) |
-| Register file | `ir_lower::IR_LOWER_LS_XMMS` = XMM2–XMM5 |
+| Register file | `ir_lower::IR_LOWER_LS_XMMS` = XMM2–XMM7 (XMM2–XMM5 before 2026-08-04) |
 | Machine model | `ir_lower::ir_lower_machine_model` — `MachineModel::for_graph` plus this backend's own clobbers |
 | The call site | `ir_lower::plan_register_residency` → `regalloc::allocate_linear_scan` + `regalloc::verify_allocation` |
 | Install | `Lowerer::set_residency`, once, before the prologue |
@@ -121,21 +121,24 @@ Three consequences, and they are the reason for the shape:
 ## The register file, and why it is this small
 
 `regalloc::RegFile::x86_64()` offers `LOCAL_REGS` (RBX, R12–R15, plus RSI/RDI on
-Win64), R8/R9 and XMM8–XMM15. **None of those is usable here yet**, for a reason
-that has nothing to do with the allocator:
+Win64), R8/R9 and XMM8–XMM15. Until 2026-08-04 **none** of them was usable here,
+for a reason that had nothing to do with the allocator:
 
 > `ir_lower::emit_prologue` saves **no callee-saved register**. It pushes RBP,
 > subtracts the frame, stores the ABI arguments to their local slots, and that
 > is all.
 
-Writing R12 (or XMM8 on Win64, where XMM6–15 are non-volatile) would corrupt the
-Rust caller. `CompiledMethod::frame_layout.callee_saved_lo` says as much
-already: it points at the outgoing-argument staging region, with the comment
-"The IR prologue saves no callee-saved registers … so that region here is not a
-register save area".
+That is no longer true of the XMM half. `ir_lower::IR_LOWER_SAVED_XMMS` is a
+callee-saved XMM save area — XMM6/XMM7 on Windows, empty on System V where
+every XMM is volatile — emitted in the prologue and restored at all three exits
+(`emit_epilogue`, `emit_call_exc_stub`, and `emit_deopt_stub`'s inlined
+teardown). It sits at `spill_cap_off`, inside the band
+`conservative_roots::band_slot_is_verifiable` already skips, so the reader side
+needed no edit. The GP half of the sentence still stands: writing R12 would
+still corrupt the Rust caller.
 
-What is left is the set that is **caller-saved on both ABIs and untouched by
-this emitter**:
+What is available is the set that is **untouched by this emitter and either
+caller-saved or saved by this frame**:
 
 | Register | Used by `ir_lower` for |
 |---|---|
@@ -144,14 +147,26 @@ this emitter**:
 | R10, R11 | thread pointer, shadow-stack cursor, safepoint flag address |
 | R8, R9 | call-argument marshalling; SysV entry ABI args 5–6 |
 | XMM0, XMM1 | the FP value tier |
-| **XMM2–XMM5** | **nothing** |
+| **XMM2–XMM7** | **nothing** |
 
-So: XMM2–XMM5. They are also the only extension that needs no encoder work —
-`fp_load` / `fp_store` / `fp_binop` emit ModRM as `(xmm & 7) << 3` with no
-REX.R, so XMM8+ is not addressable by them at all.
+So: XMM2–XMM7. The ceiling is XMM7 and it is an **encoder** limit, not a frame
+one — `fp_load` / `fp_store` / `fp_binop` emit ModRM as `(xmm & 7) << 3` with no
+REX.R, so XMM8+ is not addressable by them at all. Raising it is a REX change in
+those three functions.
 
-**This makes the wiring FP-only.** An `int` loop counter gets nothing. Growing
-past that is a prologue change, not an allocator change; see *What is not done*.
+XMM6/XMM7 come out `caller_saved: false` on Windows, which is the actual return
+on the save area: a value may now live in one **across a call** there. On System
+V they are `true` like the rest, because the ABI makes them volatile and no
+prologue can change that. The back-edge safepoint poll was narrowed to match —
+it clobbers the caller-saved subset rather than the whole file, the same rule
+`MachineModel::for_graph` applies at a call, sound because the poll's slow path
+is an ordinary `extern "C"` function.
+
+**This keeps the wiring FP-only.** An `int` loop counter still gets nothing, and
+that is now a *safepoint* question rather than a prologue one: a GP file can
+hold references, so it has to discharge the oop-map obligation per site instead
+of structurally. See `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+"Where the safepoint / oop-map obligation lives".
 
 It also makes the GC question moot by construction, which is worth having on top
 of the argument below: `RegClass::of(IrType::Ref) == Gp`, and this file offers no
@@ -325,11 +340,19 @@ Listed so nobody reads a green test suite as a finished item.
    registers and no store elimination, and should be expected to deliver a small
    fraction of it.
 2. **Integer values get nothing.** The register file is FP-only. The blocker is
-   the prologue, not the allocator: giving out RBX/R12–R15 needs a save area,
-   restored on all three exits (`emit_epilogue`, the inlined epilogue in
-   `emit_deopt_stub`, and `emit_call_exc_stub`), placed at or above
+   **no longer the prologue**: `IR_LOWER_SAVED_XMMS` landed on 2026-08-04, with
+   the restore on all three exits (`emit_epilogue`, the inlined epilogue in
+   `emit_deopt_stub`, and `emit_call_exc_stub`) and the area placed at
    `callee_saved_lo` so the conservative band scan does not read a caller's
-   register as a possible root. That is the next increment and it is a real one.
+   register as a possible root. Extending it to RBX/R12–R15 is mechanical.
+
+   What is left is the reason that was always underneath: a GP register can hold
+   a **reference**, and `OopMapEntry` describes frame slots only. The file being
+   XMM-only is what makes "no reference is register-resident at a safepoint"
+   true structurally; a GP file has to prove it per site instead, by spilling to
+   the home word before every safepoint the way `x64.rs` does
+   (`SafepointPublishPlan::no_reference_in_registers`). That is the increment,
+   and it is a bigger one than the save area was.
 3. **Stores are not eliminated.** Write-through is what makes the safepoint,
    deopt and phi arguments hold without touching those paths. Dropping the home
    store means teaching `emit_safepoint_map`, `build_deopt_points` and
