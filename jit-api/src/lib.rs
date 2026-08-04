@@ -516,15 +516,11 @@ impl CachedBytecodeMethod {
     #[inline]
     pub fn invoc_key(&self) -> u64 {
         *self.invoc_key.get_or_init(|| {
-            let mut h = 0u32;
-            for &b in self.method_name.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-            }
-            for &b in self.method_descriptor.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-            }
-            // Widening: class ID to u64 for hash key
-            ((self.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+            invoc_key_parts(
+                self.declaring_class_id.as_u32(),
+                &self.method_name,
+                &self.method_descriptor,
+            )
         })
     }
 
@@ -553,6 +549,26 @@ impl CachedBytecodeMethod {
         self.jit_probe_generation
             .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// The canonical `ProfileStore` invocation-counter key for a method.
+///
+/// Single source of the hash, because several sites key the SAME counters and a
+/// divergent hash would silently reset every method's warmup count rather than
+/// fail: [`CachedBytecodeMethod::invoc_key`] memoizes this, and the interpreter's
+/// back-edge tier-up path recomputes it from a live frame (where no
+/// `CachedBytecodeMethod` is in hand). Keep them bit-identical.
+#[inline]
+pub fn invoc_key_parts(declaring_class_id: u32, method_name: &str, method_descriptor: &str) -> u64 {
+    let mut h = 0u32;
+    for &b in method_name.as_bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+    }
+    for &b in method_descriptor.as_bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+    }
+    // Widening: class ID to u64 for hash key
+    ((declaring_class_id as u64) << 32) | (h as u64)
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a

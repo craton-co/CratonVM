@@ -3959,6 +3959,24 @@ pub(crate) enum OsrBackoffOutcome {
 /// safepoint_check(shared, thread);
 /// ```
 #[inline]
+/// Back-edges of loop work credited as one method invocation for tier-up.
+///
+/// 512 keeps the accounting cheap (one relaxed atomic per 512 iterations) while
+/// staying well inside the shape that matters: a 300-iteration constant-pool
+/// loop called once per class credits an invocation roughly every other class,
+/// so a few hundred classes carry the method over the threshold.
+const LOOP_WORK_STRIDE: u32 = 512;
+
+/// `CRATONVM_JIT=loop-work-tierup` — count loop iterations towards the method
+/// invocation threshold. Read once and cached; this sits on the interpreter's
+/// back-edge path. Default-OFF → behaviour byte-for-byte unchanged.
+fn loop_work_tierup_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOOP_WORK_TIERUP").is_some()
+    })
+}
+
 pub(crate) fn try_osr_with_backoff(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3982,6 +4000,43 @@ pub(crate) fn try_osr_with_backoff(
     // → identical to before.
     let osr_backedge_threshold =
         crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD);
+    // Loop work performed across SHORT invocations is otherwise invisible to
+    // tier-up, and that gap is what keeps Tomcat's BCEL annotation scan
+    // interpreted. Both counters miss it:
+    //
+    //   * the method invocation counter accumulates globally, but
+    //     `ConstantPool.<init>` / `ClassParser.readFields` run ONCE PER CLASS —
+    //     468 calls over the whole probe, under the 500 threshold;
+    //   * `Frame::backward_count` is per-frame and reset on every invocation
+    //     (`Frame::reset`), so a ~300-iteration constant-pool loop never reaches
+    //     the 1000-back-edge OSR threshold WITHIN one frame — no matter how many
+    //     classes are parsed. That is permanent, not a warm-up artifact.
+    //
+    // Measured: with the stock thresholds this workload reports `osr=0` — not a
+    // single OSR body in the entire scan — while the per-constant methods it
+    // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
+    // See docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Credit a chunk of loop work as one invocation, the way HotSpot sums its
+    // invocation and back-edge counters against a single threshold. This reuses
+    // the existing counter and compile path exactly — no new state, and no OSR
+    // involvement: the method simply crosses the ordinary threshold and its NEXT
+    // call runs compiled. One modulo per back-edge, one relaxed atomic per
+    // `LOOP_WORK_STRIDE` iterations.
+    //
+    // Default-OFF pending the A/B: `CRATONVM_JIT=loop-work-tierup`.
+    if loop_work_tierup_enabled() {
+        let f = &thread.frames[*frame_idx];
+        let bc = f.backward_count;
+        if bc > 0 && bc % LOOP_WORK_STRIDE == 0 {
+            let key = cratonvm_jit_api::invoc_key_parts(
+                f.class_id.as_u32(),
+                f.method_name(),
+                f.method_descriptor(),
+            );
+            shared.jit.profile_store.increment_invocation(key);
+        }
+    }
     if !thread.frames[*frame_idx].should_try_osr(entry_pc, osr_backedge_threshold) {
         return OsrBackoffOutcome::Skip;
     }
