@@ -1098,6 +1098,34 @@ pub(crate) fn mirror_class_id(
     }
     if let Value::Int(v) = ctx.get_field(mirror, 0) {
         if v >= 0 {
+            // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the
+            // slot-0 write in `vm/src/vm/vm_object.rs`. That write is an
+            // *overlay*: a VM-internal `Int` deliberately stored on top of
+            // `java.lang.Class`'s instance field 0, which JDK 25 declares as
+            // `Constructor<T> cachedConstructor` — a **reference** slot.
+            //
+            // The marker's question is not "is this the right slot" but "does
+            // anything still depend on it", and this line is the only reader of
+            // the overlay outside the VM — a fallback behind the reverse map.
+            // If a real-JDK run never reaches here, the wave-2 fix is to delete
+            // the overlay outright rather than relocate it, which is strictly
+            // better than either. Nothing in the tree could answer that, so:
+            // say it, once, under the flag the marker already nominates.
+            //
+            // Free when the flag is unset, and this is already the slow half of
+            // a two-step lookup when it is.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[cratonvm][overlay] class-mirror slot-0 fallback HIT (ClassId {v}): \
+                         `class_id_from_mirror` missed and this read the Int overlay at \
+                         field 0. The overlay in `vm_object.rs` is load-bearing on this \
+                         workload — it cannot simply be deleted."
+                    );
+                }
+            }
             return Some(cratonvm_types::ClassId::new(v as u32));
         }
     }
