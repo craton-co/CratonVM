@@ -1203,10 +1203,16 @@ pub fn create_exception_object_for_class(
                     },
                 )));
             }
+            // SB-LOADER-ZIPCONTENT (2026-08-04): old-gen-spilling retry, same
+            // reason as `alloc_object_shared` / `gc_alloc_array` — a young free
+            // list fragmented by the non-moving JIT-safe sweep must not report
+            // OOM while the old generation still holds most of the heap. This
+            // one matters twice over: failing here replaces the exception the
+            // program actually threw with an `OutOfMemoryError`.
             shared
                 .mem
                 .heap
-                .try_alloc_object(class_id, num_fields)
+                .try_alloc_object_full(class_id, num_fields)
                 .ok_or_else(|| {
                     MethodCallFailed::InternalError(VmError::Runtime(
                         RuntimeError::OutOfMemoryError {

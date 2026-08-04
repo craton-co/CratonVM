@@ -40,15 +40,27 @@ import java.util.zip.ZipFile;
  * each other and with nothing else. Stage 1 alone catches it; the later
  * stages keep the surrounding pipeline honest.
  *
- * Whole-second instants only: NTFS, ext4 and APFS disagree below a second, and
- * this vector is diffed against HotSpot byte for byte.
+ * Two more divergences this gates, both closed 2026-08-04 (second round):
  *
- * Deliberately NOT printed: a file's `creationTime()` (settable on Windows,
- * ignored by the Linux kernel, so HotSpot itself answers differently per host)
- * and a ZipEntry's `getLastAccessTime()`/`getCreationTime()` (CratonVM reads
- * the local header, where the JDK writes all three, while HotSpot reads only
- * the central directory, where it writes only the modified time -- so HotSpot
- * answers null for both; see the doc referenced above).
+ * 1. `ZipEntry.getLastAccessTime()`/`getCreationTime()` answered real values
+ *    where HotSpot answers null. The JDK writes the 0x5455 extended-timestamp
+ *    field twice with different payloads -- all three times in the local
+ *    header, the modified time alone in the central directory -- and
+ *    ZipFile/JarFile read the central directory. We were reading the local
+ *    header on top of it.
+ * 2. `JarFile.entries()` reported 1979-11-30T00:00:16Z for an entry carrying
+ *    only a DOS timestamp. The Spring Boot loader bridge dual-writes synthetic
+ *    slot 1, which is `xdostime` in the real JDK layout, so the entry's SIZE
+ *    landed in the timestamp field (size 8 -> DOS seconds 16). Only
+ *    `getLastModifiedTime()` on an entry with no FileTime reads that field, so
+ *    nothing else noticed.
+ *
+ * Whole-second instants only: NTFS, ext4 and APFS disagree below a second, and
+ * this vector is diffed against HotSpot byte for byte. DOS timestamps have
+ * two-second resolution, so DOS_ONLY_TIME lands on an even second.
+ *
+ * Deliberately NOT printed: a file's `creationTime()` -- settable on Windows,
+ * ignored by the Linux kernel, so HotSpot itself answers differently per host.
  */
 public class RFileTimes {
 
@@ -56,9 +68,19 @@ public class RFileTimes {
     static final Instant MODIFIED = Instant.parse("2021-01-01T00:00:00Z");
     static final Instant ACCESSED = Instant.parse("2022-01-01T00:00:00Z");
 
+    /** Even second: DOS timestamps cannot represent an odd one. */
+    static final Instant DOS_ONLY_TIME = Instant.parse("2021-06-15T12:34:56Z");
+
     static final String[] NAMES = {
         "BOOT-INF/classpath.idx", "BOOT-INF/lib/dependency-1.jar", "BOOT-INF/classes/app.properties",
     };
+
+    /**
+     * Written with `setTime` alone, which sets `xdostime` and clears `mtime`,
+     * so `ZipOutputStream` emits no 0x5455 field for it and the read side has
+     * nothing but the DOS timestamp to answer from.
+     */
+    static final String DOS_ONLY = "BOOT-INF/classes/dos-only.properties";
 
     static int checks = 0;
 
@@ -114,6 +136,11 @@ public class RFileTimes {
                 jar.write(("content-of-" + name).getBytes("UTF-8"));
                 jar.closeEntry();
             }
+            ZipEntry dosOnly = new ZipEntry(DOS_ONLY);
+            dosOnly.setTime(DOS_ONLY_TIME.toEpochMilli());
+            jar.putNextEntry(dosOnly);
+            jar.write(("content-of-" + DOS_ONLY).getBytes("UTF-8"));
+            jar.closeEntry();
         }
         return archive;
     }
@@ -126,13 +153,27 @@ public class RFileTimes {
                 JarEntry entry = entries.nextElement();
                 emit("jarentry." + entry.getName(), entry.getLastModifiedTime().toInstant());
                 emit("jarentry.getTime." + entry.getName(), Instant.ofEpochMilli(entry.getTime()));
+                // Null on HotSpot for every one of these: the central
+                // directory carries the modified time alone.
+                emit("jarentry.access." + entry.getName(), entry.getLastAccessTime());
+                emit("jarentry.creation." + entry.getName(), entry.getCreationTime());
             }
+            // The DOS-only entry has no mtime, so this is the one read that
+            // reaches `xdostime` -- the field the loader bridge was
+            // overwriting with the entry's size.
+            JarEntry dosOnly = jar.getJarEntry(DOS_ONLY);
+            emit("jarentry.dosOnly.getJarEntry", dosOnly.getLastModifiedTime().toInstant());
         }
         try (ZipFile zip = new ZipFile(archive)) {
             for (String name : NAMES) {
                 ZipEntry entry = zip.getEntry(name);
                 emit("zipentry." + name, entry.getLastModifiedTime().toInstant());
+                emit("zipentry.access." + name, entry.getLastAccessTime());
+                emit("zipentry.creation." + name, entry.getCreationTime());
             }
+            ZipEntry dosOnly = zip.getEntry(DOS_ONLY);
+            emit("zipentry.dosOnly", dosOnly.getLastModifiedTime().toInstant());
+            emit("zipentry.dosOnly.getTime", Instant.ofEpochMilli(dosOnly.getTime()));
         }
     }
 

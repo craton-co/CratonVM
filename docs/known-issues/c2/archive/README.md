@@ -34,7 +34,7 @@ existed.
 | ~~`hir-02-mir-regalloc-handoff.md`~~ **RETIRED 2026-08-04** | `d0ad74f1a`, then `fix/hir02-mir-regalloc-handoff-20260804` | the selector has a production caller (`CRATONVM_JIT=ir-isel-emit`, default off, fail-closed) with a byte-equality oracle that found 0 disagreements over a real workload; the `lea_r32_m` row landed and `Rule::Lea` fires 26 tiles where it fired none; the vector-pool hazard is the caller's to state | emitting the rules byte equality cannot cover, and increment 3 — both with their reasons in `hir-02-mir-regalloc-handoff-RETIRED-20260804.md` (internal tree) |
 | `pgo-01-call-site-evidence-gap.md` | `e183ccc41` | `invokestatic`/`invokespecial` feed `MethodProfile::call_sites` | — |
 | `pgo-02-guarded-inlining.md` | `76f4ca274`, residuals 2026-08-04 | monomorphic guarded virtual/interface inlining, default-off; then bimorphic splicing, the `StableType` index, the tally denominator, the saturated-profile refusal, and a fix for the shipped increment's WRONG-CODE bug (the guard named one class, the spliced body came from another) | a deopt-capable guard, blocked on `deopt::FrameState::caller` being populated — now refused mechanically rather than by convention. See `../../internal/pgo-02-guarded-inlining-RETIRED-20260804.md` |
-| `osr-01-entry-metadata-contract.md` | `c87c65f08` | the metadata contract is executable and fails closed | the **second compile door** — `compile_osr_artifact` calls `x64::compile` directly — is untouched and is the whole remaining item |
+| ~~`osr-01-entry-metadata-contract.md`~~ — **moved out 2026-08-04** to `osr-01-entry-metadata-contract-RETIRED-20260804.md` | `c87c65f08`, then finished 2026-08-04 | **all of it**: the metadata contract, the pc-space newtype (`jit/src/osr_coords.rs`), one compile door for all three (`jit/src/compile_gate.rs`) and the frame-view cross-check (`CompiledMethod::osr_home_disagreement`) | — |
 | `osr-02-exit-and-recompile.md` | `4bec5efca` | the per-pc memo already existed; lifecycle counters landed | the exit-state differential, which is the increment the doc called the point of the lane |
 | `verify-01-differential-harness.md` | `923610c81` | `scripts/verify/compare.py`, fixture checks, H2/Tomcat/Spring Boot baselines | the doc's own note that "every lane is easier to land once `verify-01` exists" still stands, and the `cov-*` lanes are the first ones to test that |
 
@@ -46,11 +46,23 @@ closeout found five stale claims, four of them asserting that *finished* work
 was unfinished). What it costs is the other direction: the residuals move into
 one cell of a summary table in the parent README and stop reading like work.
 
-Four of the nine rows above have a live residual. Two of those — the isel
-pattern rows and the OSR second door — are named in the parent README and owned
-by nobody. That is the failure this archive is meant to make visible, and the
+Four of the nine rows above had a live residual. Two of those — the isel pattern
+rows and the OSR second door — were named in the parent README and owned by
+nobody. That is the failure this archive is meant to make visible, and the
 `cov-*` lanes next to it are what a lane doc should look like while its work is
 still open.
+
+**It worked, three times over.** All three of those unowned residuals — the isel
+pattern rows, `pgo-02`'s bimorphic splicing, and the OSR second door — were
+picked up and closed on 2026-08-04, each *from its row in this table*, and the
+row was where the residual was legible enough to be picked up at all. What the
+OSR lane then found is the argument
+for keeping the archive rather than for trusting it: its brief's four items had
+been triaged into "one remaining", and finishing them turned up **three** compile
+doors where the brief said two, a code-cache cap neither direct door had ever
+checked, a compile-epoch witness a thousand lines out of place, and four
+diagnostic counters with no caller anywhere in the tree. A residual summarised
+into one cell is a pointer, not an inventory.
 
 ## Recovering one
 

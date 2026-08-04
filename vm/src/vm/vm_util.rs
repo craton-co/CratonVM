@@ -2494,6 +2494,16 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // JDK's field types: the descriptor is right there next to the name, and
     // a fixup that writes the wrong width is worse than no fixup at all
     // (a swallowed `<clinit>` at least leaves a well-typed zero).
+    //
+    // A second, independent symptom of the same slot, found in parallel on the
+    // Spring Boot loader shard: `java.util.zip.ZipUtils.get16` is
+    // `getShortUnaligned(b, off + ARRAY_BYTE_BASE_OFFSET)`, so compiled ZIP
+    // central-directory parses addressed 8 bytes before the array data and the
+    // extra-field walk silently found nothing —
+    // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` read the DOS
+    // fallback 1980-01-01 instead of the extended timestamp's 1970-01-01. It
+    // passes cold and fails once the method is hot, which is the tell. See
+    // `fixed-suite-bugs/springboot/spring-boot-loader-residual-20260723-FIXED.md`.
     let set_static_by_name = |field_name: &str, value: Value| {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
