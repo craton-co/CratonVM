@@ -69,6 +69,10 @@ pub struct OutPcIndexed<T> {
 }
 
 /// A vector indexed by an interpreter bci — the space the runtime reads.
+///
+/// `Debug`/`PartialEq` so a conversion's `Result` can be asserted on directly;
+/// the payload types are all plain integers.
+#[derive(Debug, PartialEq, Eq)]
 pub struct BciIndexed<T> {
     v: Vec<T>,
 }
