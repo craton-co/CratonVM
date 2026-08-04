@@ -41453,6 +41453,14 @@ fn native_chm_get_string_fast(
     }
     let raw_hash = ctx.java_string_hash_code(key)?;
     let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    if chm_trace() {
+        eprintln!(
+            "[chm] getfast this={:p} key={:?} raw={raw_hash:#x} hash={hash:#x} seg={:?}",
+            this.as_ptr(),
+            ctx.read_string(key),
+            chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
+        );
+    }
     let seg = chm_segment_for(ctx, this, hash)?;
     let seg_id = ctx.identity_hash_code(seg);
     let before_mutation = chm_seg_mutation_snapshot(seg_id);
@@ -41505,6 +41513,9 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     chm_reject_null_key(&key)?;
     if let Value::Object(Some(key_object)) = key {
         if let Some(value) = native_chm_get_string_fast(ctx, this, key_object) {
+            if chm_trace() {
+                eprintln!("[chm] get fast-path -> {value:?}");
+            }
             return Ok(Some(value));
         }
     }
@@ -41514,6 +41525,18 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(this_pin, this);
     let key = read_pinned_elem(ctx, key_pin, key);
+    if chm_trace() {
+        let text = match key {
+            Value::Object(Some(k)) => ctx.read_string(k),
+            _ => None,
+        };
+        eprintln!(
+            "[chm] get slow this={:p} key={:?} hash={hash:#x} seg={:?}",
+            this.as_ptr(),
+            text,
+            chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
+        );
+    }
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => Ok(Some(
             chm_seg_get(ctx, seg, key)?.unwrap_or(Value::Object(None)),
@@ -41656,6 +41679,18 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         let key = read_pinned_elem(ctx, key_pin, key);
         let hash = chm_key_hash(ctx, &key)?;
         let this = ctx.read_native_pin(this_pin, this);
+        if chm_trace() {
+            let text = match key {
+                Value::Object(Some(k)) => ctx.read_string(k),
+                _ => None,
+            };
+            eprintln!(
+                "[chm] put this={:p} key={:?} hash={hash:#x} seg={:?}",
+                this.as_ptr(),
+                text,
+                chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
+            );
+        }
         match chm_segment_for(ctx, this, hash) {
             Some(seg) => {
                 let _resize_flag = ChmResizeLockGuard::enter();

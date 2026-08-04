@@ -6,7 +6,6 @@
 //! Deleted before the fix lands.
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
@@ -34,5 +33,28 @@ fn chm_diag() {
     for m in ["returnsOne", "returnsOneThrows", "diag", "preResizeTraced"] {
         let result = vm.invoke("cratonvm/ChmDiagProbe", m, "()I", &[]);
         println!("== {m} => {result:?}");
+    }
+}
+
+#[test]
+#[ignore = "scratch diagnostic"]
+fn chm_registry() {
+    let vm = test_vm();
+    let c = "java/util/concurrent/ConcurrentHashMap";
+    for (name, desc) in [
+        ("<init>", "()V"),
+        ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+        ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+        ("containsKey", "(Ljava/lang/Object;)Z"),
+        ("size", "()I"),
+        ("keySet", "()Ljava/util/Set;"),
+    ] {
+        let found = vm
+            .shared
+            .natives
+            .native_methods
+            .find(c, name, desc)
+            .is_some();
+        println!("registry {c}.{name}{desc} -> {found}");
     }
 }
