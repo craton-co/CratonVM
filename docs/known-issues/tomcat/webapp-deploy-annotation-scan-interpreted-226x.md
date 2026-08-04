@@ -303,12 +303,25 @@ does full symbolic work on every access *including a cache hit* — two `String`
 allocations, two extra `class_manager.read()`s and a whole
 `resolve_class_loader_aware` — purely to revalidate the entry it already holds.
 Short-circuiting that for non-loader-sensitive callers
-(`CRATONVM_JIT=field-cache-fastpath`, default-off) is worth **nothing**
-measurable: off 1894–2047, on 1919–2019 µs/class over four interleaved passes.
-(The waste is real and worth removing on its own merits; it is ~3% of a 250x
-gap. NB I did not independently confirm the fast path fires — the available
-counters do not distinguish it — so read this as "no measurable effect", not as
-"the fast path was exercised and did not help".)
+(`CRATONVM_JIT=field-cache-fastpath`, default-off) measured **nothing**: off
+1894–2047, on 1919–2019 µs/class over four interleaved passes.
+
+> **RETRACTED 2026-08-04 — that lever was INERT and the null result says
+> nothing.** It gated on `should_use_loader_initiated_resolution`, which begins
+> `if loader_aware_resolution() { return true; }` — and that flag is **default
+> ON** (`classloading/src/class_manager.rs:503`, consolidated there precisely so
+> the three copies could not drift). The predicate is therefore unconditionally
+> true and the fast path could never execute. The stated caveat ("I did not
+> confirm the fast path fires") was the tell; it should have been a blocker, not
+> a footnote.
+>
+> The predicate that actually splits the cases is `loader_sensitive`, which
+> additionally requires the referencing class's loader to be `UserDefined`. The
+> replacement (`CRATONVM_JIT=field-site-cache`) uses that one and ships a
+> `CRATONVM_DBG=field-site` counter, so "did the lever fire" is answerable
+> before anything is timed. This is the fifth inert-lever incident in this
+> investigation; a lever now has to prove it fired before it is allowed a
+> timing number.
 
 **So it is not a gate at all — it is interpreter throughput.** The decisive
 measurement: on a quiet host `--nojit` is *faster* than the default
@@ -344,14 +357,62 @@ Scale, from `CRATONVM_DBG=hotpath-counts` over the same scan: ~2.0M bytecodes
 executed, ~1.2M instance-field accesses, 201k method-ref resolutions — about
 5,300 bytecodes per class at ~385 ns each.
 
-**What would actually move this** is the interpreted invoke path itself:
-`try_stackless_invoke` alone runs ~34 string comparisons per call (several of
-them `class_name.contains(...)` *substring searches* — that is the
-`is_contained_in` in the profile), plus a native-registry probe, a
-class-manager read lock, `Arc` clone/drop traffic for code+name+descriptor, and
-frame push/pop. Fixing that is an interpreter-dispatch project — inline caches,
-a resolved constant pool, per-call-site precomputed flags — not a point fix,
-and it is the only thing that gets 240x anywhere near the ~5x exit criterion.
+**What would actually move this** is the interpreted invoke and field paths.
+Fixing them is an interpreter-dispatch project — inline caches, a resolved
+constant pool, per-call-site precomputed flags — not a point fix, and it is the
+only thing that gets 240x anywhere near the ~5x exit criterion.
+
+#### Correction: it is not `try_stackless_invoke` (2026-08-04)
+
+An earlier revision of this section named `try_stackless_invoke`'s ~34 per-call
+string comparisons as the thing to fix. **That was wrong, and the way it was
+wrong is worth keeping.** `CRATONVM_DBG=invokestats` over the scan:
+
+```
+[invokestats] cache_hit=600001 cache_miss=1784 vtable_fast=2672 slow_path=3970
+```
+
+The monomorphic inline cache is **99.7% warm**. `try_stackless_invoke` is the
+cache-*miss* path; it runs on roughly 0.3% of invokes, so its comparison count
+is irrelevant no matter how large. The claim was inferred from reading the
+source rather than from asking how often the function executes — the same
+mistake, in a different costume, as the four falsified root causes above.
+
+The string comparisons per invoke are real, but they are on the **hit** path:
+`intercept_force_registered_native_cached` runs a sequence of
+`(method_name, method_descriptor)` matches on every inline-cache hit that
+dispatches bytecode. That is a per-call-site precomputable question and is
+where the "precomputed flags" half of the project belongs.
+
+#### The clusters, by mechanism
+
+Re-profiled at a 0.35% floor on a quiet host (2039.7 / 1976.2 µs/class):
+
+| cluster | share | mechanism |
+|---|---|---|
+| dispatch loop | ~13.5% | `execute_frame_from_index` 8.92, `execute_instruction` 3.38, `execute` 1.19 |
+| **field resolution** | **~12%** | `resolve_field_ref_loader_aware` 3.51, `load_class_concurrent` 2.59, `resolve_class_loader_aware` 2.02, plus its share of `memcmp` 4.30, `sip::Hasher` 0.48, `_mi_page_malloc_zero` 1.10 / `mi_free` 0.79 |
+| invoke + frame | ~12% | `execute_invokevirtual_cached` 2.90, `pop_and_recycle_frame` 1.62, **`drop_in_place<Option<(Arc.., Arc<str>, Arc<str>, usize)>>` 1.54**, `InvokeCache::get` 1.23, `Frame::new_pooled_cached` 1.05 |
+| native registry | ~4.2% | `slot_for_exact` 2.50, `should_force_registered_native_over_bytecode` 0.75, `slot_index_for_key` 0.53, `intercept_force_registered_native_cached` 0.40 |
+| heap checks | ~6.5% | `is_object_address` 3.78, `record_object_ref_payload_slow` 1.05 |
+
+Two of those have an identified, removable mechanism rather than just a name:
+
+* **Field resolution.** `resolve_field_ref_loader_aware` re-derives the
+  field-*owning class* from its name on **every** access, resolution-cache hit
+  included: two `String` allocations, three `class_manager` read acquisitions
+  and a full `resolve_class_loader_aware`. Only the second half of the answer
+  (locate the field in the owner) is memoized. ~1.2M accesses.
+* **That 1.54% `drop_in_place`.** It is `resolve_method_ref`'s four-value return
+  being dropped. `pop_coerced_invoke_args_virtual` / `_static` call it on the
+  inline-cache **hit** path for two of those four values — the descriptor and
+  the parameter count — paying a `resolution_cache` read lock, a hash probe and
+  three `Arc<str>` clone/drop pairs per invoke to get one string and one
+  integer.
+
+Both are answered by the same thing: a per-thread, epoch-validated resolved
+constant pool (`vm/src/runtime/interpreter/site_cache.rs`), behind
+`CRATONVM_JIT=field-site-cache` and `CRATONVM_JIT=method-site-cache`.
 
 **Consequence for the exit criteria below: they are not reachable by tiering
 work.** ~240x against an interpreter that the JIT cannot help is a
