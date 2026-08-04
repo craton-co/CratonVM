@@ -1465,10 +1465,19 @@ pub(super) fn note_gc_productivity(shared: &SharedVm, before_live: usize, before
         0
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        // `young_*` (SB-LOADER-ZIPCONTENT, 2026-08-04): `before`/`after` are
+        // `live_bytes_estimate`, i.e. `young.used - young.free_list + old.used`.
+        // A run of non-moving young sweeps leaves the young bump cursor pinned
+        // at the top with the reclaimed space in the free list, so a heap that
+        // is 70% free reads as "148 MB live" and every diagnosis stops there.
+        // `young_largest_free` vs `young_free_list` is the fragmentation face.
+        let (y_used, y_free, y_largest, y_cap) = shared.mem.heap.young_occupancy();
         eprintln!(
             "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
              freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
-             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak}"
+             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak} \
+             young_used={y_used} young_free_list={y_free} young_largest_free={y_largest} \
+             young_cap={y_cap}"
         );
     }
 }

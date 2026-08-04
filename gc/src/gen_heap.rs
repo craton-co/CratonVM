@@ -4430,6 +4430,20 @@ impl GenerationalHeap {
         young_live + self.old_gen.lock().used()
     }
 
+    /// `(used, free-list bytes, largest free block, capacity)` for the young
+    /// from-space — the numbers behind [`live_bytes_estimate`]'s young term,
+    /// unaggregated. See [`crate::vm_heap::VmHeap::young_occupancy`] for why
+    /// the aggregate alone cannot answer the question it gets asked.
+    pub fn young_from_occupancy(&self) -> (usize, usize, usize, usize) {
+        let from = self.young_from.lock();
+        (
+            from.used(),
+            from.free_list_bytes(),
+            from.largest_free_block(),
+            from.capacity(),
+        )
+    }
+
     /// Publish the denominators [`crate::gc_metrics::gc_metrics_report`]
     /// normalizes by: objects allocated since startup, bytes allocated, and the
     /// current live-byte estimate.
