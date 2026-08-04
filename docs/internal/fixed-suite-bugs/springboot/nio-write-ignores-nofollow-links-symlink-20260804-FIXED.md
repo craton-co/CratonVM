@@ -78,6 +78,7 @@ nofollow }` and every open path consults `nofollow`:
 | `FileSystemProvider.newOutputStream` | `fsp_new_output_stream` |
 | `Files`/`FileSystemProvider.newInputStream` | `fsp_new_input_stream` |
 | `FileChannel.open`, `Files.newByteChannel` | `newFileChannel` (both funnel through it) |
+| `Files.newByteChannel` — dangling link | additionally at its own missing-file pre-check (below) |
 | `Files.newBufferedWriter` | real path via `newOutputStream`; synthetic path via `open_buffered_writer` |
 
 `p57_nofollow_reject` performs the check with an `lstat` (`symlink_metadata`,
@@ -87,6 +88,15 @@ raises the plain `java.io.IOException` HotSpot raises. Verified against OpenJDK
 and throws a bare `IOException` — *not* a `FileSystemException` — with the
 message `Too many levels of symbolic links (NOFOLLOW_LINKS specified)` and no
 path prefix.
+
+`newByteChannel` needed the check twice. It delegates to `newFileChannel` for
+the real work, but first runs its own missing-file pre-check so a absent config
+source surfaces as `NoSuchFileException` (frameworks catch that one to treat the
+source as optional — SmallRye/Keycloak SRCFG00035). That pre-check uses
+`Path::exists()`, a `stat`, which reports a **dangling** symlink as absent — so
+without a check ahead of it, a dangling link opened `NOFOLLOW_LINKS` returned
+the recoverable `NoSuchFileException` instead of `ELOOP`, and the delegation
+that carries the real check was never reached.
 
 The `Files.write*` statics were additionally routed through the gated open
 (`capability_gate::open_write_gated`) the rest of the surface already used, so
