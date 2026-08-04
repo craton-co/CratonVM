@@ -3459,8 +3459,6 @@ fn reloc_emit_enabled() -> bool {
     /// computed nowhere — so the cover list is checked against the root and
     /// nothing else.
     fn mir_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
-        use crate::x64::isel::Rule;
-
         let plan = self.mir.as_ref()?;
         let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
         if usize::try_from(tb).ok()? != block_idx {
@@ -3471,16 +3469,7 @@ fn reloc_emit_enabled() -> bool {
             .get(usize::try_from(tb).ok()?)?
             .tiles
             .get(usize::try_from(ti).ok()?)?;
-        if tile.root != id || tile.rule != Rule::AluReg {
-            return None;
-        }
-        // A tile that covers anything but its own root absorbed a node the
-        // caller is no longer going to lower. `Rule::AluReg` never does; the
-        // check is here because a future rule that does would otherwise drop
-        // the absorbed node's semantics silently — which is the exact failure
-        // `BlockSelection::covers` exists to make unrepresentable, and it would
-        // be a shame to reintroduce it one level lower.
-        if tile.covered.as_slice() != [id] {
+        if !mir_tile_is_emittable(tile, id) {
             return None;
         }
         // The linear-scan read cache is XMM-only today, so no `AluRR` operand
@@ -7631,6 +7620,21 @@ pub mod mir_totals {
     /// holding the wrong one.
     #[cfg(test)]
     pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+/// May the level-2 encoder answer for node `id`'s lowering with this tile?
+///
+/// Three conditions, and the third is the one that is not obvious. The caller
+/// skips **every** node a tile covers, so a tile that absorbed a node the
+/// encoder does not actually fold leaves that node computed nowhere — the same
+/// failure `BlockSelection::covers` exists to make unrepresentable, one level
+/// further down. `Rule::AluReg` never absorbs, so today this clause is
+/// insurance rather than a live filter; a rule added to the set below without a
+/// fold is exactly what it is insurance against.
+fn mir_tile_is_emittable(tile: &crate::x64::isel::Tile, id: NodeId) -> bool {
+    use crate::x64::isel::Rule;
+
+    tile.root == id && tile.rule == Rule::AluReg && tile.covered.as_slice() == [id]
 }
 
 /// Build the level-2 machine list for one method, or refuse.
@@ -13243,75 +13247,47 @@ mod tests {
 
     /// A tile that absorbed another node must never reach the encoder.
     ///
-    /// `Rule::AluReg` covers exactly its own root, and the encoder checks that
-    /// rather than trusting it — an absorbed node the caller then skips is a
-    /// node computed nowhere, which is the failure `BlockSelection::covers`
-    /// exists to prevent one level up. The check is here so a future rule with a
-    /// non-trivial cover list cannot inherit this path silently.
+    /// `Rule::AluReg` covers exactly its own root, so this guard is insurance
+    /// against a future rule rather than a live filter — which is precisely why
+    /// it is tested directly instead of through a compile. Driven through one it
+    /// would be vacuous: the rules that DO absorb (`Lea`, `AluImm`, the fused
+    /// branches) are already refused a line earlier, by rule.
     ///
-    /// The exact edit that trips it: delete the `tile.covered.as_slice() == [id]`
-    /// guard in `mir_tile_bytes` and widen the rule filter to `Rule::AluImm`,
-    /// whose tiles absorb the constant.
+    /// What it prevents: the caller skips every node a tile covers, so a tile
+    /// that absorbed a node the encoder does not actually fold leaves that node
+    /// computed nowhere. That is the same failure `BlockSelection::covers`
+    /// exists to make unrepresentable, one level lower down.
+    ///
+    /// The exact edit that trips it: delete the `covered.as_slice() == [id]`
+    /// clause from `mir_tile_is_emittable`.
     #[test]
     fn the_encoder_refuses_a_tile_that_absorbed_another_node() {
-        use crate::x64::isel::{select_block, Rule, SelectOptions};
+        use crate::x64::isel::{MInst, Op as SelOp, Rule, Tile, Ty};
 
-        // `int f(int a) { return a + 7; }` — iload_0; bipush 7; iadd; ireturn.
-        let code = [0x1a, 0x10, 0x07, 0x60, 0xac, 0, 0];
-        let builder = IrBuilder::new(1, 1);
-        let mut graph = builder.build(&code, 5).expect("IR build");
-        ir_optimize::optimize(&mut graph);
-        let schedule = ir_schedule::schedule(&graph);
-
-        // Precondition: the shape really does produce an absorbing tile, or the
-        // test proves nothing about absorption.
-        let opts = SelectOptions {
-            frame_homed: true,
-            ..SelectOptions::default()
+        let alu = |dst: NodeId, lhs: NodeId, rhs: NodeId| MInst::AluRR {
+            op: SelOp::Add,
+            ty: Ty::I32,
+            dst,
+            lhs,
+            rhs,
         };
-        let absorbing = schedule.blocks.iter().any(|b| {
-            let sel = select_block(&graph, &b.nodes, b.terminator, &opts);
-            sel.tiles
-                .iter()
-                .any(|t| t.rule == Rule::AluImm && t.covered.len() > 1)
-        });
-        let dump: Vec<String> = schedule
-            .blocks
-            .iter()
-            .map(|b| {
-                let sel = select_block(&graph, &b.nodes, b.terminator, &opts);
-                format!(
-                    "all={:?} notes={:?} ops={:?} tiles={:?}",
-                    graph.nodes.iter().enumerate().map(|(i, n)| (i, format!("{:?}", n.op), n.inputs.clone())).collect::<Vec<_>>(),
-                    sel.notes,
-                    b.nodes.iter().map(|n| (n, &graph.nodes[*n as usize].op, graph.nodes[*n as usize].ty)).collect::<Vec<_>>(),
-                    sel.tiles
-                        .iter()
-                        .map(|t| (t.root, t.rule, t.covered.clone()))
-                        .collect::<Vec<_>>()
-                )
-            })
-            .collect();
+        // The shape the encoder handles: one root, nothing absorbed.
+        let plain = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluReg);
+        assert!(mir_tile_is_emittable(&plain, 5));
+
+        // The same tile, having absorbed node 4.
+        let absorbing = Tile::for_test(5, vec![5, 4], vec![alu(5, 3, 4)], Rule::AluReg);
         assert!(
-            absorbing,
-            "precondition: `a + 7` must tile as an absorbing `Rule::AluImm`: {dump:?}"
+            !mir_tile_is_emittable(&absorbing, 5),
+            "a tile that absorbed node 4 would leave it computed nowhere"
         );
 
-        // And it is not emitted: the byte-equality oracle sees no disagreement,
-        // because the encoder declined the tile rather than dropping the
-        // constant the tile absorbed.
-        let _guard = mir_totals::TEST_LOCK.lock();
-        mir_totals::reset();
-        let bytes = |mode: Option<MirMode>| -> Vec<u8> {
-            let _force = mode.map(MirForce::set);
-            let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("compiles");
-            // SAFETY: as in `mir_emitted_bytes`.
-            unsafe {
-                std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()).to_vec()
-            }
-        };
-        assert_eq!(bytes(None), bytes(Some(MirMode::Emit)));
-        assert_eq!(mir_totals::read().2, 0, "no disagreement expected");
+        // And a rule the encoder has not been proved byte-equal for, however
+        // ordinary its cover list.
+        let other = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluImm);
+        assert!(!mir_tile_is_emittable(&other, 5));
+        // A tile rooted somewhere else is never this node's answer.
+        assert!(!mir_tile_is_emittable(&plain, 4));
     }
 
     /// The two frame-access encoders are the ONE producer of these bytes.

@@ -3922,6 +3922,19 @@ impl Tile {
         )
     }
 
+    /// Build a tile directly. Tests only.
+    ///
+    /// In production only the rules construct tiles, so a tile's cover list and
+    /// its instructions always come from one place. A test that needs to hand a
+    /// *deliberately inconsistent* tile to a consumer — `ir_lower::
+    /// mir_tile_is_emittable`'s absorbed-node guard is the one that does —
+    /// cannot obtain one from a rule by construction, which is exactly why that
+    /// guard needs this.
+    #[cfg(test)]
+    pub fn for_test(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
+        Tile::new(root, covered, insts, rule)
+    }
+
     /// Can the pattern table encode every instruction in this tile?
     ///
     /// `Rule::Generic` is encodable by definition — it delegates to the
