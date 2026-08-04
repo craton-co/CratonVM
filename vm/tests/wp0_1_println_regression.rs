@@ -3,7 +3,7 @@
 
 //! WP0.1 — regression test for the "Cannot invoke write on null" P0 bug
 //! (discovered 2026-04-24 while staging EJBCA; see
-//! `docs/wildfly-ejbca-roadmap.md` WP0.1).
+//! `gaps/wildfly-ejbca-roadmap.md` WP0.1).
 //!
 //! The bug: two consecutive `System.out.println(String)` calls succeeded
 //! on the first and NPE'd on the second with "Cannot invoke write on

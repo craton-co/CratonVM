@@ -76,7 +76,7 @@ bytecode. On the interpreter's stackless/cached path, they do not. That is a
 deliberate, load-bearing asymmetry, now documented at both ends.
 
 The referenced write-up is
-`docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
+`fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
 The in-code comment still points at the pre-move path
 `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md`,
 which no longer exists — a stale reference worth fixing in the same change. It
@@ -105,7 +105,7 @@ The class list has two copies. The *predicate* built on it has more:
   holding the class-manager read lock"*).
 * The `VirtualNative` cache-hit path (`invoke.rs` ~22250) — calls Copy B as a
   cheap pre-filter, then the full helper. See
-  [cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
+  cached invoke targets retain and revalidate the `NativeKind`.
 
 Both class lists are additionally OR-ed with
 `env_cache::real_bytecode_selector().prefers_real(class)`, i.e. the

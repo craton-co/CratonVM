@@ -664,7 +664,7 @@ function Get-EffectiveClassTimeoutSec {
   # test failures unrelated to hanging -- see
   # docs/known-issues/springboot/ for the specific residual docs) and the
   # validated wall-clock times below include headroom over the observed time.
-  # See docs/internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
+  # See springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
   $slowClasses = @{
     'module/spring-boot-cache|org.springframework.boot.cache.autoconfigure.CacheAutoConfigurationTests' = 600
     # Hibernate's complete JPA auto-configuration class is CPU-bound and has

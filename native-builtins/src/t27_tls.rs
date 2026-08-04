@@ -1728,7 +1728,7 @@ pub(crate) fn build_client_config(
 /// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
 /// revoked server certificate — exactly the fail-open gap this feature
 /// fixes. See
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
 #[derive(Debug)]
 struct OcspAwareServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -2583,7 +2583,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -2595,7 +2595,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
 
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
-/// see `docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md`.
+/// see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`.
 /// Every call site that used to construct `rustls::crypto::ring::default_provider()`
 /// directly now goes through this instead, so the CBC suites are negotiable
 /// (not just reported) everywhere TLS connections get set up.
@@ -4736,7 +4736,7 @@ fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> 
 /// architectural defect already fixed once in this file for
 /// `engine_table`/`sslparams_alpn_table` via `engine_objref_key` (see its
 /// doc comment, and
-/// `docs/internal/fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
+/// `fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
 /// — that earlier fix's scope note explicitly left
 /// `ssl_server_socket_states`, `sock_alpn_table`, `session_peer_certs_table`,
 /// and `SSLSession.getId()`'s seed unfixed; this closes those.
@@ -7275,7 +7275,7 @@ enum BbBacking {
 /// server engine never saw the ClientHello Netty delivered and its first
 /// `unwrap` returned `BUFFER_UNDERFLOW consumed=0`, upon which Netty closed
 /// the connection (client saw "TLS handshake failed: unexpected EOF"). See
-/// `docs/known-issues/reactive-netty-https-sslengine-handshake-underflow.md`.
+/// `fixed-suite-bugs/reactive-netty-https-sslengine-handshake-underflow-FIXED.md`.
 struct BbView {
     backing: BbBacking,
     layout: BbLayout,
@@ -7869,7 +7869,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // `beginHandshake()` call was ALSO silently discarded on the
                     // CratonVM side even before hitting that rustls wall — see
                     // this crate's
-                    // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-
+                    // `fixed-suite-bugs/tls-ocsp-clientcert-
                     // validation-not-enforced-FIXED.md`, "Residual #2 implementation"
                     // point 2, for the full trace evidence.
                     //
@@ -9094,7 +9094,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     // reaches the connection's promise), which is why this specific NPE
     // manifested as an indefinite hang/silent-exit crash rather than a
     // visible test failure — see
-    // docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md.
+    // fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md.
     // Real JDK's `getHandshakeSession()` returns the session being
     // negotiated (or null outside a handshake); returning the same
     // best-effort synthetic session `getSession()` already builds (complete

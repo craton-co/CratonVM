@@ -148,8 +148,8 @@ pub(crate) fn is_class_mirror_native_override(
 /// bytecode invokes already prefer the registered native, but this call
 /// pattern (through the lambda-backed `ComputeValue` plumbing) can resolve
 /// through a dispatch path whose concrete-bytecode precedence needs this
-/// explicit shared gate — see docs/known-issues/springboot/
-/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md Cluster C
+/// explicit shared gate — see fixed-suite-bugs/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md Cluster C
 /// "Residual 5" (fixed under `--nojit` without this gate; JIT mode still hit
 /// the original always-null-returning symptom until this was added).
 pub(crate) fn is_classvalue_native_override(
@@ -1865,7 +1865,7 @@ pub(crate) fn is_file_channel_impl_open_native_override(
 /// `native-builtins/src/phases_late/nio_file.rs` are unreachable and every
 /// `Files.createSymbolicLink` in the VM dies with a bare
 /// `UnsupportedOperationException` — see
-/// `docs/internal/fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
+/// `fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
 ///
 /// The real `sun.nio.fs.*` provider names are listed alongside the base for the
 /// same reason `newFileChannel` lists them: a cached dispatch site can carry a
@@ -3030,8 +3030,8 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // set. Once `execute(Runnable)` (invoked via `invokeinterface
     // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
     // class's own real bytecode, that bytecode reads the never-initialized
-    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
-    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // `ctl` AtomicInteger and NPEs immediately (fixed-suite-bugs/
+    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). Force the
     // registered native (`native_es_execute`) to win for this triple;
     // `intercept_force_registered_native` additionally checks the receiver's
     // real `workers` field so a genuinely real, bytecode-constructed
@@ -3298,7 +3298,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // and even standard level names through `KnownLevel.findByName`, which
     // on JDK 25 throws internally (a `Module`-null NPE the method's own
     // catch-all reports as a generic `IllegalArgumentException: Bad level`)
-    // — see `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // — see `gaps/kc16-blocker-map.md`'s KC16 investigation.
     // This broke WildFly's own `host.xml`/`domain.xml` parsing of
     // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
     // it ever reached a genuinely-unknown name. Force the registered native
@@ -4137,7 +4137,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // completely unreachable. Confirmed via runtime instrumentation: a tight
     // `text.substring(pos, pos+5)` loop over a large parent `String` cost
     // O(n^2) instead of O(subLen) with this entry absent (see
-    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    // `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`).
     if class_name == "java/lang/String"
         && method_name == "substring"
         && method_descriptor == "(II)Ljava/lang/String;"
@@ -5132,7 +5132,7 @@ pub(super) fn redefine_immune_forced_native(
         // registered native. Keep in sync with vm_exec.rs's
         // invoke_on_class_shared_inner check_override entry for the same
         // triples; see
-        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+        // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
         || (class_name == "java/util/logging/FileHandler"
             && matches!(
                 method_name,
@@ -5652,7 +5652,7 @@ pub(super) fn intercept_force_registered_native(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
@@ -5825,14 +5825,14 @@ pub(super) fn intercept_force_registered_native_cached(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
     {
         return None;
     }
-    // Site A1 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    // Site A1 of `arch-2026-07-26/native-dispatch-memoization.md`
     // §3 Step 2. Perf (2026-07-19, TestResponsePerformance residual): memoize
     // the resolved callback per invoke-cache entry, same shape as
     // `force_native_cache` above -- `NativeMethodRegistry::find` was the #2
@@ -6305,8 +6305,8 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 // the identical bytecode shape and field count/layout (ruled
                 // out via a standalone MicroProbe repro) — something specific
                 // to this being a natively-registered bootstrap class, not the
-                // bytecode pattern itself. See docs/known-issues/
-                // stringjoiner-synthetic-native-real-jdk-field-mismatch.md. Path 2
+                // bytecode pattern itself. See fixed-suite-bugs/
+                // stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md. Path 2
                 // (`invoke_or_native` in vm/src/vm/vm_exec.rs) still protects
                 // StringJoiner via its own, separate, long-standing allowlist
                 // — this only reverts the NEW path-1 (interpreter

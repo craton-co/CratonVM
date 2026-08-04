@@ -49,7 +49,7 @@ import java.util.Map;
  * The REACH and NODE-MIX numbers in the survey are counts and are unaffected
  * by any of that; they reproduced exactly across runs. The timing is what is
  * uncharacterised. See
- * docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md.
+ * meas-02-bench-suite-c2-reach-RETIRED-20260803.md.
  *
  * Output shape is CratonBench's, exactly: "<n>. <name> : <ms> ms  [<sum>]",
  * so `run-cratonbench-gate.sh` can run this file unchanged if it is ever

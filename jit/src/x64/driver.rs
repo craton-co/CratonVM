@@ -1688,7 +1688,7 @@ pub fn compile_with_param_slots(
         // Name the target. `pc` here is the branch target with no native
         // offset and `op` the byte at it — enough to check against a `javap -c`
         // listing whether the target really is off-boundary (it usually is
-        // not: see `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
+        // not: see `jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
         let (target, nearest) = compiler.unresolved_branch_target.unwrap_or((0, -1));
         let target_op = code.get(target).copied().unwrap_or(0);
         crate::note_jit_bail_site_at(
@@ -1720,7 +1720,7 @@ pub fn compile_with_param_slots(
         // Name the method and the shortfall. A silent bail here is
         // indistinguishable from "the JIT chose not to compile this", which is
         // how a whole class of invoke-heavy methods came to stop being compiled
-        // unnoticed (`docs/internal/resolvabletype-equals-jit-...`): the only
+        // unnoticed (`resolvabletype-equals-jit-...`): the only
         // visible symptom was a flood of anonymous `try_patch_*: offset out of
         // bounds` warnings with no method attached to any of them.
         tracing::warn!(

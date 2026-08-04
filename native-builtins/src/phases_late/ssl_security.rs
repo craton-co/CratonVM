@@ -497,7 +497,7 @@ pub(crate) const NEW13_SOCK_SESSION: usize = 4;
 /// `getOutputStream`/`write` work on a socket obtained via the plain
 /// 2-arg `createSocket(host, port)` (the overload Apache HttpClient5's
 /// classic connection pool actually calls, per
-/// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+/// fixed-suite-bugs/netty-client-socket-write-after-close-nsme-FIXED.md).
 pub(crate) fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
     if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
         if id >= 0 {
@@ -1163,7 +1163,7 @@ pub(crate) fn new13_finish_socket(
 /// methods have no Code and threw `AbstractMethodError` for any caller that
 /// invoked one directly (e.g. a test wrapper `KeyManager` delegating to the
 /// array `getKeyManagers()` returned — see
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
 /// "Residual #2 implementation" for the full trace that found this).
 pub(crate) fn kmf_keystore_id_by_identity(
 ) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
@@ -1589,7 +1589,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
                 // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
                 "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -1735,7 +1735,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // CLIENT mode — the caller may still flip it to SERVER mode via
     // `setUseClientMode(false)` before the handshake actually starts, which
     // is exactly the MockWebServer HTTPS-listener pattern
-    // (`docs/internal/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
+    // (`fixed-suite-bugs/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
     // Since the role isn't known yet at this call, the handshake itself is
     // deferred — see `t27_tls::{stash_pending_layered_socket,
     // set_pending_layered_socket_client_mode, drive_pending_layered_handshake}`
@@ -2137,7 +2137,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // as its mitigation for CVE-2009-3555 and 3SHAKE. Firing the event
     // anyway would tell the application that fresh key material had been
     // derived when none had. See
-    // `docs/internal/fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md`.
+    // `fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md`.
     r.register(
         ssl_sock,
         "addHandshakeCompletedListener",
@@ -2992,7 +2992,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // at the barrier: a mutual deadlock, observed as `rounds=64 pending=1
         // taken=0` repeating with no further progress. Same bug shape as the
         // `net_phase_e` HttpClient and S2 selector fixes; see
-        // `docs/internal/fixed-suite-bugs/keycloak/
+        // `fixed-suite-bugs/keycloak/
         // keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`.
         ctx.begin_blocking_region();
         let filled = crate::servlet::s2_tls_fill_readahead(tls_id);
@@ -3693,7 +3693,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // tracing against Tomcat's `TestClientCert`/
             // `engine_run_trust_check`'s post-handshake
             // `checkClientTrusted` call — see
-            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
             // enforced-FIXED.md`, "Residual #2 implementation" for the full
             // trace). Fixed the same way as the sibling
             // `KeyManagerFactory.getKeyManagers()` fix just above: build
@@ -3960,7 +3960,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // override does exactly this
             // (`manager.chooseClientAlias(keyType, issuers, socket)`,
             // `manager` being whatever `getKeyManagers()` returned) — see
-            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
             // enforced-FIXED.md`, "Residual #2 implementation" for the full trace.
             //
             // Fixed by building the SAME real, natively-backed
@@ -4112,7 +4112,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // were never registered on javax/net/ssl/SSLEngine (only getEnabled* above), the
     // same "missing accessor" shape as the earlier SSLSocket
     // getSupportedCipherSuites/getEnabledCipherSuites gap (see
-    // docs/internal/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
+    // fixed-suite-bugs/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
     // ssleng_alloc allocates every SSLEngine directly on this abstract class (never a
     // concrete subclass), so an unregistered method here always throws
     // AbstractMethodError on any real-JDK caller. Netty's JdkSslContext.<clinit> (via
@@ -4141,7 +4141,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
                 // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
                 "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -4938,7 +4938,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // `getEncoded()` → rustls `invalid peer certificate: BadEncoding`.
             // `p59_read_input_stream_fully` keeps the fast BAIS path and adds a
             // generic `read()`-loop fallback for every other stream type. See
-            // docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+            // fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
             let der_data = if let Some(Value::Object(Some(is_ref))) = args.get(1) {
                 match p59_read_input_stream_fully(ctx, *is_ref) {
                     Ok(bytes) if !bytes.is_empty() => Some(bytes),

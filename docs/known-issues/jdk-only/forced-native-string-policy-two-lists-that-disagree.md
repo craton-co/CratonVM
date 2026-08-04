@@ -216,7 +216,7 @@ wave 1 could not validate.
 * [`NativeKind` is ambient and defaults to `SyntheticStub`](native-kind-is-ambient-and-defaults-to-syntheticstub.md)
   — the reason these natives cannot simply be re-tagged `Intrinsic` today, and
   the reason the markers' "they are already `Intrinsic`" premise needs checking.
-* [Cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md)
+* Cached invoke targets retain and revalidate the `NativeKind`
   — the structural reason a cold-path policy and a warm-path policy exist at all.
 * [Additional wave-2 markers §4](additional-wave2-markers-not-in-the-original-inventory.md)
   — the seven thin direct-call ladders, two of which are this policy's third copy.

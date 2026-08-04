@@ -22,7 +22,7 @@
 //! dedicated unconditional registrars, so an absent application pack cannot
 //! remove a platform bridge.
 //!
-//! [reachability audit]: ../../docs/internal/arch-2026-07-26/native-builtins-reachability.md
+//! [reachability audit]: arch-2026-07-26/native-builtins-reachability.md
 //!
 //! # Why selection happens at bootstrap
 //!

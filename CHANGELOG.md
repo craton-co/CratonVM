@@ -83,7 +83,7 @@ the numbers instead of having to be rediscovered.
 - `bench/CratonBenchC2.java` — a candidate workload with a framework-shaped
   node mix, reaching the tier 36/17/11 across three phases. Deliberately **not**
   a gate phase and with no baseline; see
-  `docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`.
+  `meas-02-bench-suite-c2-reach-RETIRED-20260803.md`.
 
 #### Changed
 - Results schema **1 → 2**; the default results directory is now

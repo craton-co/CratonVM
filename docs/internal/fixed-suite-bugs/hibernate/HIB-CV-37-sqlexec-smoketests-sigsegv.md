@@ -5,6 +5,17 @@
 **Original symptom:** `org.hibernate.orm.test.sql.exec.SmokeTests` crashed with rc=139
 inside `testQueryConcurrency`.
 
+**2026-08-04 note:** this exact test crashed again on current dev, same
+class/method, different mechanism — a register-invisible-root stale pointer
+(the "Layer 1" DoHead family), not the native-callback-locals-vs-moving-GC
+bug this doc fixed. See
+`../../known-issues/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804.md`.
+Consistent with this doc's own "Verification" section below, which already
+flagged that closure was never re-verified end to end against the real test —
+this doesn't retroactively invalidate the fixes recorded here (they address a
+real, different bug), it just means they were never sufficient to guarantee
+this class crash-free.
+
 ## Closure note
 
 This was left too broad in `docs/known-issues`: the original note bundled a

@@ -1313,7 +1313,7 @@ pub struct G1Collector {
     /// entirely garbage. The generational collector hides the same gap behind
     /// its young→old spill fallback (`gen_heap::alloc_object`); G1 has no
     /// equivalent, so it aborted outright. See
-    /// `docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`.
+    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`.
     native_alloc_pressure: AtomicBool,
 
     /// Per-region `(reuse_epoch, cursor, region_type)` snapshot captured at
@@ -4560,7 +4560,7 @@ impl G1Collector {
     ///       collection: the smoking gun.
     ///
     /// ROOT CAUSE (full writeup + ruled-out fixes:
-    /// `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// `fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`):
     /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
     /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
     /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in
@@ -7837,7 +7837,7 @@ impl GarbageCollector for G1Collector {
         // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
         // a non-atomic 16-byte copy that could tear against a concurrent
         // plain `set_field` from another mutator thread -- see
-        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
         let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
@@ -10741,7 +10741,7 @@ mod tests {
     }
 
     // -- Native-allocation pressure latch --
-    // (docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md)
+    // (fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md)
 
     /// Fill the first `count` regions so they read as fully-consumed Eden,
     /// leaving `num_regions - count` Free. Mirrors what a running mutator
@@ -12866,7 +12866,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // G1 maturation (docs/internal/arch-2026-07-26/g1-maturation.md)
+    // G1 maturation (arch-2026-07-26/g1-maturation.md)
     // -----------------------------------------------------------------------
 
     /// Overwrite the mark-start (TAMS) snapshot so a test can place TAMS at an

@@ -2,7 +2,7 @@
 
 Implements the "first increment" of
 `docs/known-issues/c2/verify-01-differential-harness.md` (now retired to
-`docs/internal/` — read it first for the *why*). This directory does not
+`` — read it first for the *why*). This directory does not
 replace the five suite runners under `apps/*-suite-runner/`; it standardises
 what happens *after* one of them produces results.
 

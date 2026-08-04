@@ -65,7 +65,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
+        // (`docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -509,7 +509,7 @@ struct Args {
     /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
     /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
     /// `-Xmx` instead of a fixed value. See
-    /// docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
+    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
     #[arg(
         long = "XX:MaxDirectMemorySize",
         value_name = "SIZE",
@@ -3905,7 +3905,7 @@ fn run() -> Result<()> {
     // Interpreter intrinsic-table stats. `CRATONVM_INTRINSIC_STATS=1` prints
     // the steady-state intrinsic-dispatch hit count on shutdown — the
     // counter that verifies acceptance criterion §9 of
-    // docs/feature_roadmap_interpreter_intrinsic_table.md.
+    // gaps/feature_roadmap_interpreter_intrinsic_table.md.
     if matches!(
         std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(),
         Ok("1")
@@ -4069,7 +4069,7 @@ fn run() -> Result<()> {
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
             // `throwable_stacks` directly) is roadmap item T2.2.18 — see
-            // `docs/roadmap-100.md` line 471.
+            // `history/roadmap-100.md` line 471.
             //
             // INTENTIONAL (reviewed): omitting the `\tat ...` frames here is an
             // acceptable, honest degradation — NOT a wrong-result stub. The

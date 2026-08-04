@@ -689,3 +689,51 @@ load. No code change indicated; no doc moved to `known-issues/`. See
 section's `OracleInlineMutationStrategyIdTest` entry, which the same fresh
 binary genuinely does speed up -- unlike these two, whose workload never
 touches the mechanism that fix addresses).
+
+## Correction (2026-08-04): `BatchTest` no longer belongs in this cluster; `DynamicBatchFetchTest`'s "zero GC events" claim is now stale
+
+A fresh 50-class residual run (`apps/hib-suite-runner/runs/run-20260804-113511-custom/on-real/`,
+dev tip `a43a74ded`) reports both classes as `FAIL`, not `HANG` — expected
+day-to-day variance for this load-dependent cluster, not itself news. But the
+**shape** of each failure has changed since the 2026-07-30/31 recurrence
+section above, and one specific claim in that section (a load-bearing part of
+its "moving-young explicitly ruled out" argument) no longer holds as stated:
+
+- **`BatchTest` is not a timeout at all today.** All 4 methods fail with a
+  genuine `org.hibernate.exception.ConstraintViolationException` (a unique-index
+  collision on `DataPoint(xval,yval)`), confirmed JIT-only (0/3 reproduce
+  under `--nojit` on the small methods) and 100% reproducible under JIT. This
+  is a real, distinct CratonVM defect, not a recurrence of this cluster's
+  generic throughput margin. Full write-up:
+  `../../../known-issues/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+  **`BatchTest` should be considered graduated out of this cluster** — track
+  it at the new doc, not here, going forward.
+- **`DynamicBatchFetchTest` is still the same `TimeoutException` shape**
+  (`testMultiLoad` trips the internal 120s `@Timeout`, `found=2 ok=1
+  failed=1`), so the throughput-margin classification is not overturned. But
+  the 2026-07-30/31 section above states `CRATONVM_GC_STATS=1` "printed zero
+  `[GC]` lines in any of them -- these two classes never trigger a single
+  young collection in the first place", and uses that as direct evidence the
+  moving-young mechanism cannot be involved. **That specific observation no
+  longer holds on today's binary.** Today's log
+  (`shard-3/raw.log`, strictly within `DynamicBatchFetchTest`'s own region)
+  shows 8-9 `[moving-young] fallback` WARN lines during `testMultiLoad`,
+  `reason=innermost-rbp-belongs-to-unguarded-callee` — a young collection IS
+  now being requested and attempted (always falling back to the non-moving
+  sweep), where before it was not requested at all. This is most likely
+  explained by the 2026-08-03 moving-young coverage fixes
+  (`../../default-moving-young-enabled-20260730.md`) making the collector
+  attempt cycles under JIT frames more often across the board, not by
+  anything specific to this class's workload changing. **The overall
+  "moving-young mechanism ruled out" verdict is not retested here** — the
+  original ruling-out relied on a `CRATONVM_NO_MOVING_YOUNG=1` A/B showing no
+  change, and that A/B has not been re-run on a binary where a moving cycle
+  is actually attempted (as opposed to the pre-08-03 binary, where "a
+  mechanism that only costs anything when a moving collection is requested
+  cannot explain a workload that never requests one" was literally true and
+  is no longer the situation). Until that A/B is re-run, treat "moving-young
+  explicitly ruled out" as the working assumption, not a re-confirmed fact,
+  for `DynamicBatchFetchTest` specifically.
+
+`README.md`'s "batch.BatchTest and batchfetch.DynamicBatchFetchTest" bullet
+has a matching correction pointing here and to the new `BatchTest` doc.
