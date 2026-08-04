@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — reproducible in two lines, narrowed to the OSR-compiled body |
+| **Status** | OPEN — reproducible in two lines, narrowed to ONE method's OSR artifact |
 | **Severity** | high — `Arrays.sort` is not a corner of the JDK, and the failure is a *wrong index*, i.e. silent data corruption is one branch away |
 | **HotSpot** | PASS |
 | **CratonVM** | FAIL on the FIRST sort, every run, JIT on |
@@ -72,6 +72,52 @@ the compiled pc does **not** fix it, so the OSR-compiled **body** is wrong, not
 the choice of entry point. Keep the lever: it took one build to answer and it
 will take one env var next time.
 
+## Narrowed to one method (2026-08-04)
+
+The bisect levers reach the OSR compile path as of `dev` `12b8cbdea` — another
+session closed exactly the gap this doc's step 1 asked for
+(`compile_osr_artifact` now consults `cratonvm_jit::jit_force_interpret`; see
+`annotation-scan-arrayread-sigsegv.md`, which hit the same wall). With working
+filters the answer is unambiguous:
+
+| `CRATONVM_JIT_DENY=` | verdict |
+|---|---|
+| `zzzNoSuchPrefix` via `BISECT_ONLY` (nothing compiles) | PASS — the filter is now effective |
+| `DualPivotQuicksort` | PASS |
+| `DualPivotQuicksort.mixedInsertionSort` | **PASS** |
+| `DualPivotQuicksort.partitionDualPivot` | FAIL |
+| `DualPivotQuicksort.insertionSort` | FAIL |
+| `DualPivotQuicksort.heapSort` | FAIL |
+| `DualPivotQuicksort.sort` | FAIL |
+| `DualPivotQuicksort.tryMergeRuns` | FAIL |
+| `DualPivotQuicksort.pushDown` | FAIL |
+| `SortProbe` (the probe's own code) | FAIL |
+
+**The defect is the OSR artifact for
+`java.util.DualPivotQuicksort.mixedInsertionSort([JII)V`, compiled at
+`osr_bci=282`.** Denying that one method — and only that one — makes every sort
+correct.
+
+Beware when writing further deny lists: the matcher is a case-sensitive
+substring over `Class.method`, and `DualPivotQuicksort.mixedInsertionSort`
+contains the substring `sort`. A deny list containing `sort` silently disables
+the culprit and reads as a pass for the wrong reason.
+
+### Not the operand-stack widths
+
+`CRATONVM_DBG=stack-kinds` over the failing compile:
+
+```
+[stack-kinds] …mixedInsertionSort:([JII)V answered 276 of 446 pcs (calls=0 fields=0 statics=0)
+[stack-kinds] …mixedInsertionSort:([JII)V bci=282 emitter_depth=0 analysis=Some([]) accepted=true
+```
+
+Every OSR entry candidate reports `emitter_depth=0` with an empty stack, so the
+typed-operand-stack work is not implicated — the entry states are trivial. The
+body is wrong, not the state restored into it. (`answered 276 of 446` is a
+separate observation worth a look on its own, but the accepted entries are all
+empty-stack.)
+
 ## What is left to bisect
 
 Both OSR-compiled methods are `long[]` + `int`-index kernels:
@@ -90,13 +136,15 @@ loop expecting it to fail.
 
 ## Suggested next step
 
-1. Teach `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` to gate the OSR
-   compile path. Without that, no OSR miscompile can be narrowed to a method,
-   which is the tooling gap that made this doc necessary.
-2. With the filter working, deny each of the two methods in turn to find which
-   body is wrong, then diff its OSR artifact against its whole-method artifact
-   (`jit/tests/x64_artifact_corpus.rs` is the differ).
-3. `CRATONVM_DBG=stack-kinds` over the failing compile.
+1. ~~Teach the deny/bisect filters to gate the OSR compile path.~~ Done on
+   `dev` by another session; the narrowing above is the result.
+2. ~~Find which method.~~ `mixedInsertionSort([JII)V`.
+3. ~~`CRATONVM_DBG=stack-kinds`.~~ Clean — empty stack at every accepted entry.
+4. **Next:** diff that method's OSR artifact against its whole-method artifact
+   with `jit/tests/x64_artifact_corpus.rs` (bytes AND metadata). The
+   whole-method compile appears sound — `CRATONVM_JIT_OSR=0` passes while the
+   method still compiles — so the two artifacts for the same bytecode disagree,
+   which is exactly what that differ is for.
 
 ## Blast radius
 
