@@ -323,6 +323,13 @@ const TEXT_EXTENSIONS: &[&str] = &[
     ".rs", ".md", ".toml", ".py", ".sh", ".ps1", ".java", ".tsv", ".yml", ".yaml", ".json", ".txt",
 ];
 
+/// Directories with nothing a person wrote in them. Narrower than
+/// [`SKIPPED_DIRS`] on purpose: that list drops `apps/` because it holds Java
+/// harnesses rather than Rust, but those harnesses carry READMEs, run scripts
+/// and result tables that cite records like anything else — and did carry
+/// `docs/internal/` paths when this rule went in.
+const NON_AUTHORED_DIRS: &[&str] = &["target", ".git", "node_modules"];
+
 /// Every text file outside `docs/internal/`, which is the tree this rule is
 /// about and the one place a `docs/internal/` path is still the right answer.
 fn public_text_files(dir: &Path, internal: &Path, out: &mut Vec<PathBuf>) {
@@ -335,7 +342,7 @@ fn public_text_files(dir: &Path, internal: &Path, out: &mut Vec<PathBuf>) {
             continue;
         };
         if path.is_dir() {
-            if !SKIPPED_DIRS.contains(&name) && !name.starts_with('.') && path != internal {
+            if !NON_AUTHORED_DIRS.contains(&name) && !name.starts_with('.') && path != internal {
                 public_text_files(&path, internal, out);
             }
         } else if TEXT_EXTENSIONS.iter().any(|e| name.ends_with(e)) {
