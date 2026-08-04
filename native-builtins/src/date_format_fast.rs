@@ -116,6 +116,7 @@ struct Plan {
     /// a plan rebuild instead.
     symbols_id: i32,
     pieces: std::sync::Arc<Vec<Piece>>,
+    symbols: std::sync::Arc<Symbols>,
 }
 
 /// Per-`SimpleDateFormat` cached state, keyed by the receiver's identity hash.
@@ -125,6 +126,53 @@ struct Entry {
     poisoned: bool,
     /// Output shapes already cross-checked against the bytecode.
     verified: FxHashSet<ShapeKey>,
+}
+
+/// The `DateFormatSymbols` strings a plan can need, decoded once when the plan
+/// is built rather than on every format.
+///
+/// Reading one month name per format cost two heap field reads plus a
+/// `read_string` — which allocates a Rust `String` and decodes UTF-16 — and
+/// `GenerationalHeap::is_object_address` (reached through every `get_field`)
+/// was 8.9% of the native in a perf profile. These are safe to hold across
+/// calls because the only public route to different symbols is
+/// `setDateFormatSymbols`, which installs a CLONE — a new object, so a new
+/// identity, so a plan rebuild. `probes/DateFormatParityProbe.java` covers
+/// that case explicitly.
+#[derive(Debug, Default, Clone)]
+struct Symbols {
+    eras: Vec<String>,
+    months: Vec<String>,
+    short_months: Vec<String>,
+    weekdays: Vec<String>,
+    short_weekdays: Vec<String>,
+    ampms: Vec<String>,
+}
+
+fn read_string_array(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Vec<String> {
+    let Some(arr) = obj_slot(ctx, obj, slot) else {
+        return Vec::new();
+    };
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        match ctx.get_array_element(arr, i) {
+            Value::Object(Some(s)) => out.push(ctx.read_string(s).unwrap_or_default()),
+            _ => out.push(String::new()),
+        }
+    }
+    out
+}
+
+fn read_symbols(ctx: &mut dyn NativeContext, sl: &Slots, symbols: ObjectRef) -> Symbols {
+    Symbols {
+        eras: read_string_array(ctx, symbols, sl.dfs_eras),
+        months: read_string_array(ctx, symbols, sl.dfs_months),
+        short_months: read_string_array(ctx, symbols, sl.dfs_short_months),
+        weekdays: read_string_array(ctx, symbols, sl.dfs_weekdays),
+        short_weekdays: read_string_array(ctx, symbols, sl.dfs_short_weekdays),
+        ampms: read_string_array(ctx, symbols, sl.dfs_ampms),
+    }
 }
 
 /// The tuple that determines which *text* a plan emits. See the module doc.
@@ -149,6 +197,7 @@ struct LastPlan {
     pattern_id: i32,
     symbols_id: i32,
     pieces: std::sync::Arc<Vec<Piece>>,
+    symbols: std::sync::Arc<Symbols>,
     verified: FxHashSet<ShapeKey>,
 }
 
@@ -499,10 +548,9 @@ fn string_array_elem(
 /// outside the supported subset after all" — run the bytecode.
 #[allow(clippy::too_many_arguments)]
 fn render(
-    ctx: &mut dyn NativeContext,
     pieces: &[Piece],
     inputs: &Inputs,
-    sl: &Slots,
+    syms: &Symbols,
     out: &mut String,
 ) -> Option<()> {
     let f = &inputs.fields;
@@ -515,8 +563,7 @@ fn render(
                 match letter {
                     // 'G' — era. Guarded to AD by the cutover check, so index 1.
                     'G' => {
-                        let eras = obj_slot(ctx, inputs.symbols, sl.dfs_eras)?;
-                        out.push_str(&string_array_elem(ctx, eras, 1)?);
+                        out.push_str(syms.eras.get(1)?);
                     }
                     'y' => {
                         if count == 2 {
@@ -527,11 +574,9 @@ fn render(
                     }
                     'M' => {
                         if count >= 4 {
-                            let months = obj_slot(ctx, inputs.symbols, sl.dfs_months)?;
-                            out.push_str(&string_array_elem(ctx, months, f.month0 as usize)?);
+                            out.push_str(syms.months.get(f.month0 as usize)?);
                         } else if count == 3 {
-                            let months = obj_slot(ctx, inputs.symbols, sl.dfs_short_months)?;
-                            out.push_str(&string_array_elem(ctx, months, f.month0 as usize)?);
+                            out.push_str(syms.short_months.get(f.month0 as usize)?);
                         } else {
                             zero_padding_number(out, f.month0 as i64 + 1, count, usize::MAX);
                         }
@@ -556,17 +601,11 @@ fn render(
                     's' => zero_padding_number(out, f.second as i64, count, usize::MAX),
                     'S' => zero_padding_number(out, f.millis as i64, count, usize::MAX),
                     'E' => {
-                        let arr = if count >= 4 {
-                            obj_slot(ctx, inputs.symbols, sl.dfs_weekdays)?
-                        } else {
-                            obj_slot(ctx, inputs.symbols, sl.dfs_short_weekdays)?
-                        };
-                        out.push_str(&string_array_elem(ctx, arr, f.day_of_week as usize)?);
+                        let table = if count >= 4 { &syms.weekdays } else { &syms.short_weekdays };
+                        out.push_str(table.get(f.day_of_week as usize)?);
                     }
                     'a' => {
-                        let arr = obj_slot(ctx, inputs.symbols, sl.dfs_ampms)?;
-                        let idx = usize::from(f.hour_of_day >= 12);
-                        out.push_str(&string_array_elem(ctx, arr, idx)?);
+                        out.push_str(syms.ampms.get(usize::from(f.hour_of_day >= 12))?);
                     }
                     // 'Z' — RFC 822, always +hhmm / -hhmm (5 chars with sign).
                     'Z' => {
@@ -914,15 +953,15 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
                             && l.symbols_id == symbols_id
                             && l.verified.contains(&shape) =>
                     {
-                        Some(l.pieces.clone())
+                        Some((l.pieces.clone(), l.symbols.clone()))
                     }
                     _ => None,
                 }
             });
-            if let Some(pieces) = hit {
+            if let Some((pieces, syms)) = hit {
                 let rendered = SCRATCH.with(|buf| {
                     let mut buf = buf.borrow_mut();
-                    render(ctx, &pieces, &inputs, sl, &mut buf).map(|()| buf.clone())
+                    render(&pieces, &inputs, &syms, &mut buf).map(|()| buf.clone())
                 });
                 if let Some(text) = rendered {
                     stamp_calendar(ctx, sl, inputs.calendar, inputs.millis);
@@ -936,7 +975,7 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
             if plan_cache().lock().get(&this_id).is_some_and(|e| e.poisoned) {
                 return format_via_bytecode(ctx, this, Some(date));
             }
-            let (pieces, pattern) = {
+            let (pieces, pattern, syms) = {
                 {
                 let mut cache = plan_cache().lock();
                 let entry = cache.entry(this_id).or_insert_with(|| Entry {
@@ -960,6 +999,7 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
                         return format_via_bytecode(ctx, this, Some(date));
                     };
                     let compiled = compile_pattern(&text);
+                    let syms = std::sync::Arc::new(read_symbols(ctx, sl, inputs.symbols));
                     let mut cache = plan_cache().lock();
                     let entry = cache.get_mut(&this_id).expect("entry inserted above");
                     entry.plan = compiled.map(|pieces| Plan {
@@ -967,18 +1007,19 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
                         pattern_id,
                         symbols_id,
                         pieces: std::sync::Arc::new(pieces),
+                        symbols: syms,
                     });
                 }
                 }
                 let cache = plan_cache().lock();
                 match cache.get(&this_id).and_then(|e| e.plan.as_ref()) {
-                    Some(p) => (p.pieces.clone(), p.pattern.clone()),
+                    Some(p) => (p.pieces.clone(), p.pattern.clone(), p.symbols.clone()),
                     None => return format_via_bytecode(ctx, this, Some(date)),
                 }
             };
 
             let mut fast = String::new();
-            if render(ctx, &pieces, &inputs, sl, &mut fast).is_none() {
+            if render(&pieces, &inputs, &syms, &mut fast).is_none() {
                 return format_via_bytecode(ctx, this, Some(date));
             }
 
@@ -1033,6 +1074,7 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
                         pattern_id,
                         symbols_id,
                         pieces: pieces.clone(),
+                        symbols: syms.clone(),
                         verified,
                     })
                 });
