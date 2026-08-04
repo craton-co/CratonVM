@@ -93,52 +93,76 @@ for the absence of a helper it never calls.
 
 ### Coverage — `CRATONVM_DBG=ir-compiles`, `ConditionalOnPropertyTests`
 
-Two rounds, both arms per round, arm order reversed in round 2. **Measured
-twice**, because `cov-01` and `cov-02` merged into `dev` while this lane was in
-flight and neither of their post-measurements includes this one either. The
-second table is the one that describes `dev` today.
+Two rounds, both arms per round, arm order reversed in round 2.
 
-**(a) In isolation, against `dev` before `cov-01`/`cov-02`:**
+**Measured three times, on three different trees, and the answer nearly
+doubled.** `cov-01`, `cov-02` and `cov-04` all landed on `dev` while this lane
+was in flight, and each of them admits methods that then reach *this* lane's
+sites. Every table below therefore names the tree it was taken on, because
+**none of them is comparable to the others** — quoting one against another is
+the exact mistake this directory's own re-ranking rule exists to prevent.
+
+**(a) Against `dev` before `cov-01`/`cov-02`:**
 
 | arm | admitted | bodies | builder refusals |
 |---|---:|---:|---:|
 | base | 693 / 695 | 410 / 410 | 83 / 83 |
 | **fix** | 696 / 694 | **445 / 444** | **50 / 49** |
 
-**(b) On top of `cov-01` + `cov-02`, which is where it landed:**
+**(b) On top of `cov-01` + `cov-02`:**
 
 | arm | admitted | bodies | builder refusals |
 |---|---:|---:|---:|
-| dev base | 695 / 694 | 537 / 536 | 127 / 127 |
-| **merged** | 694 / 696 | **574 / 576** | **89 / 89** |
+| base | 695 / 694 | 537 / 536 | 127 / 127 |
+| **fix** | 694 / 696 | **574 / 576** | **89 / 89** |
 
-Refusal sites for (b) (`ir.rs` line numbers shift by +79 with this edit; the
-mapping is by arm, and every surviving site maps 1:1):
+**(c) THE ONE THAT DESCRIBES `dev` — on `cov-01` + `cov-02` + `cov-04`.**
+Baseline `fb33aa5ac` (dev immediately before this lane merged), fix
+`84b519382`:
 
-| site (dev) | what | dev | site (merged) | merged |
-|---|---|---:|---|---:|
-| `ir.rs:5337` | `putfield` tag not `I/Z/B/C/S` | **38** | `ir.rs:5416` | **0** |
-| `ir.rs:5293` | `getfield` of `long`/`float`/`double` | **5** | `ir.rs:5372` | **0** |
-| `ir.rs:5456` | `invokespecial` (`cov-04`) | 73 | `ir.rs:5535` | 78 |
-| `ir.rs:5516` | invoke with no `invoke_info` (`cov-04`) | 9 | `ir.rs:5595` | 9 |
-| `ir.rs:5471` | (`cov-04`) | 1 | `ir.rs:5550` | 1 |
-| `ir.rs:5381` | `getfield` with no resolved layout | 1 | `ir.rs:5460` | 1 |
+| arm | admitted | bodies | builder refusals |
+|---|---:|---:|---:|
+| base | 690 / 690 | 588 / 588 | **72 / 72** |
+| **fix** | 696 / 695 | **661 / 660** | **2 / 2** |
 
-Both of the lane's sites are gone: **43 events removed, 38 net** (`cov-04`'s
-`invokespecial` absorbs 5), and bodies rise by **38.5**. Tests: 38/38 pass on
-every arm of every run.
+| site (base) | what | base | fix |
+|---|---|---:|---:|
+| `ir.rs:5387` | `putfield` tag not `I/Z/B/C/S` | **67** | **0** |
+| `ir.rs:5343` | `getfield` of `long`/`float`/`double` | **3** | **0** |
+| `ir.rs:5431` | a `new` whose site is `JitNewSite::Deferred` (`cov-06`) | 2 | 2 (now `5510`) |
 
-The reason 43 removed does not become 43 bodies is the same shape `cov-01` and
-`cov-02` both hit: a method that gets past this lane's site dies at the next gap
-it meets. That is not a shortfall to explain away — it is the survey's own
-prediction, and it is why the README says to re-run the survey after ANY lane
-lands.
+**70 of the 72 remaining builder refusals were this lane's, and bodies rose by
+72.5 (+12.3%).** What survives of `IrBuilder::build`'s structural refusals on
+this workload is **two events**, and they belong to `cov-06`. Tests: 38/38 pass
+on every arm of every run of all three measurements.
+
+`cov-04`'s closeout puts the same `putfield` row at **78** and the wide
+`getfield` row at **4**. Those are across the survey's **three** Spring
+workloads; the table above is `ConditionalOnPropertyTests` **alone**, which is
+what `/data/cov03count.sh` runs. 67 + 3 of 78 + 4 on one of three workloads is
+the same measurement, not a disagreement — but it is the kind of pair that
+reads as one, so: **name the corpus next to the count, not just the tree.**
+
+Two things follow, and the second is the one worth carrying:
+
+* The brief was sized at **43** events. It was 43 when the survey was taken and
+  **70** by the time it landed, and the difference is almost entirely `cov-04`:
+  the two whole-method terms that lane removed admitted a population of
+  **constructors**, and a constructor's job is largely writing reference fields.
+  Nobody predicted that; the measurement did. **Do not size a lane from a survey
+  row without re-taking it on the tree you are about to change** — and note that
+  the correction here was *upward*, which is the direction nobody checks.
+* Unlike (a) and (b), (c) loses nothing to a neighbour: every removed refusal
+  became a body. In (a) and (b) the shortfall (43 removed → 38 bodies) was
+  methods falling into `cov-04`'s invoke gap on their way out of this one. With
+  that gap closed there is nowhere left for them to fall, which is what a
+  coverage programme converging looks like.
 
 ### Wall clock — and the fake 1.7x regression on the way there
 
-The `ir-compiles` runs above took 35 s / 33 s (base) against 60 s / 57 s (fix),
-on **both** orderings. That reads as a consistent 1.7x regression and it is not
-one.
+Measurement (a)'s `ir-compiles` runs took 35 s / 33 s (base) against 60 s / 57 s
+(fix), on **both** orderings. That reads as a consistent 1.7x regression and it
+is not one.
 
 Two things were wrong with it, and both are worth carrying forward:
 
@@ -165,6 +189,11 @@ effect resolvable at this sample size on this host. That is the honest finding:
 not "no regression", but "none detectable, and the run-to-run noise is three
 times any difference either statistic claims".
 
+That was on tree (b), where the lane moved 38 methods onto the optimizing tier.
+On tree (c) it moves **70**, so the same caveat applies with more force and the
+same answer stands: unmeasured, and not this lane's to close. See the last
+section.
+
 ### Correctness
 
 * `cargo test -p cratonvm-jit` — **1,875 lib + all integration tests green** on
@@ -182,9 +211,10 @@ times any difference either statistic claims".
   identically on both (pre-existing — `BootJarTests` 43/43,
   `ModifiedClassPathExtension*`, `WebApplicationTypeIntegrationTests` 5/10, and
   the rest of the gradle-plugin group). No class changed status, test count,
-  or failure count in either direction. **Run twice** — once for the isolated
-  change and again for the merge on top of `cov-01`/`cov-02` — with the same
-  66/12 split both times.
+  or failure count in either direction. **Run three times**, once against each
+  of the three baselines above (isolated, on `cov-01`+`cov-02`, and on
+  `cov-01`+`cov-02`+`cov-04`, the last being `fb33aa5ac` vs `84b519382`), with
+  the same 66/12 split every time.
 * `jit/tests/ir_vs_singlepass.rs` — the brief's second verification item.
   `ir_vs_singlepass_reference_putfield_then_getfield` stores a reference field,
   reads it back and returns it; `…_pure_write` stores and never reads. Both run
@@ -220,7 +250,8 @@ methods under test:
 | generational | 46 minor (2 of them MOVING young) | **76,036** | 16,000 | 0 | 0 | 0 |
 | G1 | 15 young, all evacuating (`cset_young`, `cset_old=0`) | — | 16,000 | 0 | 0 | 0 |
 
-(Re-run identically on the post-`cov-01`/`cov-02` merged binary: same counts.)
+(Re-run identically on each of the three trees, including `dev` at
+`84b519382`: same counts every time, to the edge.)
 
 `old_to_young_edges=76036` is the number that makes the run non-vacuous: the
 remembered set genuinely recorded the edges, so the barrier path was on the

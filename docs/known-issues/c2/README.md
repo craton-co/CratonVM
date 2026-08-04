@@ -102,7 +102,7 @@ read each lane's "first increment".
 |---|---|---:|---|
 | ~~`cov-01`~~ | ~~`ir.rs` arms `0x12`/`0x13`/`0xb2`~~ | ~~189~~ | **CLOSED 2026-08-03** — all three at zero, **+116 bodies (+20%)**. [Closeout](../../internal/cov-01-constants-and-statics-RETIRED-20260803.md) |
 | ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. [Closeout](../../internal/cov-02-array-element-access-RETIRED-20260803.md) · [brief](archive/cov-02-array-element-access.md) |
-| ~~`cov-03`~~ | ~~`ir.rs` arms `0xb4`/`0xb5`~~ | ~~43~~ | **CLOSED 2026-08-03** — both sites at zero, bodies 536 → 575 measured on top of `cov-01`+`cov-02`. The asymmetry was the **write barrier** and only that: a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier. Wide `J`/`F`/`D` fields landed too. [Closeout](../../internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md) · [brief](archive/cov-03-field-stores-and-wide-fields.md) |
+| ~~`cov-03`~~ | ~~`ir.rs` arms `0xb4`/`0xb5`~~ | ~~43~~ → **70** | **CLOSED 2026-08-03** — on the tree it landed on (`cov-01`+`02`+`04`) builder refusals **72 → 2** and bodies **588 → 660 (+12.3%)**; the two survivors are `cov-06`'s. The asymmetry was the **write barrier** and only that: a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier. Wide `J`/`F`/`D` fields landed too. [Closeout](../../internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md) · [brief](archive/cov-03-field-stores-and-wide-fields.md) |
 | ~~`cov-04`~~ | ~~`ir.rs` invoke arms + `<init>` elision~~ | ~~69 → 81~~ | **CLOSED 2026-08-03** — all three invoke sites at zero. Every one was an `<init>`. [Closeout](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md) |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
@@ -130,8 +130,9 @@ path — expired when `ir_lower` grew one). Both terms are gone.
 
 Measured against `origin/dev` at `95152daea`, **with `cov-01` and `cov-02`
 already in it**: invoke refusals **106 → 0**, bodies **778 → 849 (+9%)**, and
-`cov-03`'s `putfield` row grew 45 → **78**, which is now **78 of the 85**
-builder refusals that remain. Correctness: the 79-class Spring Boot regression
+`cov-03`'s `putfield` row grew 45 → **78**, which was then **78 of the 85**
+builder refusals that remained — and `cov-03` closed the same day, taking them
+with it. Correctness: the 79-class Spring Boot regression
 list, both arms interleaved, run once per baseline — **no class changes state in
 either direction** that survives repetition. (Sweep 2 threw one mismatch, in the
 *flattering* direction: a devtools class that failed on base and passed on fix.
@@ -158,12 +159,19 @@ Three things to carry into the neighbouring lanes:
 
 **With `cov-01`, `cov-02` and `cov-04` closed, `cov-03` was the whole remaining
 builder story** — 78 of 85 refusals — and the opcode gap was down to **13 events
-across the entire corpus**. **`cov-03` then closed too** (2026-08-03), so as of
-now the builder's structural refusals are effectively gone and everything left
-is in `ir_compatible` (`cov-05`/`cov-06`/`cov-07`). `cov-03`'s own numbers were
-taken on `cov-01`+`cov-02` and therefore do NOT include `cov-04`; on that tree
-its two sites were 38+5 and the run above puts the `putfield` site at 78 on a
-tree that has `cov-04`. **Re-survey before quoting either.**
+across the entire corpus**.
+
+**`cov-03` then closed too** (2026-08-03), measured on exactly that tree
+(`fb33aa5ac` → `84b519382`): builder refusals **72 → 2**, bodies
+**588 → 660 (+12.3%)** on `ConditionalOnPropertyTests`. The two survivors are a
+`new` whose site is `JitNewSite::Deferred`, which is `cov-06`'s. **The builder's
+structural refusals are, on this corpus, done.** Everything left is in
+`ir_compatible` — `cov-05`, `cov-06`, `cov-07`.
+
+The lane was sized at 43 and was 70 when it landed, entirely because `cov-04`
+admitted the constructors that write reference fields. Its own earlier numbers
+(43 → 38 bodies, measured before `cov-01`/`cov-02`) are in its closeout with the
+tree each was taken on named. **Do not quote one against another.**
 
 **Re-run the survey after any of `cov-05`/`cov-06`/`cov-07` lands.** Lifting a
 whole-method conjunct admits methods that were hiding behind it, and they fail
@@ -182,11 +190,13 @@ other's ranking:
 * `cov-01` removed 155 opcode-gap events and produced only 91 bodies; the
   difference surfaced in `cov-04`, whose largest refusal doubled from 36 to 71
   without anyone touching it.
-* `cov-03` removed 43 builder refusals (38 reference `putfield` + 5 wide
-  `getfield`) for a net 38, because `cov-04`'s `invokespecial` site absorbed the
-  other 5 — the same shape a third time. Bodies **536 → 575**. Measured on
-  `cov-01`+`cov-02`, so it does not include `cov-04`, which landed while it was
-  in flight.
+* `cov-03` was measured on three trees and the answer grew each time: 43 events
+  before `cov-01`/`cov-02`, 43 with them, **70** with `cov-04` as well. On the
+  last, refusals went **72 → 2** and bodies **588 → 660**, and — unlike the
+  first two — *nothing* was lost to a neighbour, because there is no longer a
+  downstream builder gap for those methods to fall into. **The re-ranking rule
+  corrects upward as well as downward, and upward is the direction nobody
+  checks.**
 
 So: **re-run the survey after ANY lane lands**, not only the three conjunct
 ones. And a caveat that follows from those two landing in parallel — **neither
