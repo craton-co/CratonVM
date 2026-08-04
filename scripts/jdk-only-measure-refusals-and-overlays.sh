@@ -19,10 +19,12 @@
 #     That record scopes step 1 as "sweep four crates by hand". The runtime
 #     detector for the same defect already exists: CRATONVM_DBG_OVERLAY reports
 #     a native writing a primitive into a reference slot, or a reference into a
-#     primitive slot, on a class loaded from real JDK bytes. _ALL=1 is required
-#     or the java.util.Map suppression hides the dominant family. Measured: 13
-#     classes, 24 slots, from three small probes -- and identical under
-#     --real-jdk and --jdk-only, so it is a Compatible-mode defect too.
+#     primitive slot, on a class loaded from real JDK bytes. The overlay-all
+#     token is required or the java.util.Map suppression hides the dominant
+#     family. Measured: 13 classes, 24 slots, from three small probes -- and
+#     identical under --real-jdk and --jdk-only, so it is a Compatible-mode
+#     defect too. VarHandle was fixed the same day, taking it to 11 classes /
+#     21 slots.
 #
 # Usage:
 #   JAVA_HOME=/path/to/real/jdk \
@@ -81,7 +83,9 @@ echo "" >> "$LOG"
 echo "########## B. overlay-corruption census (both modes)" >> "$LOG"
 for MODE in --real-jdk --jdk-only; do
   for P in $ALL_PROBES; do
-    CRATONVM_DBG_OVERLAY=1 CRATONVM_DBG_OVERLAY_ALL=1 \
+    # Grouped spelling. The per-flag CRATONVM_DBG_OVERLAY* variables still work
+    # but the VM prints a deprecation line for each run that uses them.
+    CRATONVM_DBG=overlay,overlay-all \
       timeout 300 "$CV" "$MODE" --java-home "$JAVA_HOME" -cp . "$P" \
       > "$OUT/ov-$MODE-$P.txt" 2>&1
     rc=$?

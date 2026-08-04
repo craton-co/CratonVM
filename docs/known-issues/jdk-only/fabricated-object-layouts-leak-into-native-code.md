@@ -61,14 +61,16 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
   Three probes, both modes, JDK 25. **The results are identical under
   `--real-jdk` and `--jdk-only`**, so this is a `Compatible`-mode defect too.
-  Distinct `(class, slot, value kind, real descriptor)` sites:
+  Distinct `(class, slot, value kind, real descriptor)` sites. **The two
+  `VarHandle` rows are struck through: fixed the same day, and the re-run
+  confirms they are gone — 13 classes / 24 slots became 11 / 21.**
 
   | class | slot | writes | real desc | n |
   |---|---:|---|---|---:|
   | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
   | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
-  | `java/lang/invoke/VarHandle` | 1 | `Object` | `Z` | 52 |
-  | `java/lang/invoke/VarHandle` | 0 | `Int` | `L` | 52 |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~1~~ | ~~`Object`~~ | ~~`Z`~~ | **FIXED** |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
   | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
   | `java/util/Properties` | 7 | `Float` | `L` | 6 |
