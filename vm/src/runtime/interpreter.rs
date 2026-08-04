@@ -3863,6 +3863,33 @@ pub fn pop_and_recycle_frame_with_reason(
                 .jit
                 .profile_store
                 .add_loop_work(key, f.backward_count);
+            // Crossing the threshold is not enough: the ONLY place that acts on
+            // the counter is the dispatch site, and it tests
+            // `cnt == threshold || (cnt - threshold) % 64 == 0` against the value
+            // ITS OWN increment returned. Credit applied here lands between two
+            // dispatches, so those exact trigger points are simply stepped over
+            // — `ConstantPool.<init>` was measured reaching a count of 1149,
+            // more than twice the threshold, without ever being nominated.
+            // Nominate from here instead, the same way the dispatch site does.
+            let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+            if total >= threshold && crate::runtime::env_cache::bg_compile() {
+                // Re-nominating an already-published method is cheap and
+                // idempotent (the manager dedups), so a coarse retry stride is
+                // enough to cover a nomination the worker dropped.
+                let crossed_now = total.saturating_sub(f.backward_count / 32) < threshold;
+                if crossed_now || total % 64 == 0 {
+                    ensure_bg_compiler_started(shared);
+                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                    );
+                    let _ = shared
+                        .jit
+                        .tiered_manager
+                        .on_method_invocation_observed(&tiered_key, total as u64);
+                }
+            }
             // `CRATONVM_DBG=loop-work` — the lever's own witness. A tier-up
             // change that cannot be seen doing anything is indistinguishable
             // from an inert one, and this lever has already been inert twice.
