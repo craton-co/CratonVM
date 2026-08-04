@@ -41655,6 +41655,12 @@ fn native_chm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 // --- Core write operations (per-segment locking) ---
 
+/// TEMPORARY diagnostic switch for the CHM in-process get-miss investigation.
+fn chm_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_CHM_TRACE").is_some())
+}
+
 fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
