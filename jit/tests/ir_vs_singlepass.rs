@@ -640,6 +640,268 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
     }
 }
 
+// ── cov-01: `ldc` / `ldc_w` (0x12 / 0x13) ────────────────────────────────
+//
+// `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap events measured
+// on 2026-08-03 (`docs/known-issues/c2/ir-coverage-survey-20260803.md`) — 69%
+// of every opcode `IrBuilder::build` had no arm for. Increment 1 is the
+// IMMEDIATE case: an `int` or `float` constant the caller's `cp_ldc_resolver`
+// already reduced to bits.
+
+/// [`compile_opt`] plus a `cp_ldc_resolver`, so the IR builder can lower
+/// `ldc` / `ldc_w`. `fp` turns the `ir_emit_fp` gate on — a `float` constant is
+/// admitted only under it, exactly as a `double` `ldc2_w` is.
+fn compile_ldc(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    fp: bool,
+    ldc: &dyn Fn(u16) -> Option<cratonvm_jit::JitLdcConstant>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(ldc),
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        false,
+        false,
+        fp,
+        None,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_int_ldc_constant() {
+    // cov-01 inc 1. int f(int a) { return a * C1 + C2; }
+    //   iload_0; ldc #1; imul; ldc_w #2; iadd; ireturn
+    //
+    // Both widths in one body on purpose: `ldc` is 2 bytes and `ldc_w` is 3,
+    // and a wrong `pc` advance in either arm desyncs the abstract walk rather
+    // than producing a wrong number, so a shared-length bug would show up as a
+    // build failure on one backend and not the other.
+    const C1: i32 = 1_000_003;
+    const C2: i32 = -2_000_000_011;
+    let code = vec![
+        0x1a, // iload_0 (a)
+        0x12, 0x01, // ldc #1 (C1)
+        0x68, // imul
+        0x13, 0x00, 0x02, // ldc_w #2 (C2)
+        0x60, // iadd
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C1 as i64,
+                is_float: false,
+            }),
+            2 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C2 as i64,
+                is_float: false,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("ildc", "(I)I", code, 2, 1);
+    let ir = compile_ldc(&cm, &helpers, true, false, &ldc).expect("IR int ldc");
+    let sp = compile_ldc(&cm, &helpers, false, false, &ldc).expect("single-pass int ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: an int `ldc` must reach the optimizing backend, not fall through"
+    );
+    for a in [3i32, 0, -7, i32::MAX, i32::MIN, 65_536] {
+        let r_ir = unsafe { ir.try_call(&[a as i64]) }.unwrap() as i32;
+        let r_sp = unsafe { sp.try_call(&[a as i64]) }.unwrap() as i32;
+        let host = a.wrapping_mul(C1).wrapping_add(C2);
+        assert_eq!(r_ir, r_sp, "int ldc IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "int ldc vs host for a={a}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_ldc_constant() {
+    // cov-01 inc 1, the float half. int f(int a) { return (int)(a * 2.5f); }
+    //   iload_0; i2f; ldc #1 (2.5f); fmul; f2i; ireturn
+    //
+    // Returns an int so the GPR `try_call` ABI is exact; the FP work stays
+    // internal. The point of the case is the TYPE: `is_float` has to reach the
+    // builder, because `is_float_opcode` does not list `ldc` and the value is
+    // otherwise indistinguishable from an int with the same bit pattern.
+    const C: f32 = 2.5;
+    let code = vec![
+        0x1a, // iload_0 (a)
+        0x86, // i2f
+        0x12, 0x01, // ldc #1 (2.5f)
+        0x6a, // fmul
+        0x8b, // f2i
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C.to_bits() as i64,
+                is_float: true,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("fldc", "(I)I", code, 2, 1);
+    let ir = compile_ldc(&cm, &helpers, true, true, &ldc).expect("IR float ldc");
+    let sp = compile_ldc(&cm, &helpers, false, true, &ldc).expect("single-pass float ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: a float `ldc` must reach the optimizing backend under the FP gate"
+    );
+    for a in [3i32, 0, -7, 1000, -1_000_001] {
+        let r_ir = unsafe { ir.try_call(&[a as i64]) }.unwrap() as i32;
+        let r_sp = unsafe { sp.try_call(&[a as i64]) }.unwrap() as i32;
+        let host = (a as f32 * C) as i32;
+        assert_eq!(r_ir, r_sp, "float ldc IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "float ldc vs host for a={a}");
+    }
+}
+
+#[test]
+fn float_ldc_stays_on_single_pass_with_the_fp_gate_off() {
+    // The fail-closed half, and the edit that trips it: delete the
+    // `!is_float || ir_emit_fp` guard in `try_compile`'s cov-01 feed and this
+    // method reaches the optimizing backend with an `Op::ConstF`/`Float` node
+    // in a graph the FP tier is switched off for.
+    //
+    // `is_float_opcode` does NOT list `ldc`, so `fp_in_body` is false for a
+    // body that contains NO other FP opcode — which is exactly why this method
+    // is ADMITTED to the optimizing pipeline (through the int clause) and has
+    // to be refused by the builder rather than by admission. The `pop` keeps
+    // the body FP-opcode-free while still containing the constant; without it
+    // the refusal would come from the admission gate and the test would pass
+    // vacuously with the guard deleted.
+    //
+    // `float f(){ 2.5f; return 0; }` — ldc #1; pop; iconst_0; ireturn.
+    let code = vec![
+        0x12, 0x01, // ldc #1 (2.5f)
+        0x57, // pop
+        0x03, // iconst_0
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: 2.5f32.to_bits() as i64,
+                is_float: true,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("fldcoff", "()I", code.clone(), 1, 0);
+    let off = compile_ldc(&cm, &helpers, true, false, &ldc)
+        .expect("the method still compiles — on the single-pass backend");
+    assert!(
+        !off.used_ir_backend,
+        "cov-01: a float `ldc` with the FP gate off must bail to single-pass"
+    );
+    // The positive control for the same body: with the gate ON it IS lowered.
+    // Without this rung, "the gate is off" and "the builder cannot lower this
+    // shape at all" are indistinguishable and the assertion above proves
+    // nothing about the guard.
+    let cm_on = cached("fldcon", "()I", code, 1, 0);
+    let on = compile_ldc(&cm_on, &helpers, true, true, &ldc).expect("IR body under the FP gate");
+    assert!(
+        on.used_ir_backend,
+        "cov-01: the same body must reach the optimizing backend with the FP gate on"
+    );
+    assert_eq!(unsafe { on.try_call(&[]) }.unwrap() as i32, 0);
+}
+
+#[test]
+fn class_ldc_with_the_helper_unwired_stays_on_single_pass() {
+    // `ldc <Class>` is served by `helpers.ldc_class_cp`, which is an OptionalPtr
+    // — a hand-built table leaves it 0. The IR feed must then OMIT the site so
+    // the builder bails, exactly as the single-pass arm refuses the same
+    // condition, rather than planning a CALL through address zero.
+    //
+    // The edit that trips it: drop the `helpers.ldc_class_cp != 0` guard from
+    // the cov-01 feed in `try_compile`.
+    //
+    // (A `String` / `Class` `ldc` with its helper WIRED is lowered — increments
+    // 2 and 3 — and is covered by `ir_vs_singlepass_string_ldc` /
+    // `ir_vs_singlepass_class_ldc` further down. What stays refused for good is
+    // a `MethodHandle` / `MethodType` / condy site, whose resolver returns
+    // `None`; that is the next case.)
+    let code = vec![
+        0x12, 0x01, // ldc #1
+        0xb0, // areturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                holder_class_id: 1,
+                cp_idx: 1,
+            }),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.ldc_class_cp = 0;
+    let cm = cached("cldcoff", "()Ljava/lang/Object;", code, 1, 0);
+    // The single-pass backend bails the WHOLE compile on this condition
+    // (`ldc_class_helper_unwired`), so `None` is the expected outcome and is
+    // itself fail-closed. Either way the optimizing backend must not have
+    // produced a body.
+    if let Some(compiled) = compile_ldc(&cm, &helpers, true, false, &ldc) {
+        assert!(
+            !compiled.used_ir_backend,
+            "cov-01: an `ldc <Class>` whose helper is unwired must not reach the \
+             optimizing backend"
+        );
+    }
+}
+
+#[test]
+fn an_unresolvable_ldc_stays_on_single_pass() {
+    // The permanent fail-closed half, and the one no later increment lifts. A
+    // `MethodHandle` / `MethodType` / condy `ldc` is what `cp_ldc_resolver`
+    // answers `None` for: not an immediate, not a String, not a Class mirror.
+    // It is absent from all three of the builder's tables and must bail the
+    // method — "a constant materialised without its resolution side effects is
+    // a wrong-code bug, not a missing optimisation".
+    //
+    // The edit that trips it: give the builder's 0x12 arm a fallback that
+    // pushes anything at all for a pc absent from every table.
+    let code = vec![
+        0x12, 0x01, // ldc #1
+        0xb0, // areturn
+    ];
+    let ldc = |_cp: u16| -> Option<cratonvm_jit::JitLdcConstant> { None };
+    let helpers = dummy_helpers();
+    let cm = cached("mhldc", "()Ljava/lang/Object;", code, 1, 0);
+    // `try_compile` records this as a PERMANENT bail on the single-pass side
+    // too (RBC.7 — the constant-pool entry's kind never changes), so `None`
+    // here is the expected shape.
+    if let Some(compiled) = compile_ldc(&cm, &helpers, true, false, &ldc) {
+        assert!(
+            !compiled.used_ir_backend,
+            "cov-01: an unresolvable `ldc` must not reach the optimizing backend"
+        );
+    }
+}
+
 #[test]
 fn ir_vs_singlepass_long_ldiv() {
     // long signed division. long f(long a, long b) { return a / b; }
@@ -4681,4 +4943,430 @@ fn ir_vs_singlepass_arraylength_null_faults() {
         1,
         None,
     );
+}
+
+// ── cov-01 increments 2-4: the constant-pool constants that are calls ────
+//
+// `ldc <String>`, `ldc <Class>` and `getstatic` are constants in the bytecode's
+// sense and runtime calls in the machine's: each names a constant-pool SITE
+// whose value is materialised on every execution, because an `ObjectRef` baked
+// at compile time is stale the moment a relocating collector moves it, and
+// because `<clinit>` is a side effect the constant owes on first touch.
+//
+// `getstatic` alone was 92 of the 273 opcode-gap events measured on 2026-08-03
+// (`docs/known-issues/c2/ir-coverage-survey-20260803.md`) — the largest single
+// opcode in the survey.
+
+/// `jit_ldc_string(vm, bytes, len)` stand-in. Returns a value derived from BOTH
+/// pointer arguments (the literal's first byte and its length) so a site that
+/// baked the wrong address or the wrong length is distinguishable from one that
+/// baked the right ones — a stub returning a constant would pass either way.
+///
+/// # Safety
+/// `bytes`/`len` are the literal the compiler baked, owned by the artifact.
+unsafe extern "C" fn fake_ldc_string(_vm: i64, bytes: *const u8, len: usize) -> i64 {
+    if bytes.is_null() {
+        return 0;
+    }
+    (len as i64) * 1000 + i64::from(*bytes)
+}
+
+/// `jit_ldc_class_cp(vm, holder_class_id, cp_idx)` stand-in, likewise derived
+/// from both baked immediates. Never 0 for the sites these tests use, so the
+/// arm's zero-means-pending-exception path is not taken.
+unsafe extern "C" fn fake_ldc_class_cp(_vm: i64, holder: i64, cp_idx: i64) -> i64 {
+    holder * 1000 + cp_idx
+}
+
+/// `jit_getstatic(vm, class_id, field_index)` stand-in. The value is one no
+/// direct load of the test statics block could produce, so which of the two
+/// `getstatic` routes ran is observable from the RESULT rather than from a
+/// disassembly.
+unsafe extern "C" fn marker_getstatic(_vm: i64, class_id: i64, field_index: i64) -> i64 {
+    424_242 + class_id + field_index
+}
+
+/// Call a body with a zeroed buffer as the hidden VM context. Every helper above
+/// ignores it; the artifacts are `needs_context` because their helpers take it
+/// as arg0.
+fn call_with_dummy_context(m: &CompiledMethod, args: &[i64]) -> i64 {
+    let dummy_vm = [0u8; 64];
+    // SAFETY: the body was JIT-compiled from valid bytecode into executable
+    // memory; every helper it can reach is one of the stubs above, none of which
+    // dereferences the context pointer.
+    unsafe {
+        if m.needs_context() {
+            m.try_call_with_context(dummy_vm.as_ptr() as i64, args)
+        } else {
+            m.try_call(args)
+        }
+    }
+    .expect("jit call")
+}
+
+#[test]
+fn ir_vs_singlepass_string_ldc() {
+    // cov-01 inc 2. Object f() { return "hello"; }  —  ldc #1 ; areturn
+    let code = vec![0x12, 0x01, 0xb0];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.ldc_string = fake_ldc_string as *const () as usize;
+    let cm = cached("sldcv", "()Ljava/lang/Object;", code, 1, 0);
+    let ir = compile_ldc(&cm, &helpers, true, false, &ldc).expect("IR String ldc");
+    let sp = compile_ldc(&cm, &helpers, false, false, &ldc).expect("single-pass String ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: a String `ldc` must reach the optimizing backend"
+    );
+    // 5 bytes, first byte 'h' (104). Both backends must have baked the same
+    // (address, length) pair and called the same helper with it.
+    let expected = 5 * 1000 + i64::from(b'h');
+    assert_eq!(call_with_dummy_context(&ir, &[]), expected, "IR String ldc");
+    assert_eq!(
+        call_with_dummy_context(&sp, &[]),
+        expected,
+        "single-pass String ldc"
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_class_ldc() {
+    // cov-01 inc 3. Object f() { return Foo.class; }  —  ldc #1 ; areturn
+    let code = vec![0x12, 0x01, 0xb0];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                holder_class_id: 7,
+                cp_idx: 1,
+            }),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.ldc_class_cp = fake_ldc_class_cp as *const () as usize;
+    let cm = cached("cldcv", "()Ljava/lang/Object;", code, 1, 0);
+    let ir = compile_ldc(&cm, &helpers, true, false, &ldc).expect("IR Class ldc");
+    let sp = compile_ldc(&cm, &helpers, false, false, &ldc).expect("single-pass Class ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: a Class `ldc` must reach the optimizing backend"
+    );
+    let expected = 7 * 1000 + 1;
+    assert_eq!(call_with_dummy_context(&ir, &[]), expected, "IR Class ldc");
+    assert_eq!(
+        call_with_dummy_context(&sp, &[]),
+        expected,
+        "single-pass Class ldc"
+    );
+}
+
+#[test]
+fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
+    // The fail-closed rung for `Op::ConstString`. `helpers.ldc_string` is 0 only
+    // in a synthetic table like this one, but `lower_inner` must refuse rather
+    // than emit `CALL 0` — the same guard, and the same history, as the monitor
+    // helper's.
+    //
+    // The edit that trips it: delete the `ldc_string` row from `lower_inner`'s
+    // constant-pool helper loop.
+    //
+    // Deliberately not CALLED: the single-pass body this falls back to would
+    // itself emit a call to address 0. That asymmetry is the single-pass
+    // backend's — it treats `ldc_string` as always wired, which in production it
+    // is — and is not this lane's to change.
+    let code = vec![0x12, 0x01, 0xb0];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.ldc_string = 0;
+    let cm = cached("sldcoff", "()Ljava/lang/Object;", code, 1, 0);
+    let compiled =
+        compile_ldc(&cm, &helpers, true, false, &ldc).expect("single-pass still produces a body");
+    assert!(
+        !compiled.used_ir_backend,
+        "cov-01: an `ldc <String>` with `ldc_string` unwired must refuse the IR \
+         graph rather than emit a CALL through address zero"
+    );
+}
+
+/// [`compile_opt`] plus a `cp_static_field_resolver`, so the IR builder can
+/// lower `getstatic`.
+fn compile_getstatic(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        Some(statics),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_getstatic_through_the_helper() {
+    // cov-01 inc 4, the HELPER route — the one every site takes when the
+    // declaring class is not already initialised at compile time, which is what
+    // `resolve_static_base` reports with no VM registered (this binary has
+    // none, except for the single pair the direct-route test below registers).
+    //
+    //   int f() { return Holder.VALUE; }  —  getstatic #1 ; ireturn
+    let code = vec![0xb2, 0x00, 0x01, 0xac];
+    let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+        match cp {
+            1 => Some((0x11u32, 3usize, b'I', false)),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+    let cm = cached("gs", "()I", code, 1, 0);
+    let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR getstatic");
+    let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass getstatic");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: a getstatic must reach the optimizing backend — it was the \
+         largest single opcode gap in the survey"
+    );
+    let expected = 424_242 + 0x11 + 3;
+    assert_eq!(
+        call_with_dummy_context(&ir, &[]) as i32,
+        expected,
+        "IR getstatic through the helper"
+    );
+    assert_eq!(
+        call_with_dummy_context(&sp, &[]) as i32,
+        expected,
+        "single-pass getstatic through the helper"
+    );
+    // RBC.5: compiled code reads static storage directly, so the declaring
+    // class must be ensure-initialized before the body first runs. The
+    // single-pass artifact has recorded this since RBC.5; an IR artifact that
+    // lowers `getstatic` owes exactly the same list, and without it the DIRECT
+    // route would read a block whose `<clinit>` has not run.
+    assert_eq!(
+        ir.static_init_classes,
+        vec![0x11u32],
+        "cov-01: an IR body with a getstatic must record its declaring class \
+         for the compiled-entry ensure-init walk"
+    );
+    assert_eq!(ir.static_init_classes, sp.static_init_classes);
+    assert!(
+        ir.has_dispatch,
+        "jit_getstatic resolves `&mut JvmThread` through the JIT_THREAD TLS to \
+         run <clinit>, and the !has_dispatch fast entry never sets it"
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_getstatic_direct_load() {
+    // cov-01 inc 4, the DIRECT route — the two dependent loads that replace the
+    // helper call when `resolve_static_base` accepts the site. This is the only
+    // hand-written instruction encoding this lane adds, so it is driven rather
+    // than inspected: the marker helper returns a value no direct load of the
+    // block below could produce, which makes the ROUTE observable from the
+    // result.
+    //
+    // Both payload widths are covered, at the two
+    // `FIELD_CELL_PAYLOAD{32,64}_OFFSET` biases the two encodings use.
+    //
+    // The resolver answers for exactly one class id and declines everything
+    // else, so it stays inert for every other test in this binary — the same
+    // discipline `x64::tests::test_getstatic_inline_direct_load_and_fallback`
+    // uses, and necessary for the same reason: `set_static_base_resolver`
+    // latches its context for the life of the process.
+    use cratonvm_types::Value;
+    use std::sync::atomic::AtomicPtr;
+
+    /// Stands in for `jit_resolve_static_base`; `ctx` IS the base-pointer cell.
+    unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
+        if class_id == 0x1CE && (field_index == 1 || field_index == 2) {
+            ctx
+        } else {
+            0
+        }
+    }
+
+    static CELL_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cell_addr = *CELL_ADDR.get_or_init(|| {
+        // The same two-level shape `StaticsIndex` publishes: a leaked block and
+        // an `AtomicPtr` cell naming it. Slot 1 is the int-category case; slot 2
+        // is read back through the 64-bit payload offset the reference encoding
+        // uses, so a bias mixed up between the two arms shows up as a wrong
+        // number rather than as nothing.
+        let block: &'static mut [Value] = Box::leak(
+            vec![
+                Value::Int(0),
+                Value::Int(-7),
+                Value::Long(0x0BAD_F00D_1234_5678),
+            ]
+            .into_boxed_slice(),
+        );
+        let cell: &'static AtomicPtr<Value> =
+            Box::leak(Box::new(AtomicPtr::new(block.as_mut_ptr())));
+        cell as *const AtomicPtr<Value> as usize
+    });
+    cratonvm_jit::x64::set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+
+    // 1. int-category, slot 1 → MOVSXD of the 32-bit payload.
+    {
+        let code = vec![0xb2, 0x00, 0x01, 0xac];
+        let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x1CEu32, 1usize, b'I', false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsdi", "()I", code, 1, 0);
+        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR direct getstatic");
+        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        assert!(ir.used_ir_backend, "cov-01: direct getstatic on the IR tier");
+        assert_eq!(
+            call_with_dummy_context(&ir, &[]) as i32,
+            -7,
+            "a resolved getstatic must read the block DIRECTLY (MOVSXD of the \
+             Int payload); the marker value means it took the helper instead"
+        );
+        assert_eq!(call_with_dummy_context(&sp, &[]) as i32, -7);
+    }
+
+    // 2. A site the resolver DECLINES keeps the helper, on both backends — the
+    //    control that proves rung 1 is measuring the ROUTE and not merely that
+    //    getstatic works at all.
+    {
+        let code = vec![0xb2, 0x00, 0x01, 0xac];
+        let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x1CEu32, 5usize, b'I', false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsdf", "()I", code, 1, 0);
+        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR fallback getstatic");
+        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        let expected = 424_242 + 0x1CE + 5;
+        assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
+        assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
+    }
+
+    // 3. Reference-typed, slot 2 → the 64-bit payload, no sign extension. The
+    //    value is a `Value::Long`'s payload rather than a real oop: what is
+    //    under test is the DISPLACEMENT and the width, and a genuine object
+    //    reference would need a heap this harness does not have.
+    {
+        let code = vec![0xb2, 0x00, 0x01, 0xb0];
+        let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x1CEu32, 2usize, b'L', false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsdr", "()Ljava/lang/Object;", code, 1, 0);
+        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR ref getstatic");
+        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        assert!(ir.used_ir_backend, "cov-01: a reference static on the IR tier");
+        assert_eq!(
+            call_with_dummy_context(&ir, &[]),
+            0x0BAD_F00D_1234_5678u64 as i64,
+            "a reference static must be read at the 64-bit payload offset"
+        );
+        assert_eq!(
+            call_with_dummy_context(&sp, &[]),
+            0x0BAD_F00D_1234_5678u64 as i64
+        );
+    }
+}
+
+#[test]
+fn wide_and_fp_statics_stay_on_single_pass() {
+    // The fail-closed rung for `getstatic`. `J`, `D` and `F` are refused by the
+    // builder, not by the lowering, because the refusal is about the VALUE tier:
+    // admitting one would put a `Long`/`Double`/`Float` node in a graph whose
+    // admission clause may have been the int one, and a static field carries no
+    // equivalent of the `ir_emit_long` / `ir_emit_fp` signal the `ldc2_w` arm
+    // consults.
+    //
+    // The edit that trips it: widen the `type_tag` match in `IrBuilder`'s 0xb2
+    // arm to accept `J`/`D`/`F`.
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+    for (tag, desc, ret) in [
+        (b'J', "()J", 0xadu8),
+        (b'D', "()D", 0xafu8),
+        (b'F', "()F", 0xaeu8),
+    ] {
+        let code = vec![0xb2, 0x00, 0x01, ret];
+        let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x22u32, 0usize, tag, false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsw", desc, code, 2, 0);
+        match compile_getstatic(&cm, &helpers, true, &statics) {
+            None => { /* refused outright — also acceptable, and fail-closed. */ }
+            Some(compiled) => assert!(
+                !compiled.used_ir_backend,
+                "cov-01: a `{}` static must bail the optimizing builder",
+                tag as char
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_volatile_static_agrees_on_both_backends() {
+    // A volatile static read is a JMM acquire and both backends emit MFENCE
+    // after the load. The fence itself is not observable from a single-threaded
+    // call; what this pins is that the volatile flag does not change the VALUE,
+    // because the failure mode a mis-placed fence insertion produces in a
+    // hand-written encoder is a desynced instruction stream — a wrong result or
+    // a crash, not a quietly missing barrier.
+    let code = vec![0xb2, 0x00, 0x01, 0xac];
+    let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+        match cp {
+            1 => Some((0x33u32, 2usize, b'I', true)),
+            _ => None,
+        }
+    };
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+    let cm = cached("gsv", "()I", code, 1, 0);
+    let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR volatile getstatic");
+    let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+    let expected = 424_242 + 0x33 + 2;
+    assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
+    assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
 }

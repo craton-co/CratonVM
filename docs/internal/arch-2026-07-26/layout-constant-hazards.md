@@ -121,6 +121,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/ir_lower.rs:2647` (2604) | `MOV R10D,[RAX+ARRAY_LENGTH_OFFSET]` bounds check | **disp8** |
 | `jit/src/lib.rs:3236` (3186) | `(HEADER_SIZE + body_off) as i32` — compact string field **payload** address | disp32 |
 | `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
+| `jit/src/ir_lower.rs` `emit_inline_getstatic` (new 2026-08-03, cov-01) | direct `getstatic`: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` from the class's statics-block base | disp32 |
 
 **2026-08-03, COV-02** (`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`)
 added three more `ir_lower.rs` sites, all **disp8**, all checked by
@@ -189,17 +190,35 @@ layout constants this crate could plausibly emit:
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `jit/src/lib.rs` | 3 | 1 | 2 | 1 | 0 | 0 | 1 | 1 |
-| `jit/src/ir_lower.rs` | 10 | 4 | 4 | 0 | 0 | 0 | 3 | 0 |
+| `jit/src/ir_lower.rs` | 10 | 4 | 5 | 0 | 0 | 0 | 4 | 2 |
 
 (The `ir_lower.rs` row read `7 | 3 | …` when this section was written, went to
-`8` with the 2026-07-31 guarded inline compact `getfield`, and to `10 | 4` with
-COV-02's two GPR array emitters and `arraylength`'s length load. The authority
-is `INVENTORY` in `jit/src/lib.rs`, which is executed; this table is a copy and
+`8` with the 2026-07-31 guarded inline compact `getfield`, to `10 | 4` with
+COV-02's two GPR array emitters and `arraylength`'s length load, and to
+`… | 5 | … | 4 | 2` with cov-01's `emit_inline_getstatic`. The authority is
+`INVENTORY` in `jit/src/lib.rs`, which is executed; this table is a copy and
 had already drifted by one before COV-02 re-derived it.)
 
 The zero entries are as load-bearing as the rest: a constant that starts being
 used in a file where it never appeared before also trips the assertion and forces
 the new site into the inventory.
+
+**2026-08-03 update — cov-01.** Its contribution to the row above is the fifth
+`SLOT_SIZE`, the fourth `FIELD_CELL_PAYLOAD32_OFFSET` and **both**
+`FIELD_CELL_PAYLOAD64_OFFSET`s — the `use` list and one site,
+`emit_inline_getstatic`. (The `HEADER_SIZE` 8 → 10 and `ARRAY_LENGTH_OFFSET`
+3 → 4 in the same row are COV-02's, landed the same day; the two lanes touched
+disjoint sites and the counts simply add.)
+
+That site is value-safe at any header size for a reason worth stating rather
+than assuming: it addresses a **statics block**, which has no object header at
+all, so no `HEADER_SIZE` term appears in it. What it does bake is the
+`field_index * SLOT_SIZE + payload_offset` cell arithmetic, which is the same
+16-byte `Value` cell shape `types::heap_types::field_cell_layout_matches_value_enum`
+pins for instance fields. Both encodings are disp32
+(`48 8B 80 disp32` for a reference, `48 63 80 disp32` for an int-category
+value), so it does not share the disp8 backwards-addressing hazard the three
+array/element sites have.
 
 **2026-07-26 update — the inventory earned its keep, in reverse.** The
 `jit/src/lib.rs` row read `… 0 | 2` because `StringFieldLayout::new` had a
