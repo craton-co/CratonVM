@@ -10042,9 +10042,16 @@ mod tests {
     /// `docs/internal/cov-02-array-element-access-RETIRED-20260803.md`. So the
     /// property is asserted where it is actually decided.
     ///
-    /// **The edit that trips this**: change `0x32`'s arm in `ir.rs` to build
-    /// `(MemKind::Ref, IrType::Int)`. That flips the `IrType` assertion AND
-    /// moves the element into the primitive pool, so both halves fire.
+    /// **Anti-vacuity, executed rather than argued.** The mutation was run:
+    /// with `0x32`'s arm in `ir.rs` changed to `(MemKind::Ref, IrType::Int)`,
+    /// this test fails with `left: Int, right: Ref` and nothing else in the
+    /// crate's 1,869 lib tests notices. That is the edit to repeat if this test
+    /// is ever suspected of measuring something else.
+    ///
+    /// It has already been wrong once in the other direction: it first asserted
+    /// `class == SlotClass::Ref` and failed on an honest tree, because in a
+    /// method this short the element is still deopt-visible and gets pinned.
+    /// See the comment at the assertion.
     #[test]
     fn an_aaload_result_is_reference_typed_and_takes_a_reference_slot() {
         use crate::ir::{IrBuilder, MemKind};
