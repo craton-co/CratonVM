@@ -56,6 +56,22 @@ public class DateFormatPathProbe {
         Object fd = readField(sdf, "formatData");
         System.out.println("PROBE-FIELD formatData          = " +
                 (fd == null ? "null" : fd.getClass().getName()));
+        // `zeroPaddingNumber` caches the zero digit on first use. If that
+        // lookup throws, `zeroDigit` stays 0 and EVERY numeric field falls
+        // through to the full `DecimalFormat.format` slow path (which is also
+        // where the `Class.getPackageName()` calls the native census counts
+        // come from). A `zeroDigit` of 0 here after a format has run is the
+        // tell.
+        Object zd = readField(sdf, "zeroDigit");
+        System.out.println("PROBE-FIELD zeroDigit           = " + describeChar(zd));
+        Object nf = readField(sdf, "numberFormat");
+        System.out.println("PROBE-FIELD numberFormat        = " +
+                (nf == null ? "null" : nf.getClass().getName()));
+        Object cp = readField(sdf, "compiledPattern");
+        System.out.println("PROBE-FIELD compiledPattern.len = " +
+                (cp instanceof char[] ? String.valueOf(((char[]) cp).length) : String.valueOf(cp)));
+        Object fsf = readField(sdf, "forceStandaloneForm");
+        System.out.println("PROBE-FIELD forceStandaloneForm = " + fsf);
 
         // --- The two arms, priced separately ---------------------------------
         DateFormatSymbols symbols = DateFormatSymbols.getInstance(Locale.US);
@@ -91,6 +107,44 @@ public class DateFormatPathProbe {
             acc += gc.get(Calendar.MONTH);
         }
         row("CONTROL: Calendar.setTimeInMillis + get(MONTH)", System.nanoTime() - t0, iters);
+
+        // A native `format` still has to learn the UTC offset for the instant.
+        // If one `TimeZone.getOffset(long)` per format is affordable, the
+        // native can just call it; if it is not, the native has to mirror
+        // ZoneInfo's transition search in Rust. This row decides that.
+        TimeZone tz = TimeZone.getDefault();
+        long base = 1_700_000_000_000L;
+        int off = 0;
+        for (int i = 0; i < Math.min(iters / 10, 2000); i++) {
+            off += tz.getOffset(base + i * 37L);
+        }
+        t0 = System.nanoTime();
+        for (int i = 0; i < iters; i++) {
+            off += tz.getOffset(base + i * 37L);
+        }
+        row("TimeZone.getOffset(long)  [native-format dependency]", System.nanoTime() - t0, iters);
+        if (off == Integer.MIN_VALUE) {
+            throw new IllegalStateException();
+        }
+
+        // The two zeroPaddingNumber arms, priced. The fast arm is what a cached
+        // zeroDigit gives you; the slow arm is DecimalFormat.format.
+        java.text.NumberFormat numberFormat = java.text.NumberFormat.getIntegerInstance(Locale.US);
+        numberFormat.setGroupingUsed(false);
+        numberFormat.setMinimumIntegerDigits(2);
+        numberFormat.setMaximumIntegerDigits(2);
+        StringBuffer nb = new StringBuffer(8);
+        java.text.FieldPosition dc = new java.text.FieldPosition(0);
+        for (int i = 0; i < Math.min(iters / 10, 2000); i++) {
+            nb.setLength(0);
+            numberFormat.format((long) (i % 60), nb, dc);
+        }
+        t0 = System.nanoTime();
+        for (int i = 0; i < iters; i++) {
+            nb.setLength(0);
+            numberFormat.format((long) (i % 60), nb, dc);
+        }
+        row("zeroPaddingNumber SLOW arm: NumberFormat.format(long,..)", System.nanoTime() - t0, iters);
 
         t0 = System.nanoTime();
         for (int i = 0; i < iters; i++) {
@@ -130,6 +184,15 @@ public class DateFormatPathProbe {
 
     private static void report(Object o, String name) {
         System.out.println(String.format(Locale.US, "PROBE-FIELD %-22s = %s", name, readField(o, name)));
+    }
+
+    private static String describeChar(Object o) {
+        if (o instanceof Character) {
+            char c = (Character) o;
+            return c == 0 ? "0 (NOT CACHED — every numeric field takes the DecimalFormat slow path)"
+                    : "'" + c + "' (" + (int) c + ")";
+        }
+        return String.valueOf(o);
     }
 
     private static void row(String name, long ns, int iters) {
