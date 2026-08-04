@@ -1,5 +1,13 @@
 # `org/h2/` JIT ban (HIB-LONGTAIL.1) — the three regressions were ONE bug, and it is fixed
 
+> **Which page is current.** This one. The companion
+> `h2-jitban-longtail1-SUPERSEDED-20260728-ab-record.md` carries a LATER date and is
+> the SUPERSEDED one — it is kept only for the A/B numbers it recorded. Both
+> pages were once called `h2-jitban*-residuals-*`, so picking the right one by
+> filename was a coin toss and picking by date got you the wrong one; that is
+> why they are now named for what they conclude rather than when they were
+> written.
+
 **Status (2026-07-28, third pass):** residuals 1, 2 and 3 stay FIXED. The three
 classes the 2026-07-28 re-test recorded as "genuine, reproducible JIT
 regressions" — `TestPageStoreCoverage`, `TestReopen` and `TestRunscript` — all
@@ -384,5 +392,5 @@ suite runner already isolates per class; hand-run repros do not.
 - `native-io/src/direct_buffer.rs` — the four `DirectByteBuffer` element
   accessors and what they deliberately refuse to model.
 - `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` entry.
-- `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md` — the
+- `docs/known-issues/h2/h2-jitban-longtail1-SUPERSEDED-20260728-ab-record.md` — the
   re-test whose three "distinct" regressions this page collapses into one.

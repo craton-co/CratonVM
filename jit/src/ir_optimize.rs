@@ -37,8 +37,14 @@ pub fn optimize(graph: &mut Graph) {
             break;
         }
     }
-    // Full unrolling of small constant-trip counted loops. Default-OFF behind
-    // `CRATONVM_JIT_UNROLL` (Increment 3 of activate-ir-optimizer). Runs after
+    // Full unrolling of small constant-trip counted loops. Default-**ON**;
+    // `CRATONVM_JIT_UNROLL=0` turns it off (`unroll_enabled` is
+    // `map_or(true, ..)`). This comment said "Default-OFF ... while it soaks"
+    // until 2026-08-04; it had outlived the soak. It matters more than a stale
+    // comment usually does, because the parity audit in
+    // `x64/single_pass_only.rs` decides whether the optimizing tier may take a
+    // method by asking which transforms it has, and this one is the reason the
+    // single-pass native unroller is NOT on that veto list. Runs after
     // the fixed-point cleanup so init/stride/bound are already folded to
     // constants; re-runs the cleanup so the unrolled straight-line code folds
     // (the concrete induction values collapse the per-iteration computation)
@@ -56,9 +62,11 @@ pub fn optimize(graph: &mut Graph) {
             }
         }
     }
-    // SCEV-driven loop-invariant code motion. Default-OFF behind
-    // `CRATONVM_JIT_LICM` while it soaks (Increment 2 of activate-ir-optimizer).
-    // Runs once *after* the fixed-point cleanup so it sees already-folded /
+    // SCEV-driven loop-invariant code motion. Default-**ON**;
+    // `CRATONVM_JIT_LICM=0` turns it off (`licm_enabled` is `map_or(true, ..)`).
+    // Same correction, same date, same reason as the unroll comment above: it
+    // is why the single-pass `aaload`/FP hoists are not on the veto list in
+    // `x64/single_pass_only.rs`. Runs once *after* the fixed-point cleanup so it sees already-folded /
     // GVN'd invariant expressions, then a final lightweight cleanup re-runs
     // GVN + DCE to dedup any anchor edges it rewrote.
     if licm_enabled() && licm(graph) {
