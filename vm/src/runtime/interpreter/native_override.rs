@@ -5246,9 +5246,96 @@ pub(super) fn should_force_registered_native_over_bytecode_precomputed(
             || redefine_immune_forced_native(class_name, method_name, method_descriptor))
 }
 
-/// Dispatch a force-native override via `safe_native_call`, pushing any return
-/// value onto the caller operand stack.
+/// Route a force-native interception through §7 policy, and count it.
+///
+/// # The gap this closes
+///
+/// [`intercept_force_registered_native`] and its cached twin are reached from
+/// **seven** call sites across `dispatch_static`, `dispatch_virtual` and
+/// `invoke`, and both used to end in a bare `safe_native_call` on a callback
+/// from `NativeMethodRegistry::find`. No `dispatch_policy`, no
+/// `resolve_native_dispatch_wave1`, no `record_invocation`. Their entire
+/// purpose is to make a registered native beat *concrete real-JDK bytecode*,
+/// which is precisely the inversion §1.4 forbids under `JdkOnly` — so under
+/// `--jdk-only` these were seven unguarded holes in contract §11's *"every
+/// strict-mode native dispatch"*, and in `Compatible` they were seven
+/// dispatches missing from the §4 census. Every sibling dispatch route
+/// (`invoke_or_native`, `try_stackless_invoke` steps 1 and 6,
+/// `invoke_on_class_shared_inner`) was routed in wave 1; these two were not.
+///
+/// # Why `bytecode_available: true`
+///
+/// Unlike `resolve_step1_native`, which runs before any method resolution and
+/// passes `false` because it genuinely does not know, these sites are only
+/// reached *because* `force_native_over_real_jdk_bytecode` said this triple's
+/// real bytecode must lose. Concrete bytecode existing is the premise of the
+/// call, so `true` is the honest input to §7 step 3 — and it is what makes a
+/// strict run fall through to that bytecode instead of running the shadow.
+///
+/// # `Compatible` is bit-for-bit unchanged
+///
+/// `compat_native_wins` is `true` — exactly the unconditional "a registered
+/// native wins here" the `find` call encoded — and in `Compatible` mode
+/// `resolve_native_dispatch_wave1` is a pure function of that boolean. The
+/// added cost is one relaxed `fetch_add` for the census.
+///
+/// Returns `None` when the policy refuses, which the interceptors surface by
+/// declining to intercept — so the caller falls through to real bytecode,
+/// which is §7 step 3's answer, rather than raising. A refusal that *has* no
+/// bytecode to fall through to cannot occur here by the premise above.
 #[inline]
+fn admit_forced_native(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    let id = shared
+        .natives
+        .native_methods
+        .resolve_id(class_name, method_name, method_descriptor)?;
+    admit_forced_native_id(shared, id, class_name, method_name, method_descriptor)
+}
+
+/// [`admit_forced_native`] for a caller that already holds the resolved
+/// [`cratonvm_native_api::NativeMethodId`].
+///
+/// The cached interceptor gets its id from the call site's generation-keyed
+/// `NativeCallSite` memo, which exists because the plain
+/// `NativeMethodRegistry::find` it replaced was measured as the #2 hottest
+/// symbol (~7% of samples) on `TestResponsePerformance`. Routing that path
+/// through the string-hashing sibling would hand that back; taking the id
+/// keeps the warm cost at two array indexes, the policy call, and one relaxed
+/// `fetch_add`.
+#[inline]
+fn admit_forced_native_id(
+    shared: &SharedVm,
+    id: cratonvm_native_api::NativeMethodId,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    let registry = &shared.natives.native_methods;
+    let callback = registry.callback_of(id)?;
+    let kind = registry
+        .kind_of_id(id)
+        .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+    let decision = crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        method_name,
+        method_descriptor,
+        Some((callback, kind)),
+        true,
+        true,
+    )?;
+    let admitted = decision.native_callback()?;
+    // Counted at the point of actual dispatch, matching every other route:
+    // the caller calls `safe_native_call` on the next statement.
+    registry.record_invocation(id);
+    Some(admitted)
+}
+
 /// Every dispatch site that carries the `ThreadPoolExecutor.execute`
 /// receiver-shape check, as `(file, enclosing function)`.
 ///
@@ -5347,6 +5434,11 @@ pub(crate) const THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES: &[(&str, &str)] = &[
 /// the `workers`-field probe by hand, giving three copies of one predicate —
 /// and both inlined copies took a plain `read()` where the note below explains
 /// why `read_recursive()` is required. They call this now.
+///
+/// (The `#[inline]` here was previously attached to an orphaned doc comment —
+/// *"Dispatch a force-native override via `safe_native_call`"* — describing a
+/// function that no longer exists next to it. Restored onto its real subject.)
+#[inline]
 pub(crate) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
     let Value::Object(Some(recv)) = recv else {
         return false;
@@ -5723,10 +5815,13 @@ pub(super) fn intercept_force_registered_native(
     {
         return None;
     }
-    let cb = shared
-        .natives
-        .native_methods
-        .find(class_name, method_name, method_descriptor)?;
+    // §7 routing. This was a bare `find`, so the dispatch below ran with no
+    // policy check and no census count — see `admit_forced_native` for why
+    // that made this one of seven unguarded strict-mode holes. `None` here
+    // means the policy refused, and declining to intercept hands the call to
+    // the real bytecode this site exists to override, which is §7 step 3's
+    // answer.
+    let cb = admit_forced_native(shared, class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
@@ -5917,12 +6012,21 @@ pub(super) fn intercept_force_registered_native_cached(
     // at the top of this function), so this cell only ever sees this entry's
     // own triple. The `java/lang/ClassLoader` re-target earlier in this
     // function deliberately stays on plain `find` for that reason.
-    let cb = cached.native_call_site().callback(
+    //
+    // §7 routing (2026-08-04). This ended in a bare `safe_native_call` on the
+    // memoized callback — no `dispatch_policy`, no
+    // `resolve_native_dispatch_wave1`, no census count — which made it one of
+    // seven unguarded strict-mode holes; see `admit_forced_native`. The memo
+    // is kept: `resolve` hands back the `NativeMethodId` without re-hashing,
+    // and `admit_forced_native_id` takes it from there, so the perf argument
+    // above survives intact.
+    let id = cached.native_call_site().resolve(
         &shared.natives.native_methods,
         class_name,
         method_name,
         method_descriptor,
     )?;
+    let cb = admit_forced_native_id(shared, id, class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"

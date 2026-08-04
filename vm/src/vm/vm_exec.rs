@@ -9841,7 +9841,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .ensure_generated_class(
                     &name,
                     num_fields,
-                    crate::classloading::ClassOrigin::VmInternal,
+                    cratonvm_classloading::class_origin::ClassOrigin::VmInternal,
                 );
             // Cache for the lock-free fast path above. Races are benign:
             // `ensure_generated_class` is idempotent, so any racing thread
