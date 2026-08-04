@@ -114,22 +114,27 @@ pub(super) fn compile_osr_artifact(
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
-    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
-    // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
-    // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
-    // CRATONVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
-    if crate::runtime::env_cache::disable_jit() {
-        return None;
-    }
-    // Same reasoning one gate down, for the BISECT levers.
-    // `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` were applied only inside
-    // `cratonvm_jit::try_compile`, and this function reaches
-    // `x64::compile_with_param_slots` directly (see the "calls the backend
-    // directly instead of going through `try_compile`" note further down), so
-    // an OSR body could be force-interpreted by neither lever. A bisect step
-    // that cannot actually stop the compile reads as an exoneration — see
-    // `cratonvm_jit::jit_force_interpret`.
-    if cratonvm_jit::jit_force_interpret(&class_name, &method_name) {
+    // The two whole-method vetoes that must also stop a CACHED artifact from
+    // being reused, not merely stop a new compile:
+    //
+    //   * `CRATONVM_DISABLE_JIT=1` forces interpreter-only execution. OSR is a
+    //     JIT entry point distinct from `try_jit_compile_callee` /
+    //     `try_jit_upgrade_with_gate`, so the user-facing flag has to be asked
+    //     here for it to disable all three.
+    //   * the BISECT levers. `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY`
+    //     were applied only inside `cratonvm_jit::try_compile`, and this
+    //     function reaches `x64::compile_with_param_slots` directly, so an OSR
+    //     body could be force-interpreted by neither. A bisect step that cannot
+    //     actually stop the compile reads as an exoneration — see
+    //     `cratonvm_jit::jit_force_interpret`.
+    //
+    // Both now come from `compile_gate`, so this door and `try_compile` cannot
+    // disagree about them. The rest of the admission chain (the permanent
+    // bail-list, the code-cache cap, the compile-epoch witness) is asked at the
+    // compile itself, further down — refusing to *reuse* a body that is already
+    // committed on either of those grounds would cost throughput and buy
+    // nothing.
+    if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -237,15 +242,37 @@ pub(super) fn compile_osr_artifact(
         cached_osr
     } else {
         (|| -> Option<_> {
-            // RBC.2 — honor the permanent bail-list here too. This OSR path
-            // calls `x64::compile` directly (not `jit::try_compile`), so it
-            // used to bypass the bail-list short-circuit and re-ran the FULL
-            // compile pipeline on every OSR trigger of a permanently
-            // uncompilable hot method (observed: 35,923 wasted pipelines on
-            // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
-            if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
-                return None;
-            }
+            // ── The admission gate ────────────────────────────────────────
+            //
+            // The ONE door. This path reaches `x64::compile_with_param_slots`
+            // directly rather than through `jit::try_compile`, and for a long
+            // time that meant it applied whatever subset of `try_compile`'s
+            // admission chain someone had noticed was missing:
+            //
+            //   * RBC.2 — the permanent bail-list, hand-copied here after the
+            //     full compile pipeline re-ran on every OSR trigger of a
+            //     permanently uncompilable hot method (35,923 wasted pipelines
+            //     on `Nat.inc`'s dup_x2 bail in one crypto-prng suite run);
+            //   * the bisect levers, hand-copied after every bisect step on the
+            //     annotation-scan SIGSEGV read "no effect" while 11 methods
+            //     kept compiling;
+            //   * the code-cache cap, never copied at all — an OSR compile
+            //     could commit code past a cap the ordinary door respected.
+            //
+            // `compile_gate::admit` asks all of them, in one place, for all
+            // three doors, and the token it returns owns the compile-epoch
+            // witness. That witness used to be opened ~1,000 lines below, after
+            // every class load and constant-pool read this function performs:
+            // a redefinition landing in that window produced a body stamped
+            // with the CURRENT epoch, which the install barrier then accepted.
+            // Holding the token from here is what closes it.
+            let admission = cratonvm_jit::compile_gate::admit(
+                &class_name,
+                &method_name,
+                &method_descriptor,
+                cratonvm_jit::compile_gate::CompileDoor::Osr,
+            )
+            .ok()?;
             // A previous compile for exactly this back-edge produced a body
             // whose `osr_dead_mask` refuses entry there. That verdict is a pure
             // function of a deterministic compile, so re-running the pipeline
@@ -1193,13 +1220,14 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
-            // Stamp this artifact's install epoch from HERE, not from the
-            // `put_osr` below. This path calls the backend directly instead of
-            // going through `try_compile`, so without the witness it is stamped
-            // at finalize and a redefine that lands mid-compile would not be
-            // caught by the install barrier.
-            let _compile_epoch = cratonvm_jit::open_compile_epoch_witness();
+            // This artifact's install epoch was stamped by the `compile_gate`
+            // admission at the top of this closure — before the class loading
+            // and constant-pool resolution above, not here. A witness opened at
+            // this line covered only the backend call, so a redefinition that
+            // landed while the resolvers ran produced a body the install
+            // barrier could not tell from a current one.
             let mut cm = crate::jit::x64::compile_with_param_slots(
+                &admission,
                 &code,
                 code_len,
                 param_slots,

@@ -67,9 +67,20 @@ grep.
   whole-tree problem, and `native-collections` is 1,338 of it. Nothing is
   reclassified; contract §8 makes that its own wave, and it can now be cut into
   subsystem batches from data.
-* **2** — the two `unknown` overlay verdicts drop from ranked-HIGH on evidence
-  (two of three checks run, both clean); the third is instrumented. The
-  cross-crate sweep is untouched and is the bulk of the item.
+* **2** — **step 1 stopped being a hand sweep.** The runtime detector for this
+  exact defect already existed (`CRATONVM_DBG=overlay,overlay-all`) and had
+  never been run broadly. It produced a work list of **13 classes / 24 slots**,
+  each with class, slot, value kind, real descriptor and frequency — and
+  **identical under `--real-jdk` and `--jdk-only`**, so this is a
+  `Compatible`-mode defect too, not a strict-mode one. Two entries are now
+  fixed: `VarHandle` slots 0/1 (the VM was handing real `AtomicBoolean` /
+  `AtomicReference` `<clinit>`s a `VarHandle` whose `vform` it had nulled) and
+  `Properties` slots 5/6/7 (`try_set_jdk_map_field` resolved every field name
+  against a hard-coded `java/util/HashMap` and wrote that index into whatever
+  receiver it was given). **19 slots remain**, listed in the record.
+  `CRATONVM_DBG=overlay-bt` was added to name the *Rust* writer, because the
+  Java frames mislead. The two `unknown` overlay verdicts also drop from
+  ranked-HIGH on evidence (two of three checks run, both clean).
 * **11 §5** — **retracted**: its premise (the memo needs policy-qualifying) does
   not hold. Checking it found a larger defect in its place — seven force-native
   dispatch sites bypassing `resolve_dispatch` and the census entirely — which is

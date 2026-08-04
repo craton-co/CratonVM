@@ -1987,8 +1987,23 @@ fn safe_native_call_impl(
     // the flag check itself is one relaxed load on the hot path.
     let mut pressure_gc = false;
     if shared.mem.heap.young_spill_pressure() {
+        // `|| old_gen_needs_gc()` — SB-LOADER-ZIPCONTENT (2026-08-04).
+        // `needs_gc()` asks about the YOUNG generation, and this hook fires
+        // precisely when young could NOT serve an allocation and the request
+        // went to old gen instead. Young's live set is small in exactly that
+        // situation — that is why the allocation spilled — so the young trigger
+        // answers "no" and the relief this hook exists to provide never runs.
+        // Old gen then absorbs every subsequent spill with nothing watching it:
+        // measured on `ZipContentTests`, the heap reached live=1,555,123,224 of
+        // a 1,610,612,736-byte capacity before any collection ran, and a native
+        // allocation — which cannot initiate a GC of its own, by design —
+        // raised `OutOfMemoryError` in the gap. The collection that eventually
+        // ran freed 1.49 GB, so nothing was leaking; the trigger was blind to
+        // where the bytes had gone. `old_gen_needs_gc` is the same 75 %
+        // threshold both major-GC branches use, so the collection this admits
+        // is exactly the one that reclaims old.
         if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-            && shared.mem.heap.needs_gc()
+            && (shared.mem.heap.needs_gc() || shared.mem.heap.old_gen_needs_gc())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
             crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -3130,6 +3145,29 @@ fn cold_log_overlay_corruption(
             f.method_descriptor(),
             f.pc,
         );
+    }
+    // `CRATONVM_DBG=overlay-bt` — the RUST writer, optionally filtered by a
+    // substring of the class name (`overlay-bt=ClassLoaders`).
+    //
+    // The Java frames above name the method that was executing, which is often
+    // not the code that wrote the field: a native reached from a `<clinit>`, or
+    // from class-loading machinery triggered incidentally, prints a Java stack
+    // that has nothing to do with the writer. The measured example is four
+    // `Int` writes over reference slots on `ClassLoaders$AppClassLoader` whose
+    // Java stack reads `BufferedWriter.initialBufferSize()`.
+    //
+    // Same lesson as the class-origin census's `requested_by`, which had to
+    // learn to name the Rust call site because the Java frame was usually
+    // absent: for a defect that lives in native code, the Rust backtrace is the
+    // answer and the Java frame is context.
+    if let Ok(spec) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_OVERLAY_BT") {
+        let want = spec.trim();
+        if want.is_empty() || want == "1" || class_name.contains(want) {
+            eprintln!(
+                "[OVERLAY]   rust writer:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
 }
 

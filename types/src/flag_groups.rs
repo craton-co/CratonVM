@@ -432,6 +432,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-prune", on_key: Some("CRATONVM_DBG_OVERLAY_PRUNE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
@@ -762,6 +763,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "range-bce", on_key: Some("CRATONVM_JIT_RANGE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "range-scan-legacy", on_key: Some("CRATONVM_JIT_RANGE_SCAN_LEGACY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "reassoc", on_key: Some("CRATONVM_JIT_REASSOC"), off_key: None, off_word: None },
+    // Default-ON kill switch, hence `off_key` only: `CRATONVM_JIT=-retpc-validate`
+    // makes the A5 unregistered-JIT-frame stack scan treat EVERY in-range stack
+    // word as a return address again, the way it did before 2026-08-04. Kept as
+    // a one-flag bisect for the false-positive filter in
+    // `conservative_roots::is_plausible_return_pc`.
+    E { group: Group::JIT, token: "retpc-validate", on_key: None, off_key: Some("CRATONVM_JIT_NO_RETPC_VALIDATE"), off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache", on_key: Some("CRATONVM_ROOTSNAP_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache-survive-gc", on_key: Some("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "safepoint-polls", on_key: Some("CRATONVM_JIT_SAFEPOINT_POLLS"), off_key: None, off_word: None },
@@ -849,6 +856,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
+    // Default-ON kill switch, hence `off_key` only: `CRATONVM_GC=-defrag-promote`
+    // restores the pre-2026-08-04 non-moving young sweep, which promoted only
+    // objects that had reached `PROMOTION_AGE` and therefore had no way out of
+    // a free list fragmented below any usable block size.
+    E { group: Group::GC, token: "defrag-promote", on_key: None, off_key: Some("CRATONVM_NO_DEFRAG_PROMOTE"), off_word: None },
     // Bisection escape hatches for two GC fixes, both opt-out-only. Enabling
     // either *reinstates a known defect* (stale-address writes in post-GC
     // reference processing; monotonic old-gen fragmentation) — they exist for

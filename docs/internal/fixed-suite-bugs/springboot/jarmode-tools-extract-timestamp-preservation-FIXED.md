@@ -158,24 +158,69 @@ Also green with the fixed binary: the full core regression suite,
 regression-suite/run.sh`), and `cargo check -p cratonvm-native-builtins` on
 Windows, since the change is in a file with `#[cfg(windows)]` branches.
 
+## Follow-up round, 2026-08-04: the deferred parity gap, and a second defect
+
+The `ZipEntry` accessor divergence this doc deferred is now **CLOSED**.
+Chasing it also surfaced a second, undocumented defect on the sibling path.
+
+1. **`getLastAccessTime()`/`getCreationTime()` diverged from HotSpot.** The
+   JDK's `ZipOutputStream` writes the 0x5455 extended-timestamp field **twice
+   with different payloads**: the local header carries every time it was given
+   (13 bytes, flags `0x07`), the central-directory copy keeps the same flags
+   byte but carries the modified time alone (5 bytes). Verbatim from a Temurin
+   25.0.3+9 jar: `5554 0d00 07 66ee5f80 99cf6100 cdb06300` local,
+   `5554 0500 07 66ee5f80` central. `ZipFile`/`JarFile` read the central
+   directory, so HotSpot answers `null` for both; only `ZipInputStream`, which
+   walks local headers, sees all three.
+
+   We read the local header on top of the central one and merged it in.
+   Removed — `zip_local_entry_times` / `p59_zip_local_entry_times` and their
+   byte parsers are gone. The `zip` crate already answers correctly unaided:
+   `by_index`/`by_index_raw` both reach `central_header_to_zip_file`, whose
+   `ExtendedTimestamp` parser handles the 5-byte central record by ignoring
+   the flag bits it has no bytes for. This also removes a `File::open` plus
+   two seeks and a read **per entry, per `entries()` call**.
+
+2. **`JarFile.entries()` reported `1979-11-30T00:00:16Z`** for an entry
+   carrying only a DOS timestamp — found by the parity probe, not by any test.
+   The Spring Boot loader bridge dual-writes synthetic slot 1, which is
+   `xdostime` in the real JDK layout, so the entry's **size** landed in the
+   timestamp field (size 8 → DOS seconds 16). The later `set_field_by_name`
+   writes repair every other clobbered slot; `xdostime` was the one nobody
+   wrote back, and only `getLastModifiedTime()` on an entry with no `FileTime`
+   ever reads it. Fixed by carrying the central DOS timestamp through
+   `JarEntryTimes` and setting `xdostime` by name — the same remedy
+   `zip_real_jar.rs` already applied via its `real_layout` gate, whose comment
+   records the identical "DOS date in 1979" symptom.
+
+Neither defect was reachable from the tests' own assertions:
+`entryTimeAttributes` compares two archives read through the same bridge, so
+it stayed green either way.
+
+**Verification** (binary `cratonvm-jmzip2-fix-20260804`, JDK 25.0.3+9, Azure):
+
+| check | result |
+|---|---|
+| `ZipTimeParity` probe diffed against HotSpot | identical except the jar's own creation second (the two runs wrote their jars 2 s apart) |
+| `RFileTimes` (HotSpot-diffed) | PASS |
+| full core regression suite | **25 passed / 0 failed** |
+| `ExtractCommandTests` | PASS 22/22 on JIT **and** `--nojit` |
+| `ExtractLayersCommandTests` | PASS 6/6 on JIT **and** `--nojit` |
+
+`ZipInputStream` still reports all three times, matching HotSpot — the fix is
+not an over-correction of the streaming path.
+
+`RFileTimes` gained both accessors for every entry plus a DOS-only entry
+(written with `setTime`, which clears `mtime` so `ZipOutputStream` emits no
+0x5455) on an even second, since DOS timestamps cannot represent an odd one.
+**Limitation worth stating:** the pre-fix binary had already been discarded
+when the vector was extended, so unlike the first round's vector this one is
+not *demonstrated* to fail against it. What is measured is that the pre-fix
+binary answered `2022-01-01`/`2023-01-01` for those accessors and
+`1979-11-30T00:00:16Z` for the DOS-only read — the exact quantities the vector
+now prints and diffs against HotSpot.
+
 ## Deliberate non-changes
-
-* **A `ZipEntry`'s `getLastAccessTime()`/`getCreationTime()` still diverge
-  from HotSpot.** CratonVM parses the entry's LOCAL header extra field, where
-  the JDK writes all three times; HotSpot's `ZipFile` reads only the CENTRAL
-  directory, where the JDK writes only the modified time — so HotSpot answers
-  `null` for both and CratonVM answers the real value. Introduced by the
-  2026-07-18 round (`zip_local_entry_times` in `native-io/src/zip_real_jar.rs`
-  and `p59_zip_local_entry_times` in `phases_late/jar_manifest.rs`).
-
-  It is not what these tests were failing on, and it is benign for them —
-  `ExtractCommandTests.entryTimeAttributes` compares the extracted jar's
-  entries against the source archive's, and both sides read consistently. It
-  is left alone here rather than folded into a timestamp fix: removing it is a
-  parity **and** perf change (`zip_local_entry_times` costs a `File::open` +
-  two seeks + a read *per entry*, per `entries()` call — material on a jar
-  with thousands of entries), and it deserves its own suite validation. No
-  in-tree code reads those two accessors.
 
 * **The four other `loader/spring-boot-jarmode-tools` classes are still red**
   — `HelpCommandTests` (2/2), `ListCommandTests` (1/1),
