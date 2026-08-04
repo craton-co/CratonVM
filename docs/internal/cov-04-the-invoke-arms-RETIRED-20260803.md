@@ -1,4 +1,4 @@
-# COV-04 — RETIRED 2026-08-03. All 68 invoke refusals were a constructor
+# COV-04 — RETIRED 2026-08-03. Every invoke refusal was a constructor
 
 Was `docs/known-issues/c2/cov-04-the-invoke-arms.md`. Owned the `0xb7` / `0xb9`
 arms and the `<init>`-elision path of `IrBuilder::build`, and the invoke
@@ -135,7 +135,7 @@ graph when `helpers.new_object == 0` rather than calling through address zero.
 The premise expired; the term did not.
 
 It is the single largest cause of an invoke refusal in the corpus: 79 compiles,
-39 of the 68 bails, including *all* of `5264` and `5314`.
+39 of the 68 bails at that baseline, including *all* of `5264` and `5314`.
 
 `anewarray` stays. `IrBuilder::build` has no `0xbd` arm at all and
 `ir_compatible` refuses such methods a stage earlier anyway — that conjunct is

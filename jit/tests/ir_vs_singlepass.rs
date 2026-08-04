@@ -5444,12 +5444,13 @@ fn compile_with_dispatch_and_new(
 
 #[test]
 fn ir_invokespecial_super_constructor_chain_is_called() {
-    // cov-04 group A (29 of the 68 measured events, and the whole of the 35
-    // compiles the `is_special && mn == "<init>"` term used to discard): a
-    // compiled CONSTRUCTOR's `super(...)` / `this(...)` chain call. The
-    // receiver is `this` — a parameter, never a fresh `Op::New` — so the
-    // elision path is structurally inapplicable and the only correct lowering
-    // is a real call.
+    // cov-04 group A — 29 of the 68 events measured at `48fba3a31`, and the
+    // whole of the 35 compiles the `is_special && mn == "<init>"` term used to
+    // discard. (Counts are baseline-relative; the shape is not. See the
+    // closeout.) A compiled CONSTRUCTOR's `super(...)` / `this(...)` chain
+    // call: the receiver is `this` — a parameter, never a fresh `Op::New` — so
+    // the elision path is structurally inapplicable and the only correct
+    // lowering is a real call.
     //
     //   int <init>(Corpus this, int n) { super(n); return this.f0; }
     //   aload_0; iload_1; invokespecial #2 <init>(I)V; aload_0; getfield #4; ireturn
@@ -5715,7 +5716,8 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
 
 #[test]
 fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
-    // cov-04 group B (39 of the 68 measured events): a method containing a
+    // cov-04 group B — 39 of the 68 events measured at `48fba3a31`: a method
+    // containing a
     // `new` whose constructor the elision analysis declines. Two things had to
     // change for this to compile — the `<init>` call itself, and
     // `call_eligible`, which discarded `invoke_info` for the WHOLE method

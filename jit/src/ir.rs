@@ -5462,16 +5462,22 @@ impl IrBuilder {
                 //     `new` the elision analysis declined.
                 //
                 // cov-04 measured this arm on the three Spring Boot workloads
-                // that carry 1,947 of the survey's 1,954 compile requests:
-                // **all 52** refusals here were an `<init>`, and **none** was a
-                // non-`<init>` `invokespecial` the arm had no path for. 29 were
-                // a `super(...)`/`this(...)` chain call in a compiled
-                // constructor (receiver `this`, no `new` in the method at all)
-                // and 23 were a `new X(args)` site. So the ordering above is
-                // not a preference between two common cases — case 1 is rare
-                // (`is_elidable_construction` admits only a 5-byte
-                // `aload_0; invokespecial Object.<init>()V; return` body) and
-                // case 2 is the arm's real work.
+                // that carry 1,947 of the survey's 1,954 compile requests, at
+                // `48fba3a31` — **every** refusal here was an `<init>`, and
+                // **none** was a non-`<init>` `invokespecial` the arm had no
+                // path for. 29 of 52 were a `super(...)`/`this(...)` chain call
+                // in a compiled constructor (receiver `this`, no `new` in the
+                // method at all) and 23 were a `new X(args)` site. So the
+                // ordering above is not a preference between two common cases —
+                // case 1 is rare (`is_elidable_construction` admits only a
+                // 5-byte `aload_0; invokespecial Object.<init>()V; return`
+                // body) and case 2 is the arm's real work.
+                //
+                // The COUNTS are baseline-relative and should not be quoted
+                // without their tree: the same measurement re-run after `cov-01`
+                // and `cov-02` landed reads 106, not 52, because a method
+                // blocked on `ldc` never reached its `invokespecial`. The
+                // *shape* — all of them `<init>` — held at every baseline.
                 //
                 // Calling an `<init>` runs every side effect the elision path
                 // was allowed to skip, which is the safe direction: the hazard
