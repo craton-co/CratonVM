@@ -6195,6 +6195,29 @@ fn map_alloc_node(
     let value = read_pinned_elem(ctx, value_pin, value);
     let next = next.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
     ctx.unpin_native_roots(key_pin);
+    // A node's value slot is `V value` -> `Ljava/lang/Object;` on the real
+    // `java/util/HashMap$Node` the line above binds to, so the
+    // descriptor-aware `set_field` path coerces a primitive there to NULL
+    // (`coerce_field_value_by_descriptor`, the `b'L'` arm).
+    //
+    // Every caller of this function is a view/snapshot set builder that passes
+    // a raw `Value::Int(1)` PRESENT marker, so every one of those markers was
+    // reaching the heap as null — ~1000 destructive writes in a program that
+    // does nothing but iterate an entrySet. Nothing read them back (the
+    // view branches of `native_hs_contains`/`native_hs_remove` resolve
+    // membership against the SOURCE map's `containsKey`/`get`), so it was
+    // invisible; it also drowned `CRATONVM_DBG=overlay` in benign noise, which
+    // is how it went unnoticed.
+    //
+    // Use the node's own key as the marker. It is a reference, it is never
+    // null here (every caller passes a freshly allocated entry), it costs no
+    // allocation and no Java dispatch — and "the entry is present" is exactly
+    // what a set's value slot means. A caller with a genuine value is
+    // unaffected.
+    let value = match value {
+        Value::Object(_) => value,
+        _ => Value::Object(Some(key)),
+    };
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
@@ -8154,7 +8177,32 @@ fn native_map_put_evict_pinned(
     let value = read_pinned_elem(ctx, value_pin, value);
     let key_pin = pin_value(ctx, key_val);
     let value_pin = pin_value(ctx, value);
-    // Create node — for null keys, store Value::Object(None) in key field
+    // Create node — for null keys, store Value::Object(None) in key field.
+    //
+    // LOAD-BEARING: `ClassId::new(0)` here is not laziness. It resolves to a
+    // `cratonvm/synthetic/AnonymousObject$4` (see `VmExec::alloc_object`),
+    // which declares no fields and therefore carries NO field descriptors — so
+    // `set_field` takes the raw path and stores every `Value` variant as
+    // written. Bind this to the real `java/util/HashMap$Node` (as
+    // `map_alloc_node` does) and the descriptor-aware path turns on: a
+    // primitive written to the value slot, declared `Ljava/lang/Object;`, is
+    // coerced to NULL.
+    //
+    // `native_hs_add` writes a raw `Value::Int(1)` PRESENT marker through this
+    // path, and `native_hs_add`/`native_hs_remove` decide membership purely
+    // from whether the previous value was null. So making this node "properly"
+    // typed, on its own, silently turns every `HashSet.remove(x)` into "delete
+    // it and report false" and every duplicate `add` into "reported new".
+    //
+    // That is not hypothetical: it is exactly what happened on the
+    // LinkedHashMap side when its node was switched to the real
+    // `java/util/LinkedHashMap$Entry` (`7bf427af1`, and Defect 3 of
+    // `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`),
+    // where it broke Jersey's `Resource.Builder.onBuildMethod`.
+    //
+    // If you change this class, box the marker first — and
+    // `probes/LinkedHashMapNodeProbe.java`'s set-membership section is what
+    // tells you whether you got it right.
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     // Keep the node and both object values rooted through population and
     // refresh every reference immediately before its store. The later
@@ -11516,8 +11564,24 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
-    // put(key, sentinel) — returns null if key was new
-    let sentinel = Value::Int(1);
+    // put(key, PRESENT) — returns null if key was new. This is the whole of
+    // how a Set encodes membership, so the marker MUST survive the round trip
+    // as non-null: `remove` below reports "was it there" from the same slot.
+    //
+    // A raw `Value::Int(1)` only survives because the backing map's nodes are
+    // untyped (`ClassId::new(0)` in `native_map_put_evict_pinned` — see the
+    // load-bearing note there). On a node bound to a real JDK class the value
+    // slot is `Ljava/lang/Object;` and a primitive is coerced to null, which
+    // makes `remove` delete the element and still answer `false`. Prefer the
+    // element itself as its own marker: it is a reference, it needs no
+    // allocation and no Java dispatch, and it is what a real
+    // `HashSet.PRESENT` stands in for. A null element has no such marker and
+    // keeps the legacy `Int(1)` — it is only reachable through the untyped
+    // node, and `LinkedHashMapNodeProbe` covers it.
+    let sentinel = match elem {
+        Value::Object(Some(_)) => elem,
+        _ => Value::Int(1),
+    };
     let put_args = [Value::Object(Some(backing)), elem, sentinel];
     let old = native_map_put(ctx, &put_args)?;
     let was_new = matches!(old, Some(Value::Object(None)));
