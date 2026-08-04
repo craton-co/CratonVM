@@ -18,6 +18,17 @@ below it is the original filing.
 |---|---|
 | 9 — the observability surface | [`jdk-only-observability-surface-FIXED-20260804.md`](../../internal/jdk-only-observability-surface-FIXED-20260804.md) |
 | 10 — `System.exit` bypasses the census | [`jdk-only-system-exit-census-FIXED-20260804.md`](../../internal/jdk-only-system-exit-census-FIXED-20260804.md) |
+| 8 — the real-protected-stub allow-lists | [`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) |
+
+**Found and fixed while working this list, not filed here before:**
+[`--jdk-only` could not start a thread](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).
+§7 step 3's decline fell through to `UnsatisfiedLinkError` rather than to the
+bytecode, so every `new Thread(…)` died, every `ExecutorService` had no live
+workers, a workload that joined on one **hung**, and `FileChannel.size()`
+silently returned `0`. Pre-existing on `dev`. It was surfaced by the schema-3
+census on that instrument's first run — the three `java/lang/Thread` rows say
+`start0` is `ACC_NATIVE` and `run`/`start` are shadows of concrete bytecode —
+and the other 4,795 shadowing `Bridge` registrations can reach the same path.
 
 **The finding that came out of closing item 9, and that changes how the rest of
 this list should be worked.** `requested_by` now names the *Rust* call site that
@@ -34,13 +45,7 @@ grep.
   fix that had never once executed); both halves of the policy are named
   functions side by side; a 29-shape table pins the `(cold, warm)` verdict pair.
   Deletion still needs RKC16N.6 fixed.
-* **8** — one list plus one *stated* exception, with the divergence asserted by
-  a test instead of described in two comments. **The `StringJoiner` defect did
-  not reproduce**: with the class protected on both paths — the exact merge this
-  record says reintroduces it — 40,000 `add()` calls under `-Xmx64m` came back
-  byte-identical to HotSpot in both modes. That is a microprobe and the defect
-  was found in a suite, so the asymmetry stays until H2 and Hibernate confirm
-  it; the code is unchanged.
+* **8** — **CLOSED**, see above.
 * **7** — the marker undercount that made this tier-1 is gone: a census constant
   names all eight sites plus the ninth, the probe has one implementation instead
   of three, and a gate fails on a partial sweep. No site is deleted; that still
@@ -50,9 +55,18 @@ grep.
   `Proxy$Instance`'s origin question is answered — `VmInternal`, not
   `GeneratedProxy`, and the in-code marker is corrected — but flipping it is not
   attempted.
-* **1** — `register_with_kind` exists and the census carries `kind_stated`, so
-  "chosen" and "inherited" are finally distinguishable per row. Nothing is
-  reclassified; contract §8 makes that its own wave.
+* **1** — **the census this item was blocked on has been taken.** Schema 3 adds
+  `image_declaring_method`, adjudicating every registration against the bytes on
+  the class path rather than against whatever the run happened to load, and
+  `scripts/jdk-only-adjudicate.py` reads it. Measured on JDK 25: **11,909
+  registrations**, `kind_stated` false on **all** of them (`register_with_kind`
+  has zero callers), and **10,084 of 10,844 `Bridge` rows have no `ACC_NATIVE`
+  target** — 4,796 shadow concrete bytecode, 1,321 are abstract, 2,489 name a
+  method the class does not declare. The record's "1,195 `native-collections`
+  registrations" framing is off by an order of magnitude and by scope: this is a
+  whole-tree problem, and `native-collections` is 1,338 of it. Nothing is
+  reclassified; contract §8 makes that its own wave, and it can now be cut into
+  subsystem batches from data.
 * **2** — the two `unknown` overlay verdicts drop from ranked-HIGH on evidence
   (two of three checks run, both clean); the third is instrumented. The
   cross-crate sweep is untouched and is the bulk of the item.
@@ -63,6 +77,15 @@ grep.
 
 **Unchanged and open:** 4 (the migration itself), 11 §1, §2, §4, §6, §8, §9,
 §10, §11, and §3's residual.
+
+**One thing this pass established that no record says:** strict mode had never
+been run against ordinary Java. The first breadth workload pointed at it —
+`probes/JdkOnlyCensusLoadProbe.java`, nine sections of collections, streams,
+`Properties`, io, nio, net, executors — found that `--jdk-only` could not start
+a thread, and had been unable to for as long as anyone can date. Criterion 6
+("strict corpus green") is not a formality to tick after the list is done; it is
+where the defects are. Run the probe under both modes with a HotSpot control
+before trusting any strict-mode claim in this directory.
 
 Four new guards landed, each **verified by injecting a violation and watching it
 fail**, then reverted: the site census, the no-hand-inlined-probe scan, the
@@ -139,7 +162,10 @@ behaviour** — no exception, no log line, no failing test.
 | 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
 | 5 | [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md) | `AnonymousObject$N` and `Proxy$Instance` are stamped `CompatibilityStub` to avoid flipping the derived `is_synthetic_stub` bool that 181 read sites across 20 files depend on. Correct deferral — but it makes contract §11's zero-stub criterion unachievable by construction, and two of those read sites gate native-vs-bytecode dispatch. |
 | 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
-| 8 | [The real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md) | Two copies, 11 classes vs 10: one includes `java/util/StringJoiner`, the other deliberately omits it with a documented heap-corruption reason. Wave 2 must **reconcile**, not merge; both naive directions reintroduce a known defect. *Demoted from 7 to 8:* the re-land added the missing cross-reference to the including copy, so the "a reader who finds one has no way to know the other exists" trap is retired. The divergence itself is untouched. |
+
+Item 8 left this table on 2026-08-04:
+[the real-protected-stub allow-lists](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md)
+are one predicate now.
 
 Retired item 6: [cached invoke targets retain and revalidate `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md)
 was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
@@ -178,13 +204,20 @@ instruments, make the census survive `System.exit` — are **done**; what follow
 is the order for what remains.
 
 The single most useful thing to do before starting any of it: **take the
-schema-2 census and the class-origin census from a real-JDK run of the workload
-you actually care about.** Every item below is evidence-driven, the instruments
-now produce that evidence (`requested_by` naming Rust call sites, `kind_stated`
-separating chosen from inherited kinds, a live violation trace), and the one
-concrete result so far — 52 grep-visible `ensure_synthetic_class` call sites, 3
-of which fire on a strict boot — suggests the grep-derived sizes in these
-records are systematically wrong in the same direction.
+schema-3 census and the class-origin census from a real-JDK run of the workload
+you actually care about**, and read them with `scripts/jdk-only-adjudicate.py`.
+Every item below is evidence-driven, and the instruments now produce that
+evidence: `requested_by` naming Rust call sites, `kind_stated` separating chosen
+from inherited kinds, `image_declaring_method` adjudicating every registration
+against the class-path bytes whether or not the run touched the class, and a
+live violation trace.
+
+**The grep-derived sizes in these records are systematically wrong, and always
+in the same direction.** Three measurements now say so: 52 grep-visible
+`ensure_synthetic_class` call sites of which **3** fire on a strict boot; "about
+8,000" registrations against a measured **11,909**; and a `native-collections`
+mis-tagging scoped at 1,195 registrations that is really **10,084** spread over
+the whole tree. Do not size anything here from a `rg` count.
 
 1. **Item 1** — make every native's kind an explicit, per-registration fact.
    `register_with_kind` and the `kind_stated` census column exist now; the
@@ -202,13 +235,9 @@ records are systematically wrong in the same direction.
    JDK-only change:
    * **RKC16N.6** — real-JDK `java/lang/String` bytecode resolution during JDK
      `<clinit>`s. Until this is fixed, both `String` lists have to stay.
-   * **The `StringJoiner` heap-reference-integrity defect** (HIB-CV-32 family).
-     **Probably already gone** — it did not reproduce on 2026-08-04 under the
-     exact merge that is supposed to trigger it, with collector pressure and a
-     HotSpot control. What is missing is a suite run (H2, Hibernate), because
-     the defect was found in a suite and a microprobe has repeatedly failed to
-     predict a real library here. Cheapest of the three blockers to retire, and
-     the one most likely to be retired already.
+   * ~~**The `StringJoiner` heap-reference-integrity defect**~~ — retired
+     2026-08-04. It did not reproduce under the exact merge that was supposed to
+     trigger it, and the merge is landed.
    * **Real `ThreadPoolExecutor` field initialisation** so
      `Executors.new*ThreadPool()` returns objects built by the real `<init>`.
      Until this is fixed, reclassifying `native_es_execute` drops it under

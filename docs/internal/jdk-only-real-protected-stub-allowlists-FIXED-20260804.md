@@ -1,10 +1,49 @@
-# The real-protected-stub class allow-list exists twice and the two copies are **not** identical — one includes `java/util/StringJoiner`, the other deliberately omits it
+# The real-protected-stub class allow-list existed twice and the two copies were **not** identical — one included `java/util/StringJoiner`, the other deliberately omitted it
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **The divergence is intentional and
-means the cold and warm dispatch paths make different decisions for the same
-class.** Wave 2 must **reconcile** these, not assume they are copies of each
-other.
+**Status:** FIXED 2026-08-04 on `fix/jdk-only-wave2-retire-20260804`. Filed
+2026-07-31 as JDK-only wave-2 item 8.
+
+## Resolution
+
+There is **one predicate**. `java/util/StringJoiner` joined
+`real_protected_stub_class_common`, `real_protected_stub_class_cold` was
+deleted, and `vm_exec`'s cold (vtable-miss) path calls
+`real_protected_stub_class` like everything else. A `SyntheticStub` native's
+yield-to-real-bytecode verdict no longer depends on how many times its call site
+has executed.
+
+The exception existed because merging the lists once tripped the
+`gen_heap::read_slot` "corrupt Value cell" / HIB-CV-32 guard. That was
+re-measured under the exact merge — 40,000 `add()` calls under `-Xmx64m` with
+per-iteration allocation churn and seven intermediate consistency checks,
+against a HotSpot control — and did not reproduce, in either mode. The
+measurement, including the two ways it nearly produced a false result, is in
+*The defect did not reproduce* below. The owner ran their own probe before this
+was landed.
+
+**`real_protected_stub_paths_diverge_on_exactly_stringjoiner` is gone, replaced
+by `every_allowlisted_class_is_protected`.** The old test froze the one-class
+divergence between the two paths; with a single predicate there is nothing left
+to compare, and an "the paths agree" assertion over one function is a guard that
+cannot fail. What can still regress is a class quietly leaving the list, so that
+is what is asserted, with a floor on the corpus size so an emptied corpus is not
+vacuous either.
+
+Dropping `StringJoiner` from the cold path instead was never an option, and the
+code now says so where someone would try it: the synthetic `add()` writes a
+5-field layout over the real 7-field class, reads slot 3 — real `elts`, null —
+and no-ops, giving a **silently empty join**, not a crash.
+
+---
+
+*Everything below is the original filing, kept for its reasoning and its
+measurement.*
+
+**Original status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31,
+re-verified against the re-landed tree the same day. **The divergence is
+intentional and means the cold and warm dispatch paths make different decisions
+for the same class.** Wave 2 must **reconcile** these, not assume they are
+copies of each other.
 
 *Re-ranked from tier-1 #7 to #8.* The original filing's sharpest hazard was that
 the including copy carried **no** comment saying the other copy differed, so a
