@@ -38,7 +38,8 @@
 //! because a gate that refused every compile would also satisfy every counter
 //! assertion above.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -91,6 +92,19 @@ public class CompileGateDoorsProbe {
 }
 "#;
 
+/// The `cratonvm` binary **this run built**.
+///
+/// This test lives in `vm-cli` rather than in `vm`, and that is load-bearing.
+/// Cargo builds a package's own binary targets before running that package's
+/// integration tests, and only that package's. The same test under `vm/tests/`
+/// compiles the `vm` library and then runs whatever `cratonvm` happens to be
+/// sitting in `target/release` — which may be several commits old. Not
+/// hypothetical: the first injection run of this very test (the gate deleted
+/// from the OSR door) **passed**, because the stale binary still had the gate
+/// in it. Rebuilding the binary and re-running showed what the check really
+/// sees — `osr: admitted=0`, `ungated-backend-entries=3`.
+/// `CARGO_BIN_EXE_cratonvm` is what cargo sets to the binary it built for this
+/// test, and it is the only path here that cannot go stale.
 fn cratonvm_binary() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
@@ -98,20 +112,9 @@ fn cratonvm_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target");
-    let exe = if cfg!(windows) {
-        "cratonvm.exe"
-    } else {
-        "cratonvm"
-    };
-    for profile in &["release", "debug"] {
-        let candidate = target.join(profile).join(exe);
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    let p = PathBuf::from(env!("CARGO_BIN_EXE_cratonvm"));
+    if p.exists() {
+        return Some(p);
     }
     None
 }
