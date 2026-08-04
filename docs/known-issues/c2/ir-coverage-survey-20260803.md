@@ -144,9 +144,11 @@ not new ones.
 
 **This table is revision-stamped and expected to go stale.** It is measured at
 `50218df9b`, which has `cov-02` and not `cov-01`; `cov-01` landed immediately
-after and takes the `0x12 ldc` row with it. Every remaining `cov-*` lane will
-move a row here the day it lands — that is the point of them. Do not patch a
-cell: re-take the whole column, which is one command per phase
+after and takes the `0x12 ldc` row with it. **`cov-04` landed after that and
+takes the `ir.rs:5329` row** — the candidate's 4 non-elidable-`<init>` refusals
+are now zero, and the site itself no longer exists at that line. Every remaining
+`cov-*` lane will move a row here the day it lands — that is the point of them.
+Do not patch a cell: re-take the whole column, which is one command per phase
 (`regression-suite/perf/c2-reach.sh`), and re-stamp the revision. A table with
 one fresh row and six stale ones is the failure this directory's own rules
 already name twice.
@@ -171,6 +173,13 @@ already name twice.
 
 `getstatic` + `ldc`/`ldc_w` is **189 of 273 — 69%** of every opcode gap.
 
+> **Superseded — `cov-01`, `cov-02` and `cov-04` all closed 2026-08-03.**
+> Re-measured on the same three workloads with all three in, this whole table
+> is **13 events**, not 273: `newarray` `0xbc` 7, `0x53` 4, `0xb3` 1, `0x5c` 1,
+> and every `cov-01` and `cov-02` row is **zero**. The opcode gap is no longer
+> where the tier loses methods — `cov-03`'s `putfield` is (78 of the 85
+> structural refusals that remain). Do not size anything from these rows.
+
 ### The asymmetry worth staring at
 
 `IrBuilder::build` **does** have arms for `0x30 faload`, `0x31 daload`,
@@ -190,12 +199,32 @@ fixture's node mix"* — showing up in the code rather than in a plan.
 
 | site | what it is | events | lane |
 |---|---|---:|---|
-| `ir.rs:5204` | `invokespecial` that is neither a resolvable call nor a trivial `<init>` to elide | 53 | `cov-04` |
+| `ir.rs:5204` | `invokespecial` that is neither a resolvable call nor a trivial `<init>` to elide | 53 | ~~`cov-04`~~ CLOSED |
 | `ir.rs:5085` | `putfield` whose type tag is not `I/Z/B/C/S` — **every reference field store** | 37 | `cov-03` |
-| `ir.rs:5264` | an invoke with no `invoke_info` at that pc | 13 | `cov-04` |
+| `ir.rs:5264` | an invoke with no `invoke_info` at that pc | 13 | ~~`cov-04`~~ CLOSED |
 | `ir.rs:5041` | `getfield` of a `long`/`float`/`double` | 6 | `cov-03` |
-| `ir.rs:5314` | — | 2 | `cov-04` |
-| `ir.rs:5219` | — | 1 | `cov-04` |
+| `ir.rs:5314` | — | 2 | ~~`cov-04`~~ CLOSED |
+| `ir.rs:5219` | — | 1 | ~~`cov-04`~~ CLOSED |
+
+**The four `cov-04` rows are one cause, not four, and this table says so
+misleadingly.** Closed 2026-08-03 —
+[`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+Every one of the events is an `<init>`: two whole-method terms discarded the
+method's entire `invoke_info` map, and the builder then bailed at whichever
+invoke came first in bytecode order. That is why `5264`'s callees are
+`StringBuilder.append` and `Class.getName` — sites that were never the problem.
+A bail site records where a method died; it does not record why, and a row that
+reads like an opcode-shaped gap can be neither.
+
+> **Superseded, and the counts moved in both directions.** With `cov-01` and
+> `cov-02` in, this table had grown to **159** events before `cov-04` landed —
+> the invoke rows nearly doubling, because a method blocked on `ldc` never
+> reached its `invokespecial`. With `cov-04` in as well it reads **85**, and
+> only three rows survive: `putfield` **78**, `getfield` **4**, and a `new`
+> whose site is `JitNewSite::Deferred` **3**. `cov-03` therefore owns 78 of the
+> 85 and is the whole remaining builder story. The methods that were hiding
+> behind the invoke terms are constructors, and constructors write reference
+> fields.
 
 **These line numbers are pre-`cov-02`.** Adding the array arms pushed the whole
 match statement down; re-derived after it landed, `5204` is now **5329** and

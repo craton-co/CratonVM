@@ -3585,6 +3585,23 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
+    /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
+    /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
+    /// so an absent or stale entry cannot change a compile.
+    ///
+    /// It exists because the invoke bails below report a line number and a
+    /// pc, and the question every one of them raises — *which callee* — was
+    /// otherwise a `javap` away for each event. `cov-04`'s whole first
+    /// increment was "group the 53 by callee"; this is what makes that a grep.
+    invoke_labels: HashMap<usize, Box<str>>,
+    /// Diagnostic-only companion to [`Self::invoke_labels`]: the compiling
+    /// method's own `cn.mn desc`. Without it the caller has to be recovered by
+    /// pairing a bail line with the nearest preceding `[ir] invoke-plan` line,
+    /// which is an *assumption about log interleaving* rather than a fact —
+    /// exactly the kind of inferred join this directory's rule 6 says not to
+    /// trust. Same lifetime and same flag as `invoke_labels`.
+    method_label: Option<Box<str>>,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
@@ -3665,6 +3682,8 @@ impl IrBuilder {
             new_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            invoke_labels: HashMap::new(),
+            method_label: None,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             ldc_info: HashMap::new(),
@@ -3844,6 +3863,37 @@ impl IrBuilder {
     /// to single-pass. `ret_type` is the JVM return-type byte (see the field doc).
     pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, u8)>) {
         self.invoke_info = info;
+    }
+
+    /// Diagnostic-only: supply `pc → "0xNN cn.mn desc"` for the invoke sites, so
+    /// the three invoke bails can name the callee they refused. Never read by
+    /// lowering; `lib.rs` only calls this when `CRATONVM_DBG=ir-compiles` (or
+    /// `jitc`) is on, so the default path never builds the strings.
+    pub fn set_invoke_labels(&mut self, labels: HashMap<usize, Box<str>>, method: Box<str>) {
+        self.invoke_labels = labels;
+        self.method_label = Some(method);
+    }
+
+    /// [`ir_build_bail`] for the invoke arms, which — given the diagnostic map
+    /// above — know the one thing the bare pc does not: *which callee*.
+    ///
+    /// Falls back to the plain report when the map is empty (no flag, a
+    /// hand-built graph, or a resolver that declined the CP index), so the
+    /// `ir.rs:NNNN` line the survey greps for is emitted either way.
+    #[cold]
+    #[inline(never)]
+    fn bail_invoke<T>(&self, site: u32, pc: usize) -> Option<T> {
+        if ir_bail_reporting() {
+            if let Some(label) = self.invoke_labels.get(&pc) {
+                eprintln!(
+                    "[ir] IrBuilder::build refused at ir.rs:{site} (bytecode pc {pc}) \
+                     in {} callee {label}",
+                    self.method_label.as_deref().unwrap_or("<unknown>"),
+                );
+                return None;
+            }
+        }
+        ir_build_bail(site, pc)
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -5392,28 +5442,80 @@ impl IrBuilder {
                     self.push(newobj);
                     pc += 3;
                 }
-                // invokespecial — only a trivial `<init>()V` on a fresh object
-                // is handled, by ELISION: pop the receiver (the `dup`'d new
-                // object) and emit nothing. Sound only because the caller
-                // admits the pc to `trivial_init_pcs` exclusively when the
-                // object is a non-escaping `new` whose class has no primitive
-                // field initialisers (its fields are zero-initialised and set
-                // by the visible `putfield`s — the constructor adds nothing the
-                // scalar-replaced slots don't already model). Any other
-                // `invokespecial` bails to single-pass.
+                // invokespecial — two lowerings, tried in this order:
+                //
+                //  1. ELISION of a trivial `<init>()V` on a fresh object: pop
+                //     the `dup`'d receiver and emit nothing. Sound only because
+                //     the caller admits the pc to `trivial_init_pcs` exclusively
+                //     when the object is a `new` whose class has no primitive
+                //     field initialisers (its fields are zero-initialised and
+                //     set by the visible `putfield`s — the constructor adds
+                //     nothing the scalar-replaced slots don't already model),
+                //     AND because the receiver is a fresh `Op::New` this pass
+                //     emitted. Preferred when it applies: it is the whole point
+                //     of scalar replacement, and a call here would pin the
+                //     allocation (`Op::Call` arg-escapes its reference inputs).
+                //
+                //  2. an ordinary statically-bound CALL — a `super.m()`, a
+                //     private method, or (cov-04) a real constructor: a
+                //     `super(...)`/`this(...)` chain call, or the `<init>` of a
+                //     `new` the elision analysis declined.
+                //
+                // cov-04 measured this arm on the three Spring Boot workloads
+                // that carry 1,947 of the survey's 1,954 compile requests, at
+                // `48fba3a31` — **every** refusal here was an `<init>`, and
+                // **none** was a non-`<init>` `invokespecial` the arm had no
+                // path for. 29 of 52 were a `super(...)`/`this(...)` chain call
+                // in a compiled constructor (receiver `this`, no `new` in the
+                // method at all) and 23 were a `new X(args)` site. So the
+                // ordering above is not a preference between two common cases —
+                // case 1 is rare (`is_elidable_construction` admits only a
+                // 5-byte `aload_0; invokespecial Object.<init>()V; return`
+                // body) and case 2 is the arm's real work.
+                //
+                // The COUNTS are baseline-relative and should not be quoted
+                // without their tree: the same measurement re-run after `cov-01`
+                // and `cov-02` landed reads 106, not 52, because a method
+                // blocked on `ldc` never reached its `invokespecial`. The
+                // *shape* — all of them `<init>` — held at every baseline.
+                //
+                // Calling an `<init>` runs every side effect the elision path
+                // was allowed to skip, which is the safe direction: the hazard
+                // named at the elision site is the other one.
                 0xb7 => {
-                    // inc 24 (Gap B): a resolved non-`<init>` `invokespecial`
+                    // Defence in depth on the elision: only elide when the
+                    // receiver (top of stack for a no-arg `<init>`) is a fresh
+                    // `Op::New` we emitted. Eliding a `<init>` whose receiver is
+                    // `this` or a parameter would skip a real superclass
+                    // constructor (and hide any escape it performs) — and that
+                    // is exactly what a `super()` chain call looks like, which
+                    // the census found 29 of. Such a site now falls through to
+                    // the call path below instead of bailing the method.
+                    let elide = self.trivial_init_pcs.contains(&pc)
+                        && matches!(
+                            self.peek_opt().and_then(|r| self.graph.node_opt(r)),
+                            Some(Node {
+                                op: Op::New { .. },
+                                ..
+                            })
+                        );
+                    if elide {
+                        self.pop();
+                        pc += 3;
+                    }
+                    // inc 24 (Gap B) + cov-04: a resolved `invokespecial`
                     // lowered to `Op::Call` — identical to the `invokestatic`
                     // arm except the receiver is arg0 (the caller's
                     // `invoke_info` entry already counts it in `num_args`, and
                     // the leaked `JitInvokeInfo` carries `invoke_kind == 1` so
                     // `invoke_dispatch` does the non-virtual dispatch to the
-                    // statically-resolved target). GC-safe by the same
-                    // conservative IR-frame scan that roots reference args
-                    // (inc 22). Only populated when the special-call gate is on;
-                    // otherwise `invoke_info` has no entry for this pc and we
-                    // fall through to the elidable-`<init>` path below.
-                    if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                    // statically-resolved target — the same route the
+                    // single-pass backend gives every non-elided `<init>`).
+                    // GC-safe by the same conservative IR-frame scan that roots
+                    // reference args (inc 22). Only populated when the
+                    // special-call gate is on; otherwise `invoke_info` has no
+                    // entry for this pc and the method bails to single-pass.
+                    else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
                         let mut args = Vec::with_capacity(num_args);
                         for _ in 0..num_args {
                             args.push(self.pop());
@@ -5450,28 +5552,13 @@ impl IrBuilder {
                         }
                         pc += 3;
                     } else {
-                        // Elidable-`<init>` path (scalar-new): elide a trivial
-                        // `<init>()V` on a fresh object.
-                        if !self.trivial_init_pcs.contains(&pc) {
-                            return ir_build_bail(line!(), pc);
-                        }
-                        // Defence in depth: only elide when the receiver (top of
-                        // stack for a no-arg `<init>`) is a fresh `Op::New` we
-                        // emitted. Eliding a `<init>` whose receiver is `this` or
-                        // a parameter would skip a real superclass constructor
-                        // (and hide any escape it performs).
-                        let recv_is_new = matches!(
-                            self.peek_opt().and_then(|r| self.graph.node_opt(r)),
-                            Some(Node {
-                                op: Op::New { .. },
-                                ..
-                            })
-                        );
-                        if !recv_is_new {
-                            return ir_build_bail(line!(), pc);
-                        }
-                        self.pop();
-                        pc += 3;
+                        // Neither lowering applies: no `invoke_info` entry for
+                        // this pc (the special-call gate is off, or one
+                        // non-emittable invoke elsewhere in the method
+                        // discarded the whole map) and the site is not an
+                        // elidable `<init>` on a fresh `Op::New`. Refuse the
+                        // method — never guess a callee identity.
+                        return self.bail_invoke(line!(), pc);
                     }
                 }
                 // invokestatic (0xb8) and invokevirtual (0xb6) — lower a resolved
@@ -5513,7 +5600,7 @@ impl IrBuilder {
                     }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return ir_build_bail(line!(), pc),
+                        None => return self.bail_invoke(line!(), pc),
                     };
                     // Pop args (deepest-first on the abstract stack) and restore
                     // source order so inputs are [ctrl, mem, arg0, arg1, …].
@@ -5563,7 +5650,7 @@ impl IrBuilder {
                 0xb9 => {
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return ir_build_bail(line!(), pc),
+                        None => return self.bail_invoke(line!(), pc),
                     };
                     let mut args = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
