@@ -298,18 +298,63 @@ That last one was the live risk in this change — those interface natives read
 `hash`/`key`. Confirmed empirically rather than by reading: `eldest.getKey()`
 returns the key, not the boxed `hash` a slot-0 read would have produced.
 
+### The regression this exposed, and its fix
+
+Making the node honest turned on the descriptor-aware write path for its
+slots, and that immediately broke something else. The 24-class Spring Boot A/B
+below caught it: `JerseyAutoConfigurationDefaultFilterPathTests` went PASS ->
+FAIL, and an interleaved re-run was **6/6 PASS on `dev`, 6/6 FAIL on the new
+binary** — deterministic, not a flake.
+
+`Resource.Builder` keeps its method builders in a `LinkedHashSet` and asserts
+on the removal (`javap`: `getfield methodBuilders:Ljava/util/Set;` ->
+`invokeinterface Set.remove` -> `Preconditions.checkState`):
+
+```
+IllegalStateException: Resource.Builder.onBuildMethod() invoked from a
+resource method builder that is not registered in the resource builder
+instance.
+```
+
+Reduced to 20 lines: `LinkedHashSet.remove(x)` **deleted the element and
+returned `false`** (the set really did end up empty), while
+`LinkedHashMap.remove` and `HashSet.remove` were both fine.
+
+The cause is the other half of "the slot has a real type now". A `Set` is a
+map whose values are a PRESENT marker, and `native_hs_add` writes a raw
+`Value::Int(1)` as that marker. The node's value slot is `V value` ->
+`Ljava/lang/Object;`, so the descriptor-aware write coerced the marker to
+**null** — and both `native_hs_add` and `native_hs_remove` decide membership
+purely from whether the previous value was null. `add` reported a duplicate as
+new, and `remove` reported a present element as absent.
+`CopyOnWriteArraySet` shares the backing and broke with it.
+
+Fixed by `7bf427af1`: `native_lhm_put_evict` — the single choke point for both
+node-value writes — boxes a primitive value on the way in. A real Java caller
+can never arrive with one (`Map.put`'s descriptor is `(Object,Object)Object`,
+so the interpreter has already boxed), so this only fires for our own
+sentinels, and `Integer.valueOf(1)` returns the JDK's cached instance rather
+than allocating.
+
+The identical trap is still latent on the plain-`HashMap` view-set paths
+(`map_alloc_node(ctx, entry, sentinel, ..)`, four sites). They are not broken
+today only because `java/util/HashMap$Node` is in practice a synthetic stub
+with no field descriptors, so no coercion runs — luck, not design. Left for
+its own pass; **it is a live trip-wire for anyone who makes that class real.**
+
 ### Validation
 
 HotSpot control first, same host and JDK: `probes/LinkedHashMapNodeProbe.java`
-**PROBE PASS**, 54 assertions.
+**PROBE PASS**, 80 assertions.
 
 | Binary | Contents | `LinkedHashMapNodeProbe` | `MapConditionalMutatorProbe` |
 |---|---|---|---|
 | HotSpot 25.0.3+9 | the control | PASS | PASS |
 | `cratonvm-lhment-base` | `origin/dev` @ `87d323bac`, unmodified | **FAIL** (JIT and `--nojit`) | PASS |
-| `cratonvm-lhment-r1` | + this fix | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
+| `cratonvm-lhment-r1` | + the class change alone | **FAIL** (6, the Set regression) | PASS |
+| `cratonvm-lhment-r2` | + the sentinel fix, as landed | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
 
-The baseline failure is the divergence itself, identically on both arms:
+The baseline failure is the original divergence, identically on both arms:
 
 ```
   FAIL eldest.getClass() expected=java.util.LinkedHashMap$Entry
@@ -319,11 +364,47 @@ Exception in thread "main" java/lang/UnsupportedOperationException
         at LinkedHashMapNodeProbe$Observer.removeEldestEntry(...)
 ```
 
-`KafkaAutoConfigurationIntegrationTests` on `r1`: **3/3 PASS** under JIT and
-**2/2 PASS** under `--nojit`, every run reporting `SBRUNNER_RESULT tests=3
-failed=0 aborted=0 skipped=0 containersFailed=0`.
+and `r1`'s is the regression, which the probe now carries a section for:
 
-`regression-suite/run.sh` (it diffs CratonVM against HotSpot) against `r1`:
+```
+  FAIL   LinkedHashSet add(dup) expected=false actual=true
+  FAIL   LinkedHashSet remove(present) expected=true actual=false
+  FAIL   LinkedHashSet 40 identity removes report true expected=40 actual=0
+  FAIL   CopyOnWriteArraySet ... (same three)
+```
+
+**A note on how nearly this was missed.** The first version of that probe
+section did not compile (`Set`/`HashSet`/`LinkedHashSet` unimported). `javac`
+failed, the runner kept using the previous class file, and every arm — base,
+`r1`, `r2` — reported `PROBE PASS`, including the one the section exists to
+catch. Always check that the compile succeeded before reading the verdicts.
+
+`KafkaAutoConfigurationIntegrationTests`, run **interleaved across the
+binaries** (arm order rotating) so the class's known load sensitivity cannot
+land on one arm:
+
+| Arm | JIT | `--nojit` |
+|---|---|---|
+| `base` | 8/8 PASS | 2/3 PASS |
+| `r1` | 8/8 PASS | — |
+| `r2` | 7/8 PASS | 3/3 PASS |
+
+Every PASS reports `SBRUNNER_RESULT tests=3 failed=0 aborted=0 skipped=0
+containersFailed=0`. **Both reds are this class's documented load sensitivity,
+not an arm difference** — one on `r2` under JIT, one on `base` under
+`--nojit`. `testEndToEndWithRetryTopics` gates on a 30-second latch, and the
+reds are that assertion or a starved broker heartbeat
+(`InvalidReplicationFactorException: All brokers are currently fenced`) in
+runs taking 170–290 s against the 33–56 s an idle box gives.
+
+An earlier window recorded **0/3 on `r2`**, and it is kept here rather than
+dropped, because "0/3" is exactly the shape that reads as a regression when it
+is a busy neighbour. Every one of those runs took 150–218 s with host load at
+80–95 from concurrent builds by other sessions — past the level at which a
+Spring Boot verdict means nothing. Re-run interleaved against `base` and `r1`
+on a quiet box, `r2` went 5/5.
+
+`regression-suite/run.sh` (it diffs CratonVM against HotSpot) against `r2`:
 **24 passed, 0 failed**, including `RCollections`, `RJdkCollections`,
 `RMapResizeGc`, `RMapGcStress`, `RSerial` and `RForNameGcStress`.
 
@@ -335,7 +416,20 @@ integration test (`abstract_collection_interception`, `gc_native_pins`,
 `lhm_node_class_identity`). `gc_relocation_harness` is excluded — it does not
 compile on `dev` either.
 
-SB_AB_PLACEHOLDER
+Collateral damage — and the reason this pass was worth running: a fixed
+24-class random sample of the Spring Boot suite (`shuf -n 24
+--random-source=<(yes)` over the 08-02 full-suite PASS set), run **interleaved
+per class** with the arm order alternating, `dev` against the new binary.
+
+| Round | New binary | Result |
+|---|---|---|
+| 1 | `r1` (class change alone) | **23 SAME, 1 DIFF** — `JerseyAutoConfigurationDefaultFilterPathTests` PASS -> FAIL |
+| 2 | `r2` (as landed) | **24 SAME, 0 DIFF** |
+
+The round-1 DIFF is the `LinkedHashSet` regression above. It was confirmed
+deterministic before being diagnosed — the class re-run interleaved was
+**6/6 PASS on `dev` against 6/6 FAIL on `r1`** — and it is PASS/PASS in round
+2.
 
 ### Regression tests
 
@@ -353,6 +447,18 @@ SB_AB_PLACEHOLDER
   eviction shape under both verdicts, insertion order across head and tail
   removal, `entrySet` `setValue`, access-order LRU, serialization round trip,
   and 2000 entries across several resizes.
+
+### Not run, and why
+
+The Hibernate `InPredicateTest` witness for the `removeEldestEntry` hook was
+**not** re-run. The host's Hibernate fixture is incomplete (156 of 235
+classpath entries present, and the test class is not built), and that test is
+independently on record as a JIT timeout on `dev`, so it would not have given
+a clean signal even rebuilt. The hook change is instead covered end-to-end by
+`LinkedHashMapNodeProbe`'s reentrant-eviction section, which reproduces
+`BoundedConcurrentHashMap.LRU`'s exact shape — the override removes the eldest
+itself from its eviction listener — under both verdicts it can report, with
+HotSpot as the control.
 
 ### Left alone, deliberately
 
