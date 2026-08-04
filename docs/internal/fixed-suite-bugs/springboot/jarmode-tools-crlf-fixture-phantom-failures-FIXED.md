@@ -58,7 +58,66 @@ blobs themselves. See [[reference_scp_windows_worktree_source_carries_crlf]].
 
 ## The two fixes
 
-### 1. The fixture (16 files)
+### 1. The fixture — whole tree (2026-08-04, second pass)
+
+Initially scoped to the 16 `jarmode-tools` resources (below). The tree was then
+normalized **in full**, measured before and after:
+
+```
+cd <fixture>
+git config core.autocrlf input
+git add --renormalize .            # 13,945 files
+git commit -m "normalize line endings to LF (whole tree)"
+git ls-files -z | xargs -0 rm -f   # a plain `checkout --`/`checkout-index -f`
+git checkout-index -a -f           # will NOT rewrite them -- see below
+```
+
+Restore point: commit `0163c69f` (`fixture_snapshot`) still holds every
+original CRLF blob, so any single file can be put back for an A/B.
+
+Two traps worth writing down:
+
+* **`git checkout-index -a -f` does not rewrite the working tree here.** Under
+  `autocrlf=input` a CRLF working file over an LF blob already reads as clean,
+  so git has nothing to do. The files must be deleted first. `git status` then
+  reports ~13.9k `M` entries that are pure stale-stat-cache — `git diff
+  --numstat` returns **zero lines**, i.e. no real content difference.
+* **The tests read `build/resources/**`, not `src/**/resources`.** Normalizing
+  the sources alone changes nothing until the built copies are fixed too: 825
+  of them were CRLF. They were stripped in place rather than re-copied from
+  `src`, so whatever gradle's `processResources` had produced (including any
+  filtering) is preserved and only the line endings change.
+
+#### Measured effect: one class, zero casualties
+
+A full HotSpot run of all 1,976 suite classes before and after, diffed
+class-by-class (`hsfull-before-20260804-s{1..6}` vs
+`hsfull-after-20260804-s{1..6}`):
+
+| Class | Before | After |
+|---|---|---|
+| `ChangelogWriterTests` | FAIL 1/1 | **PASS 0/1** |
+| `JettyServletWebServerFactoryTests` | PASS 0/113 | FAIL 1/113 |
+
+**Every other one of the 1,975 compared rows is unchanged.** The Jetty row is
+load noise, not a normalization casualty: the after-arm ran at load average
+104–164 (the standing rule is that reds above ~80 are not trustworthy), the
+failing method is `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade`
+— a graceful-shutdown timing test that reads no fixture resource — and it
+passes cleanly when re-run alone at load 14.
+
+So the whole-tree CRLF defect was worth **exactly one more class** beyond the
+four `jarmode-tools` ones. `ChangelogWriterTests` also passes on CratonVM after
+the change. That is the honest scale: 13,945 files carried CRLF, but only five
+classes ever compared a changed file against generated text.
+
+The run also produced something the tree did not have before: a **full 1,976-row
+HotSpot baseline** (`.suite/baseline/hotspot-baseline-full-lf-20260804.tsv`,
+also installed as `hotspot-baseline-latest.tsv`), which is what makes the
+`BOTH-FAIL` classification below useful across the whole suite rather than for
+whichever handful of classes was last run under `-Vm hotspot`.
+
+### 1b. The fixture — first pass (16 files, `jarmode-tools` only)
 
 `core.autocrlf=input` + `git add --renormalize` + delete-and-restore on
 `loader/spring-boot-jarmode-tools/src/test/resources/org/springframework/boot/jarmode/tools/`,
@@ -67,13 +126,8 @@ is actually on the test classpath; a plain `git checkout --` will NOT rewrite
 the working tree, because under `autocrlf=input` a CRLF working file over an LF
 blob already reads as clean).
 
-Originals backed up at `/data/data/jm2-crlf-backup/`.
-
-**Deliberately scoped to this one module.** The other 12,772 CRLF blobs are
-untouched: renormalizing the whole tree changes results for every concurrently
-running suite session and invalidates the existing baselines. At least one more
-class is known to be affected — `ChangelogWriterTests` (1/1) fails on HotSpot
-too, by the same expected-file mechanism.
+Originals backed up at `/data/data/jm2-crlf-backup/`. Superseded by the
+whole-tree pass above, which subsumes it.
 
 ### 2. The runner (`apps/spring-boot-suite-runner/run-spring-boot-suite.ps1`)
 
@@ -127,6 +181,15 @@ A HotSpot control over the whole `residual-azure-20260802-32.tsv` list found
 **5 of 32** classes failing on HotSpot too — the four above plus
 `ChangelogWriterTests`. The remaining 27 behave as advertised: where CratonVM
 fails and HotSpot passes, the defect is genuine and belongs to its own doc.
+
+The subsequent full-suite HotSpot run put a ceiling on it: across **all 1,976
+classes**, those five were the *only* fixture-caused failures, and all five are
+now green. The before-arm — with the four `jarmode-tools` classes already fixed
+but the rest of the tree still CRLF — recorded 1,931 PASS, 43 `EMPTY` and a
+single FAIL (`ChangelogWriterTests`). The 43 `EMPTY` rows are abstract base
+classes with no `@Test` methods, not failures. After normalization the counts
+are identical except that `ChangelogWriterTests` moved into the PASS column
+(the after-arm's one FAIL is the Jetty timing flake described above).
 
 ## Reproduce
 

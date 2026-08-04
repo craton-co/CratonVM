@@ -5763,7 +5763,32 @@ fn try_set_jdk_map_field(
     field_name: &str,
     value: Value,
 ) {
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", field_name) {
+    // JDK-ONLY-LAYOUT: resolve the name on the RECEIVER's class, not on a
+    // hard-coded `java/util/HashMap`.
+    //
+    // This was `resolve_field_index("java/util/HashMap", field_name)` and then
+    // wrote that index into `this` — whatever class `this` actually was. For a
+    // receiver that is not a `HashMap`, the index names a *different field*,
+    // and the `slot < object_num_fields` bound below does not help: it stops an
+    // out-of-range write, not a wrong-field one. That is the shape of guard
+    // that looks protective and is not.
+    //
+    // Measured 2026-08-04 with `CRATONVM_DBG=overlay,overlay-all` on
+    // `new Properties()`: `Float(0.75)` — a `loadFactor` — landed on
+    // `Properties` slot 7, which the real class declares as a **reference**,
+    // and `Int(0)` / `Int(12)` landed on slots 5 and 6, likewise references. On
+    // a real `java.util.Properties` those slots are `defaults` / `map`, so each
+    // write both destroyed a live reference and stored the value nowhere useful.
+    //
+    // `resolve_field_index_by_class_id` walks the receiver's own hierarchy, so
+    // `loadFactor` on a `Properties` resolves through `Hashtable` to its true
+    // absolute slot; its doc comment already recommends it over the name-based
+    // form in exactly this situation, because the caller holds the object. When
+    // the receiver's class does not declare the field the lookup returns `None`
+    // and nothing is written — the correct outcome, and strictly better than
+    // writing whatever field happens to sit at a `HashMap` index.
+    let class_id = ctx.class_id_of_object(this);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, field_name) {
         if slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, value);
         }

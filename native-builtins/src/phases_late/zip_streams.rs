@@ -1198,20 +1198,46 @@ fn native_sb_zip_inflater_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // run concrete Java bytecode. `available = -1` is the documented
         // ZipInflaterInputStream fallback that delegates to its superclass.
         let buffer_size = args.get(3).and_then(Value::as_int).unwrap_or(1).max(1);
+        // `this` crosses a re-entrant call that allocates (the superclass
+        // constructor allocates its own inflate buffer), so it must be pinned
+        // and read back — same stale-`ObjectRef` family as the `in` field
+        // below. Writing `available` through the pre-collection reference would
+        // leave the real stream at `available = 0`, i.e. silently reporting
+        // end-of-stream on a bulk-drainable entry.
+        let this_pin = ctx.pin_native_root(this);
         ctx.invoke_special(
             "java/util/zip/InflaterInputStream",
             "<init>",
             "(Ljava/io/InputStream;Ljava/util/zip/Inflater;I)V",
             &[args[0], args[1], args[2], Value::Int(buffer_size)],
         )?;
+        let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this, "available", Value::Int(-1));
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
 
     let this_pin = ctx.pin_native_root(this);
-    let source = drain_input_stream_bulk(ctx, source);
+    // Pin the SOURCE stream too, and read it back below.
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): `this` was pinned and re-read, but the
+    // stream went into `this.in` straight out of `args[1]` — a raw `ObjectRef`
+    // captured before `drain_input_stream_bulk` and `new_array`, either of which
+    // can run a moving young collection. When one did, `in` was set to the
+    // stream's PRE-collection address, so `InflaterInputStream.close()` closed
+    // whatever occupied that slot afterwards and never closed the real
+    // `DataBlockInputStream` — leaving its `FileDataBlock` reference count
+    // permanently above zero, and the file channel with it.
+    //
+    // That is why `SecurityInfoTests.getWhenJarIsSigned` and
+    // `NestedJarFileTests.verifySignedJar` failed with "[open paths] Expecting
+    // empty but was: [bcprov-jdk18on-1.78.1.jar]" while HotSpot passed: of the
+    // 5,370 signed entries those tests stream, 2 to 3 were left open, and WHICH
+    // ones changed between runs — a GC-timing signature, not a logic one.
+    let source_pin = ctx.pin_native_root(source);
+    let drained = drain_input_stream_bulk(ctx, source);
     let mut decoded = Vec::new();
-    let inflated = flate2::read::DeflateDecoder::new(source.as_slice())
+    let inflated = flate2::read::DeflateDecoder::new(drained.as_slice())
         .read_to_end(&mut decoded)
         .is_ok();
     if !inflated {
@@ -1220,7 +1246,8 @@ fn native_sb_zip_inflater_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decoded.len());
     ctx.write_byte_array_from(bytes, 0, &decoded);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field_by_name(this, "in", args[1]);
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.set_field_by_name(this, "in", Value::Object(Some(source)));
     ctx.set_field_by_name(this, "buf", Value::Object(Some(bytes)));
     ctx.set_field_by_name(this, "len", Value::Int(decoded.len() as i32));
     ctx.set_field_by_name(this, "available", Value::Int(decoded.len() as i32));

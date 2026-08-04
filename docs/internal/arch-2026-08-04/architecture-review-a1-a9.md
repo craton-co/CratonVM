@@ -496,6 +496,75 @@ That is a change that must be made with the GC decision report
 (`gc_metrics::collector_decision_report()`) in hand across a real workload,
 not alongside nine other findings.
 
+## Second pass (2026-08-04, later the same day): one hypothesis refuted, the
+## measurement replicated, still not landed
+
+Returning to this with the explicit goal of doing the rewrite produced three
+results and no landed code.
+
+**1. The "it's the memory ordering" hypothesis is REFUTED.**
+
+The reasoning was: on x86-64 an `Acquire` load *is* a plain `mov`, so the
+instruction cannot cost 7% — but it is a compiler barrier sitting in the loop
+prologue once per bytecode, plausibly stopping rustc from keeping frame/pc state
+in registers across iterations. If so, a `Relaxed` load with the `Acquire` fence
+moved *inside* the taken branch would recover the win at zero semantic cost
+(nothing on the not-taken path depends on the flag — the next statement drains a
+*local*).
+
+It was implemented and measured against an otherwise identical binary:
+
+| Arm | min (s) | median (s) |
+|---|---:|---:|
+| A — `Acquire` load (baseline) | 15.225 | ~15.41 |
+| B — `Relaxed` + fence in branch | 15.259 | ~15.39 |
+
+**No difference.** 12 interleaved runs, both orders, on an unusually stable
+window (0.7% spread across the first five). The change was reverted and is not
+in the tree.
+
+Also worth recording because it killed an earlier guess: there is **no address
+chase to hoist**. `mem`, `gc_barrier` and `stw_requested` are all inline fields,
+so the flag is already one load at a constant offset from `shared`.
+
+**2. The cost of the poll REPLICATED, on an independent run.**
+
+Same protocol, arm C = poll deleted outright:
+
+| Arm | min (s) | first three clean pairs |
+|---|---:|---|
+| A — poll present | 8.333 | — |
+| C — poll deleted | **7.953** | C faster by 4.6%, 9.0%, 3.3% |
+
+Minimum-to-minimum **4.6%**, direction consistent, and consistent with the
+first session's 7.5%. Call it **~5%**, twice measured, on two different days
+and two different thermal states of the box.
+
+So the cost is the load *and its branch*, and whatever they do to the loop —
+not the ordering. That is only recoverable by polling **less often**, which is
+precisely the change that needs the GC analysis.
+
+**3. Two of the three safety questions are now answered.**
+
+- **STW does not wait indefinitely.** `GcBarrier::wait_for_all_timeout` is a
+  *bounded* wait the caller loops on. So a thread that polls less often costs
+  latency and retries, not an automatic hang.
+- **Every fast-path back edge already polls.** All **15** sites that do
+  `backward_count += 1` are accompanied by a `safepoint_check` — 15 of 15.
+
+What remains unanswered, and is the actual gate on this change:
+
+- The same back-edge guarantee for the **decoded** path, which is a separate
+  ~200-opcode implementation.
+- What the STW initiator does when `wait_for_all_timeout` **expires** — retry
+  forever, or proceed. If it can proceed, a thread polling less often is a
+  correctness hazard, not a latency one.
+- The `moving_young` coverage-proof interaction, unchanged from above.
+
+Nothing was landed. The prize is real and now twice-measured, the cheap
+alternative is eliminated, and the remaining work is a bounded GC-safety
+analysis rather than an open question.
+
 ---
 
 # A5 — WITHDRAWN: the "458 methods" claim was wrong
