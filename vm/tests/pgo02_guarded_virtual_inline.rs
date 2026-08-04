@@ -63,9 +63,11 @@ fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
 fn method_descriptor(method: &str) -> &'static str {
     match method {
         "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface"
-        | "callDivider" => "(I)I",
+        | "callDivider" | "dividerTagFrames" | "callFinally" | "callSynchronized"
+        | "callMonitor" => "(I)I",
         "callPoly" | "callBimorphic" => "(II)I",
         "setCurrent" | "setDivisor" => "(I)V",
+        "finallySideEffects" => "()I",
         other => panic!("unknown method: {other}"),
     }
 }
@@ -150,6 +152,9 @@ fn run_all_checks() -> Result<(), String> {
     check_interface_site(&mut vm)?;
     check_bimorphic(&mut vm)?;
     check_uncaught_from_inlined_frame(&mut vm)?;
+    check_stack_trace_through_an_inlined_frame(&mut vm)?;
+    check_monitor_bearing_callees_are_refused(&mut vm)?;
+    check_finally_runs_at_a_guard_eligible_site(&mut vm)?;
     check_thrower(&mut vm)?;
     check_polymorphic(&mut vm)?;
     check_metrics_harvest()?;
@@ -361,6 +366,152 @@ fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
             "check_interface_site: callIface compiled but speculative_sites == 0 (tally={tally:?}) \
              — an interface site with one implementation must be reachable by the guarded \
              inliner"
+        ));
+    }
+    Ok(())
+}
+
+/// The brief's stack-trace requirement: "a guard that always fires must produce
+/// the same observable results as the un-inlined path — same exceptions, same
+/// STACK TRACES, same `finally` execution".
+///
+/// A spliced body has no frame of its own, and `capture_current_stack_trace`
+/// walks the interpreter's frame list, so the question is whether the callee
+/// still appears. Measured against the SAME call before the method compiled.
+fn check_stack_trace_through_an_inlined_frame(vm: &mut Vm) -> Result<(), String> {
+    // Read the trace the VM CAPTURED, not one reconstructed through Java
+    // reflection: these in-process tests boot the synthetic JDK, whose
+    // `Throwable` has no `getStackTrace()` (it raises NoSuchMethodError). The
+    // captured `Vec<StackTraceEntry>` is what `Throwable.getStackTrace()` is
+    // served from, so this reads the same structure the consumer does.
+    fn tag_frames(vm: &mut Vm, x: i32) -> Result<usize, String> {
+        let err = match vm.invoke(
+            "cratonvm/PgoGuardedVirtualInline",
+            "callDivider",
+            "(I)I",
+            &[Value::Int(x)],
+        ) {
+            Err(e) => e,
+            Ok(v) => {
+                return Err(format!(
+                    "callDivider({x}) returned {v:?} instead of raising — the fixture is not                      dividing by zero, so this check would be vacuous"
+                ))
+            }
+        };
+        let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc) = err else {
+            return Err(format!("callDivider({x}) failed without a throwable: {err:?}"));
+        };
+        let hash = vm.shared.mem.heap.identity_hash_code(exc);
+        let trace = vm
+            .shared
+            .throwable_stack_trace(hash)
+            .ok_or_else(|| "no stack trace was captured for the throwable".to_string())?;
+        Ok(trace
+            .iter()
+            .filter(|f| &*f.method_name == "tag")
+            .count())
+    }
+
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let interpreted = tag_frames(vm, 9)?;
+
+    invoke_void(vm, "setDivisor", &[Value::Int(1)]);
+    for i in 0..CALLS {
+        let _ = invoke_int(vm, "callDivider", &[Value::Int(i)]);
+    }
+    let tally = compiled_tally(vm, "callDivider", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_stack_trace_through_an_inlined_frame: callDivider was not spliced              ({tally:?}), so this check would compare the dispatch path against itself"
+        ));
+    }
+
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let compiled = tag_frames(vm, 9)?;
+    eprintln!("[pgo02] tag frames: interpreted={interpreted} compiled={compiled}");
+
+    // A floor, or the comparison below is vacuous: two zeros agree perfectly
+    // and say nothing about whether the callee frame survives inlining.
+    if interpreted == 0 {
+        return Err(
+            "check_stack_trace_through_an_inlined_frame: the INTERPRETED trace names no              `tag` frame at all, so comparing it against the compiled one proves nothing.              The fixture or the capture path changed."
+                .to_string(),
+        );
+    }
+
+    if compiled != interpreted {
+        return Err(format!(
+            "check_stack_trace_through_an_inlined_frame: the captured stack trace of an              exception raised inside a GUARD-HIT INLINED body names {compiled} `tag`              frame(s); the interpreted path names {interpreted}. The pgo-02 brief requires              a guard that always fires to produce \"the same observable results as the              un-inlined path — same exceptions, same stack traces, same `finally`              execution\". A spliced body has no frame of its own and              `deopt::FrameState::caller` is populated by nobody, so there is nothing to              rebuild the callee frame from (tally={tally:?})."
+        ));
+    }
+    Ok(())
+}
+
+/// The brief's second blocker: every `FrameState` the lowerer builds hard-codes
+/// an EMPTY MONITOR LIST, so an inlined body can carry no monitor state. "If
+/// this lane inlines across a monitor, it must keep that refusal."
+///
+/// Both shapes are covered — a `synchronized` method and a `synchronized`
+/// block, which are different bytecode (an access flag vs.
+/// `monitorenter`/`monitorexit`). The refusal exists in the resolver; nothing
+/// pinned it, and a refusal nobody tests is a refusal that can be relaxed by
+/// accident.
+fn check_monitor_bearing_callees_are_refused(vm: &mut Vm) -> Result<(), String> {
+    for (method, offset) in [("callSynchronized", 42), ("callMonitor", 99)] {
+        for i in 0..CALLS {
+            let got = invoke_int(vm, method, &[Value::Int(i)]);
+            if got != i + offset {
+                return Err(format!("{method}({i}) = {got}, want {}", i + offset));
+            }
+        }
+        let tally = compiled_tally(vm, method, &[Value::Int(1)])?;
+        if tally.speculative_sites != 0 {
+            return Err(format!(
+                "check_monitor_bearing_callees_are_refused: {method} spliced a                  monitor-bearing callee ({tally:?}). An inlined body's FrameState carries                  no monitor list, so there would be nothing to rebuild at a deopt."
+            ));
+        }
+        // Pin WHY. Without this the check also passes when the site was
+        // refused for an unrelated reason — an unprofiled site refuses too,
+        // and that would be a different fact wearing the same result.
+        if tally.refusal_count("callee-unresolved") == 0 {
+            return Err(format!(
+                "check_monitor_bearing_callees_are_refused: {method} did not splice, but                  not because the monitor-bearing callee was refused ({tally:?}). The                  refusal this check exists for is `callee-unresolved`, raised by the                  resolver's monitorenter/synchronized rejection."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The brief's `finally` requirement, and the reason it is called out: "this VM
+/// has already shipped a JIT-compiled `finally` that was not run on three
+/// escape routes; inlining multiplies that surface."
+///
+/// The resolver refuses any callee with a non-empty exception table, so a
+/// `finally`-bearing callee is never spliced — but that is a claim about the
+/// resolver, and what matters is that the `finally` RUNS, once per call, on
+/// both escape routes, at a site the guard was otherwise eligible for.
+fn check_finally_runs_at_a_guard_eligible_site(vm: &mut Vm) -> Result<(), String> {
+    let before = invoke_int(vm, "finallySideEffects", &[]);
+    let mut expected = 0;
+    for i in 0..CALLS {
+        let got = invoke_int(vm, "callFinally", &[Value::Int(i)]);
+        let want = if i == 13 { -13 } else { i + 1 };
+        expected += 1;
+        if got != want {
+            return Err(format!("callFinally({i}) = {got}, want {want}"));
+        }
+    }
+    let tally = compiled_tally(vm, "callFinally", &[Value::Int(1)])?;
+    if tally.speculative_sites != 0 {
+        return Err(format!(
+            "check_finally_runs_at_a_guard_eligible_site: callFinally spliced a callee              carrying an exception table ({tally:?})"
+        ));
+    }
+    let after = invoke_int(vm, "finallySideEffects", &[]);
+    if after - before != expected {
+        return Err(format!(
+            "check_finally_runs_at_a_guard_eligible_site: the `finally` ran {} times for              {expected} calls (both escape routes must run it, exactly once each)",
+            after - before
         ));
     }
     Ok(())

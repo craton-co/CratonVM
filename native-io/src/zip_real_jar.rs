@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
@@ -457,8 +457,7 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // compression scheme. Unknown methods get -1 (not a valid ZIP code)
     // so they fail loudly rather than being misinterpreted.
     let method: i64 = compression_method_code(&entry.compression());
-    let mut times = zip_entry_times(&entry);
-    merge_zip_entry_times(&mut times, zip_local_entry_times(&state.path, &entry));
+    let times = zip_entry_times(&entry);
     drop(entry);
     drop(table);
 
@@ -583,6 +582,23 @@ fn alloc_zip_entry(
     Ok(entry)
 }
 
+/// The three `ZipEntry` time attributes, as the **central directory** carries
+/// them.
+///
+/// The JDK's `ZipOutputStream` writes the 0x5455 extended-timestamp field
+/// twice with different payloads: the local header gets every time it was
+/// given (`5554 0d00 07 …`, flags 0x07, 13 bytes), while the central-directory
+/// copy keeps the flags byte but carries the modified time alone
+/// (`5554 0500 07 …`, 5 bytes). `ZipFile`/`JarFile` read the central
+/// directory, so on HotSpot `getLastAccessTime()` and `getCreationTime()`
+/// answer `null` for a JDK-written entry; only `ZipInputStream`, which walks
+/// local headers, sees all three.
+///
+/// We used to read the local header too and merge it in, which made
+/// `JarFile.entries()` answer real values where HotSpot answers `null`. Beyond
+/// the parity break it cost a `File::open` plus two seeks and a read *per
+/// entry, per call* — material on a jar with thousands of entries. Take the
+/// central record and nothing else.
 #[derive(Clone, Copy, Default)]
 struct ZipEntryTimes {
     /// The central-directory DOS timestamp packed as `(date << 16) | time`.
@@ -596,6 +612,14 @@ struct ZipEntryTimes {
 /// Pull high-fidelity times out of ZIP extra fields. The DOS header is only
 /// two-second resolution and, for entries written by the JDK with FileTime
 /// metadata, may be the 1980 fallback while the real values live in 0x5455.
+///
+/// `extra_data_fields()` yields the **central-directory** extras — `by_index`
+/// and `by_index_raw` both reach `central_header_to_zip_file`, which is the
+/// only place the `zip` crate runs `parse_extra_field` for a seekable archive
+/// (the other call site is `read_zipfile_from_stream`, a path we never take).
+/// That is exactly the JDK's source for `ZipFile`/`JarFile`, so this function
+/// must not be supplemented from anywhere else — see the note on
+/// `ZipEntryTimes` for why reading the local header instead broke parity.
 fn zip_entry_times(entry: &zip::read::ZipFile<'_>) -> ZipEntryTimes {
     let mut times = ZipEntryTimes::default();
     times.dos_time = entry
@@ -638,77 +662,6 @@ fn merge_zip_entry_times(target: &mut ZipEntryTimes, source: ZipEntryTimes) {
     if source.creation.is_some() {
         target.creation = source.creation;
     }
-}
-
-/// The JDK writes access and creation times to the local-header 0x5455 field,
-/// while its central-directory record commonly carries only modified time.
-/// `zip` exposes parsed central extras, so read the small local extra block as
-/// well to preserve all three `ZipEntry` time attributes.
-fn zip_local_entry_times(path: &PathBuf, entry: &zip::read::ZipFile<'_>) -> ZipEntryTimes {
-    let Ok(mut file) = File::open(path) else {
-        return ZipEntryTimes::default();
-    };
-    if file.seek(SeekFrom::Start(entry.header_start())).is_err() {
-        return ZipEntryTimes::default();
-    }
-    let mut header = [0u8; 30];
-    if file.read_exact(&mut header).is_err() || header[0..4] != *b"PK\x03\x04" {
-        return ZipEntryTimes::default();
-    }
-    let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
-    let extra_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
-    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
-        return ZipEntryTimes::default();
-    }
-    let mut extra = vec![0u8; extra_len];
-    if file.read_exact(&mut extra).is_err() {
-        return ZipEntryTimes::default();
-    }
-    zip_extra_bytes_times(&extra)
-}
-
-fn zip_extra_bytes_times(extra: &[u8]) -> ZipEntryTimes {
-    let mut times = ZipEntryTimes::default();
-    let mut offset = 0;
-    while offset + 4 <= extra.len() {
-        let tag = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
-        let len = usize::from(u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]));
-        offset += 4;
-        let Some(data) = extra.get(offset..offset + len) else {
-            break;
-        };
-        match tag {
-            0x5455 if !data.is_empty() => {
-                let flags = data[0];
-                let mut cursor = 1;
-                let mut read_time = |enabled: bool| {
-                    if !enabled || cursor + 4 > data.len() {
-                        return None;
-                    }
-                    let time = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?);
-                    cursor += 4;
-                    Some(i64::from(time) * 1_000)
-                };
-                times.modified = read_time(flags & 0x01 != 0 || data.len() == 5);
-                times.access = read_time(flags & 0x02 != 0);
-                times.creation = read_time(flags & 0x04 != 0);
-            }
-            0x000a if data.len() >= 32 && data[4..6] == [0x01, 0x00] && data[6..8] == [24, 0] => {
-                times.modified = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[8..16].try_into().unwrap(),
-                )));
-                times.access = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[16..24].try_into().unwrap(),
-                )));
-                times.creation = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[24..32].try_into().unwrap(),
-                )));
-            }
-            _ => {}
-        }
-        offset += len;
-    }
-    times
 }
 
 fn zip_filetime(ctx: &mut dyn NativeContext, millis: i64) -> Result<ObjectRef, MethodCallFailed> {
@@ -887,8 +840,7 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     .extra_data()
                     .filter(|bytes| !bytes.is_empty())
                     .map(ToOwned::to_owned);
-                let mut times = zip_entry_times(&f);
-                merge_zip_entry_times(&mut times, zip_local_entry_times(&state.path, &f));
+                let times = zip_entry_times(&f);
                 v.push((
                     f.name().to_string(),
                     method,
@@ -1366,14 +1318,47 @@ mod tests {
         assert_eq!(&out, data);
     }
 
+    /// A JDK-written entry carries two *different* 0x5455 payloads: 13 bytes
+    /// with all three times in the local header, 5 bytes with the modified
+    /// time alone in the central directory — and both stamp the same flags
+    /// byte 0x07. `zip_entry_times` reads central records, so it must answer
+    /// modified-only, matching what HotSpot's `ZipFile` reports. Feeding it
+    /// the local payload instead is what used to make `getLastAccessTime()`
+    /// and `getCreationTime()` non-`null` where HotSpot answers `null`.
+    ///
+    /// Byte layout below is verbatim from a jar written by Temurin 25.0.3+9's
+    /// `JarOutputStream` (`5554 0d00 07 …` local, `5554 0500 07 …` central).
     #[test]
-    fn local_extended_timestamp_preserves_all_three_times() {
-        // Header 0x5455, payload: flags + modified/access/creation Unix seconds.
-        let mut extra = vec![0x55, 0x54, 13, 0, 0x07];
-        for seconds in [1_700_000_001u32, 1_700_000_002, 1_700_000_003] {
-            extra.extend_from_slice(&seconds.to_le_bytes());
+    fn central_extended_timestamp_carries_modified_time_only() {
+        fn extended_timestamp(payload: &[u8]) -> ZipEntryTimes {
+            let mut cursor = std::io::Cursor::new(payload);
+            let stamp = zip::extra_fields::ExtendedTimestamp::try_from_reader(
+                &mut cursor,
+                payload.len() as u16,
+            )
+            .expect("well-formed 0x5455 payload");
+            zip_extra_field_times(&ExtraField::ExtendedTimestamp(stamp))
         }
-        let times = zip_extra_bytes_times(&extra);
+
+        // Central directory: flags 0x07, but only the modified time follows.
+        let mut central = vec![0x07];
+        central.extend_from_slice(&1_700_000_001u32.to_le_bytes());
+        let times = extended_timestamp(&central);
+        assert_eq!(times.modified, Some(1_700_000_001_000));
+        assert_eq!(times.access, None, "central record carries no access time");
+        assert_eq!(
+            times.creation, None,
+            "central record carries no creation time"
+        );
+
+        // The same parser still reads all three from a full 13-byte payload,
+        // which is what a central record looks like when a writer does emit
+        // every time there. Nothing in our read path feeds it local bytes.
+        let mut full = vec![0x07];
+        for seconds in [1_700_000_001u32, 1_700_000_002, 1_700_000_003] {
+            full.extend_from_slice(&seconds.to_le_bytes());
+        }
+        let times = extended_timestamp(&full);
         assert_eq!(times.modified, Some(1_700_000_001_000));
         assert_eq!(times.access, Some(1_700_000_002_000));
         assert_eq!(times.creation, Some(1_700_000_003_000));

@@ -61,14 +61,16 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
   Three probes, both modes, JDK 25. **The results are identical under
   `--real-jdk` and `--jdk-only`**, so this is a `Compatible`-mode defect too.
-  Distinct `(class, slot, value kind, real descriptor)` sites:
+  Distinct `(class, slot, value kind, real descriptor)` sites. **The two
+  `VarHandle` rows are struck through: fixed the same day, and the re-run
+  confirms they are gone — 13 classes / 24 slots became 11 / 21.**
 
   | class | slot | writes | real desc | n |
   |---|---:|---|---|---:|
   | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
   | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
-  | `java/lang/invoke/VarHandle` | 1 | `Object` | `Z` | 52 |
-  | `java/lang/invoke/VarHandle` | 0 | `Int` | `L` | 52 |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~1~~ | ~~`Object`~~ | ~~`Z`~~ | **FIXED** |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
   | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
   | `java/util/Properties` | 7 | `Float` | `L` | 6 |
@@ -86,13 +88,65 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   * The **`HashMap` family is the known-benign case** the hunter suppresses by
     default — coercion-to-null lands the real bytecode in the null-initialised
     state it expects. It dominates by volume and says nothing.
-  * **`VarHandle` is the one to look at first.** It mismatches in *both*
-    directions on adjacent slots (`Int` over a reference at 0, an `Object` over
-    a `boolean` at 1), it is not a `Map`, and the benign argument says nothing
-    about it.
-  * **`Properties` writing a `Float` over a reference slot** is in the group
-    item 1 calls the highest-risk in `native-collections`, and it is on the
-    bootstrap path.
+  * **`VarHandle` — FIXED 2026-08-04, and it was the worst of the set.** It
+    mismatched in *both* directions on adjacent slots (`Int` over a reference at
+    0, an `Object` over a `boolean` at 1). The frames say why that mattered:
+    `MhUtil.findVarHandle`, reached from the `<clinit>` of
+    `java.util.concurrent.atomic.AtomicBoolean`, `AtomicReference` and
+    `java.io.ObjectInputFilter$Config`. Those are **real JDK classes whose
+    `static final VarHandle` fields real bytecode uses**, and slot 0 on a real
+    `VarHandle` is `vform` — so the VM was handing the JDK a `VarHandle` with a
+    null `VarForm`. It did not fault only because our natives intercept every
+    `VarHandle` operation and read the WP4.2 side table; the moment §7 step 3
+    routes one of those to real bytecode — the direction this whole feature is
+    going, on a path that already fires 3,344 times per run —
+    `vform.getMethodHandle(…)` is an NPE.
+
+    Fixed by writing the six synthetic slots only when the object actually has
+    our layout. No metadata is lost: `vh_meta_put` runs on every allocation path
+    and every reader consults it first.
+
+    **The first attempt at that guard was inert and nearly shipped.** It tested
+    `object_num_fields(vh) >= VH_FIELD_COUNT`, but `alloc_concurrent_synthetic`
+    returns at least the requested slot count either way, so a count test cannot
+    separate the layouts. It was caught by A/B against the pre-fix binary — 8
+    writes before, 8 after — after a first reading compared a six-run aggregate
+    (52) with a single run (8) and mistook the difference for a fix. The working
+    predicate asks by **name**: a real `VarHandle` declares an instance field
+    called `vform` and a fabricated stub does not. Verified 8 → 0 on the same
+    probe, with both probes still byte-identical to HotSpot in both modes.
+
+    Two lessons for the remaining 22 sites. **Field count does not identify a
+    layout** — ask for a field the real class declares and the stub cannot.
+    And **A/B the same workload against the pre-fix binary**; an aggregate and a
+    single run are not comparable numbers, however much they look like a
+    before/after.
+  * **`Properties` — diagnosed 2026-08-04, not yet fixed, and the fix shape is
+    already in the same file.** The frames put all four writes at
+    `new Properties()`, and the values name themselves: slot 5 `Int(0)`, slot 6
+    `Int(12)`, slot 7 `Float(0.75)` — `count`, `threshold` and `loadFactor`,
+    i.e. `native_map_init` writing a `HashMap`-shaped layout by raw slot index
+    onto a real `java.util.Properties`, where those slots are `defaults`/`map`
+    references and slot 2 is an `int`. It is in the group item 1 calls the
+    highest-risk in `native-collections`, and it is on the bootstrap path.
+
+    `native-collections/src/lib.rs` already demonstrates the correct pattern
+    twice, so this does not need inventing:
+    `native_props_init_defaults` resolves `defaults` with
+    `ctx.resolve_field_index("java/util/Properties", "defaults")` and writes
+    *both* the model slot and the real one, with a comment explaining that on a
+    real layout the inherited `Hashtable` fields push `defaults` onto
+    `loadFactor`; and `try_set_jdk_map_field(ctx, this, "loadFactor", …)` is the
+    by-name setter. `native_map_init` is the one still writing raw indices.
+
+    Not attempted here because `native_map_init` is shared by every map type
+    and is hot, so converting it is its own change with its own A/B — not
+    something to bolt onto a `VarHandle` fix. Note also that
+    `native_props_init` writes `Value::Object(None)` to `PROPS_FIELD_DEFAULTS`
+    (slot 3 = `loadFactor` on the real layout) and **the hunter does not report
+    it**: `overlay_write_is_destructive` only flags `Object(Some(_))` over a
+    primitive, so a null write is invisible. The census is a floor for that
+    reason too.
   * **Both built-in class loaders take `Int` writes over four reference slots
     each.** Whatever those slots hold on the real classes, they are not integers.
   * `URI` and `Properties` each mismatch in both directions, which rules out a

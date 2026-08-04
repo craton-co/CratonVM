@@ -170,6 +170,23 @@ version worth building, if any, is a guarded-inline lowering on the IR path.
 That is now a decision with an instrument behind it instead of an open
 question.
 
+## The brief's own "How to verify" / "What to refuse" lists
+
+Separate from the §8 residuals, and initially missed by this lane — three of
+its five items had no test until they were asked for explicitly.
+
+| The brief said | Status |
+|---|---|
+| "a guard that never fires must be byte-identical in behaviour to no inline" | Covered behaviourally by `check_guard_miss` (the receiver is switched to three other classes after the guard is baked in). Byte-identity is asserted for the FLAG-OFF path by construction, not measured for a never-firing guard |
+| "same exceptions" | `check_uncaught_from_inlined_frame`, against the same call before the method compiled |
+| "same stack traces" | **Measured, and it holds.** The captured trace of an `ArithmeticException` out of a spliced `idiv` names one `tag` frame compiled and one interpreted. A floor assertion stops two zeros from agreeing vacuously. One shape, not a general proof — the general guarantee would be `FrameState::caller` |
+| "same `finally` execution" | `check_finally_runs_at_a_guard_eligible_site`: a `finally`-bearing callee is never spliced (non-empty exception table), and the side effect fires exactly once per call on both escape routes |
+| "a megamorphic site must refuse" | `check_polymorphic` + the policy tests |
+| "a truncated or saturated profile reads as megamorphic rather than its dominant type" | `classify_receiver_shape` gained the `Saturated` arm, checked before any share arithmetic. Truncation is unreachable in the live store and handled where it is reachable, in `pgo.rs` |
+| "refuse any inline across a monitor while the frame states carry no monitor list" | `check_monitor_bearing_callees_are_refused` — both a `synchronized` method and a `synchronized` block, asserting the refusal CATEGORY so "refused for an unrelated reason" cannot pass |
+| "refuse any speculation seeded from a profile read that is not point-in-time consistent" | Holds by construction: `ProfileStore::get_profile` clones all four maps under one per-slot mutex |
+| "is the metadata total for an inlined frame chain of depth k?" | **Not answered — made moot.** The brief said "if there is an input it cannot express, that input must be a refusal". Rather than enumerate depth-k chains, `try_emit_inline` refuses any splice that publishes deopt metadata at all, so no inlined frame chain is ever described. That is strictly stronger for the current design and strictly less informative about the metadata itself |
+
 ## Verification
 
 * `vm/tests/pgo02_guarded_virtual_inline.rs` — nine checks, one warm VM, every

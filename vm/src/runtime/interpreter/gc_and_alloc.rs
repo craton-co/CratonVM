@@ -1465,10 +1465,27 @@ pub(super) fn note_gc_productivity(shared: &SharedVm, before_live: usize, before
         0
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        // `young_*` (SB-LOADER-ZIPCONTENT, 2026-08-04): `before`/`after` are
+        // `live_bytes_estimate`, i.e. `young.used - young.free_list + old.used`.
+        // A run of non-moving young sweeps leaves the young bump cursor pinned
+        // at the top with the reclaimed space in the free list, so a heap that
+        // is 70% free reads as "148 MB live" and every diagnosis stops there.
+        // `young_largest_free` vs `young_free_list` is the fragmentation face.
+        let (y_used, y_free, y_largest, y_cap) = shared.mem.heap.young_occupancy();
+        // Selective-promotion census: `promoted=0` for hundreds of cycles has
+        // at least three very different causes (pass never ran / nothing
+        // tenurable / everything pinned) and the aggregate cannot tell them
+        // apart. See `gen_heap::SP_CENSUS`.
+        let (sw, sel, defrag, cand, pin, unaged, evac, ofull) =
+            cratonvm_gc::gen_heap::selective_promotion_census();
         eprintln!(
             "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
              freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
-             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak}"
+             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak} \
+             young_used={y_used} young_free_list={y_free} young_largest_free={y_largest} \
+             young_cap={y_cap} sp_sweeps={sw} sp_selective={sel} sp_defrag={defrag} \
+             sp_candidates={cand} sp_pinned={pin} sp_unaged={unaged} sp_evacuated={evac} \
+             sp_old_full={ofull}"
         );
     }
 }
@@ -3131,7 +3148,16 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
-    if let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) {
+    // SB-LOADER-ZIPCONTENT (2026-08-04): the post-GC retries use the
+    // old-gen-spilling `try_alloc_object_full`, for the same reason
+    // `gc_alloc_array` gives on the array side — once a non-moving JIT-safe
+    // young sweep has fragmented the young free list, a young-only retry
+    // reports OOM while the old generation still holds most of the heap. (The
+    // first attempt above stays young-only: it is the fast path, and spilling
+    // before a GC has even been attempted would promote ordinary short-lived
+    // objects straight into old gen.) `gc_alloc_array`'s doc comment already
+    // claimed this path behaved that way; it did not.
+    if let Some(obj) = shared.mem.heap.try_alloc_object_full(class_id, num_fields) {
         shared
             .mem
             .bytes_allocated_total
@@ -3145,7 +3171,7 @@ pub(crate) fn alloc_object_shared(
     shared
         .mem
         .heap
-        .try_alloc_object(class_id, num_fields)
+        .try_alloc_object_full(class_id, num_fields)
         .map(|obj| {
             shared
                 .mem
