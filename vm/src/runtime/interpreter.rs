@@ -3859,10 +3859,27 @@ pub fn pop_and_recycle_frame_with_reason(
                 f.method_name(),
                 f.method_descriptor(),
             );
-            shared
+            let total = shared
                 .jit
                 .profile_store
                 .add_loop_work(key, f.backward_count);
+            // `CRATONVM_DBG=loop-work` — the lever's own witness. A tier-up
+            // change that cannot be seen doing anything is indistinguishable
+            // from an inert one, and this lever has already been inert twice.
+            if loop_work_dbg() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 40 || total >= crate::runtime::env_cache::jit_invocation_threshold() {
+                    eprintln!(
+                        "[loop-work] {}.{}{} backedges={} count_now={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.backward_count,
+                        total
+                    );
+                }
+            }
         }
         if crate::runtime::env_cache::frame_trace() {
             eprintln!(
@@ -3964,6 +3981,15 @@ fn loop_work_tierup_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOOP_WORK_TIERUP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG=loop-work` — trace what [`loop_work_tierup_enabled`] actually
+/// credits, so an inert lever is visibly inert instead of quietly so.
+fn loop_work_dbg() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LOOP_WORK").is_some()
     })
 }
 
