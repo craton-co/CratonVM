@@ -73,8 +73,8 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
   | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
-  | `java/util/Properties` | 7 | `Float` | `L` | 6 |
-  | `java/util/Properties` | 6, 5 | `Int` | `L` | 6 each |
+  | ~~`java/util/Properties`~~ | ~~7~~ | ~~`Float`~~ | ~~`L`~~ | **FIXED** |
+  | ~~`java/util/Properties`~~ | ~~6, 5~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/Properties` | 2 | `Object` | `I` | 6 |
   | `ClassLoaders$PlatformClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
   | `ClassLoaders$AppClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
@@ -139,14 +139,38 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `loadFactor`; and `try_set_jdk_map_field(ctx, this, "loadFactor", …)` is the
     by-name setter. `native_map_init` is the one still writing raw indices.
 
-    Not attempted here because `native_map_init` is shared by every map type
-    and is hot, so converting it is its own change with its own A/B — not
-    something to bolt onto a `VarHandle` fix. Note also that
-    `native_props_init` writes `Value::Object(None)` to `PROPS_FIELD_DEFAULTS`
-    (slot 3 = `loadFactor` on the real layout) and **the hunter does not report
-    it**: `overlay_write_is_destructive` only flags `Object(Some(_))` over a
-    primitive, so a null write is invisible. The census is a floor for that
-    reason too.
+    **Three of the four rows FIXED 2026-08-04, and the root cause was one
+    line.** `try_set_jdk_map_field` resolved every field name against a
+    hard-coded `"java/util/HashMap"` and then wrote that index into `this`,
+    whatever class `this` actually was. For a non-`HashMap` receiver the index
+    names a *different field*. Its `slot < object_num_fields(this)` bound does
+    not help: it stops an out-of-range write, not a wrong-field one — **the
+    third guard in this file's story that looks protective and is not**, after
+    the frozen divergence test and the field-count `VarHandle` predicate.
+
+    Fixed with `resolve_field_index_by_class_id`, which walks the receiver's
+    own hierarchy, so `loadFactor` on a `Properties` resolves through
+    `Hashtable` to its true slot; the API's own doc comment already recommended
+    it over the name-based form when the caller holds the object. Where the
+    receiver's class does not declare the field, nothing is written.
+
+    A/B on the same probe against the pre-fix binary: slots 5, 6 and 7 go 3 → 0
+    each, every other row byte-identical, both probes still identical to
+    HotSpot 25 in both modes, and 94 `native-collections` unit tests plus the
+    four ratchets green. This changes `Compatible` mode too — from *writes the
+    wrong field* to *writes the right field or none* — which is why it was
+    A/B'd separately rather than riding on the `VarHandle` verification.
+
+    **Slot 2 survives** (`Object` over an `int`, 3 hits): it comes from the raw
+    `MAP_FIELD_*` writes in `native_map_init`'s legacy branch, not from
+    `try_set_jdk_map_field`. Converting those is the next step and is a larger
+    change — they are the layout every other native map operation reads.
+
+    Note also that `native_props_init` writes `Value::Object(None)` to
+    `PROPS_FIELD_DEFAULTS` (slot 3 = `loadFactor` on the real layout) and **the
+    hunter does not report it**: `overlay_write_is_destructive` only flags
+    `Object(Some(_))` over a primitive, so a null write is invisible. The
+    census is a floor for that reason too.
   * **Both built-in class loaders take `Int` writes over four reference slots
     each.** Whatever those slots hold on the real classes, they are not integers.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
