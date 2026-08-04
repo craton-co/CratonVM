@@ -75,24 +75,29 @@ public class WideFieldSlotProbe {
     }
 
     /**
-     * A wide field value live across a DEOPT.
+     * A wide field value live across a div-by-zero GUARD, in a body that is
+     * actually compiled.
      *
-     * <p>`d == 0` takes the div-by-zero guard, which leaves the compiled body
-     * for the interpreter. The `long` read from the field has to be rebuilt
-     * into the interpreter's two-slot frame; if it is rebuilt as an `Int`, or
-     * placed in one slot, the value that comes back is wrong rather than
-     * missing. The admission chain's own comment records that a `long` live at
-     * an `idiv` deopt is exactly what the precise resume was built for.
+     * <p>NO try/catch here, deliberately. The first draft caught the
+     * `ArithmeticException` in this method so the interpreter would resume at
+     * the handler and the rebuilt `long` could be read back — the case the
+     * admission chain's own comment describes ("a `long` live at an `idiv`
+     * deopt"). That method was refused by **both** backends before the
+     * admission chain ever ran, at `rbc6-handler-reads-unsafe-local`: the code
+     * after the handler reads `x`, a non-parameter local. So the one shape that
+     * would let Java observe the reconstructed frame is structurally
+     * uncompilable, and a probe written that way reports PASS while testing the
+     * interpreter. See this lane's closeout — it is named there as a residual
+     * rather than papered over.
+     *
+     * <p>What this version does establish, in a C2 body: a `long` sourced from
+     * a field is correct on the guard's fall-through path, the guard still
+     * fires on `d == 0` rather than returning a fabricated value, and the body
+     * is still correct afterwards.
      */
-    static long liveAcrossDeopt(Box b, int n, int d) {
+    static long divGuard(Box b, int n, int d) {
         long x = b.l;
-        int q;
-        try {
-            q = n / d;
-        } catch (ArithmeticException e) {
-            q = -1;
-        }
-        return x + q;
+        return x + (n / d);
     }
 
     private static int check(String what, long got, long want, int failures) {
@@ -109,19 +114,26 @@ public class WideFieldSlotProbe {
         b.guard = 0x5A5A5A5A;
         int failures = 0;
 
-        // Warm every method past the C2 threshold on values that cannot hide a
-        // truncation (nothing fits in 32 bits by accident).
+        // Warm every method past the C2 threshold.
+        //
+        // FP values are POWERS OF TWO, and the arithmetic on them is exactly
+        // representable, so each expected constant is provable rather than
+        // approximately right. The first draft of this probe used `1.5e20f` as
+        // the float base and expected `+7` to change it; one ULP up there is
+        // ~1e13, so the answer was 0.0f and the probe reported a VM failure
+        // that was its own arithmetic. An expectation you cannot derive by hand
+        // is not an oracle.
         for (int i = 1; i <= warm; i++) {
             b.l = 0x1234_5678_9ABCL + i;
-            b.d = 1.5e100 + i;
-            b.f = 1.5e20f + i;
+            b.d = 4.0d;
+            b.f = 4.0f;
             long r = mixLong(b, 0x7FFF_FFFF_0000_0001L, 0x0000_0002_0000_0003L);
             if (r != 0x8000_0001_0000_0004L) {
                 failures = check("mixLong warm i=" + i, r, 0x8000_0001_0000_0004L, failures);
                 break;
             }
-            double dr = mixDouble(b, 1.5e100, 2.5e100);
-            if (dr != 4.0e100) {
+            double dr = mixDouble(b, 1.0d, 2.0d);
+            if (dr != 3.0d) {
                 System.out.println("[wideslot] FAIL mixDouble warm i=" + i + ": " + dr);
                 failures++;
                 break;
@@ -132,9 +144,7 @@ public class WideFieldSlotProbe {
                 failures++;
                 break;
             }
-            long dp = liveAcrossDeopt(b, 10, (i % 2 == 0) ? 0 : 5);
-            long wantDp = b.l + ((i % 2 == 0) ? -1 : 2);
-            failures = check("liveAcrossDeopt warm i=" + i, dp, wantDp, failures);
+            failures = check("divGuard warm i=" + i, divGuard(b, 10, 5), b.l + 2, failures);
             if (failures != 0) {
                 break;
             }
@@ -162,10 +172,42 @@ public class WideFieldSlotProbe {
             failures++;
         }
 
+        // The high bits, in the only form where the expected answer is exact:
+        // 2^1000 + 2^1001 == 3 * 2^1000 needs two significand bits and a
+        // 64-bit exponent field, so a value truncated or rebuilt through 32
+        // bits cannot produce it. Same shape at 2^100 for float.
+        b.d = 0x1p1000;
+        dr = mixDouble(b, 0x1p1000, 0x1p1000);
+        if (dr != 0x1p1001) {
+            System.out.println("[wideslot] FAIL mixDouble 2^1000: " + dr);
+            failures++;
+        }
+        b.f = 0x1p100f;
+        fr = mixFloat(b, 0x1p100f, 0, 0x1p100f);
+        if (fr != 0x1p101f) {
+            System.out.println("[wideslot] FAIL mixFloat 2^100: " + fr);
+            failures++;
+        }
+
+        // The guard, in a compiled body, with a field-sourced long live across
+        // it. It must THROW — a guard that returned a fabricated value here is
+        // the silent-corruption shape, and it would look identical to success.
         b.l = Long.MIN_VALUE;
-        failures = check("deopt MIN", liveAcrossDeopt(b, 1, 0), Long.MIN_VALUE - 1, failures);
+        failures = check("divGuard MIN fallthrough", divGuard(b, 4, 2), Long.MIN_VALUE + 2, failures);
+        boolean threw = false;
+        try {
+            divGuard(b, 1, 0);
+        } catch (ArithmeticException expected) {
+            threw = true;
+        }
+        if (!threw) {
+            System.out.println("[wideslot] FAIL divGuard(d=0) did not throw");
+            failures++;
+        }
+        // …and the body is still right after the guard fired.
         b.l = 0x7FFF_FFFF_FFFF_FFFFL;
-        failures = check("deopt MAX", liveAcrossDeopt(b, 1, 0), 0x7FFF_FFFF_FFFF_FFFEL, failures);
+        failures = check("divGuard MAX after deopt", divGuard(b, 4, 2),
+                0x7FFF_FFFF_FFFF_FFFFL + 2, failures);
 
         if (b.guard != 0x5A5A5A5A) {
             System.out.println("[wideslot] FAIL neighbouring field clobbered: "

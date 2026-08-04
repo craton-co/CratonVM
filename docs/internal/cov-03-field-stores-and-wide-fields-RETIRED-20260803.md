@@ -260,8 +260,76 @@ critical path rather than merely present.
 `probes/WideFieldProbe.java` covers the wide half: `Long.MIN_VALUE` and `-0.0d`
 (the two values bit-identical to the deopt sentinel), NaN and both infinities by
 raw bits, guard fields on either side of the wide slots, and a null receiver on
-all six accessors. Green, with all twelve accessors confirmed compiled by the
+all six accessors. Green, with every accessor confirmed compiled by the
 optimizing backend.
+
+### The category-2 slot check the brief asked for
+
+The brief named the bug to be afraid of: *"they carry the category-2 slot
+question, which the IR's parameter model has already been burned by once — see
+the `optimize=false` guard's comment about `boolean eq(long, long)` truncating
+its second parameter."* That defect was the IR laying parameters out by
+JIT-**argument** index while the bytecode reads them by JVM **local slot**: a
+`long` occupies two slots, so the second `long` parameter was read from a slot
+nothing had populated.
+
+A field access is one value on the IR's operand stack whatever its width, so in
+principle a wide field cannot reintroduce it. In principle is not a test. What a
+wide field adds is a new **source** for a category-2 value, and every consumer
+downstream — an `lstore` into a two-slot local, a later local whose slot index
+depends on this one being two wide, a deopt snapshot rebuilding the
+interpreter's two-slot frame — was written when the only sources were
+parameters, constants and calls.
+
+`probes/WideFieldSlotProbe.java` puts a wide field value **next to** other
+category-2 values so a layout that is off by one slot returns garbage instead of
+faulting:
+
+* `mixLong(Box, long, long)` — the `eq(long, long)` shape with a `getfield J` in
+  the middle. Slots `b`=0, `a`=1..2, `c`=3..4, `x`=5..6, `y`=7..8; every index
+  is only right if each preceding category-2 value consumed two.
+* `mixFloat(Box, float, int, float)` — catches a layout that **over**-counts.
+  `float` is category-ONE, and over-counting is as wrong as under-counting.
+* `divGuard(Box, int, int)` — a field-sourced `long` live across a div-by-zero
+  guard in a compiled body.
+
+Green, with all four methods confirmed compiled by the optimizing backend.
+
+Two things this probe cost, both worth keeping:
+
+* **Its first version reported a VM failure that was its own arithmetic.** The
+  float base was `1.5e20f` and it expected `+7` to change it; one ULP up there
+  is ~1e13, so the answer was `0.0f`. The values are now powers of two with
+  exactly-representable arithmetic, so each expected constant is derivable by
+  hand. *An expectation you cannot derive by hand is not an oracle* — and note
+  the failure pointed at the VM, which is the direction that wastes a day.
+* **The one shape that would observe the rebuilt frame is uncompilable.** The
+  first `divGuard` caught the `ArithmeticException` itself, so the interpreter
+  would resume at the handler and the rebuilt `long` could be read back — the
+  case the admission chain's own comment describes. Both backends refuse that
+  method before the admission chain, at `rbc6-handler-reads-unsafe-local`,
+  because the code after the handler reads a non-parameter local. It is
+  refused for reasons that predate and are unrelated to this lane, and a probe
+  written that way reports PASS while exercising the interpreter. Named as a
+  residual below rather than papered over.
+
+### The vacuity gate, demonstrated rather than asserted
+
+`/data/cov03probe.sh` fails a run that shows fewer optimizing bodies than the
+probe has methods under test, or (for the barrier probe) zero collections.
+Rule 5 of the `c2` README asks for the exact edit that would trip each new
+check, so here it is, run rather than described — the same three probes against
+the same binary with `--nojit` appended:
+
+```
+negctl RefPutfieldBarrierProbe rc=0 [refbarrier] PASS c2_bodies=0/2 … => OK/VACUOUS-C2-BODIES-0-of-2
+negctl WideFieldProbe          rc=0 [widefield]  PASS c2_bodies=0/6 … => OK/VACUOUS-C2-BODIES-0-of-6
+negctl WideFieldSlotProbe      rc=0 [wideslot]   PASS c2_bodies=0/4 … => OK/VACUOUS-C2-BODIES-0-of-4
+runner exit=1
+```
+
+Every probe reports `PASS` from Java and the runner rejects all three. That is
+the property the gate exists for: **the Java verdict is not the result.**
 
 Reproduce:
 
@@ -289,8 +357,20 @@ wave lost its residuals (`docs/known-issues/c2/archive/README.md`).
 
 2. **No inline fast path for a wide field READ either.**
    `emit_inline_compact_getfield` refuses `J`/`F`/`D` tags, so every wide read
-   is a helper call plus the `dispatch_threw` cold branch. Six events' worth of
-   sites, so this is unlikely to be worth doing on its own.
+   is a helper call plus the `dispatch_threw` cold branch. A handful of sites,
+   so this is unlikely to be worth doing on its own.
+
+2b. **A wide value's reconstruction at a deopt is not observable from Java.**
+   The only shape that would let a Java probe read back a `long` rebuilt into
+   the interpreter's two-slot frame — catch the div-by-zero in the same method
+   and read the local in the handler's continuation — is refused by BOTH
+   backends at `rbc6-handler-reads-unsafe-local`, before the admission chain.
+   So this lane verified everything up to the guard and nothing past it. The
+   machinery itself is not new (`ir_emit_long` is default-ON and the whole
+   Spring corpus exercises it), and a field-sourced `long` is indistinguishable
+   from any other by the time `frame_value_for` reads `node_slot` and
+   `node.ty` — but that is an argument, not a measurement, and it is recorded
+   here as the latter's absence.
 
 3. **The brief's stated "first increment" is not what landed.** It proposed
    reference `putfield` on the non-compact path only, refusing when compact
