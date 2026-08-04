@@ -1546,6 +1546,16 @@ pub(crate) struct JarEntryRec {
 /// fields retain the actual FileTime values.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct JarEntryTimes {
+    /// The central-directory DOS timestamp packed as `(date << 16) | time`,
+    /// i.e. the low half of the real `ZipEntry.xdostime`.
+    ///
+    /// Entries written without any `FileTime` carry no 0x5455 extra field at
+    /// all, so `modified` is `None` and `getLastModifiedTime()` falls through
+    /// to `xdostime`. We allocate the `JarEntry` without running `<init>`, so
+    /// that field starts at 0 rather than the JDK's `-1` sentinel, and 0
+    /// decodes as `1979-11-30T00:00:16Z` instead of the real timestamp. Carry
+    /// the DOS value so the fallback lands where HotSpot's does.
+    pub(crate) dos_time: Option<i64>,
     pub(crate) modified: Option<i64>,
     pub(crate) access: Option<i64>,
     pub(crate) creation: Option<i64>,
@@ -1557,19 +1567,37 @@ pub(crate) struct JarContents {
     pub(crate) order: Vec<String>,
 }
 
+/// The three `ZipEntry` time attributes for Spring Boot's cached `JarEntryRec`.
+///
+/// `extra_data_fields()` yields the **central-directory** extras, which is the
+/// same record HotSpot's `ZipFile`/`JarFile` read. For a JDK-written entry the
+/// central 0x5455 payload holds the modified time alone (5 bytes) even though
+/// its flags byte claims all three, so access and creation come back `None`
+/// and `getLastAccessTime()`/`getCreationTime()` answer `null` — exactly as on
+/// HotSpot. Do not supplement this from the local file header: that carries
+/// all three, and merging it in broke parity while costing a `File::open` plus
+/// two seeks and a read per entry. See `native-io/src/zip_real_jar.rs`'s
+/// `ZipEntryTimes` for the byte-level detail.
 pub(crate) fn p59_zip_entry_times(entry: &zip::read::ZipFile<'_>) -> JarEntryTimes {
-    let mut times = JarEntryTimes::default();
+    let mut times = JarEntryTimes {
+        dos_time: entry
+            .last_modified()
+            .map(|time| (i64::from(time.datepart()) << 16) | i64::from(time.timepart())),
+        ..JarEntryTimes::default()
+    };
     for field in entry.extra_data_fields() {
         let parsed = match field {
             zip::extra_fields::ExtraField::ExtendedTimestamp(timestamp) => JarEntryTimes {
                 modified: timestamp.mod_time().map(|time| i64::from(time) * 1_000),
                 access: timestamp.ac_time().map(|time| i64::from(time) * 1_000),
                 creation: timestamp.cr_time().map(|time| i64::from(time) * 1_000),
+                ..JarEntryTimes::default()
             },
             zip::extra_fields::ExtraField::Ntfs(timestamp) => JarEntryTimes {
                 modified: Some(p59_windows_filetime_to_unix_millis(timestamp.mtime())),
                 access: Some(p59_windows_filetime_to_unix_millis(timestamp.atime())),
                 creation: Some(p59_windows_filetime_to_unix_millis(timestamp.ctime())),
+                ..JarEntryTimes::default()
             },
         };
         p59_merge_zip_times(&mut times, parsed);
@@ -1593,86 +1621,17 @@ pub(crate) fn p59_merge_zip_times(target: &mut JarEntryTimes, source: JarEntryTi
     }
 }
 
-/// The JDK writes access and creation values into the local header's 0x5455
-/// extra field while the central directory often retains only modified time.
-pub(crate) fn p59_zip_local_entry_times(
-    path: &str,
-    entry: &zip::read::ZipFile<'_>,
-) -> JarEntryTimes {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return JarEntryTimes::default();
-    };
-    if file.seek(SeekFrom::Start(entry.header_start())).is_err() {
-        return JarEntryTimes::default();
-    }
-    let mut header = [0u8; 30];
-    if file.read_exact(&mut header).is_err() || header[0..4] != *b"PK\x03\x04" {
-        return JarEntryTimes::default();
-    }
-    let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
-    let extra_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
-    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
-        return JarEntryTimes::default();
-    }
-    let mut extra = vec![0u8; extra_len];
-    if file.read_exact(&mut extra).is_err() {
-        return JarEntryTimes::default();
-    }
-    p59_zip_extra_times(&extra)
-}
-
-pub(crate) fn p59_zip_extra_times(extra: &[u8]) -> JarEntryTimes {
-    let mut times = JarEntryTimes::default();
-    let mut offset = 0;
-    while offset + 4 <= extra.len() {
-        let tag = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
-        let len = usize::from(u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]));
-        offset += 4;
-        let Some(data) = extra.get(offset..offset + len) else {
-            break;
-        };
-        match tag {
-            0x5455 if !data.is_empty() => {
-                let flags = data[0];
-                let mut cursor = 1;
-                let mut read_time = |enabled: bool| {
-                    if !enabled || cursor + 4 > data.len() {
-                        return None;
-                    }
-                    let time = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?);
-                    cursor += 4;
-                    Some(i64::from(time) * 1_000)
-                };
-                times.modified = read_time(flags & 0x01 != 0 || data.len() == 5);
-                times.access = read_time(flags & 0x02 != 0);
-                times.creation = read_time(flags & 0x04 != 0);
-            }
-            0x000a if data.len() >= 32 && data[4..6] == [0x01, 0x00] && data[6..8] == [24, 0] => {
-                times.modified = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[8..16].try_into().unwrap(),
-                )));
-                times.access = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[16..24].try_into().unwrap(),
-                )));
-                times.creation = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
-                    data[24..32].try_into().unwrap(),
-                )));
-            }
-            _ => {}
-        }
-        offset += len;
-    }
-    times
-}
-
 pub(crate) fn p59_set_jar_entry_times(
     ctx: &mut dyn NativeContext,
     entry: ObjectRef,
     times: JarEntryTimes,
 ) {
     let entry_pin = ctx.pin_native_root(entry);
+    // Before the FileTime fields, because this is the fallback they shadow:
+    // `getLastModifiedTime()` only consults `xdostime` when `mtime` is null.
+    if let Some(dos_time) = times.dos_time {
+        ctx.set_field_by_name(entry, "xdostime", Value::Long(dos_time));
+    }
     for (field, millis) in [
         ("mtime", times.modified),
         ("atime", times.access),
@@ -1768,8 +1727,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
         let comment = (!entry.comment().is_empty()).then(|| entry.comment().to_owned());
-        let mut times = p59_zip_entry_times(&entry);
-        p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
+        let times = p59_zip_entry_times(&entry);
         order.push(name.clone());
         by_name.insert(
             name,
