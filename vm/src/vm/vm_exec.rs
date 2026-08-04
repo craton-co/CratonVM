@@ -9966,14 +9966,45 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     stack.join("\n")
                 );
             }
+            // `ensure_generated_class`, not `ensure_synthetic_class`: this is a
+            // VM bookkeeping type, not a compatibility substitution. There is
+            // no `cratonvm/synthetic/AnonymousObject$N` class file anywhere and
+            // there never will be — it is the untyped allocation shape behind
+            // every `HashMap`/`LinkedHashMap` node and friends, and contract §1
+            // item 6 makes it legitimate in **both** modes.
+            //
+            // Stamping it `CompatibilityStub` (which `ensure_synthetic_class`
+            // hard-codes) made contract §11's zero-stub acceptance criterion
+            // unachievable by construction: a strict boot reported a
+            // `compatibility-class-requested` violation for a class the
+            // contract explicitly permits, so the census could never reach
+            // zero however much real work was done. It also cost a
+            // full-classpath rescan per fresh field count, looking for a class
+            // file that cannot exist (the `is_synthetic` branch in
+            // `fabricate_class`; `synthetic_upgrade_known_absent` memoised it
+            // away after the first, but the first still ran).
+            //
+            // The deferral this replaces was correct at the time: the origin
+            // feeds the derived `is_synthetic_stub` bool, and flipping it for a
+            // class ~181 read sites reason about is a `Compatible`-mode
+            // behaviour change wave 1 could not validate. What makes it safe
+            // *here* is that this class is inert at every one of those sites —
+            // nothing is registered as a native on it, neither
+            // real-protected-stub allow-list names it, and `fabricate_class`'s
+            // `Proxy$Instance` / collection-iterator special cases key on the
+            // name, not the origin.
             let cid = self
                 .shared
                 .classes
                 .class_manager
                 .write()
-                .ensure_synthetic_class(&name, num_fields);
+                .ensure_generated_class(
+                    &name,
+                    num_fields,
+                    cratonvm_classloading::class_origin::ClassOrigin::VmInternal,
+                );
             // Cache for the lock-free fast path above. Races are benign:
-            // `ensure_synthetic_class` is idempotent, so any racing thread
+            // `ensure_generated_class` is idempotent, so any racing thread
             // stores the same id.
             if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 self.shared.classes.anon_class_cache[num_fields]
@@ -14773,40 +14804,33 @@ pub fn invoke_or_native(
     // See fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
-    // OF 4. The other three are in `vm/src/runtime/interpreter/invoke.rs`
-    // (`try_stackless_invoke` step 1, `try_stackless_invoke` step 6, and the
-    // `!is_native` forced-native block of `invoke_on_class_shared_inner` below
-    // — which inlines the `workers`-field probe a fourth time rather than
-    // calling `threadpool_executor_has_real_workers`). Each dispatch path
-    // carries its own copy because each reaches the native by a different
-    // route; all four must be removed together or the paths disagree about the
-    // same receiver. What must replace them: `native_es_execute` is only
-    // correct for CratonVM's synthetic 2-field `Executors.new*ThreadPool()`
-    // stand-in, so under `--jdk-only` (where that stand-in cannot exist) the
-    // registration itself is a `SyntheticStub` that never dispatches, and the
-    // receiver probe becomes unreachable.
+    // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+    // `vm/src/runtime/interpreter/native_override.rs` for the full census, for
+    // the ninth (receiver-blind) site these eight exist to override, and for
+    // why all nine have to go together.
+    //
+    // The wave-1 markers named four of eight, and got one of those wrong. The
+    // hazard that undercount creates is specific: a mechanical "delete every
+    // marked `ThreadPoolExecutor` site" sweep leaves the four unmarked ones
+    // enforcing a policy the other four no longer apply, which is the same
+    // cold-path/warm-path split as the forced-native `String` lists.
+    //
+    // This copy also used to inline the `workers`-field probe by hand rather
+    // than calling `threadpool_executor_has_real_workers`, making three
+    // implementations of one predicate — and it took a plain `read()` where the
+    // helper documents why `read_recursive()` is required at these call sites.
     if effective_class == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && descriptor == "(Ljava/lang/Runnable;)V"
     {
-        if let Some(Value::Object(Some(recv))) = args.first() {
-            let recv_class_id = shared.mem.heap.class_id_of(*recv);
-            let has_real_workers = {
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| {
-                        matches!(
-                            shared.mem.heap.get_field(*recv, idx),
-                            Value::Object(Some(_))
-                        )
-                    })
-                    .unwrap_or(false)
-            };
-            if has_real_workers {
+        if let Some(recv_value @ Value::Object(Some(recv))) = args.first() {
+            if crate::runtime::interpreter::threadpool_executor_has_real_workers(
+                shared, recv_value,
+            ) {
                 return invoke_on_class_shared(
                     shared,
                     thread,
-                    recv_class_id,
+                    shared.mem.heap.class_id_of(*recv),
                     method_name,
                     descriptor,
                     args,
@@ -14838,34 +14862,25 @@ pub fn invoke_or_native(
         // single native dispatch VM-wide. `find_with_kind` above folds both
         // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native = native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
-        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 1 OF 2.
-        // The other copy is `real_protected_stub_class` in
-        // `vm/src/runtime/interpreter/invoke.rs`, and the two are NOT identical:
-        // this one includes `java/util/StringJoiner`, that one deliberately
-        // omits it (see the long comment there — yielding StringJoiner's stub
-        // to real bytecode on the interpreter path trips a heap-reference
-        // integrity defect). Wave 2 must RECONCILE them, not assume they are
-        // the same list and delete one; deleting either without the other
-        // desynchronises the two dispatch paths for this exact class.
-        // What must replace it: `NativeKind` alone. Under `--jdk-only` a
-        // `SyntheticStub` never dispatches, so no class needs "protecting"
-        // from one and the whole allow-list becomes dead.
+        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, cold path.
+        //
+        // This was an inline `matches!` maintained by hand alongside a second
+        // copy in `real_protected_stub_class`, and the two had drifted: this
+        // one listed `java/util/StringJoiner`, the other deliberately omitted
+        // it — so a `SyntheticStub` native's yield-to-real-bytecode verdict
+        // depended on how many times its call site had executed. The copies
+        // were centralised into one list plus one stated exception, and the
+        // exception was retired on 2026-08-04 once the defect that forced it
+        // was measured not to reproduce. Both paths now call the one predicate.
+        //
+        // Do NOT re-inline a copy here. The divergence this replaced is exactly
+        // what the contract §7 centralisation exists to prevent.
+        //
+        // What must ultimately replace the list: `NativeKind` alone — under
+        // `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
+        // "protecting" from one and the whole allow-list becomes dead.
         let real_protected_stub = synthetic_stub_native
-            && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
-                || matches!(
-                    effective_class,
-                    "java/util/concurrent/locks/ReentrantLock"
-                        | "java/util/concurrent/LinkedBlockingDeque"
-                        | "java/util/concurrent/atomic/AtomicBoolean"
-                        | "java/util/EnumSet"
-                        | "java/time/Instant"
-                        | "java/time/ZonedDateTime"
-                        | "java/util/StringJoiner"
-                        | "java/io/FileInputStream"
-                        | "java/lang/ref/Cleaner"
-                        | "java/lang/ref/Cleaner$Cleanable"
-                        | "java/lang/management/ManagementFactory"
-                ));
+            && crate::runtime::interpreter::real_protected_stub_class(effective_class);
         let has_real = real_protected_stub && {
             let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
@@ -20168,48 +20183,20 @@ fn invoke_on_class_shared_inner(
                         // permanent fix.
                         //
                         // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
-                        // policy, POSITIVE FORM (21 methods). Its twin is the
-                        // INVERTED-EXCLUSION form in
-                        // `vm/src/runtime/interpreter/invoke.rs::force_native_over_real_jdk_bytecode`
-                        // (`class == "java/lang/String" && !matches!(..7 shapes..)
-                        // => return false`). This arm is the COLD path
-                        // (`invoke_on_class_shared_inner`, first call at a
-                        // site); that one is the WARM path (memoized
-                        // force-native gate). THEY MUST BE DELETED TOGETHER:
-                        // removing one alone makes cold and warm dispatch
-                        // disagree about which implementation of `String.equals`
-                        // / `hashCode` / `substring` runs, and the observable
-                        // behaviour of a String method then depends on how many
-                        // times its call site has executed. What must replace
-                        // both: nothing — these natives are registered as
-                        // `Intrinsic`, so `resolve_dispatch` step 2 takes them
-                        // on their own merit with no class-name list at all;
-                        // any that are NOT intrinsic-grade are `SyntheticStub`s
-                        // shadowing real `String` bytecode and must go.
+                        // policy, POSITIVE FORM (21 method names, matched
+                        // descriptor-blind). The list itself now lives in
+                        // `cold_forced_native_string_name`, beside the WARM
+                        // path's inverted-exclusion twin
+                        // (`warm_forced_native_string_candidate`), so the two
+                        // halves of one policy can be compared by a test
+                        // instead of by a reader diffing two files — see that
+                        // function for the RKC16N.6 defect they both work
+                        // around, for the five entries that were statically
+                        // unreachable until 2026-08-04, and for why they must
+                        // be deleted together.
                         || (class_name == "java/lang/String"
-                            && matches!(
+                            && crate::runtime::interpreter::cold_forced_native_string_name(
                                 method_name,
-                                "charAt"
-                                | "length"
-                                | "isEmpty"
-                                | "equals"
-                                | "hashCode"
-                                | "indexOf"
-                                | "lastIndexOf"
-                                | "substring"
-                                | "startsWith"
-                                | "endsWith"
-                                | "trim"
-                                | "toString"
-                                | "concat"
-                                | "replace"
-                                | "toLowerCase"
-                                | "toUpperCase"
-                                | "compareTo"
-                                | "compareToIgnoreCase"
-                                | "equalsIgnoreCase"
-                                | "contains"
-                                | "split"
                             ))
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
@@ -22732,20 +22719,17 @@ fn invoke_on_class_shared_inner(
         // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
         //
         // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
-        // COPY 4 OF 4 — and the one that does NOT call
-        // `threadpool_executor_has_real_workers`, it re-inlines the
-        // `workers`-field probe. See COPY 1 in `invoke_or_native` above for the
-        // full note and what must replace all four.
+        // COPY 2 OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+        // `vm/src/runtime/interpreter/native_override.rs` for the census.
+        //
+        // This one re-inlined the `workers`-field probe rather than calling
+        // `threadpool_executor_has_real_workers` — with a plain `read()`, where
+        // the helper documents why `read_recursive()` is needed.
         let force_native_receiver_exempt = class_name_for_force
             == "java/util/concurrent/ThreadPoolExecutor"
             && method_name == "execute"
-            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
-                let recv_class_id = shared.mem.heap.class_id_of(*recv);
-                let cm = shared.classes.class_manager.read();
-                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.mem.heap.get_field(*recv, idx), Value::Object(Some(_))))
-                    .unwrap_or(false)
-            });
+            && matches!(args.first(), Some(recv) if
+                crate::runtime::interpreter::threadpool_executor_has_real_workers(shared, recv));
         // §7 routing. This site's whole purpose is "force the registered native
         // in front of real JDK bytecode", so the pre-existing condition IS
         // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
@@ -22860,20 +22844,21 @@ fn invoke_on_class_shared_inner(
     };
     let args = synchronized_args.as_deref().unwrap_or(args);
 
-    let result = if is_native {
-        // Look up native implementation.
-        //
-        // §7 routing. `is_native` here is NOT the same thing as
-        // `method.is_native()`: the `check_override` chain above also sets it
-        // for concrete methods whose real bytecode we deliberately shadow. So
-        // this site can be about to run a native in front of real bytes —
-        // exactly the §1.4 question — and it is the only place that can answer
-        // it, because it is the only place holding `declaring_class_id`.
-        //
-        // The answer is recovered from the SAME class-manager read that was
-        // already being taken for `class_name`: no extra lock, no extra
-        // hierarchy walk. It is computed only under `JdkOnly`, so a default
-        // `--real-jdk` run pays one `is_jdk_only()` bool test and nothing else.
+    // §7 routing, hoisted OUT of the `if is_native` arm below — see
+    // `bytecode_wins_under_strict` for why it cannot be decided inside it.
+    //
+    // `is_native` here is NOT the same thing as `method.is_native()`: the
+    // `check_override` chain above also sets it for concrete methods whose real
+    // bytecode we deliberately shadow. So this site can be about to run a native
+    // in front of real bytes — exactly the §1.4 question — and it is the only
+    // place that can answer it, because it is the only place holding
+    // `declaring_class_id`.
+    //
+    // The answer is recovered from the SAME class-manager read that was already
+    // being taken for `class_name`: no extra lock, no extra hierarchy walk. It
+    // is computed only under `JdkOnly`, so a default `--real-jdk` run pays one
+    // `is_jdk_only()` bool test and nothing else.
+    let (class_name, native_shadows_bytecode, registry_native) = if is_native {
         let policy = dispatch_policy(shared);
         let strict = policy.is_jdk_only();
         let (class_name, native_shadows_bytecode) = {
@@ -22913,14 +22898,45 @@ fn invoke_on_class_shared_inner(
                 }
                 Some(decision) => decision.native_callback(),
                 // JdkOnly, §7 step 3: this "native" is a bridge standing in
-                // front of concrete bytecode. Fall through to the JNI chain,
-                // and past it to the bytecode path, exactly as an unregistered
-                // native would have.
+                // front of concrete bytecode, and the bytecode wins.
                 None => None,
             },
             None => None,
         };
+        (class_name, native_shadows_bytecode, registry_native)
+    } else {
+        (String::new(), false, None)
+    };
 
+    // §7 step 3, the part the code did not previously implement.
+    //
+    // The `if is_native` arm below has THREE outcomes — registry native, JNI
+    // function pointer, or `UnsatisfiedLinkError`. It has no path to the
+    // bytecode. So when §7 step 3 declined a shadowing native above, the old
+    // code did not "fall through to the bytecode path exactly as an
+    // unregistered native would have", as its comment claimed: it fell through
+    // to the *link error*, for a method whose `Code` attribute is sitting right
+    // there. Measured 2026-08-04 on JDK 25: `--jdk-only` could not start a
+    // single `java.lang.Thread` — `UnsatisfiedLinkError: java/lang/Thread.run()V`,
+    // whose real bytecode the class-path image plainly declares — so every
+    // `new Thread(…)` and every `ExecutorService` was dead, and any workload
+    // that joined on one hung rather than failed.
+    //
+    // Deciding it here, before the `if`, is what makes the bytecode branch
+    // reachable at all.
+    //
+    // `Compatible` is bit-for-bit unchanged: `native_shadows_bytecode` is
+    // `false` unless the policy is `JdkOnly`, so this whole term folds away.
+    //
+    // Genuinely unimplemented natives still raise. If `is_native` came from
+    // `method.is_native()` then `native_shadows_bytecode` is `false` by
+    // construction (`!m.is_native()` is one of its conjuncts), so an
+    // `ACC_NATIVE` method with nothing behind it takes the error arm exactly as
+    // before — including one a host library would have served over JNI, since a
+    // `RegisterNatives` target is `ACC_NATIVE` too.
+    let is_native = is_native && !(registry_native.is_none() && native_shadows_bytecode);
+
+    let result = if is_native {
         // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
         // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
         // function pointers are not ABI-compatible with CratonVM's libffi
