@@ -729,6 +729,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
+    // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
+    // the contrast is the reason these two carry a comment at all.
+    // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
+    // both answer `false` for `Err(_)` and admit only `1`/`on`/`true`/`yes`, so
+    // unsetting the key IS the off state and `off_word` stays `None`. Writing
+    // `Some("0")` would mislabel them as default-ON kill switches — the one
+    // thing this table exists to state unambiguously — and would make
+    // `-osr-single-pc` expand to `=0`, which those consumers happen to read as
+    // off only because `0` is absent from their truthy list, not because they
+    // were written to accept an opt-out.
+    E { group: Group::JIT, token: "osr-seed-frame-slots", on_key: Some("CRATONVM_JIT_OSR_SEED_FRAME_SLOTS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-single-pc", on_key: Some("CRATONVM_JIT_OSR_SINGLE_PC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
     // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
@@ -2061,6 +2073,56 @@ mod tests {
             // ...and the positive token clears a stale export.
             let c = case(&[(group.var(), token), (off_key, "1")]);
             assert_eq!(c.resolve().get(off_key), None);
+        }
+    }
+
+    /// The two OSR diagnosis levers declared 2026-08-04 resolve BOTH ways, and
+    /// are default-OFF.
+    ///
+    /// `flag_declaration_guard` only asks whether a name appears in
+    /// [`INVENTORY`]; a row can be listed and still not resolve, and from there
+    /// the two look identical. So this drives the grouped spelling and checks
+    /// the legacy key it must set — and checks the polarity, because these two
+    /// sit four rows from `osr-dead-locals`, which is the opposite: default-ON
+    /// with `"0"` as its kill switch.
+    ///
+    /// The exact edit that trips it: give either row an `off_word`. The
+    /// `off_word.is_none()` assertion fails, and so does the last block —
+    /// `-osr-single-pc` would start expanding to `=0` instead of doing nothing,
+    /// and for a consumer that accepts only `1`/`on`/`true`/`yes` that is an
+    /// opt-out spelling nobody wrote.
+    #[test]
+    fn the_osr_diagnosis_levers_resolve_and_are_default_off() {
+        for (token, key) in [
+            ("osr-seed-frame-slots", "CRATONVM_JIT_OSR_SEED_FRAME_SLOTS"),
+            ("osr-single-pc", "CRATONVM_JIT_OSR_SINGLE_PC"),
+        ] {
+            let e = lookup(Group::JIT, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            assert_eq!(e.on_key, Some(key));
+            assert!(e.off_key.is_none(), "{token} gained an opt-out key");
+            assert!(
+                e.off_word.is_none(),
+                "{token} is default-OFF; an `off_word` would label it a kill switch"
+            );
+
+            // The positive token reaches the key `jit::osr_always_seed_frame_slot`
+            // and `jit::osr_single_pc_entry_only` actually read.
+            let c = case(&[("CRATONVM_JIT", token)]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from("1")),
+                "CRATONVM_JIT={token} must set {key}"
+            );
+
+            // And the negative spelling exports nothing, rather than a word
+            // those consumers never agreed to read.
+            let spec = format!("-{token}");
+            let c = case(&[("CRATONVM_JIT", spec.as_str())]);
+            assert_eq!(
+                c.resolve().get(key),
+                None,
+                "-{token} must not export a value; these are off by absence"
+            );
         }
     }
 
