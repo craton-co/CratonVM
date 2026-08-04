@@ -22684,20 +22684,21 @@ fn invoke_on_class_shared_inner(
     };
     let args = synchronized_args.as_deref().unwrap_or(args);
 
-    let result = if is_native {
-        // Look up native implementation.
-        //
-        // §7 routing. `is_native` here is NOT the same thing as
-        // `method.is_native()`: the `check_override` chain above also sets it
-        // for concrete methods whose real bytecode we deliberately shadow. So
-        // this site can be about to run a native in front of real bytes —
-        // exactly the §1.4 question — and it is the only place that can answer
-        // it, because it is the only place holding `declaring_class_id`.
-        //
-        // The answer is recovered from the SAME class-manager read that was
-        // already being taken for `class_name`: no extra lock, no extra
-        // hierarchy walk. It is computed only under `JdkOnly`, so a default
-        // `--real-jdk` run pays one `is_jdk_only()` bool test and nothing else.
+    // §7 routing, hoisted OUT of the `if is_native` arm below — see
+    // `bytecode_wins_under_strict` for why it cannot be decided inside it.
+    //
+    // `is_native` here is NOT the same thing as `method.is_native()`: the
+    // `check_override` chain above also sets it for concrete methods whose real
+    // bytecode we deliberately shadow. So this site can be about to run a native
+    // in front of real bytes — exactly the §1.4 question — and it is the only
+    // place that can answer it, because it is the only place holding
+    // `declaring_class_id`.
+    //
+    // The answer is recovered from the SAME class-manager read that was already
+    // being taken for `class_name`: no extra lock, no extra hierarchy walk. It
+    // is computed only under `JdkOnly`, so a default `--real-jdk` run pays one
+    // `is_jdk_only()` bool test and nothing else.
+    let (class_name, native_shadows_bytecode, registry_native) = if is_native {
         let policy = dispatch_policy(shared);
         let strict = policy.is_jdk_only();
         let (class_name, native_shadows_bytecode) = {
@@ -22737,14 +22738,45 @@ fn invoke_on_class_shared_inner(
                 }
                 Some(decision) => decision.native_callback(),
                 // JdkOnly, §7 step 3: this "native" is a bridge standing in
-                // front of concrete bytecode. Fall through to the JNI chain,
-                // and past it to the bytecode path, exactly as an unregistered
-                // native would have.
+                // front of concrete bytecode, and the bytecode wins.
                 None => None,
             },
             None => None,
         };
+        (class_name, native_shadows_bytecode, registry_native)
+    } else {
+        (String::new(), false, None)
+    };
 
+    // §7 step 3, the part the code did not previously implement.
+    //
+    // The `if is_native` arm below has THREE outcomes — registry native, JNI
+    // function pointer, or `UnsatisfiedLinkError`. It has no path to the
+    // bytecode. So when §7 step 3 declined a shadowing native above, the old
+    // code did not "fall through to the bytecode path exactly as an
+    // unregistered native would have", as its comment claimed: it fell through
+    // to the *link error*, for a method whose `Code` attribute is sitting right
+    // there. Measured 2026-08-04 on JDK 25: `--jdk-only` could not start a
+    // single `java.lang.Thread` — `UnsatisfiedLinkError: java/lang/Thread.run()V`,
+    // whose real bytecode the class-path image plainly declares — so every
+    // `new Thread(…)` and every `ExecutorService` was dead, and any workload
+    // that joined on one hung rather than failed.
+    //
+    // Deciding it here, before the `if`, is what makes the bytecode branch
+    // reachable at all.
+    //
+    // `Compatible` is bit-for-bit unchanged: `native_shadows_bytecode` is
+    // `false` unless the policy is `JdkOnly`, so this whole term folds away.
+    //
+    // Genuinely unimplemented natives still raise. If `is_native` came from
+    // `method.is_native()` then `native_shadows_bytecode` is `false` by
+    // construction (`!m.is_native()` is one of its conjuncts), so an
+    // `ACC_NATIVE` method with nothing behind it takes the error arm exactly as
+    // before — including one a host library would have served over JNI, since a
+    // `RegisterNatives` target is `ACC_NATIVE` too.
+    let is_native = is_native && !(registry_native.is_none() && native_shadows_bytecode);
+
+    let result = if is_native {
         // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
         // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
         // function pointers are not ABI-compatible with CratonVM's libffi

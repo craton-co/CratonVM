@@ -2408,8 +2408,13 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     if let Some(path) = &args.dump_native_registry {
         match shared.dump_native_census_json(path, verbose) {
             Ok((intrinsic, bridge, stub)) => eprintln!(
-                "[cratonvm] wrote native registry census (schema 2) to {path} \
-                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})"
+                "[cratonvm] wrote native registry census (schema 3{}) to {path} \
+                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})",
+                if verbose {
+                    ", image-adjudicated"
+                } else {
+                    ", no image adjudication — pass --explain-jdk-only"
+                }
             ),
             Err(e) => eprintln!(
                 "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
