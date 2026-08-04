@@ -291,14 +291,22 @@ pub fn compile_with_param_slots(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
-    // PGO-02: guard_class_id for every Monomorphic-admitted virtual/interface
-    // inline site, keyed by the same pc as `inline_sites`. See
-    // `docs/feature-designs/profile-guided-inlining.md`. Deliberately NOT
-    // threaded through the loop-unroll pc-replication tuple a few lines below
-    // (unlike `inline_sites` itself) — a replicated pc without an entry here
-    // just falls back to normal dispatch for that unrolled copy, which is
-    // always correct, only not optimized.
-    inline_guard_class_ids: HashMap<usize, u32>,
+    // PGO-02: the guarded variants of a speculative virtual/interface inline
+    // site — `(receiver class id, the body THAT CLASS dispatches to)`, in guard
+    // order, keyed by the same pc as `inline_sites`. One entry is a Monomorphic
+    // plan, two are a Bimorphic one. See
+    // `docs/feature-designs/profile-guided-inlining.md`.
+    //
+    // Element `[0]` is ALSO the `inline_sites` entry for that pc (the primary
+    // body), so the buffer/frame reservations below count it exactly once and
+    // `try_emit_inline(pc)` finds it where it has always been; element `[1]`
+    // exists only here and is added to those reservations explicitly.
+    //
+    // Deliberately NOT threaded through the loop-unroll pc-replication tuple a
+    // few lines below (unlike `inline_sites` itself) — a replicated pc without
+    // an entry here just falls back to normal dispatch for that unrolled copy,
+    // which is always correct, only not optimized.
+    inline_guard_variants: HashMap<usize, Vec<(u32, crate::InlineSite)>>,
     // Compile-time resolved `java/lang/String` field layout for the String
     // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
     // layout unavailable" — String-intrinsic codegen (added by a later
@@ -625,8 +633,20 @@ pub fn compile_with_param_slots(
     // one-shot thread-local staging requests before the buffer is allocated,
     // and re-entering it would find them gone. The estimate has to be right the
     // first time here, so it errs high.
+    // PGO-02 (bimorphic): a two-guard site splices a SECOND body at the same
+    // pc, and that body is not in `inline_sites`. Both this buffer estimate
+    // and the spill reservation below must see it — this backend cannot retry
+    // a short buffer, and an unreserved inlined body writes past the spill
+    // region into the callee-saved area. Skip variant `[0]`, which IS the
+    // `inline_sites` entry and is already counted.
+    let extra_guard_bodies = || {
+        inline_guard_variants
+            .values()
+            .flat_map(|variants| variants.iter().skip(1).map(|(_, s)| s))
+    };
     let inline_extra: usize = inline_sites
         .values()
+        .chain(extra_guard_bodies())
         .map(|s| s.callee_code_len.saturating_mul(64))
         .sum();
     let estimated_size = code_len
@@ -672,6 +692,7 @@ pub fn compile_with_param_slots(
     // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
     let inline_stack_reserve: usize = inline_sites
         .values()
+        .chain(extra_guard_bodies())
         .map(|s| {
             let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
             s.callee_max_locals
@@ -1572,7 +1593,7 @@ pub fn compile_with_param_slots(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
-    compiler.inline_guard_class_ids = inline_guard_class_ids.into_iter().collect();
+    compiler.inline_guard_variants = inline_guard_variants.into_iter().collect();
     // String call-site intrinsics: hand the resolved String field layout to
     // the compiler so intrinsic codegen can emit inline field loads.
     compiler.string_layout = string_layout;

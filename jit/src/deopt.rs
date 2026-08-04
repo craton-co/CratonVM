@@ -1024,6 +1024,19 @@ pub struct InvalidationManager {
     /// key appears at most once per (class_id, method_name). Mirrors the
     /// `UniqueConcreteMethod` entries in `assumptions`.
     unique_method_index: FxHashMap<(u32, String), Vec<String>>,
+    /// Reverse index: expected receiver class_id → method keys that hold a
+    /// `StableType { expected_class }` assumption. Mirrors the `StableType`
+    /// entries in `assumptions`, same per-key dedup as the two indices above.
+    ///
+    /// PGO-02 (`docs/feature-designs/profile-guided-inlining.md` §4): a guarded
+    /// receiver speculation IS a `StableType` assumption, and this index is
+    /// what [`Self::on_class_loaded_with_supertypes`] queries. It exists
+    /// because a speculation on class `A` must be RETIRED when a descendant of
+    /// `A` is loaded — not for correctness (an exact class-id guard rechecks
+    /// the receiver and routes a miss to normal dispatch) but because without
+    /// a retirement event the caller keeps paying a guard that now always
+    /// misses, forever, with nothing to trigger a recompile.
+    stable_type_index: FxHashMap<u32, Vec<String>>,
 }
 
 impl InvalidationManager {
@@ -1033,6 +1046,7 @@ impl InvalidationManager {
             class_dependencies: FxHashMap::default(),
             leaf_class_index: FxHashMap::default(),
             unique_method_index: FxHashMap::default(),
+            stable_type_index: FxHashMap::default(),
         }
     }
 
@@ -1044,6 +1058,7 @@ impl InvalidationManager {
         self.class_dependencies.clear();
         self.leaf_class_index.clear();
         self.unique_method_index.clear();
+        self.stable_type_index.clear();
     }
 
     /// Register an assumption made while compiling `method`.
@@ -1078,6 +1093,12 @@ impl InvalidationManager {
             } => {
                 let key = (*class_id, method_name.clone());
                 let entry = self.unique_method_index.entry(key).or_default();
+                if !entry.iter().any(|m| m == method) {
+                    entry.push(method.to_string());
+                }
+            }
+            CompilationAssumption::StableType { expected_class, .. } => {
+                let entry = self.stable_type_index.entry(*expected_class).or_default();
                 if !entry.iter().any(|m| m == method) {
                     entry.push(method.to_string());
                 }
@@ -1121,6 +1142,46 @@ impl InvalidationManager {
         invalidated
     }
 
+    /// Called when a new class is loaded, given that class's full supertype
+    /// closure. Returns everything [`Self::on_class_loaded`] would, PLUS every
+    /// method holding a `StableType` assumption on the new class or on any of
+    /// its ancestors.
+    ///
+    /// The supertype argument is what closes the gap
+    /// `docs/feature-designs/profile-guided-inlining.md` §4 records. A guarded
+    /// receiver speculation on `A` is threatened by a *descendant* of `A`
+    /// appearing, not by `A` itself changing — and a class-load event knows
+    /// only the id of the class that just arrived. Asking the caller for the
+    /// closure keeps the hierarchy walk where the class metadata lives,
+    /// instead of building a second parent map in here that could disagree
+    /// with the real one.
+    ///
+    /// The result is a *retirement* set, never a correctness one: a stale
+    /// guard still rechecks the receiver's exact class id and routes a miss to
+    /// normal dispatch. What this buys is that the recheck stops being paid
+    /// forever after the speculation has been falsified.
+    pub fn on_class_loaded_with_supertypes(
+        &self,
+        class_id: u32,
+        supertypes: &[u32],
+    ) -> Vec<String> {
+        let mut invalidated = self.on_class_loaded(class_id);
+        // `class_id` itself covers a redefinition of the speculated class;
+        // every ancestor covers the case this exists for — a NEW DESCENDANT,
+        // whose receivers a guard baked before it existed can only miss.
+        for probe in std::iter::once(&class_id).chain(supertypes.iter()) {
+            let Some(methods) = self.stable_type_index.get(probe) else {
+                continue;
+            };
+            for m in methods {
+                if !invalidated.contains(m) {
+                    invalidated.push(m.clone());
+                }
+            }
+        }
+        invalidated
+    }
+
     /// Called when a method is overridden in `class_id`. Returns methods whose
     /// `UniqueConcreteMethod` assumption is now invalid.
     pub fn on_method_override(&self, class_id: u32, method_name: &str) -> Vec<String> {
@@ -1159,6 +1220,7 @@ impl InvalidationManager {
         // is removed once. Empty buckets are pruned to keep lookups tight.
         let mut leaf_seen: Vec<u32> = Vec::new();
         let mut unique_seen: Vec<(u32, &str)> = Vec::new();
+        let mut stable_seen: Vec<u32> = Vec::new();
         for a in &removed {
             match a {
                 CompilationAssumption::LeafClass(cid) => {
@@ -1187,6 +1249,18 @@ impl InvalidationManager {
                         entry.retain(|m| m != method);
                         if entry.is_empty() {
                             self.unique_method_index.remove(&key);
+                        }
+                    }
+                }
+                CompilationAssumption::StableType { expected_class, .. } => {
+                    if stable_seen.contains(expected_class) {
+                        continue;
+                    }
+                    stable_seen.push(*expected_class);
+                    if let Some(entry) = self.stable_type_index.get_mut(expected_class) {
+                        entry.retain(|m| m != method);
+                        if entry.is_empty() {
+                            self.stable_type_index.remove(expected_class);
                         }
                     }
                 }
@@ -7134,6 +7208,78 @@ mod tests {
         assert_eq!(mgr.on_class_loaded(42), vec!["m".to_string()]);
         mgr.clear_assumptions("m");
         assert!(mgr.on_class_loaded(42).is_empty());
+    }
+
+    /// PGO-02 §4: a guarded receiver speculation on `A` must be retired when a
+    /// DESCENDANT of `A` is loaded — including a grandchild, which the old
+    /// direct-superclass-only reach missed entirely.
+    #[test]
+    fn stable_type_speculation_is_retired_by_a_descendant_load() {
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption(
+            "app/Caller.run()V",
+            CompilationAssumption::StableType {
+                bci: 12,
+                expected_class: 100, // app/Circle
+            },
+        );
+
+        // The old query cannot see it at all: `on_class_loaded` only consults
+        // the LeafClass index, so a StableType assumption had no retirement
+        // path of any kind.
+        assert!(mgr.on_class_loaded(200).is_empty());
+
+        // Direct subclass: supertype closure is [Circle].
+        assert_eq!(
+            mgr.on_class_loaded_with_supertypes(200, &[100]),
+            vec!["app/Caller.run()V".to_string()]
+        );
+        // GRANDCHILD: closure is [SmallCircle, Circle]. This is the case §4
+        // documented as unreachable.
+        assert_eq!(
+            mgr.on_class_loaded_with_supertypes(300, &[200, 100]),
+            vec!["app/Caller.run()V".to_string()]
+        );
+        // Redefining the speculated class itself.
+        assert_eq!(
+            mgr.on_class_loaded_with_supertypes(100, &[]),
+            vec!["app/Caller.run()V".to_string()]
+        );
+        // An unrelated hierarchy must not evict — invalidation that fires on
+        // everything is invalidation nobody can afford to leave on.
+        assert!(mgr
+            .on_class_loaded_with_supertypes(400, &[401, 402])
+            .is_empty());
+    }
+
+    /// The `StableType` index tears down with the assumption, like the other
+    /// two. A retirement index that outlives its assumption evicts code for a
+    /// speculation that is no longer made.
+    #[test]
+    fn invalidation_clear_removes_from_stable_type_index() {
+        let mut mgr = InvalidationManager::new();
+        mgr.register_assumption(
+            "caller",
+            CompilationAssumption::StableType {
+                bci: 3,
+                expected_class: 55,
+            },
+        );
+        // Registered twice: the index must still list the method once, and one
+        // clear must remove it.
+        mgr.register_assumption(
+            "caller",
+            CompilationAssumption::StableType {
+                bci: 9,
+                expected_class: 55,
+            },
+        );
+        assert_eq!(
+            mgr.on_class_loaded_with_supertypes(70, &[55]),
+            vec!["caller".to_string()]
+        );
+        mgr.clear_assumptions("caller");
+        assert!(mgr.on_class_loaded_with_supertypes(70, &[55]).is_empty());
     }
 
     #[test]

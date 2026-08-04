@@ -62,9 +62,10 @@ fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
 
 fn method_descriptor(method: &str) -> &'static str {
     match method {
-        "callA" | "callCurrent" | "callThrowerCaught" => "(I)I",
-        "callPoly" => "(II)I",
-        "setCurrent" => "(I)V",
+        "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface"
+        | "callDivider" => "(I)I",
+        "callPoly" | "callBimorphic" => "(II)I",
+        "setCurrent" | "setDivisor" => "(I)V",
         other => panic!("unknown method: {other}"),
     }
 }
@@ -113,6 +114,11 @@ fn test_pgo02_guarded_virtual_inline() {
             // builder has no `invoke_info` for those sites and bails the whole
             // method, which is exactly the routing this file needs.
             ("CRATONVM_JIT_IR_CALL_VIRTUAL", Some("0")),
+            // So `check_metrics_harvest` has something to read. The design doc
+            // recorded the inline tally as unharvested; it is harvested, and
+            // this is the run that proves it end to end rather than by reading
+            // `metrics.rs`.
+            ("CRATONVM_JIT_METRICS", Some("1")),
         ],
         run_all_checks,
     );
@@ -122,22 +128,343 @@ fn test_pgo02_guarded_virtual_inline() {
     }
 }
 
+/// ONE `Vm` for every check.
+///
+/// This file used to build a fresh `Vm` per check. It turned out that only the
+/// FIRST one ever compiled anything — the tiered background compile worker is
+/// process-global and did not warm up again for later VMs — so every check
+/// after `check_guard_hit` ran fully interpreted, including the guard-MISS
+/// check this file calls its single most safety-critical one. They asserted
+/// correct results, got them from the interpreter, and proved nothing about
+/// the compiled path. Found by `CRATONVM_DBG_JITC=1`: exactly one
+/// `bg-compile` line in the whole run.
+///
+/// Every check that depends on a compiled artifact now ASSERTS that the
+/// artifact exists (`compiled_tally`), so the same silent regression to
+/// "correct, but interpreted" fails loudly instead of passing.
 fn run_all_checks() -> Result<(), String> {
-    check_guard_hit()?;
-    check_guard_miss()?;
-    check_thrower()?;
-    check_polymorphic()?;
+    let mut vm = test_vm();
+    check_guard_hit(&mut vm)?;
+    check_guard_miss(&mut vm)?;
+    check_override_receiver(&mut vm)?;
+    check_interface_site(&mut vm)?;
+    check_bimorphic(&mut vm)?;
+    check_uncaught_from_inlined_frame(&mut vm)?;
+    check_thrower(&mut vm)?;
+    check_polymorphic(&mut vm)?;
+    check_metrics_harvest()?;
     Ok(())
+}
+
+/// The inlining tally reaches the metrics surface.
+///
+/// `docs/feature-designs/profile-guided-inlining.md` recorded this as an open
+/// gap ("Nothing in `jit/src/metrics.rs` harvests it yet"). It does —
+/// `CompileRecorder::installed` copies the whole tally off the artifact — but
+/// the claim was only ever checked by reading the source, and a harvest that
+/// runs on no real compile is indistinguishable from one that does not exist.
+/// This asserts it against the reports the compiles above actually published.
+fn check_metrics_harvest() -> Result<(), String> {
+    let reports = cratonvm_jit::metrics::compilation_reports();
+    if reports.is_empty() {
+        return Err(
+            "check_metrics_harvest: no compilation reports at all — CRATONVM_JIT_METRICS did              not take, so nothing below would have been measured"
+                .to_string(),
+        );
+    }
+    let speculative = reports
+        .iter()
+        .filter(|r| matches!(r.speculative_inlined_sites, cratonvm_jit::metrics::Measured::Value(n) if n > 0))
+        .count();
+    if speculative == 0 {
+        let measured = reports
+            .iter()
+            .filter(|r| !matches!(r.inline_candidates, cratonvm_jit::metrics::Measured::NotMeasured))
+            .count();
+        return Err(format!(
+            "check_metrics_harvest: {} reports, {measured} carrying an inline tally, but none              reporting a speculative site — the guarded inlines the checks above proved              happened did not reach the metrics surface",
+            reports.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Two receiver classes, both overriding, in an even mix — the Bimorphic
+/// verdict, and the two-guard chain that emits it.
+///
+/// Results alone cannot tell a two-guard site from a one-guard site: with only
+/// the first guard emitted, a `C` receiver simply misses and dispatches, which
+/// is also correct. So this checks the SPLICED BYTE COUNT. `B.tag` and `C.tag`
+/// are 6 bytecodes each (`iload_1; sipush; iadd; ireturn`), so a bimorphic
+/// splice charges 12 and a monomorphic one 6.
+fn check_bimorphic(vm: &mut Vm) -> Result<(), String> {
+    for i in 0..CALLS {
+        let which = i % 2;
+        let got = invoke_int(vm, "callBimorphic", &[Value::Int(i), Value::Int(which)]);
+        let want = i + if which == 0 { 1000 } else { 2000 };
+        if got != want {
+            return Err(format!(
+                "check_bimorphic: callBimorphic({i}, {which}) = {got}, want {want}"
+            ));
+        }
+    }
+    let tally = compiled_tally(vm, "callBimorphic", &[Value::Int(1), Value::Int(0)])?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_bimorphic: callBimorphic compiled but speculative_sites == 0 (tally={tally:?})"
+        ));
+    }
+    if tally.inlined_bytecodes < 12 {
+        return Err(format!(
+            "check_bimorphic: only {} callee bytecodes spliced (tally={tally:?}) — a Bimorphic \
+             verdict must splice BOTH receiver classes' bodies (6 + 6); one body means the \
+             second guard was never emitted and the site degraded to monomorphic",
+            tally.inlined_bytecodes
+        ));
+    }
+    Ok(())
+}
+
+/// §8 item 7: an UNCAUGHT exception propagating out of a guard-hit inlined
+/// frame.
+///
+/// The callee divides by an instance field. Warm up with a non-zero divisor so
+/// the site compiles with a guard baked in, then set the divisor to 0: the
+/// spliced `idiv` raises ArithmeticException inside an inlined frame, with no
+/// handler in that frame and none in the caller either.
+///
+/// The control is the SAME call before the method was ever compiled — if the
+/// compiled path disagrees with the interpreter about what escapes, that is
+/// the bug this check exists for, and comparing against a hard-coded string
+/// would only prove the compiler agrees with the test author.
+fn check_uncaught_from_inlined_frame(vm: &mut Vm) -> Result<(), String> {
+    // Interpreted control, before any warmup of this entry point.
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let interpreted = vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        "callDivider",
+        "(I)I",
+        &[Value::Int(9)],
+    );
+    let interpreted = match interpreted {
+        Err(e) => describe_failure(vm, &e),
+        Ok(v) => {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: interpreted callDivider(9) with divisor 0 \
+                 returned {v:?} instead of raising — the fixture does not divide by zero, so \
+                 the compiled comparison below would be vacuous"
+            ))
+        }
+    };
+
+    // Warm up past the compile threshold with a safe divisor.
+    invoke_void(vm, "setDivisor", &[Value::Int(1)]);
+    for i in 0..CALLS {
+        let got = invoke_int(vm, "callDivider", &[Value::Int(i)]);
+        if got != i {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: callDivider({i}) = {got}, want {i}"
+            ));
+        }
+    }
+    let tally = compiled_tally(vm, "callDivider", &[Value::Int(1)])?;
+
+    // Now the same division raises, from inside whatever the compiled body is.
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let compiled = vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        "callDivider",
+        "(I)I",
+        &[Value::Int(9)],
+    );
+    let compiled = match compiled {
+        Err(e) => describe_failure(vm, &e),
+        Ok(v) => {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: compiled callDivider(9) with divisor 0 \
+                 returned {v:?} — the exception was swallowed (tally={tally:?})"
+            ))
+        }
+    };
+    if compiled != interpreted {
+        return Err(format!(
+            "check_uncaught_from_inlined_frame: compiled and interpreted disagree about the \
+             escaping exception.\n  interpreted: {interpreted}\n  compiled:    {compiled}\n  \
+             (tally={tally:?})"
+        ));
+    }
+    // State which path was actually exercised. A refusal here is a legitimate
+    // outcome — `try_emit_inline`'s deopt-metadata postcondition refuses any
+    // body that publishes a deopt point, and an inlined `idiv` may do exactly
+    // that — but it means this check covered the DISPATCH path, not the
+    // spliced one, and that difference must not be silent.
+    if tally.speculative_sites == 0 {
+        eprintln!(
+            "[pgo02] note: callDivider was not spliced (tally={tally:?}); the uncaught-exception \
+             check above exercised the guard-miss/dispatch path. See \
+             docs/feature-designs/profile-guided-inlining.md §8."
+        );
+    }
+    Ok(())
+}
+
+/// The constant-pool class and the speculated receiver class disagree.
+///
+/// `callOverride`'s site is `invokevirtual A.tag` (javac uses the receiver
+/// expression's STATIC type) but every receiver is exactly `B`, which
+/// overrides `tag`. The guard is emitted against B's class id, so the body
+/// behind it must be B's. Resolving the callee from the constant-pool class
+/// name instead splices A's body behind a B guard, and every call quietly
+/// returns `x+1` instead of `x+1000`.
+fn check_override_receiver(vm: &mut Vm) -> Result<(), String> {
+    for i in 0..CALLS {
+        let got = invoke_int(vm, "callOverride", &[Value::Int(i)]);
+        let want = i + 1000;
+        if got != want {
+            return Err(format!(
+                "check_override_receiver: callOverride({i}) = {got}, want {want} (call #{i} of \
+                 {CALLS}) — the guard admitted a receiver of class B and ran a body that is not \
+                 B's `tag`"
+            ));
+        }
+    }
+    // The results above come from the interpreter unless this holds, and the
+    // interpreter was never the thing at risk.
+    let tally = compiled_tally(vm, "callOverride", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_override_receiver: callOverride compiled but speculative_sites == 0              (tally={tally:?}) — the guarded path never ran, so a wrong spliced body              would not have been observable"
+        ));
+    }
+    Ok(())
+}
+
+/// `invokeinterface` with a single implementation. Resolution that starts at
+/// the constant-pool class finds `Tagger.itag`'s ABSTRACT declaration, which
+/// has no `Code` attribute, so the site can never be spliced; resolution from
+/// the speculated receiver class finds `OnlyImpl.itag` and can. Asserts both
+/// the result and that a speculative site was actually admitted, so a
+/// regression back to "correct but never inlined" is visible.
+fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
+    for i in 0..CALLS {
+        let got = invoke_int(vm, "callIface", &[Value::Int(i)]);
+        let want = i + 77;
+        if got != want {
+            return Err(format!(
+                "check_interface_site: callIface({i}) = {got}, want {want}"
+            ));
+        }
+    }
+    let tally = compiled_tally(vm, "callIface", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_interface_site: callIface compiled but speculative_sites == 0 (tally={tally:?}) \
+             — an interface site with one implementation must be reachable by the guarded \
+             inliner"
+        ));
+    }
+    Ok(())
+}
+
+/// Name a failed call by what ESCAPED, not by the heap address it escaped in.
+///
+/// Comparing the raw `ObjectRef` compares two allocations of the same
+/// exception and always differs; the question this file asks is whether the
+/// compiled path and the interpreter throw the same THING.
+fn describe_failure(vm: &Vm, failure: &cratonvm_vm::error::MethodCallFailed) -> String {
+    match failure {
+        cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc) => {
+            let class_id = vm.shared.mem.heap.class_id_of(*exc);
+            let class_name = vm
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {class_id:?}>"));
+            format!("ExceptionThrown({class_name})")
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// The `inline_tally` of a compiled entry point, with the tier dependency
+/// stated rather than relied on (an IR artifact leaves the tally zeroed, which
+/// is the opposite conclusion from "the guard did not fire").
+fn compiled_tally(
+    vm: &mut Vm,
+    method: &str,
+    warm_args: &[Value],
+) -> Result<cratonvm_jit::InlineDecisionTally, String> {
+    // Compilation is ASYNCHRONOUS. `CRATONVM_DBG_JITC=1` shows it as
+    // `bg-compile … bg=true`: crossing the invocation threshold enqueues the
+    // method, and a background worker installs the artifact some time later.
+    // A release build runs this file's 700-call warm-up in ~80 ms, which is
+    // routinely faster than the worker — so reading the cache once and
+    // declaring "never JIT-compiled" is a race, not a result. It passed on
+    // Windows/debug (a slow enough interpreter that the worker always won)
+    // and failed on Linux/release inside the full suite.
+    //
+    // Keep calling the method while waiting. That gives the worker both the
+    // trigger and the time, and it is what a real caller would be doing
+    // anyway. The bound is generous because a loaded CI host is exactly when
+    // the worker is slowest; exceeding it is still a failure, because
+    // "eventually compiles" is the claim under test.
+    const ATTEMPTS: usize = 400;
+    const CALLS_PER_ATTEMPT: i32 = 50;
+
+    for attempt in 0..ATTEMPTS {
+        let class_id = vm
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
+            .ok_or_else(|| "class must be loaded after invoke".to_string())?;
+        let found = vm.shared.jit.jit_cache.read().get(
+            "cratonvm/PgoGuardedVirtualInline",
+            method,
+            method_descriptor(method),
+            class_id,
+        );
+        if let Some(compiled) = found {
+            // State the tier dependency instead of relying on it.
+            // `inline_tally` is a single-pass artifact's record; an IR
+            // artifact leaves it zeroed, so without this rung "the guard did
+            // not fire" and "a different backend compiled the method" are
+            // indistinguishable — and they are opposite conclusions.
+            if compiled.used_ir_backend {
+                return Err(format!(
+                    "{method} was compiled by the OPTIMIZING (IR) backend, which plans no \
+                     guarded inlines and records no inline_tally — the tier pin did not take"
+                ));
+            }
+            return Ok(compiled.inline_tally.clone());
+        }
+        if attempt + 1 == ATTEMPTS {
+            break;
+        }
+        for i in 0..CALLS_PER_ATTEMPT {
+            let _ = invoke_int(vm, method, warm_args);
+            let _ = i;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Err(format!(
+        "{method} never JIT-compiled, after {} further calls and ~{} ms of waiting",
+        ATTEMPTS as i32 * CALLS_PER_ATTEMPT,
+        ATTEMPTS * 5
+    ))
 }
 
 /// Positive control: a fixed monomorphic-A call site, called past the
 /// (lowered) JIT threshold, must keep returning the correct result once
 /// compiled — the guard-hit path must be observably identical to the
 /// interpreted / unguarded-dispatch result.
-fn check_guard_hit() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_guard_hit(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callA", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callA", &[Value::Int(i)]);
         let want = i + 1;
         if got != want {
             return Err(format!(
@@ -149,37 +476,12 @@ fn check_guard_hit() -> Result<(), String> {
     // happened to be correct (which normal dispatch alone would also give):
     // callA must have compiled, and its own inline_tally must show at least
     // one speculative (guarded) site admitted.
-    let class_id = vm
-        .shared
-        .classes
-        .class_manager
-        .read()
-        .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
-        .expect("class must be loaded after invoke");
-    let compiled = vm
-        .shared
-        .jit
-        .jit_cache
-        .read()
-        .get("cratonvm/PgoGuardedVirtualInline", "callA", "(I)I", class_id)
-        .ok_or_else(|| "check_guard_hit: callA never JIT-compiled".to_string())?;
-    // State the tier dependency instead of relying on it. `inline_tally` is a
-    // single-pass artifact's record; an IR artifact leaves it zeroed, so
-    // without this rung the assertion below cannot tell "the guard did not
-    // fire" from "a different backend compiled the method and was never asked
-    // to plan an inline". Those are opposite conclusions.
-    if compiled.used_ir_backend {
-        return Err(
-            "check_guard_hit: callA was compiled by the OPTIMIZING (IR) backend, which \
-             plans no guarded inlines and records no inline_tally — the pin in \
-             `test_pgo02_guarded_virtual_inline` did not take"
-                .to_string(),
-        );
-    }
-    if compiled.inline_tally.speculative_sites == 0 {
+    let tally = compiled_tally(vm, "callA", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
         return Err(format!(
-            "check_guard_hit: callA compiled but speculative_sites == 0              (tally={:?}) — the guard never actually fired, correctness above              only proves normal dispatch works",
-            compiled.inline_tally
+            "check_guard_hit: callA compiled but speculative_sites == 0 (tally={tally:?}) \
+             — the guard never actually fired, so the correctness above only proves \
+             normal dispatch works"
         ));
     }
     Ok(())
@@ -191,11 +493,10 @@ fn check_guard_hit() -> Result<(), String> {
 /// one of those later calls must dispatch to the actual runtime class's
 /// `tag()`, not silently run A's already-inlined body against a receiver
 /// the guard should have rejected.
-fn check_guard_miss() -> Result<(), String> {
-    let mut vm = test_vm();
-    invoke_void(&mut vm, "setCurrent", &[Value::Int(0)]); // A
+fn check_guard_miss(vm: &mut Vm) -> Result<(), String> {
+    invoke_void(vm, "setCurrent", &[Value::Int(0)]); // A
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callCurrent", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callCurrent", &[Value::Int(i)]);
         let want = i + 1;
         if got != want {
             return Err(format!(
@@ -207,11 +508,21 @@ fn check_guard_miss() -> Result<(), String> {
     // The guard (if the flag admitted one) is now baked in for class A.
     // Switch the receiver and confirm every subsequent call still resolves
     // to the ACTUAL runtime class, not the guarded/inlined body.
+    // Without this the phases below run interpreted and the check is empty:
+    // "a mismatched guard falls back to dispatch" is only a claim about
+    // COMPILED code.
+    let tally = compiled_tally(vm, "callCurrent", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_guard_miss: callCurrent compiled but speculative_sites == 0              (tally={tally:?}) — no guard was baked in, so switching the receiver              tests nothing"
+        ));
+    }
+
     let cases: &[(i32, i32)] = &[(1, 1000), (2, 2000), (3, 3000)];
     for &(which, offset) in cases {
-        invoke_void(&mut vm, "setCurrent", &[Value::Int(which)]);
+        invoke_void(vm, "setCurrent", &[Value::Int(which)]);
         for i in 0..20 {
-            let got = invoke_int(&mut vm, "callCurrent", &[Value::Int(i)]);
+            let got = invoke_int(vm, "callCurrent", &[Value::Int(i)]);
             let want = i + offset;
             if got != want {
                 return Err(format!(
@@ -227,10 +538,9 @@ fn check_guard_miss() -> Result<(), String> {
 /// A callee that throws, called past the compile threshold: verifies a
 /// guard-eligible call site's exception + catch control flow is unchanged
 /// once compiled.
-fn check_thrower() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_thrower(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callThrowerCaught", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callThrowerCaught", &[Value::Int(i)]);
         let want = if i == 7 { -1000 - i } else { i + 1 };
         if got != want {
             return Err(format!(
@@ -246,11 +556,10 @@ fn check_thrower() -> Result<(), String> {
 /// classification every call must still dispatch correctly — proving the
 /// widened admission path doesn't corrupt a shape it was never meant to
 /// guard.
-fn check_polymorphic() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_polymorphic(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
         let which = i % 4;
-        let got = invoke_int(&mut vm, "callPoly", &[Value::Int(i), Value::Int(which)]);
+        let got = invoke_int(vm, "callPoly", &[Value::Int(i), Value::Int(which)]);
         let want = i + [1, 1000, 2000, 3000][which as usize];
         if got != want {
             return Err(format!(

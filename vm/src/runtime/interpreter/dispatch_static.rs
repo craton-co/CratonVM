@@ -46,17 +46,33 @@ pub(super) fn execute_invokestatic(
     // SyntheticStub registrations on real-protected classes must not suppress
     // loading the real owner. Otherwise the first call materializes a stub and
     // seeds a native invoke-cache entry before real bytecode can take over.
-    let direct_native_registered = shared
-        .natives
-        .native_methods
-        .find(&method_class_name, &method_name, &method_descriptor)
-        .is_some();
-    let direct_synthetic_stub_may_yield = direct_native_registered
-        && shared.natives.native_methods.kind_of(
-            &method_class_name,
-            &method_name,
-            &method_descriptor,
-        ) == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+    // ONE registry probe, not two (ARCH-2026-08-04, native-dispatch pass).
+    //
+    // This was `find(..).is_some()` immediately followed by `kind_of(..)` on
+    // the *same* triple. Both funnel into `slot_for_exact`, and each pass
+    // hashes the class name, probes the `classes_with_natives` prefilter,
+    // hashes name + descriptor, indexes, and then verifies all three strings —
+    // so the pair did that work twice, back to back, on the `invokestatic`
+    // resolution path. `find_with_kind` returns both facts from one pass.
+    //
+    // Behaviour is identical *for this comparison*, which is the only thing
+    // that made the merge safe and is worth writing down. The two forms differ
+    // on the cold descriptor-quirk path: `kind_of` is `slot_for_exact`-only, so
+    // a quirk match gives `None`, while `find_with_kind` deliberately reports
+    // `Bridge` there (its own comment explains why it does not report the true
+    // kind — that would change which natives the real-JDK `SyntheticStub` drop
+    // applies to). Neither `None` nor `Bridge` equals `SyntheticStub`, so
+    // `direct_synthetic_stub_may_yield` is `false` either way. `find` and
+    // `find_with_kind` also share the same `slot_for_exact`-then-quirks
+    // structure, so `.is_some()` agrees on every input.
+    let direct = shared.natives.native_methods.find_with_kind(
+        &method_class_name,
+        &method_name,
+        &method_descriptor,
+    );
+    let direct_native_registered = direct.is_some();
+    let direct_synthetic_stub_may_yield = direct
+        .is_some_and(|(_, kind)| kind == cratonvm_native_api::NativeKind::SyntheticStub)
         && real_protected_stub_class(&method_class_name);
     let direct_native = direct_native_registered && !direct_synthetic_stub_may_yield;
     let is_native = direct_native

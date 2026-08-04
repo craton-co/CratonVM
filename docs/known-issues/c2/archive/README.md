@@ -31,9 +31,9 @@ existed.
 | `seam-01-x64-backend-split.md` | `60e297ec9` | all of it — `x64.rs` 40,588 → 2,539 lines | — |
 | `seam-02-invoke-dispatch-split.md` | `44aabd78b` | all of it — the interpreter's two files 26,775 → 8,158 and 24,817 → 3,941 | — |
 | `hir-01-lowering-contract.md` | `a628e18cb` | the contract is settled; four levels, not three | — |
-| `hir-02-mir-regalloc-handoff.md` | `d0ad74f1a` | the shadow selection pass exists and was measured | isel covers 15.7–19.0% on real code and `Rule::Lea`/`AluImm` fire zero times — six 32-bit pattern rows are the named next step, and nobody owns them |
+| ~~`hir-02-mir-regalloc-handoff.md`~~ **RETIRED 2026-08-04** | `d0ad74f1a`, then `fix/hir02-mir-regalloc-handoff-20260804` | the selector has a production caller (`CRATONVM_JIT=ir-isel-emit`, default off, fail-closed) with a byte-equality oracle that found 0 disagreements over a real workload; the `lea_r32_m` row landed and `Rule::Lea` fires 26 tiles where it fired none; the vector-pool hazard is the caller's to state | emitting the rules byte equality cannot cover, and increment 3 — both with their reasons in `docs/internal/hir-02-mir-regalloc-handoff-RETIRED-20260804.md` |
 | `pgo-01-call-site-evidence-gap.md` | `e183ccc41` | `invokestatic`/`invokespecial` feed `MethodProfile::call_sites` | — |
-| `pgo-02-guarded-inlining.md` | `76f4ca274` | monomorphic guarded virtual/interface inlining, default-off | bimorphic splicing, a deopt-capable guard, `StableType` invalidation, the metrics harvest — all still listed open in `docs/feature-designs/profile-guided-inlining.md` §8 |
+| `pgo-02-guarded-inlining.md` | `76f4ca274`, residuals 2026-08-04 | monomorphic guarded virtual/interface inlining, default-off; then bimorphic splicing, the `StableType` index, the tally denominator, the saturated-profile refusal, and a fix for the shipped increment's WRONG-CODE bug (the guard named one class, the spliced body came from another) | a deopt-capable guard, blocked on `deopt::FrameState::caller` being populated — now refused mechanically rather than by convention. See `../../internal/pgo-02-guarded-inlining-RETIRED-20260804.md` |
 | ~~`osr-01-entry-metadata-contract.md`~~ — **moved out 2026-08-04** to `osr-01-entry-metadata-contract-RETIRED-20260804.md` | `c87c65f08`, then finished 2026-08-04 | **all of it**: the metadata contract, the pc-space newtype (`jit/src/osr_coords.rs`), one compile door for all three (`jit/src/compile_gate.rs`) and the frame-view cross-check (`CompiledMethod::osr_home_disagreement`) | — |
 | `osr-02-exit-and-recompile.md` | `4bec5efca` | the per-pc memo already existed; lifecycle counters landed | the exit-state differential, which is the increment the doc called the point of the lane |
 | `verify-01-differential-harness.md` | `923610c81` | `scripts/verify/compare.py`, fixture checks, H2/Tomcat/Spring Boot baselines | the doc's own note that "every lane is easier to land once `verify-01` exists" still stands, and the `cov-*` lanes are the first ones to test that |
@@ -52,9 +52,11 @@ nobody. That is the failure this archive is meant to make visible, and the
 `cov-*` lanes next to it are what a lane doc should look like while its work is
 still open.
 
-**It worked, at least once.** The OSR second door was picked up and closed on
-2026-08-04 *from this table's row*, and the row was where its residual was
-legible enough to be picked up at all. What the lane then found is the argument
+**It worked, three times over.** All three of those unowned residuals — the isel
+pattern rows, `pgo-02`'s bimorphic splicing, and the OSR second door — were
+picked up and closed on 2026-08-04, each *from its row in this table*, and the
+row was where the residual was legible enough to be picked up at all. What the
+OSR lane then found is the argument
 for keeping the archive rather than for trusting it: its brief's four items had
 been triaged into "one remaining", and finishing them turned up **three** compile
 doors where the brief said two, a code-cache cap neither direct door had ever
