@@ -109,6 +109,33 @@ present in **both** CratonVM modes and is therefore not a strict-mode defect.
 on ISO timestamps only; with timestamps and numerals normalised, **0 of 10**
 differ.
 
+### Repeated, because a single pass hid a second defect
+
+Eight runs per arm rather than one, after a lone verification run came back with
+a truncated transcript that a first reading took for a regression:
+
+| binary | mode | completed 9/9 | hung | other |
+|---|---:|---:|---:|---:|
+| this branch | `--jdk-only` | 6 | 1 | 1 |
+| this branch | `--real-jdk` | 6 | 2 | 0 |
+| `dev` | `--jdk-only` | **0** | 0 | **8** |
+| `dev` | `--real-jdk` | 6 | 2 | 0 |
+
+The `dev` / `--jdk-only` row is this defect at full strength: eight runs, none
+of them clean, 16 `UnsatisfiedLinkError` lines apiece, `net` and `concurrent`
+both dead, `nio` returning `0`, and four system properties missing. **0/8 → 6/8**
+is what the fix buys.
+
+The residual 2/8 is a **different, pre-existing, mode-independent** defect —
+the `dev` binary hangs at the same rate under `--real-jdk`, which no
+`JdkOnly`-gated change can cause. Filed separately as
+[bounded socket operations hang about one run in five](../known-issues/bounded-socket-operations-hang-about-one-run-in-five.md),
+with a HotSpot control (12/12 clean at the same host load) that is what
+distinguishes it from contention.
+
+Worth stating plainly: a *single* verification run would have reported this fix
+as a regression, because the one sample it drew happened to be a hang.
+
 ### The probe had to be made hang-proof first
 
 The first two attempts at the strict census produced no census at all: the run
