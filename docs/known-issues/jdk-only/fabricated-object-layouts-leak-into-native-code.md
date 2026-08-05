@@ -398,8 +398,56 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `java/security/CodeSource` 1, `java/io/BufferedWriter` / `BufferedReader` /
     `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
     / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
-    0/1. **None is fixed yet**; each is its own change with its own A/B, and the
-    list is this lane's output.
+    0/1. Each is its own change with its own A/B, and the list is this lane's
+    output. **`ThreadGroup` is FIXED (2026-08-05); the rest are open.**
+
+    ### Reading a NAME row — `ThreadGroup`, worked through
+
+    **A NAME row says the model and the image disagree. It does not say which
+    of the two is wrong, and for `ThreadGroup` the answer was BOTH, in
+    different places.** Tracing it is the whole job; four of the six reported
+    access sites turned out not to be defects at all.
+
+    The natives (`native-builtins/src/phases_late/concurrent.rs`) go through
+    `tg_slot`, which resolves the field **by name first** and only falls back
+    to a hard-coded index. On a real image every `ThreadGroup` declares all
+    four names, so the fallback is never reached and those writes were already
+    landing on the right fields — they were reported only because the *model*
+    they were being compared against was transposed. Fixing them would have
+    entrenched the bug; the fix was to correct the model
+    (`synthetic_stub_fields` now declares the real `parent, name, maxPriority,
+    daemon` order) and the fallback constants with it, under a test that
+    asserts the two tables agree **and** that they are the JDK's order — so a
+    future transposition of both together still fails.
+
+    Behind those four sat one real defect, on the one path that used a raw
+    index: `SecurityManager.getRootGroup` wrote the fields by name and then
+    wrote them **again** by raw index 0..3 in the legacy order, guarded by
+    `object_num_fields >= 4`. The raw pass ran second and won. Measured on the
+    pre-fix binary through `MethodHandles.findVirtual` (reflection cannot see a
+    registered native — `getDeclaredMethod` scans the real class's metadata and
+    answers `NO_SUCH_METHOD`):
+
+    | | pre-fix | post-fix / HotSpot |
+    |---|---|---|
+    | `getName()` | **null** | `system` |
+    | `getParent()` | **a `java.lang.String`** | null |
+    | `getMaxPriority()` | **0** | 10 |
+    | `isDaemon()` | **true** | false |
+
+    A `String` returned where every caller expects a `ThreadGroup` — the same
+    live shape as L1's `classloader_parent`. The guard it sat behind is the one
+    this record keeps describing: `object_num_fields >= 4` stops an
+    out-of-range write, not a wrong-field one. That is the fourth such guard in
+    this file's story.
+
+    **Two lessons for the remaining eleven classes.** A NAME row is a lead, not
+    a verdict: read the writer before changing it, because a by-name writer
+    under a wrong model produces rows that are noise. And a probe is not an
+    oracle until it goes red on the pre-fix binary —
+    `probes/ThreadGroupLayoutProbe.java` was byte-identical across the two arms
+    on every section until it reached `getRootGroup`, because everything else
+    resolves by name.
   * **The `Object(None)` half is no longer verified only by unit test.** Two new
     cross-type WRITE rows appear that the pre-fix binary is silent on, both
     `Object(None)` over an `int`: `jdk/internal/math/FloatingDecimal$1` slot 0
@@ -450,7 +498,9 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   shadow-layout diff compares CratonVM's `synthetic_stub_fields` model against
   the real layout by NAME, which is a signal the value's type tag does not
   carry — and on its first run it found 23 such slots across 12 classes,
-  including `java/lang/ThreadGroup` with two field pairs transposed. What is
+  including `java/lang/ThreadGroup` with two field pairs transposed (fixed the
+  same day — see the worked example above for why four of its six reported
+  access sites were not defects). What is
   still unfindable is the narrower case where the model slot is **anonymous**
   (`_fN`, declared `Ljava/lang/Object;`): there the model asserts nothing, so
   there is nothing to disagree with, and only a behavioural probe diffed against
