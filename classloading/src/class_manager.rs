@@ -1182,6 +1182,39 @@ fn fire_class_file_load_hook(
     }
 }
 
+/// Write the class bytes a `redefine_class` verification rejected to
+/// `$CRATONVM_DBG_REDEFINE_DUMP/<mangled-name>.class`, so the rejection can be
+/// disassembled with `javap` instead of reasoned about from an offset.
+///
+/// Off unless the variable names a directory; every failure is best-effort and
+/// silent, because this runs on a path that is already returning an error and
+/// must not turn a diagnosable rejection into a second one.
+fn dump_rejected_redefine_bytes(class_name: &str, bytes: &[u8]) {
+    let Ok(dir) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_REDEFINE_DUMP") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let safe: String = class_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // A class can be retransformed more than once in a run and fail every
+    // time; a counter keeps the later attempts from overwriting the first.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("{safe}.{n}.class"));
+    if std::fs::write(&path, bytes).is_ok() {
+        eprintln!(
+            "[REDEFINE-DUMP] rejected bytes for {class_name} ({} bytes) -> {}",
+            bytes.len(),
+            path.display()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WP2.4-B — JIT cache invalidation hook
 // ---------------------------------------------------------------------------
@@ -7601,6 +7634,12 @@ impl ClassManager {
                     error = ?verify_err,
                     "WP2.4-B redefine: bytecode verification failed; rolled back",
                 );
+                // The rejected bytes are the ONLY copy of what the agent
+                // produced — the rollback below throws them away, and the
+                // transformer is not deterministic enough to re-derive them by
+                // hand. `CRATONVM_DBG_REDEFINE_DUMP=<dir>` keeps them so a
+                // rejection can be disassembled instead of guessed at.
+                dump_rejected_redefine_bytes(&existing_name, &effective_new_bytes);
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
                     message: format!("new bytes failed bytecode verification: {verify_err}",),
