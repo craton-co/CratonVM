@@ -5,7 +5,7 @@
  * VM. `probes/AqsBreakdownProbe.java` reports an "empty instance call" at
  * ~431 ns. Both are a compiled loop calling a tiny method. Something between
  * those two shapes costs sixty times more, and that gap is the whole story of
- * `docs/internal/aqs-thread-handoff-latency-RETIRED-20260805.md` — an
+ * `aqs-thread-handoff-latency-RETIRED-20260805.md` — an
  * uncontended `ReentrantLock.lock()`/`unlock()` is 16 nested calls, and
  * 16 x 7 ns is invisible while 16 x 431 ns is 7 us.
  *

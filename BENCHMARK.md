@@ -120,7 +120,7 @@ loops the single-pass backend would lower better, and the seven classes of
 lowering that backend has and the IR tier lacks are enumerated in
 `jit/src/x64/single_pass_only.rs` rather than discovered one regression at a
 time. Detail:
-[`docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`](docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md).
+`perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`.
 
 **Fibonacci is not that, and is still unexplained.** Interleaved against a
 pre-`cov-02` control it measured 8,393–8,572 ms against the merged tree's

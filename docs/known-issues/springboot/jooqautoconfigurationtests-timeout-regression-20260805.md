@@ -23,7 +23,7 @@ against the last full-suite comparison point.
 `Flyway`, `Jackson`, `Rabbit` and `TomcatServletWebServer`
 `AutoConfigurationTests` — were all one bug, the recycled-`JitInvokeInfo`
 dispatch aliasing fixed by `383e7f5cf` (see
-`docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`).
+`fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`).
 All four are green on the fixed binary. **This class is not:** on the same
 binary, same host, same launcher it still HANGs — 900s on Azure and 1200s
 locally. That makes it the negative control for that fix as well as its own
@@ -62,7 +62,7 @@ against ~1s/test on HotSpot (17 tests in 17.9s total).
 
 ## Original regression note (2026-08-05), retained
 
-`docs/internal/fixed-suite-bugs/springboot/jooq-destroy-method-ambiguity-and-hang-FIXED.md`
+`fixed-suite-bugs/springboot/jooq-destroy-method-ambiguity-and-hang-FIXED.md`
 closed this exact class's "Cluster B" hang on 2026-07-18 (a Panama
 downcall-adapter fallback reading field 0 of every invoke-shaped receiver,
 fixed by requiring `java/lang/invoke/MethodHandle` before the adapter read),

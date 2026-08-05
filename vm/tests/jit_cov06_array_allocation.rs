@@ -18,7 +18,7 @@
 //!   * a hot `newarray`/`anewarray` site actually reaches the OPTIMIZING
 //!     tier (checked via `CRATONVM_DBG=ir-compiles`'s "produced a body" line
 //!     — a passing run that never engaged the tier would be vacuous, exactly
-//!     the trap `docs/internal/jit-ir-relocation-map-contract.md` fell into);
+//!     the trap `jit-ir-relocation-map-contract.md` fell into);
 //!   * a negative length throws `NegativeArraySizeException` for real,
 //!     through the pending-exception → interpreter-catch path, not just a
 //!     sentinel value a synthetic caller happens to check;

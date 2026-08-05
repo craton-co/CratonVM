@@ -1111,7 +1111,7 @@ fn populate_inet_holder(
     // answered **null** while `isUnresolved()` still answered false, and
     // `sun.nio.ch.Net.bind`'s first act — `addr.isLinkLocalAddress()` — threw
     // `NullPointerException: … because "addr" is null`. See
-    // `docs/internal/fixed-suite-bugs/serversocket-bind-null-inetaddress-net-sockets-FIXED.md`.
+    // `fixed-suite-bugs/serversocket-bind-null-inetaddress-net-sockets-FIXED.md`.
     //
     // Returns the CURRENT (post-GC) address of `ia` so the caller propagates
     // the live reference instead of its own stale copy.
@@ -1219,7 +1219,7 @@ fn inet_addr_field(ctx: &mut dyn NativeContext, this: ObjectRef, which: usize) -
 /// reintroducing the very divergence this file was corrected for, at an
 /// unpredictable moment. A stable `toString()` is worth the one lost mutation;
 /// the difference is recorded in
-/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`.
+/// `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`.
 fn inet_addr_host_name_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let name = inet_addr_field_string_or(ctx, this, IA_HOST, "");
     if !name.is_empty() {

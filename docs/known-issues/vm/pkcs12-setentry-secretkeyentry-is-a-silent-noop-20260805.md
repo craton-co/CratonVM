@@ -37,7 +37,7 @@ that writes a keystore and checks for an exception is told it worked.
 `JdkOnlyPlatformProbe` prints the round-trip result as a value
 (`p12=false`) rather than as an absence of exceptions. This is the
 "print values, not `ok`" rule from
-[L8](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md)
+L8 (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`)
 earning its place: every step here *succeeded*.
 
 ## Where to start
