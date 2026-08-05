@@ -122,6 +122,42 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
 
+      # The stub ratchet's sibling, and BLOCKING for the same reasons it is.
+      # Contract 1.5 defines a `Bridge` by its `ACC_NATIVE` target; 10,069 of the
+      # 10,842 `Bridge` registrations have none, every one of them inherited its
+      # kind from an ambient `set_category`, and this is what stops that number
+      # rising. See docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
+      #
+      # WHY HERE AND NOT ONLY IN THE ADVISORY `jdk-only` JOB. That job is
+      # advisory for two documented reasons — wave 1 is measurement, and the
+      # strict corpus is not green — and NEITHER applies to this gate: it
+      # measures the `Compatible`-mode registry against a real image, is
+      # deterministic today, and has a committed baseline. Left only there, a new
+      # unadjudicated `Bridge` printed an error and failed nothing, which is the
+      # decorative-guard shape the lane exists to avoid. The `jdk-only` step
+      # stays as the multi-JDK/multi-OS probe that reports its ungated legs.
+      #
+      # `ubuntu-latest` only, exactly like its sibling above, and for a sharper
+      # reason: baselines are keyed `<jdk-feature>/<os>` because the registrars
+      # are platform-conditional, and `25/linux` is the only committed key. On
+      # the windows leg the gate would (correctly) refuse with exit 2, so it is
+      # not run here rather than made to look green.
+      #
+      # Prerequisites are already satisfied by earlier steps in this job: `Set up
+      # JDK 25` exports JAVA_HOME (the image under audit), and `Build`
+      # (`cargo build --workspace`) leaves target/debug/cratonvm for the script
+      # to find. The census is profile-invariant — verified byte-identical debug
+      # vs release — so the debug binary scores the numbers the baseline was
+      # frozen from.
+      #
+      # The script self-tests its own gate logic first, hermetically, and
+      # refuses to take a census if that fails. Exit codes: 1 the ratchet fired,
+      # 2 refused to adjudicate (never a pass), 3 a prerequisite is missing. All
+      # three fail this job; that is the point of it being here.
+      - name: Bridge ratchet (unadjudicated Bridge registrations)
+        if: matrix.os == 'ubuntu-latest'
+        run: sh regression-suite/bridge-ratchet.sh
+
       # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
       # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an
       # unwired resolution cache alive that way, through a 2026-07-26 audit that
