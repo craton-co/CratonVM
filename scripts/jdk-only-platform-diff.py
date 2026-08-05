@@ -35,6 +35,24 @@ are a genuine ACC_NATIVE bridge only on Windows** — including all nine
 `WindowsSocketOptions` entries, the `WinNTFileSystem` family, and
 `PlatformGraphicsInfo.hasDisplays0`, whose `JDK-ONLY-CLASSIFY: bridge` marker
 was right all along and unprovable on Linux.
+
+THE "DEAD ON BOTH" COUNT IS NOT A DELETION LIST
+-----------------------------------------------
+
+Rows absent from both images split in two, and only one half is a defect:
+
+* **A JDK namespace** (`java.`, `javax.`, `jdk.`, `sun.`, `com.sun.`): a name
+  that should be in the image and is in neither. These are the deletion
+  candidates — but only for the JDK version measured. A registration dead on
+  JDK 25 may be the live one on JDK 21, and this tool cannot see that, so the
+  list is a starting point for a version sweep, not a delete-me list.
+* **Everything else** — `org.springframework.`, `io.netty.`, `groovy.`,
+  `cratonvm/synthetic/…`: third-party shims and VM-minted classes. They are
+  absent from a JDK image *by construction* and are live whenever the
+  application supplies them. Deleting one because a JDK census called it
+  ABSENT would remove a working native.
+
+The split is printed below so nobody has to re-derive it.
 """
 import json
 import sys
@@ -107,10 +125,25 @@ def main(argv):
         for f, n in by_file.most_common():
             print("  %5d  %s" % (n, f))
 
-    both_absent = sum(1 for ra, rb in zip(a_rows, b_rows)
-                      if verdict(ra) == "ABSENT" and verdict(rb) == "ABSENT")
-    print("\nrows ABSENT on BOTH images (dead on every platform, deletion "
-          "candidates): %d" % both_absent)
+    jdk_prefixes = ("java/", "javax/", "jdk/", "sun/", "com/sun/")
+    both_absent = [ra for ra, rb in zip(a_rows, b_rows)
+                   if verdict(ra) == "ABSENT" and verdict(rb) == "ABSENT"]
+    jdk_dead = [r for r in both_absent if r["class"].startswith(jdk_prefixes)]
+    other = len(both_absent) - len(jdk_dead)
+    print("\nrows ABSENT on BOTH images: %d" % len(both_absent))
+    print("  in a JDK namespace — the deletion candidates, for THIS JDK "
+          "version only: %d" % len(jdk_dead))
+    print("  third-party or VM-minted names, absent by construction and live "
+          "when the app supplies them: %d" % other)
+    if jdk_dead:
+        by_file = Counter((r.get("registered_by") or "?").rsplit(":", 1)[0]
+                          for r in jdk_dead)
+        print("\n  JDK-namespace dead registrations, by registering file:")
+        for f, n in by_file.most_common(15):
+            print("    %5d  %s" % (n, f))
+        print("\n  A registration dead on this JDK may be the live one on an "
+              "older JDK.\n  Sweep the versions you support before deleting "
+              "any of these.")
     return 0
 
 
