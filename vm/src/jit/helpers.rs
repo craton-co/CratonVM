@@ -9411,36 +9411,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         Some(Value::Long(v)) => v,
         Some(Value::Float(f)) => f.to_bits() as i64,
         Some(Value::Double(d)) => d.to_bits() as i64,
-        Some(Value::Object(Some(obj))) => {
-            // Object-return handoff root — the same contract every other
-            // object-returning JIT native fast path honours, and the one this
-            // path was missing.
-            //
-            // What comes back here is a bare address. The native that produced
-            // it has returned, so nothing roots the object any more: it is not
-            // on a Java frame, not in `native_pin_roots`, and the compiled
-            // caller has not stored it yet. `native_pending_return` is what the
-            // collector scans (`roots.rs`) and remaps (`gc.rs`) to cover
-            // exactly that window; without it the next allocation or safepoint
-            // between here and the caller's store can move or reclaim the
-            // object, and compiled code keeps using the stale address.
-            //
-            // The `ThreadCurrentThread` arm above already did this — its own
-            // comment calls it "the same contract as every other JIT native
-            // fast path" — but the general callback arm, which is what serves
-            // every ordinary native, did not.
-            //
-            // Symptom when it bites: a reference-returning JDK/library method
-            // hands compiled code a dead reference. It surfaced as Spring's
-            // `MergedAnnotations.from(..)` — a static factory that cannot
-            // return null — coming back null through
-            // `AnnotatedElementUtils.getAnnotations`, failing configuration-class
-            // parsing in several `spring-boot-kafka` / `-pulsar` / `-hazelcast`
-            // tests. JIT-only, and intermittent because it needs a collection
-            // to land inside that window.
-            thread.native_pending_return = Some(obj);
-            obj.as_ptr() as i64
-        }
+        Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
         Some(Value::Object(None)) | None => 0,
         Some(_) => 0,
     })
