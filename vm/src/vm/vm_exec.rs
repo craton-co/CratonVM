@@ -25698,9 +25698,20 @@ mod tests {
         let boxed = proxy_box_value(&shared, Value::Double(2.5));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Double(2.5));
+                // Same unexplained full-suite-only flake as
+                // `t19_h6_cas_field_double_field_roundtrip`; name the class and
+                // the slot so the next occurrence carries its own evidence
+                // instead of just a value mismatch.
+                let got = shared.mem.heap.get_field(obj, 0);
+                assert_eq!(
+                    got,
+                    Value::Double(2.5),
+                    "boxed Double slot 0 held {got:?}; box class_id={:?} kind={:?}",
+                    shared.mem.heap.class_id_of(obj),
+                    shared.mem.heap.kind_of(obj),
+                );
             }
-            _ => panic!("Expected Object(Some(...))"),
+            _ => panic!("Expected Object(Some(...)), got {boxed:?}"),
         }
     }
 
@@ -26550,8 +26561,20 @@ mod tests {
             shared: &shared,
             thread: &mut thread,
         };
+        // Read the slot back BEFORE the CAS, so a failure reports what was
+        // actually there rather than only that the CAS said no. This test
+        // fails in roughly 1 of 25 full-suite runs and never in 30 isolated
+        // runs of `vm::vm_exec::tests`; the bare "must succeed" message is a
+        // large part of why the cause is still unknown, since it cannot
+        // separate a mis-decoded descriptor from a slot holding something
+        // else entirely.
+        let before_cas = ctx.get_field_volatile(obj, 0);
         let swapped = ctx.compare_and_swap_field(obj, 0, Value::Double(2.5), Value::Double(7.5));
-        assert!(swapped, "Double CAS with same-tag expected must succeed");
+        assert!(
+            swapped,
+            "Double CAS with same-tag expected must succeed; the slot held \
+             {before_cas:?} just before the CAS, expected Double(2.5)"
+        );
         assert_eq!(ctx.get_field_volatile(obj, 0), Value::Double(7.5));
     }
 
