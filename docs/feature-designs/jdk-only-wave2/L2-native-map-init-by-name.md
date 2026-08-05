@@ -1,5 +1,10 @@
 # L2 — `native_map_init`'s raw `MAP_FIELD_*` branch → by-name
 
+> **DONE 2026-08-04**, branch `fix/jdk-only-l2-mapinit-byname-20260804`.
+> What was actually done and measured is in *Outcome* at the bottom; the
+> sections above are the plan as written, left unedited so the two can be
+> compared. **L10 can rebase now.**
+
 **Owns:** `native-collections/src/lib.rs` (whole file — 55k lines, one owner)
 **Gated on:** nothing.
 **Conflicts:** L10 (real `ThreadPoolExecutor` init) is in the same file. **Land
@@ -64,3 +69,119 @@ native-backed `HashMap` path alone.
 
 `Properties` slot 2 is gone, the `HashMap` family is unchanged or its change is
 justified in the record, and the 94 collections tests pass.
+
+---
+
+## Outcome (2026-08-04)
+
+### What the fix is
+
+`receiver_table_slot(ctx, this)` resolves `table` **by name on the receiver's
+own class id**, bounded by the receiver's allocated slot count.
+`publish_map_table{,_volatile}` is the one idiom every bucket-publishing site
+now uses:
+
+* slot 0 (`MAP_FIELD_BUCKETS`) always — every other native map op reads it, and
+  the native surface stays the authoritative `HashMap` implementation;
+* the receiver's real `table` when that is a different slot;
+* the legacy `Int(capacity)` at slot 2 **only when the receiver has no `table`
+  field at all**, which is what "our fabricated layout" means.
+
+The predicate is a field NAME the real class declares, never a count — the
+fabricated `cratonvm/util/MapViewBacking` is *wider* than a real `HashMap`, so
+a count test would have been the fourth guard in this file's story that cannot
+fail.
+
+The plan named `native_map_init`. The same fixed-class lookup was in **five**
+functions: `native_map_init`, `native_map_init_capacity`, `map_resize`,
+`resync_view_set` and `map_state`'s bucket fallback, plus a read in
+`hashmap_serialized_capacity`. Step 3 (`native_props_init`) became
+`props_defaults_slot`, through which both writers and all three chain readers
+now go.
+
+### The scope note in *The part that needs care* was right, and narrower than it looks
+
+The `HashMap` family did change, deliberately and measurably: the sites writing
+`Int(cap)` at absolute slot 2 unconditionally (`new HashMap<>(map)`, `Map.of`,
+`Set.of`, `newKeySet`, the `HashSet` backings) were writing an int into the
+REAL `table` field of a real-layout receiver, while `native_map_init` next door
+already stored the bucket array there. They now agree. Nothing reads the
+dropped `Int`: `map_state` derives capacity from the array's length and only
+falls back to slot 2 when there is no array.
+
+### Measured
+
+A/B, pre-fix vs post-fix binary, same workload, four probes × both modes,
+JDK 25:
+
+| row | pre | post |
+|---|---:|---:|
+| `java/util/Properties` slot 2 `Object` over `I` | 40 | **0** |
+| `java/util/Properties` slot 3 `Object` over `F` | 12 | **0** |
+| `java/util/HashMap` slot 2 `Int` over `[` | 66 | **0** |
+| every other census row | — | byte-identical |
+
+`JdkOnlyCensusLoadProbe` alone: `Properties` slot 2 **3 → 0**, the number this
+doc predicted. Probe transcripts identical pre/post but for an ephemeral TCP
+port and a timing line. `test_classes` corpus identical in `Compatible` mode
+with timestamps normalised, all 10 members. 101 `--lib` tests
+(94 + 7 new) green in both feature configurations, and all 8 integration
+targets — including `gc_relocation_harness`, which had not compiled since
+`gc_overlay_roots_for_collection` grew a parameter.
+
+The benign `HashMap` slot-1 row moved 8,256 → 8,318. That is the
+`stringPropertyNames` fix below building one more set per call, not this
+change; the row's own spread on an unmodified binary is ±4 on a single probe
+(1634 / 1636 / 1638 over three runs), so it does not resolve at that scale
+anyway.
+
+### Each new test was shown to fail
+
+Seven unit tests, then the pre-fix resolver injected (resolve on a fixed
+`java/util/HashMap`; always the raw props slot) — four fail, including the
+flagship `Properties` one, and revert restores green. The flagship test needed
+the fixture to declare the real `HashMap` layout *as well*: without a loaded
+`HashMap` for the old code to find an index on, it passed vacuously. That is
+the shape of the "guard that cannot fail" this feature keeps producing, caught
+this time by doing the injection instead of assuming it.
+
+### New instrument
+
+`probes/MapLayoutMatrixProbe.java` — 78 deterministic, order-normalised lines
+over the `defaults` chain, `HashMap.writeObject`'s `table` walk,
+spliterator/view paths, resize boundaries and a `Hashtable` control section.
+Run under HotSpot FIRST; it immediately falsified an assumption (the `defaults`
+chain already worked through the side table, so this fix moved no *behaviour*
+there — it stopped destroying `threshold` / `loadFactor`, which nothing
+observes today and which is exactly why it is a latent defect and not a bug
+report).
+
+It also found, and this change does NOT fix, four divergences from HotSpot 25
+that are not layout defects: `Properties.getProperty(null)` /
+`setProperty(k, null)` / `put(null, v)` / `load(null)` do not throw NPE;
+`HashMap` iteration raises no `ConcurrentModificationException`; `Hashtable`
+accepts null keys and values; `new Hashtable<>(h).equals(h)` is false. They are
+recorded in the evidence file. One divergence it did fix, in a second commit:
+`stringPropertyNames()` did not walk the `defaults` chain while
+`propertyNames()` did — `--dump-native-registry` named
+`properties_sidetable.rs` as the live owner of the triple, so the
+`native-collections` implementation that *does* walk it never runs.
+
+### Still open, deliberately
+
+* **L4 gap 3.** `native_props_init`'s `Object(None)` over `loadFactor` is fixed
+  but its absence is verified by unit test, not by the census: the hunter still
+  cannot see a null written over a primitive. Widening it is L4's lane and
+  L4's re-measurement.
+* **Same-kind wrong-slot writes remain invisible** (L4 gap 2). Slot 0 on a real
+  `HashMap` is `AbstractMap.keySet`, and we store the bucket array there
+  deliberately; no instrument in the tree reports that, and this change does not
+  add one.
+
+### Verified on
+
+Windows 11 / JDK 25.0.3 (Temurin), release binaries built from
+`d81e220b3` (pre) and this branch (post). The shared Linux build host refused
+connections for the whole session, so the Linux half is **not** covered —
+`native-collections` has no host-conditional code, but that is an argument, not
+a measurement.
