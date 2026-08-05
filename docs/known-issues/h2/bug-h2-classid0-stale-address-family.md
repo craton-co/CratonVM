@@ -453,6 +453,60 @@ moving collection un-rewritten still carries a forwarding pointer and
 `get_header` hard-panics on the first read with holder attribution, instead of
 reading an all-zero header minutes later on another thread.
 
+### A second young witness, and it narrows the question to ROOT COLLECTION
+
+Same binary, same class, later the same day — and this one is as clean as this
+family gets:
+
+```
+WARN  …gc_quiescence: [moving-young] fallback #1: reason=unregistered-jit-frame-on-stack   [18:26:21]
+WARN  …vm_exec: NoSuchMethodError                                                          [18:26:28]
+      method="java/lang/Object.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+      caller="java/sql/DriverManager.getConnection(String,String,String)Connection @pc=19"
+ERROR …gc::guard: receiver is inside a YOUNG span the non-moving sweep zeroed and
+      returned to the free list.  obj="0x2004940a3d0" actual_class_id=0
+      freed_span="0x20049406020+0x75e8" interior_off=17328 sweep_cycle=0 free_seq=2525
+```
+
+`DriverManager.getConnection(String,String,String)` is four bytecodes long
+before the failure:
+
+```
+ 0: new java/util/Properties ; 3: dup ; 4: invokespecial Properties.<init>()V
+ 7: astore_3                               <- `info`, LOCAL 3
+ 8: aload_1 ; 9: ifnull 20
+12: aload_3 ; 13: ldc "user" ; 15: aload_1
+16: invokevirtual Properties.put(Object,Object)     <- fails; @pc=19 is the `pop` after it
+```
+
+So the victim is a **brand-new `java.util.Properties`, held in LOCAL 3 of the
+frame that is executing right now**, reclaimed between its constructor and its
+first use. The seven seconds between the fallback line and the failure are the
+pause: the thread was stopped at a safepoint across that sweep and resumed into
+`put`.
+
+**What that rules out.** `ROOT_IN_DEAD_SPANS` — unconditional, and it RETAINS
+the span rather than freeing it — did **not** fire for this span. That invariant
+compares the doomed spans against `roots` + `finalizer_addrs`, i.e. the exact
+slice the mark phase was handed. Its silence therefore says the address was
+**not in the root slice at all**. Combined with the `SWEEP_LIVENESS` heap-edge
+result (`hits=0`, §above), the mark phase neither dropped a root it was given
+nor missed a heap edge:
+
+> the root slice handed to the sweep did not contain a live top-frame local of
+> a thread stopped at a safepoint.
+
+That is a **root COLLECTION** question, not a mark or sweep question, and it is
+where the next instrument belongs. Note also that all three frame-root paths
+already screen operand-stack roots with `is_heap_addr` rather than the strict
+`is_object_address` header probe (see `scan_frame_roots`' doc comment), so the
+mid-init-object hole that shape would otherwise have is already closed — this
+witness is on the fixed code.
+
+`sweep_cycle=0` is worth keeping too: this is the FIRST non-moving young sweep
+of the process. Whatever the gap is, it does not need a long-running heap or an
+accumulated free list to appear.
+
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
 Recorded so they are not re-derived; each cost a build-and-soak cycle. These
