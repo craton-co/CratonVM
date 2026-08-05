@@ -168,6 +168,20 @@ every run passed:
 | **whole package `org.springframework.boot.env`, one JVM, 134 tests of JIT warm-up** — the closest thing to the suite run it was filed from | 3 JIT + 1 `--nojit` | PASS |
 | `probes/GrowCopyStress.java`, the shared-shape hypothesis, content-verified | seq / `--nojit` / 8-concurrent / tight heap | PASS (hypothesis eliminated) |
 
+**The harness is not the difference.** `run-spring-boot-suite.ps1` launches
+CratonVM as
+
+```
+<exe> --java-home <jdk> --Xmx <heap> --stack-dump-on-timeout 0       -Dfile.encoding=UTF-8 -Djava.awt.headless=true -cp <cp> SbRunner <class>
+```
+
+which is flag-for-flag what `sb-class-oracle.sh` / `sb-yaml-method-oracle.sh`
+issue, against the same JDK, classpath, working directory and heap. Note also
+that the suite runs **one class per process** — so it never gave this test the
+thousands-of-tests JIT warm-up that a single-JVM module run would, and the
+"insufficient warm-up" theory for why it no longer reproduces is wrong on the
+suite's own terms. The conditions above are the filed conditions.
+
 11 of those are on the pre-fix binary (3 at 2 g, 2 at 1 g, 6 pinned) and all
 PASS — see [Re-verification](#re-verification-2026-08-05). Every lever below
 answers a question about a failure that no longer occurs, so running them now
