@@ -85,6 +85,7 @@ fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
         ("toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;"),
         // The plain ones it also forced.
         ("equals", "(Ljava/lang/Object;)Z"),
+        ("hashCode", "()I"),
         ("endsWith", "(Ljava/lang/String;)Z"),
         ("indexOf", "(Ljava/lang/String;)I"),
         ("lastIndexOf", "(Ljava/lang/String;)I"),
@@ -129,31 +130,41 @@ fn real_jdk_registry_keeps_the_one_genuine_string_bridge() {
     );
 }
 
-/// `String.hashCode()` survives the drop, and for a reason that is not speed.
+/// `String.hashCode()` does NOT survive the drop -- the bytecode won it back.
 ///
-/// The real `String.hashCode()` bytecode is WRONG on this VM for any string
-/// whose backing array is UTF-16: it hashes the first `length()` BYTES of that
-/// array, sign-extended to `char`, instead of the `length()` code units. The
-/// object is fine — `length`, `charAt` and `equals` on it all agree with
-/// HotSpot — so the defect is in what `hashCode` dispatches to. Measured with
-/// `probes/StringUtf16HashProbe`; filed as
-/// `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`.
+/// It was promoted to `Intrinsic` on 2026-08-05 for CORRECTNESS: the real
+/// `String.hashCode()` was wrong for any UTF-16 string, because
+/// `ArraysSupport.vectorizedHashCode` read one byte per char under `T_CHAR`
+/// instead of pairing them. That defect is fixed, so the registration had to
+/// argue on performance again -- and lost.
 ///
-/// Dropping this registration therefore replaces a correct answer with a wrong
-/// one for every non-ASCII `String` key in the VM. When the `StringUTF16`
-/// defect is fixed, re-measure and probably delete this registration: at that
-/// point it is a pure performance optimisation again (the ~1950x caching win
-/// it was originally written for) and has to argue on those terms.
+/// Measured A-B-B-A interleaved, three rounds, `probes/StringHashCostProbe`,
+/// identical digests (medians, ms):
+///
+/// ```text
+///           cold-latin1  cold-utf16  warm  map-utf16
+///   native       89         135        5      110
+///   bytecode     95         149        2      111
+/// ```
+///
+/// Faster on the first hash of a distinct string, 2-4x SLOWER on the cached
+/// read, a wash on the realistic `HashMap<String,_>` workload. Both sides
+/// cache in the same `String.hash` field, so the warm gap is
+/// `safe_native_call` overhead on one field read. Contract 1.4's default is
+/// the bytecode and a "wash" does not license shadowing it.
+///
+/// This test is here so re-promoting it is a decision rather than a reflex: if
+/// it comes back, it comes back with suite numbers and a `register_with_kind`.
 #[test]
-fn real_jdk_registry_keeps_string_hash_code_because_the_bytecode_is_wrong() {
+fn string_hash_code_is_left_to_the_bytecode() {
     let shared = shared();
-    assert_eq!(
+    assert!(
         shared
             .natives
             .native_methods
-            .kind_of("java/lang/String", "hashCode", "()I"),
-        Some(cratonvm_native_api::NativeKind::Intrinsic),
-        "java/lang/String.hashCode()I must survive the real-JDK `Bridge` drop, stated          `Intrinsic`. It is not kept for speed: the bytecode it would fall through to          hashes the backing BYTES sign-extended rather than the UTF-16 code units, so          `ΣΟΣ`.hashCode() returns 62956255 where the JLS (and HotSpot) say          924359 — while `charAt`/`length`/`equals` on the same object are all correct. See          docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md."
+            .find("java/lang/String", "hashCode", "()I")
+            .is_none(),
+        "java/lang/String.hashCode()I is registered again in a real-JDK registry. It was          measured (A-B-B-A interleaved, `probes/StringHashCostProbe`) as a wash overall and          2-4x SLOWER than the bytecode on the cached read, which is the case that dominates          real workloads. If new numbers say otherwise, bring them and use          `register_with_kind(.., Intrinsic)` -- a plain `register` here is dropped anyway, so          this failing means somebody added a kind without the measurement."
     );
 }
 
@@ -223,15 +234,19 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
 /// present. Both passed while the drop was silently deleting **four**
 /// registrations nobody had thought to name:
 ///
-/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` -- the F4 workaround for a
-///   generic `Preconditions` override that threw the wrong exception class.
-///   Without them `"Hello, World".substring(-1)` raised
+/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` / `checkIndex` -- the F4
+///   workaround for a generic `Preconditions` override that threw the wrong
+///   exception class. Without them `"Hello, World".substring(-1)` raised
 ///   `ArrayIndexOutOfBoundsException`, which `catch
-///   (StringIndexOutOfBoundsException)` does not catch. (Both are gone again
-///   as of the `native-builtins/src/preconditions.rs` fix -- deliberately, and
-///   with the underlying override honouring `SIOOBE_FORMATTER` so the real
-///   bytecode gets the class right. If they reappear here, the override
-///   regressed;)
+///   (StringIndexOutOfBoundsException)` does not catch, and `charAt`'s class
+///   depended on the SIGN of the argument: a negative index reached
+///   `Preconditions` and came back AIOOBE while an index past the end came
+///   back SIOOBE. **All three are deliberately gone again** as of the
+///   `native-builtins/src/preconditions.rs` fix -- the override honours
+///   `SIOOBE_FORMATTER` now, so the real bytecode gets the class *and* the
+///   message right, which the bypasses never did for `substring`. If any of
+///   them reappears in this list, that override regressed and re-adding a
+///   bypass here would hide it from every non-`String` caller again;
 /// * `<init>(Ljava/lang/StringBuilder;)V` and its `AbstractStringBuilder`
 ///   sibling -- DF05. Without them `new String(sb)`, for a builder holding
 ///   seven characters, returned four: the real ctor's `Arrays.copyOfRange`
@@ -290,7 +305,6 @@ Intrinsic codePoints()Ljava/util/stream/IntStream;\n\
 Intrinsic format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
 Intrinsic format(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
 Intrinsic formatted([Ljava/lang/Object;)Ljava/lang/String;\n\
-Intrinsic hashCode()I\n\
 Intrinsic indent(I)Ljava/lang/String;\n\
 Intrinsic isBlank()Z\n\
 Intrinsic lines()Ljava/util/stream/Stream;\n\

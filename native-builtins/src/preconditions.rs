@@ -74,7 +74,7 @@
 //! `invokedynamic` anywhere.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{out_of_bounds_message, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Which `Preconditions` check failed. Selects both the `checkKind` string the
@@ -110,15 +110,12 @@ impl CheckKind {
         }
     }
 
-    /// `Preconditions.outOfBoundsMessage(checkKind, args)`, verbatim.
+    /// `Preconditions.outOfBoundsMessage(checkKind, args)`.
     ///
-    /// The `int` and `long` overloads produce the same text because the JDK
-    /// formats through `%s` on a boxed `Number`; rendering `i64` decimal here
-    /// matches both.
-    ///
-    /// Shared with the `java.nio` buffer natives, which shadow the bytecode
-    /// that would otherwise reach `Preconditions` and so have to produce this
-    /// text themselves.
+    /// The three in-range shapes come from
+    /// [`cratonvm_types::error::out_of_bounds_message`], which is also what
+    /// `RuntimeError::sioobe_*` and the `java.nio` buffer natives format
+    /// through — one copy of the wording for all three families of caller.
     pub(crate) fn message(self, args: &[i64]) -> String {
         // `outOfBoundsMessage` falls through to its default arm when the
         // argument count does not match the check kind. Reproduce that rather
@@ -132,17 +129,13 @@ impl CheckKind {
             );
         }
         match self {
-            CheckKind::Index => {
-                format!("Index {} out of bounds for length {}", args[0], args[1])
+            CheckKind::Index => out_of_bounds_message::check_index(args[0], args[1]),
+            CheckKind::FromToIndex => {
+                out_of_bounds_message::check_from_to_index(args[0], args[1], args[2])
             }
-            CheckKind::FromToIndex => format!(
-                "Range [{}, {}) out of bounds for length {}",
-                args[0], args[1], args[2]
-            ),
-            CheckKind::FromIndexSize => format!(
-                "Range [{}, {} + {}) out of bounds for length {}",
-                args[0], args[0], args[1], args[2]
-            ),
+            CheckKind::FromIndexSize => {
+                out_of_bounds_message::check_from_index_size(args[0], args[1], args[2])
+            }
         }
     }
 }
@@ -226,7 +219,11 @@ fn throw_constructed(
     let index = i32::try_from(fallback_index).unwrap_or(i32::MAX);
     match exception_class {
         "java/lang/StringIndexOutOfBoundsException" => {
-            RuntimeError::StringIndexOutOfBoundsException { index }.into()
+            RuntimeError::StringIndexOutOfBoundsException {
+                index,
+                message: Some(message),
+            }
+            .into()
         }
         "java/lang/ArrayIndexOutOfBoundsException" => {
             RuntimeError::ArrayIndexOutOfBoundsException { index }.into()
@@ -332,27 +329,6 @@ pub(crate) fn throw_out_of_bounds(
     }
     // `outOfBounds` treats a formatter that returns null as no formatter.
     throw_constructed(ctx, FALLBACK_EXCEPTION, message, fallback_index)
-}
-
-/// The exception a `java.lang.String` bounds check owes its caller: the class
-/// `SIOOBE_FORMATTER` builds, carrying `Preconditions.outOfBoundsMessage` text.
-///
-/// For the `String` methods CratonVM implements natively rather than letting
-/// their bytecode reach `Preconditions` — `charAt`, `codePointAt` — which is
-/// how the right class ends up with a null `getMessage()` where HotSpot has
-/// `"Index 12 out of bounds for length 12"`. The class was never wrong there;
-/// only the text was.
-pub(crate) fn throw_string_index_out_of_bounds(
-    ctx: &mut dyn NativeContext,
-    kind: CheckKind,
-    args: &[i64],
-) -> MethodCallFailed {
-    throw_constructed(
-        ctx,
-        "java/lang/StringIndexOutOfBoundsException",
-        kind.message(args),
-        args.first().copied().unwrap_or(0),
-    )
 }
 
 // ---------------------------------------------------------------------------

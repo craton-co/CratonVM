@@ -203,17 +203,47 @@ had looked at. Not accessed by these probes but reported by the diff:
 `Constructor` (slots 1/3/4/6), `java/util/Collections$SingletonMap` (`k`/`v`
 over `keySet`/`values`). `ProtectionDomain` slot 3 went with slots 1 and 2 — **all three FIXED 2026-08-05**.
 
-**Status of the list, end of 2026-08-05: seven of twelve fixed.**
-`ThreadGroup`, `Thread`, `ProtectionDomain`, `CodeSource`, `BufferedReader`,
-`BufferedWriter`, `Collections$SingletonMap`. The five that remain are the ones
-that are *not* rotations — `InputStreamReader` / `OutputStreamWriter` name
-fields the real classes do not declare at all, and
-`reflect/{Field,Method,Constructor}` shift across 58 raw slot accesses with a
-third, disagreeing mapping in the test mock. Each is filed in the evidence
-record with what makes it structural rather than a reorder.
+**Status of the list, end of 2026-08-05: TWELVE of twelve fixed.**
 
-**None of these is fixed here.** L4 owns the detector; each row is a separate
-change with its own A/B, and filing them as a work list is this lane's output.
+Seven were rotations — `ThreadGroup`, `Thread`, `ProtectionDomain`,
+`CodeSource`, `BufferedReader`, `BufferedWriter`, `Collections$SingletonMap` —
+each a separate change with its own A/B. The last five were not, and needed two
+different answers:
+
+* **`reflect/{Field,Method,Constructor}`** were shifted, not rotated:
+  `AccessibleObject` declares TWO instance fields (`override`,
+  `accessCheckCache`) and `Executable` adds two more (`parameterData`,
+  `declaredAnnotations`) ahead of Method's and Constructor's own, and the models
+  had none of them. Twenty disagreeing slots, all gone with a model edit — the
+  58 raw slot accesses that made this look structural turned out to be by-NAME
+  resolution plus extras anchored at `base + *_EXTRA_OFFSET_*` past
+  `class_num_total_fields`. Three live sites stopped being reported (`Field`
+  4/5, `Constructor` 4): each was a by-name read landing CORRECTLY on the image
+  and flagged only because the model claimed a different field there.
+
+* **`InputStreamReader` / `OutputStreamWriter`** could not be fixed by naming,
+  because the names they claimed (`in`, `out`) do not exist on those classes at
+  any index. The value the VM parks there has no home. That produced the
+  instrument's third verdict, below.
+
+### `_vmN` — the third model spelling
+
+`SlotVerdict::VmInternal` (tag `VM`) reports a slot the model declares `_vmN`:
+"the VM keeps its OWN value here" — an fd, a wrapped stream, a discriminator —
+whenever a real field turns out to live at that index. It is silent when the
+slot is anchored past the real layout, which is the shape a fix should reach.
+
+It exists because the two spellings this design shipped with both lie about a
+kind 3. Naming the slot after the real field makes the diff **agree with the
+overlay**; leaving it anonymous makes the diff **say nothing**. The
+`BufferedWriter` fix earlier the same day took the second option, and turned a
+wrong NAME row into silence while the fd stayed exactly where it was. Relabelling
+it `_vm0` brought `BufferedReader` slot 0 and `InputStreamReader` slot 1 into
+the census with it — two overlays that had never been reported at all.
+
+Final census: **139 → 124** unique disagreeing class+slot pairs. Twenty removed,
+five added, and every one of the five is a kind-3 row that was previously
+mislabelled or invisible. Six probe transcripts byte-identical across the A/B.
 
 Also settled in passing, for L3: `java/util/Scanner`'s model is
 `instance_fields(5)`, not 3, and slots 3 and 4 are `delimPattern` and
@@ -291,13 +321,28 @@ Stated here rather than left to be discovered:
    entry, not a defect.** `java/lang/Integer` slot 0 is `value:I` under an
    anonymous model and the VM writes an `Int` there entirely correctly. The
    rendered line shows `model=_f0:Ljava/lang/Object;`, so the weakness is
-   visible on its face — filter on `verdict=NAME` for the actionable set.
+   visible on its face — filter on `verdict=NAME` (or `VM`) for the actionable
+   set.
 3. **Classes with no model at all.** The diff is driven by
    `synthetic_stub_fields`; a native that indexes a real JDK class with no arm
    in that table is outside this instrument entirely. The access-site cross-type
    check still covers it; nothing else does.
 4. **Three probes is still not Spring Boot.** Every number above is a floor for
    the same reason it was before.
+5. **A `_vmN` slot says a value has no home; it does not fix one.** The five
+   `VM` rows are open kind-3 defects, filed in
+   `docs/known-issues/jdk-only/files-newbufferedwriter-parks-an-fd-in-writebuffer.md`.
+   Each wants a side table keyed by the object, or the index anchored past the
+   real field count. Marking them countable is what this lane could do; only one
+   of them (`Files.newBufferedWriter`) fires in the default build.
+6. **Which is the reason a behavioural probe still earns its keep.** The
+   overlays above are not yet observable from Java, so a probe cannot find them.
+   `probes/ReaderWriterLayoutProbe` was written to be the thing that notices when
+   they become observable — and on its very first run against Temurin 25.0.3 it
+   found an unrelated live divergence anyway (`getEncoding()` returning the
+   canonical charset name where the JDK returns the historical one, 24 charsets
+   affected, fixed). A paired transcript diffed against the host JDK keeps paying
+   for itself; see the L2 note on the same pattern.
 
 ### Volume, and why the two halves are counted differently
 

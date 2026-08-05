@@ -988,7 +988,16 @@ pub(crate) fn native_string_hash_code(
 
     // For compact strings (byte[] value), inspect the `coder` byte
     // (field 1) to know whether the bytes are LATIN-1 (one byte per char,
-    // unsigned-extended) or UTF-16 (big-endian u16 pairs).
+    // unsigned-extended) or UTF-16 (LITTLE-endian u16 pairs).
+    //
+    // This said "big-endian" while the loop below has always read little-endian.
+    // The identical stale claim on `vectorizedHashCode` is the one that named
+    // the contract that native was not implementing while it hashed bytes for a
+    // day, so these are corrected rather than left as harmless prose. The layout
+    // is little-endian in all four places that touch it: `create_java_string`
+    // writes the low byte at the even index, `decode_string_value` reads it back,
+    // `native_string_index_of_static_helper` decodes the same pairs, and
+    // `StringUTF16.isBigEndian()` answers false.
     let is_utf16 = is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1));
 
     // Strategy: drain the array into a thread-local i32 scratch buffer in
@@ -1107,10 +1116,7 @@ pub(crate) fn native_string_char_at(
     let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => {
-            return Err(
-                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }
-                    .into(),
-            )
+            return Err(cratonvm_types::error::RuntimeError::sioobe_no_length(index).into())
         }
     };
     let is_byte_array = matches!(
@@ -1128,11 +1134,9 @@ pub(crate) fn native_string_char_at(
         // the whole chain — including from the interpreter's inline-cache
         // intrinsic table, which is why only the FIRST out-of-range `charAt`
         // at a call site used to carry a message and every later one did not.
-        return Err(crate::preconditions::throw_string_index_out_of_bounds(
-            ctx,
-            crate::preconditions::CheckKind::Index,
-            &[i64::from(index), char_count as i64],
-        ));
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_index(index, char_count as i32).into(),
+        );
     }
 
     let i = index as usize;
@@ -1363,12 +1367,7 @@ pub(crate) fn native_string_substring(
     };
 
     if begin < 0 || end < begin || end > char_count as i32 {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: if begin < 0 { begin } else { end },
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -2440,12 +2439,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // [srcBegin, srcEnd) window against the builder length via
     // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: src_begin,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
     }
     let n = (src_end - src_begin) as usize;
     // Destination-range check: the underlying `System.arraycopy` into `dst`
@@ -2577,11 +2571,7 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // Message as well as class: `AbstractStringBuilder.charAt` delegates
         // to `String.checkIndex` → `Preconditions.checkIndex(index, count,
         // SIOOBE_FORMATTER)`.
-        return Err(crate::preconditions::throw_string_index_out_of_bounds(
-            ctx,
-            crate::preconditions::CheckKind::Index,
-            &[i64::from(index), i64::from(count)],
-        ));
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
@@ -2621,11 +2611,9 @@ pub(crate) fn native_sb_code_point_at(
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // `AbstractStringBuilder.codePointAt` also delegates to
         // `String.checkIndex`, so it carries the same text.
-        return Err(crate::preconditions::throw_string_index_out_of_bounds(
-            ctx,
-            crate::preconditions::CheckKind::Index,
-            &[i64::from(index_i32), chars.len() as i64],
-        ));
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into(),
+        );
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -2655,12 +2643,7 @@ pub(crate) fn native_sb_code_point_before(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 <= 0 || (index_i32 as usize) > chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index - 1];
@@ -3310,7 +3293,7 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
     // SIOOBE_FORMATTER)`. Clamping instead — which this used to do — turned
     // `sb.substring(-1)` into the whole sequence and `sb.substring(99)` into
     // "": a silent wrong answer where the caller asked for an exception.
-    if let Some(failure) = sb_check_from_to_index(ctx, start, count, count) {
+    if let Some(failure) = sb_check_from_to_index(start, count, count) {
         return Err(failure);
     }
     let result = String::from_utf16_lossy(&chars[start as usize..]);
@@ -3323,7 +3306,6 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
 ///
 /// Returns the failure to raise, or `None` when the range is valid.
 fn sb_check_from_to_index(
-    ctx: &mut dyn NativeContext,
     start: i32,
     end: i32,
     count: i32,
@@ -3331,11 +3313,7 @@ fn sb_check_from_to_index(
     if start >= 0 && start <= end && end <= count {
         return None;
     }
-    Some(crate::preconditions::throw_string_index_out_of_bounds(
-        ctx,
-        crate::preconditions::CheckKind::FromToIndex,
-        &[i64::from(start), i64::from(end), i64::from(count)],
-    ))
+    Some(cratonvm_types::error::RuntimeError::sioobe_range(start, end, count).into())
 }
 
 /// substring(int, int) — substring [start, end)
@@ -3360,7 +3338,7 @@ pub(crate) fn native_sb_substring_range(
     // See `native_sb_substring`: the real body checks the range before doing
     // anything, so `sb.substring(3, 2)` is a `StringIndexOutOfBoundsException`
     // and not the empty string this used to clamp it into.
-    if let Some(failure) = sb_check_from_to_index(ctx, start, end, count) {
+    if let Some(failure) = sb_check_from_to_index(start, end, count) {
         return Err(failure);
     }
     let result = String::from_utf16_lossy(&chars[start as usize..end as usize]);
@@ -4086,10 +4064,7 @@ pub(crate) fn native_string_substring_one(
     let end = char_count as i32;
 
     if begin < 0 || begin > end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }
-                .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -4818,11 +4793,9 @@ pub(crate) fn native_string_code_point_at(
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // Message as well as class: the real `codePointAt` reaches
         // `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`.
-        return Err(crate::preconditions::throw_string_index_out_of_bounds(
-            ctx,
-            crate::preconditions::CheckKind::Index,
-            &[i64::from(index_i32), chars.len() as i64],
-        ));
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into(),
+        );
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -6236,6 +6209,28 @@ pub(crate) fn native_string_formatted(
 // same little-endian layout as CratonVM's Rust code, keeping every code path
 // consistent. `HI_BYTE_SHIFT == 8` in OpenJDK <=> big-endian; here it is 0.
 //
+// # On JDK 25 this registration never fires, and that is not a defect
+//
+// `--dump-native-registry` against Temurin 25.0.3, checked while closing the
+// `String.hashCode` record because it asked whether `HI_BYTE_SHIFT` /
+// `LO_BYTE_SHIFT` are populated at all:
+//
+//   java/lang/StringUTF16.isBigEndian()Z   loaded: true  declared: FALSE
+//                                          has_code: false  invocations: 0
+//
+// `declared: false` — the method does not exist on JDK 25's `StringUTF16`. Its
+// `<clinit>` reads the byte order from `UNSAFE`, which this VM answers through
+// `jdk/internal/misc/UnsafeConstants.BIG_ENDIAN` (the boot log's
+// "UnsafeConstants populated (5/5)"). The statics are populated and
+// little-endian: `probes/StringUtf16ClassShapeProbe` reads them back as
+// `HI_BYTE_SHIFT=0` / `LO_BYTE_SHIFT=8`, identical to HotSpot.
+//
+// So this stays registered for images that DO declare the method (JDK 17/21),
+// where it must give the same answer `UnsafeConstants` gives, which it does. A
+// census row reading `has_code: false` here means "absent from this image", not
+// "an unimplemented native something is waiting on" — the distinction cost a
+// paragraph of doubt in the record that filed the UTF-16 hash defect.
+//
 // Arity is guaranteed by the verifier (`()Z`); we ignore any extra args
 // defensively and return the constant unconditionally.
 pub(crate) fn native_string_utf16_is_big_endian(
@@ -6284,10 +6279,8 @@ pub(crate) fn native_string_utf16_get_chars(
     // StringIndexOutOfBoundsException rather than overflowing Rust arithmetic.
     let count = src_end.wrapping_sub(src_begin);
     let source_len = (ctx.array_length(value) / 2) as i32;
-    if let Some(index) = bounds_off_count_violation(src_begin, count, source_len) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(src_begin, count, source_len).is_some() {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(src_begin, count, source_len).into());
     }
     // The bytecode validates the source before its first destination access.
     // Preserve that ordering when both inputs are invalid/null.
@@ -6487,10 +6480,9 @@ pub(crate) fn native_string_init_from_char_array_range(
         _ => 0,
     };
     let length = ctx.array_length(arr) as i32;
-    if let Some(index) = bounds_off_count_violation(offset, count, length) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(offset, count, length).is_some() {
+        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
     }
     let mut units = vec![0u16; count as usize];
     let written = ctx.read_char_array_into(arr, offset as usize, &mut units);
@@ -6630,7 +6622,9 @@ fn native_string_index_of_str_from(
 /// coder format, we recompute the same answer character-wise from the target
 /// alone if `srcCount` and `coder` are sufficient. Concretely we decode the
 /// `[B` array per `coder` (0 = LATIN1 single-byte zero-extended, 1 = UTF16
-/// big-endian u16 pairs) and search for the target's UTF-16 code units.
+/// LITTLE-endian u16 pairs) and search for the target's UTF-16 code units.
+/// (The doc said big-endian; the code below reads `lo` at `2i` and `hi` at
+/// `2i+1`, which is little-endian and is what the rest of the VM writes.)
 fn native_string_index_of_static_helper(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7728,13 +7722,14 @@ mod tests {
     /// Name the exception class a native raised, whichever of the two shapes
     /// it used.
     ///
-    /// A native can fail in two ways and the class matters in both: a
+    /// A native can fail two ways and the class matters in both: a
     /// `RuntimeError` the VM maps to a class later, or an already-materialised
-    /// throwable (`ExceptionThrown`) — which is what the bounds checks now
-    /// produce, because carrying HotSpot's detail message means constructing
-    /// the object here rather than naming a message-less variant. Classifying
-    /// only the first shape made every migrated site report `other-failed`,
-    /// so the tests would have gone green on a genuinely wrong class too.
+    /// throwable (`ExceptionThrown`), which is what
+    /// `crate::preconditions::throw_out_of_bounds` produces when it has to
+    /// build the class an application-supplied exception formatter asked for.
+    /// Classifying only the first shape would report `other-failed` for the
+    /// second, so a test asserting `"sioobe"` would fail on a *correct* answer
+    /// and — worse — a test asserting anything else would pass on a wrong one.
     fn err_kind(ctx: &dyn NativeContext, e: &cratonvm_types::error::MethodCallFailed) -> &'static str {
         match e {
             cratonvm_types::error::MethodCallFailed::InternalError(

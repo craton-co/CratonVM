@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use parking_lot::Mutex;
@@ -699,15 +699,15 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
     // native disposer thread. CratonVM resolves fields by name and has no JNI
     // ID cache, so there is nothing to initialize — same rationale as the
     // `initIDs` block further down this file.
-    registry.register("sun/java2d/Disposer", "initIDs", "()V", |_ctx, _args| {
+    registry.register_with_kind("sun/java2d/Disposer", "initIDs", "()V", |_ctx, _args| {
         void_ok()
-    });
+    }, NativeKind::Bridge);
     // Toolkit.<clinit> calls this JNI bootstrap before ImageIO and Spring's
     // HTTP image converter can initialize desktop classes. CratonVM keeps the
     // relevant IDs in Rust-side registries, so the HotSpot native is a no-op.
-    registry.register("java/awt/Toolkit", "initIDs", "()V", |_ctx, _args| {
+    registry.register_with_kind("java/awt/Toolkit", "initIDs", "()V", |_ctx, _args| {
         void_ok()
-    });
+    }, NativeKind::Bridge);
     // java.awt.Toolkit.getDefaultToolkit — return a real HeadlessToolkit.
     // The previous implementation returned `new java/awt/Toolkit`, but
     // `java.awt.Toolkit` is abstract; instances of it have no concrete
@@ -788,14 +788,25 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
 /// together does not run cleanly under the partial bootstrap. Registering
 /// `getLocalGraphicsEnvironment` as a native lets us reproduce the exact JDK
 /// headless wiring without depending on the `LocalGE` static initializer.
-// JDK-ONLY-CLASSIFY: bridge — `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` is
-// ACC_NATIVE in JDK 25: it is the display probe, an OS boundary with no
-// bytecode fallback, and answering `false` is the truthful answer for a VM with
-// no display backend. The four sibling registrations in this function
-// (`getDefaultHeadlessProperty`, `getDefaultHeadlessMessage`, and the
-// `GraphicsEnvironment` entries) have concrete bytecode in the image and are
-// JDK-ONLY-CLASSIFY: stub — they restate a policy the real bytecode already
-// derives from `hasDisplays0`. Split this function before retagging.
+// JDK-ONLY-CLASSIFY: bridge on Windows/macOS, DEAD on this image — and that
+// is the whole finding. This marker used to assert that
+// `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` is ACC_NATIVE in JDK 25. On a
+// **Linux** JDK 25 image it is not there at all: `javap -p
+// sun.awt.PlatformGraphicsInfo` lists exactly `createGE`, `createToolkit`,
+// `getDefaultHeadlessProperty` and `getDefaultHeadlessMessage`, every one of
+// them ordinary bytecode, and no `hasDisplays0`. `hasDisplays0` is declared by
+// the Windows and macOS variants of the class, which a Unix image does not
+// ship. The schema-3 census agrees per row: `declared: false`.
+//
+// So this registrar states nothing (L5b, 2026-08-05). `hasDisplays0` is a
+// genuine OS-boundary bridge on the platforms that have it and a registration
+// that can never bind on this one, and a census taken here cannot tell those
+// two apart from a defect. The three siblings that ARE declared here have
+// concrete bytecode — they restate a policy the real bytecode already derives —
+// so they are shadows under §1.4, not §1.5 bridges. The split this marker asked
+// for has been made in evidence rather than in code; retagging still needs a
+// Windows-image census. See
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md.
 fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessProperty()Z — the JDK
     // consults this when `java.awt.headless` is unset. On a host with no
@@ -809,11 +820,12 @@ fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     );
     // sun.awt.PlatformGraphicsInfo.hasDisplays0()Z — native display probe.
     // No native display backend → no displays.
-    registry.register(
+    registry.register_with_kind(
         "sun/awt/PlatformGraphicsInfo",
         "hasDisplays0",
         "()Z",
         |_ctx, _args| bool_ok(false),
+        NativeKind::Bridge,
     );
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessMessage — diagnostic
     // text shown when a headless app touches a graphics-only API.
@@ -2364,17 +2376,19 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     // register these as no-ops so the real-JDK `<clinit>` of each class can
     // complete (it would otherwise throw UnsatisfiedLinkError). The JPEG plugin
     // uses method-specific bootstrap names rather than `initIDs`.
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "initReaderIDs",
         "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)V",
         |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageWriter",
         "initWriterIDs",
         "(Ljava/lang/Class;Ljava/lang/Class;)V",
         |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
     );
     // KEEP (deliberate constants) — audited 2026-07-27. Every native below
     // manipulates the libjpeg `jpeg_decompress_struct` that the real JDK
@@ -2398,39 +2412,44 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     //     the token, and there is no per-handle table to key it into.
     // Throwing from any of the six below would break a JPEG decoder that
     // works today, purely to remove a constant that is load-bearing.
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "initJPEGImageReader",
         "()J",
         |_ctx, _args| Ok(Some(Value::Long(1))),
+        NativeKind::Bridge,
     );
     // The remaining five are lifecycle calls against that non-existent
     // struct — setSource/resetReader/resetLibraryState/disposeReader/dispose
     // have nothing to own, point at, or release, so an empty body is the
     // correct implementation rather than a missing one.
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "setSource",
         "(J)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "resetReader",
         "(J)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "resetLibraryState",
         "(J)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "disposeReader",
         "(J)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
     registry.register(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
@@ -2450,6 +2469,11 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V",
         |ctx, args| imageio_writer_write(ctx, args, image::EncodedImageFormat::Png),
     );
+    // Twelve of these thirteen classes declare `initIDs()V` ACC_NATIVE in
+    // JDK 25 — they are the JNI field-ID caches the Java2D native library
+    // fills in, and an empty body is the spec-correct implementation for a VM
+    // that resolves fields by name. Those twelve state `Bridge` at this call
+    // site (L5b, 2026-08-05).
     for class in [
         "java/awt/image/BufferedImage",
         "java/awt/image/ColorModel",
@@ -2457,7 +2481,6 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "java/awt/image/Raster",
         "java/awt/image/SampleModel",
         "java/awt/image/SinglePixelPackedSampleModel",
-        "java/awt/image/ComponentSampleModel",
         "java/awt/image/Kernel",
         "sun/awt/image/IntegerComponentRaster",
         "sun/awt/image/ByteComponentRaster",
@@ -2465,8 +2488,30 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "sun/awt/image/BytePackedRaster",
         "sun/awt/image/GifImageDecoder",
     ] {
-        registry.register(class, "initIDs", "()V", |_ctx, _args| void_ok());
+        registry.register_with_kind(
+            class,
+            "initIDs",
+            "()V",
+            |_ctx, _args| void_ok(),
+            NativeKind::Bridge,
+        );
     }
+    // The thirteenth is split out only because the census reports it
+    // differently, NOT because it is a different kind of thing — a correction
+    // to what L5b wrote here on the strength of `declared: false`.
+    // `java.awt.image.ComponentSampleModel` does not declare `initIDs` itself;
+    // `InheritedDeclProbe` resolves it up the hierarchy and finds `initIDs()V`
+    // **native** on the superclass `java.awt.image.SampleModel`, which is what
+    // dispatch binds to. `declared: false` on one class is not the same claim
+    // as "no ACC_NATIVE target", and reading it that way is how 1,939 rows
+    // tree-wide were mis-filed. So this states its kind too.
+    registry.register_with_kind(
+        "java/awt/image/ComponentSampleModel",
+        "initIDs",
+        "()V",
+        |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
+    );
 }
 
 // ---------------------------------------------------------------------------

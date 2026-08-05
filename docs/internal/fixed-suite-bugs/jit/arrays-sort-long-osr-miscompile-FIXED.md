@@ -78,7 +78,9 @@ will take one env var next time.
 The bisect levers reach the OSR compile path as of `dev` `12b8cbdea` — another
 session closed exactly the gap this doc's step 1 asked for
 (`compile_osr_artifact` now consults `cratonvm_jit::jit_force_interpret`; see
-`annotation-scan-arrayread-sigsegv.md`, which hit the same wall). With working
+`annotation-scan-arrayread-sigsegv.md`, which hit the same wall — and, it
+turned out on 2026-08-05, the same DEFECT: its reused slot holds a `byte[]`
+rather than an `int`, and this commit closed it too). With working
 filters the answer is unambiguous:
 
 | `CRATONVM_JIT_DENY=` | verdict |

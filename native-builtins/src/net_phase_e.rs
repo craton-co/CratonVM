@@ -161,7 +161,7 @@ fn spring_dbg_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::nbflags().spring_dbg)
 }
 
-use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
@@ -13994,7 +13994,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // killed any class-init touching NetworkInterface (Gradle's user-home
     // services during ProjectBuilder bootstrap). The real init only caches
     // JNI field IDs; a no-op is faithful.
-    r.register(ni, "init", "()V", |_ctx, _args| Ok(None));
+    r.register_with_kind(ni, "init", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
 
     // IMPLEMENTED (wave 4). This used to return an unconditional `null`,
     // justified by "`getAll()` hands out exactly one interface, loopback, which
@@ -14043,7 +14043,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // These mirror the real JNI bodies: `isUp0` is `IFF_UP && IFF_RUNNING`,
     // `isLoopback0` is `IFF_LOOPBACK`, `isP2P0` is `IFF_POINTOPOINT`,
     // `supportsMulticast0` is `IFF_MULTICAST`.
-    r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    r.register_with_kind(ni, "isUp0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let up = match re8_host_iface_by_name(&name) {
             Some(host) => host.flags & RE8_IFF_UP != 0 && host.flags & RE8_IFF_RUNNING != 0,
@@ -14051,8 +14051,8 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             None => true,
         };
         Ok(Some(Value::Int(i32::from(up))))
-    });
-    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let index = args.get(1).and_then(Value::as_int).unwrap_or(0);
         let loopback = match re8_host_iface_by_name(&name) {
@@ -14060,16 +14060,16 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             None => name == RE8_LOOPBACK_NAME || index == RE8_LOOPBACK_INDEX,
         };
         Ok(Some(Value::Int(i32::from(loopback))))
-    });
-    r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(ni, "isP2P0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let p2p = re8_host_iface_by_name(&name)
             .map(|host| host.flags & RE8_IFF_POINTOPOINT != 0)
             // Loopback is not point-to-point.
             .unwrap_or(false);
         Ok(Some(Value::Int(i32::from(p2p))))
-    });
-    r.register(
+    }, NativeKind::Bridge);
+    r.register_with_kind(
         ni,
         "supportsMulticast0",
         "(Ljava/lang/String;I)Z",
@@ -14081,19 +14081,20 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 .unwrap_or(false);
             Ok(Some(Value::Int(i32::from(multicast))))
         },
+        NativeKind::Bridge,
     );
-    r.register(ni, "getMTU0", "(Ljava/lang/String;I)I", |ctx, args| {
+    r.register_with_kind(ni, "getMTU0", "(Ljava/lang/String;I)I", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let mtu = re8_host_iface_by_name(&name)
             .and_then(|host| host.mtu)
             .unwrap_or_else(re8_loopback_mtu);
         Ok(Some(Value::Int(mtu)))
-    });
+    }, NativeKind::Bridge);
     // `getMacAddr0(byte[] inAddr, String name, int ind)` — static, so the name
     // is argument 1. `inAddr` only disambiguates which binding the caller meant
     // on platforms whose lookup is per-address; the Linux/`/sys` answer is
     // per-interface, so it is not needed.
-    r.register(
+    r.register_with_kind(
         ni,
         "getMacAddr0",
         "([BLjava/lang/String;I)[B",
@@ -14104,8 +14105,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             re8_mac_array(ctx, &mac)
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getAll",
         "()[Ljava/net/NetworkInterface;",
@@ -14113,6 +14115,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             let arr = re8_all_interfaces(ctx);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
     // These three must agree with `getAll()` — a blanket null here used to
     // contradict it outright (`getByName("lo")` reported "no such interface"
@@ -14120,7 +14123,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // search the same host enumeration `getAll()` uses, and fall back to the
     // loopback carrier only where `getAll()` itself does. Null stays the answer
     // for an interface that does not exist — the spec'd "no such interface".
-    r.register(
+    r.register_with_kind(
         ni,
         "getByName0",
         "(Ljava/lang/String;)Ljava/net/NetworkInterface;",
@@ -14134,8 +14137,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getByInetAddress0",
         "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
@@ -14151,6 +14155,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback());
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
     // `boundInetAddress0(InetAddress)` — "is this address configured on some
     // local interface?". This one answers a QUESTION rather than handing back a
@@ -14162,7 +14167,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // would have worked — for 127.0.0.1, always. Answer from the same local-IP
     // enumeration `getAll()` uses (`re8_enumerate_local_ips` now folds in the
     // host's configured addresses, so a secondary NIC is no longer a miss).
-    r.register(
+    r.register_with_kind(
         ni,
         "boundInetAddress0",
         "(Ljava/net/InetAddress;)Z",
@@ -14184,8 +14189,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 || re8_enumerate_local_ips().contains(&ip);
             Ok(Some(Value::Int(i32::from(bound))))
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getByIndex0",
         "(I)Ljava/net/NetworkInterface;",
@@ -14198,6 +14204,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
 
     // REMOVED (wave 4): the R76 `HostInfoEnvironmentPostProcessor.

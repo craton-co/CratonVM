@@ -33,6 +33,12 @@
 > loops were split rather than claimed whole, which is exactly what `net.rs`'s
 > own marker had asked for.
 
+> **Follow-up, same day:** two of this lane's adjudications were later
+> measured wrong, both because the census asks one class in one image — the
+> `FileDispatcherImpl` alias rows inherit an ACC_NATIVE surface and ARE
+> bridges, and `WindowsFileDispatcherImpl` is on no JDK 25 image at all. See
+> `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+
 ---
 
 # L5 — `register_with_kind` migration, starting with `native-io`

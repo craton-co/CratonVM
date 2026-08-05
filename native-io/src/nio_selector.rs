@@ -63,7 +63,7 @@
 //! dropping the selector state drops only its clones, not the originals.
 //! This avoids double-close issues.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use parking_lot::{Mutex, RwLock};
@@ -3732,21 +3732,41 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
 
     // IOUtil.fdVal — used by every SocketChannelImpl to extract the raw
     // OS fd from a FileDescriptor before passing it to native ops.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/IOUtil",
         "fdVal",
         "(Ljava/io/FileDescriptor;)I",
         ioutil_fdval_native,
+        NativeKind::Bridge,
     );
 
-    r.register("sun/nio/ch/EventFD", "eventfd0", "()I", eventfd0_native);
-    r.register("sun/nio/ch/EventFD", "set0", "(I)I", eventfd_set0_native);
-    r.register("sun/nio/ch/IOUtil", "drain", "(I)Z", ioutil_drain_native);
-    r.register(
+    r.register_with_kind(
+        "sun/nio/ch/EventFD",
+        "eventfd0",
+        "()I",
+        eventfd0_native,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "sun/nio/ch/EventFD",
+        "set0",
+        "(I)I",
+        eventfd_set0_native,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "sun/nio/ch/IOUtil",
+        "drain",
+        "(I)Z",
+        ioutil_drain_native,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
         "sun/nio/ch/FileDispatcherImpl",
         "closeIntFD",
         "(I)V",
         fd_close_int_fd_native,
+        NativeKind::Bridge,
     );
 
     // Linux: sun.nio.ch.EPoll static natives. Registered unconditionally
@@ -3754,23 +3774,26 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // implementation actually performs the syscall; on Windows / macOS
     // the methods return an IOException, which matches the JDK's behavior
     // when EPoll is unavailable.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/EPoll",
         "eventSize",
         "()I",
         epoll_event_size_native,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/EPoll",
         "eventsOffset",
         "()I",
         epoll_events_offset_native,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/EPoll",
         "dataOffset",
         "()I",
         epoll_data_offset_native,
+        NativeKind::Bridge,
     );
     r.register(
         "sun/nio/ch/EPoll",
@@ -3778,16 +3801,34 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "()I",
         epoll_create_native,
     );
-    r.register("sun/nio/ch/EPoll", "create", "()I", epoll_create_native);
+    r.register_with_kind(
+        "sun/nio/ch/EPoll",
+        "create",
+        "()I",
+        epoll_create_native,
+        NativeKind::Bridge,
+    );
     r.register("sun/nio/ch/EPoll", "epollCtl", "(IIII)I", epoll_ctl_native);
-    r.register("sun/nio/ch/EPoll", "ctl", "(IIII)I", epoll_ctl_native);
+    r.register_with_kind(
+        "sun/nio/ch/EPoll",
+        "ctl",
+        "(IIII)I",
+        epoll_ctl_native,
+        NativeKind::Bridge,
+    );
     r.register(
         "sun/nio/ch/EPoll",
         "epollWait",
         "(IJII)I",
         epoll_wait_native,
     );
-    r.register("sun/nio/ch/EPoll", "wait", "(IJII)I", epoll_wait_native);
+    r.register_with_kind(
+        "sun/nio/ch/EPoll",
+        "wait",
+        "(IJII)I",
+        epoll_wait_native,
+        NativeKind::Bridge,
+    );
 
     // Netty ships a separate JNI epoll transport (`io.netty.channel.epoll.Native`).
     // CratonVM supports the JDK's selector-facing EPoll surface above, but not
@@ -3920,11 +3961,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "(II)V",
         windows_set_wakeup_socket0_native,
     );
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/WindowsSelectorImpl",
         "resetWakeupSocket0",
         "(I)V",
         windows_reset_wakeup_socket0_native,
+        NativeKind::Bridge,
     );
     r.set_category(__prev_cat);
 }

@@ -24,7 +24,7 @@
 //! `ClassLoader.getResources`) then NPEs, which breaks every
 //! `ServiceLoader` user (SLF4J, JDBC autodetection, etc).
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, Value};
 
@@ -87,39 +87,44 @@ fn native_vm_support_get_vm_temp_dir(
 pub fn register_boot_loader_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/BootLoader",
         "setBootLoaderUnnamedModule0",
         "(Ljava/lang/Module;)V",
         native_set_boot_loader_unnamed_module0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/BootLoader",
         "getSystemPackageLocation",
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_get_system_package_location,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/BootLoader",
         "getSystemPackageNames",
         "()[Ljava/lang/String;",
         native_get_system_package_names,
+        NativeKind::Bridge,
     );
 
     // Bonus: jdk/internal/vm/VMSupport — stubs for the two natives that
     // can surface during VM bootstrap when an agent or diagnostic tool
     // touches the class.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/vm/VMSupport",
         "initAgentProperties",
         "(Ljava/util/Properties;)Ljava/util/Properties;",
         native_vm_support_init_agent_properties,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/vm/VMSupport",
         "getVMTemporaryDirectory",
         "()Ljava/lang/String;",
         native_vm_support_get_vm_temp_dir,
+        NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }

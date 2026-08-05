@@ -50,6 +50,44 @@ is unaffected; **`catch (StringIndexOutOfBoundsException)` is not**, and real
 parsing and validation code writes exactly that. This was a control-flow
 defect, not a message defect.
 
+## Narrowed first, on 2026-08-05, by a bypass — and the class depended on the SIGN
+
+Between the filing and this fix, a concurrent lane narrowed the record and
+found the half `substring` was hiding. Worth keeping, because the *method* is
+the transferable part: the `StringPolicyMatrixProbe` rows for `charAt` only
+ever showed a null MESSAGE, which hid a wrong CLASS. A five-line probe against
+a HotSpot 25 control (`"hello world!"`, length 12):
+
+```text
+                 HotSpot                             CratonVM before
+  charAt(-1)     SIOOBE "Index -1 out of bounds..."  ArrayIndexOutOfBoundsException, msg=null
+  charAt(12)     SIOOBE "Index 12 out of bounds..."  SIOOBE, msg=null
+```
+
+**The exception class depended on the sign of the index.** A negative index
+reached `Preconditions.checkIndex` (which discarded the formatter and threw
+AIOOBE); an index past the end was caught earlier and produced SIOOBE. So
+`catch (StringIndexOutOfBoundsException)` around `charAt` worked for one
+out-of-range direction and not the other. **A row can differ on message text
+and be hiding a class difference underneath**, and a diff that already counts
+it as "diverging" cannot report that it got worse.
+
+That lane added `java/lang/String.checkIndex(II)V` as F4's third member and
+moved every `StringIndexOutOfBoundsException` construction site to
+`RuntimeError::sioobe_index` / `sioobe_range` / `sioobe_range_size`, which
+build HotSpot's three message shapes verbatim in one place. Measured:
+`StringPolicyMatrixProbe` 21 → 8 divergences, 13 fixed, 0 regressed, identical
+under default/`--nojit`/`--jdk-only`.
+
+It named exactly what it had not done: the `BiFunction` was still never
+invoked, and the non-`String` callers still got the wrong class, which needed
+an `IndexOutOfBoundsException` variant `RuntimeError` did not have. Both are
+what this record closes. The `sioobe_*` constructors survive and are now the
+single source of the three message shapes — `native-builtins/src/preconditions.rs`
+formats through the same module rather than keeping a second copy.
+
+All three bypasses are retired, `checkIndex` included.
+
 ## What changed
 
 ### 1. The natives honour the formatter (`native-builtins/src/preconditions.rs`)
@@ -110,9 +148,10 @@ RuntimeError::IllegalArgumentException { message: "IndexOutOfBoundsException".to
 hierarchy at all, so `catch (IndexOutOfBoundsException)` around a buffer access
 never saw it. All 21 now raise the real class.
 
-### 4. F4 is retired, which is the test that the fix worked
+### 4. F4 is retired — all three of it — which is the test that the fix worked
 
-`java/lang/String.checkBoundsBeginEnd(III)V` and `checkBoundsOffCount(III)I`
+`java/lang/String.checkBoundsBeginEnd(III)V`, `checkBoundsOffCount(III)I` and
+`checkIndex(II)V`
 were intercepted with SIOOBE-correct natives to route `String`-domain callers
 around the broken override. They are gone. Their bytecode reaches
 `Preconditions` with `SIOOBE_FORMATTER` and now gets the right class *and* the

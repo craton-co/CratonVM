@@ -339,10 +339,7 @@ pub(super) fn publish_entry_metadata(
         // is masked if (and only if) its register is genuinely shared.
         let kinds = classify_local_kinds(code, code_len, num_locals);
         let high_halves = wide_local_high_halves(code, code_len);
-        for &hh in &high_halves {
-            if !matches!(kinds.get(hh), Some(LocalKind::HighHalf)) {
-                continue;
-            }
+        for hh in pure_high_halves(&kinds, &high_halves) {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
             }
