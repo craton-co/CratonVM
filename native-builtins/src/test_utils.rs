@@ -1068,6 +1068,27 @@ impl MockNativeContext {
         unsafe { (*self.registered_native_threads.get()).clone() }
     }
 
+    /// Slot of `field_name` among the instance fields a test declared for
+    /// `obj`'s class via `set_declared_fields`. This is the one source of
+    /// field-name → slot mapping in the mock that a test controls; the
+    /// `mock_*_field_slot` tables below it are fixed, per-class special cases.
+    ///
+    /// Consulted FIRST by `get_field_by_name` / `set_field_by_name`, so a test
+    /// that declares a class's real layout gets by-name access consistent with
+    /// it. Without this, a test that models the real `java.lang.ClassLoader`
+    /// layout would still have `set_field_by_name(loader, "parent", …)`
+    /// silently do nothing (there is no `parent` entry in any table), which
+    /// reads exactly like the production code failing to write it.
+    fn declared_field_slot(&self, obj: ObjectRef, field_name: &str) -> Option<usize> {
+        // SAFETY: single-threaded test code.
+        let overrides = unsafe { &*self.declared_fields_override.get() };
+        overrides
+            .get(&self.class_id_of_object(obj).as_u32())?
+            .iter()
+            .find(|f| !f.is_static && f.name == field_name)
+            .map(|f| f.slot_index)
+    }
+
     /// WP0.2: push declared field metadata for `class_id`.  Overrides
     /// the default (empty) `declared_fields` return.
     #[allow(dead_code)]
@@ -1812,7 +1833,8 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
+            self.declared_field_slot(obj, field_name)
+                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
@@ -1835,7 +1857,8 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
+            self.declared_field_slot(obj, field_name)
+                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))

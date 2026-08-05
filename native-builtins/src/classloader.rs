@@ -651,7 +651,15 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     let name_pin = ctx.pin_native_root(name);
     obj = ctx.read_native_pin(obj_pin, obj);
     let name = ctx.read_native_pin(name_pin, name);
-    ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    // L1: only on OUR layout. Slot 2 is `unnamedModule` on the real
+    // `java.lang.ClassLoader`, NOT a second copy of `name` — a reference for a
+    // reference, which is why the overlay detector never flagged it. Writing
+    // the "platform" String there made `getUnnamedModule()` answer a String,
+    // and (via `classloader_parent`'s slot-1 fallback) made the platform
+    // loader's PARENT a String as well.
+    if cl_has_synthetic_layout(ctx, obj) {
+        ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    }
     // Also populate the REAL `name` field by name: the active getName native
     // (classloader_real) reads the real field slot, not CL_NAME_REF.
     obj = ctx.read_native_pin(obj_pin, obj);
@@ -748,10 +756,20 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     let mut platform = ctx.read_native_pin(platform_pin, platform);
     obj = ctx.read_native_pin(obj_pin, obj);
     let mut name = ctx.read_native_pin(name_pin, name);
-    ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    // L1: only on OUR layout — see the same guard in
+    // `get_or_create_platform_loader`. On the real layout slots 2 and 1 are
+    // `unnamedModule` and `name`, so these two writes put the "app" String in
+    // `unnamedModule` and the platform LOADER in `name`. The by-name writes
+    // below are the correct path there and already run unconditionally.
+    let synthetic_layout = cl_has_synthetic_layout(ctx, obj);
+    if synthetic_layout {
+        ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    }
     obj = ctx.read_native_pin(obj_pin, obj);
     platform = ctx.read_native_pin(platform_pin, platform);
-    ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
+    if synthetic_layout {
+        ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
+    }
     // Also populate the REAL `name`/`parent` fields by name: the active
     // getName/getParent natives (classloader_real) read the real field slots,
     // not CL_NAME_REF/CL_PARENT_REF. Without the real `parent`, the app
@@ -1168,20 +1186,46 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     };
     let mut obj = alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT);
     let obj_pin = ctx.pin_native_root(obj);
-    // L1: the four VM-internal slots go into the object ONLY on our own
-    // layout. On a real JDK image `class_name` resolves to the real
-    // `ClassLoaders$AppClassLoader` / `$PlatformClassLoader`, whose slots
-    // 0/3/4/6 are `parent` / `nameAndId` / `parallelLockMap` / `classes` —
-    // references, all four. These were the eight measured overlay rows.
-    // The values themselves are not lost: `loader_meta_put` below records
-    // them, and every reader consults that table first.
+    // L1: the synthetic slots go into the object ONLY on our own layout. On a
+    // real JDK image `class_name` resolves to the real
+    // `ClassLoaders$AppClassLoader` / `$PlatformClassLoader`, and NONE of the
+    // seven indices means there what it means here:
+    //
+    //   ours                      | real `java.lang.ClassLoader`
+    //   0 CL_LOADER_TYPE   Int    | parent            ClassLoader
+    //   1 CL_PARENT_REF    ref    | name              String
+    //   2 CL_NAME_REF      ref    | unnamedModule     Module
+    //   3 CL_CLASSES_LOADED Int   | nameAndId         String
+    //   4 CL_IS_PARALLEL…  Int    | parallelLockMap   ConcurrentHashMap
+    //   5 CL_DEFAULT_DOMAIN ref   | package2certs     ConcurrentHashMap
+    //   6 CL_LOADER_ID     Int    | classes           ArrayList
+    //
+    // The four `Int` rows are the eight measured overlay rows (four slots x
+    // two built-in loaders): `Heap::set_field_as` coerces each to
+    // `Object(None)` and the JDK's field is gone. The three reference rows
+    // are the SAME defect one kind quieter — a reference for a reference, so
+    // the detector cannot see it, but slot 1 still receives a ClassLoader
+    // where `name:String` belongs and slot 5 a ProtectionDomain where
+    // `package2certs:ConcurrentHashMap` belongs.
+    //
+    // The wave-2 brief's step 4 says to leave those three alone because "they
+    // are references with real counterparts and are already written by name
+    // too". The first half of that is a factual error: the by-name write goes
+    // to a DIFFERENT slot than the index write (`name` is 1, and we index-write
+    // 1 with the parent), so the index write is not a duplicate of it — it is
+    // the corruption of an unrelated field. `classloader_parent`'s slot-1
+    // fallback then read that field back and returned the platform loader's
+    // `name` String AS ITS PARENT. Gated here, and at the matching reads.
+    //
+    // Nothing is lost by skipping any of them: `loader_meta_put` below records
+    // the four VM-internal values, the by-name writes cover `name` / `parent`
+    // / `defaultDomain`, and every reader consults the table (or the name)
+    // first.
     let synthetic_layout = cl_has_synthetic_layout(ctx, obj);
     if synthetic_layout {
         ctx.set_field(obj, CL_LOADER_TYPE, Value::Int(loader_type));
-    }
-    ctx.set_field(obj, CL_PARENT_REF, Value::Object(None));
-    ctx.set_field(obj, CL_NAME_REF, Value::Object(None));
-    if synthetic_layout {
+        ctx.set_field(obj, CL_PARENT_REF, Value::Object(None));
+        ctx.set_field(obj, CL_NAME_REF, Value::Object(None));
         ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     }
@@ -1189,7 +1233,9 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     let pd_pin = ctx.pin_native_root(pd);
     obj = ctx.read_native_pin(obj_pin, obj);
     let pd = ctx.read_native_pin(pd_pin, pd);
-    ctx.set_field(obj, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    if synthetic_layout {
+        ctx.set_field(obj, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    }
     obj = ctx.read_native_pin(obj_pin, obj);
     let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field_by_name(obj, "defaultDomain", Value::Object(Some(pd)));
@@ -1377,16 +1423,20 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     // parent defaults to system class loader
     let sys = alloc_classloader(ctx, LOADER_APP);
-    ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys)));
-    ctx.set_field(this, CL_NAME_REF, Value::Object(None));
     if synthetic_layout {
+        ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys)));
+        ctx.set_field(this, CL_NAME_REF, Value::Object(None));
         ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    } else {
+        ctx.set_field_by_name(this, "parent", Value::Object(Some(sys)));
     }
     // WP2.3: build a non-null defaultDomain so JDK preDefineClass's
     // `pd.getCodeSource()` chain doesn't NPE on the no-PD defineClass path.
     let pd = alloc_default_protection_domain(ctx);
-    ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    if synthetic_layout {
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    }
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader — initialize `packages` CHM so
     // ClassLoader.packages() doesn't NPE on `getfield + values()`.
@@ -1405,14 +1455,18 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if synthetic_layout {
         ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     }
-    ctx.set_field(this, CL_PARENT_REF, parent);
-    ctx.set_field(this, CL_NAME_REF, Value::Object(None));
     if synthetic_layout {
+        ctx.set_field(this, CL_PARENT_REF, parent);
+        ctx.set_field(this, CL_NAME_REF, Value::Object(None));
         ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    } else {
+        ctx.set_field_by_name(this, "parent", parent);
     }
     let pd = alloc_default_protection_domain(ctx);
-    ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    if synthetic_layout {
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    }
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
@@ -1436,14 +1490,19 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if synthetic_layout {
         ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     }
-    ctx.set_field(this, CL_PARENT_REF, parent);
-    ctx.set_field(this, CL_NAME_REF, name);
     if synthetic_layout {
+        ctx.set_field(this, CL_PARENT_REF, parent);
+        ctx.set_field(this, CL_NAME_REF, name);
         ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    } else {
+        ctx.set_field_by_name(this, "parent", parent);
+        ctx.set_field_by_name(this, "name", name);
     }
     let pd = alloc_default_protection_domain(ctx);
-    ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    if synthetic_layout {
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    }
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
@@ -2325,6 +2384,16 @@ pub(crate) fn classloader_parent(
     // fallback — silently losing the parent's classpath.
     if let Value::Object(Some(parent)) = ctx.get_field_by_name(loader, "parent") {
         return Some(parent);
+    }
+    // L1: the slot fallback is for OUR layout only. On the real layout slot 1
+    // is `java.lang.ClassLoader.name` — a String — so this read handed the
+    // platform loader's own name back as its PARENT, and every caller that
+    // walks the chain (`builtin_loader_reachable`, `parent_namespace_id`,
+    // Tomcat's `while (j.getParent() != null)`) then treated a String as a
+    // ClassLoader. On a real layout a null by-name `parent` is the truth:
+    // nothing but real bytecode and the by-name writes above ever sets it.
+    if !cl_has_synthetic_layout(ctx, loader) {
+        return None;
     }
     match ctx.get_field(loader, CL_PARENT_REF) {
         Value::Object(Some(parent)) => Some(parent),
@@ -4321,7 +4390,20 @@ fn cl_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn cl_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let name_val = ctx.get_field(this, CL_NAME_REF);
+    // L1: `CL_NAME_REF` is slot 2, which on the real layout is
+    // `unnamedModule` — reading it back handed a `Module` to a caller
+    // expecting a `String`. The real `name` is slot 1 and is written BY NAME,
+    // so ask for it that way on that layout and keep the synthetic slot for
+    // ours. (The by-name read is deliberately NOT tried first on our own
+    // layout: `resolve_field_index_in_hierarchy` answers the MOST-DERIVED
+    // declaration, so a user loader that happens to declare its own `name`
+    // field would shadow the loader name — the trap `native_enum_name` fell
+    // into.)
+    let name_val = if cl_has_synthetic_layout(ctx, this) {
+        ctx.get_field(this, CL_NAME_REF)
+    } else {
+        ctx.get_field_by_name(this, "name")
+    };
     if let Value::Object(Some(_)) = name_val {
         Ok(Some(name_val))
     } else {
@@ -10162,27 +10244,34 @@ mod classloader_tests {
         }
 
         let name = ctx.create_string("l1");
+        let parent = make_loader(&mut ctx, "example/L1RealCtorParent", true);
         cl_init_name_parent(
             &mut ctx,
             &[
                 Value::Object(Some(loader)),
                 Value::Object(Some(name)),
-                Value::Object(None),
+                Value::Object(Some(parent)),
             ],
         )
         .expect("ClassLoader(String, ClassLoader) native");
 
-        for slot in [
-            CL_LOADER_TYPE,
-            CL_CLASSES_LOADED,
-            CL_IS_PARALLEL_CAPABLE,
-            CL_LOADER_ID,
-        ] {
+        // Slot 0 IS the real `parent`, so it legitimately receives the parent
+        // LOADER — by name. What it must never receive is `Int(LOADER_CUSTOM)`,
+        // which `set_field_as` coerces to `Object(None)`.
+        assert_eq!(
+            ctx.get_field(loader, CL_LOADER_TYPE),
+            Value::Object(Some(parent)),
+            "slot 0 is `parent` on the real layout: the parent loader, never \
+             the VM's loader-type tag"
+        );
+        // 3 / 4 / 6 are `nameAndId` / `parallelLockMap` / `classes` and have no
+        // CratonVM counterpart at all — nothing may be written there.
+        for slot in [CL_CLASSES_LOADED, CL_IS_PARALLEL_CAPABLE, CL_LOADER_ID] {
             assert_eq!(
                 ctx.get_field(loader, slot),
                 Value::Object(Some(sentinel)),
-                "slot {slot} is a JDK reference field on the real layout and \
-                 must not be overwritten with VM bookkeeping"
+                "slot {slot} is a JDK reference field with no CratonVM \
+                 counterpart and must not be overwritten with VM bookkeeping"
             );
         }
 
@@ -10277,6 +10366,102 @@ mod classloader_tests {
             .expect("native")
             .expect("return value");
         assert_eq!(answer, Value::Int(1));
+    }
+
+    /// The three REFERENCE slots are the same defect one kind quieter: slot 1
+    /// is `name:String` and receives a ClassLoader, slot 2 is
+    /// `unnamedModule:Module` and receives a String, slot 5 is
+    /// `package2certs:ConcurrentHashMap` and receives a ProtectionDomain. A
+    /// reference for a reference, so the overlay detector cannot see them —
+    /// which is why the wave-2 brief's step 4 left them in place on the
+    /// (mistaken) grounds that the by-name writes duplicate them.
+    #[test]
+    fn cl_init_leaves_the_three_reference_slots_untouched_on_a_real_layout() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1RealRefSlotLoader", true);
+        let sentinel = new_object_ref(&mut ctx, "java/lang/Object");
+        for slot in [CL_PARENT_REF, CL_NAME_REF, CL_DEFAULT_DOMAIN] {
+            ctx.set_field(loader, slot, Value::Object(Some(sentinel)));
+        }
+
+        let name = ctx.create_string("l1-refslots");
+        let parent = make_loader(&mut ctx, "example/L1RefSlotParent", true);
+        cl_init_name_parent(
+            &mut ctx,
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(name)),
+                Value::Object(Some(parent)),
+            ],
+        )
+        .expect("ClassLoader(String, ClassLoader) native");
+
+        // Slot 1 IS `name` and legitimately receives the name STRING — by
+        // name. The defect was the index write putting the parent LOADER
+        // there.
+        assert_eq!(
+            ctx.get_field(loader, CL_PARENT_REF),
+            Value::Object(Some(name)),
+            "slot 1 is `name` on the real layout: the name String, never the \
+             parent loader"
+        );
+        // 2 and 5 are `unnamedModule` and `package2certs`. Nothing CratonVM
+        // holds belongs in either.
+        for slot in [CL_NAME_REF, CL_DEFAULT_DOMAIN] {
+            assert_eq!(
+                ctx.get_field(loader, slot),
+                Value::Object(Some(sentinel)),
+                "slot {slot} belongs to the JDK on a real layout"
+            );
+        }
+        // `parent` and `name` still arrive — by NAME, which is where the real
+        // fields actually are.
+        assert_eq!(
+            ctx.get_field_by_name(loader, "parent"),
+            Value::Object(Some(parent))
+        );
+        assert_eq!(
+            ctx.get_field_by_name(loader, "name"),
+            Value::Object(Some(name))
+        );
+        assert_eq!(classloader_parent(&mut ctx, loader), Some(parent));
+
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// `classloader_parent`'s slot fallback read slot 1 unconditionally. On a
+    /// real layout that is `java.lang.ClassLoader.name` — a String — so a
+    /// parentless loader whose name had been written reported its own NAME as
+    /// its PARENT, and every caller that walks the chain then treated a String
+    /// as a ClassLoader.
+    #[test]
+    fn classloader_parent_does_not_return_the_name_string_as_a_parent() {
+        let mut ctx = MockNativeContext::new();
+        let real = make_loader(&mut ctx, "example/L1ParentFallbackReal", true);
+        let name = ctx.create_string("platform");
+        // Exactly what `get_or_create_platform_loader` produces: the real
+        // `name` field set, the real `parent` genuinely null.
+        ctx.set_field_by_name(real, "name", Value::Object(Some(name)));
+        assert_eq!(
+            ctx.get_field(real, CL_PARENT_REF),
+            Value::Object(Some(name)),
+            "precondition: slot 1 IS the name on the real layout"
+        );
+        assert_eq!(
+            classloader_parent(&mut ctx, real),
+            None,
+            "a parentless real-layout loader has no parent — not its own name"
+        );
+
+        // Synthetic layout keeps the fallback: it is what makes an ordinary
+        // `URLClassLoader` constructed with a non-null parent resolve at all.
+        let ours = make_loader(&mut ctx, "example/L1ParentFallbackSynthetic", false);
+        let p = make_loader(&mut ctx, "example/L1ParentFallbackSyntheticParent", false);
+        ctx.set_field(ours, CL_PARENT_REF, Value::Object(Some(p)));
+        assert_eq!(classloader_parent(&mut ctx, ours), Some(p));
     }
 
     /// The side table is authoritative, ahead of the slot — the ordering
