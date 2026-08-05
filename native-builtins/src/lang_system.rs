@@ -3,7 +3,7 @@
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1236,29 +1236,33 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Runtime;",
         native_runtime_get_runtime,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "availableProcessors",
         "()I",
         native_runtime_available_processors,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "maxMemory",
         "()J",
         native_runtime_max_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "totalMemory",
         "()J",
         native_runtime_total_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
         "()J",
         native_runtime_free_memory,
+        NativeKind::Bridge,
     );
     // JDK 9+ / WildFly: `Runtime.version()` and `Runtime.Version.feature()`.
     registry.register(
@@ -1303,10 +1307,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
-    registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
+    registry.register_with_kind("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)
-    });
+    }, NativeKind::Bridge);
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
     // `Runtime.halt(int)` is NOT intercepted — its real bytecode runs, and it
@@ -1319,11 +1323,17 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError: java/lang/Shutdown.beforeHalt()V` and the process
     // kept running: a caller asking to die immediately got a linkage error out
     // of a method that cannot legally return.
-    registry.register("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
+    registry.register_with_kind("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
         // HotSpot's does nothing an application can observe.
         Ok(None)
-    });
-    registry.register("java/lang/Shutdown", "halt0", "(I)V", native_shutdown_halt0);
+    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "halt0",
+        "(I)V",
+        native_shutdown_halt0,
+        NativeKind::Bridge,
+    );
 
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
     registry.register(

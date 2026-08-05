@@ -35,7 +35,7 @@
 
 use std::rc::Rc;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry, StackTraceEntry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::Value;
 
@@ -681,7 +681,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // the ContinuationScope / Continuation are dropped (we have no
     // virtual-thread continuation support so the user-visible behaviour
     // matches the platform-thread code path).
-    registry.register(
+    registry.register_with_kind(
         asw,
         "callStackWalk",
         "(IILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
@@ -702,6 +702,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             ];
             native_call_stack_walk(ctx, &reordered)
         },
+        NativeKind::Bridge,
     );
     // JDK 21's actual signature: single `long mode` (not split into two
     // ints like JDK 25) plus the ContinuationScope/Continuation params and
@@ -771,11 +772,12 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     );
     // JDK 25: fetchStackFrames(int mode, long anchor, int batchSize,
     //                           int startIndex, int endIndex, T[] frameBuffer)
-    registry.register(
+    registry.register_with_kind(
         asw,
         "fetchStackFrames",
         "(IJIII[Ljava/lang/Object;)I",
         native_fetch_stack_frames,
+        NativeKind::Bridge,
     );
 
     // StackFrameInfo — native overrides run before bytecode (see
@@ -1268,7 +1270,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // `type` is left as the descriptor String, which is a shape the JDK itself
     // uses: `getDescriptor()` returns it as-is and `getMethodType()` inflates a
     // String `type` into a `MethodType` on demand.
-    registry.register(sfi, "expandStackFrameInfo", "()V", |ctx, args| {
+    registry.register_with_kind(sfi, "expandStackFrameInfo", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
@@ -1334,7 +1336,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         ctx.set_field_by_name(this, "type", Value::Object(Some(desc_str)));
         ctx.unpin_native_roots(pin);
         Ok(None)
-    });
+    }, NativeKind::Bridge);
     // IMPLEMENTED (was an unconditional no-op). Real
     // `ClassFrameInfo.ensureRetainClassRefEnabled()` throws
     // UnsupportedOperationException unless the RETAIN_CLASS_REF bit is set in the

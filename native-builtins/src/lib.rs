@@ -8,9 +8,7 @@
 
 #![allow(clippy::collapsible_if, clippy::needless_range_loop, dead_code)]
 
-use cratonvm_native_api::{
-    NativeCallback, NativeContext, NativeHandleScope, NativeMethodRegistry,
-};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
@@ -8521,7 +8519,7 @@ pub fn register_essential_natives_with_shims(
     // W3: same treatment as `istty()` above — report the real per-stream state.
     // Bit layout matches `java.io.Console`: 0b001 stdin, 0b010 stdout,
     // 0b100 stderr (TTY_STDIN_MASK / TTY_STDOUT_MASK / TTY_STDERR_MASK).
-    registry.register("java/io/Console", "ttyStatus", "()I", |_ctx, _args| {
+    registry.register_with_kind("java/io/Console", "ttyStatus", "()I", |_ctx, _args| {
         use std::io::IsTerminal;
         let mut status = 0i32;
         if std::io::stdin().is_terminal() {
@@ -8534,7 +8532,7 @@ pub fn register_essential_natives_with_shims(
             status |= 0b100;
         }
         Ok(Some(Value::Int(status)))
-    });
+    }, NativeKind::Bridge);
 
     // nontty-console: companion to `Console.istty()` for the modern
     // (JDK 22+) console path. In JDK 25 the only two natives across the
@@ -8568,7 +8566,7 @@ pub fn register_essential_natives_with_shims(
     // and keeps `readLine`/`readPassword` from faulting if a Console is ever
     // instantiated. Args: [0] = boolean `on` (this is a STATIC native, so there
     // is no receiver in args).
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/io/JdkConsoleImpl",
         "echo",
         "(Z)Z",
@@ -8582,6 +8580,7 @@ pub fn register_essential_natives_with_shims(
             // touches a real tty ioctl.
             Ok(Some(Value::Int(on)))
         },
+        NativeKind::Bridge,
     );
 
     registry.register(
@@ -9701,30 +9700,40 @@ pub fn register_essential_natives_with_shims(
     // implementation, not a stub. (Same for every other `registerNatives`
     // below.)
     registry.register("java/lang/Object", "registerNatives", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Object",
         "hashCode",
         "()I",
         native_object_hash_code,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Object",
         "getClass",
         "()Ljava/lang/Class;",
         native_object_get_class,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Object",
         "clone",
         "()Ljava/lang/Object;",
         native_object_clone,
+        NativeKind::Bridge,
     );
-    registry.register("java/lang/Object", "notify", "()V", native_object_notify);
-    registry.register(
+    registry.register_with_kind(
+        "java/lang/Object",
+        "notify",
+        "()V",
+        native_object_notify,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/lang/Object",
         "notifyAll",
         "()V",
         native_object_notify_all,
+        NativeKind::Bridge,
     );
     registry.register("java/lang/Object", "wait", "()V", native_object_wait);
     // BUG FIX: `wait(J)` / `wait0(J)` must honor the millisecond timeout.
@@ -9741,11 +9750,12 @@ pub fn register_essential_natives_with_shims(
     );
     // JDK 19+: wait(long) is a Java method that delegates to wait0(long),
     // which is the actual private native method.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Object",
         "wait0",
         "(J)V",
         native_object_wait_timeout,
+        NativeKind::Bridge,
     );
     registry.register("java/lang/Object", "finalize", "()V", |_ctx, _args| {
         // Object.finalize() is deprecated for removal since JDK 9 and was removed from
@@ -9757,7 +9767,13 @@ pub fn register_essential_natives_with_shims(
 
     // --- java.lang.System (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
-    registry.register("java/lang/System", "registerNatives", "()V", native_noop);
+    registry.register_with_kind(
+        "java/lang/System",
+        "registerNatives",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     // LEAF: both clock reads are `_ctx`-free — a `SystemTime::now()` /
     // `Instant::elapsed()` and an integer cast. Nothing to pin, nothing that
     // can allocate, safepoint or throw. See `NativeMethodRegistry::set_leaf`.
@@ -9766,30 +9782,34 @@ pub fn register_essential_natives_with_shims(
     // `System.nanoTime` is what every timeout, scheduler and benchmark in the
     // JDK calls.
     registry.set_leaf(true);
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "currentTimeMillis",
         "()J",
         native_system_current_time_millis,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "nanoTime",
         "()J",
         native_system_nano_time,
+        NativeKind::Bridge,
     );
     registry.set_leaf(false);
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "arraycopy",
         "(Ljava/lang/Object;ILjava/lang/Object;II)V",
         native_system_arraycopy,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "identityHashCode",
         "(Ljava/lang/Object;)I",
         native_system_identity_hash_code,
+        NativeKind::Bridge,
     );
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
     // W3: derive the answer from the host instead of hard-coding null, so this
@@ -10424,7 +10444,7 @@ pub fn register_essential_natives_with_shims(
     // iterated the keys).
 
     // JDK 25 additional System natives:
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "setIn0",
         "(Ljava/io/InputStream;)V",
@@ -10440,8 +10460,9 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "setOut0",
         "(Ljava/io/PrintStream;)V",
@@ -10455,8 +10476,9 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "setErr0",
         "(Ljava/io/PrintStream;)V",
@@ -10470,6 +10492,7 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/System",
@@ -10516,11 +10539,12 @@ pub fn register_essential_natives_with_shims(
             Ok(None)
         },
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/System",
         "mapLibraryName",
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_system_map_library_name,
+        NativeKind::Bridge,
     );
 
     // System.getenv — needed in both synthetic and real-JDK modes because
@@ -10601,11 +10625,12 @@ pub fn register_essential_natives_with_shims(
 
     // --- java.lang.String (native methods + overrides) ---
     // JDK 9+: String.intern() is the only ACC_NATIVE method in java.lang.String.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/String",
         "intern",
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
+        NativeKind::Bridge,
     );
     // The `AbstractStringBuilder` half of DF05 — see the
     // `(Ljava/lang/StringBuilder;)V` sibling in `deprecated_util.rs` for the
@@ -11484,12 +11509,19 @@ pub fn register_essential_natives_with_shims(
 
     // --- java.lang.Class (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
-    registry.register("java/lang/Class", "registerNatives", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/lang/Class",
+        "registerNatives",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/lang/Class",
         "getPrimitiveClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_class_get_primitive_class,
+        NativeKind::Bridge,
     );
 
     // WildFly livelock fix — override the three `java.lang.Class$Atomic`
@@ -11884,7 +11916,7 @@ pub fn register_essential_natives_with_shims(
     // so a later registry-backed `canRead` agrees. `from`/`to` may be the unnamed
     // module (null name → empty string), which `module_add_reads` accepts. Without
     // this the whole inline-mock path aborts before `retransformClasses` even runs.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Module",
         "addReads0",
         "(Ljava/lang/Module;Ljava/lang/Module;)V",
@@ -11900,19 +11932,22 @@ pub fn register_essential_natives_with_shims(
             ctx.module_add_reads(&from, &to);
             Ok(None)
         },
+        NativeKind::Bridge,
     );
 
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "desiredAssertionStatus0",
         "(Ljava/lang/Class;)Z",
         |_ctx, _args| Ok(Some(Value::Int(assertion_status_default()))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "forName0",
         "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;",
         native_class_for_name,
+        NativeKind::Bridge,
     );
     // Public-name `Class.forName` overloads. In stock OpenJDK these are
     // Java methods that forward to `forName0`; in synthetic-jdk mode the
@@ -11972,17 +12007,19 @@ pub fn register_essential_natives_with_shims(
     registry.register("java/lang/Class", "isArray", "()Z", native_class_is_array);
     registry.register("java/lang/Class", "isEnum", "()Z", native_class_is_enum);
     // JDK 25 native methods needed for real Class bootstrap:
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "isInstance",
         "(Ljava/lang/Object;)Z",
         lang_class::native_class_is_instance,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "isAssignableFrom",
         "(Ljava/lang/Class;)Z",
         lang_class::native_class_is_assignable_from,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/Class",
@@ -11996,17 +12033,19 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/Class;)Ljava/lang/Class;",
         lang_class::native_class_as_subclass,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getSuperclass",
         "()Ljava/lang/Class;",
         lang_class::native_class_get_superclass,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getInterfaces0",
         "()[Ljava/lang/Class;",
         lang_class::native_class_get_interfaces,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/Class",
@@ -12040,7 +12079,7 @@ pub fn register_essential_natives_with_shims(
     // NEW-8: Class.isHidden() — consult the real hidden flag set by
     // `Lookup.defineHiddenClass`. The previous stub always returned 0
     // which broke JEP 371 class-identity checks.
-    registry.register("java/lang/Class", "isHidden", "()Z", |ctx, args| {
+    registry.register_with_kind("java/lang/Class", "isHidden", "()Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
@@ -12057,7 +12096,7 @@ pub fn register_essential_natives_with_shims(
             None => false,
         };
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
-    });
+    }, NativeKind::Bridge);
     // Round 63: org.jboss.staxmapper.IntVersion.toString() — WildFly uses
     // IntStream.of(segments).limit(n).mapToObj(Integer::toString).collect(joining("."))
     // to format its version. Our IntStream/mapToObj chain returns null on the
@@ -12208,11 +12247,12 @@ pub fn register_essential_natives_with_shims(
         "()V",
         |_ctx, _args| Ok(None),
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "initClassName",
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
+        NativeKind::Bridge,
     );
     // getName() is a Java method that caches via initClassName(). Override with
     // native since JDK's Class field layout differs from our mirror layout.
@@ -12272,29 +12312,33 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/Class;",
         lang_class::native_class_array_type,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getDeclaringClass0",
         "()Ljava/lang/Class;",
         lang_class::native_class_get_declaring_class,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getSimpleBinaryName0",
         "()Ljava/lang/String;",
         lang_class::native_class_get_simple_binary_name,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getEnclosingMethod0",
         "()[Ljava/lang/Object;",
         lang_class::native_class_get_enclosing_method,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getGenericSignature0",
         "()Ljava/lang/String;",
         lang_class::native_class_get_generic_signature,
+        NativeKind::Bridge,
     );
     // GENS-1 (real-JDK): override Class.getGenericInterfaces() and
     // getGenericSuperclass() with our native implementations. The JDK's
@@ -12330,29 +12374,33 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/reflect/Type;",
         lang_class::native_class_get_generic_superclass,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getRawAnnotations",
         "()[B",
         lang_class::native_class_get_raw_annotations,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getRawTypeAnnotations",
         "()[B",
         lang_class::native_class_get_raw_type_annotations,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getConstantPool",
         "()Ljdk/internal/reflect/ConstantPool;",
         lang_class::native_class_get_constant_pool,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getDeclaredFields0",
         "(Z)[Ljava/lang/reflect/Field;",
         lang_class::native_class_get_declared_fields,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/Class",
@@ -12366,11 +12414,12 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
         lang_class::native_class_get_declared_field,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getDeclaredMethods0",
         "(Z)[Ljava/lang/reflect/Method;",
         lang_class::native_class_get_declared_methods,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/Class",
@@ -12378,11 +12427,12 @@ pub fn register_essential_natives_with_shims(
         "()[Ljava/lang/reflect/Method;",
         lang_class::native_class_get_declared_methods,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getDeclaredConstructors0",
         "(Z)[Ljava/lang/reflect/Constructor;",
         lang_class::native_class_get_declared_constructors,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/Class",
@@ -12442,41 +12492,47 @@ pub fn register_essential_natives_with_shims(
         "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
         lang_class::native_class_get_constructor,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getDeclaredClasses0",
         "()[Ljava/lang/Class;",
         lang_class::native_class_get_declared_classes,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getRecordComponents0",
         "()[Ljava/lang/reflect/RecordComponent;",
         lang_class::native_class_get_record_components,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "isRecord0",
         "()Z",
         lang_class::native_class_is_record,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getNestHost0",
         "()Ljava/lang/Class;",
         lang_class::native_class_get_nest_host,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getNestMembers0",
         "()[Ljava/lang/Class;",
         lang_class::native_class_get_nest_members,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getPermittedSubclasses0",
         "()[Ljava/lang/Class;",
         lang_class::native_class_get_permitted_subclasses,
+        NativeKind::Bridge,
     );
     // WP2.1-class-modern — `Class.getAnnotatedSuperclass()` /
     // `getAnnotatedInterfaces()`. Real-JDK impl is pure Java but reads
@@ -12583,17 +12639,19 @@ pub fn register_essential_natives_with_shims(
         "()[Ljava/lang/reflect/AnnotatedType;",
         lang_class::native_annotated_parameterized_type_get_annotated_actual_type_arguments,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getClassFileVersion0",
         "()I",
         lang_class::native_class_get_class_file_version,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Class",
         "getClassAccessFlagsRaw0",
         "()I",
         lang_class::native_class_get_modifiers,
+        NativeKind::Bridge,
     );
     // T19.N1: Class security natives — expose the CodeSource installed at
     // class-define time via `Class.getProtectionDomain()` / `.getSigners()`
@@ -12971,23 +13029,31 @@ pub fn register_essential_natives_with_shims(
 
     // --- java.lang.Thread (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
-    registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/lang/Thread",
+        "registerNatives",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/lang/Thread",
         "currentThread",
         "()Ljava/lang/Thread;",
         native_thread_current_thread,
+        NativeKind::Bridge,
     );
     registry.register("java/lang/Thread", "sleep", "(J)V", native_thread_sleep);
     registry.register("java/lang/Thread", "yield", "()V", |_ctx, _args| {
         std::thread::yield_now();
         Ok(None)
     });
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "interrupt0",
         "()V",
         native_thread_interrupt,
+        NativeKind::Bridge,
     );
     // Also register public interrupt() so it works on synthetic Thread stubs
     registry.register(
@@ -13114,11 +13180,12 @@ pub fn register_essential_natives_with_shims(
     );
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
     // JDK 25 additional Thread natives:
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "currentCarrierThread",
         "()Ljava/lang/Thread;",
         native_thread_current_thread,
+        NativeKind::Bridge,
     );
     // Thread.<init> overrides: synthetic-JDK only. In real-JDK mode the
     // Thread class has many more fields and a FieldHolder layout — writing
@@ -13394,7 +13461,13 @@ pub fn register_essential_natives_with_shims(
             Ok(None)
         },
     );
-    registry.register("java/lang/Thread", "start0", "()V", native_thread_start0);
+    registry.register_with_kind(
+        "java/lang/Thread",
+        "start0",
+        "()V",
+        native_thread_start0,
+        NativeKind::Bridge,
+    );
     // Thread.start: in real-JDK mode the JDK's Java implementation must
     // run (it sets thread state, checks already-started, and calls start0).
     // Only intercept for synthetic-JDK Thread where there is no Java body
@@ -13478,15 +13551,16 @@ pub fn register_essential_natives_with_shims(
         }
         Ok(None)
     });
-    registry.register("java/lang/Thread", "yield0", "()V", |_ctx, _args| {
+    registry.register_with_kind("java/lang/Thread", "yield0", "()V", |_ctx, _args| {
         std::thread::yield_now();
         Ok(None)
-    });
-    registry.register(
+    }, NativeKind::Bridge);
+    registry.register_with_kind(
         "java/lang/Thread",
         "sleepNanos0",
         "(J)V",
         native_thread_sleep_nanos,
+        NativeKind::Bridge,
     );
     // T19.N2: JDK 21+ Thread.sleep(long) delegates to this private native
     // for the actual sleep + interrupt handling.
@@ -13562,7 +13636,7 @@ pub fn register_essential_natives_with_shims(
     // T1.6.7 — `Thread.holdsLock(Object)` real implementation.
     // Was a constant `return false` stub. Now consults the per-thread
     // monitor table via NativeContext::current_thread_holds_lock.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "holdsLock",
         "(Ljava/lang/Object;)Z",
@@ -13583,8 +13657,9 @@ pub fn register_essential_natives_with_shims(
                 0
             })))
         },
+        NativeKind::Bridge,
     );
-    registry.register("java/lang/Thread", "setPriority0", "(I)V", |_ctx, _args| {
+    registry.register_with_kind("java/lang/Thread", "setPriority0", "(I)V", |_ctx, _args| {
         // KEEP: genuine no-op, and the same one HotSpot performs. The Java-visible
         // state (`Thread.holder.priority`, what `getPriority()` returns) is written
         // by the `setPriority(int)` bytecode BEFORE this call; `setPriority0`'s only
@@ -13592,8 +13667,8 @@ pub fn register_essential_natives_with_shims(
         // runs as root with `-XX:ThreadPriorityPolicy=1`, so "accept and ignore" is
         // the mainstream platform behaviour, not an unimplemented stub.
         Ok(None)
-    });
-    registry.register(
+    }, NativeKind::Bridge);
+    registry.register_with_kind(
         "java/lang/Thread",
         "setNativeName",
         "(Ljava/lang/String;)V",
@@ -13620,8 +13695,9 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "getNextThreadIdOffset",
         "()J",
@@ -13634,6 +13710,7 @@ pub fn register_essential_natives_with_shims(
             // high range.
             Ok(Some(Value::Long(thread_next_tid_offset() as i64)))
         },
+        NativeKind::Bridge,
     );
     // KEEP (the `BootLoader.loadLibrary` no-op): CratonVM has no JNI library
     // to load for any boot-loader library name — it implements the Java-visible
@@ -13661,11 +13738,12 @@ pub fn register_essential_natives_with_shims(
     // library STATICALLY LINKED into libjvm; CratonVM links none, and `null`
     // is the JDK's own "not a built-in" answer, which `NativeLibraries.load`
     // handles on its ordinary path.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/NativeLibraries",
         "findBuiltinLib",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
     // `NativeLibraries.load(NativeLibraryImpl impl, String name, boolean isBuiltin,
     // boolean throwExceptionIfFail)` — the classic JNI native-library loader behind
@@ -13692,7 +13770,7 @@ pub fn register_essential_natives_with_shims(
     // of whether the underlying .so actually loaded, exactly like the
     // adjacent `findBuiltinLib` stub's "not a built-in, but proceed anyway"
     // contract.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/NativeLibraries",
         "load",
         "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
@@ -13715,18 +13793,20 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(Some(Value::Int(1)))
         },
+        NativeKind::Bridge,
     );
     // KEEP: genuine no-op here. The native's only effect in HotSpot is to
     // hand the boot loader's unnamed Module to the VM's own module table;
     // CratonVM resolves modules through the class manager, never through
     // that table, so there is no state to record.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/loader/BootLoader",
         "setBootLoaderUnnamedModule0",
         "(Ljava/lang/Module;)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "setCurrentThread",
         "(Ljava/lang/Thread;)V",
@@ -13743,27 +13823,30 @@ pub fn register_essential_natives_with_shims(
             // bytecode overwrite the VM's own notion of the current thread.
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // KEEP: correct constant. `null` is the JDK's "no scoped-value bindings
     // on this stack" answer; `ScopedValue` treats it as the empty snapshot.
     // CratonVM never installs bindings (the `setScopedValueCache` companion
     // below is likewise inert), so there are genuinely none to report.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "findScopedValueBindings",
         "()Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
     // KEEP: correct constant. A null cache is a cache MISS, not a wrong
     // answer — the JDK re-derives the bindings and repopulates. Costs a
     // little speed, never correctness.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "scopedValueCache",
         "()[Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "setScopedValueCache",
         "([Ljava/lang/Object;)V",
@@ -13776,8 +13859,9 @@ pub fn register_essential_natives_with_shims(
             // correctness — and the two halves stay consistent.
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "ensureMaterializedForStackWalk",
         "(Ljava/lang/Object;)V",
@@ -13790,14 +13874,16 @@ pub fn register_essential_natives_with_shims(
             // nothing to materialise.
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "getStackTrace0",
         "()Ljava/lang/Object;",
         native_thread_get_stack_trace,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "dumpThreads",
         "([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;",
@@ -13824,8 +13910,9 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(Some(Value::Object(Some(outer))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "getThreads",
         "()[Ljava/lang/Thread;",
@@ -13838,8 +13925,9 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "clearInterruptEvent",
         "()V",
@@ -13855,71 +13943,81 @@ pub fn register_essential_natives_with_shims(
             let _ = ctx.is_interrupted(true);
             Ok(None)
         },
+        NativeKind::Bridge,
     );
 
     // --- java.lang.Throwable (native methods) ---
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Throwable",
         "fillInStackTrace",
         "(I)Ljava/lang/Throwable;",
         native_throwable_fill_in_stack_trace,
+        NativeKind::Bridge,
     );
 
     // --- java.lang.Float / Double (native bit manipulation) ---
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Float",
         "floatToRawIntBits",
         "(F)I",
         native_float_to_raw_int_bits,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Float",
         "intBitsToFloat",
         "(I)F",
         native_float_int_bits_to_float,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Double",
         "doubleToRawLongBits",
         "(D)J",
         native_double_to_raw_long_bits,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Double",
         "longBitsToDouble",
         "(J)D",
         native_long_bits_to_double,
+        NativeKind::Bridge,
     );
 
     // --- java.lang.Runtime ---
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "availableProcessors",
         "()I",
         native_runtime_available_processors,
+        NativeKind::Bridge,
     );
-    registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
+    registry.register_with_kind("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)
-    });
+    }, NativeKind::Bridge);
     registry.register("java/lang/Runtime", "exit", "(I)V", native_system_exit);
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
         "()J",
         native_runtime_free_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "totalMemory",
         "()J",
         native_runtime_total_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "maxMemory",
         "()J",
         native_runtime_max_memory,
+        NativeKind::Bridge,
     );
 
     registry.register(
@@ -14029,7 +14127,7 @@ pub fn register_essential_natives_with_shims(
     // stay distinct, and -1 for a name we do not know, which is exactly what
     // `JVM_FindSignal` returns and what `Signal(String)` turns into the
     // spec'd `IllegalArgumentException("Unknown signal: ...")`.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/Signal",
         "findSignal0",
         "(Ljava/lang/String;)I",
@@ -14040,6 +14138,7 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Int(posix_signal_number(&name))))
         },
+        NativeKind::Bridge,
     );
     // `handle0(sig, handler)` installs `handler` and returns the PREVIOUS
     // handler (0 = SIG_DFL, 1 = SIG_IGN, -1 = "reserved by the VM/OS", which
@@ -14052,11 +14151,12 @@ pub fn register_essential_natives_with_shims(
     // signals — so throwing here would break boot without buying the caller
     // any working signal delivery. Deliberate silent accept; see the wave-2
     // stub-removal report.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/Signal",
         "handle0",
         "(IJ)J",
         |_ctx, _args| Ok(Some(Value::Long(0))),
+        NativeKind::Bridge,
     );
 
     // --- I/O essential natives ---
@@ -14085,7 +14185,7 @@ pub fn register_essential_natives_with_shims(
     // the given fd number.  0..=2 map to the standard-stream pseudo-handles
     // (we don't surface the real Windows HANDLE, and <clinit> accepts -1 for
     // non-standard fds).
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileDescriptor",
         "getHandle",
         "(I)J",
@@ -14102,6 +14202,7 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Long(handle)))
         },
+        NativeKind::Bridge,
     );
     // W4: was a hard `false` on the (incorrect) grounds that CratonVM never
     // opens an O_APPEND descriptor — `FileDescriptorTable::open_write` passes
@@ -14111,11 +14212,12 @@ pub fn register_essential_natives_with_shims(
     // the only ones the JDK's sole caller, `FileDescriptor(int)`, asks about.
     // See `native_file_descriptor_get_append` for the escalation covering the
     // remaining, table-id-only descriptors.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileDescriptor",
         "getAppend",
         "(I)Z",
         native_file_descriptor_get_append,
+        NativeKind::Bridge,
     );
     // FileDescriptor.sync0()V — fsync. `this` carries the fd id that `open0`
     // stored in the Windows `handle` long / POSIX `fd` int slot.
@@ -14129,7 +14231,7 @@ pub fn register_essential_natives_with_shims(
     // swallowed, matching `FileDescriptor.sync`'s contract of throwing only
     // `SyncFailedException` (which we have no way to raise from a path that
     // never had a durable handle to begin with).
-    registry.register("java/io/FileDescriptor", "sync0", "()V", |ctx, args| {
+    registry.register_with_kind("java/io/FileDescriptor", "sync0", "()V", |ctx, args| {
         let Some(Value::Object(Some(this))) = args.first().copied() else {
             return Ok(None);
         };
@@ -14145,7 +14247,7 @@ pub fn register_essential_natives_with_shims(
             let _ = ctx.fd_table().rw_sync(fd, false);
         }
         Ok(None)
-    });
+    }, NativeKind::Bridge);
 
     // --- jdk/internal/misc/VM (needed by IntegerCache, LongCache, etc.) ---
     // `VM.initialize()` is libjava's one-shot hook for caching the JVM handle
@@ -14153,7 +14255,13 @@ pub fn register_essential_natives_with_shims(
     // points from this registry, and the JVM's own bootstrap state machine is
     // driven separately by `set_init_level` (see `initLevel` right below), so
     // there is no handle to cache and no state to flip here.
-    registry.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
+    registry.register_with_kind(
+        "jdk/internal/misc/VM",
+        "initialize",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     // WP1.3: VM.initLevel() and VM.awaitInitLevel(int) track the JVM
     // bootstrap state machine (mirroring HotSpot's `VM::_init_level`):
     //   * 1 — after `Vm::new` finishes (primordial classes loaded),
@@ -14302,11 +14410,12 @@ pub fn register_essential_natives_with_shims(
     // behaviour of `initializeFromArchive` / `dumpClassList` /
     // `dumpDynamicArchive` / `logLambdaFormInvoker` is precisely to do
     // nothing. These are no-ops in HotSpot too whenever no archive is mapped.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "initializeFromArchive",
         "(Ljava/lang/Class;)V",
         native_noop,
+        NativeKind::Bridge,
     );
     registry.register(
         "jdk/internal/misc/CDS",
@@ -14326,36 +14435,41 @@ pub fn register_essential_natives_with_shims(
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "logLambdaFormInvoker",
         "(Ljava/lang/String;)V",
         native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "getCDSConfigStatus",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+        NativeKind::Bridge,
     );
     // T15: JDK 25 CDS adds a seed native for deterministic archive dumping.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "getRandomSeedForDumping",
         "()J",
         |_ctx, _args| Ok(Some(Value::Long(0))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "dumpClassList",
         "(Ljava/lang/String;)V",
         native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/CDS",
         "dumpDynamicArchive",
         "(Ljava/lang/String;)V",
         native_noop,
+        NativeKind::Bridge,
     );
 
     // --- jdk/internal/misc/PreviewFeatures ---
@@ -14364,22 +14478,24 @@ pub fn register_essential_natives_with_shims(
     // discovery), which otherwise aborts every real-JDK run with
     // UnsatisfiedLinkError before a single test executes. We don't parse
     // `--enable-preview` yet (see roadmap), so mirror HotSpot's default: off.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/PreviewFeatures",
         "isPreviewEnabled",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+        NativeKind::Bridge,
     );
 
     // jdk/internal/misc/ScopedMemoryAccess — JEP 471 panama foreign memory.
     // registerNatives is called from <clinit>. We don't support scoped memory
     // natives yet (they're used by Vector API and Foreign Memory API), but
     // noop'ing registerNatives keeps the class loadable.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/ScopedMemoryAccess",
         "registerNatives",
         "()V",
         native_noop,
+        NativeKind::Bridge,
     );
 
     // --- jdk/internal/perf/Perf (C27) ---
@@ -14388,11 +14504,12 @@ pub fn register_essential_natives_with_shims(
     // and by JBoss Modules for its own counters. We don't track perf data; we
     // hand out benign defaults — empty/zeroed direct ByteBuffers for the
     // create* methods, zero/no-op for the rest. See lang_system::native_perf_*.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "registerNatives",
         "()V",
         native_noop,
+        NativeKind::Bridge,
     );
     registry.register(
         "jdk/internal/perf/Perf",
@@ -14400,51 +14517,63 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;I)Ljava/nio/ByteBuffer;",
         lang_system::native_perf_attach,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "attach0",
         "(I)Ljava/nio/ByteBuffer;",
         lang_system::native_perf_attach0,
+        NativeKind::Bridge,
     );
     // Perf.detach(ByteBuffer) releases the mapping that `attach` handed out.
     // Our `attach`/`create*` return ordinary heap-backed direct ByteBuffers
     // (lang_system::native_perf_*), not an mmap of a hsperfdata file, so there
     // is nothing to unmap — the buffer is reclaimed by GC like any other.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "detach",
         "(Ljava/nio/ByteBuffer;)V",
         native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "createLong",
         "(Ljava/lang/String;IIJ)Ljava/nio/ByteBuffer;",
         lang_system::native_perf_create_long,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "createByteArray",
         "(Ljava/lang/String;II[BI)Ljava/nio/ByteBuffer;",
         lang_system::native_perf_create_byte_array,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "highResCounter",
         "()J",
         lang_system::native_perf_high_res_counter,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "highResFrequency",
         "()J",
         lang_system::native_perf_high_res_frequency,
+        NativeKind::Bridge,
     );
 
     // Win32-side filesystem init — noop in our VM (path canonicalization
     // and FS flags are built in Rust, not JNI).
     registry.register("java/io/WinNTFileSystem", "initIDs", "()V", native_noop);
-    registry.register("java/io/UnixFileSystem", "initIDs", "()V", native_noop);
+    registry.register_with_kind(
+        "java/io/UnixFileSystem",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     // Guard real-JDK File.<clinit> against missing System property entries.
     // JDK constructors call:
     //   props.getProperty("file.separator").charAt(0)
@@ -14687,17 +14816,24 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
         |_ctx, args| Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessEnvironment",
         "environ",
         "()[[B",
         native_process_environment_environ,
+        NativeKind::Bridge,
     );
     // ProcessImpl.init() is the JNI field-ID cache (the `initIDs` idiom under a
     // different name): it looks up the jfieldIDs the native process code later
     // pokes `handle`/`exitcode` through. Our ProcessBuilder/Process surface is
     // implemented in Rust against named fields, so there are no IDs to cache.
-    registry.register("java/lang/ProcessImpl", "init", "()V", native_noop);
+    registry.register_with_kind(
+        "java/lang/ProcessImpl",
+        "init",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
     registry.register(
@@ -14814,7 +14950,7 @@ pub fn register_essential_natives_with_shims(
     // present; `set_field_by_name` is a no-op for a layout without `state`.
     // The FFM-side accessors (`isAlive`, `checkValidState`) are owned by
     // `phases_late/foreign_ffm.rs`.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/ScopedMemoryAccess",
         "closeScope0",
         "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V",
@@ -14834,6 +14970,7 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     let scoped_memory_access = "jdk/internal/misc/ScopedMemoryAccess";
     for name in ["getByte", "getByteInternal"] {
@@ -15061,23 +15198,26 @@ pub fn register_essential_natives_with_shims(
 
     // --- jdk/internal/misc/Unsafe: JDK 25 method-name variants with `0` suffix ---
     let u2 = "jdk/internal/misc/Unsafe";
-    registry.register(
+    registry.register_with_kind(
         u2,
         "objectFieldOffset0",
         "(Ljava/lang/reflect/Field;)J",
         native_unsafe_object_field_offset,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "objectFieldOffset1",
         "(Ljava/lang/Class;Ljava/lang/String;)J",
         native_unsafe_object_field_offset1,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "staticFieldOffset0",
         "(Ljava/lang/reflect/Field;)J",
         native_unsafe_static_field_offset,
+        NativeKind::Bridge,
     );
     // NOTE: `staticFieldBase0(Field)` is NOT registered here. It used to be a
     // constant `null`, which is the wrong answer (the real contract is the
@@ -15086,199 +15226,231 @@ pub fn register_essential_natives_with_shims(
     // function a few hundred lines below — registers the real
     // `native_unsafe_static_field_base` for this exact triple and, being
     // later, already won. The stub was dead weight that read as intentional.
-    registry.register(
+    registry.register_with_kind(
         u2,
         "arrayBaseOffset0",
         "(Ljava/lang/Class;)I",
         native_unsafe_array_base_offset,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "arrayIndexScale0",
         "(Ljava/lang/Class;)I",
         native_unsafe_array_index_scale,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "ensureClassInitialized0",
         "(Ljava/lang/Class;)V",
         native_unsafe_ensure_class_initialized,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "copyMemory0",
         "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
         unsafe_natives::native_unsafe_copy_memory_consolidated,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "setMemory0",
         "(Ljava/lang/Object;JJB)V",
         native_unsafe_set_memory,
+        NativeKind::Bridge,
     );
     // compareAndExchange variants (return old value instead of boolean)
-    registry.register(
+    registry.register_with_kind(
         u2,
         "compareAndExchangeInt",
         "(Ljava/lang/Object;JII)I",
         native_unsafe_compare_and_exchange_int,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "compareAndExchangeLong",
         "(Ljava/lang/Object;JJJ)J",
         native_unsafe_compare_and_exchange_long,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "compareAndExchangeReference",
         "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         native_unsafe_compare_and_exchange_reference,
+        NativeKind::Bridge,
     );
     // Remaining primitive get/put for jdk/internal/misc/Unsafe (JDK 25 declares them directly)
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getBoolean",
         "(Ljava/lang/Object;J)Z",
         native_unsafe_get_byte_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putBoolean",
         "(Ljava/lang/Object;JZ)V",
         native_unsafe_put_byte_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getByte",
         "(Ljava/lang/Object;J)B",
         native_unsafe_get_byte_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putByte",
         "(Ljava/lang/Object;JB)V",
         native_unsafe_put_byte_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getShort",
         "(Ljava/lang/Object;J)S",
         native_unsafe_get_short_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putShort",
         "(Ljava/lang/Object;JS)V",
         native_unsafe_put_short_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getChar",
         "(Ljava/lang/Object;J)C",
         native_unsafe_get_char_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putChar",
         "(Ljava/lang/Object;JC)V",
         native_unsafe_put_char_mb,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getFloat",
         "(Ljava/lang/Object;J)F",
         native_unsafe_get_float,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putFloat",
         "(Ljava/lang/Object;JF)V",
         native_unsafe_put_float,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getDouble",
         "(Ljava/lang/Object;J)D",
         native_unsafe_get_double,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putDouble",
         "(Ljava/lang/Object;JD)V",
         native_unsafe_put_double,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getBooleanVolatile",
         "(Ljava/lang/Object;J)Z",
         native_unsafe_get_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putBooleanVolatile",
         "(Ljava/lang/Object;JZ)V",
         native_unsafe_put_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getByteVolatile",
         "(Ljava/lang/Object;J)B",
         native_unsafe_get_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putByteVolatile",
         "(Ljava/lang/Object;JB)V",
         native_unsafe_put_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getShortVolatile",
         "(Ljava/lang/Object;J)S",
         native_unsafe_get_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putShortVolatile",
         "(Ljava/lang/Object;JS)V",
         native_unsafe_put_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getCharVolatile",
         "(Ljava/lang/Object;J)C",
         native_unsafe_get_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putCharVolatile",
         "(Ljava/lang/Object;JC)V",
         native_unsafe_put_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getFloatVolatile",
         "(Ljava/lang/Object;J)F",
         native_unsafe_get_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putFloatVolatile",
         "(Ljava/lang/Object;JF)V",
         native_unsafe_put_int_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getDoubleVolatile",
         "(Ljava/lang/Object;J)D",
         native_unsafe_get_long_volatile,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "putDoubleVolatile",
         "(Ljava/lang/Object;JD)V",
         native_unsafe_put_long_volatile,
+        NativeKind::Bridge,
     );
     // Unaligned get/put variants (C16). For a `byte[]`-backed target a typed
     // access must assemble/scatter N consecutive bytes honoring endianness;
@@ -15390,15 +15562,34 @@ pub fn register_essential_natives_with_shims(
     // cache's problem. With nothing to write back, a no-op is the correct
     // implementation (the surrounding fences are still real — see the two
     // `native_unsafe_fence` registrations below).
-    registry.register(u2, "writeback0", "(J)V", native_noop_with_this);
-    registry.register(u2, "writebackPreSync0", "()V", native_unsafe_fence);
-    registry.register(u2, "writebackPostSync0", "()V", native_unsafe_fence);
+    registry.register_with_kind(
+        u2,
+        "writeback0",
+        "(J)V",
+        native_noop_with_this,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        u2,
+        "writebackPreSync0",
+        "()V",
+        native_unsafe_fence,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        u2,
+        "writebackPostSync0",
+        "()V",
+        native_unsafe_fence,
+        NativeKind::Bridge,
+    );
     // copySwapMemory — copy with byte-swap (endian conversion); real impl in unsafe_jdk25
-    registry.register(
+    registry.register_with_kind(
         u2,
         "copySwapMemory0",
         "(Ljava/lang/Object;JLjava/lang/Object;JJJ)V",
         unsafe_jdk25::native_unsafe_copy_swap_memory,
+        NativeKind::Bridge,
     );
     // NOTE: `getLoadAverage0([DI)I` is NOT registered here. The old constant
     // `0` claimed "0 samples retrieved" while leaving the caller's double[]
@@ -15411,11 +15602,12 @@ pub fn register_essential_natives_with_shims(
     // oop address back into a reference; only whitebox/G1 internals call it.
     // CratonVM never hands raw heap addresses to Java, so no caller can have
     // produced a meaningful argument, and `null` is the only honest answer.
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getUncompressedObject",
         "(J)Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
     // setMemory on sun/misc/Unsafe
     registry.register(
@@ -15427,29 +15619,50 @@ pub fn register_essential_natives_with_shims(
 
     // --- java/lang/ClassLoader ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ClassLoader",
         "registerNatives",
         "()V",
         native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ClassLoader",
         "findBootstrapClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_classloader_find_bootstrap_class,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ClassLoader",
         "findLoadedClass0",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_classloader_find_loaded_class,
+        NativeKind::Bridge,
     );
     // T15: defineClass0/1 — real implementations that extract bytes and define classes
-    registry.register("java/lang/ClassLoader", "defineClass0", "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;", lang_system::native_classloader_define_class0);
-    registry.register("java/lang/ClassLoader", "defineClass1", "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class1);
+    registry.register_with_kind(
+        "java/lang/ClassLoader",
+        "defineClass0",
+        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+        lang_system::native_classloader_define_class0,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        "java/lang/ClassLoader",
+        "defineClass1",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        lang_system::native_classloader_define_class1,
+        NativeKind::Bridge,
+    );
     // defineClass2 uses ByteBuffer; keep it on the ByteBuffer-specific handler.
-    registry.register("java/lang/ClassLoader", "defineClass2", "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;", lang_system::native_classloader_define_class2);
+    registry.register_with_kind(
+        "java/lang/ClassLoader",
+        "defineClass2",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        lang_system::native_classloader_define_class2,
+        NativeKind::Bridge,
+    );
     // `ClassLoader.initializeJavaAssertionMaps()` is the sole caller and it
     // dereferences the result immediately (`directives.classes.length`), so a
     // constant `null` here was not a "no directives" answer — it was a
@@ -15458,7 +15671,7 @@ pub fn register_essential_natives_with_shims(
     // per-class and no per-package overrides, and the JVM-wide default taken
     // from the same switch `Class.desiredAssertionStatus` answers
     // (`assertion_status_default`, honouring CRATONVM_ENABLE_ASSERTIONS).
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ClassLoader",
         "retrieveDirectives",
         "()Ljava/lang/AssertionStatusDirectives;",
@@ -15510,6 +15723,7 @@ pub fn register_essential_natives_with_shims(
             ctx.unpin_native_roots(d_pin);
             Ok(Some(Value::Object(Some(d))))
         },
+        NativeKind::Bridge,
     );
     // Per-thread context classloader (Surefire ForkedBooter calls
     // Thread.currentThread().getContextClassLoader().setDefaultAssertionStatus).
@@ -16022,41 +16236,46 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- java/lang/ref/Reference ---
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/Reference",
         "clear0",
         "()V",
         native_reference_clear0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/Reference",
         "refersTo0",
         "(Ljava/lang/Object;)Z",
         native_reference_refers_to,
+        NativeKind::Bridge,
     );
     // KEEP: correct constant, paired with `hasReferencePendingList` below.
     // CratonVM's GC enqueues cleared references onto their ReferenceQueue
     // directly, so the JDK-side pending list is genuinely always empty and
     // `Reference.processPendingReferences` has nothing to drain.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/Reference",
         "getAndClearReferencePendingList",
         "()Ljava/lang/ref/Reference;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
     // KEEP: correct constant — see `getAndClearReferencePendingList` above.
     // The two must agree, and both report "nothing pending".
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/Reference",
         "hasReferencePendingList",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/Reference",
         "waitForReferencePendingList",
         "()V",
         native_reference_wait_pending,
+        NativeKind::Bridge,
     );
     // WP1.10: `Reference.waitForReferenceProcessing()` — used by
     // `jdk.internal.misc.VM` drain paths and by application code that
@@ -16077,17 +16296,19 @@ pub fn register_essential_natives_with_shims(
     // JDK 25 declares clear0/refersTo0 on PhantomReference as well
     // (overriding the inherited Reference natives). Register them
     // explicitly so the real JDK class finds them.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/PhantomReference",
         "clear0",
         "()V",
         native_reference_clear0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ref/PhantomReference",
         "refersTo0",
         "(Ljava/lang/Object;)Z",
         native_reference_refers_to,
+        NativeKind::Bridge,
     );
     // Ensure full Reference/Weak/Soft/Phantom constructor + queue surface is
     // present in real-JDK mode too (needed by Spring Boot launcher paths).
@@ -16106,25 +16327,45 @@ pub fn register_essential_natives_with_shims(
         lang_system::native_finalizer_register,
     );
     // T15: java/lang/reflect/Array.newArray (alias for newInstance used internally by JDK)
-    registry.register(
+    registry.register_with_kind(
         "java/lang/reflect/Array",
         "newArray",
         "(Ljava/lang/Class;I)Ljava/lang/Object;",
         lang_system::native_array_new_array,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/reflect/Array",
         "multiNewArray",
         "(Ljava/lang/Class;[I)Ljava/lang/Object;",
         lang_system::native_array_multi_new_array,
+        NativeKind::Bridge,
     );
 
     // --- java/lang/invoke/MethodHandle (signature-polymorphic) ---
     let mh = "java/lang/invoke/MethodHandle";
     let poly = "([Ljava/lang/Object;)Ljava/lang/Object;";
-    registry.register(mh, "invoke", poly, native_method_handle_invoke);
-    registry.register(mh, "invokeExact", poly, native_method_handle_invoke);
-    registry.register(mh, "invokeBasic", poly, native_method_handle_invoke);
+    registry.register_with_kind(
+        mh,
+        "invoke",
+        poly,
+        native_method_handle_invoke,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "invokeExact",
+        poly,
+        native_method_handle_invoke,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "invokeBasic",
+        poly,
+        native_method_handle_invoke,
+        NativeKind::Bridge,
+    );
     // One handler serves all five: it dispatches off the reference kind in
     // the trailing MemberName's `flags`, which is the authoritative source
     // (HotSpot itself requires the refKind to agree with the linkTo* variant
@@ -16133,25 +16374,57 @@ pub fn register_essential_natives_with_shims(
     // Panama downcalls reach `panama::pe_downcall_invoke` through
     // `native_method_handle_invoke`, never through here. See
     // `native_method_handle_link_to` for the layout validation.
-    registry.register(mh, "linkToStatic", poly, native_method_handle_link_to);
-    registry.register(mh, "linkToVirtual", poly, native_method_handle_link_to);
-    registry.register(mh, "linkToInterface", poly, native_method_handle_link_to);
-    registry.register(mh, "linkToSpecial", poly, native_method_handle_link_to);
-    registry.register(mh, "linkToNative", poly, native_method_handle_link_to);
+    registry.register_with_kind(
+        mh,
+        "linkToStatic",
+        poly,
+        native_method_handle_link_to,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "linkToVirtual",
+        poly,
+        native_method_handle_link_to,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "linkToInterface",
+        poly,
+        native_method_handle_link_to,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "linkToSpecial",
+        poly,
+        native_method_handle_link_to,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        mh,
+        "linkToNative",
+        poly,
+        native_method_handle_link_to,
+        NativeKind::Bridge,
+    );
 
     // T15: java/lang/invoke/MethodHandleNatives
     let mhn = "java/lang/invoke/MethodHandleNatives";
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "resolve",
         "(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;",
         lang_invoke::native_mhn_resolve,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "init",
         "(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V",
         lang_invoke::native_mhn_init,
+        NativeKind::Bridge,
     );
     registry.register(
         mhn,
@@ -16161,32 +16434,36 @@ pub fn register_essential_natives_with_shims(
     );
     registry.register(mhn, "linkMethod", "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;", lang_invoke::native_mhn_link_method);
     registry.register(mhn, "linkCallSite", "(Ljava/lang/Object;ILjava/lang/invoke/MemberName;Ljava/lang/Object;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;", lang_invoke::native_mhn_link_call_site);
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "objectFieldOffset",
         "(Ljava/lang/invoke/MemberName;)J",
         lang_invoke::native_mhn_object_field_offset,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "staticFieldOffset",
         "(Ljava/lang/invoke/MemberName;)J",
         lang_invoke::native_mhn_static_field_offset,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "staticFieldBase",
         "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;",
         lang_invoke::native_mhn_static_field_base,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         mhn,
         "getMemberVMInfo",
         "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;",
         lang_invoke::native_mhn_get_member_vm_info,
+        NativeKind::Bridge,
     );
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
-    registry.register(mhn, "registerNatives", "()V", native_noop);
+    registry.register_with_kind(mhn, "registerNatives", "()V", native_noop, NativeKind::Bridge);
 
     // C33: InvokerBytecodeGenerator bypass — register the three entry points
     // that drive JEP 466 code-gen as natives that return a minimal resolved
@@ -16214,17 +16491,19 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- jdk/internal/misc/VM additional ---
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/VM",
         "getNanoTimeAdjustment",
         "(J)J",
         native_vm_get_nano_time_adjustment,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/VM",
         "getRuntimeArguments",
         "()[Ljava/lang/String;",
         lang_system::native_vm_get_runtime_arguments,
+        NativeKind::Bridge,
     );
     // `VM.latestUserDefinedLoader0()` backs `ObjectInputStream.resolveClass()`'s
     // default class resolution (`Class.forName(name, false,
@@ -16259,7 +16538,7 @@ pub fn register_essential_natives_with_shims(
     // `essential_registers_latest_user_defined_loader0_in_default_build`
     // (runtime registry lookup under default features) and
     // `vm/tests/t14_system_conformance.rs::t14_vm_natives_not_feature_gated`.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/misc/VM",
         "latestUserDefinedLoader0",
         "()Ljava/lang/ClassLoader;",
@@ -16271,6 +16550,7 @@ pub fn register_essential_natives_with_shims(
                 });
             Ok(Some(Value::Object(loader)))
         },
+        NativeKind::Bridge,
     );
     // `VM.get{u,eu,g,eg}id()` — real process credentials. A constant 0 does
     // not read as "unknown", it reads as **root**: any caller that gates on
@@ -16279,26 +16559,26 @@ pub fn register_essential_natives_with_shims(
     // branch on every platform. Report the true ids from the OS on Unix.
     // HotSpot does not define these natives on Windows at all, so the 0
     // fallback there is unreachable in practice.
-    registry.register("jdk/internal/misc/VM", "getuid", "()J", |_ctx, _args| {
+    registry.register_with_kind("jdk/internal/misc/VM", "getuid", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(process_credential(
             ProcessCredential::Uid,
         ))))
-    });
-    registry.register("jdk/internal/misc/VM", "geteuid", "()J", |_ctx, _args| {
+    }, NativeKind::Bridge);
+    registry.register_with_kind("jdk/internal/misc/VM", "geteuid", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(process_credential(
             ProcessCredential::Euid,
         ))))
-    });
-    registry.register("jdk/internal/misc/VM", "getgid", "()J", |_ctx, _args| {
+    }, NativeKind::Bridge);
+    registry.register_with_kind("jdk/internal/misc/VM", "getgid", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(process_credential(
             ProcessCredential::Gid,
         ))))
-    });
-    registry.register("jdk/internal/misc/VM", "getegid", "()J", |_ctx, _args| {
+    }, NativeKind::Bridge);
+    registry.register_with_kind("jdk/internal/misc/VM", "getegid", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(process_credential(
             ProcessCredential::Egid,
         ))))
-    });
+    }, NativeKind::Bridge);
 
     // --- java/lang/NullPointerException ---
     // JEP 358: return the synthesized HotSpot-style extended message. The VM
@@ -16308,7 +16588,7 @@ pub fn register_essential_natives_with_shims(
     // (e.g. an NPE thrown by `new NullPointerException()` with no detail, or a
     // path the analysis couldn't classify), `detailMessage` is null and we
     // return null — matching `Throwable.getMessage()`/the JDK accessor shape.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/NullPointerException",
         "getExtendedNPEMessage",
         "()Ljava/lang/String;",
@@ -16319,24 +16599,27 @@ pub fn register_essential_natives_with_shims(
                 _ => Ok(Some(Value::Object(None))),
             }
         },
+        NativeKind::Bridge,
     );
 
     // --- java/lang/StackTraceElement ---
-    registry.register(
+    registry.register_with_kind(
         "java/lang/StackTraceElement",
         "initStackTraceElement",
         "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V",
         native_init_stack_trace_element,
+        NativeKind::Bridge,
     );
     // `initStackTraceElements` MUST populate the array — real-JDK
     // `Throwable.getOurStackTrace()` calls `StackTraceElement.of(backtrace,
     // depth)` which allocates the STE[] and delegates here. A no-op left
     // every real-JDK `printStackTrace()` / `getStackTrace()` empty.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/StackTraceElement",
         "initStackTraceElements",
         "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
         native_init_stack_trace_elements,
+        NativeKind::Bridge,
     );
     // JDK 17 uses the older Throwable-shaped native entrypoint while JDK 25
     // passes the opaque backtrace plus depth. The implementation only needs the
@@ -16374,11 +16657,12 @@ pub fn register_essential_natives_with_shims(
     // `privateGetParameters` flips `hasRealParameterData` to true for ANY
     // non-null result, and that is what `Parameter.isNamePresent()` reports.
     // See `native_executable_get_parameters0`.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/reflect/Executable",
         "getParameters0",
         "()[Ljava/lang/reflect/Parameter;",
         native_executable_get_parameters0,
+        NativeKind::Bridge,
     );
     // KEEP x2: correct constant. `null` (NOT an empty byte[]) is the JDK's
     // "no RuntimeVisibleTypeAnnotations" encoding —
@@ -16386,17 +16670,19 @@ pub fn register_essential_natives_with_shims(
     // `ByteBuffer.wrap(bytes).getShort()` on a non-null buffer, so a
     // zero-length array throws BufferUnderflowException. CratonVM does not
     // surface type-annotation bytes, so "none" is the truth.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/reflect/Executable",
         "getTypeAnnotationBytes0",
         "()[B",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/reflect/Field",
         "getTypeAnnotationBytes0",
         "()[B",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+        NativeKind::Bridge,
     );
 
     // --- jdk/internal/misc/Signal ---
@@ -16409,20 +16695,28 @@ pub fn register_essential_natives_with_shims(
     // process whose Java-side handler was silently never registered. Left as a
     // no-op deliberately; implementing it requires a real signal-dispatch
     // subsystem (findSignal0/handle0 first), not a change here.
-    registry.register("jdk/internal/misc/Signal", "raise0", "(I)V", native_noop);
+    registry.register_with_kind(
+        "jdk/internal/misc/Signal",
+        "raise0",
+        "(I)V",
+        native_noop,
+        NativeKind::Bridge,
+    );
 
     // --- java/util/TimeZone ---
-    registry.register(
+    registry.register_with_kind(
         "java/util/TimeZone",
         "getSystemTimeZoneID",
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_timezone_get_system_id,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/util/TimeZone",
         "getSystemGMTOffsetID",
         "()Ljava/lang/String;",
         native_timezone_get_gmt_offset_id,
+        NativeKind::Bridge,
     );
 
     // NOTE: java/io/FileInputStream and FileOutputStream JDK 25 natives (open0, read0,
@@ -18204,11 +18498,12 @@ pub fn register_essential_natives_with_shims(
     // that disagrees with the real JDK for any class that HAS a <clinit>,
     // breaking cross-VM deserialization (e.g. the Gradle test worker reading a
     // HotSpot-written WorkerConfig stream).
-    registry.register(
+    registry.register_with_kind(
         "java/io/ObjectStreamClass",
         "initNative",
         "()V",
         native_noop,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/io/ObjectStreamClass",
@@ -18220,7 +18515,7 @@ pub fn register_essential_natives_with_shims(
             )))
         },
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;)Z",
@@ -18229,6 +18524,7 @@ pub fn register_essential_natives_with_shims(
                 essential_class_has_static_initializer(ctx, args) as i32,
             )))
         },
+        NativeKind::Bridge,
     );
 
     // Force VM.isJavaLangInvokeInited() to return true. In a normal JVM,
@@ -19963,11 +20259,12 @@ pub fn register_essential_natives_with_shims(
     // path does its own close/shutdown handling independent of this
     // JDK-internal flag, so the exact value mainly needs to avoid the
     // UnsatisfiedLinkError, not drive real behavior.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/Net",
         "shouldShutdownWriteBeforeClose0",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
+        NativeKind::Bridge,
     );
 
     // `sun/net/dns/ResolverConfigurationImpl.{init0,loadDNSconfig0,notifyAddrChange0}`
@@ -20052,12 +20349,12 @@ pub fn register_essential_natives_with_shims(
     // JNDI DNS uses PortConfig to select a UDP source port. These are native
     // JDK methods (not Java fallbacks), so real-JDK mode otherwise stops at an
     // UnsatisfiedLinkError before the TXT query can be issued.
-    registry.register("sun/net/PortConfig", "getLower0", "()I", |_ctx, _args| {
+    registry.register_with_kind("sun/net/PortConfig", "getLower0", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(system_ephemeral_port_range().0)))
-    });
-    registry.register("sun/net/PortConfig", "getUpper0", "()I", |_ctx, _args| {
+    }, NativeKind::Bridge);
+    registry.register_with_kind("sun/net/PortConfig", "getUpper0", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(system_ephemeral_port_range().1)))
-    });
+    }, NativeKind::Bridge);
 
     // MongoDB Reactive Streams 5.7 uses Netty 4.2's
     // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
@@ -20113,11 +20410,12 @@ pub fn register_essential_natives_with_shims(
     // threw `UnsatisfiedLinkError`, leaving `NioSocketImpl` erroneous and
     // cascading to `NoClassDefFoundError` for `DefaultHttpClientConnectionOperator`
     // — breaking Apache HttpClient5-based tests entirely on this host.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeThread",
         "supportPendingSignals0",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
+        NativeKind::Bridge,
     );
 
     // `sun/nio/ch/UnixDispatcher.init()V` — one-time native bookkeeping
@@ -20126,9 +20424,9 @@ pub fn register_essential_natives_with_shims(
     // don't need any native-side state for this — our socket I/O doesn't
     // route through a `UnixDispatcher` table — so a no-op keeps
     // `NioSocketImpl.<clinit>` progressing.
-    registry.register("sun/nio/ch/UnixDispatcher", "init", "()V", |_ctx, _args| {
+    registry.register_with_kind("sun/nio/ch/UnixDispatcher", "init", "()V", |_ctx, _args| {
         Ok(None)
-    });
+    }, NativeKind::Bridge);
 
     crate::phases_late::register_p66_file_visitor(registry);
     // Restore the caller's category so later registrars keep their intended tag.
@@ -29912,11 +30210,12 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
     // `Thread.currentCarrierThread()` is already registered elsewhere; we
     // re-register here with the same implementation so any duplicate-entry
     // drift keeps both pointing at the same forwarder.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Thread",
         "currentCarrierThread",
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
+        NativeKind::Bridge,
     );
 
     // ---- JavaLangAccess interface receiver-class registrations ----
