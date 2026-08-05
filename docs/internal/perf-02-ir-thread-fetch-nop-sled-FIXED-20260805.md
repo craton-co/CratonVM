@@ -174,19 +174,47 @@ count. Anything call-heavy and shallow was paying it in proportion.
 ## Residual and follow-up
 
 The fix does not restore `fib` to its 2026-07-23 single-pass number, and is not
-expected to. The IR body still carries per-call instrumentation the single-pass
-body did not:
+expected to. Counting instructions on the two bodies: post-fix IR is ~73 per
+`fib` call against the single-pass body's ~59, which is 1.24x and brackets the
+measured 1.32x. The 14 extra split into two very different groups, and an
+earlier draft of this section got the split wrong by calling all of them dead.
 
-- the two prologue slot zeroings, which exist only so the null guards skip;
-- `mov [fs:...],rbp` (frame record) on entry **and after every call return**;
-- a bytecode-index store to `[rbp-18h]` before each call;
-- the epilogue savetop-restore `mov r10,[rbp-20h]; test r10,r10; je ...`,
-  emitted on all four exit paths.
+**Dead when `!shadow_pushed_any`** — the same condition that erases the fetch:
 
-**Every one of these is provably dead whenever `!shadow_pushed_any`** — the same
-condition that erases the fetch. The slot zeroings exist only to make the
-epilogue guard skip; erase the guard and the zeroings go too. That is the
-obvious next increment: record those spans and erase them the same way. It is
-strictly more bookkeeping than this fix (four exit spans instead of one prologue
-span) and was deliberately not bundled in, so that the measurement above
-attributes to one change.
+- the epilogue savetop-restore `mov r10,[rbp-20h]; test r10,r10; je ...`
+  (`emit_shadow_savetop_restore`), emitted on all four exit paths, ~3
+  instructions on the executed path. There is no push to unwind, so the guard
+  can only ever fall through.
+- the two prologue slot zeroings — but see below, these should stay.
+
+**Not dead, and not removable**, though both are absent from the single-pass
+body and so show up in the same 14:
+
+- `mov [fs:...],rbp`, the precise-maps innermost-RBP mirror, on entry **and
+  after every call return** (3 per `fib` call). The stack walker reads it.
+- the safepoint-id store to `[rbp - sp_id_slot_off]` before each call (2 per
+  call). `vm/src/jit/conservative_roots.rs` reads exactly this slot to pick the
+  active safepoint's oop map for **precise root scanning**
+  (`read the active safepoint's bytecode PC from [rbp - sp_id_slot_off]`).
+  It has nothing to do with the shadow stack.
+- the 3-instruction safepoint poll, and the `JMP` this fix introduced.
+
+So the realistic next increment is **only** the epilogue restore: roughly 3
+instructions of 73, which would take the 1.32x residual to about 1.27x. Worth
+doing, much smaller than it first looked.
+
+**Do not also erase the prologue zeroings.** They look like pure bookkeeping for
+a guard that is being deleted, but the frame slot stays readable, and a slot
+holding stack garbage instead of a deterministic zero is the exact shape of an
+already-documented SIGSEGV on the single-pass side: *"with the helper unwired
+the slot kept whatever stack garbage occupied the frame, the push's null test
+passed, and it stored a live oop through a wild pointer"*
+(`jit/src/x64/frames.rs`, the `emit_prologue` shadow block). Two stores is a
+cheap price for that not being possible.
+
+**The rest of the residual is not a defect.** It is precise-root and deopt
+metadata that the IR tier emits and the single-pass backend does not, i.e. the
+IR body is doing strictly more work because it supports strictly more. Whether
+that is worth paying on a method like `fib` is the same open policy question
+`perf-01` raised — nothing today compares an IR body against the C1 body it
+replaces before keeping it — and not something to fix by deleting metadata.
