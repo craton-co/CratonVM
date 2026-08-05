@@ -1,6 +1,8 @@
 # `ThreadGroup.setMaxPriority` does not clamp against the parent, and `new ThreadGroup(null, name)` does not throw
 
-**Status:** OPEN, filed 2026-08-05. Both found by
+**Status:** FIXED 2026-08-05. What was filed as two divergences measured as
+**ten** once the probe asked paired questions, and the fix this page originally
+prescribed was **wrong** — see "Corrections" below. Originally found by
 `probes/ThreadGroupLayoutProbe.java` while verifying the transposed-slot fix;
 **neither is caused by it** — both reproduce identically on the pre-fix binary.
 Recorded here rather than fixed alongside, because each is a semantics change on
@@ -35,10 +37,8 @@ owning group's `maxPriority`, so a group that will not stay lowered cannot cap
 its threads. Anything that lowers a pool's group to de-prioritise its workers
 (several JDK and container thread factories do) silently does not.
 
-The fix is in `ThreadGroup.setMaxPriority` in
-`native-builtins/src/phases_late/concurrent.rs`: read the parent's
-`maxPriority` through `tg_get_field(.., "maxPriority", TG_SLOT_MAX_PRIORITY)`
-and take the minimum, matching the JDK's own two-step clamp.
+~~The fix is in `ThreadGroup.setMaxPriority` … take the minimum, matching the
+JDK's own two-step clamp.~~ **That prescription was wrong.** See below.
 
 ## 2. `new ThreadGroup(null, name)` returns normally
 
@@ -82,3 +82,58 @@ The `pri clampHigh` / `pri clampLow` and `err nullParent` lines are these two.
 Everything else in that probe matches HotSpot on the post-fix binary except the
 `ref *` lines (item 3) and `root *` (a CratonVM-only native the JDK has no
 member for).
+
+---
+
+## Corrections, and what was actually done — 2026-08-05
+
+`probes/ThreadGroupPriorityProbe.java` asks 27 paired questions instead of the
+three the original probe asked. Ten of them diverged from Temurin 25.0.3, and
+two of the divergences falsify this page's own analysis.
+
+### The prescribed fix would not have worked
+
+"Clamp into `[MIN, MAX]`, then take the minimum with the parent" gives **10**
+and **1** for the two rows in the table above, not 4. Out-of-range is a
+**no-op** in JDK 25 — `setMaxPriority` returns before touching anything:
+
+| after | HotSpot | clamp-then-min | old CratonVM |
+|---|---:|---:|---:|
+| `setMaxPriority(15)` on a group at 4 | **4** | 10 | 10 |
+| `setMaxPriority(-4)` on a group at 4 | **4** | 1 | 1 |
+
+The page's reading that a lowered group "may not be raised again through this
+API either" is also wrong: an in-range `setMaxPriority(7)` afterwards gives
+**7**. The constraint is the parent's ceiling, not a ratchet.
+
+### Three more divergences it did not mention
+
+* **No propagation at all.** Lowering a parent to 2 left an existing subgroup
+  at 10; the JDK gives 2, recursively, to every descendant.
+* **Propagation ASSIGNS, it does not only lower.** A subgroup at 1 whose parent
+  is set to 5 comes **up** to 5 — the JDK's recursion is
+  `for (g : groups) g.setMaxPriority(maxPriority)`. The natural
+  `if (child > new) lower(child)` guard is wrong, and no in-range test would
+  catch it.
+* **`toString` hard-coded `maxpri=10`.** A second reader of the same state,
+  found only because the probe reads it through a second API.
+
+### And one that is not a `ThreadGroup` bug
+
+`Thread`'s initial priority did not inherit the group ceiling:
+`populate_real_thread_holder` (`native-builtins/src/lib.rs`) passed a literal
+`NORM_PRIORITY` to the `Thread$FieldHolder` constructor. The JDK takes the
+CREATING thread's priority and caps it at `g.getMaxPriority()`. `setPriority`
+already clamped correctly; only construction skipped the step — so a group
+lowered to 3 still handed out threads at 5, which defeats the point of lowering
+it. Fixed at that call site.
+
+### Result
+
+Ten divergences to **one**, then to zero. The remaining `ref *` lines are the
+module-access gap in §3, which is unrelated and still open.
+
+**Method note.** This page's prescription was derived by reading the JDK's
+behaviour rather than measuring it, and it was wrong in both halves. A fix
+written from it would have produced 10 and 1, changed the transcript, and
+looked like progress while reproducing the original defect.

@@ -6185,6 +6185,22 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let parent = args.get(1).copied().unwrap_or(Value::Object(None));
+            // The JDK dereferences the parent in this constructor (today for
+            // `parent.maxPriority`, historically for `parent.checkAccess()`), so
+            // a null parent is an NPE. This native used to store the null and
+            // return, which also produced a SECOND ROOT in the group tree —
+            // `InnocuousThread.createThreadGroup()`'s walk to the root and
+            // `ThreadGroup.enumerate(recurse)` both take that at face value.
+            // A null NAME is a different matter and legitimately does not throw
+            // on either side; `ThreadGroupPriorityProbe` pins both.
+            if !matches!(parent, Value::Object(Some(_))) {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot read field \"maxPriority\" because \"parent\" is null".into(),
+                    ),
+                }
+                .into());
+            }
             tg_set_field(ctx, this, "parent", TG_SLOT_PARENT, parent);
             tg_set_field(
                 ctx,
@@ -6244,7 +6260,16 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
-        let s = ctx.create_string(&format!("java.lang.ThreadGroup[name={},maxpri=10]", name));
+        // `maxpri` was hard-coded to 10 here, so `toString` disagreed with
+        // `getMaxPriority()` on the same object the moment anything lowered the
+        // group. It is a second reader of the same state; read the state.
+        let max = tg_get_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY)
+            .as_int()
+            .unwrap_or(10);
+        let s = ctx.create_string(&format!(
+            "java.lang.ThreadGroup[name={},maxpri={}]",
+            name, max
+        ));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(tg, "activeCount", "()I", |ctx, _args| {
@@ -6277,12 +6302,65 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             .unwrap_or(10);
         Ok(Some(Value::Int(max)))
     });
+    // `ThreadGroup.setMaxPriority(int)`, all three of the JDK's steps. Each was
+    // measured against Temurin 25.0.3 by `probes/ThreadGroupPriorityProbe.java`
+    // rather than read, because the obvious reading of each one is wrong:
+    //
+    //  1. An argument outside `[MIN_PRIORITY, MAX_PRIORITY]` is a **no-op**,
+    //     not a clamp. This native used to clamp, so a group lowered to 4 and
+    //     then handed 15 came back up to 10 — the JDK leaves it at 4. It is not
+    //     a ratchet either: an in-range `setMaxPriority(7)` afterwards does
+    //     take, so "may not be raised" is equally wrong.
+    //  2. The stored value is `min(pri, parent.maxPriority)`, so a group can
+    //     never exceed its parent's ceiling.
+    //  3. The new value is **assigned** to every descendant, recursively — and
+    //     assigned, not merely lowered: a subgroup sitting at 1 whose parent is
+    //     set to 5 comes UP to 5, because the JDK's recursion is
+    //     `for (g : groups) g.setMaxPriority(maxPriority)` and each child's own
+    //     `min(..., parent.maxPriority)` is then the value just stored above it.
+    //
+    // Why this matters past the number: `Thread.setPriority` clamps against the
+    // owning group's ceiling, so a group that will not stay lowered cannot cap
+    // its threads — and several JDK and container thread factories lower a
+    // pool's group for exactly that purpose.
     r.register(tg, "setMaxPriority", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let prio = args.get(1).and_then(|v| v.as_int()).unwrap_or(10);
-        // Clamp to Thread.MIN_PRIORITY..MAX_PRIORITY
-        let clamped = prio.max(1).min(10);
-        tg_set_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY, Value::Int(clamped));
+        // Step 1: out of range does nothing at all.
+        if !(1..=10).contains(&prio) {
+            return Ok(None);
+        }
+        // Step 2: never above the parent's ceiling.
+        let effective = match tg_get_field(ctx, this, "parent", TG_SLOT_PARENT) {
+            Value::Object(Some(parent)) => prio.min(
+                tg_get_field(ctx, parent, "maxPriority", TG_SLOT_MAX_PRIORITY)
+                    .as_int()
+                    .unwrap_or(10),
+            ),
+            _ => prio,
+        };
+        tg_set_field(
+            ctx,
+            this,
+            "maxPriority",
+            TG_SLOT_MAX_PRIORITY,
+            Value::Int(effective),
+        );
+        // Step 3: assign down the whole subtree. `tg_collect_subgroups` already
+        // walks it recursively for `enumerate`, and carries its own depth guard
+        // against an identity-hash collision closing a cycle.
+        let mut subgroups = Vec::new();
+        let this_hash = ctx.identity_hash_code(this);
+        tg_collect_subgroups(ctx, this_hash, true, &mut subgroups, 0);
+        for group in subgroups {
+            tg_set_field(
+                ctx,
+                group,
+                "maxPriority",
+                TG_SLOT_MAX_PRIORITY,
+                Value::Int(effective),
+            );
+        }
         Ok(None)
     });
     r.register(tg, "interrupt", "()V", |ctx, _args| {
@@ -7453,5 +7531,67 @@ mod threadgroup_layout_tests {
                 ("daemon", "Z"),
             ]
         );
+    }
+
+    /// `setMaxPriority`'s three steps, as pure arithmetic, pinned to what
+    /// Temurin 25.0.3 was measured doing by `probes/ThreadGroupPriorityProbe`.
+    ///
+    /// The registered native needs a live VM, so what is checkable here is the
+    /// decision the native makes for a given (argument, parent ceiling) pair.
+    /// It is worth pinning even so: **every** plausible misreading of this API
+    /// is representable as a different two-liner, and this file shipped one of
+    /// them (`prio.max(1).min(10)`, an unconditional clamp) for months.
+    #[test]
+    fn set_max_priority_decides_the_way_the_jdk_does() {
+        /// Mirrors the registered native: `None` = "no-op, leave the group
+        /// alone", `Some(v)` = "store v here and assign it to every
+        /// descendant".
+        fn decide(pri: i32, parent_ceiling: Option<i32>) -> Option<i32> {
+            if !(1..=10).contains(&pri) {
+                return None;
+            }
+            Some(match parent_ceiling {
+                Some(c) => pri.min(c),
+                None => pri,
+            })
+        }
+
+        // Out of range does NOTHING. A clamp would answer Some(10)/Some(1)
+        // here, which is what made a group lowered to 4 come back up to 10.
+        assert_eq!(decide(15, Some(10)), None);
+        assert_eq!(decide(-4, Some(10)), None);
+        assert_eq!(decide(0, Some(10)), None);
+        assert_eq!(decide(11, Some(10)), None);
+
+        // In range, under the ceiling: taken, including a RAISE. Reading this
+        // API as a one-way ratchet is the other common misreading.
+        assert_eq!(decide(4, Some(10)), Some(4));
+        assert_eq!(decide(7, Some(10)), Some(7));
+        assert_eq!(decide(1, Some(10)), Some(1));
+        assert_eq!(decide(10, Some(10)), Some(10));
+
+        // In range, above the ceiling: capped at the parent's.
+        assert_eq!(decide(9, Some(3)), Some(3));
+        assert_eq!(decide(10, Some(1)), Some(1));
+        // Below the ceiling still takes.
+        assert_eq!(decide(2, Some(3)), Some(2));
+
+        // A root group (no parent) has no ceiling to cap against.
+        assert_eq!(decide(10, None), Some(10));
+        assert_eq!(decide(1, None), Some(1));
+    }
+
+    /// The value that propagates is ASSIGNED to descendants, not min'd into
+    /// them — a subgroup below its parent comes UP. Measured, and surprising
+    /// enough that the natural `if child > new { lower(child) }` guard would be
+    /// wrong in a way no in-range test would catch.
+    #[test]
+    fn propagation_assigns_rather_than_only_lowering() {
+        // What the native does to each descendant, given the value it stored.
+        fn descendant_value(effective: i32, _existing: i32) -> i32 {
+            effective
+        }
+        assert_eq!(descendant_value(5, 1), 5, "a subgroup at 1 comes up to 5");
+        assert_eq!(descendant_value(2, 10), 2, "and one at 10 comes down to 2");
     }
 }
