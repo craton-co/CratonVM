@@ -600,6 +600,7 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_COMPACTVALUE` | 1 | no | types |
 | `CRATONVM_DBG_COMPACT_LEGACY` | 1 | no | types |
 | `CRATONVM_DBG_COMPONENT_TYPE` | 1 | no | types |
+| `CRATONVM_DBG_DBB_ELEM` | 1 | no | native-io |
 | `CRATONVM_DBG_DEFINE` | 1 | no | types |
 | `CRATONVM_DBG_DEFLATE` | 1 | no | types |
 | `CRATONVM_DBG_DESCTRACE` | 1 | no | types |

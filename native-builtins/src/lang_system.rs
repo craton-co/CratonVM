@@ -3,7 +3,7 @@
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1236,29 +1236,33 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Runtime;",
         native_runtime_get_runtime,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "availableProcessors",
         "()I",
         native_runtime_available_processors,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "maxMemory",
         "()J",
         native_runtime_max_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "totalMemory",
         "()J",
         native_runtime_total_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
         "()J",
         native_runtime_free_memory,
+        NativeKind::Bridge,
     );
     // JDK 9+ / WildFly: `Runtime.version()` and `Runtime.Version.feature()`.
     registry.register(
@@ -1303,10 +1307,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
-    registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
+    registry.register_with_kind("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)
-    });
+    }, NativeKind::Bridge);
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
     // `Runtime.halt(int)` is NOT intercepted — its real bytecode runs, and it
@@ -1319,11 +1323,17 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError: java/lang/Shutdown.beforeHalt()V` and the process
     // kept running: a caller asking to die immediately got a linkage error out
     // of a method that cannot legally return.
-    registry.register("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
+    registry.register_with_kind("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
         // HotSpot's does nothing an application can observe.
         Ok(None)
-    });
-    registry.register("java/lang/Shutdown", "halt0", "(I)V", native_shutdown_halt0);
+    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "halt0",
+        "(I)V",
+        native_shutdown_halt0,
+        NativeKind::Bridge,
+    );
 
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
     registry.register(
@@ -2201,15 +2211,30 @@ fn set_system_env_singleton(vm: usize, obj: ObjectRef) -> ObjectRef {
 /// that backing map. System Rules reflects on that field by name, so the
 /// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
 /// slot 0, matching the JDK's `m` field slot.
-fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7 residual R1): the
+/// wrapper stands in for `java.util.Collections$UnmodifiableMap`, whose real
+/// bytecode is not running, so under `--jdk-only` it is refused as a catchable
+/// `NoClassDefFoundError` rather than fabricated behind a recorded violation.
+fn wrap_system_env_map(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(map);
-    let wrapper_class = ctx.ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    // Not `?`: the pin above must be released before unwinding.
+    let wrapper_class =
+        match ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2) {
+            Ok(id) => id,
+            Err(err) => {
+                ctx.unpin_native_roots(pin);
+                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+            }
+        };
     let map = ctx.read_native_pin(pin, map);
     let wrapper = ctx.alloc_object(wrapper_class, 2);
     let map = ctx.read_native_pin(pin, map);
     ctx.set_field(wrapper, 0, Value::Object(Some(map)));
     ctx.unpin_native_roots(pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
@@ -2428,7 +2453,7 @@ pub(crate) fn native_system_getenv_all(
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
-        let env = wrap_system_env_map(ctx, map);
+        let env = wrap_system_env_map(ctx, map)?;
         let env = set_system_env_singleton(ctx.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
@@ -2466,7 +2491,7 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    let env = wrap_system_env_map(ctx, map);
+    let env = wrap_system_env_map(ctx, map)?;
     Ok(Some(Value::Object(Some(env))))
 }
 

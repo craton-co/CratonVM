@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1025,7 +1025,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(
+    r.register_with_kind(
         refl2,
         "getCallerClass",
         "()Ljava/lang/Class;",
@@ -1076,6 +1076,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Object(None)))
             }
         },
+        NativeKind::Bridge,
     );
 
     // Reflection.getClassAccessFlags(Class) — returns the raw ACC_ flags of
@@ -1093,7 +1094,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // class-file access flags (`NativeClassAccess::class_access_flags`); report
     // them.  The 0x0001 fallback is kept for the case where the argument is not
     // a resolvable class mirror, so no caller that works today starts failing.
-    r.register(
+    r.register_with_kind(
         refl2,
         "getClassAccessFlags",
         "(Ljava/lang/Class;)I",
@@ -1107,6 +1108,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             };
             Ok(Some(Value::Int(flags.unwrap_or(0x0001))))
         },
+        NativeKind::Bridge,
     );
     // `Reflection.ensureNativeAccess` is the JEP 442/472 restricted-method
     // announce point (`--enable-native-access`). Now implemented, not a no-op.

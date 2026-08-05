@@ -42,7 +42,7 @@ pub use capability::{
     CapabilityAuditReport, CapabilityCheck, CapabilityDenied, CapabilityKind, CapabilityMode,
     CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
 };
-pub use class_identity::{ClassIdentityError, NameLookup};
+pub use class_identity::{refusal_to_java_failure, ClassIdentityError, NameLookup};
 pub use intrinsic::InterpIntrinsic;
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///

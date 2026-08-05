@@ -392,6 +392,170 @@ distinguishable:
    overlay owner; nothing reports when a freed block is **referenced by** one,
    and that is the next instrument to write.
 
+### 2026-08-05: the `NoSuchMethodError` face DID produce a reclaim verdict — in YOUNG, from a heap field
+
+The table above records the blocked-frame face as `reclaimed_hole_at` =
+**not reclaimed**, **no ring record**. That was true of every occurrence it had
+then. It is not true of this one, caught on `org.h2.test.db.TestMultiThread`
+with no debug flags set:
+
+```
+WARN  …vm_exec: NoSuchMethodError
+      method="java/lang/Object.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+      caller="org/h2/engine/ConnectionInfo.readProperties(Ljava/util/Properties;)V @pc=95"
+ERROR …gc::guard: receiver points into RECLAIMED memory  obj="0x2005cc39d10"
+      site="invoke dispatch"  location=young TO-space (the inactive semispace)
+ERROR …gc::guard: …and a YOUNG non-moving sweep zeroed a span covering this
+      address.  span="0x2005cc151f8+0x3ff08" interior_off=150296 sweep_cycle=5
+```
+
+Three things it settles, and one it opens.
+
+**The region is YOUNG, not old gen.** Every verdict this page had before was
+`old-gen FREE BLOCK`. This one is the inactive semispace — the from-space a
+moving collection evacuated and then wiped — which is why the old-gen
+reclamation ring has nothing to say about it and why every old-side instrument
+in the sections above is looking in the wrong generation for it.
+
+**The holder is a HEAP FIELD, not a frame local, a root, or a JIT register.**
+`@pc=95` in `ConnectionInfo.readProperties` is:
+
+```
+84: aload_0 ; 85: getfield prop ; 88: aload 8 ; 90: aload 9
+92: invokevirtual java/util/Properties.put(Object,Object)
+```
+
+so the receiver came out of `this.prop` by `getfield`, on a live
+`ConnectionInfo` the frame is executing a method of. That kills the
+blocked-frame framing the old page name asserted, and it also means the
+reference survived *un-rewritten* rather than being *unrooted*: something wrote
+a stale address into that field, or a collection moved the target and did not
+rewrite the field.
+
+**The victim's class is `java.util.Properties`.** That is the one class on this
+page whose CratonVM state lives in an identity-keyed native side table
+(`properties_sidetable`) — i.e. exactly the remaining candidate *Where that
+leaves the residual* names, arrived at independently and from the other end.
+Treat it as corroboration of that lead, not as proof: nothing yet shows the
+side table held the stale address, only that the object whose field went stale
+is of the type the side table backs.
+
+What it opens: the address predates the last semispace swap, and on this
+workload only **~2 moving young collections happen per run** (measured
+`old_gen_scanned` 150-180 on both, i.e. during startup) with every later
+collection taking the non-moving fallback — while the failing `ConnectionInfo`
+is created hundreds of seconds later. Reconciling those two facts is the next
+step.
+
+`CRATONVM_DBG_STALE_OBJREF=1` is the instrument for it: it quarantines the
+just-evacuated from-space instead of wiping it, so a reference that survived a
+moving collection un-rewritten still carries a forwarding pointer and
+`get_header` hard-panics on the first read with holder attribution, instead of
+reading an all-zero header minutes later on another thread.
+
+### A second young witness, and it narrows the question to ROOT COLLECTION
+
+Same binary, same class, later the same day — and this one is as clean as this
+family gets:
+
+```
+WARN  …gc_quiescence: [moving-young] fallback #1: reason=unregistered-jit-frame-on-stack   [18:26:21]
+WARN  …vm_exec: NoSuchMethodError                                                          [18:26:28]
+      method="java/lang/Object.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+      caller="java/sql/DriverManager.getConnection(String,String,String)Connection @pc=19"
+ERROR …gc::guard: receiver is inside a YOUNG span the non-moving sweep zeroed and
+      returned to the free list.  obj="0x2004940a3d0" actual_class_id=0
+      freed_span="0x20049406020+0x75e8" interior_off=17328 sweep_cycle=0 free_seq=2525
+```
+
+`DriverManager.getConnection(String,String,String)` is four bytecodes long
+before the failure:
+
+```
+ 0: new java/util/Properties ; 3: dup ; 4: invokespecial Properties.<init>()V
+ 7: astore_3                               <- `info`, LOCAL 3
+ 8: aload_1 ; 9: ifnull 20
+12: aload_3 ; 13: ldc "user" ; 15: aload_1
+16: invokevirtual Properties.put(Object,Object)     <- fails; @pc=19 is the `pop` after it
+```
+
+So the victim is a **brand-new `java.util.Properties`, held in LOCAL 3 of the
+frame that is executing right now**, reclaimed between its constructor and its
+first use. The seven seconds between the fallback line and the failure are the
+pause: the thread was stopped at a safepoint across that sweep and resumed into
+`put`.
+
+**What that rules out.** `ROOT_IN_DEAD_SPANS` — unconditional, and it RETAINS
+the span rather than freeing it — did **not** fire for this span. That invariant
+compares the doomed spans against `roots` + `finalizer_addrs`, i.e. the exact
+slice the mark phase was handed. Its silence therefore says the address was
+**not in the root slice at all**. Combined with the `SWEEP_LIVENESS` heap-edge
+result (`hits=0`, §above), the mark phase neither dropped a root it was given
+nor missed a heap edge:
+
+> the root slice handed to the sweep did not contain a live top-frame local of
+> a thread stopped at a safepoint.
+
+That is a **root COLLECTION** question, not a mark or sweep question, and it is
+where the next instrument belongs. Note also that all three frame-root paths
+already screen operand-stack roots with `is_heap_addr` rather than the strict
+`is_object_address` header probe (see `scan_frame_roots`' doc comment), so the
+mid-init-object hole that shape would otherwise have is already closed — this
+witness is on the fixed code.
+
+`sweep_cycle=0` is worth keeping too: this is the FIRST non-moving young sweep
+of the process. Whatever the gap is, it does not need a long-running heap or an
+accumulated free list to appear.
+
+### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
+
+Recorded so they are not re-derived; each cost a build-and-soak cycle. These
+are the young-generation counterparts of the old-gen negatives above.
+
+1. **The young non-moving sweep does not drop a root it was handed.** The
+   root-in-dead-span invariant (`ROOT_IN_DEAD_SPANS`, unconditional, and it
+   RETAINS the span rather than freeing it) reported **zero** violations across
+   thousands of sweeps under `CRATONVM_NO_MOVING_YOUNG=1
+   CRATONVM_DBG_GC_STRESS=2097152`, once roots pointing at an EVACUATED source
+   were excluded. That exclusion is the measurement: before it the check fired
+   constantly and every hit was a promoted object whose young source shares a
+   dead run with an unpromoted neighbour. A dead span is a RUN of consecutive
+   dead objects carrying the first one's header — ask `is_forwarded()` of the
+   ROOT's object, not the run's head, or the check is pure noise.
+2. **No heap edge points into a doomed young span either.**
+   `CRATONVM_DBG_SWEEP_LIVENESS=1` on the real class: 14+ non-moving sweeps,
+   `hits=0 root_hits=0` on every one, ~611 000 old-gen objects scanned per cycle
+   against 32 000-60 000 doomed spans. Its young→young half stays vacuous
+   (`young_survivors_scanned=0`) because selective promotion moves every
+   survivor out — a real limit of the assertion, not a clean result.
+3. **`Object.clone()` is not a use-after-move.** `native_object_clone` reads
+   fields off `this` AFTER `ctx.alloc_object`, which is the exact shape of the
+   native stale-local bug class — but `NativeContextImpl::alloc_object` never
+   collects ("a native callback never initiates collection on this path", its
+   own comment), and a counter that fired whenever the receiver moved across
+   that allocation read **0**, including under `CRATONVM_DBG_GC_STRESS`. The
+   pin/read/unpin hardening was written, measured, and reverted rather than
+   left as unjustified cost on `MVStore.Page.copy()`, which clones a page per
+   structural modification.
+4. **Per-bci local liveness is correct for the enhanced-for shape** the
+   `hasNext()` witness came from. The synthetic `Iterator` local is read only
+   across the loop's BACK EDGE, so an analysis that did not reach a fixpoint
+   over it would report the slot dead exactly where the thread parks — and that
+   mask filters a blocked thread's root snapshot. Regression test:
+   `local_liveness::tests::enhanced_for_iterator_is_live_at_the_blocking_call`,
+   at the real byte offsets of `TestMultiThread.testConcurrentUpdate`.
+
+Two instrument lessons from the same window, both of which cost a build:
+
+* **A primitive array reads back class id 0.** Array headers carry the
+  COMPONENT class id (JVMS §4.4.1) and `long[]`/`int[]` have none, so a
+  `ClassId(0)` gate flags every `long[] toc` local in
+  `FileStore.dropUnusedChunks` on every wake. Gate on `kind == Object` too.
+* **Filter frame locals by the frame's own live mask.** The frame audit's first
+  true hit was `H2ConcurrentUpdateLoop.main` local 8 pointing into a young free
+  block — the seed loop's `PreparedStatement`, semantically dead for the rest of
+  the method, i.e. the liveness filter working exactly as designed.
+
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero
 `gen_heap::set_field`/`get_field` out-of-bounds hits, zero
@@ -499,7 +663,7 @@ workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
 the 27.
 
 `TimeoutException` is the separate throughput defect tracked on
-`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+`h2-update-path-throughput-20260802.md`, not this one.
 
 #### Eliminated, with measurements
 
@@ -786,7 +950,7 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
-* `bug-h2-testmultithread-concurrent-update-timeout.md` — the class the
+* `h2-update-path-throughput-20260802.md` — the class the
   blocked-frame face was found in, whose own problem is throughput, not this.
 * the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
   same signature; see *Handed over from `TestDiskFull`* above.

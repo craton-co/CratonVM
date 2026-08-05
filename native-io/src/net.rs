@@ -1663,16 +1663,46 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("poll: FileDescriptor has no fd id"))?;
-    let stream = {
+    // DEADLOCK (2026-08-05): the listener arm used to `return
+    // net_poll_listener(..)` from INSIDE this block. A `return` evaluates its
+    // expression before the block's locals are dropped, so the entire listener
+    // poll — up to the caller's full SO_TIMEOUT — ran while this thread still
+    // held a READ guard on the registry, and `net_poll_listener`'s loop calls
+    // `net_listener_still_registered`, which takes that SAME read lock again.
+    //
+    // `parking_lot::RwLock` is fair: once a writer is queued, new readers
+    // block. So a `socket0` on another Java thread (`register_handle`, a
+    // `write()`) arriving between the outer read and the nested one wedges all
+    // three — the writer waits for the outer reader, the outer reader waits on
+    // its own nested read, and nothing can release. Measured on
+    // `probes/JdkOnlyCensusLoadProbe`: 2 hangs in 40 runs, every thread parked
+    // at 0% CPU, `gdb` showing `lock_exclusive` under `register_handle` against
+    // `lock_shared_slow` under `net_listener_still_registered`.
+    //
+    // Note what this is NOT: `net_poll_listener` was already careful to hold
+    // the LISTENER mutex only for a bounded slice ("never across an unbounded
+    // wait"). The registry guard it inherited from its caller was the one
+    // nobody was looking at.
+    //
+    // The guard's scope now ends before any call that can re-enter the
+    // registry. Cloning the handle first is cheap: every variant is an `Arc`
+    // or a unit.
+    let target = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(stream)) => Arc::clone(stream),
+            Some(NetSocketHandle::Stream(stream)) => Some(PollTarget::Stream(Arc::clone(stream))),
             Some(NetSocketHandle::Listener(listener)) => {
-                let listener = Arc::clone(listener);
-                return net_poll_listener(ctx, &listener, fd, events, timeout_millis);
+                Some(PollTarget::Listener(Arc::clone(listener)))
             }
-            _ => return Ok(Some(Value::Int(0))),
+            _ => None,
         }
+    };
+    let stream = match target {
+        Some(PollTarget::Listener(listener)) => {
+            return net_poll_listener(ctx, &listener, fd, events, timeout_millis)
+        }
+        Some(PollTarget::Stream(stream)) => stream,
+        None => return Ok(Some(Value::Int(0))),
     };
     let timeout = if timeout_millis < 0 {
         -1
@@ -1685,6 +1715,15 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .map_err(|error| net_err("poll", error));
     ctx.end_blocking_region();
     result
+}
+
+/// What `net_poll` found for an fd, cloned OUT of the registry so the read
+/// guard can be dropped before the poll runs. See the deadlock note in
+/// `net_poll`: holding the registry guard across the poll is what wedged the
+/// VM, because the poll loop re-reads the registry.
+enum PollTarget {
+    Listener(Arc<Mutex<TcpListener>>),
+    Stream(Arc<TcpStream>),
 }
 
 /// Longest single OS poll a listener wait is allowed to sit in. A
@@ -1847,7 +1886,33 @@ fn net_poll_raw(raw: NetRawHandle, events: i32, timeout: i32) -> std::io::Result
     // the borrowed socket's file descriptor alive for the call.
     let count = unsafe { poll(&mut pfd, 1, timeout) };
     if count < 0 {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        // AUDIT 2026-08-02: report EINTR as "not ready", exactly as
+        // OpenJDK's `Net.poll` does — `unix/native/libnio/ch/Net.c` returns
+        // 0 revents on EINTR rather than throwing. `poll(2)` is NEVER
+        // auto-restarted by `SA_RESTART`, so any signal delivered to a
+        // thread parked here comes straight back as EINTR — and CratonVM
+        // sends one on purpose: `jit::xt_root_scan` SIGUSR2s every thread
+        // to take it over for a cross-thread JIT root scan. Without this
+        // arm `net_err` has no `Interrupted` case, so the park surfaced as
+        // `SocketException: poll: Interrupted system call` — a random
+        // mid-request connection abort whenever a GC landed on a socket
+        // wait. Measured 2026-08-02: 14 of 160
+        // `RequestMappingMessageConversionIntegrationTests` failed exactly
+        // that way, and 0 with this arm. This is the same audit that fixed
+        // `read0`/`write0` above on 2026-07-26 and missed the poll
+        // primitive they park on.
+        //
+        // Reporting "not ready" rather than retrying the poll in place is
+        // what keeps the caller's deadline honest: `NioSocketImpl`'s
+        // `timedRead`/`timedAccept` recompute the remaining timeout from
+        // `System.nanoTime()` on every pass, and `net_poll_listener` below
+        // loops on `Ok(false)`. Re-polling here with the same `timeout`
+        // would restart the whole wait on each signal instead.
+        if error.kind() == std::io::ErrorKind::Interrupted || error.raw_os_error() == Some(4) {
+            return Ok(false);
+        }
+        Err(error)
     } else {
         Ok(count > 0)
     }
@@ -3428,6 +3493,78 @@ mod tests {
 
     fn remove_fd(id: i32) {
         net_sockets().write().remove(&id);
+    }
+
+    /// A listener poll must not hold the registry read guard while it polls.
+    ///
+    /// The bug this pins (2026-08-05) hung the VM outright: `net_poll` returned
+    /// `net_poll_listener(..)` from inside a `net_sockets().read()` block, so
+    /// the guard outlived the call, and the poll loop's own
+    /// `net_listener_still_registered` took the same read lock again. With
+    /// `parking_lot`'s fair `RwLock`, a `socket0` (`register_handle`, a write)
+    /// arriving in between wedges all three.
+    ///
+    /// The test asserts the property directly and with a BOUND, so a
+    /// regression fails in a second instead of hanging the suite the way the
+    /// defect hangs the VM: while a listener poll is in flight, a writer must
+    /// still be able to take the registry lock.
+    #[test]
+    fn a_listener_poll_does_not_hold_the_registry_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener
+            .set_nonblocking(false)
+            .expect("blocking listener");
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
+        // Poll for a connection that never comes, on another thread, THROUGH
+        // `net_poll` — the entry point that held the guard. Calling
+        // `net_poll_listener` directly proves nothing: the defect is the
+        // caller's guard, so a direct call passes on the broken code too
+        // (it did, on the first attempt at this test).
+        let poller = thread::spawn(move || {
+            let mut ctx = MockNativeContext::new();
+            let fd_obj = ctx.alloc_object(4);
+            ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+            // The JDK's `Net` POLLIN differs per platform and this file's
+            // poll shims take it verbatim: `poll(2)`'s 1 on Unix, WSAPoll's
+            // 0x300 on Windows. Passing the wrong one makes the poll fail
+            // instantly with EINVAL — which looked exactly like a passing
+            // test, since a poll that never blocks holds no guard.
+            #[cfg(windows)]
+            const POLLIN: i32 = 0x300;
+            #[cfg(not(windows))]
+            const POLLIN: i32 = 1;
+            let t0 = std::time::Instant::now();
+            let r = net_poll(
+                &mut ctx,
+                &[Value::Object(Some(fd_obj)), Value::Int(POLLIN), Value::Long(1_500)],
+            );
+            (r.is_ok(), t0.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(250));
+
+        // The assertion: a writer gets in. Pre-fix this returns `None` — the
+        // outer read guard is still held and the writer is queued behind it,
+        // which is exactly the state the deadlock freezes.
+        let acquired = net_sockets()
+            .try_write_for(Duration::from_millis(750))
+            .is_some();
+
+        let (poll_ok, poll_took) = poller.join().expect("poll thread");
+        remove_fd(fd);
+        // A poll that returned instantly holds no guard and so cannot observe
+        // the defect. Say so instead of passing: this test reported a clean
+        // pass against the KNOWN-BROKEN code twice before this assertion
+        // existed — once because it called `net_poll_listener` directly, once
+        // because it passed Unix's POLLIN on Windows.
+        assert!(
+            poll_ok && poll_took >= Duration::from_millis(400),
+            "the poll did not block (ok={poll_ok}, took={poll_took:?}), so this              test could not exercise the registry guard at all"
+        );
+        assert!(
+            acquired,
+            "a writer could not take the socket registry while a listener poll              was in flight — the poll is holding the read guard across its loop,              and its own nested read will deadlock against the queued writer"
+        );
     }
 
     #[test]
