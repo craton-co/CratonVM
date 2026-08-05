@@ -2693,6 +2693,17 @@ impl ClassManager {
         self.class_store
             .iter()
             .map(|c| ClassOriginEntry {
+                // Superclass first, then declared interfaces, each resolved
+                // back to a name through the same store. An id that does not
+                // resolve is dropped: it can only mean the row was taken
+                // mid-definition, and a census that guesses is worse than one
+                // that is short.
+                supertypes: c
+                    .superclass
+                    .into_iter()
+                    .chain(c.interfaces.iter().copied())
+                    .filter_map(|id| self.class_store.get(id).map(|s| s.name.to_string()))
+                    .collect(),
                 name: c.name.to_string(),
                 origin: c.origin.as_str().to_string(),
                 reason: c.origin.reason().map(|r| r.to_string()),

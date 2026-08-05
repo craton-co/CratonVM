@@ -186,6 +186,25 @@ pub struct ClassOriginEntry {
     pub real_bytes_found: bool,
     /// Defining loader, as the flat `ClassLoaderId::to_native_id` wire value.
     pub loader_id: u32,
+    /// Direct supertypes — superclass first, then declared interfaces, as
+    /// internal names.
+    ///
+    /// # Why the census carries this
+    ///
+    /// A native registered on an **abstract** method intercepts every
+    /// implementor, including user-defined ones, and that blast radius is the
+    /// open question on `register_interface_natives` and on the 308
+    /// inherited-abstract rows in
+    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    /// Answering it needs the loaded class graph: the native census names the
+    /// declaring class, and only this column says which loaded classes sit
+    /// under it. `scripts/jdk-only-interception.py` does that join.
+    ///
+    /// Direct supertypes only — the transitive closure is the reader's job,
+    /// and computing it here would make the row depend on load order.
+    /// A name that no longer resolves in the store is skipped rather than
+    /// rendered as a placeholder: a census must not invent a class name.
+    pub supertypes: Vec<String>,
 }
 
 #[cfg(test)]
