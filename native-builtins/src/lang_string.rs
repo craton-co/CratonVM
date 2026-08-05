@@ -4495,7 +4495,9 @@ pub(crate) fn native_string_replace_all(
     // "x")` returned the input unchanged where HotSpot throws — a silently
     // wrong answer produced by the error path of a fast path.
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_all_java(&s, replacement.as_str());
+    let result = re
+        .replace_all_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4519,7 +4521,9 @@ pub(crate) fn native_string_replace_first(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_first_java(&s, replacement.as_str());
+    let result = re
+        .replace_first_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
