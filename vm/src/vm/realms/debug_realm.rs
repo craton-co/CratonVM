@@ -125,4 +125,20 @@ pub struct DebugRealm {
     /// this to decide how long to wait for interpreter threads to respond
     /// before aborting the process.
     pub stack_dump_ack_count: std::sync::atomic::AtomicU32,
+
+    /// Sampling mode for [`Self::stack_dump_requested`] (see `--stack-sample-ms`).
+    ///
+    /// The watchdog's dump is one-shot: the flag is never cleared and each
+    /// `execute()` invocation dumps at most once, so what it produces is one
+    /// record per *nested interpreter entry* — a call-count trace wearing a
+    /// profile's clothes, in which a method entered 100k times cheaply
+    /// outranks the one that actually burned the wall clock.
+    ///
+    /// With this flag set the interpreter clears the request after dumping,
+    /// so a sampler thread re-arming it every N ms yields one dump per
+    /// interval per running thread: a time-weighted Java-level profile.
+    /// Diagnostic-only, and off unless `--stack-sample-ms` is passed — when
+    /// off the hot loop pays exactly the `stack_dump_pending()` load it
+    /// already paid.
+    pub stack_sample_mode: std::sync::atomic::AtomicBool,
 }

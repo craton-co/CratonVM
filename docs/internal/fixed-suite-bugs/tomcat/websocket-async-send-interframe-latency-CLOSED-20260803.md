@@ -6,7 +6,7 @@
 | **Test** | still FAILS (SEQ2), and is expected to until the residue doc closes |
 | **HotSpot** | PASS 3/3 (SEQ2 = 1, 2, 0 of 500) |
 | **CratonVM** | FAIL 3/3 (SEQ2 = 476, 486, 481 of 500; before the fix, 491, 489, 483) |
-| **Residue owned by** | [`docs/known-issues/vm/aqs-thread-handoff-latency-20260803.md`](../../../known-issues/vm/aqs-thread-handoff-latency-20260803.md) |
+| **Residue owned by** | [`aqs-thread-handoff-latency` — RETIRED 2026-08-05](../../aqs-thread-handoff-latency-RETIRED-20260805.md), residual now [`uncontended-reentrantlock-pair-is-mostly-unattributed`](../../../known-issues/vm/uncontended-reentrantlock-pair-is-mostly-unattributed-20260805.md) |
 
 This doc opened with "**root cause not found**" and three Next Steps. All three
 are answered below. It is closed on the same basis as
@@ -104,7 +104,7 @@ floor. An empty static call in a user class costs 166 ns interpreted here
 against 0.2 ns inlined on HotSpot. Until that closes, a 255-round AQS spin
 cannot cost less than tens of microseconds and a handoff cannot approach
 HotSpot's single-digit microseconds. That is the subject of
-[`aqs-thread-handoff-latency-20260803`](../../../known-issues/vm/aqs-thread-handoff-latency-20260803.md),
+[`aqs-thread-handoff-latency` (RETIRED 2026-08-05)](../../aqs-thread-handoff-latency-RETIRED-20260805.md),
 which carries the SEQ2 blocker forward.
 
 ## Corrections to the original doc

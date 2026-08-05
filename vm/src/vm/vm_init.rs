@@ -3270,6 +3270,7 @@ impl SharedVm {
                 swallow_counter: std::sync::atomic::AtomicU64::new(0),
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+                stack_sample_mode: std::sync::atomic::AtomicBool::new(false),
             },
             jit: crate::vm::realms::JitRealm {
                 jit_cache: JitCache::new(),
@@ -6354,6 +6355,41 @@ impl SharedVm {
         self.debug
             .stack_dump_requested
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether stack dumps are being driven as a periodic *sampler* rather
+    /// than as the watchdog's one-shot pre-abort dump. See
+    /// [`crate::vm::realms::DebugRealm::stack_sample_mode`].
+    #[inline(always)]
+    pub fn stack_sample_mode(&self) -> bool {
+        self.debug
+            .stack_sample_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm sampling mode. Called once by the CLI when `--stack-sample-ms` is
+    /// given, before the sampler thread starts re-arming the dump request.
+    pub fn enable_stack_sampling(&self) {
+        self.debug
+            .stack_sample_mode
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the pending dump request (sampling mode only) so the next
+    /// re-arm from the sampler thread produces the next sample.
+    pub fn clear_stack_dump_request(&self) {
+        self.debug
+            .stack_dump_requested
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-arm the dump request without the watchdog's thread-summary and
+    /// unpark side effects, which are far too costly to repeat every
+    /// sampling interval (and would themselves distort the profile).
+    pub fn request_stack_sample(&self) {
+        self.debug
+            .stack_dump_requested
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// T19.H1 — dump the calling thread's frame chain to stderr.

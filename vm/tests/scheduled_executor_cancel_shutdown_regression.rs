@@ -12,7 +12,15 @@ fn probe_source() -> PathBuf {
         .join("tests/resources/cratonvm/ScheduledExecutorCancelShutdownProbe.java")
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     std::env::var("CRATONVM_BIN")
         .ok()
         .map(PathBuf::from)

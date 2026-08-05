@@ -27,7 +27,15 @@ fn probe_dir() -> PathBuf {
     manifest.parent().unwrap().join("apps").join("lm_subclass")
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
@@ -105,7 +113,13 @@ fn ensure_probe_compiled() -> bool {
     }
 }
 
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING JDK is
+/// reported differently. See `common::require_jdk`.
 fn jdk_home() -> Option<PathBuf> {
+    common::require_jdk(jdk_home_lookup())
+}
+
+fn jdk_home_lookup() -> Option<PathBuf> {
     if let Ok(j) = std::env::var("CRATONVM_TEST_JDK") {
         let p = PathBuf::from(&j);
         if p.exists() {

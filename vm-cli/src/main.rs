@@ -609,6 +609,18 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
+    /// If set, sample every interpreter thread's Java frame chain to stderr
+    /// every `MILLIS` and keep running (no abort). Unlike
+    /// `--stack-dump-on-timeout`, which emits one dump per nested interpreter
+    /// entry and therefore ranks methods by CALL COUNT, this is a
+    /// time-weighted profile: aggregate the leaf frame of each emitted
+    /// `T19.H1 stack dump` record to see where wall-clock actually goes.
+    /// Diagnostic-only. JIT-compiled frames never reach the dispatch loop and
+    /// so are not sampled — pair it with `--nojit`, or read the result as
+    /// "of the interpreted time, ...".
+    #[arg(long = "stack-sample-ms", value_name = "MILLIS")]
+    stack_sample_ms: Option<u64>,
+
     // -----------------------------------------------------------------------
     // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
     //
@@ -1051,6 +1063,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--add-modules",
     "--Xlog",
     "--stack-dump-on-timeout",
+    "--stack-sample-ms",
     "--gpu-device",
     "--gpu-min-work",
 ];
@@ -3661,6 +3674,30 @@ fn run() -> Result<()> {
         cratonvm_vm::dispatch_trace::enable();
     }
 
+    // `--stack-sample-ms`: periodic, time-weighted Java-frame profiler. Arms
+    // sampling mode (which makes the interpreter CONSUME each dump request
+    // instead of latching it once per nested `execute()`), then re-arms the
+    // request every interval. Never aborts the process, so it composes with a
+    // normal run; the run just gets slower in proportion to the sample rate.
+    if let Some(ms) = args.stack_sample_ms.filter(|ms| *ms > 0) {
+        vm.shared.enable_stack_sampling();
+        let shared_for_sampler = std::sync::Arc::clone(&vm.shared);
+        let sampler_completed = std::sync::Arc::clone(&watchdog_completed);
+        std::thread::Builder::new()
+            .name("cratonvm-stack-sampler".into())
+            .spawn(move || {
+                eprintln!("=== stack sampler: armed at {ms}ms intervals ===");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if sampler_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    shared_for_sampler.request_stack_sample();
+                }
+            })
+            .ok();
+    }
+
     if let Some(secs) = effective_watchdog {
         // Enable the native-call ring buffer so the watchdog's "0 Java
         // threads dumped" fallback can show the last ~64 native methods
@@ -4154,6 +4191,22 @@ fn run() -> Result<()> {
             "[cratonvm] interpreter intrinsic dispatches: {}",
             cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
         );
+        // Compiled code's own funnel bypass. Reported beside the interpreter's
+        // counter because the two answer the same question for different
+        // execution tiers, and the JIT half is the one that was missing: a
+        // compiled loop's calls do not reach the interpreter's inline cache, so
+        // a run whose first number moves and whose second stays at zero has NOT
+        // been sped up where it is hot. See `jit::helpers::LEAF_NATIVE_HITS`.
+        eprintln!(
+            "[cratonvm] compiled leaf-native dispatches: {}",
+            cratonvm_vm::jit::helpers::leaf_native_hit_count()
+        );
+        // A zero above is ambiguous — "nothing here is a leaf" and "every site
+        // was refused for a reason nobody intended" look identical — so the
+        // fill-time refusal reasons are reported alongside it.
+        for (reason, count) in cratonvm_vm::jit::helpers::leaf_native_refusals() {
+            eprintln!("[cratonvm]   leaf sites refused, {reason}: {count}");
+        }
     }
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown

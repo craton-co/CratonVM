@@ -457,19 +457,28 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         }
     });
 
-    // ClassLoader.getName() — read name field
+    // ClassLoader.getName() — read the real `name` field.
+    //
+    // `null` for an unnamed loader, NOT `""`. `ClassLoader.getName()` is
+    // specified as "the name of this class loader **or null if this class
+    // loader is not named**", and the three unnamed constructors
+    // (`ClassLoader()`, `ClassLoader(ClassLoader)`, and
+    // `ClassLoader(String,ClassLoader)` with a null name) all leave it null.
+    // This used to answer `""`, which is a different value from the one every
+    // caller's null check is written against — measured against HotSpot 25 by
+    // `probes/L1LoaderIdentityProbe` (`parented-getName` / `default-getName` /
+    // `nullparent-getName`), which is also the regression test for it.
+    // `getName()` on the app / platform loaders is unaffected: their real
+    // `name` field is populated by name in `get_or_create_app_loader` /
+    // `get_or_create_platform_loader`.
     r.register(cl, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let name = ctx.get_field_by_name(this, "name");
-        match name {
-            Value::Object(Some(_)) => Ok(Some(name)),
-            _ => {
-                let s = ctx.create_string("");
-                Ok(Some(Value::Object(Some(s))))
-            }
+        match ctx.get_field_by_name(this, "name") {
+            name @ Value::Object(Some(_)) => Ok(Some(name)),
+            _ => Ok(Some(Value::Object(None))),
         }
     });
 
