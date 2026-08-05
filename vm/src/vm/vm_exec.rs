@@ -3146,6 +3146,29 @@ fn cold_log_overlay_corruption(
             f.pc,
         );
     }
+    // `CRATONVM_DBG=overlay-bt` — the RUST writer, optionally filtered by a
+    // substring of the class name (`overlay-bt=ClassLoaders`).
+    //
+    // The Java frames above name the method that was executing, which is often
+    // not the code that wrote the field: a native reached from a `<clinit>`, or
+    // from class-loading machinery triggered incidentally, prints a Java stack
+    // that has nothing to do with the writer. The measured example is four
+    // `Int` writes over reference slots on `ClassLoaders$AppClassLoader` whose
+    // Java stack reads `BufferedWriter.initialBufferSize()`.
+    //
+    // Same lesson as the class-origin census's `requested_by`, which had to
+    // learn to name the Rust call site because the Java frame was usually
+    // absent: for a defect that lives in native code, the Rust backtrace is the
+    // answer and the Java frame is context.
+    if let Ok(spec) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_OVERLAY_BT") {
+        let want = spec.trim();
+        if want.is_empty() || want == "1" || class_name.contains(want) {
+            eprintln!(
+                "[OVERLAY]   rust writer:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
 }
 
 /// Run a previously yielded virtual-thread continuation on a pool carrier.

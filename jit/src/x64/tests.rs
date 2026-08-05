@@ -525,6 +525,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
     let code = [0x1a, 0xb8, 0x00, 0x00, 0x1a, 0xb8, 0x00, 0x00, 0x57, 0xb0];
     let helpers = test_helpers();
     let compiled = compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         &code,
         code.len(),
         1,
@@ -4558,6 +4559,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
     ];
     let compile_it = |helpers: &JitRuntimeHelpers| {
         compile_with_param_slots(
+            &crate::compile_gate::CompileAdmission::for_backend_test(),
             &code,
             6,
             2,

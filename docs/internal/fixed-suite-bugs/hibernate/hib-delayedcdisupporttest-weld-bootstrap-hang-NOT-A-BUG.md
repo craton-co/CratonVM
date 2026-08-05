@@ -74,8 +74,14 @@ doc refutes; it's caused by `CRATONVM_REAL_FORKJOINPOOL` becoming
 default-on after this doc was written (`16ec5d7ad`, 2026-07-30), which
 exposed an uncovered `ForkJoinPool.invokeAll` overload in the real-FJP
 bridge allow-list. This doc's refutation of the *hang* claim stands — see
-[`docs/known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md`](../../../known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md)
+[`docs/internal/fixed-suite-bugs/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md`](cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md)
 for the current (different) failure.
+
+**2026-08-04 update:** that `RejectedExecutionException` is now FIXED, and
+`DelayedCdiSupportTest` PASSES in the default configuration (`found=1 ok=1`,
+identical to HotSpot). The class is green again, so neither the hang described
+here nor the `invokeAll` failure applies to it today. This doc stays as the
+record of why the original *hang* diagnosis was wrong.
 
 ## Lesson
 

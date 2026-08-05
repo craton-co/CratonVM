@@ -3,7 +3,8 @@
 
 //! The OSR entry-metadata contract, as executable checks.
 //!
-//! `docs/known-issues/c2/archive/osr-01-entry-metadata-contract.md`. OSR entry works;
+//! The `osr-01` lane brief, retired to
+//! `osr-01-entry-metadata-contract-RETIRED-20260804.md`. OSR entry works;
 //! what had no owner is the *contract between* the seven pieces of metadata it
 //! rides on. Every near-miss this campaign found in that area was the same bug
 //! class — **a plausible integer in the wrong coordinate space**.
@@ -63,7 +64,7 @@
 //!
 //! # What a violation costs
 //!
-//! Refusing OSR for the method. `docs/known-issues/c2/osr-01`'s "What to
+//! Refusing OSR for the method. The `osr-01` brief's "What to
 //! refuse" is explicit: over-refusal costs an optimisation, under-refusal
 //! re-runs loop iterations or resumes with the wrong locals. So the publication
 //! site drops **all** OSR metadata on a violation rather than publishing a set

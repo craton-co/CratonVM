@@ -15,6 +15,26 @@ either landed or closed with a measurement. One — increment 3, real registers 
 is **deliberately not built**, and §6 says why in terms of that same document's
 own refusal list.
 
+> **Second pass, 2026-08-04, branch `fix/ir-callee-saved-save-area-20260804`.**
+> This writeup was honest about what it left open, and two of those items were
+> the ones the brief named explicitly. Both are now closed:
+>
+> * **the first increment's middle third** — "an allocation over it, verified by
+>   the existing `verify_allocation`". §1's row claimed it as landed; §7 was
+>   more accurate, and a grep for `verify_allocation` inside `mir_tile_bytes`
+>   returned nothing. `ir_lower::verify_mir_allocation` is the real thing, and
+>   it is checked by injection rather than by inspection. See increment 2c in
+>   the consolidated doc.
+> * **hazard 2's residual overlap** (§5), which needed increment 3's prologue.
+>   `ir_lower::IR_LOWER_SAVED_XMMS` is that prologue. The scalar file moved to
+>   XMM2–XMM7, the vector pool to XMM8–XMM15, and
+>   `xmm_roles::disjointness_violation()` returns `None`.
+>
+> §6's argument survived the fix — the save area was built **with** consumers,
+> which is what §6 said the bar was — but its conclusion has moved. What is
+> unbuilt in increment 3 is now the GP register class alone, and the reason is
+> the safepoint obligation, not the prologue. §6 is annotated in place.
+
 ---
 
 ## 1. What the brief asked for, and what happened to each item
@@ -26,8 +46,9 @@ own refusal list.
 | "The first increment": a tile list, an allocation over it, an encoder | **Landed** as `MirPlan` + the frame plan + the allocation, encoded through `isel::select`. |
 | "Prove equivalence rather than asserting it … compare emitted bytes" | **Landed** as `ir-isel-verify`, and it ran: 27 tiles, 19 methods, **0 mismatches**, checksums identical in all four modes. |
 | Hazard 1 — safepoints | Discharged **structurally**: the emitted bytes are identical to the per-opcode arms', so no reference changes residency and `OopMapEntry` is untouched. |
-| Hazard 2 — the vector register pool | **Landed** as `regalloc::xmm_roles` plus a caller-supplied `VecEmitRequest::vector_pool`. The overlap itself cannot be removed here; §5. |
-| Increment 3 — registers | **Not built, on purpose.** §6. |
+| "The first increment": … *an allocation over it, verified by `verify_allocation`* | The row above overstated this. The allocation was the frame plan, and nothing ran `verify_allocation` over the tile list. **Closed 2026-08-04** by `verify_mir_allocation`. |
+| Hazard 2 — the vector register pool | First pass: `regalloc::xmm_roles` plus a caller-supplied `VecEmitRequest::vector_pool`, with the overlap asserted rather than removed (§5). **Fully closed 2026-08-04**: the pool is XMM8–XMM15 and disjoint. |
+| Increment 3 — registers | Prologue prerequisite **landed 2026-08-04**; the GP register class is still not built, on purpose. §6. |
 
 ---
 
@@ -203,6 +224,16 @@ prerequisite. `the_three_xmm_authorities_are_stated_in_one_place` therefore
 
 ## 6. Increment 3 — registers — is not built, and this is the reason
 
+> **Annotated 2026-08-04.** The argument below is about whether to build a save
+> area *with no consumer*. It stands, and it is why the second pass did not
+> build one either: `IR_LOWER_SAVED_XMMS` landed with three consumers already
+> attached — the linear-scan file reaching XMM7, a value living across a call on
+> Windows, and the vector pool's separation. What is unbuilt is the **GP**
+> register class, and the blocker named below ("the prologue is tractable") is
+> no longer the operative one. The operative one is the sentence after it: a GP
+> class turns "no reference is register-resident at a GC safepoint" from a
+> structural fact into something proved per site.
+
 The brief and the design doc both name the prerequisite correctly:
 `ir_lower::emit_prologue` saves no callee-saved register, so RBX/R12–R15 cannot
 be handed out until there is a save area restored on all three exits.
@@ -284,6 +315,45 @@ and not caused by this branch:**
 
 ---
 
+## 7b. The second pass's measurement (2026-08-04)
+
+Same host, same corpus, same three phases: `CratonBenchC2` on the Azure Linux
+box, one process per arm.
+
+| Arm | `dispatch` | `bind` | `pipeline` |
+|---|---|---|---|
+| `force-c2` | `2893201123071733440` | `-1727289071355132288` | `97968176938830464` |
+| `+ ir-isel-shadow` | identical | identical | identical |
+| `+ ir-isel-verify` | identical | identical | identical |
+| `+ ir-isel-emit` | identical | identical | identical |
+| `CRATONVM_JIT_IR_LINEAR_SCAN=0` | identical | identical | identical |
+| `CRATONVM_JIT_IR_LINEAR_SCAN=1` | identical | identical | identical |
+
+Six arms, bit-identical results. The last two are the save area's arm: the
+linear-scan path is what reserves it, so `LINEAR_SCAN=1` is the configuration
+where the frame grows and (on Windows) the `MOVUPS` pair is emitted.
+
+Increment 2c's verdicts, both modes, unchanged between them:
+
+```
+[ir-isel] MIR TOTALS methods=27 tiles=39 mismatches=0
+[ir-isel] MIR ALLOC  verified=25 values=406 nothing_to_cover=0
+                     indescribable=2 rejected=0
+```
+
+**406 values verified across 25 methods, nothing rejected.** The two
+`indescribable` methods are the honest residual: `build_live_model` and
+`plan_slots` disagreed there about which values want a location, which
+`plan_register_residency` treats the same way — decline, keep the colourer's
+answer — and which is why the verdict is three-valued rather than a boolean.
+`nothing_to_cover=0` is what makes the other 25 evidence rather than a run of
+vacuous passes.
+
+Test suites, both targets, because `IR_LOWER_SAVED_XMMS` is `[6, 7]` on Windows
+and empty on System V — a Linux-only run would have exercised none of the save
+path, and a Windows-only run none of the "the ABI already gives you this"
+path. `cargo test -p cratonvm-jit`: **1911 passed, 0 failed** on each.
+
 ## 8. Where the residual now stands
 
 `docs/known-issues/c2/README.md`'s residual row for `hir-02` was:
@@ -302,5 +372,7 @@ rather than here:
   it — and verify mode has already priced it: **150 bytes → 114 over seven
   nodes** on the `pipeline` phase (`shadow_tiles`, `arm_bytes`, `enc_bytes` on
   the `[ir-isel] MIR TOTALS` line).
-* **Increment 3**, on the terms in §6.
-* **The XMM overlap**, which increment 3's prologue would remove (§5).
+* **Increment 3's GP register class**, on the annotated terms in §6 — gated on
+  the safepoint obligation now, not on the prologue.
+* ~~**The XMM overlap**, which increment 3's prologue would remove (§5).~~
+  **Closed 2026-08-04.** The prologue landed and the overlap went with it.

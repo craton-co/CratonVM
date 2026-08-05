@@ -116,5 +116,22 @@ default-on in `16ec5d7ad`, 2026-07-30, exposing an uncovered
 `ForkJoinPool.invokeAll` overload in the real-FJP bridge allow-list) that
 now blocks bootstrap one step earlier, so this doc's fix is currently
 unreachable/unverifiable by the suite rather than wrong. Full analysis:
-[`docs/known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md`](../../../known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md).
+[`docs/internal/fixed-suite-bugs/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md`](cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md).
 Re-verify this doc's "9/11 PASS" claim once the `invokeAll` gap is fixed.
+
+## 2026-08-04 re-verification — done, and the claim is now stronger
+
+The `invokeAll` gap is FIXED (see the doc linked above). All 14 `cdi.*` /
+`jpa.cdi.*` classes were re-run on the fixed binary in the **default**
+configuration (no `CRATONVM_SYNTHETIC_FORKJOINPOOL`), against a HotSpot
+control on the same classpath and the same `@common.args`:
+
+* HotSpot: 14/14 PASS
+* CratonVM: **14/14 PASS**, with per-class `found`/`ok` counts identical to
+  HotSpot.
+
+So this doc's `containsAll` fix is reachable and correct again, and the result
+supersedes the original "9/11 sampled" claim — the sample is now the whole
+cluster, including the 2 `HibernateSearch*` classes previously flagged as a
+residual, and it is green. `native_hs_contains_all` still routes through
+`collect_collection_elements_or_real`, untouched by the ForkJoinPool work.

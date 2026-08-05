@@ -1864,6 +1864,28 @@ pub fn execute(
                             None => None,
                         };
                     }
+                    // ── The admission gate, third door ────────────────────
+                    //
+                    // This block reaches `x64::compile_with_param_slots`
+                    // directly, like `compile_osr_artifact` and unlike
+                    // `jit::try_compile`. It had already been taught the
+                    // kill-switch and the bisect levers by hand (see
+                    // `env_disable_jit` above) but never the permanent
+                    // bail-list, the code-cache cap, or the compile-epoch
+                    // witness — so an eager first-call compile could re-run the
+                    // pipeline on a method the backend had permanently refused,
+                    // commit code past a cap the ordinary door was respecting,
+                    // and publish a body stamped at buffer finalize rather than
+                    // from before the first constant-pool read.
+                    // `compile_gate::admit` asks all of them; the token owns
+                    // the epoch witness and must outlive the resolution below.
+                    let admission = cratonvm_jit::compile_gate::admit(
+                        &class_name_str,
+                        method_name,
+                        method_descriptor,
+                        cratonvm_jit::compile_gate::CompileDoor::EagerFirstCall,
+                    )
+                    .ok()?;
                     let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
                     let code_len = code_attr.code.len();
                     let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
@@ -2632,6 +2654,7 @@ pub fn execute(
                         0
                     };
                     let mut cm = crate::jit::x64::compile_with_param_slots(
+                        &admission,
                         &padded,
                         code_len,
                         param_slots,
@@ -3840,6 +3863,74 @@ pub fn pop_and_recycle_frame_with_reason(
         if let Some(caller) = thread.frames.last_mut() {
             caller.exec_epoch = caller.exec_epoch.wrapping_add(1);
         }
+        // Harvest this activation's loop work towards the method's tier-up
+        // counter. This is the ONLY point at which the count is complete and
+        // still attributable: `Frame::backward_count` is reset on every reuse,
+        // so a loop that runs a few hundred iterations per call — the shape of
+        // `ConstantPool.<init>` and `ClassParser.readFields` in Tomcat's
+        // annotation scan — is otherwise thrown away wholesale, over and over,
+        // and never reaches the OSR back-edge threshold within any one frame.
+        //
+        // Harvesting HERE rather than on a back-edge stride is deliberate: a
+        // stride can only ever credit loops longer than the stride, which is
+        // exactly the set this gap does NOT contain. Every iteration counts,
+        // however short the loop, at a cost of one hash + one relaxed atomic
+        // per *invocation that actually looped*.
+        if f.backward_count > 0 && loop_work_tierup_enabled() {
+            let key = cratonvm_jit_api::invoc_key_parts(
+                f.class_id.as_u32(),
+                f.method_name(),
+                f.method_descriptor(),
+            );
+            let total = shared
+                .jit
+                .profile_store
+                .add_loop_work(key, f.backward_count);
+            // Crossing the threshold is not enough: the ONLY place that acts on
+            // the counter is the dispatch site, and it tests
+            // `cnt == threshold || (cnt - threshold) % 64 == 0` against the value
+            // ITS OWN increment returned. Credit applied here lands between two
+            // dispatches, so those exact trigger points are simply stepped over
+            // — `ConstantPool.<init>` was measured reaching a count of 1149,
+            // more than twice the threshold, without ever being nominated.
+            // Nominate from here instead, the same way the dispatch site does.
+            let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+            if total >= threshold && crate::runtime::env_cache::bg_compile() {
+                // Re-nominating an already-published method is cheap and
+                // idempotent (the manager dedups), so a coarse retry stride is
+                // enough to cover a nomination the worker dropped.
+                let crossed_now = total.saturating_sub(f.backward_count / 32) < threshold;
+                if crossed_now || total % 64 == 0 {
+                    ensure_bg_compiler_started(shared);
+                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                    );
+                    let _ = shared
+                        .jit
+                        .tiered_manager
+                        .on_method_invocation_observed(&tiered_key, total as u64);
+                }
+            }
+            // `CRATONVM_DBG=loop-work` — the lever's own witness. A tier-up
+            // change that cannot be seen doing anything is indistinguishable
+            // from an inert one, and this lever has already been inert twice.
+            if loop_work_dbg() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 40 || total >= crate::runtime::env_cache::jit_invocation_threshold() {
+                    eprintln!(
+                        "[loop-work] {}.{}{} backedges={} count_now={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.backward_count,
+                        total
+                    );
+                }
+            }
+        }
         if crate::runtime::env_cache::frame_trace() {
             eprintln!(
                 "[FRAME_POP] depth={} {}.{}{}",
@@ -3933,6 +4024,25 @@ pub(crate) enum OsrBackoffOutcome {
     ThrowJava(ObjectRef),
 }
 
+/// `CRATONVM_JIT=loop-work-tierup` — count loop iterations towards the method
+/// invocation threshold. Read once and cached; this sits on the interpreter's
+/// back-edge path. Default-OFF → behaviour byte-for-byte unchanged.
+fn loop_work_tierup_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOOP_WORK_TIERUP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG=loop-work` — trace what [`loop_work_tierup_enabled`] actually
+/// credits, so an inert lever is visibly inert instead of quietly so.
+fn loop_work_dbg() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LOOP_WORK").is_some()
+    })
+}
+
 /// Run the standard back-edge OSR orchestration: backoff check → try_osr →
 /// rejection bookkeeping. See [`OsrBackoffOutcome`] for the meaning of
 /// each return variant.
@@ -3966,6 +4076,22 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    // osr-02 frame comparator: record the back-edge ARRIVAL here, ahead of
+    // every early return below.
+    //
+    // The placement is the whole point. This function is the one funnel all
+    // fourteen back-edge sites go through, and the records have to be taken
+    // under conditions that do NOT depend on OSR — the ground-truth arm runs
+    // `--nojit`, where every check below would decline. A hook placed after the
+    // virtual-thread test, the `CRATONVM_JIT_OSR` gate or the backoff schedule
+    // would emit in one arm and not the other, and the comparison would be
+    // between two different things rather than between two runs of one.
+    //
+    // Costs one `OnceLock` bool load when the flag is unset, on a path that
+    // already performs several cached environment reads.
+    if osr_frame_trace::enabled() {
+        osr_frame_trace::record_arrival(&thread.frames[*frame_idx], entry_pc);
+    }
     if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
         return OsrBackoffOutcome::Skip;
     }
@@ -3982,6 +4108,32 @@ pub(crate) fn try_osr_with_backoff(
     // → identical to before.
     let osr_backedge_threshold =
         crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD);
+    // Loop work performed across SHORT invocations is otherwise invisible to
+    // tier-up, and that gap is what keeps Tomcat's BCEL annotation scan
+    // interpreted. Both counters miss it:
+    //
+    //   * the method invocation counter accumulates globally, but
+    //     `ConstantPool.<init>` / `ClassParser.readFields` run ONCE PER CLASS —
+    //     468 calls over the whole probe, under the 500 threshold;
+    //   * `Frame::backward_count` is per-frame and reset on every invocation
+    //     (`Frame::reset`), so a ~300-iteration constant-pool loop never reaches
+    //     the 1000-back-edge OSR threshold WITHIN one frame — no matter how many
+    //     classes are parsed. That is permanent, not a warm-up artifact.
+    //
+    // Measured: with the stock thresholds this workload reports `osr=0` — not a
+    // single OSR body in the entire scan — while the per-constant methods it
+    // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
+    // See docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Credit loop work towards that same invocation counter, the way HotSpot
+    // sums its invocation and back-edge counters against a single threshold.
+    // This reuses the existing counter and compile path exactly — no new state,
+    // and no OSR involvement: the method simply crosses the ordinary threshold
+    // and its NEXT call runs compiled.
+    //
+    // The credit itself is applied in `pop_and_recycle_frame_with_reason`, at
+    // the one point where an activation's back-edge count is both complete and
+    // still attributable. See `ProfileStore::add_loop_work`.
     if !thread.frames[*frame_idx].should_try_osr(entry_pc, osr_backedge_threshold) {
         return OsrBackoffOutcome::Skip;
     }
@@ -7297,6 +7449,11 @@ pub use constants::*;
 // `runtime::resolve::guard` enforces it.
 pub(crate) mod field_access;
 pub use field_access::*;
+// The interpreter's resolved constant pool: per-thread, lock-free site caches
+// for field and method constant-pool references. `pub` so `vm-cli` can print
+// the `CRATONVM_DBG=field-site` tally at exit.
+pub mod site_cache;
+pub use site_cache::{FieldSiteCache, MethodSiteCache, MethodSiteInfo};
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
 // ---------------------------------------------------------------------------
@@ -7330,6 +7487,10 @@ mod native_override;
 pub use native_override::*;
 mod jit_bridge;
 pub use jit_bridge::*;
+// The frame-level half of the osr-02 exit differential: back-edge arrivals and
+// OSR-exit resumed frames, in one format, under one flag. Inert unless
+// `CRATONVM_DBG_OSR_FRAME_TRACE` names a class substring.
+mod osr_frame_trace;
 
 // ---------------------------------------------------------------------------
 // Helper: loader-faithful ARRAY class resolution (JVMS §5.3.3)

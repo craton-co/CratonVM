@@ -83,6 +83,11 @@
 pub mod aarch64;
 pub mod aarch64_backend;
 pub mod bailout;
+// The one door every backend entry point must pass through. There are THREE
+// doors (method entry, the eager first-call compile, OSR), and only the first
+// ever asked the admission questions; the other two grew hand-copied subsets
+// of them. See `docs/feature-designs/jit-osr-entry-metadata.md` step 3.
+pub mod compile_gate;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod ir;
@@ -94,6 +99,16 @@ pub mod ir_schedule;
 // deliberately: it must be testable against synthetic vectors, and a check
 // that can only be handed a real `CompiledMethod` cannot be.
 pub mod osr_contract;
+// The OSR *exit* side of the same argument — where an exit landed relative to
+// the recorded loop-boundary maps, and whether its resume bci names one image
+// or several. See `docs/feature-designs/jit-osr-exit-and-recompile.md`. Kept
+// out of this file for the same reason as `osr_contract`: it is tested against
+// synthetic point lists, not against whatever a real compile produced.
+pub mod osr_exit;
+// The two OSR pc spaces, kept apart by the type system. `osr_contract` catches
+// the consequence (vectors that disagree); this catches the cause (an integer
+// in the wrong space).
+pub mod osr_coords;
 pub mod ir_verify;
 pub mod loop_analysis;
 pub mod metrics;
@@ -747,6 +762,13 @@ pub fn jit_code_cache_cap_bytes() -> usize {
 /// Diagnostic only.
 pub fn jit_code_cache_cap_refusals() -> u64 {
     JIT_CODE_CACHE_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one cap refusal. Called from [`compile_gate::admit`], which is the
+/// single place the check now lives — the counter stays here so the accessor
+/// above and the static it reads keep one owner.
+pub(crate) fn note_jit_code_cache_cap_refusal() {
+    JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 
@@ -3036,13 +3058,34 @@ pub const OSR_REFUSE_UNCONDITIONAL_TRAP: &str = "osr-entry-unconditional-trap";
 /// resumable. Entering would commit loop iterations that a bail could then only
 /// discard — the replay this whole section exists to prevent.
 pub const OSR_REFUSE_UNRESUMABLE_EXIT: &str = "osr-entry-unresumable-exit";
+/// The artifact records more than one resume image at some bci, and they
+/// disagree on what the by-bci resume lookups read (`semantics`, `reason`), so
+/// the pick would be arbitrary — the lane's "what to refuse", applied where it
+/// is free to apply it.
+///
+/// At ADMISSION, not at exit. Refusing at exit is not the mirror of refusing at
+/// entry: by then the body has committed iterations, and the caller's only
+/// remaining move is the safe reject, which re-runs every one of them. See
+/// [`osr_exit`] for the argument in full.
+pub const OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE: &str = "osr-entry-ambiguous-exit-image";
 /// Post-entry: the reconstructed frame cannot name an exact resume point, so
 /// the interpreter must NOT be resumed (least of all at the entry bci).
 pub const OSR_REFUSE_EXIT_REPLAY: &str = "osr-exit-replay-refused";
+/// The artifact's **two views of its own frame** disagree about a slot: the
+/// precise `FrameState` at the entry bci says one register file, the register
+/// homes the trampoline actually seeds through say the other.
+///
+/// `osr-01` item 4 — "`osr_entry_frame_state` and the deopt frame state are two
+/// views of the same thing and are not checked against each other". The two
+/// views are produced by the same compile from the same allocator state, so
+/// they cannot legitimately differ; when they do, the entry that
+/// [`CompiledMethod::validate_osr_entry`] type-checks is not the entry
+/// [`osr_trampoline`] performs. See [`CompiledMethod::osr_home_disagreement`].
+pub const OSR_REFUSE_CONTRACT_DISAGREEMENT: &str = "osr-entry-contract-disagreement";
 
 /// Every refusal tag, in taxonomy order. A new refusal must be added here; the
 /// tests assert the list is complete and duplicate-free.
-pub const OSR_REFUSAL_TAGS: [&str; 12] = [
+pub const OSR_REFUSAL_TAGS: [&str; 14] = [
     OSR_REFUSE_NO_ENTRY_TABLE,
     OSR_REFUSE_PC_NOT_AN_ENTRY,
     OSR_REFUSE_DEAD_LOCAL_MASK,
@@ -3054,7 +3097,9 @@ pub const OSR_REFUSAL_TAGS: [&str; 12] = [
     OSR_REFUSE_INLINED_SCOPE,
     OSR_REFUSE_UNCONDITIONAL_TRAP,
     OSR_REFUSE_UNRESUMABLE_EXIT,
+    OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE,
     OSR_REFUSE_EXIT_REPLAY,
+    OSR_REFUSE_CONTRACT_DISAGREEMENT,
 ];
 
 /// Build (and count) an OSR refusal.
@@ -3071,7 +3116,7 @@ fn osr_refusal(tag: &'static str, context: impl Into<String>) -> bailout::Bailou
 /// The subset of [`OSR_REFUSAL_TAGS`] whose answer is a pure function of the
 /// *artifact*, and therefore reproduces for every future back-edge over the
 /// same pc. See [`osr_refusal_is_permanent`].
-pub const OSR_PERMANENT_REFUSAL_TAGS: [&str; 7] = [
+pub const OSR_PERMANENT_REFUSAL_TAGS: [&str; 9] = [
     OSR_REFUSE_NO_ENTRY_TABLE,
     OSR_REFUSE_PC_NOT_AN_ENTRY,
     OSR_REFUSE_DEAD_LOCAL_MASK,
@@ -3079,6 +3124,14 @@ pub const OSR_PERMANENT_REFUSAL_TAGS: [&str; 7] = [
     OSR_REFUSE_INLINED_SCOPE,
     OSR_REFUSE_UNCONDITIONAL_TRAP,
     OSR_REFUSE_UNRESUMABLE_EXIT,
+    // A pure function of the artifact's own point list: the same two
+    // disagreeing points are there on every future back edge over this pc.
+    OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE,
+    // Artifact-level: both views come from this compile and neither depends on
+    // the offered locals, so the answer reproduces for every future back-edge
+    // over this pc. Memoing it is the difference between one wasted pipeline
+    // and one per trip.
+    OSR_REFUSE_CONTRACT_DISAGREEMENT,
 ];
 
 /// Is this refusal a pure function of the *artifact* (as opposed to the
@@ -3274,14 +3327,48 @@ impl OsrEntryPlan {
                 ),
             ));
         }
-        let Some(point) = artifact.deopt_points.iter().find(|p| p.bci == rframe.bci) else {
-            return Err(osr_refusal(
-                OSR_REFUSE_EXIT_REPLAY,
-                format!(
-                    "exit bci {} is not a recorded deopt point of this artifact",
-                    rframe.bci
-                ),
-            ));
+        // "More than one possible native image, or none" — both answered here,
+        // by the same lookup, instead of by a `find` that silently takes the
+        // first of however many there are.
+        //
+        // The ambiguous arm is an ASSERTION, not a new policy: `osr_exit_policy`
+        // walked this artifact's whole point list at admission and refused the
+        // entry (`osr-entry-ambiguous-exit-image`) if any bci named two
+        // disagreeing images, so an admitted plan cannot reach it. It is here
+        // because the alternative — reaching it and picking arbitrarily — is a
+        // wrong-code bug, and because the check costs one scan of a list with
+        // tens of entries on a path that has already taken a deopt.
+        let point = match osr_exit::resume_image(&artifact.deopt_points, rframe.bci) {
+            osr_exit::ResumeImage::Unique { index, .. } => &artifact.deopt_points[index],
+            osr_exit::ResumeImage::None => {
+                return Err(osr_refusal(
+                    OSR_REFUSE_EXIT_REPLAY,
+                    format!(
+                        "exit bci {} is not a recorded deopt point of this artifact",
+                        rframe.bci
+                    ),
+                ));
+            }
+            osr_exit::ResumeImage::Ambiguous { first, second } => {
+                let (a, b) = (
+                    &artifact.deopt_points[first],
+                    &artifact.deopt_points[second],
+                );
+                return Err(osr_refusal(
+                    OSR_REFUSE_EXIT_REPLAY,
+                    format!(
+                        "exit bci {} names two resume images that disagree: +{:#x} ({:?}, {}) \
+                         vs +{:#x} ({:?}, {}) — admission should have refused this artifact",
+                        rframe.bci,
+                        a.native_offset,
+                        a.reason,
+                        a.semantics,
+                        b.native_offset,
+                        b.reason,
+                        b.semantics
+                    ),
+                ));
+            }
         };
         if point.semantics != deopt::ResumeSemantics::REEXECUTE {
             return Err(osr_refusal(
@@ -3388,6 +3475,17 @@ impl CompiledMethod {
             .map(|p| &p.frame_state)
     }
 
+    /// Where an exit taken at `bci` landed, relative to the loop-boundary exit
+    /// maps this artifact recorded.
+    ///
+    /// The lane's step 4: `osr_exit_points` is populated and nothing compared
+    /// it with the exits that actually happen. This is that comparison, and it
+    /// is a **classification, not a verdict** — see [`osr_exit::OsrExitSite`].
+    /// The caller counts the answer; only `Unrecorded` is a defect.
+    pub fn classify_osr_exit_site(&self, bci: u32) -> osr_exit::OsrExitSite {
+        osr_exit::classify_exit_site(&self.osr_exit_points, &self.deopt_points, bci)
+    }
+
     /// Classify what a mid-loop bail out of this artifact may do, refusing the
     /// entry outright when some reachable exit could not be resumed.
     ///
@@ -3450,6 +3548,42 @@ impl CompiledMethod {
                 ));
             }
         }
+        // The lane's "what to refuse", at the only moment refusing is free.
+        //
+        // `resume_after_exit` finds its point BY BCI and takes the first match,
+        // reading its `semantics` — the field that decides whether the bci is a
+        // place the interpreter may be parked at. Two points at one bci that
+        // disagree there make the resume bci itself arbitrary, and "picking the
+        // wrong image is a wrong-code bug rather than a missed optimisation".
+        //
+        // Two things are deliberately NOT refused here, both because refusing
+        // them costs OSR and buys nothing:
+        //
+        //  * Copies that agree. Several native images of one bytecode is
+        //    exactly what a loop transform produces, and every consumer that
+        //    RECONSTRUCTS a frame finds its point by native offset or through
+        //    the copy's own baked box.
+        //  * Images that differ only in `reason`. That is the ordinary shape of
+        //    a compiled counted loop — the loop-boundary exit map and the
+        //    speculative-BCE range guard on the same header bci — and it was
+        //    measured: refusing it took 10 of CratonBench's 11 OSR refusals and
+        //    cost `matrixKernel` its OSR permanently. It is counted instead;
+        //    `osr_exit`'s module note carries the full argument.
+        if osr_exit::has_reason_ambiguous_bci(&self.deopt_points) {
+            metrics::record_osr_event("osr_entry_reason_ambiguous_image");
+        }
+        if let Some((bci, i, j)) = osr_exit::first_ambiguous_resume_bci(&self.deopt_points) {
+            metrics::record_osr_event("osr_entry_refused_ambiguous_image");
+            let (a, b) = (&self.deopt_points[i], &self.deopt_points[j]);
+            return Err(osr_refusal(
+                OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE,
+                format!(
+                    "bci {bci} names two resume images whose ResumeSemantics disagree, so the \
+                     resume bci itself is arbitrary: +{:#x} ({:?}, {}) vs +{:#x} ({:?}, {})",
+                    a.native_offset, a.reason, a.semantics, b.native_offset, b.reason, b.semantics
+                ),
+            ));
+        }
         Ok(OsrExitPolicy::ExactTransfer)
     }
 
@@ -3476,6 +3610,91 @@ impl CompiledMethod {
             return OsrSlotExpectation::Integral;
         }
         OsrSlotExpectation::Unconstrained
+    }
+
+    /// Does the register file a local's homes imply admit `want`?
+    ///
+    /// A *set*, not a single answer, because a JVM slot index is legally reused
+    /// by locals of different types in disjoint live ranges — `java.util.
+    /// DualPivotQuicksort.mixedInsertionSort` has slot 7 as a `long`'s high half
+    /// in one region and as an `int` loop counter in the others — so a slot can
+    /// legitimately carry BOTH a GPR and an XMM home. The trampoline seeds both
+    /// when both exist (see [`osr_trampoline`]'s emit loop), so "has an XMM
+    /// home" does not mean "is FP".
+    ///
+    /// No home at all means memory-homed: the trampoline stores the word to the
+    /// frame slot and every type is admissible.
+    fn osr_homes_admit(&self, i: usize, want: OsrSlotType) -> bool {
+        let has = |m: &Option<Vec<Option<u8>>>| {
+            m.as_ref().and_then(|v| v.get(i)).is_some_and(|a| a.is_some())
+        };
+        let gpr = has(&self.osr_local_assignments);
+        let xmm = has(&self.osr_xmm_assignments);
+        if !gpr && !xmm {
+            return true;
+        }
+        match want {
+            OsrSlotType::Float | OsrSlotType::Double => xmm,
+            OsrSlotType::Int | OsrSlotType::Long | OsrSlotType::Ref => gpr,
+            // The precise contract says nothing lives here, so it constrains
+            // nothing. (`Exact(Top)` accepts any incoming value too — see
+            // `OsrSlotExpectation::accepts`.)
+            OsrSlotType::Top => true,
+        }
+    }
+
+    /// `osr-01` item 4: check this artifact's **two views of its own frame**
+    /// against each other, and name the first slot where they disagree.
+    ///
+    /// The two views are:
+    ///
+    /// * the precise `FrameState` at the entry bci — what
+    ///   [`CompiledMethod::validate_osr_entry`] type-checks the interpreter's
+    ///   offer against; and
+    /// * `osr_local_assignments` / `osr_xmm_assignments` — the register homes
+    ///   [`osr_trampoline`] actually seeds through.
+    ///
+    /// They are produced by one compile from one allocator state, so they
+    /// cannot legitimately differ. When they do, the entry that was *validated*
+    /// is not the entry that is *performed*: a `double` whose only home is a
+    /// GPR has its bits moved into a register the body reads as an integer, and
+    /// — worse — a reference whose only home is an XMM register is seeded into
+    /// the FP file with the frame-slot store elided, so the GC cannot see it
+    /// and the body reads a stale word.
+    ///
+    /// Deliberately narrow. It does **not** assert that a slot the frame state
+    /// calls live has a register home (memory-homed locals are ordinary), nor
+    /// that a slot with a home is described by the frame state (a snapshot
+    /// shorter than the compiled frame simply does not describe its tail), nor
+    /// anything about the dead mask (see `osr_contract`'s note on the
+    /// invariant-that-is-not-one). Only the *register file* is cross-checked,
+    /// because that is the only place the two views make a claim that can
+    /// contradict — and it is the claim the trampoline acts on.
+    ///
+    /// Masked-dead slots are skipped: the trampoline does not seed them at all,
+    /// so their homes describe nothing that happens at this entry.
+    fn osr_home_disagreement(
+        &self,
+        frame_state: &deopt::FrameState,
+        dead_mask: u64,
+    ) -> Option<(usize, OsrSlotType)> {
+        for i in 0..self.osr_num_locals {
+            if i < 64 && (dead_mask >> i) & 1 == 1 {
+                continue;
+            }
+            let Some(v) = frame_state.locals.get(i) else {
+                break; // the snapshot describes a prefix; the tail is untyped
+            };
+            // An undescribable slot is `validate_osr_entry`'s refusal, not
+            // this one's — reporting it here would blame the wrong thing.
+            let Some(want) = OsrSlotType::from_frame_value(v) else {
+                continue;
+            };
+            if !self.osr_homes_admit(i, want) {
+                return Some((i, want));
+            }
+        }
+        None
     }
 
     /// Type-check an offered interpreter state against this artifact's OSR
@@ -3628,6 +3847,33 @@ impl CompiledMethod {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!("{}: entry contract holds monitors", label()),
+                ));
+            }
+            // `osr-01` item 4. The precise contract is what the loop below
+            // type-checks the interpreter's offer against; the register homes
+            // are what the trampoline seeds through. Both come from this one
+            // compile, so a disagreement is a compiler bug — and it is the kind
+            // that validates one entry and performs another. Checked BEFORE the
+            // per-slot loop so a disagreement is reported as itself rather than
+            // surfacing later as a slot-type mismatch against the offer, which
+            // would name the interpreter for the compiler's error.
+            if let Some((i, want)) = self.osr_home_disagreement(fs, dead_mask) {
+                return Err(osr_refusal(
+                    OSR_REFUSE_CONTRACT_DISAGREEMENT,
+                    format!(
+                        "{}: the entry contract says local {i} is {want}, but its register \
+                         homes are gpr={:?} xmm={:?} — the trampoline seeds through the \
+                         homes, so the validated entry is not the entry performed",
+                        label(),
+                        self.osr_local_assignments
+                            .as_ref()
+                            .and_then(|m| m.get(i).copied())
+                            .flatten(),
+                        self.osr_xmm_assignments
+                            .as_ref()
+                            .and_then(|m| m.get(i).copied())
+                            .flatten(),
+                    ),
                 ));
             }
         }
@@ -12026,12 +12272,21 @@ fn force_interpret_matches(
     bisect_only.is_some_and(|prefixes| !prefixes.iter().any(|p| class_name.starts_with(p.as_str())))
 }
 
-/// Diagnostic: number of `try_compile` calls short-circuited because
-/// the method was already bail-listed.  Each short-circuit saves the
-/// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
-/// re-hit the same backend bail.
+/// Diagnostic: number of compile requests short-circuited because the method
+/// was already bail-listed. Each short-circuit saves the ~50µs we'd otherwise
+/// have spent re-running scan/IR/lowering only to re-hit the same backend bail.
+///
+/// Counts **every** door since the admission gate landed, not just
+/// `try_compile`: the OSR door's hand-copied bail-list check never incremented
+/// this, so the figure understated the saving by exactly the traffic that
+/// motivated adding the check there (35 923 pipelines on `Nat.inc`).
 pub fn jit_bail_shortcircuits() -> u64 {
     JIT_BAIL_SHORTCIRCUITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one bail-list short-circuit. Called from [`compile_gate::admit`].
+pub(crate) fn note_jit_bail_shortcircuit() {
+    JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -12774,25 +13029,30 @@ pub fn try_compile_with_invokespecial_resolver(
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
 ) -> Option<CompiledMethod> {
-    // Open the compilation scope FIRST, before any constant-pool resolver runs.
-    // Every `CompiledMethod` built under it — including one built by a nested
-    // `callee_compiler` compile on this thread — is stamped with the install
-    // epoch as of right now, so a redefinition or layout upgrade that lands
-    // while this compile is reading bytecode makes the result unpublishable.
-    // See `CompiledMethod::install_epoch` and `JitCache::flush_barrier`.
-    let _compile_epoch = open_compile_epoch_witness();
+    // The admission gate. Four checks and two side effects, all of which used
+    // to live inline here and NONE of which the other two backend doors (the
+    // eager first-call compile and `compile_osr_artifact`) applied in full —
+    // see `compile_gate`'s module doc for the three-door table and what each
+    // door had hand-copied. The token owns the compile-epoch witness, so it
+    // must outlive the whole pipeline below.
+    //
+    // The historical notes each check was written under are preserved verbatim
+    // beneath, because they record *why* a whole-method refusal is worth its
+    // cost and every one of them was paid for by a real defect.
+    //
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
     // scan/IR/lowering work per re-attempt (every 2000 invocations
     // under the default interpreter warmup gate).
-    if is_jit_bail_listed(
+    let admission = match compile_gate::admit(
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
+        compile_gate::CompileDoor::MethodEntry,
     ) {
-        JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    }
+        Ok(a) => a,
+        Err(_) => return None,
+    };
 
     // Keep the final compiler admission gate aligned with the VM static
     // skip-list. The tiered background worker bypasses VM-side eligibility and
@@ -12841,25 +13101,19 @@ pub fn try_compile_with_invokespecial_resolver(
     // prefixes stay JIT-eligible. Both now live in `jit_force_interpret`, so
     // the eager first-call and OSR codegen paths — which do NOT come through
     // this function — can apply the identical predicate. See that function for
-    // why sharing it matters.
-    if jit_force_interpret(&cached.class_name, &cached.method_name) {
-        return None;
-    }
-
-    // Live code-cache cap. Reclaimed bodies restore headroom, so this is a
-    // transient admission check rather than a permanent compile stop.
-    if jit_code_cache_at_capacity() {
-        JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    }
+    // why sharing it matters. Both levers, and the live code-cache cap below
+    // them, are now asked by `compile_gate::admit` above — one place, all three
+    // doors. (Live code-cache cap: reclaimed bodies restore headroom, so it is
+    // a transient admission check rather than a permanent compile stop.)
 
     // Consume the per-compile self-call identity proof FIRST — even an
     // early bail below must not leak a stale `true` into a later compile.
+    // Stays here rather than in the gate: it is a proof the *caller* of this
+    // function deposits for this one compile, and the other two doors neither
+    // set nor read it.
     let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
-    // Same one-shot discipline for the bail-site record: clear whatever the
-    // previous compile on this worker thread left behind, so a bail below can
-    // only ever report its own cause.
-    let _ = take_jit_bail_site();
+    // The one-shot bail-site clear that used to sit here is `compile_gate::
+    // admit`'s job now — same discipline, every door.
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
@@ -12896,6 +13150,7 @@ pub fn try_compile_with_invokespecial_resolver(
         receiver_inline_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
+        &admission,
     );
 
     if result.is_none() && backend_attempted {
@@ -13446,6 +13701,10 @@ fn try_compile_inner(
     // present — worth retrying later).
     backend_attempted: &mut bool,
     self_call_identity_stable: bool,
+    // The caller's admission token, threaded through so the single-pass
+    // backend call at the end of this function can require it. See
+    // `x64::compile_with_param_slots`'s first parameter.
+    admission: &compile_gate::CompileAdmission,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -15142,6 +15401,18 @@ fn try_compile_inner(
                     // Hoisted out of the `if let` (same call, same arguments,
                     // same control flow) purely so the timer can stop before
                     // the post-lowering bookkeeping below.
+                    // The drift witness, optimizing half. `lower_inner`
+                    // installs an executable buffer itself and never goes
+                    // through `x64::compile_with_param_slots`, so without this
+                    // the witness covered only the single-pass backend — a
+                    // future door reaching the IR lowerer directly would have
+                    // produced a body with no admission and no count. This path
+                    // is reachable only from the gated
+                    // `try_compile_with_invokespecial_resolver`, so it is
+                    // expected to add nothing to `ungated_backend_entries()`;
+                    // the point is that it would stop being true if that
+                    // changed.
+                    compile_gate::note_backend_entry();
                     let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     let lowered = ir_lower::lower_inner(
                         &graph,
@@ -16872,6 +17143,7 @@ fn try_compile_inner(
     // the `?` below: a backend bail is a compilation that spent this time.
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
+        admission,
         code,
         code_len,
         param_slots,
@@ -20740,6 +21012,158 @@ mod tests {
         )));
     }
 
+    // ── osr-01 item 4: the two views of one frame ────────────────────
+    //
+    // `osr_entry_frame_state` (the precise contract `validate_osr_entry`
+    // type-checks against) and the register homes (`osr_local_assignments` /
+    // `osr_xmm_assignments`, which is what `osr_trampoline` seeds through) are
+    // two views of the same compile. Until now nothing compared them, so an
+    // artifact could validate one entry and perform another.
+    //
+    // The fixtures below build the disagreement directly rather than trying to
+    // provoke it out of a real compile — a compiler bug that has never been
+    // observed cannot be reproduced, and the point of the check is that it
+    // would be caught if it ever happened.
+
+    /// An artifact with a precise contract at the header: `[ref, int, int]`.
+    fn osr_t_precise(num_locals: usize) -> CompiledMethod {
+        let mut cm = osr_t_artifact(num_locals);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        )];
+        cm
+    }
+
+    /// The baseline the three refusals below are perturbations of: a precise
+    /// contract over memory-homed locals agrees with the register-home view
+    /// vacuously, because a memory-homed slot admits every type.
+    ///
+    /// Stated as its own test so a check that refused *everything* could not
+    /// pass the refusal tests below and look correct.
+    #[test]
+    fn a_memory_homed_precise_contract_has_no_home_disagreement() {
+        let cm = osr_t_precise(3);
+        let locals = [0x1234_5678i64, 200, 4950];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .is_ok());
+    }
+
+    /// The corruption this check exists for, in its most direct form: the
+    /// contract says local 1 is a `double`, but its only home is a GPR. The
+    /// trampoline moves the double's bits into a general-purpose register the
+    /// compiled body reads as an integer, and the frame-slot store is elided
+    /// because a home exists — so nothing downstream can notice.
+    #[test]
+    fn a_wide_fp_local_homed_only_in_a_gpr_refuses_the_entry() {
+        let mut cm = osr_t_precise(3);
+        cm.deopt_points[0].frame_state.locals[1] = deopt::FrameValue::XmmDouble(2);
+        cm.osr_local_assignments = Some(vec![None, Some(3), None]);
+        let locals = [0x1234_5678i64, 0x4008_0000_0000_0000u64 as i64, 4950];
+        let tags = [
+            cratonvm_types::VTAG_OBJECT,
+            cratonvm_types::VTAG_DOUBLE,
+            cratonvm_types::VTAG_INT,
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &tags))
+            .expect_err("a double with only a GPR home is a compiler bug, not an entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_CONTRACT_DISAGREEMENT));
+        let msg = err.to_string();
+        assert!(msg.contains("local 1"), "{msg}");
+        assert!(msg.contains("double"), "{msg}");
+    }
+
+    /// The other direction, and the more dangerous one: a reference whose only
+    /// home is an XMM register is seeded into the FP file with the frame-slot
+    /// store elided, so the GC's precise map has nothing to find and the body
+    /// reads a stale word.
+    #[test]
+    fn a_reference_homed_only_in_an_xmm_refuses_the_entry() {
+        let mut cm = osr_t_precise(3);
+        cm.osr_xmm_assignments = Some(vec![Some(1), None, None]);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a reference with only an XMM home must be refused");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_CONTRACT_DISAGREEMENT));
+        assert!(err.to_string().contains("local 0"), "{err}");
+    }
+
+    /// Over-refusal check, and the reason `osr_homes_admit` answers with a
+    /// *set*. A JVM slot index is legally reused by locals of different types
+    /// in disjoint live ranges, so the allocator can give one slot BOTH a GPR
+    /// and an XMM home — `DualPivotQuicksort.mixedInsertionSort` does exactly
+    /// this. The trampoline seeds both, so neither home contradicts the other.
+    #[test]
+    fn a_slot_with_both_register_homes_is_not_a_disagreement() {
+        let mut cm = osr_t_precise(3);
+        cm.osr_local_assignments = Some(vec![None, Some(3), None]);
+        cm.osr_xmm_assignments = Some(vec![None, Some(1), None]);
+        let locals = [0x1234_5678i64, 200, 4950];
+        assert!(
+            cm.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                .is_ok(),
+            "a slot reused across disjoint live ranges may carry both homes"
+        );
+    }
+
+    /// A masked-dead slot is not seeded at all, so its homes describe nothing
+    /// that happens at this entry and must not be cross-checked. Without this
+    /// the check would refuse entries the dead mask exists to make safe.
+    #[test]
+    fn a_masked_dead_slot_is_not_cross_checked() {
+        let mut cm = osr_t_precise(3);
+        cm.osr_xmm_assignments = Some(vec![Some(1), None, None]);
+        let mut mask = vec![0u64; OSR_T_HEADER + 2];
+        mask[OSR_T_HEADER] = 0b1; // local 0 is dead here
+        cm.osr_dead_mask = Some(mask);
+        let locals = [0x1234_5678i64, 200, 4950];
+        // The kill switch turns a non-zero mask into a blanket refusal, which
+        // would make this pass for the wrong reason.
+        if !osr_dead_local_entry_allowed() {
+            return;
+        }
+        assert!(
+            cm.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                .is_ok(),
+            "a slot the trampoline skips carries no home claim"
+        );
+    }
+
+    /// A snapshot shorter than the compiled frame describes a prefix; the tail
+    /// is simply untyped, not contradicted. (`validate_osr_entry` already falls
+    /// back to the register-home expectation for those slots.)
+    #[test]
+    fn a_short_snapshot_does_not_manufacture_a_disagreement() {
+        let mut cm = osr_t_precise(3);
+        cm.deopt_points[0].frame_state.locals.truncate(1);
+        cm.osr_xmm_assignments = Some(vec![None, None, Some(3)]);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let tags = [
+            cratonvm_types::VTAG_OBJECT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_DOUBLE,
+        ];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &tags))
+            .is_ok());
+    }
+
+    /// The verdict is a pure function of the artifact and the entry pc — it
+    /// does not read the offered locals — so it may be memoed. Asserted here as
+    /// well as in the taxonomy test because memoing a *state-dependent* refusal
+    /// is the same bug in the other direction: a silent, permanent loss of OSR.
+    #[test]
+    fn the_home_disagreement_refusal_is_memoable() {
+        assert!(osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_CONTRACT_DISAGREEMENT,
+            "probe"
+        )));
+    }
+
     /// A long-running loop must request an OSR compile at its back-edge — and a
     /// short one must not. The request has to name the loop header, because the
     /// entry bci is what the compiled artifact publishes a native offset for.
@@ -21327,6 +21751,142 @@ mod tests {
         assert_eq!(
             osr_t_tag(&plan.resume_after_exit(&cm, &stray).unwrap_err()),
             Some(OSR_REFUSE_EXIT_REPLAY)
+        );
+    }
+
+    /// The lane's "what to refuse", and the two halves of getting it right:
+    /// an ambiguous resume bci refuses the ENTRY, and copies that agree do not.
+    ///
+    /// > An OSR exit whose resume bci has more than one possible native image,
+    /// > or none.
+    ///
+    /// The refusal is at ADMISSION on purpose. Refusing at exit is not the
+    /// mirror image: by then the body has committed iterations and the caller's
+    /// only remaining move is the safe reject, which re-runs all of them — the
+    /// exact defect this lane exists for. So the test asserts the refusal
+    /// happens where nothing has run, and that it is memoable.
+    ///
+    /// The two NON-refusing cases carry as much weight as the refusing one, and
+    /// one of them is here because a measurement put it here: refusing a
+    /// `reason`-only disagreement took 10 of CratonBench's 11 OSR refusals and
+    /// cost `matrixKernel(I)I` its OSR permanently.
+    #[test]
+    fn an_ambiguous_resume_bci_refuses_the_entry_and_a_copy_does_not() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // Two images of the loop header that disagree on the SEMANTICS.
+        //
+        // `RETHROW`, not `RESUME`, and the choice is the whole point: a
+        // `RESUME` point anywhere in an artifact is already refused by the
+        // per-point rule above (`osr-entry-unresumable-exit`), so it could
+        // never reach this check. A `RETHROW` point is explicitly ALLOWED to
+        // exist — such points are stashed separately and never routed to a
+        // resume — which is exactly what makes it the reachable disagreement:
+        // `for_reason` answers `RETHROW` for `PendingException` and `REEXECUTE`
+        // for everything else.
+        let mut cm = osr_t_artifact(3);
+        let mut other = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        other.native_offset = 0x90;
+        other.reason = deopt::DeoptReason::PendingException;
+        other.semantics = deopt::ResumeSemantics::for_reason(deopt::DeoptReason::PendingException);
+        assert_eq!(other.semantics, deopt::ResumeSemantics::RETHROW);
+        cm.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            other,
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE));
+        assert!(
+            osr_refusal_is_permanent(&err),
+            "the point list is a pure function of the artifact, so the refusal is memoable"
+        );
+
+        // Over-refusal guard 1: several native images of ONE bytecode is
+        // exactly what a loop transform produces, and they agree on everything
+        // a by-bci lookup reads, so the pick cannot be wrong.
+        let mut copies = osr_t_artifact(3);
+        let mut second = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        second.native_offset = 0x90;
+        let mut third = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        third.native_offset = 0xE0;
+        copies.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            second,
+            third,
+        ];
+        let plan = copies
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("agreeing copies must still admit the entry");
+        assert_eq!(plan.exit_policy, OsrExitPolicy::ExactTransfer);
+
+        // Over-refusal guard 2, the measured one: the loop-boundary exit map
+        // and the speculative-BCE range guard on the same header bci. Different
+        // reasons, same `REEXECUTE` semantics — the ordinary shape of a
+        // compiled counted loop, and the resume bci is not in doubt.
+        let mut counted = osr_t_artifact(3);
+        let mut guard = osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new());
+        guard.native_offset = 0x3c1;
+        guard.reason = deopt::DeoptReason::BoundsCheck;
+        assert_eq!(
+            guard.semantics,
+            deopt::ResumeSemantics::REEXECUTE,
+            "a reason disagreement never implies a semantics one"
+        );
+        counted.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            guard,
+        ];
+        assert!(
+            counted
+                .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                .is_ok(),
+            "refusing this cost CratonBench.matrixKernel its OSR, permanently"
+        );
+    }
+
+    /// `osr_exit_points` is cross-checked against where exits are actually
+    /// taken — the lane's step 4, which had no consumer at all before.
+    ///
+    /// The first two are both legitimate; the last two are disagreements and
+    /// must read zero. The `invokedynamic` trap is the case that makes set
+    /// membership alone insufficient: it shares the exit-map machinery, so it
+    /// lands in `osr_exit_points` exactly like a loop boundary and is told
+    /// apart only by its recorded reason.
+    #[test]
+    fn the_exit_site_classification_names_every_outcome() {
+        use osr_exit::OsrExitSite;
+
+        let mut cm = osr_t_artifact(3);
+        let mut trap = osr_t_exit_point(30, osr_t_contract_locals(), Vec::new());
+        trap.native_offset = 0x90;
+        trap.reason = deopt::DeoptReason::UnreachedCode;
+        cm.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            trap,
+        ];
+        // Both bcis are in the set — that is what the shared emitter does.
+        cm.osr_exit_points = vec![OSR_T_HEADER, 30];
+
+        assert_eq!(
+            cm.classify_osr_exit_site(OSR_T_HEADER as u32),
+            OsrExitSite::LoopBoundary
+        );
+        assert_eq!(
+            cm.classify_osr_exit_site(30),
+            OsrExitSite::OffLoopBoundary(deopt::DeoptReason::UnreachedCode),
+            "membership alone would have called the indy trap a loop boundary"
+        );
+        assert_eq!(cm.classify_osr_exit_site(99), OsrExitSite::Unrecorded);
+
+        // The cross-check: drop the header from the set while its `OsrExit`
+        // point stays. One function writes both, so this cannot happen — and
+        // nothing could have said so before.
+        cm.osr_exit_points = vec![30];
+        assert_eq!(
+            cm.classify_osr_exit_site(OSR_T_HEADER as u32),
+            OsrExitSite::ExitMapMissing
         );
     }
 

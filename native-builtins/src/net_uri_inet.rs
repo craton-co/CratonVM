@@ -469,6 +469,32 @@ fn native_uri_get_scheme_specific_part(
     Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
 }
 
+/// JDK-ONLY-LAYOUT: does `this` have the synthetic six-slot **URL** layout that
+/// [`url_parse`]'s raw `URL_FIELD_*` writes assume?
+///
+/// A real `java.net.URI` does not, and `native_uri_init` calls `url_parse` with
+/// exactly that receiver. Measured 2026-08-04 with
+/// `CRATONVM_DBG=overlay,overlay-all` from `SocksSocketImpl.connect`:
+/// `URL_FIELD_PORT` (slot 2) put an `Int` port on the real `URI.authority`, a
+/// reference, and `URL_FIELD_FULL` (slot 5) put a `String` on the real
+/// `URI.port`, an `int`. Both writes are also pointless there — `native_uri_init`
+/// calls [`uri_store_named`] straight afterwards, which stores the same
+/// information under the names a real `URI` actually declares.
+///
+/// Detected by asking for a field name only the real classes declare:
+/// `java.net.URI` declares `scheme`, `java.net.URL` declares `protocol`, and a
+/// VM-fabricated stub has generated placeholders and declares neither. Asking by
+/// *name* rather than by field count is deliberate — a count test cannot
+/// separate these layouts, which is how an earlier version of a sibling guard in
+/// `lang_invoke.rs` shipped completely inert.
+fn has_synthetic_url_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(this);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && (f.name == "scheme" || f.name == "protocol"))
+}
+
 pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) {
     // Fast path: opaque/hierarchical `file:` URIs used by `Class.getProtectionDomain`
     // (`file:/C:/foo.jar` on Windows — note **no** `file://`). The generic
@@ -616,12 +642,27 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         .filter(|fragment| !fragment.is_empty())
         .map(|fragment| ctx.create_string(fragment));
 
-    ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
-    ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_obj)));
-    ctx.set_field(this, URL_FIELD_PORT, Value::Int(port));
-    ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-    ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
-    ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+    // Raw slots only on OUR layout — see `has_synthetic_url_layout`. On a real
+    // `java.net.URI` these six put a port on `authority` and a `String` on
+    // `port`. The by-name writes below, and `uri_store_named` in the URI
+    // callers, carry the same information to fields that exist.
+    if has_synthetic_url_layout(ctx, this) {
+        ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
+        ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_obj)));
+        ctx.set_field(this, URL_FIELD_PORT, Value::Int(port));
+        ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
+        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
+        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+    } else {
+        // Real layout: the same six values, under the names the real class
+        // declares. `java.net.URL` names them protocol/host/port; `java.net.URI`
+        // names the first `scheme`. `set_field_by_name` is a no-op for a name
+        // the class does not declare, so one list serves both.
+        ctx.set_field_by_name(this, "protocol", Value::Object(Some(proto_obj)));
+        ctx.set_field_by_name(this, "scheme", Value::Object(Some(proto_obj)));
+        ctx.set_field_by_name(this, "host", Value::Object(Some(host_obj)));
+        ctx.set_field_by_name(this, "port", Value::Int(port));
+    }
     ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
     ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
     ctx.set_field_by_name(this, "query", Value::Object(query_obj));

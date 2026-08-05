@@ -275,8 +275,14 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // ForkJoinTask.exec() returns Z; ignore the result.
-            let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+            // Complete the task in the shared side table rather than running
+            // a bare `exec()`. An unrecorded task is `done == false`, so the
+            // matching `join()` runs the body a SECOND time. This duplicates
+            // the registration in `lib.rs` (a `--dump-native-registry` census
+            // shows lib.rs currently winning the overwrite); the two are kept
+            // identical so registration order cannot silently decide whether
+            // tasks run once or twice.
+            let _ = crate::phases_early::fjp_compute_for_submit(ctx, task)?;
             Ok(None)
         },
     );
@@ -294,7 +300,9 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(args.get(1).copied()),
             };
-            let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+            // Same side-table completion as `execute` above — a bare `exec()`
+            // leaves the task un-recorded and the later `join()` re-runs it.
+            let task = crate::phases_early::fjp_compute_for_submit(ctx, task)?;
             Ok(Some(Value::Object(Some(task))))
         },
     );

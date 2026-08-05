@@ -114,22 +114,27 @@ pub(super) fn compile_osr_artifact(
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
-    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
-    // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
-    // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
-    // CRATONVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
-    if crate::runtime::env_cache::disable_jit() {
-        return None;
-    }
-    // Same reasoning one gate down, for the BISECT levers.
-    // `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` were applied only inside
-    // `cratonvm_jit::try_compile`, and this function reaches
-    // `x64::compile_with_param_slots` directly (see the "calls the backend
-    // directly instead of going through `try_compile`" note further down), so
-    // an OSR body could be force-interpreted by neither lever. A bisect step
-    // that cannot actually stop the compile reads as an exoneration — see
-    // `cratonvm_jit::jit_force_interpret`.
-    if cratonvm_jit::jit_force_interpret(&class_name, &method_name) {
+    // The two whole-method vetoes that must also stop a CACHED artifact from
+    // being reused, not merely stop a new compile:
+    //
+    //   * `CRATONVM_DISABLE_JIT=1` forces interpreter-only execution. OSR is a
+    //     JIT entry point distinct from `try_jit_compile_callee` /
+    //     `try_jit_upgrade_with_gate`, so the user-facing flag has to be asked
+    //     here for it to disable all three.
+    //   * the BISECT levers. `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY`
+    //     were applied only inside `cratonvm_jit::try_compile`, and this
+    //     function reaches `x64::compile_with_param_slots` directly, so an OSR
+    //     body could be force-interpreted by neither. A bisect step that cannot
+    //     actually stop the compile reads as an exoneration — see
+    //     `cratonvm_jit::jit_force_interpret`.
+    //
+    // Both now come from `compile_gate`, so this door and `try_compile` cannot
+    // disagree about them. The rest of the admission chain (the permanent
+    // bail-list, the code-cache cap, the compile-epoch witness) is asked at the
+    // compile itself, further down — refusing to *reuse* a body that is already
+    // committed on either of those grounds would cost throughput and buy
+    // nothing.
+    if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -237,15 +242,37 @@ pub(super) fn compile_osr_artifact(
         cached_osr
     } else {
         (|| -> Option<_> {
-            // RBC.2 — honor the permanent bail-list here too. This OSR path
-            // calls `x64::compile` directly (not `jit::try_compile`), so it
-            // used to bypass the bail-list short-circuit and re-ran the FULL
-            // compile pipeline on every OSR trigger of a permanently
-            // uncompilable hot method (observed: 35,923 wasted pipelines on
-            // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
-            if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
-                return None;
-            }
+            // ── The admission gate ────────────────────────────────────────
+            //
+            // The ONE door. This path reaches `x64::compile_with_param_slots`
+            // directly rather than through `jit::try_compile`, and for a long
+            // time that meant it applied whatever subset of `try_compile`'s
+            // admission chain someone had noticed was missing:
+            //
+            //   * RBC.2 — the permanent bail-list, hand-copied here after the
+            //     full compile pipeline re-ran on every OSR trigger of a
+            //     permanently uncompilable hot method (35,923 wasted pipelines
+            //     on `Nat.inc`'s dup_x2 bail in one crypto-prng suite run);
+            //   * the bisect levers, hand-copied after every bisect step on the
+            //     annotation-scan SIGSEGV read "no effect" while 11 methods
+            //     kept compiling;
+            //   * the code-cache cap, never copied at all — an OSR compile
+            //     could commit code past a cap the ordinary door respected.
+            //
+            // `compile_gate::admit` asks all of them, in one place, for all
+            // three doors, and the token it returns owns the compile-epoch
+            // witness. That witness used to be opened ~1,000 lines below, after
+            // every class load and constant-pool read this function performs:
+            // a redefinition landing in that window produced a body stamped
+            // with the CURRENT epoch, which the install barrier then accepted.
+            // Holding the token from here is what closes it.
+            let admission = cratonvm_jit::compile_gate::admit(
+                &class_name,
+                &method_name,
+                &method_descriptor,
+                cratonvm_jit::compile_gate::CompileDoor::Osr,
+            )
+            .ok()?;
             // A previous compile for exactly this back-edge produced a body
             // whose `osr_dead_mask` refuses entry there. That verdict is a pure
             // function of a deterministic compile, so re-running the pipeline
@@ -1193,13 +1220,14 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
-            // Stamp this artifact's install epoch from HERE, not from the
-            // `put_osr` below. This path calls the backend directly instead of
-            // going through `try_compile`, so without the witness it is stamped
-            // at finalize and a redefine that lands mid-compile would not be
-            // caught by the install barrier.
-            let _compile_epoch = cratonvm_jit::open_compile_epoch_witness();
+            // This artifact's install epoch was stamped by the `compile_gate`
+            // admission at the top of this closure — before the class loading
+            // and constant-pool resolution above, not here. A witness opened at
+            // this line covered only the backend call, so a redefinition that
+            // landed while the resolvers ran produced a body the install
+            // barrier could not tell from a current one.
             let mut cm = crate::jit::x64::compile_with_param_slots(
+                &admission,
                 &code,
                 code_len,
                 param_slots,
@@ -1513,6 +1541,22 @@ pub(super) fn try_osr(
         }
     };
 
+    // osr-02 frame comparator: record the ENTRY frame — the state compiled code
+    // is about to start from. Here, because the entry has validated and nothing
+    // has run yet.
+    //
+    // Without this record the comparator cannot see a replay at all: compiled
+    // iterations produce no back-edge arrivals, so "entered at frame 5, ran to
+    // 12, resumed at 5" and "entered at 5 and advanced nothing" are the same
+    // sequence of arrival indices, both strictly increasing. A hand-written
+    // fixture modelling the historical defect passed without it. Paired with
+    // the next exit record this makes the advance a MEASURED quantity —
+    // `index(X) - index(E)` over the un-compiled run's own trajectory, not
+    // anything the JIT claims.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_entry(&thread.frames[frame_idx], entry_pc);
+    }
+
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
     // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the
@@ -1823,6 +1867,33 @@ pub(super) fn try_osr(
         cratonvm_jit::metrics::record_osr_event("osr_exited");
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             dbg_deopt_sink("osr-exit", &rframe, "");
+            // The lane's step 4, and the only place it can be answered: the
+            // artifact records a set of loop-boundary exit-map bcis
+            // (`osr_exit_points`) and until now nothing compared it with where
+            // exits are actually taken. Counted before the identity gate,
+            // because the classification is about THIS artifact's own view of
+            // the bci the frame names; whether the frame is ours to transfer is
+            // the separate question the gate below answers.
+            //
+            // Ungated, for the same reason `osr_entered` / `osr_exited` are: an
+            // exit at a bci this artifact records nothing for otherwise leaves
+            // no trace at all.
+            let exit_site = compiled.classify_osr_exit_site(rframe.bci);
+            cratonvm_jit::metrics::record_osr_event(exit_site.metric());
+            if matches!(exit_site, cratonvm_jit::osr_exit::OsrExitSite::Unrecorded)
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit at bci={} which {}.{}{} records neither an \
+                     exit map nor a deopt point for ({} exit points, {} deopt points)",
+                    rframe.bci,
+                    &*class_name_arc,
+                    &*method_name_arc,
+                    &*descriptor_arc,
+                    compiled.osr_exit_points.len(),
+                    compiled.deopt_points.len(),
+                );
+            }
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
             // could belong to a NESTED compiled callee of the OSR'd code whose
             // sentinel bubbled up here; transferring THAT frame into this live
@@ -2455,6 +2526,17 @@ pub(super) fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: C
     elidable
 }
 
+/// `CRATONVM_JIT=sync-methods` — admit `ACC_SYNCHRONIZED` methods to the
+/// invocation-counter compile path, where the interpreter's call wrapper owns
+/// the implicit monitor. Read once and cached; this sits on the hot
+/// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
+fn jit_sync_methods_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
+    })
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -2502,10 +2584,31 @@ pub(super) fn try_jit_upgrade_with_gate(
     if gate.generation > 0 {
         return None;
     }
-    // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
-    // Do not let a cached interpreter target become a compiled monitor-less
-    // body through the invocation-counter upgrade path.
-    if cached.is_synchronized {
+    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
+    // the *caller* supplies it. Both interpreter entry points into compiled code
+    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
+    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
+    // class mirror's) monitor for the whole native activation and releases it on
+    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
+    // through those two, so admitting a synchronized method here is contained.
+    //
+    // The three entries that would NOT be wrapped each refuse a synchronized
+    // callee independently, and must keep doing so:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
+    //     `named_method_is_synchronized` gate;
+    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
+    //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
+    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
+    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
+    // deploy interpreted — the method was rejected here *before* it was ever
+    // counted, which is why `jit-method-stats` reported it neither compiled nor
+    // `hot_but_stuck_in_interpreter`. See
+    // docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
+    if cached.is_synchronized && !jit_sync_methods_enabled() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the

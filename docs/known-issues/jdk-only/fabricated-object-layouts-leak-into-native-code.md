@@ -73,8 +73,8 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
   | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
-  | `java/util/Properties` | 7 | `Float` | `L` | 6 |
-  | `java/util/Properties` | 6, 5 | `Int` | `L` | 6 each |
+  | ~~`java/util/Properties`~~ | ~~7~~ | ~~`Float`~~ | ~~`L`~~ | **FIXED** |
+  | ~~`java/util/Properties`~~ | ~~6, 5~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | `java/util/Properties` | 2 | `Object` | `I` | 6 |
   | `ClassLoaders$PlatformClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
   | `ClassLoaders$AppClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
@@ -139,16 +139,70 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `loadFactor`; and `try_set_jdk_map_field(ctx, this, "loadFactor", …)` is the
     by-name setter. `native_map_init` is the one still writing raw indices.
 
-    Not attempted here because `native_map_init` is shared by every map type
-    and is hot, so converting it is its own change with its own A/B — not
-    something to bolt onto a `VarHandle` fix. Note also that
-    `native_props_init` writes `Value::Object(None)` to `PROPS_FIELD_DEFAULTS`
-    (slot 3 = `loadFactor` on the real layout) and **the hunter does not report
-    it**: `overlay_write_is_destructive` only flags `Object(Some(_))` over a
-    primitive, so a null write is invisible. The census is a floor for that
-    reason too.
-  * **Both built-in class loaders take `Int` writes over four reference slots
-    each.** Whatever those slots hold on the real classes, they are not integers.
+    **Three of the four rows FIXED 2026-08-04, and the root cause was one
+    line.** `try_set_jdk_map_field` resolved every field name against a
+    hard-coded `"java/util/HashMap"` and then wrote that index into `this`,
+    whatever class `this` actually was. For a non-`HashMap` receiver the index
+    names a *different field*. Its `slot < object_num_fields(this)` bound does
+    not help: it stops an out-of-range write, not a wrong-field one — **the
+    third guard in this file's story that looks protective and is not**, after
+    the frozen divergence test and the field-count `VarHandle` predicate.
+
+    Fixed with `resolve_field_index_by_class_id`, which walks the receiver's
+    own hierarchy, so `loadFactor` on a `Properties` resolves through
+    `Hashtable` to its true slot; the API's own doc comment already recommended
+    it over the name-based form when the caller holds the object. Where the
+    receiver's class does not declare the field, nothing is written.
+
+    A/B on the same probe against the pre-fix binary: slots 5, 6 and 7 go 3 → 0
+    each, every other row byte-identical, both probes still identical to
+    HotSpot 25 in both modes, and 94 `native-collections` unit tests plus the
+    four ratchets green. This changes `Compatible` mode too — from *writes the
+    wrong field* to *writes the right field or none* — which is why it was
+    A/B'd separately rather than riding on the `VarHandle` verification.
+
+    **Slot 2 survives** (`Object` over an `int`, 3 hits): it comes from the raw
+    `MAP_FIELD_*` writes in `native_map_init`'s legacy branch, not from
+    `try_set_jdk_map_field`. Converting those is the next step and is a larger
+    change — they are the layout every other native map operation reads.
+
+    Note also that `native_props_init` writes `Value::Object(None)` to
+    `PROPS_FIELD_DEFAULTS` (slot 3 = `loadFactor` on the real layout) and **the
+    hunter does not report it**: `overlay_write_is_destructive` only flags
+    `Object(Some(_))` over a primitive, so a null write is invisible. The
+    census is a floor for that reason too.
+  * **Both built-in class loaders — root cause found 2026-08-04, and it is a
+    different KIND of defect from the two fixed above.** `alloc_classloader`
+    writes CratonVM's seven-slot loader model onto the object, and four of those
+    slots are `Int`:
+
+    | slot | synthetic meaning | real `ClassLoaders$AppClassLoader` |
+    |---:|---|---|
+    | 0 | `CL_LOADER_TYPE` | a reference |
+    | 3 | `CL_CLASSES_LOADED` | a reference |
+    | 4 | `CL_IS_PARALLEL_CAPABLE` | a reference |
+    | 6 | `CL_LOADER_ID` | a reference |
+
+    Reached from `Thread.currentThread()` → `current_thread_object` →
+    `get_or_create_system_cl` while initialising `contextClassLoader`, which is
+    why the Java stack said `BufferedWriter.initialBufferSize()` and why
+    grepping found nothing. Named by `CRATONVM_DBG=overlay-bt`, which exists
+    because of this site.
+
+    **`resolve_field_index_by_class_id` cannot fix these.** `loadFactor` on a
+    `Properties` has a real counterpart to resolve to; `CL_LOADER_TYPE` and
+    `CL_LOADER_ID` are VM-internal bookkeeping with **no real JDK field at
+    all**. There is nowhere correct to put them in a real loader's layout, so
+    on a real image they must not be in the object: they belong in a side table
+    keyed by the loader, exactly as `vh_meta_put` does for `VarHandle`. Note the
+    same function already writes `name`/`parent` twice — once by index, once by
+    name — with a comment explaining that the real natives read the real slots,
+    so the by-name half of this lesson was already learned here and the
+    VM-internal half was not.
+
+    Size: 9 / 6 / 10 / 16 read-and-write sites for the four constants. Not a
+    one-line change, and it is the reason this row is diagnosed rather than
+    fixed.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
     single off-by-one against one layout.
 
@@ -159,7 +213,34 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   probes is not Spring Boot. Treat the table as a floor and re-run under H2 or
   Spring Boot before calling the sweep done.
 
-  Adjudicating and fixing the 24 sites is untouched.
+  ### The 19 open slots are FOUR defects, not nineteen
+
+  Classified 2026-08-04 by tracing each writer (`CRATONVM_DBG=overlay-bt` names
+  the Rust frame; the Java frames mislead). Each kind has a different fix, and
+  applying the wrong one is silent:
+
+  | # | kind | tell | fix | status |
+  |---|---|---|---|---|
+  | 1 | synthetic slots written onto a real layout | the real class declares a field our model does not have | write the slots only when the layout is ours, keyed on a field name the real class declares | **`VarHandle` fixed** |
+  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7 fixed**; `URI`, `Properties` 2 open |
+  | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does | `ClassLoaders` ×2 open |
+  | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | `Proxy` open |
+
+  Kind 3 is the one that cannot be fixed by resolving harder: there is nowhere
+  correct in a real layout to put a `CL_LOADER_ID`. Kind 4 likewise — resolving
+  `java.net.Proxy.type` by name finds a real field, and writing our `int` into
+  it is still wrong, because the real field holds a `Proxy$Type` **enum
+  reference**.
+
+  Two things found while classifying, both worth fixing alongside:
+
+  * **The synthetic `URI` model is duplicated**, with identical constants, in
+    `native-builtins/src/http2.rs` and `native-builtins/src/servlet.rs`. Two
+    copies of a layout is how the `real_protected_stub` allow-lists drifted.
+  * `native_map_init`'s legacy branch still writes raw `MAP_FIELD_*` indices,
+    which is the surviving `Properties` slot-2 row and the whole `HashMap`
+    family. It is kind 2, but converting it touches the layout every other
+    native map operation reads, so it wants its own change and its own A/B.
 * **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
   Note the `ValueLayout` one cannot be converted at all — the marker is explicit
   that there are no real fields to name, so it is a
