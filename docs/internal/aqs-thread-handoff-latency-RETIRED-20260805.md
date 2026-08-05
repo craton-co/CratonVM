@@ -6,7 +6,7 @@
 | **Opened** | 2026-08-03, root-causing `TestAsyncMessagesPerformance` SEQ2 |
 | **Closed by** | `perf/aqs-native-funnel-20260804` |
 | **Owned** | the residue of the retired `websocket-async-send-interframe-latency` doc |
-| **Residual, still OPEN** | [`uncontended-reentrantlock-pair-is-mostly-unattributed`](../known-issues/vm/uncontended-reentrantlock-pair-is-mostly-unattributed-20260805.md) |
+| **Residual, still OPEN** | [`uncontended-reentrantlock-pair-mostly-unattributed` — ATTRIBUTED and RETIRED 2026-08-05](uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md), residual now [`native-funnel-fixed-cost-is-the-remaining-wall`](../known-issues/vm/native-funnel-fixed-cost-is-the-remaining-wall-20260805.md) |
 
 This document was corrected twice while it was open, and it is worth saying
 plainly that **the second correction was also incomplete**. Revision 1 blamed
@@ -148,7 +148,7 @@ So the pair is still tens of microseconds against HotSpot's 14.8 ns, and the
 reason is **not** known. That is now its own document — with the arithmetic
 above as its starting point, and a warning not to repeat the mistake of
 attributing the total to the first expensive thing found on the path:
-[`uncontended-reentrantlock-pair-is-mostly-unattributed`](../known-issues/vm/uncontended-reentrantlock-pair-is-mostly-unattributed-20260805.md).
+[`uncontended-reentrantlock-pair-mostly-unattributed` — ATTRIBUTED and RETIRED 2026-08-05](uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md), residual now [`native-funnel-fixed-cost-is-the-remaining-wall`](../known-issues/vm/native-funnel-fixed-cost-is-the-remaining-wall-20260805.md).
 
 `TestAsyncMessagesPerformance.testAsyncTiming` is therefore **not** unblocked by
 this work, and neither is the `SmokeTests` concurrency ceiling. They move to the

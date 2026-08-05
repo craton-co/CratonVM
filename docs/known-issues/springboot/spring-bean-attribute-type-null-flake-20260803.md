@@ -1,8 +1,55 @@
 # Rare: `@Bean` attribute resolution fails because a primitive return type is unmappable
 
-**Status: FIXED 2026-08-03.** Retired from `docs/known-issues/`. Everything
-from "What happened" down is the original report, kept verbatim; the closure
-is immediately below.
+**Status: OPEN — REGRESSED 2026-08-05.**
+
+## Regression note (2026-08-05)
+
+Reproduced with the *identical* signature (`NullPointerException: Cannot
+invoke "java.lang.Class.isArray()" because "attributeType" is null`, at
+`TypeMappedAnnotation.adaptForAttribute`) in a completely different caller
+than the original report: `module/spring-boot-data-couchbase`'s
+`DataCouchbaseReactiveRepositoriesAutoConfigurationTests`, evaluating the
+`@ConditionalOnProperty`'s `matchIfMissing` attribute (also a primitive
+`boolean`) on `CouchbaseClientFactoryConfiguration` during condition
+processing — not the original report's `@Bean.autowireCandidate()` path.
+
+```
+11:52:09 [main] WARN AnnotationConfigApplicationContext -- Exception encountered during context initialization -
+  cancelling refresh attempt: org.springframework.beans.factory.BeanDefinitionStoreException: Failed to process
+  import candidates for configuration class [DataCouchbaseAutoConfiguration]: Error processing condition on
+  CouchbaseClientFactoryConfiguration
+Caused by: java.lang.IllegalStateException: Error processing condition on CouchbaseClientFactoryConfiguration
+Caused by: java.lang.IllegalArgumentException: Attribute 'matchIfMissing' for annotation
+  [org.springframework.boot.autoconfigure.condition.ConditionalOnProperty] was not resolvable due to exception
+  [java.lang.NullPointerException: Cannot invoke "java.lang.Class.isArray()" because "attributeType" is null]
+Caused by: java.lang.NullPointerException: Cannot invoke "java.lang.Class.isArray()" because "attributeType" is null
+```
+
+HotSpot passes this class cleanly (`hsfull-after-20260804-s3`,
+`tests=6 failed=0`), same fixture, so this is not a CRLF/classpath artifact.
+Full log:
+`apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-azure-20260805-s4/all-jit/logs/module_spring-boot-data-couchbase.org.springframework.boot.data.couchbase.autoconfigure.DataCouchbaseReact-da37a2c78c76.out.log`
+
+The 2026-08-03 closure was explicit that it had never caught the bug live —
+it closed on "two real defects found and fixed, both matching the report's
+own analysis, plus negative evidence" (0 reproductions in ~1030 hunt
+attempts), not on a confirmed kill. This 08-05 sighting is the first known
+live reproduction since that closure, on a *different* attribute
+(`matchIfMissing` vs `autowireCandidate`) and a *different* IdentityHashMap
+consumer (`ConditionalOnProperty` condition evaluation vs `@Bean` attribute
+merging) — same underlying `ClassUtils.resolvePrimitiveIfNecessary` /
+`primitiveTypeToWrapperMap` (`IdentityHashMap<Class<?>, Class<?>>`) miss for
+a primitive `Class` mirror, confirming this is a real, still-live gap and
+not something specific to the original caller. Re-open per the doc's own
+"re-open if it resurfaces" instruction.
+
+Also worth checking: `module/spring-boot-data-cassandra`'s
+`DataCassandraReactiveRepositoriesAutoConfigurationTests` failed the same day
+with a related-looking but not identical NPE — `MergedAnnotations.get(Class)`
+invoked on a null return from `MergedAnnotations.from(...)` — filed
+separately (not folded into this doc, since the exact null site differs and
+the chain doesn't obviously funnel through `resolvePrimitiveIfNecessary`).
+See `spring-boot-annotation-metadata-null-cluster-20260805.md`.
 
 ---
 
@@ -262,3 +309,7 @@ The remaining candidates, in the order they are worth testing:
 2. The miss audit firing — that separates a hash mismatch from a bucket
    mismatch outright.
 3. Only then, the lookup path itself.
+
+## Affected classes
+
+- `module/spring-boot-data-couchbase` — `org.springframework.boot.data.couchbase.autoconfigure.DataCouchbaseReactiveRepositoriesAutoConfigurationTests` (regression, 2026-08-05)
