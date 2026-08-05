@@ -211,3 +211,95 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
         );
     }
 }
+
+
+/// The EXACT set of `java/lang/String` registrations that survive into a
+/// real-JDK registry -- two-sided, so the set cannot drift in either direction
+/// without somebody adjudicating the change.
+///
+/// # Why a two-sided pin, and not the two one-sided ones above
+///
+/// The tests above check that a named list is absent and another named list is
+/// present. Both passed while the drop was silently deleting **four**
+/// registrations nobody had thought to name:
+///
+/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` -- the F4 workaround for a
+///   generic `Preconditions` override that throws the wrong exception class.
+///   Without them `"Hello, World".substring(-1)` raised
+///   `ArrayIndexOutOfBoundsException`, which `catch
+///   (StringIndexOutOfBoundsException)` does not catch;
+/// * `<init>(Ljava/lang/StringBuilder;)V` and its `AbstractStringBuilder`
+///   sibling -- DF05. Without them `new String(sb)`, for a builder holding
+///   seven characters, returned four: the real ctor's `Arrays.copyOfRange`
+///   reads this VM's `char[]`-backed builder one byte at a time. Silent
+///   content corruption, no exception anywhere.
+///
+/// Every one of those had a comment at its registration site saying exactly
+/// what breaks without it. A category-wide drop invalidates all such comments
+/// at once, and a test that only knows the names its author remembered cannot
+/// see that. This one fails on any triple entering or leaving the set, so
+/// "should this survive?" has to be answered rather than assumed.
+///
+/// Updating this list is expected when a `java/lang/String` native is added or
+/// retired. Updating it *without* deciding which side of contract 1.4 the
+/// triple falls on is the failure it exists to prevent.
+#[test]
+fn the_surviving_string_registration_set_is_exactly_this() {
+    let shared = shared();
+    let registry = &shared.natives.native_methods;
+    let mut actual: Vec<String> = registry
+        .dump_registrations()
+        .into_iter()
+        .filter(|(class, _, _, _)| *class == "java/lang/String")
+        .map(|(_, name, descriptor, kind)| format!("{kind:?} {name}{descriptor}"))
+        .collect();
+    actual.sort();
+    actual.dedup();
+    let rendered = actual.join("\n");
+
+    let expected = EXPECTED_SURVIVING_STRING_REGISTRATIONS.trim();
+    assert_eq!(
+        rendered.trim(),
+        expected,
+        "\nThe set of `java/lang/String` natives surviving into a real-JDK registry changed.\n\
+         \n\
+         A triple that DISAPPEARED is now handed to the real bytecode. Before accepting that, \
+         read the comment at its registration site: four of these exist because the \
+         bytecode's premise does not hold on this VM, and dropping them produced a wrong \
+         exception class and, in one case, silently corrupted string content.\n\
+         \n\
+         A triple that APPEARED is a native standing in front of real bytecode (contract \
+         1.4). It needs a review against `probes/StringPolicyMatrixProbe` and \
+         `register_with_kind(.., Intrinsic)` at its own site -- not an entry here.\n"
+    );
+}
+
+/// One line per surviving registration, `Kind name+descriptor`, sorted.
+const EXPECTED_SURVIVING_STRING_REGISTRATIONS: &str = "\
+Bridge intern()Ljava/lang/String;\n\
+Intrinsic <init>(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V\n\
+Intrinsic <init>(Ljava/lang/StringBuilder;)V\n\
+Intrinsic chars()Ljava/util/stream/IntStream;\n\
+Intrinsic checkBoundsBeginEnd(III)V\n\
+Intrinsic checkBoundsOffCount(III)I\n\
+Intrinsic codePointAt(I)I\n\
+Intrinsic codePointCount(II)I\n\
+Intrinsic codePoints()Ljava/util/stream/IntStream;\n\
+Intrinsic format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic format(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic formatted([Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic hashCode()I\n\
+Intrinsic indent(I)Ljava/lang/String;\n\
+Intrinsic isBlank()Z\n\
+Intrinsic lines()Ljava/util/stream/Stream;\n\
+Intrinsic matches(Ljava/lang/String;)Z\n\
+Intrinsic offsetByCodePoints(II)I\n\
+Intrinsic regionMatches(ILjava/lang/String;II)Z\n\
+Intrinsic regionMatches(ZILjava/lang/String;II)Z\n\
+Intrinsic repeat(I)Ljava/lang/String;\n\
+Intrinsic replace(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;\n\
+Intrinsic replaceAll(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\
+Intrinsic replaceFirst(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\
+Intrinsic transform(Ljava/util/function/Function;)Ljava/lang/Object;\n\
+Intrinsic valueOf(I)Ljava/lang/String;\n\
+Intrinsic valueOf(Ljava/lang/Object;)Ljava/lang/String;";
