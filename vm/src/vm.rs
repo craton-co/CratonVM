@@ -658,6 +658,60 @@ mod tests {
         ctx.alloc_object(cid, num_fields)
     }
 
+    /// `Integer.valueOf(v)` — what the interpreter has already done before any
+    /// `Map.put`, whose descriptor is `(Object,Object)Object`.
+    ///
+    /// A test that hands a raw `Value::Int` to a map native is exercising a
+    /// call no real caller can make. Since `7bf427af1` the map natives box it
+    /// themselves (`java/util/HashMap$Node.value` is `Ljava/lang/Object;` on
+    /// the real class the nodes now bind to, and the descriptor-aware write
+    /// path coerces a primitive there to **null** — which is what deleted
+    /// elements from `LinkedHashSet` while reporting `false`, and broke
+    /// Jersey). So the value that comes back out of a map is a box, and a test
+    /// asserting `Value::Int` against it is asserting the old, impossible
+    /// calling convention.
+    ///
+    /// Box on the way in and unbox on the way out, exactly as bytecode would.
+    fn box_int(shared: &Arc<SharedVm>, thread: &mut JvmThread, v: i32) -> Value {
+        match call_native(
+            shared,
+            thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(v)],
+        ) {
+            Ok(Some(boxed @ Value::Object(Some(_)))) => boxed,
+            other => panic!("Integer.valueOf({v}) did not box: {other:?}"),
+        }
+    }
+
+    /// The inverse of [`box_int`]: `((Integer) v).intValue()`.
+    ///
+    /// Takes the `Option<Value>` a native returns so the assertions read the
+    /// same way they did before boxing, i.e. against a plain `Value::Int`.
+    fn unbox_int(
+        shared: &Arc<SharedVm>,
+        thread: &mut JvmThread,
+        v: Option<Value>,
+    ) -> Option<Value> {
+        match v {
+            Some(Value::Object(Some(obj))) => call_native(
+                shared,
+                thread,
+                "java/lang/Integer",
+                "intValue",
+                "()I",
+                &[Value::Object(Some(obj))],
+            )
+            .unwrap_or_else(|e| panic!("Integer.intValue() failed: {e:?}")),
+            // Not a box: hand it back unchanged so the assertion reports the
+            // real value (a null, or a stray primitive) rather than a panic
+            // that hides it.
+            other => other,
+        }
+    }
+
     /// Helper to call a native method by (class, name, descriptor).
     fn call_native(
         shared: &Arc<SharedVm>,
@@ -17359,17 +17413,14 @@ mod tests {
             };
             ctx.create_string("key")
         };
+        let boxed_42 = box_int(&shared, &mut thread, 42);
         call_native(
             &shared,
             &mut thread,
             "java/util/LinkedHashMap",
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[
-                Value::Object(Some(lhm)),
-                Value::Object(Some(k)),
-                Value::Int(42),
-            ],
+            &[Value::Object(Some(lhm)), Value::Object(Some(k)), boxed_42],
         )
         .unwrap();
 
@@ -17388,9 +17439,8 @@ mod tests {
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(lhm)), Value::Object(Some(k2))],
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(v, Value::Int(42));
+        assert_eq!(unbox_int(&shared, &mut thread, v), Some(Value::Int(42)));
     }
 
     #[test]
@@ -17497,6 +17547,7 @@ mod tests {
         };
 
         // putIfAbsent on new key: should insert
+        let boxed_10 = box_int(&shared, &mut thread, 10);
         call_native(
             &shared,
             &mut thread,
@@ -17506,7 +17557,7 @@ mod tests {
             &[
                 Value::Object(Some(lhm)),
                 Value::Object(Some(k)),
-                Value::Int(10),
+                boxed_10,
             ],
         )
         .unwrap();
@@ -17519,6 +17570,7 @@ mod tests {
             };
             ctx.create_string("x")
         };
+        let boxed_99 = box_int(&shared, &mut thread, 99);
         let existing = call_native(
             &shared,
             &mut thread,
@@ -17528,12 +17580,14 @@ mod tests {
             &[
                 Value::Object(Some(lhm)),
                 Value::Object(Some(k2)),
-                Value::Int(99),
+                boxed_99,
             ],
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(existing, Value::Int(10));
+        assert_eq!(
+            unbox_int(&shared, &mut thread, existing),
+            Some(Value::Int(10))
+        );
     }
 
     #[test]
@@ -38250,7 +38304,30 @@ mod tests {
                 shared: &shared,
                 thread: &mut thread,
             };
-            assert_eq!(ctx.read_string(s).unwrap(), "localhost:8080");
+            let rendered = ctx.read_string(s).unwrap();
+            // This asserted `"localhost:8080"` until 2026-08-05, and that was
+            // never what a JVM prints. `InetSocketAddress.toString()` on a
+            // RESOLVED address is `holder.addr.toString() + ":" + port`, and
+            // `InetAddress.toString()` is `hostName + "/" + literal`. Verified
+            // against HotSpot 25.0.3 on the build host:
+            //
+            //     resolved.toString   = localhost/127.0.0.1:8080
+            //     unresolved.toString = localhost/<unresolved>:8080
+            //
+            // The old expectation was frozen from the VM's own pre-`e092b0f3b`
+            // output, so it locked in the divergence instead of catching it —
+            // and it started failing the moment that commit fixed the
+            // hostName model.
+            //
+            // Asserted as prefix + suffix rather than the exact literal: the
+            // middle is whatever `localhost` resolves to, which is 127.0.0.1
+            // here but is an IPv6 loopback on some hosts. The "/" is the part
+            // that matters — its absence is exactly the old bug.
+            assert!(
+                rendered.starts_with("localhost/") && rendered.ends_with(":8080"),
+                "InetSocketAddress.toString() rendered {rendered:?}; HotSpot 25 \
+                 gives `localhost/<literal>:8080` for a resolved address"
+            );
         } else {
             panic!("expected string");
         }
@@ -55527,6 +55604,7 @@ mod tests {
         // Insert "a"->1, "b"->2, "c"->3
         for (k, v) in [("alpha", 1), ("beta", 2), ("gamma", 3)] {
             let key = create_java_string(&shared, k);
+            let boxed_v = box_int(&shared, &mut thread, v);
             call_native(
                 &shared,
                 &mut thread,
@@ -55536,7 +55614,7 @@ mod tests {
                 &[
                     Value::Object(Some(lhm)),
                     Value::Object(Some(key)),
-                    Value::Int(v),
+                    boxed_v,
                 ],
             )
             .unwrap();
@@ -55565,7 +55643,7 @@ mod tests {
             &[Value::Object(Some(entry))],
         )
         .unwrap();
-        assert_eq!(val, Some(Value::Int(1)));
+        assert_eq!(unbox_int(&shared, &mut thread, val), Some(Value::Int(1)));
 
         // lastEntry
         let le = call_native(
@@ -55590,7 +55668,7 @@ mod tests {
             &[Value::Object(Some(entry2))],
         )
         .unwrap();
-        assert_eq!(val2, Some(Value::Int(3)));
+        assert_eq!(unbox_int(&shared, &mut thread, val2), Some(Value::Int(3)));
     }
 
     #[test]
@@ -61852,12 +61930,33 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
-        let input = create_java_string(&shared, "line1\nline2\nline3");
-        shared.mem.heap.set_field(sc, 0, Value::Object(Some(input)));
-        shared.mem.heap.set_field(sc, 1, Value::Int(0));
-        let delim = create_java_string(&shared, "\\s+");
-        shared.mem.heap.set_field(sc, 2, Value::Object(Some(delim)));
+        // Built through the fixture API, not by writing heap slots. Until
+        // 2026-08-05 this hand-rolled `alloc_object(ClassId::new(0), 3)` and
+        // wrote the input String to slot 0, the position to slot 1 and the
+        // delimiter to slot 2. Two things changed under it (`5521d2469`):
+        //
+        //  * the input text has NO field to live in. Real `java.util.Scanner`
+        //    holds its input in `buf`, a `java.nio.CharBuffer`; a `String`
+        //    written there is a wrong-type reference. So `native-io` moved it
+        //    to a side table keyed by object identity, and slot 0 is simply not
+        //    read any more — `nextLine()` answered `NoSuchElementException: no
+        //    more elements` against a scanner whose text was sitting in a slot
+        //    nobody consults.
+        //  * `position` is resolved BY NAME on the receiver, and a
+        //    `ClassId::new(0)` receiver declares no names at all.
+        //
+        // `scanner_set_source` is the entry point `native-io` documents for
+        // "the constructors here and out-of-crate test fixtures"; it installs
+        // the text and resets position/delimiter/radix/closed, which is why the
+        // three slot writes are gone rather than translated.
+        let sc = alloc_receiver(&shared, &mut thread, "java/util/Scanner", 5);
+        {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            cratonvm_native_io::scanner_set_source(&mut ctx, sc, "line1\nline2\nline3");
+        }
 
         let line1 = call_native(
             &shared,
