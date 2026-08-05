@@ -288,7 +288,20 @@ Filed rather than fixed:
   through to real bytecode that cannot work against our state. Its natives are
   rewired onto the shared accessors rather than left reading `buf` and
   `position` raw, but nothing runs them. A registration gap, not a layout one.
-* **`useDelimiter(String)` fabricates an uncompiled `java.util.regex.Pattern`**
-  — two fields poked directly, no `compile()`. Correct for our readers, which
-  only want field 0, and wrong for any real JDK code handed that object. The
-  same shape as the rows this record is about, one class over.
+(A fourth, filed and then fixed once measured: **`useDelimiter(String)` and
+`delimiter()` fabricated an uncompiled `java.util.regex.Pattern`** — two field
+pokes, no `compile()`. The two slots they wrote are the real class's first two,
+`pattern:String` and `flags:int`, so no census ever objected and our own
+readers, which want the source string, were satisfied. It was still not a
+usable `Pattern`: real `Pattern.matcher()` compiles lazily, gets as far as
+running, and then throws, because everything a real `compile()` fills in was
+left zeroed. Measured — `sc.useDelimiter(","); sc.delimiter().matcher("x,y")
+.find()` answers `true` on HotSpot 25 and threw
+`ArrayIndexOutOfBoundsException` inside `Matcher.search` here. Both sites now
+ask the JDK for the object, keeping the fabricated one only as the fallback
+for a runtime that cannot invoke `Pattern.compile`. `L3ScannerLayoutProbe`
+covers it, and still matches HotSpot line for line in both modes. Filing it and
+then measuring it is the order this record recommends: the first draft of the
+note called it "correct for our readers and wrong for real JDK code", which was
+a guess that happened to be right — the reproduction is what made it a
+finding.)

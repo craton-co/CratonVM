@@ -27,6 +27,7 @@ public final class L3ScannerLayoutProbe {
     public static void main(String[] args) {
         radix();
         delimiter();
+        delimiterIsUsable();
         position();
         closed();
         System.out.println("L3ScannerLayoutProbe done");
@@ -56,6 +57,27 @@ public final class L3ScannerLayoutProbe {
             sb.append(sc.next()).append('|');
         }
         System.out.println("delim.tokens=" + sb);
+        sc.close();
+    }
+
+    /**
+     * The `Pattern` `delimiter()` returns has to be a real one. Both delimiter
+     * sites used to fabricate it — two field pokes, no `compile()` — which
+     * satisfies our own readers (they want the source string) and no census
+     * (the two slots it writes are the real class's first two). It is still
+     * unusable: `matcher(...).find()` threw `ArrayIndexOutOfBoundsException`
+     * inside `Matcher.search`, because everything a real `compile()` fills in
+     * was left zeroed.
+     */
+    static void delimiterIsUsable() {
+        Scanner sc = new Scanner("a,b,c");
+        sc.useDelimiter(",");
+        java.util.regex.Pattern p = sc.delimiter();
+        System.out.println("usable.find=" + p.matcher("x,y").find());
+        System.out.println("usable.split=" + String.join("|", p.split("1,2,3")));
+        System.out.println("usable.matches=" + p.matcher(",").matches());
+        System.out.println("usable.default-compiles="
+                + new Scanner("q").delimiter().matcher(" ").matches());
         sc.close();
     }
 
