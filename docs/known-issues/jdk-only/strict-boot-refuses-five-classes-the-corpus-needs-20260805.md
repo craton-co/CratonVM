@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — a live regression on `dev`, found the same day it landed |
+| **Status** | OPEN, NARROWED 2026-08-05 — three of the five classes are fixed and the gate is down from 9 failed sections to 6. Two families remain, both named below |
 | **Severity** | high — the first genuine **strict-only** regression this corpus has produced, and it is nine probe sections wide |
 | **Modes** | `--jdk-only` ONLY. `--real-jdk` is byte-identical to HotSpot 25 on both probes |
 | **Found** | 2026-08-05 by `scripts/jdk-only-strict-probes.sh`, on its first run against a merged `dev` |
@@ -74,6 +74,70 @@ The other four names were not in that note, and `java/util/HashMap$KeyItr` is
 not a `cratonvm/internal/*` name at all — it is a real JDK nested class, so
 "stop fabricating compatibility classes" should not be refusing it. That one
 may be a different defect wearing the same symptom.
+
+## What was fixed, 2026-08-05 — three of the five, and the cause was duplicate registrations
+
+L7 R1 retagged four registrars `SyntheticStub` so `--jdk-only` drops them and
+`java.base`'s bytecode runs, then made the allocators refuse. **The retag missed
+the duplicates of the same triples in other registrars, and those win by
+last-write**, so the refusal landed on registrations that were still live:
+
+| triple | registrar that kept it `Bridge` | class it minted |
+|---|---|---|
+| `java/util/ArrayList.subList(II)` | `register_arraylist_natives` | `ArrayListSubList` |
+| `java/util/Collections.unmodifiableList` | `register_collections_utility_natives` | `UnmodifiableList` |
+| `java/util/{List,Set,Map}.copyOf` | `register_collections_extras_natives` | `Unmodifiable{List,Map}` |
+
+`--dump-native-registry` named all five with invocation counts. Re-reading the
+retagged registrars would not have: they say exactly what L7 intended, and the
+registrations that dispatch are somewhere else. This is the duplicate-
+registration failure mode this repository keeps producing, one layer up — the
+usual form is a fix that stops working, and this form is a fix that never
+started.
+
+The five are `SyntheticStub` now. Measured with
+`scripts/jdk-only-strict-probes.sh`, same JDK image, same class files:
+
+| | before | after |
+|---|---:|---:|
+| `SECTION-FAILED` lines | 9 | **6** |
+| `CENSUSLOAD` failed sections | 5 | **4** |
+| `PROBE2` failed sections | 4 | **2** |
+| regression corpus, `CRATONVM_ARGS=--jdk-only` | 21 passed / 28 failed | **24 / 25** |
+| regression corpus, default | 28 / 0 | 28 / 0 |
+
+Sections recovered: `text`, `regex`, `textformat`. The corpus classes recovered
+are `RCollections`, `RStrings` and `RJdkCollections`, and the failure list is a
+strict SUBSET of the previous one — nothing newly broken.
+
+`probes/JdkOnlyCollectionViewProbe` is the blast radius rather than the two
+paths this was found through: 20 lines diverging from HotSpot 25 under
+`--jdk-only` before, 7 after, and 0 in `--real-jdk` both times. It reports the
+CONTENT of every view (`[b|c]/2`), so a real fallback that came back silently
+EMPTY — L7's stated reason for leaving `HashSet.iterator()` alone — cannot read
+as a pass.
+
+The bridge ratchet moved in the good direction and was re-frozen in the same
+change, as it demands: 9705 → 9697 and 4696 → 4688.
+
+## What remains, and why neither is the same fix
+
+* **`java/util/HashMap$KeyItr` and `java/util/TreeSet$Itr` — 4 of the 6 sections.**
+  L7 R1 deferred this family explicitly and gave the reason: the real iterator
+  reads the real `table[]`, which CratonVM's `HashMap.put` native never fills,
+  so retagging it returns a silently EMPTY iteration instead of a loud error.
+  That is worse than the current failure, and the fix is the collections
+  reclassification wave, not a retag.
+* **`cratonvm/internal/StreamCollector` — `interfaces`, and
+  `cratonvm/internal/SystemLogger` — `serialization`.** Neither is a stand-in
+  for a JDK class, so no retag can remove them. `StreamCollector` is a
+  VM-internal `Consumer` handed to a REAL `Spliterator.tryAdvance` by
+  `drain_spliterator_to_array` — the JDK needs an object of a `Consumer` type
+  and a side table cannot be one. Draining through
+  `StreamSupport.stream(spl, false).toArray()` instead would need no fabricated
+  class, but it also discards the safety cap that function exists to enforce
+  against an infinite spliterator, so it is a stream-subsystem change with its
+  own evidence, not a line edit.
 
 ## Reproducing
 

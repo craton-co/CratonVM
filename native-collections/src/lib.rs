@@ -3567,7 +3567,27 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "trimToSize", "()V", native_al_trim_to_size);
     r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
     r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_al_add_all);
-    r.register(c, "subList", "(II)Ljava/util/List;", native_al_sub_list);
+    // `subList` is `SyntheticStub`, not the ambient `Bridge` (JDK-only wave 2,
+    // L7 R1 follow-up, 2026-08-05). It mints `cratonvm/internal/ArrayListSubList`,
+    // which `--jdk-only` refuses to fabricate — so this registration, which
+    // OUTLIVED L7's retag because it is a duplicate in a different registrar and
+    // last write wins, turned `list.subList(..)` into a
+    // `NoClassDefFoundError` naming a class no caller has heard of. It took
+    // `Pattern.split` and `String.split` down with it, neither of which mentions
+    // a collection.
+    //
+    // The real-bytecode fallback is `java.util.ArrayList$SubList`, which reads
+    // `elementData`/`size` through the same accessors `native_al_*` maintain —
+    // measured by `probes/JdkOnlyCollectionViewProbe`, which reports CONTENT so
+    // that a view coming back silently EMPTY (L7's reason for leaving
+    // `HashSet.iterator()` alone) cannot read as a pass.
+    r.register_with_kind(
+        c,
+        "subList",
+        "(II)Ljava/util/List;",
+        native_al_sub_list,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
     r.register(c, "hashCode", "()I", native_al_hash_code);
     r.register(c, "equals", "(Ljava/lang/Object;)Z", native_al_equals);
     r.register(
@@ -13799,11 +13819,16 @@ fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/List;)V",
         native_collections_reverse,
     );
-    r.register(
+    // `SyntheticStub`, matching `register_unmodifiable_natives` (L7 R1). This
+    // is the DUPLICATE of that registration, in a different registrar, and it
+    // wins by last-write — so the retag there had no effect on the triple that
+    // actually dispatches until this one moved too.
+    r.register_with_kind(
         c,
         "unmodifiableList",
         "(Ljava/util/List;)Ljava/util/List;",
         native_collections_unmodifiable_list,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     r.register(
         c,
@@ -46047,24 +46072,30 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;[Ljava/lang/Object;)Z",
         native_collections_add_all,
     );
-    // List.copyOf / Set.copyOf / Map.copyOf
-    r.register(
+    // List.copyOf / Set.copyOf / Map.copyOf — `SyntheticStub` for the same
+    // reason as `unmodifiableList` above: each returns a `cratonvm/internal/*`
+    // stand-in that `--jdk-only` refuses to fabricate, and each is a duplicate
+    // of a registration `register_factory_natives` already retagged.
+    r.register_with_kind(
         "java/util/List",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/List;",
         native_list_copy_of,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
-    r.register(
+    r.register_with_kind(
         "java/util/Set",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/Set;",
         native_set_copy_of,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
-    r.register(
+    r.register_with_kind(
         "java/util/Map",
         "copyOf",
         "(Ljava/util/Map;)Ljava/util/Map;",
         native_map_copy_of,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // Enumeration interface

@@ -712,6 +712,19 @@ function Get-EffectiveClassTimeoutSec {
     # (`Test run finished after 470134 ms`, 76/78 passed). Keep headroom
     # above that observed time instead of reporting a false HANG.
     'module/spring-boot-amqp|org.springframework.boot.amqp.autoconfigure.RabbitAutoConfigurationTests' = 900
+    # JACKSON-BUDGET.1 (2026-08-05): this class has been reported as a HANG at
+    # the standard 300s shard timeout in every full-suite run that did not
+    # instead report a correctness failure -- `08-02 HANG 300.140s`, and the
+    # 2026-07-22 severe-slowdown page before it. It is not stuck. With the
+    # recycled-`JitInvokeInfo` dispatch aliasing fixed (`383e7f5cf`, see
+    # docs/internal/fixed-suite-bugs/springboot/jacksonautoconfigurationtests-disabledcondition-npe-FIXED-20260805.md)
+    # it runs to natural completion with all 162 tests, 0 failed, 0
+    # containersFailed: 336s and 343s on the Azure host at load average ~30,
+    # 308s on Windows. That is 11-15x the HotSpot baseline (22.4s) and simply
+    # does not fit 300s. Carve out headroom so the suite reports what actually
+    # happens instead of a false HANG; the ratio itself belongs to the
+    # Spring-bootstrap throughput work, not to a per-class timeout.
+    'module/spring-boot-jackson|org.springframework.boot.jackson.autoconfigure.JacksonAutoConfigurationTests' = 900
     # CORE39-CLUSTERA.1 (2026-07-23): originally reported as a HANG at the
     # standard 300s shard timeout. A 900s standalone repro (single OS thread,
     # JIT on) proved this is not a deadlock -- it completes on its own in
