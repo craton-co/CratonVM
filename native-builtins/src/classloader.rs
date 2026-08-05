@@ -12,6 +12,7 @@ use crate::service_loader::impl_jars_load_class;
 use crate::{alloc_concurrent_synthetic, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Monotonic counter for generating unique hidden class names.
@@ -149,9 +150,7 @@ pub fn reset_loader_singletons() {
     // L1: the per-loader bookkeeping is keyed by heap address, so carrying it
     // into a fresh VM would hand a brand-new loader an old one's loader type
     // and namespace id the moment an address is reused.
-    loader_meta_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    loader_meta_store().lock()
         .clear();
     // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
     cratonvm_types::loader_pin::clear_loader_pins();
@@ -338,14 +337,40 @@ pub fn gc_reconcile_defining_loaders(
     // namespace store above is object-keyed: an identity-hash key recurs once
     // a collection reuses the address, and a brand-new loader would inherit a
     // dead one's namespace id. Prune the dead, remap the moved.
+    //
+    // Three phases so the survivor predicate runs with NO lock held. That is
+    // not tidiness: `is_marked` is the GC's own
+    // `pointer_map.contains_key(addr) || heap.is_addr_live(addr)`, and
+    // `is_addr_live` takes heap-interior locks (`old_gen`, `young_from`).
+    // Calling it inside the critical section would mean holding this
+    // process-global side table across a heap lock — the loader_meta -> heap
+    // edge this crate is least able to afford, since it re-enters the VM
+    // everywhere. Those heap locks are raw today, so the ordering checker
+    // cannot see the edge and would not have complained; hoisting the call is
+    // what makes this lock's `LockLevel::Scratch` (L0, "acquires nothing")
+    // literally true rather than true-by-the-checker's-blind-spot.
+    //
+    // Concurrency-safe beyond the STW window it actually runs in: an entry
+    // added between phases is absent from `dead` and is therefore KEPT. The
+    // pass only ever removes addresses it positively judged dead, so the
+    // failure mode is one collection's delay in pruning, never dropping a live
+    // loader's bookkeeping.
+    let addrs: Vec<usize> = {
+        let table = loader_meta_store().lock();
+        table.iter().map(|(o, _)| o.as_ptr() as usize).collect()
+    };
+    let dead: std::collections::HashSet<usize> = addrs
+        .into_iter()
+        .filter(|addr| !is_marked(*addr))
+        .collect();
     loader_meta_store()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .retain_mut(|(obj_ref, _)| {
             let old_addr = obj_ref.as_ptr() as usize;
-            if !is_marked(old_addr) {
+            if dead.contains(&old_addr) {
                 return false;
             }
+            // `pointer_map` is a plain `HashMap` owned by the caller — no lock.
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -902,16 +927,34 @@ impl LoaderMeta {
 /// address that the GC rewrites, and `retain_mut` over a `Vec` remaps in
 /// place where a hash map would have to be rebuilt. Loader counts are in the
 /// tens even for a servlet container.
-fn loader_meta_store() -> &'static Mutex<Vec<(ObjectRef, LoaderMeta)>> {
-    static INSTANCE: OnceLock<Mutex<Vec<(ObjectRef, LoaderMeta)>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
+fn loader_meta_store() -> &'static OrderedPlMutex<Vec<(ObjectRef, LoaderMeta)>> {
+    // LEVEL (lock-discipline ratchet): `Scratch` is L0, the bottom of the
+    // hierarchy — a thread holding it may acquire NOTHING else. That is a
+    // claim about every critical section, and each was checked against it:
+    // `clear` (VM reset), `find`/`push` (`loader_meta_put`), `find`/copy
+    // (`loader_meta_get`), one caller-supplied closure whose only caller
+    // assigns a field (`loader_meta_upsert`), the test helper's `retain`, and
+    // the GC pass's `retain_mut` — which reads `dead` and `pointer_map`, both
+    // plain collections. None re-enters the VM; none takes another lock.
+    //
+    // The GC pass had to be restructured for that last clause to be true: it
+    // used to call the collector's `is_marked` from inside the critical
+    // section, and that reaches `heap.is_addr_live`, which takes the
+    // `old_gen` / `young_from` locks. See `gc_reconcile_defining_loaders`.
+    //
+    // Why the bottom and not some other free level: this crate re-enters the
+    // VM constantly (a native callback calls back into Java, taking the heap
+    // and the L10 class-manager lock), so anything held across that re-entry
+    // is a cycle. L0 says this one never is, and makes a future violation a
+    // checker failure instead of a hang.
+    static INSTANCE: OrderedPlMutex<Vec<(ObjectRef, LoaderMeta)>> =
+        OrderedPlMutex::new(Vec::new(), LockLevel::Scratch);
+    &INSTANCE
 }
 
 /// Record (or replace) `loader`'s bookkeeping.
 pub(crate) fn loader_meta_put(loader: ObjectRef, meta: LoaderMeta) {
-    let mut t = loader_meta_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut t = loader_meta_store().lock();
     match t.iter_mut().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
         Some((_, slot)) => *slot = meta,
         None => t.push((loader, meta)),
@@ -920,9 +963,7 @@ pub(crate) fn loader_meta_put(loader: ObjectRef, meta: LoaderMeta) {
 
 /// Read `loader`'s recorded bookkeeping, if this VM has any.
 pub(crate) fn loader_meta_get(loader: ObjectRef) -> Option<LoaderMeta> {
-    loader_meta_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    loader_meta_store().lock()
         .iter()
         .find(|(l, _)| l.as_ptr() == loader.as_ptr())
         .map(|&(_, m)| m)
@@ -930,9 +971,7 @@ pub(crate) fn loader_meta_get(loader: ObjectRef) -> Option<LoaderMeta> {
 
 /// Read-modify-write, creating an all-`None` entry if the loader has none.
 fn loader_meta_upsert(loader: ObjectRef, f: impl FnOnce(&mut LoaderMeta)) {
-    let mut t = loader_meta_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut t = loader_meta_store().lock();
     match t.iter_mut().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
         Some((_, slot)) => f(slot),
         None => {
@@ -10138,9 +10177,7 @@ mod classloader_tests {
     /// already removes by id.
     fn forget_loader_meta(loaders: &[ObjectRef]) {
         let mine: Vec<usize> = loaders.iter().map(|l| l.as_ptr() as usize).collect();
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        loader_meta_store().lock()
             .retain(|(l, _)| !mine.contains(&(l.as_ptr() as usize)));
     }
 
