@@ -712,8 +712,14 @@ fn regex_cache() -> &'static Mutex<RegexLru> {
 
 /// Small cache for recently-used delimiter regexes.
 fn cached_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    // Fast path: default whitespace delimiter
-    if pattern == r"\s+" {
+    // Fast path: default whitespace delimiter. `\p{javaWhitespace}+` is the
+    // literal pattern real `Scanner.WHITESPACE_PATTERN` carries, and what
+    // `sc.delimiter().pattern()` must therefore print; `\p{javaWhitespace}` is
+    // a Java-only character class that the `regex` crate cannot compile, so it
+    // is mapped here rather than left to `delimiter_regex`'s compile-failure
+    // fallback — a fallback that produces the right answer by accident reads
+    // exactly like one that does not.
+    if pattern == r"\s+" || pattern == SCAN_DEFAULT_DELIM {
         return Ok(default_whitespace_regex().clone());
     }
     // Cache lookup for repeated user-supplied delimiters.
@@ -1291,9 +1297,24 @@ fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Verify the write LANDED before trusting it. `set_field_by_name` is a
+        // silent no-op when the receiver's class has no field of that name,
+        // and CratonVM's synthetic `java/io/FileDescriptor` is
+        // `instance_fields(4)` — four `_fN` slots, no `fd`, no `handle`. So in
+        // synthetic mode `fis_ensure_fd_object` attached a descriptor that
+        // could not hold the id, both writes vanished, and `fis_get_fd`
+        // returned `None` for the rest of the stream's life: every `read()`
+        // answered -1 and every `available()` 0. That took out five `TckIo`
+        // corpus tests, and read as "the file is empty" rather than as a lost
+        // descriptor. The real-JDK layout does declare both fields, so this
+        // read-back never falls through there.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
-    // Legacy synthetic layout: no `FileDescriptor` object — slot 0 is a
+    // Legacy synthetic layout: no usable `FileDescriptor` object — slot 0 is a
     // plain scratch slot, so stash the raw id there.
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
@@ -1398,7 +1419,25 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(s) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let path = validated_path(&path)?;
+    fis_open_path(ctx, this, &path, path_obj)
+}
+
+/// Open `path` for reading and wire the result into `this`.
+///
+/// Shared by `open0` / `<init>(String)` and `<init>(File)`. Takes the path as
+/// a `&str` rather than a `java.lang.String` on purpose: the `File` overload
+/// would otherwise have to `create_string` to call the other entry point, and
+/// that allocation can move `this` out from under the Rust local — the
+/// receiver is pinned as a native ARG and the collector remaps the pin, but
+/// not a bare copy of it. The first version of the `File` overload did exactly
+/// that and every `TckIo` read came back `-1`.
+fn fis_open_path(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+    path_obj: Option<ObjectRef>,
+) -> MethodCallResult {
+    let path = validated_path(path)?;
     let fd = ctx
         .fd_table()
         .open_read(&path)
@@ -1412,6 +1451,41 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     fis_backfill_constructor_fields(ctx, this, path_obj);
     fis_set_fd(ctx, this, fd);
     Ok(None)
+}
+
+/// `FileInputStream.<init>(Ljava/io/File;)V` — synthetic-mode only.
+///
+/// The `FileOutputStream` side of this block has had `<init>(File)` and
+/// `<init>(File, boolean)` since FOS-FIX; the input side only ever got
+/// `<init>(String)`. In `synthetic-jdk` mode there is no bytecode constructor
+/// to fall back to, so `new FileInputStream(file)` raised
+/// `NoSuchMethodError: java.io.FileInputStream.<init>(Ljava/io/File;)V` — which
+/// took out seven `TckIo` corpus tests (`fis_readEof`, `fis_available`,
+/// `fis_skip`, `fis_closeIdempotent`, `fos_writeSingleByte`, `fos_writeBulk`,
+/// `e2e_writeReadRoundtrip`), all of which open their file through a `File`.
+///
+/// Resolves the path off the `File` exactly as `native_fos_init_file` does and
+/// then reuses [`fis_open_path`], so the fd layout and the constructor-field
+/// backfill stay in one place.
+fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing this".to_string(),
+            }))
+        }
+    };
+    let file_obj = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing File arg".to_string(),
+            }))
+        }
+    };
+    let path = read_file_path(ctx, file_obj).unwrap_or_default();
+    fis_open_path(ctx, this, &path, None)
 }
 
 fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1744,7 +1818,15 @@ fn fos_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fos_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Same read-back as `fis_set_fd` — see the writeup there for the
+        // synthetic `FileDescriptor` that has neither field. The output side
+        // never hit it (nothing attaches a descriptor to a synthetic
+        // `FileOutputStream`), but the asymmetry was luck, not design.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
@@ -3769,30 +3851,184 @@ fn native_baos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 // ---------------------------------------------------------------------------
-// Scanner — 5-field synthetic
+// Scanner — 5-field synthetic model, mapped onto the real layout by NAME
 // ---------------------------------------------------------------------------
+//
+// JDK-ONLY-LAYOUT. These natives shadow every `java.util.Scanner` method (see
+// the JDK-ONLY-CLASSIFY note on `register_scanner_natives`), so in real-JDK
+// mode they run against an object with the REAL `java.util.Scanner` layout.
+// Writing the model's slot indices straight onto that object put every value in
+// the wrong field. `javap -p --module java.base java.util.Scanner`, Temurin
+// 25.0.3, instance fields in declaration order:
+//
+//   real 0 buf             Ljava/nio/CharBuffer;
+//   real 1 position        I
+//   real 2 matcher         Ljava/util/regex/Matcher;
+//   real 3 delimPattern    Ljava/util/regex/Pattern;
+//   real 4 hasNextPattern  Ljava/util/regex/Pattern;
+//   … 5 hasNextPosition, 6 hasNextResult, 7 source, … 15 closed, 16 radix, …
+//
+// So the model's five slots landed like this, and only two of the five were
+// visible to the overlay census (`CRATONVM_DBG=overlay,overlay-all`) — the
+// other three are same-kind writes, which `overlay_write_is_destructive`
+// cannot see:
+//
+//   model 0 input  -> buf            reference over reference, INVISIBLE
+//   model 1 pos    -> position       right field, by coincidence
+//   model 2 delim  -> matcher        reference over reference, INVISIBLE
+//   model 3 radix  -> delimPattern   `Int` over `L` — 1 census hit per run
+//   model 4 closed -> hasNextPattern `Int` over `L` — 1 census hit per run
+//
+// Both census rows were *lossy*, not merely misplaced: `set_field` coerces by
+// the declared descriptor and an `Int` written to an `L` slot becomes
+// `Object(None)` (`coerce_field_value_by_descriptor`, gc/src/heap.rs). So on a
+// real image `useRadix(16)` was silently discarded and `radix()` always
+// answered 10 — which is what `probes/L3ScannerLayoutProbe` measures against
+// the host JDK.
+//
+// The fix is the taxonomy's kind 2 for four of the five — resolve the field on
+// the RECEIVER's own class by name, exactly as `native-collections` now does
+// for `Properties.loadFactor` — plus kind 3 for the input text, which has no
+// real counterpart at all: `buf` is a `CharBuffer`, not a `String`.
+//
+// `SCAN_FIELD_*` remain as the fallback for a VM-fabricated `Scanner` stub,
+// whose slots are named `_f0.._f4` and so resolve no names.
 
 const SCAN_FIELD_INPUT: usize = 0; // String object — full input text
 const SCAN_FIELD_POS: usize = 1; // Int — current position in input
 const SCAN_FIELD_DELIM: usize = 2; // Pattern object or null (default \s+)
 const SCAN_FIELD_RADIX: usize = 3; // Int — radix (default 10)
 const SCAN_FIELD_CLOSED: usize = 4; // Int — 0=open, 1=closed
-const SCAN_DEFAULT_DELIM: &str = r"\s+";
+/// The real `Scanner`'s default delimiter, verbatim: `Scanner.WHITESPACE_PATTERN`
+/// is `Pattern.compile("\p{javaWhitespace}+")`, and `sc.delimiter().pattern()`
+/// hands that exact string back. We used to answer `\s+` — the pattern our
+/// tokenizer actually runs — which is a different string with the same meaning,
+/// and a visible API divergence. `cached_regex` maps this spelling onto the
+/// whitespace regex; see the note there.
+const SCAN_DEFAULT_DELIM: &str = r"\p{javaWhitespace}+";
 
-/// Read the scanner's input as a Rust String.
-fn scan_input(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, SCAN_FIELD_INPUT) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+/// Resolve one of the scanner's state fields on the RECEIVER's own class,
+/// falling back to the fabricated model's slot when the receiver does not
+/// declare that name.
+///
+/// Deliberately NOT `resolve_field_index(class_name, field)`: that form
+/// re-resolves the class globally by name and is the shape that wrote
+/// `HashMap`'s field indices onto a `Properties`.
+fn scan_slot(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, model: usize) -> usize {
+    let class_id = ctx.class_id_of_object(this);
+    ctx.resolve_field_index_by_class_id(class_id, name)
+        .unwrap_or(model)
+}
+
+/// Key for [`scan_sources`]. `(vm_identity, identity_hash_code)`, the
+/// convention documented on `DcKey` below: the identity hash survives a moving
+/// GC, and scoping by `vm_identity` keeps two `Vm`s in one test process from
+/// resolving to each other's entries. No `ObjectRef` is stored, so no collector
+/// path has to scan or remap this table.
+type ScanKey = (usize, i32);
+
+fn scan_key(ctx: &dyn NativeContext, this: ObjectRef) -> ScanKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(this))
+}
+
+/// The scanner's input text — the one piece of the model with NO real field to
+/// live in. Real `java.util.Scanner` holds its input in `buf`, a
+/// `java.nio.CharBuffer`; a `java.lang.String` written there is a wrong-type
+/// reference that the overlay census cannot see and that any real `Scanner`
+/// bytecode would `ClassCastException` on. Kind 3 in the layout taxonomy, so it
+/// goes in a side table keyed by object identity — the same shape as `SR_STATE`
+/// for `StringReader` further down this file, and `LoaderMeta` in
+/// `native-builtins/src/classloader.rs`.
+///
+/// `Arc<str>` because every token read pulls the whole input; the `Arc` clone
+/// under the lock replaces what used to be a full `read_string` copy per call.
+///
+/// An entry lives as long as its scanner is used. `close()` drops it, and every
+/// read path treats a missing entry as "closed" — which is also how the real
+/// `Scanner` behaves (`ensureOpen()` throws `IllegalStateException`), and how
+/// `SR_STATE` detects a closed `StringReader`.
+static SCAN_SOURCES: OnceLock<Mutex<HashMap<ScanKey, Arc<str>>>> = OnceLock::new();
+
+fn scan_sources() -> &'static Mutex<HashMap<ScanKey, Arc<str>>> {
+    SCAN_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install the scanner's input text and reset its position. Every `Scanner`
+/// constructor funnels through here.
+fn scan_set_source(ctx: &mut dyn NativeContext, this: ObjectRef, text: &str) {
+    let key = scan_key(ctx, this);
+    scan_sources().lock().insert(key, Arc::from(text));
+    scan_set_pos_raw(ctx, this, 0);
+    scan_set_delim(ctx, this, Value::Object(None));
+    scan_set_radix(ctx, this, 10);
+    scan_set_closed(ctx, this, false);
+}
+
+/// The input text, or `None` once the scanner has been closed (or if it was
+/// never initialised through one of our constructors).
+fn scan_source_opt(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Arc<str>> {
+    let key = scan_key(ctx, this);
+    scan_sources().lock().get(&key).cloned()
+}
+
+/// What the real `Scanner.ensureOpen()` throws on every read after `close()`.
+fn ise_scanner_closed() -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: "Scanner closed".to_string(),
     }
+    .into()
+}
+
+/// Read the scanner's input, refusing a closed scanner the way the real
+/// `Scanner` does. Every token/predicate native goes through here, so the
+/// `ensureOpen()` check lives in one place rather than at twenty call sites.
+///
+/// A missing entry is NOT by itself "closed". `java.util.Scanner` has fourteen
+/// constructors and we register four, so a `new Scanner(path, UTF_8)` runs real
+/// bytecode, never reaches `scan_set_source`, and arrives here with no entry.
+/// That scanner reads as empty — which is what it did before this state moved
+/// off the object, when `scan_input` read the real `buf` field and got a
+/// `CharBuffer` it could not decode. Only the `closed` flag makes it an
+/// `IllegalStateException`.
+fn scan_input(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Arc<str>, MethodCallFailed> {
+    if let Some(text) = scan_source_opt(ctx, this) {
+        return Ok(text);
+    }
+    if scan_is_closed(ctx, this) {
+        return Err(ise_scanner_closed());
+    }
+    Ok(Arc::from(""))
+}
+
+/// Non-throwing input read, for the paths the real `Scanner` also allows after
+/// `close()` — `toString()` does not call `ensureOpen()`.
+fn scan_input_lenient(ctx: &mut dyn NativeContext, this: ObjectRef) -> Arc<str> {
+    scan_source_opt(ctx, this).unwrap_or_else(|| Arc::from(""))
 }
 
 /// Get the scanner's current position.
 fn scan_pos(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
-    match ctx.get_field(this, SCAN_FIELD_POS) {
+    let slot = scan_slot(ctx, this, "position", SCAN_FIELD_POS);
+    match ctx.get_field(this, slot) {
         Value::Int(v) => v.max(0) as usize,
         _ => 0,
     }
+}
+
+fn scan_set_pos_raw(ctx: &mut dyn NativeContext, this: ObjectRef, pos: i32) {
+    let slot = scan_slot(ctx, this, "position", SCAN_FIELD_POS);
+    ctx.set_field(this, slot, Value::Int(pos));
+}
+
+/// Store the scanner's position, rejecting one that does not fit the real
+/// field's `int`.
+fn scan_set_pos(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    pos: usize,
+) -> Result<(), MethodCallFailed> {
+    scan_set_pos_raw(ctx, this, safe_pos_to_i32(pos)?);
+    Ok(())
 }
 
 /// Safely convert a `usize` position to an `i32` for storage.
@@ -3807,17 +4043,89 @@ fn safe_pos_to_i32(pos: usize) -> Result<i32, MethodCallFailed> {
 
 /// Get the scanner's radix.
 fn scan_radix(ctx: &mut dyn NativeContext, this: ObjectRef) -> u32 {
-    match ctx.get_field(this, SCAN_FIELD_RADIX) {
+    let slot = scan_slot(ctx, this, "radix", SCAN_FIELD_RADIX);
+    match ctx.get_field(this, slot) {
         Value::Int(v) if (2..=36).contains(&v) => v as u32,
         _ => 10,
     }
 }
 
+fn scan_set_radix(ctx: &mut dyn NativeContext, this: ObjectRef, radix: i32) {
+    let slot = scan_slot(ctx, this, "radix", SCAN_FIELD_RADIX);
+    ctx.set_field(this, slot, Value::Int(radix));
+}
+
+/// The delimiter `Pattern` object, or `Object(None)` for the default.
+fn scan_delim_obj(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let slot = scan_slot(ctx, this, "delimPattern", SCAN_FIELD_DELIM);
+    ctx.get_field(this, slot)
+}
+
+fn scan_set_delim(ctx: &mut dyn NativeContext, this: ObjectRef, pattern: Value) {
+    let slot = scan_slot(ctx, this, "delimPattern", SCAN_FIELD_DELIM);
+    ctx.set_field(this, slot, pattern);
+}
+
+/// The real field is `boolean closed`; the fabricated model's slot is an `Int`.
+/// `set_field` coerces between the two, so one writer serves both.
+fn scan_set_closed(ctx: &mut dyn NativeContext, this: ObjectRef, closed: bool) {
+    let slot = scan_slot(ctx, this, "closed", SCAN_FIELD_CLOSED);
+    ctx.set_field(this, slot, Value::Int(i32::from(closed)));
+}
+
+/// Has `close()` been called? On the real layout this is the real `boolean
+/// closed` field and reads back what `scan_set_closed` wrote. On a FABRICATED
+/// `Scanner` stub the slot is declared `Ljava/lang/Object;`, so the `Int` is
+/// coerced to null on the way in and this always answers false — the same
+/// lossiness every primitive has on a fabricated layout, and the reason the
+/// close-then-read case degrades to "empty input" rather than
+/// `IllegalStateException` in synthetic-JDK mode.
+fn scan_is_closed(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let slot = scan_slot(ctx, this, "closed", SCAN_FIELD_CLOSED);
+    matches!(ctx.get_field(this, slot), Value::Int(v) if v != 0)
+}
+
+// --- Scanner state, for the `Scanner` natives that live in other crates ---
+//
+// `Scanner.findWithinHorizon` is registered from
+// `native-builtins/src/phases_early.rs` (it wants that crate's Java regex
+// engine), and it used to read the model's slots 0 and 1 directly — which on a
+// real layout is `buf` and `position`. It has to see the same state as the
+// natives here, so these four functions are the crate boundary.
+// `native-builtins` already depends on `cratonvm-native-io`.
+
+/// The scanner's input text, or `None` if it was never opened through one of
+/// our constructors, or has since been closed.
+pub fn scanner_source(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Arc<str>> {
+    scan_source_opt(ctx, this)
+}
+
+/// The scanner's read position, resolved on the receiver's own layout.
+pub fn scanner_position(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    scan_pos(ctx, this)
+}
+
+/// Advance the scanner's read position.
+pub fn scanner_set_position(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    pos: usize,
+) -> Result<(), MethodCallFailed> {
+    scan_set_pos(ctx, this, pos)
+}
+
+/// Install a scanner's input text and reset the rest of its state. Only the
+/// constructors here and out-of-crate test fixtures need this.
+pub fn scanner_set_source(ctx: &mut dyn NativeContext, this: ObjectRef, text: &str) {
+    scan_set_source(ctx, this, text);
+}
+
 /// Get the delimiter pattern string.
 fn scan_delimiter(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, SCAN_FIELD_DELIM) {
+    match scan_delim_obj(ctx, this) {
         Value::Object(Some(pat)) => {
-            // Pattern object: field 0 = source string
+            // `Pattern`'s first instance field is `pattern:String` on the real
+            // layout too (javap), so this read needs no receiver resolution.
             match ctx.get_field(pat, 0) {
                 Value::Object(Some(s)) => ctx
                     .read_string(s)
@@ -3875,23 +4183,21 @@ fn scanner_peek_token(input: &str, pos: usize, delimiter: &str) -> Option<String
     scanner_next_token(input, pos, delimiter).map(|(tok, _)| tok)
 }
 
-/// Advance position past the token found by scanner_next_token.
-/// The position should be moved past the token AND any trailing delimiter.
+/// Advance position past the token found by `scanner_next_token` — and NOT past
+/// the delimiter that follows it.
+///
+/// This used to skip the trailing delimiter too. That is invisible to a run of
+/// `next()` calls (the next token search skips leading delimiters anyway) and
+/// wrong for everything that reads the position back: after
+/// `new Scanner("10 20 hello<LF>second").next()` the real `Scanner` sits at the
+/// end of `hello`, so `nextLine()` returns the empty remainder of THAT line and
+/// only the second `nextLine()` returns `second`. Consuming the newline here made
+/// the first `nextLine()` return `second` and the second one throw — the exact
+/// shape the JDK's own `java/util/Scanner/NextIntNextLineTest` exists to catch,
+/// and what `probes/L3ScannerLayoutProbe` measures against the host JDK.
+/// `findInLine`, `skip` and `toString`'s `position=` read the same value.
 fn scanner_consume_token(input: &str, pos: usize, delimiter: &str) -> Option<(String, usize)> {
-    let (token, token_end) = scanner_next_token(input, pos, delimiter)?;
-    // Skip trailing delimiter after the token
-    let remaining = &input[token_end..];
-    let re = delimiter_regex(delimiter);
-    let new_pos = if let Some(m) = re.find(remaining) {
-        if m.start() == 0 {
-            token_end + m.end()
-        } else {
-            token_end
-        }
-    } else {
-        token_end
-    };
-    Some((token, new_pos))
+    scanner_next_token(input, pos, delimiter)
 }
 
 /// Find the next line from pos. Returns (line_content, new_pos_after_line_ending).
@@ -3938,15 +4244,11 @@ fn native_scanner_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let input = match args.get(1) {
-        Some(Value::Object(Some(s))) => *s,
-        _ => ctx.create_string(""),
+    let text = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
     };
-    ctx.set_field(this, SCAN_FIELD_INPUT, Value::Object(Some(input)));
-    ctx.set_field(this, SCAN_FIELD_POS, Value::Int(0));
-    ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(None));
-    ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(10));
-    ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(0));
+    scan_set_source(ctx, this, &text);
     Ok(None)
 }
 
@@ -3962,12 +4264,7 @@ fn native_scanner_init_inputstream(
     let stream = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
         _ => {
-            let empty = ctx.create_string("");
-            ctx.set_field(this, SCAN_FIELD_INPUT, Value::Object(Some(empty)));
-            ctx.set_field(this, SCAN_FIELD_POS, Value::Int(0));
-            ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(None));
-            ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(10));
-            ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(0));
+            scan_set_source(ctx, this, "");
             return Ok(None);
         }
     };
@@ -4032,12 +4329,7 @@ fn native_scanner_init_inputstream(
         }
     }
     let text = String::from_utf8_lossy(&bytes);
-    let input_obj = ctx.create_string(&text);
-    ctx.set_field(this, SCAN_FIELD_INPUT, Value::Object(Some(input_obj)));
-    ctx.set_field(this, SCAN_FIELD_POS, Value::Int(0));
-    ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(None));
-    ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(10));
-    ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(0));
+    scan_set_source(ctx, this, &text);
     Ok(None)
 }
 
@@ -4060,12 +4352,7 @@ fn native_scanner_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Ok(s) => s,
         Err(_) => return Err(file_not_found(&path_str)),
     };
-    let input_obj = ctx.create_string(&text);
-    ctx.set_field(this, SCAN_FIELD_INPUT, Value::Object(Some(input_obj)));
-    ctx.set_field(this, SCAN_FIELD_POS, Value::Int(0));
-    ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(None));
-    ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(10));
-    ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(0));
+    scan_set_source(ctx, this, &text);
     Ok(None)
 }
 
@@ -4076,12 +4363,12 @@ fn native_scanner_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Err(throw_no_such_element("no more elements")),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => {
-            ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+            scan_set_pos(ctx, this, new_pos)?;
             let s = ctx.create_string(&token);
             Ok(Some(Value::Object(Some(s))))
         }
@@ -4094,11 +4381,11 @@ fn native_scanner_next_line(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Err(throw_no_such_element("no more elements")),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     match scanner_next_line(&input, pos) {
         Some((line, new_pos)) => {
-            ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+            scan_set_pos(ctx, this, new_pos)?;
             let s = ctx.create_string(&line);
             Ok(Some(Value::Object(Some(s))))
         }
@@ -4115,13 +4402,13 @@ fn native_scanner_next_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(r)) => *r as u32,
         _ => scan_radix(ctx, this),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i32::from_str_radix(token.trim(), radix) {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4139,13 +4426,13 @@ fn native_scanner_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(r)) => *r as u32,
         _ => scan_radix(ctx, this),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i64::from_str_radix(token.trim(), radix) {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Long(v)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4159,13 +4446,13 @@ fn native_scanner_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Err(throw_no_such_element("no more elements")),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match token.trim().parse::<f64>() {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Double(v)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4179,13 +4466,13 @@ fn native_scanner_next_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Err(throw_no_such_element("no more elements")),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match token.trim().parse::<f32>() {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Float(v)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4199,17 +4486,17 @@ fn native_scanner_next_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Err(throw_no_such_element("no more elements")),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => {
             let trimmed = token.trim().to_lowercase();
             if trimmed == "true" {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(1)))
             } else if trimmed == "false" {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(0)))
             } else {
                 Err(throw_input_mismatch("token mismatch"))
@@ -4225,13 +4512,13 @@ fn native_scanner_next_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Err(throw_no_such_element("no more elements")),
     };
     let radix = scan_radix(ctx, this);
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i8::from_str_radix(token.trim(), radix) {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v as i32)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4246,13 +4533,13 @@ fn native_scanner_next_short(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Err(throw_no_such_element("no more elements")),
     };
     let radix = scan_radix(ctx, this);
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i16::from_str_radix(token.trim(), radix) {
             Ok(v) => {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(new_pos)?));
+                scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v as i32)))
             }
             Err(_) => Err(throw_input_mismatch("token mismatch")),
@@ -4268,7 +4555,7 @@ fn native_scanner_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let found = scanner_peek_token(&input, pos, &delim).is_some();
@@ -4280,7 +4567,7 @@ fn native_scanner_has_next_line(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     Ok(Some(Value::Int(i32::from(pos < input.len()))))
 }
@@ -4294,7 +4581,7 @@ fn native_scanner_has_next_int(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(r)) => *r as u32,
         _ => scan_radix(ctx, this),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let ok = scanner_peek_token(&input, pos, &delim)
@@ -4308,7 +4595,7 @@ fn native_scanner_has_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Int(0))),
     };
     let radix = scan_radix(ctx, this);
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let ok = scanner_peek_token(&input, pos, &delim)
@@ -4321,7 +4608,7 @@ fn native_scanner_has_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let ok =
@@ -4334,7 +4621,7 @@ fn native_scanner_has_next_float(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let ok =
@@ -4350,7 +4637,7 @@ fn native_scanner_has_next_boolean(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let ok = scanner_peek_token(&input, pos, &delim).is_some_and(|t| {
@@ -4361,6 +4648,47 @@ fn native_scanner_has_next_boolean(
 }
 
 // --- Scanner configuration ---
+
+/// Build the `java.util.regex.Pattern` that `delimiter()` hands back.
+///
+/// Both delimiter sites used to fabricate one — `alloc_object(Pattern, 2)` with
+/// the source poked into slot 0 and `0` into slot 1. Those two writes land on
+/// the right fields (`pattern:String`, `flags:int` are the real class's first
+/// two, per javap), so nothing in the overlay census ever objected, and our own
+/// readers only want slot 0. **It is still not a usable `Pattern`.** Real
+/// `Pattern.matcher()` does compile lazily when `compiled` is false, so it gets
+/// as far as running — and then throws, because the rest of the object
+/// (`capturingGroupCount`, `localCount`, `root`, …) is the zeroed state a real
+/// `compile()` would have filled in. Measured against the host JDK:
+/// `sc.useDelimiter(","); sc.delimiter().matcher("x,y").find()` answers `true`
+/// on HotSpot 25 and threw `ArrayIndexOutOfBoundsException` inside
+/// `Matcher.search` here.
+///
+/// So ask the JDK for one. The fabricated object survives only as the fallback
+/// for a runtime where `Pattern.compile` cannot be invoked (a synthetic image
+/// whose `Pattern` is itself a stub), which is the only place it was ever
+/// adequate.
+fn scan_make_pattern(ctx: &mut dyn NativeContext, source: ObjectRef) -> ObjectRef {
+    let source_pin = ctx.pin_native_root(source);
+    let compiled = ctx.invoke(
+        "java/util/regex/Pattern",
+        "compile",
+        "(Ljava/lang/String;)Ljava/util/regex/Pattern;",
+        &[Value::Object(Some(source))],
+    );
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.unpin_native_roots(source_pin);
+    if let Ok(Some(Value::Object(Some(pat)))) = compiled {
+        return pat;
+    }
+    let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
+        Ok(cid) => ctx.alloc_object(cid, 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
+    };
+    ctx.set_field(pat, 0, Value::Object(Some(source)));
+    ctx.set_field(pat, 1, Value::Int(0));
+    pat
+}
 
 fn native_scanner_use_delimiter_string(
     ctx: &mut dyn NativeContext,
@@ -4374,14 +4702,12 @@ fn native_scanner_use_delimiter_string(
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    // Create a Pattern synthetic: 2 fields (source=0, flags=1)
-    let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
-        Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
-    };
-    ctx.set_field(pat, 0, Value::Object(Some(pattern_str)));
-    ctx.set_field(pat, 1, Value::Int(0));
-    ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(Some(pat)));
+    // GC-safety: `scan_make_pattern` invokes Java, which can relocate `this`.
+    let this_pin = ctx.pin_native_root(this);
+    let pat = scan_make_pattern(ctx, pattern_str);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    scan_set_delim(ctx, this, Value::Object(Some(pat)));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -4394,7 +4720,7 @@ fn native_scanner_use_delimiter_pattern(
         _ => return Ok(Some(Value::Object(None))),
     };
     let pattern = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, SCAN_FIELD_DELIM, pattern);
+    scan_set_delim(ctx, this, pattern);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -4407,7 +4733,7 @@ fn native_scanner_use_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(r)) => *r,
         _ => 10,
     };
-    ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(radix));
+    scan_set_radix(ctx, this, radix);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -4424,18 +4750,13 @@ fn native_scanner_delimiter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let delim = ctx.get_field(this, SCAN_FIELD_DELIM);
+    let delim = scan_delim_obj(ctx, this);
     if let Value::Object(Some(_)) = delim {
         Ok(Some(delim))
     } else {
-        // Return default pattern
+        // No delimiter set: hand back the default, compiled the same way.
         let src = ctx.create_string(SCAN_DEFAULT_DELIM);
-        let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
-            Ok(cid) => ctx.alloc_object(cid, 2),
-            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
-        };
-        ctx.set_field(pat, 0, Value::Object(Some(src)));
-        ctx.set_field(pat, 1, Value::Int(0));
+        let pat = scan_make_pattern(ctx, src);
         Ok(Some(Value::Object(Some(pat))))
     }
 }
@@ -4459,12 +4780,26 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // receivers whose resolved declaring class IS the interface, which bounds
     // this to synthetic objects typed as bare Closeable/AutoCloseable rather
     // than to user classes — but "only corrupts synthetic receivers" is not a
-    // guarantee worth keeping. Write the flag only when the receiver actually
-    // has the Scanner shape; for anything else, closing is a no-op here and
-    // the object's own close native (if any) does the real work.
-    if ctx.object_num_fields(this) > SCAN_FIELD_CLOSED {
-        ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(1));
+    // guarantee worth keeping.
+    //
+    // The `object_num_fields(this) > SCAN_FIELD_CLOSED` shape this replaces was
+    // the wrong question, and the same wrong question that made three other
+    // guards in this work item inert: a slot COUNT cannot identify a layout,
+    // and "has at least five fields" is true of most JDK classes. Resolving the
+    // flag by NAME does not fix that either — plenty of `java.io` classes
+    // declare a field called `closed`. Ask what the receiver actually IS;
+    // `java.util.Scanner` is final, so an exact class match is exact.
+    let class_id = ctx.class_id_of_object(this);
+    if ctx.class_name_of_id(class_id).as_deref() != Some("java/util/Scanner") {
+        return Ok(None);
     }
+    scan_set_closed(ctx, this, true);
+    // Drop the input text. Every read path treats a missing entry as closed and
+    // raises the `IllegalStateException("Scanner closed")` that the real
+    // `ensureOpen()` raises — so this both matches the JDK and keeps
+    // `SCAN_SOURCES` from retaining the text of every scanner ever opened.
+    let key = scan_key(ctx, this);
+    scan_sources().lock().remove(&key);
     Ok(None)
 }
 
@@ -4473,8 +4808,8 @@ fn native_scanner_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.set_field(this, SCAN_FIELD_DELIM, Value::Object(None));
-    ctx.set_field(this, SCAN_FIELD_RADIX, Value::Int(10));
+    scan_set_delim(ctx, this, Value::Object(None));
+    scan_set_radix(ctx, this, 10);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -4483,7 +4818,9 @@ fn native_scanner_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let input = scan_input(ctx, this);
+    // `toString()` is one of the few real `Scanner` methods that does NOT call
+    // `ensureOpen()`, so it must keep working on a closed scanner.
+    let input = scan_input_lenient(ctx, this);
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let info = format!(
@@ -4505,7 +4842,7 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     // Search for pattern on current line only
     let remaining = &input[pos..];
@@ -4514,18 +4851,108 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(current_line) {
             let matched = m.as_str();
-            ctx.set_field(
-                this,
-                SCAN_FIELD_POS,
-                Value::Int(safe_pos_to_i32(
-                    pos.checked_add(m.end()).unwrap_or(usize::MAX),
-                )?),
-            );
+            scan_set_pos(ctx, this, pos.checked_add(m.end()).unwrap_or(usize::MAX))?;
             let s = ctx.create_string(matched);
             return Ok(Some(Value::Object(Some(s))));
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// The window `findWithinHorizon` is allowed to search: `horizon` CODE POINTS
+/// from `pos`, or the whole remainder when `horizon == 0`.
+///
+/// The horizon is counted in characters, not bytes — the javadoc says the
+/// scanner "will never search more than horizon code points beyond its current
+/// position". The implementation this replaces (in `phases_early.rs`, never
+/// registered) added the horizon to a byte offset and then walked back to a
+/// char boundary, which is the same number only for ASCII.
+fn scanner_horizon_window(input: &str, pos: usize, horizon: i32) -> &str {
+    let remaining = &input[pos..];
+    if horizon == 0 {
+        return remaining;
+    }
+    match remaining.char_indices().nth(horizon as usize) {
+        Some((byte_end, _)) => &remaining[..byte_end],
+        // Fewer than `horizon` characters left: the window is the remainder.
+        None => remaining,
+    }
+}
+
+/// `Scanner.findWithinHorizon(String|Pattern, int)`.
+///
+/// Shared by both overloads. Returns the matched text and the new position, or
+/// `None` for no match — in which case the position must not move.
+fn scanner_find_within_horizon(
+    input: &str,
+    pos: usize,
+    pattern: &str,
+    horizon: i32,
+) -> Option<(String, usize)> {
+    if pos >= input.len() {
+        return None;
+    }
+    let hay = scanner_horizon_window(input, pos, horizon);
+    let re = regex::Regex::new(pattern).ok()?;
+    let m = re.find(hay)?;
+    Some((m.as_str().to_string(), pos + m.end()))
+}
+
+fn scanner_find_within_horizon_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    pattern_str: String,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let horizon = match args.get(2) {
+        Some(Value::Int(h)) => *h,
+        _ => 0,
+    };
+    if horizon < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("horizon < 0: {horizon}"),
+        }
+        .into());
+    }
+    let input = scan_input(ctx, this)?;
+    let pos = scan_pos(ctx, this);
+    match scanner_find_within_horizon(&input, pos, &pattern_str, horizon) {
+        Some((matched, new_pos)) => {
+            scan_set_pos(ctx, this, new_pos)?;
+            let s = ctx.create_string(&matched);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_scanner_find_within_horizon_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
+}
+
+fn native_scanner_find_within_horizon_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `Pattern`'s first instance field is `pattern:String` on both layouts.
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(p))) => match ctx.get_field(*p, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        },
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
 }
 
 fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4541,19 +4968,13 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let input = scan_input(ctx, this);
+    let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let remaining = &input[pos..];
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(remaining) {
             if m.start() == 0 {
-                ctx.set_field(
-                    this,
-                    SCAN_FIELD_POS,
-                    Value::Int(safe_pos_to_i32(
-                        pos.checked_add(m.end()).unwrap_or(usize::MAX),
-                    )?),
-                );
+                scan_set_pos(ctx, this, pos.checked_add(m.end()).unwrap_or(usize::MAX))?;
             }
         }
     }
@@ -4908,6 +5329,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
             "<init>",
             "(Ljava/lang/String;)V",
             native_fis_open0,
+        );
+        // ...and the `File` overload, the one every `TckIo` fixture actually
+        // uses. Its absence was invisible for as long as the corpus was dark.
+        registry.register(
+            "java/io/FileInputStream",
+            "<init>",
+            "(Ljava/io/File;)V",
+            native_fis_init_file,
         );
         // Public FileInputStream read surface. In real-JDK mode the bytecode
         // read()/read(byte[])/read(byte[],i,i)/available()/skip()/close() call
@@ -6121,6 +6550,44 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "skip",
         "(Ljava/util/regex/Pattern;)Ljava/util/Scanner;",
         native_scanner_skip,
+    );
+    // `findWithinHorizon` had an implementation in
+    // `native-builtins/src/phases_early.rs` that NOTHING registered: its only
+    // registrar, `register_t2_3_completion_natives`, has no call site, and
+    // `--dump-native-registry` showed no such row among the 35 live
+    // `java/util/Scanner` entries. So the call reached real JDK bytecode, which
+    // reads `buf`, `matcher` and `source` — none of which these natives
+    // populate — and threw `NullPointerException` in both modes, measured by
+    // `probes/L3ScannerSearchProbe`. It lives here now, beside `findInLine` and
+    // `skip`, which share its state accessors and its regex engine.
+    //
+    // Registered as INTRINSIC, with the kind STATED rather than inherited.
+    // `java.util.Scanner` declares no ACC_NATIVE method, so a `Bridge` tag —
+    // which contract §1.5 defines by an ACC_NATIVE target — would be wrong,
+    // and the L6 ratchet says so in as many words: two new Bridge rows
+    // shadowing concrete bytecode is a regression it refuses, and raising the
+    // baseline is explicitly not the fix. Intrinsic is what these are: a Rust
+    // fast path replicating a method that HAS real bytecode and has to match
+    // it, which is the category the implementation in `phases_early.rs` used
+    // before it moved here.
+    //
+    // The other 35 registrations in this function are still `Bridge` by
+    // inheritance and still wrong for the same reason — see the
+    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
+    // GOOD direction and belongs with whoever re-freezes it.
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/lang/String;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_string,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_pattern,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
 
     // Interface dispatch: Iterator
@@ -15931,6 +16398,10 @@ const EVENT_CREATE: i32 = 1;
 const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
+/// `#[track_caller]` so the class-origin census's `requested_by` names the
+/// native that wanted the shape, not this one forwarding line — see the
+/// matching note on `NativeContext::ensure_synthetic_class`.
+#[track_caller]
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
@@ -18839,12 +19310,15 @@ mod io_tests {
     }
 
     #[test]
-    fn scanner_consume_token_advances_past_delimiter() {
+    fn scanner_consume_token_stops_at_the_delimiter() {
         let input = "hello world foo";
         let (tok, new_pos) = scanner_consume_token(input, 0, r"\s+").unwrap();
         assert_eq!(tok, "hello");
-        // new_pos should be past the trailing whitespace
-        assert!(new_pos > 5);
+        // The real `Scanner` leaves the position at the END OF THE TOKEN, not
+        // past the delimiter that follows it — that difference is what
+        // `nextLine()` after `next()` reads. This assertion used to be
+        // `new_pos > 5`, which froze the divergence.
+        assert_eq!(new_pos, 5);
         // Second consume from new_pos should give "world"
         let (tok2, new_pos2) = scanner_consume_token(input, new_pos, r"\s+").unwrap();
         assert_eq!(tok2, "world");
@@ -18864,6 +19338,57 @@ mod io_tests {
     #[test]
     fn scanner_consume_token_empty() {
         assert!(scanner_consume_token("", 0, r"\s+").is_none());
+    }
+
+    // T2.3.12 - `findWithinHorizon`, ported from `phases_early.rs` when the
+    // implementation moved here. These exercise the pure helper rather than the
+    // native, so they need no mock heap; the horizon boundary and the
+    // no-match-does-not-move-the-position rule are what they are for.
+
+    #[test]
+    fn scanner_fwh_finds_first_match_and_reports_the_new_position() {
+        let (text, pos) =
+            scanner_find_within_horizon("prefix abc123 suffix", 0, r"\d+", 0).unwrap();
+        assert_eq!(text, "123");
+        assert_eq!(pos, "prefix abc123".len());
+    }
+
+    #[test]
+    fn scanner_fwh_no_match_is_none() {
+        assert!(scanner_find_within_horizon("only letters here", 0, r"\d+", 0).is_none());
+    }
+
+    #[test]
+    fn scanner_fwh_respects_the_horizon() {
+        // Horizon 4 sees only "aaaa" - no digits in that window.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 4).is_none());
+        // One more character and the digits are reachable.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 5).is_some());
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_counts_characters_not_bytes() {
+        // Four 2-byte characters then a digit: a horizon of 4 must NOT reach
+        // the digit, and a horizon of 5 must. Counting bytes would let a
+        // horizon of 4 see nothing and a horizon of 8 see the digit - which is
+        // what the implementation this replaced did.
+        let s = "\u{e9}\u{e9}\u{e9}\u{e9}7";
+        assert!(scanner_find_within_horizon(s, 0, r"\d", 4).is_none());
+        assert_eq!(scanner_find_within_horizon(s, 0, r"\d", 5).unwrap().0, "7");
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_past_the_end_is_the_remainder() {
+        assert_eq!(scanner_horizon_window("abc", 0, 99), "abc");
+        assert_eq!(scanner_horizon_window("abc", 1, 0), "bc");
+    }
+
+    #[test]
+    fn scanner_fwh_searches_from_the_given_position() {
+        // The first match is behind `pos`; only the one after it counts.
+        let (text, pos) = scanner_find_within_horizon("11 22", 3, r"\d+", 0).unwrap();
+        assert_eq!(text, "22");
+        assert_eq!(pos, 5);
     }
 
     #[test]

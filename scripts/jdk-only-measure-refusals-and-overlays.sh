@@ -81,6 +81,7 @@ done
 
 echo "" >> "$LOG"
 echo "########## B. overlay-corruption census (both modes)" >> "$LOG"
+PARTIAL_RUNS=0
 for MODE in --real-jdk --jdk-only; do
   for P in $ALL_PROBES; do
     # Grouped spelling. The per-flag CRATONVM_DBG_OVERLAY* variables still work
@@ -90,17 +91,70 @@ for MODE in --real-jdk --jdk-only; do
       > "$OUT/ov-$MODE-$P.txt" 2>&1
     rc=$?
     n=$(grep -ci overlay "$OUT/ov-$MODE-$P.txt")
-    echo "--- $MODE $P exit=$rc lines=$n ---" >> "$LOG"
+    # A run that did not reach its own completion line contributes a PARTIAL
+    # census that looks exactly like a small clean one -- the counts below are
+    # then silently short. `JdkOnlyCensusLoadProbe` deadlocked in its `net`
+    # section roughly 1 run in 20 until 2026-08-05 (a registry read guard held
+    # across the listener poll), and during that period a truncated run was
+    # briefly read as a behavioural difference between two binaries. Check the
+    # terminator, not just the exit code: a probe can also fail a section and
+    # still exit 0.
+    case "$P" in
+      JdkOnlyCensusLoadProbe) want="CENSUSLOAD sections=" ;;
+      JdkOnlyBreadthProbe)    want="PROBE2 sections=" ;;
+      JdkOnlyIcHotProbe)      want="ICHOT done" ;;
+      *)                      want="" ;;
+    esac
+    complete=yes
+    if [ -n "$want" ] && ! grep -q "$want" "$OUT/ov-$MODE-$P.txt"; then
+      complete=no
+      PARTIAL_RUNS=$((PARTIAL_RUNS + 1))
+    fi
+    echo "--- $MODE $P exit=$rc complete=$complete lines=$n ---" >> "$LOG"
   done
 done
 
+if [ "$PARTIAL_RUNS" -gt 0 ]; then
+  echo "" >> "$LOG"
+  echo "!!! $PARTIAL_RUNS of the census runs above did NOT complete. Every count" >> "$LOG"
+  echo "!!! below is a FLOOR of a floor -- do not A/B against it." >> "$LOG"
+fi
+
 echo "" >> "$LOG"
-echo "=== distinct (class, slot, value kind, real descriptor) sites ===" >> "$LOG"
+echo "=== distinct (op, class, slot, value kind, real descriptor) sites ===" >> "$LOG"
+# The hunter's line reads `suspect native set_field [reasons]:` / `... get_field
+# [reasons]:` since L4 (2026-08-05) — it used to read `destructive native
+# set_field:` and cover writes only. Both spellings are matched so this script
+# can score a PRE-L4 binary and a post-L4 one in the same A/B, which is the
+# whole point of running it twice.
 cat "$OUT"/ov-*.txt 2>/dev/null \
-  | grep "destructive native set_field" \
+  | grep -E "(destructive|suspect) native (set|get)_field" \
   | sed -E 's/value=(Int|Long|Float|Double|Object)\([^)]*\)/value=\1/' \
-  | sed -E 's/^.*class=/class=/' \
+  | sed -E 's/ model=[^ ]* real=[^ ]* verdict=[A-Za-z]+//' \
+  | sed -E 's/^.*(set_field|get_field)[^:]*:.*class=/\1 class=/' \
   | sort | uniq -c | sort -rn >> "$LOG"
 
-echo "MEASURECOMPLETE" >> "$LOG"
+echo "" >> "$LOG"
+echo "=== shadow-layout diff: classes whose model disagrees with the image ===" >> "$LOG"
+# L4 step 3. One line per class, emitted at define time, independent of whether
+# any native ever touches the class — so this half of the census does not depend
+# on the probe reaching the code.
+cat "$OUT"/ov-*.txt 2>/dev/null \
+  | grep "^\[OVERLAY-LAYOUT\] " \
+  | grep -v "^\[OVERLAY-LAYOUT\]   " \
+  | sed -E 's/^\[OVERLAY-LAYOUT\] //' \
+  | sort -u >> "$LOG"
+
+echo "" >> "$LOG"
+echo "=== shadow-layout diff: disagreeing slots ===" >> "$LOG"
+cat "$OUT"/ov-*.txt 2>/dev/null \
+  | grep -E "^\[OVERLAY-LAYOUT\]   slot .* (TYPE|NAME) " \
+  | sed -E 's/^\[OVERLAY-LAYOUT\]   //' \
+  | sort | uniq -c | sort -rn >> "$LOG"
+
+if [ "$PARTIAL_RUNS" -gt 0 ]; then
+  echo "MEASUREPARTIAL runs_incomplete=$PARTIAL_RUNS" >> "$LOG"
+else
+  echo "MEASURECOMPLETE" >> "$LOG"
+fi
 cat "$LOG"

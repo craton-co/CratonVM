@@ -818,7 +818,13 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     let u2 = "jdk/internal/misc/Unsafe";
     // Same as the `sun/misc/Unsafe` entry above: JNI binding is done at
     // registry-build time, so the method genuinely has no work to do.
-    r.register(u2, "registerNatives", "()V", native_noop);
+    r.register_with_kind(
+        u2,
+        "registerNatives",
+        "()V",
+        native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
     r.register(u2, "<clinit>", "()V", |ctx, _args| {
         let class_name = "jdk/internal/misc/Unsafe";
         let unsafe_obj = alloc_concurrent_synthetic(ctx, class_name, 0);
@@ -871,59 +877,68 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)I",
         native_unsafe_array_index_scale,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "compareAndSetInt",
         "(Ljava/lang/Object;JII)Z",
         native_unsafe_cas_int,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "compareAndSetLong",
         "(Ljava/lang/Object;JJJ)Z",
         native_unsafe_cas_long,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "compareAndSetReference",
         "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
         native_unsafe_cas_object,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getIntVolatile",
         "(Ljava/lang/Object;J)I",
         native_unsafe_get_int_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putIntVolatile",
         "(Ljava/lang/Object;JI)V",
         native_unsafe_put_int_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getLongVolatile",
         "(Ljava/lang/Object;J)J",
         native_unsafe_get_long_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putLongVolatile",
         "(Ljava/lang/Object;JJ)V",
         native_unsafe_put_long_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getReferenceVolatile",
         "(Ljava/lang/Object;J)Ljava/lang/Object;",
         native_unsafe_get_object_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putReferenceVolatile",
         "(Ljava/lang/Object;JLjava/lang/Object;)V",
         native_unsafe_put_object_volatile,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     // Acquire/Release variants — same as volatile in our single-threaded model
     r.register(
@@ -987,65 +1002,75 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JI)V",
         native_unsafe_put_int_volatile,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getReference",
         "(Ljava/lang/Object;J)Ljava/lang/Object;",
         native_unsafe_get_object,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putReference",
         "(Ljava/lang/Object;JLjava/lang/Object;)V",
         native_unsafe_put_object,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getInt",
         "(Ljava/lang/Object;J)I",
         native_unsafe_get_int_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putInt",
         "(Ljava/lang/Object;JI)V",
         native_unsafe_put_int_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getLong",
         "(Ljava/lang/Object;J)J",
         native_unsafe_get_long_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putLong",
         "(Ljava/lang/Object;JJ)V",
         native_unsafe_put_long_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getShort",
         "(Ljava/lang/Object;J)S",
         native_unsafe_get_short_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putShort",
         "(Ljava/lang/Object;JS)V",
         native_unsafe_put_short_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "getChar",
         "(Ljava/lang/Object;J)C",
         native_unsafe_get_char_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "putChar",
         "(Ljava/lang/Object;JC)V",
         native_unsafe_put_char_mb,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     // Unaligned access variants (C16). When the target is a `byte[]` (every
     // HeapByteBuffer's backing store) a typed read/write must assemble or
@@ -1152,14 +1177,33 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(u2, "storeFence", "()V", native_unsafe_fence);
     r.register(u2, "loadFence", "()V", native_unsafe_fence);
-    r.register(u2, "fullFence", "()V", native_unsafe_fence);
-    r.register(u2, "park", "(ZJ)V", native_unsafe_park);
-    r.register(u2, "unpark", "(Ljava/lang/Object;)V", native_unsafe_unpark);
-    r.register(
+    r.register_with_kind(
+        u2,
+        "fullFence",
+        "()V",
+        native_unsafe_fence,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        u2,
+        "park",
+        "(ZJ)V",
+        native_unsafe_park,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        u2,
+        "unpark",
+        "(Ljava/lang/Object;)V",
+        native_unsafe_unpark,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
         u2,
         "allocateInstance",
         "(Ljava/lang/Class;)Ljava/lang/Object;",
         native_unsafe_allocate_instance,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     r.register(
         u2,
@@ -1212,14 +1256,27 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_allocate_memory_realloc,
     );
     r.register(u, "freeMemory", "(J)V", native_unsafe_free_memory_ext);
-    r.register(u2, "allocateMemory0", "(J)J", native_unsafe_allocate_memory);
-    r.register(
+    r.register_with_kind(
+        u2,
+        "allocateMemory0",
+        "(J)J",
+        native_unsafe_allocate_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
         u2,
         "reallocateMemory0",
         "(JJ)J",
         native_unsafe_allocate_memory_realloc,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory_ext);
+    r.register_with_kind(
+        u2,
+        "freeMemory0",
+        "(J)V",
+        native_unsafe_free_memory_ext,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // monitorEnter / monitorExit — manual synchronization. These take the
     // VM's real monitor, not a no-op: see `native_unsafe_monitor_enter`.
@@ -1255,11 +1312,12 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Throwable;)V",
         native_unsafe_throw_exception,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "throwException",
         "(Ljava/lang/Throwable;)V",
         native_unsafe_throw_exception,
+        cratonvm_native_api::NativeKind::Bridge,
     );
 
     // shouldBeInitialized(Class) — "is this class still uninitialized?".
@@ -1278,11 +1336,12 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Z",
         native_unsafe_should_be_initialized,
     );
-    r.register(
+    r.register_with_kind(
         u2,
         "shouldBeInitialized0",
         "(Ljava/lang/Class;)Z",
         native_unsafe_should_be_initialized,
+        cratonvm_native_api::NativeKind::Bridge,
     );
 
     // staticFieldBase — returns the declaring class's mirror, which is what the
@@ -1363,23 +1422,26 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_cds_is_sharing_enabled0,
     );
-    r.register(
+    r.register_with_kind(
         cds_cls,
         "logLambdaFormInvoker",
         "(Ljava/lang/String;)V",
         native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         cds_cls,
         "initializeFromArchive",
         "(Ljava/lang/Class;)V",
         native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         cds_cls,
         "defineArchivedModules",
         "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     // `getRandomSeedForDumping()` — 0 means "not dumping", and 0 is the right
     // answer here even under `-Xshare:dump`. Its one consumer is
@@ -1389,20 +1451,22 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // CratonVM's archive holds class bytes only — no archived
     // `ImmutableCollections` state — so pinning the salt would remove
     // iteration-order randomisation from an ordinary run and buy nothing.
-    r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
+    r.register_with_kind(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
-    });
-    r.register(
+    }, cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(
         cds_cls,
         "dumpClassList",
         "(Ljava/lang/String;)V",
         native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         cds_cls,
         "dumpDynamicArchive",
         "(Ljava/lang/String;)V",
         native_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
 
     // defineClass / defineClass0 — real `define_class_full`-routed impl. These
@@ -1413,7 +1477,13 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // injection no longer silently gets `null` back if a future registrar lands
     // after this one.
     r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
-    r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
+    r.register_with_kind(
+        u2,
+        "defineClass0",
+        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        unsafe_natives::native_unsafe_define_class,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // defineAnonymousClass — legacy API for defining hidden classes (used by old Lambda/invoke)
     // Signature: defineAnonymousClass(Class<?> hostClass, byte[] data, Object[] cpPatches) -> Class<?>

@@ -253,6 +253,64 @@ public class JitPreciseHandlerFrame {
         return r;
     }
 
+    // ---- instanceofStep: the protected range holds an `instanceof` ---------
+
+    /**
+     * The `instanceof` shape — and the reason `loopStep` above had to give one
+     * up.
+     *
+     * `instanceof` is opcode 0xc1. It used to sit inside
+     * `may_throw_without_precise_frame`'s `0xbb..=0xc1` range, so a protected
+     * range containing one refused the WHOLE method — even though the x64
+     * lowering of `instanceof` cannot throw: it emits one call to
+     * `jit_instanceof`, which returns 0 or 1 on every path and never stashes a
+     * pending exception. That is why the note on `loopStep` records its first
+     * draft as a false pass in BOTH arms of its own A/B: the method under test
+     * never compiled, so neither arm exercised anything.
+     *
+     * `tag` is a non-parameter local assigned before the try and read inside
+     * the handler, so this method needs the precise-handler-frame machinery —
+     * it exercises the gate rather than side-stepping it. The range holds both
+     * an `instanceof` and a throwing `invokeinterface`, so admitting 0xc1 is
+     * held to the real shape: it must not disturb frame publication for the
+     * invoke that does throw.
+     */
+    static int instanceofStep(int i, boolean fail) {
+        Cell tag = new Cell(i + 7);
+        Step step = fail ? new Thrower() : new Adder(3);
+        int r = 0;
+        try {
+            if (step instanceof Adder) {
+                r = 1;
+            }
+            r += step.apply(i);
+        } catch (Boom b) {
+            // Reads `tag`, which the params-only reconstruction cannot restore.
+            return tag.v * 10;
+        }
+        return r + tag.v;
+    }
+
+    public static int instanceofMismatches() {
+        int bad = 0;
+        for (int i = 0; i < 20000; i++) {
+            int v = i % 97;
+            boolean fail = (i % 3) == 0;
+            int got;
+            try {
+                got = instanceofStep(v, fail);
+            } catch (Boom escaped) {
+                bad++;
+                continue;
+            }
+            int want = fail ? (v + 7) * 10 : 1 + (v + 3) + (v + 7);
+            if (got != want) {
+                bad++;
+            }
+        }
+        return bad;
+    }
+
     public static int loopMismatches() {
         int bad = 0;
         for (int i = 0; i < 20000; i++) {

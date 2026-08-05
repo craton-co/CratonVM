@@ -1225,6 +1225,38 @@ pub(crate) fn create_string_or_oom(
     )))
 }
 
+/// [`create_string_or_oom`] for UTF-16 code units.
+///
+/// Identical escalation ladder — the only difference is that the source is a
+/// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
+/// allocated `String`. String concatenation builds its result this way; see
+/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+pub(crate) fn create_string_from_units_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    units: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_from_units as try_new_string;
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", units.len()),
+        },
+    )))
+}
+
 pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
@@ -1753,6 +1785,38 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        // A real `jdk.internal.ref.Cleaner` is NOT the synthetic `Cleanable`
+        // shape the rest of this loop assumes (field 0 = action, field 1 =
+        // cleaned flag) — its slots are `PhantomReference`'s. It carries its own
+        // `clean()`, which unlinks it from the class's static list and runs its
+        // thunk exactly once, and that is precisely what the JDK's
+        // `ReferenceHandler` calls when it sees one. Dispatch to it and skip the
+        // `Cleanable` decoding entirely: reading field 1 of a `Cleaner` as a
+        // "cleaned" flag would be reading its `queue`.
+        //
+        // See `native_phantom_ref_init` for why these arrive here at all.
+        {
+            let class_id = shared.mem.heap.class_id_of(cleanable);
+            let is_jdk_cleaner = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .is_some_and(|c| c.name.as_ref() == "jdk/internal/ref/Cleaner");
+            if is_jdk_cleaner {
+                // Errors are swallowed per the Cleaner contract, exactly as for
+                // the `Cleanable` arm below.
+                let _ = crate::vm::invoke_shared(
+                    shared,
+                    thread,
+                    "jdk/internal/ref/Cleaner",
+                    "clean",
+                    "()V",
+                    &[Value::Object(Some(cleanable))],
+                );
+                continue;
+            }
+        }
         // Idempotency: skip if user code already invoked clean().
         let already = matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1),);
         if already {
@@ -1900,6 +1964,7 @@ pub(super) fn process_references_after_gc(
             pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
         };
         let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
             &is_marked,
             pointer_map,
         );
@@ -2614,6 +2679,64 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     total_size: usize,
 ) -> Option<ObjectRef> {
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
+}
+
+/// The ARRAY twin of [`tlab_alloc_object_guarded_refill`], for the JIT's
+/// `newarray`/`anewarray` helpers.
+///
+/// Until this existed the JIT had no TLAB path for arrays *at all*. Its object
+/// sites bump inline (`emit_inline_tlab_new`) and miss into the guarded refill
+/// above; its array sites had neither, so every single JIT-compiled array
+/// allocation went to `try_alloc_young_probe` + `try_alloc_array`, which take
+/// the global `young_from` mutex twice — the second time holding it across the
+/// bump, the zeroing AND the header init, so hold time scales with the array's
+/// size. The interpreter's `gc_alloc_array` grew its TLAB arm on 2026-07-25
+/// (`7888b80b6`, +36% aggregate at 4 threads) and the JIT's was left behind;
+/// `AllocScaleProbe` reports the difference as a `long[16]` aggregate scaling
+/// factor stuck near 1.00x while `new Object()` scales.
+///
+/// `refill_needs_young_room = true` for the same reason the object twin passes
+/// it: on this path a refill that forces a collection is worse than spilling to
+/// old gen, because the caller has a cheaper fallback and, unlike the
+/// interpreter, may be holding JIT frames the collector cannot map precisely.
+#[inline(always)]
+pub(crate) fn tlab_alloc_array_guarded_refill(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    element_type: ArrayElementType,
+    length: usize,
+) -> Option<ObjectRef> {
+    use cratonvm_gc::heap::{ObjectKind, HEADER_SIZE};
+    let length_u32 = u32::try_from(length).ok()?;
+    let data_size = cratonvm_gc::heap::array_data_size_checked(length, element_type)?;
+    let total_size = HEADER_SIZE.checked_add(data_size)?;
+    // Anything at or above the TLAB's per-allocation cap goes down the ordinary
+    // path, which owns the young-vs-old-gen (humongous) routing decision.
+    if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
+        return None;
+    }
+    let obj = tlab_alloc_shaped_inner(
+        thread,
+        shared,
+        class_id,
+        TlabShape::Array {
+            element_type,
+            length_u32,
+        },
+        total_size,
+        true,
+    )?;
+    cratonvm_gc::a2dbg::record(
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        ObjectKind::Array as u8,
+        element_type as u8,
+        length_u32,
+        length_u32,
+        total_size,
+    );
+    Some(obj)
 }
 
 /// DBG (CRATONVM_DBG_INVOKESTATS): counts invoke-dispatch path outcomes to
@@ -3544,6 +3667,31 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                     thread.thread_id.0,
                 );
             }
+        }
+    }
+    // H2-CID0: once per collection per thread, ask whether any LIVE frame slot
+    // now points into memory the collector reclaimed. The blocked-region
+    // deposit/wake pair covers a PARKED thread; this covers a RUNNING one, and
+    // it bounds the loss window to "since the previous safepoint" — which no
+    // reader-side reporter can do, because by the time a `checkcast` or an
+    // `invoke` trips over the address, any number of collections have passed.
+    //
+    // One relaxed load per publish on the common path; the frame walk runs only
+    // when the collection counter actually moved. Unconditional, and that is
+    // the point: this family has been chased across four sessions on runs that
+    // were never armed.
+    {
+        thread_local! {
+            static AUDIT_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.mem.heap.collection_count();
+        let prev = AUDIT_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            crate::memory::reclaim_guard::audit_thread_frames(
+                shared,
+                thread,
+                "running frame slot (safepoint)",
+            );
         }
     }
     // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
@@ -4942,7 +5090,11 @@ pub(super) fn g1_remark_process_references(
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
     let no_moves = std::collections::HashMap::new();
     let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(is_marked, &no_moves);
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
+            is_marked,
+            &no_moves,
+        );
     let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(

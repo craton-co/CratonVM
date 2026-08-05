@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), deny(clippy::panic, clippy::unimplemented, clippy::todo,))]
 
 use crate::classloading::resolution::MethodHandleKind;
+use crate::classloading::shadow_layout::ShadowLayoutDiff;
 use crate::classloading::ClassId;
 use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use crate::memory::heap::{ArrayElementType, ObjectKind};
@@ -1448,6 +1449,18 @@ fn blockgc_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some())
+}
+
+/// Cached `CRATONVM_DBG_HEAPCOPY` gate — the managed-heap-destination tripwire
+/// on `copy_to_native_memory`. PERF: that tripwire sat on the single-byte
+/// `DirectByteBuffer.put` path, so an uncached `runtime_var_os` probe ran once
+/// per byte written through a direct buffer. Same read-once treatment as
+/// [`blockgc_dbg`] and for the same reason.
+#[inline]
+fn heapcopy_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some())
 }
 
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
@@ -3277,42 +3290,117 @@ fn resolve_field_descriptor_byte_cached(
 /// This replaces the previous `impl NativeContext for Vm`. Native methods
 /// receive a `&mut NativeContextImpl` which provides access to the shared
 /// VM state and the calling thread's state.
-/// Would `coerce_field_value_by_descriptor(value, desc)` DESTROY `value`?
+/// Does `value` disagree with the slot's declared descriptor across the
+/// reference/primitive boundary?
 ///
-/// Only the two cross-type-class cases lose data: a primitive value landing
-/// in a reference-typed (`L`/`[`) slot coerces to `Object(None)`, and a
-/// non-null reference value landing in a primitive slot coerces to a numeric
-/// reinterpretation of the pointer. Same-type-class tag normalization
-/// (Long-as-Double -> Long, `Object(None)`/`Uninitialized` -> typed zero) is
-/// benign and is NOT flagged. Real bytecode (verified) never triggers the
-/// cross-type cases — only a synthetic overlay bound to a real JDK class does.
-fn overlay_write_is_destructive(value: Value, desc: u8) -> bool {
+/// A native that reaches a real JDK object by a slot index chosen against
+/// CratonVM's own fabricated layout writes whatever its model says lives there.
+/// When the model and the image disagree about *type class*, this is the tell:
+/// a primitive landing in a reference-typed (`L`/`[`) slot, or a reference
+/// landing in a primitive one. Real (verified) bytecode never does either.
+/// Same-type-class tag normalization (Long-as-Double -> Long, `Uninitialized`
+/// -> typed zero) is benign and is NOT flagged.
+///
+/// **L4 gap 3, 2026-08-05: `Object(None)` over a primitive now counts.** The
+/// predicate used to require `Object(Some(_))`, on the reasoning that a null
+/// coerces to a typed zero and so destroys nothing. That is true about the
+/// *value* and false about the *defect*: the native still believed it was
+/// clearing a reference field and still wrote a slot the image declares as an
+/// `int`. `native_props_init` writing a null to `PROPS_FIELD_DEFAULTS` — which
+/// is `loadFactor` on a real `java.util.Properties` — is the measured example,
+/// and it never appeared in any census. The function is named for the mismatch
+/// rather than for the damage because that is what it actually tests.
+fn overlay_access_is_cross_type(value: Value, desc: u8) -> bool {
     match desc {
         b'L' | b'[' => matches!(
             value,
             Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)
         ),
+        // `Object(_)`, not `Object(Some(_))`: see the gap-3 note above.
+        // `Uninitialized` stays out — it is the allocator's "no value yet" tag,
+        // not a claim by any native about what the slot holds.
         b'J' | b'D' | b'F' | b'I' | b'B' | b'C' | b'S' | b'Z' => {
-            matches!(value, Value::Object(Some(_)))
+            matches!(value, Value::Object(_))
         }
         _ => false,
     }
 }
 
-/// Cold path for the overlay-corruption hunter. Logs the destructive native
-/// field write: the bound class (real JDK class whose declared field
-/// descriptor is coercing the overlay value away), the slot, the value being
-/// lost, and the native caller's Java frames so the offending native is
-/// directly identifiable. Gated by `CRATONVM_DBG_OVERLAY`.
+thread_local! {
+    /// Per-class shadow-layout diffs, memoized so the access-site hunter's
+    /// check is a map lookup plus an array index instead of a hierarchy walk
+    /// under the class-manager lock. Stamped with `class_origin_epoch()` (a
+    /// stub promoted to real bytes changes the answer) and with the VM identity
+    /// (a `SharedVm` address can be recycled by a later VM in-process).
+    ///
+    /// Populated only when `CRATONVM_DBG_OVERLAY` is on, so it costs a default
+    /// run nothing.
+    static SHADOW_LAYOUT_CACHE: std::cell::RefCell<
+        rustc_hash::FxHashMap<(usize, u32), (u64, Option<std::sync::Arc<ShadowLayoutDiff>>)>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// The shadow-layout diff for `class_id`, or `None` when the class carries no
+/// fabricated slot model or is itself a stub.
+fn shadow_layout_for(
+    shared: &SharedVm,
+    class_id: ClassId,
+) -> Option<std::sync::Arc<ShadowLayoutDiff>> {
+    let vm_key = shared.vm_identity;
+    let epoch = cratonvm_classloading::class_origin_epoch();
+    let key = (vm_key, class_id.as_u32());
+    if let Some(hit) = SHADOW_LAYOUT_CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(stamp, _)| *stamp == epoch)
+            .map(|(_, v)| v.clone())
+    }) {
+        return hit;
+    }
+    // Deliberately computed with the lock taken and released here, not held
+    // across the log below: `cold_log_overlay_access` re-acquires it, and two
+    // sequential reads are safe where a nested one is not.
+    let computed = {
+        let cm = shared.classes.class_manager.read();
+        cm.shadow_layout_diff(class_id).map(std::sync::Arc::new)
+    };
+    SHADOW_LAYOUT_CACHE.with(|c| {
+        c.borrow_mut().insert(key, (epoch, computed.clone()));
+    });
+    computed
+}
+
+/// Why the hunter fired. A single access can trip more than one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayReason {
+    /// The value's type class disagrees with the slot's declared descriptor.
+    /// The original signal: catches an `Int` over a reference and a reference
+    /// (now including `null`) over a primitive.
+    CrossType,
+    /// The slot is one where CratonVM's fabricated model for this class and the
+    /// loaded image disagree, whatever the value's type tag says. This is the
+    /// only signal that reaches a same-kind wrong-slot access — an `Int` into
+    /// the wrong `Int` slot type-checks and would otherwise pass silently.
+    ModelSlot,
+}
+
+/// Cold path for the overlay hunter. Logs the suspect native field access: the
+/// bound class (the real JDK class whose layout the access is addressing), the
+/// slot, the value, why it fired, and the native caller's Java frames so the
+/// offending native is identifiable. Gated by `CRATONVM_DBG_OVERLAY`.
 #[cold]
 #[inline(never)]
-fn cold_log_overlay_corruption(
+#[allow(clippy::too_many_arguments)]
+fn cold_log_overlay_access(
     shared: &SharedVm,
     thread: &JvmThread,
     class_id: ClassId,
     index: usize,
     value: Value,
     desc: u8,
+    is_read: bool,
+    reasons: &[OverlayReason],
+    shadow: Option<&ShadowLayoutDiff>,
 ) {
     let class_name = {
         let cm = shared.classes.class_manager.read();
@@ -3335,9 +3423,34 @@ fn cold_log_overlay_corruption(
             .map(|c| c.name.to_string())
             .unwrap_or_else(|| format!("<cid {}>", class_id.as_u32()))
     };
+    let op = if is_read { "get_field" } else { "set_field" };
+    let why = reasons
+        .iter()
+        .map(|r| match r {
+            OverlayReason::CrossType => "cross-type",
+            OverlayReason::ModelSlot => "model-slot",
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    // The model's own claim about the slot, when we have one. This is what
+    // turns a same-kind report from "something is odd here" into a statement:
+    // *our* model calls slot 4 `parallelLockMap`, the image calls it `classes`.
+    let model = shadow
+        .and_then(|s| s.slot(index))
+        .map(|s| {
+            format!(
+                " model={}:{} real={}:{} verdict={}",
+                s.model_name,
+                s.model_desc,
+                s.real_name.as_deref().unwrap_or("<none>"),
+                s.real_desc.as_deref().unwrap_or("<none>"),
+                s.verdict.tag(),
+            )
+        })
+        .unwrap_or_default();
     eprintln!(
-        "[OVERLAY] destructive native set_field: class={class_name} slot={index} \
-         value={value:?} real_field_desc='{}' (overlay layout bound to a real JDK class)",
+        "[OVERLAY] suspect native {op} [{why}]: class={class_name} slot={index} \
+         value={value:?} real_field_desc='{}'{model} (overlay layout bound to a real JDK class)",
         desc as char,
     );
     for f in thread.frames.iter().rev().take(6) {
@@ -3372,6 +3485,96 @@ fn cold_log_overlay_corruption(
             );
         }
     }
+}
+
+/// Has this `(class, slot, read/write)` already produced a model-slot report?
+///
+/// Returns `true` exactly once per distinct site. Process-global on purpose —
+/// a per-thread set would print one line per thread for the same site, which is
+/// noise, not information. Only ever populated under `CRATONVM_DBG_OVERLAY`, so
+/// a default run and every unit test leave it empty.
+///
+/// This is diagnostic de-duplication state, not `--jdk-only` feature state (the
+/// contract's "no process globals" clause is about the latter), and it is the
+/// same shape as the `static N: AtomicU32` print caps the two neighbouring
+/// diagnostics in this file already use.
+fn first_model_slot_report(class_id: ClassId, index: usize, is_read: bool) -> bool {
+    // `CRATONVM_DBG=overlay-nodedup` turns the cap off, for when you want
+    // per-site COUNTS rather than per-site presence.
+    static NODEDUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NODEDUP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_NODEDUP").is_some()
+    }) {
+        return true;
+    }
+    static SEEN: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashSet<(u32, u32, bool)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .insert((class_id.as_u32(), index as u32, is_read))
+}
+
+/// Decide whether a native positional field access is suspect, and report it.
+///
+/// One entry point for both halves — `NativeContextImpl::get_field` and
+/// `::set_field` — because the two questions are the same question. The write
+/// path has been instrumented since the hunter was written; **the read path had
+/// not, and reads are arguably the more common half**: a native that reads slot
+/// 3 of a real `java.util.Properties` gets a `float` where its model says a
+/// reference lives, misbehaves, and nothing ever said so.
+///
+/// `value` is what is being written, or what the read is about to return.
+#[inline]
+fn overlay_check_access(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    class_id: ClassId,
+    index: usize,
+    value: Value,
+    desc: u8,
+    is_read: bool,
+) {
+    let mut reasons: [OverlayReason; 2] = [OverlayReason::CrossType; 2];
+    let mut n = 0usize;
+    if overlay_access_is_cross_type(value, desc) {
+        reasons[n] = OverlayReason::CrossType;
+        n += 1;
+    }
+    let shadow = shadow_layout_for(shared, class_id);
+    let model_slot = shadow.as_ref().is_some_and(|s| s.is_disagreeing(index));
+    if model_slot {
+        reasons[n] = OverlayReason::ModelSlot;
+        n += 1;
+    }
+    if n == 0 {
+        return;
+    }
+    // Volume control, and only for the NEW signal. A cross-type access still
+    // prints every time, so the pre-L4 census rows keep their counts and an A/B
+    // against a pre-L4 binary compares like with like.
+    //
+    // A model-slot-only report is different in kind: the complete list of
+    // disagreeing slots is already printed once per class by the shadow-layout
+    // census, so the per-access line's whole job is to NAME the native, and one
+    // occurrence does that. Without this, `java/lang/String` slot 1 alone —
+    // model says reference, image says `byte coder` — buries the run.
+    if n == 1 && reasons[0] == OverlayReason::ModelSlot
+        && !first_model_slot_report(class_id, index, is_read)
+    {
+        return;
+    }
+    cold_log_overlay_access(
+        shared,
+        thread,
+        class_id,
+        index,
+        value,
+        desc,
+        is_read,
+        &reasons[..n],
+        shadow.as_deref(),
+    );
 }
 
 /// Run a previously yielded virtual-thread continuation on a pool carrier.
@@ -3938,112 +4141,7 @@ impl<'a> NativeContextImpl<'a> {
     ///
     /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
-        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        const PROBE_BUDGET: u64 = 200_000;
-        let heap = &self.shared.mem.heap;
-        // Nothing this thread holds can have been reclaimed since the last
-        // time this walk proved it clean unless a COLLECTION ran in between,
-        // so that is the audit's real precondition — and it is what bounds the
-        // cost. Both call sites sit on the blocked-region entry/exit path,
-        // which a workload doing file or socket I/O crosses thousands of times
-        // between two collections; without this gate the audit would walk
-        // every frame's locals and stack on each of those crossings, doubling
-        // a `deposit_root_snapshot` that already walks exactly the same slots.
-        // With it the audit costs at most one frame walk per collection per
-        // thread, which is the rate at which it can possibly have anything new
-        // to say.
-        //
-        // Thread-local because both sites run ON the owning thread, and it is
-        // seeded to `u64::MAX` so the first audit on a thread always runs.
-        // Updated on every audit rather than only at block entry, so a wake
-        // with no matching entry (or a nested blocked region) still compares
-        // against the last time THIS thread looked.
-        thread_local! {
-            static LAST_AUDITED_GC_COUNT: std::cell::Cell<u64> =
-                const { std::cell::Cell::new(u64::MAX) };
-        }
-        let gc_count = heap.collection_count();
-        if LAST_AUDITED_GC_COUNT.with(|c| c.replace(gc_count)) == gc_count {
-            return;
-        }
-        let probe = |addr: usize, ctx: &dyn Fn() -> String| {
-            if PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PROBE_BUDGET {
-                return;
-            }
-            // Free-list membership FIRST, and only then the full report. A
-            // zeroed header is ambiguous on its own — `java.lang.Object` is
-            // `ClassId(0)` and so is a genuine `new Object()` — and the young
-            // span ring cannot settle it either, because the allocator
-            // re-serves young spans. Asking the heap whether the address is
-            // inside a hole right now is the one question with no false
-            // positives: a live object is never in a free block, never past
-            // the allocation frontier, and never in the inactive semispace.
-            if heap.reclaimed_hole_at(addr).is_none() {
-                return;
-            }
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
-                self.shared,
-                addr,
-                site,
-                &ctx(),
-                0,
-            );
-        };
-        for (fi, fr) in self.thread.frames.iter().enumerate() {
-            let check = |o: cratonvm_types::ObjectRef, what: &str, idx: usize| {
-                let a = o.as_ptr() as usize;
-                // Region membership first: a lost-tag slot can hold a
-                // non-address, and the header read below is a raw
-                // dereference.
-                if heap.is_heap_addr(a).is_none() {
-                    return;
-                }
-                // `ClassId(0)` alone is not the face. A PRIMITIVE ARRAY also
-                // reads back class id 0 — array headers carry the COMPONENT
-                // class id (JVMS §4.4.1; see `virtual_dispatch_target_cached`)
-                // and `long[]`/`int[]` have none — so gating on the class id
-                // alone flags every `long[] toc` local in
-                // `FileStore.dropUnusedChunks` on every wake. Requiring
-                // `kind == Object` costs one more byte load and drops that
-                // whole population; the all-zero header the collector leaves
-                // behind reads `kind == Object` because that is discriminant
-                // zero.
-                if heap.class_id_of(o).as_u32() != 0
-                    || heap.kind_of(o) != cratonvm_types::ObjectKind::Object
-                {
-                    return;
-                }
-                probe(a, &|| {
-                    format!(
-                        "tid={} frame#{fi} {}.{} pc={} {what}[{idx}]",
-                        self.thread.thread_id.0,
-                        fr.class_name(),
-                        fr.method_name(),
-                        fr.pc,
-                    )
-                });
-            };
-            // Only locals the collector itself would have rooted. A local
-            // the liveness analysis calls dead is SUPPOSED to be reclaimable:
-            // `H2ConcurrentUpdateLoop.main` slot 8 holds the seed loop's
-            // `PreparedStatement` for the rest of the method and read back as
-            // a free block on every wake. Counting those separately keeps the
-            // signal — a LIVE local the collector took anyway — visible.
-            let live_mask = fr.live_locals_mask_here();
-            for li in 0..fr.locals_len() {
-                if li < 64 && live_mask & (1u64 << li) == 0 {
-                    continue;
-                }
-                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
-                    check(o, "local", li);
-                }
-            }
-            for si in 0..fr.stack.len() {
-                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
-                    check(o, "stack", si);
-                }
-            }
-        }
+        crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
 
     /// Deposit a root snapshot of this thread's frames into the shared registry.
@@ -6006,7 +6104,12 @@ impl<'a> NativeContextImpl<'a> {
             .collect();
         let dbg = crate::runtime::env_cache::dbg_stub_loader();
         for cid in frame_classes {
-            if cratonvm_native_builtins::classloader::defining_loader_for(cid.as_u32()).is_none() {
+            if cratonvm_native_builtins::classloader::defining_loader_for(
+                self.shared.vm_identity,
+                cid.as_u32(),
+            )
+            .is_none()
+            {
                 continue;
             }
             let driven = crate::runtime::interpreter::drive_defining_loader_load(
@@ -9482,6 +9585,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     // -- Heap access methods --
 
+    fn get_field_typed(&self, obj: ObjectRef, index: usize, descriptor: u8) -> Value {
+        // Same decode as `get_field`, minus `resolve_field_descriptor_byte_cached`
+        // — the caller supplied the answer that lookup would have produced.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        self.shared.mem.heap.get_field_as(obj, index, descriptor)
+    }
+
+    fn get_fields_typed(&self, obj: ObjectRef, slots: &[(usize, u8)], out: &mut [Value]) {
+        // One forwarding read for the whole batch — that is the point.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        for (slot, dst) in slots.iter().zip(out.iter_mut()) {
+            *dst = self.shared.mem.heap.get_field_as(obj, slot.0, slot.1);
+        }
+    }
+
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let obj = self.shared.mem.heap.load_and_forward(obj);
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
@@ -9493,7 +9611,28 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `coerce_field_value_by_descriptor`'s default arm.
         let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self.shared.mem.heap.get_field_as(obj, index, desc),
+            Some(desc) => {
+                let decoded = self.shared.mem.heap.get_field_as(obj, index, desc);
+                // L4 gap 1 — the read half of the overlay hunter. The value
+                // checked is the RAW slot contents, not `decoded`: `get_field_as`
+                // has already coerced the storage tag to the declared descriptor,
+                // so by the time the native sees it the disagreement is gone.
+                // Reading it raw is what makes a slot that some other writer
+                // overlaid visible on the way out.
+                if crate::runtime::env_cache::overlay_corruption_dbg() {
+                    let raw = self.shared.mem.heap.get_field(obj, index);
+                    overlay_check_access(
+                        self.shared,
+                        self.thread,
+                        class_id,
+                        index,
+                        raw,
+                        desc,
+                        true,
+                    );
+                }
+                decoded
+            }
             None => self.shared.mem.heap.get_field(obj, index),
         }
     }
@@ -9588,21 +9727,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => {
-                // Overlay-corruption hunter (CRATONVM_DBG_OVERLAY): a native
-                // writing a primitive value to a reference-typed slot (or a
-                // reference to a primitive slot) is a synthetic overlay bound
-                // to a real JDK class — the descriptor coercion below silently
-                // destroys the value (Int->null / ref->numeric). Surface it.
-                if crate::runtime::env_cache::overlay_corruption_dbg()
-                    && overlay_write_is_destructive(value, desc)
-                {
-                    cold_log_overlay_corruption(
+                // Overlay hunter (CRATONVM_DBG_OVERLAY): a native writing a
+                // primitive value to a reference-typed slot (or a reference to
+                // a primitive slot) is a synthetic overlay bound to a real JDK
+                // class — the descriptor coercion below silently destroys the
+                // value (Int->null / ref->numeric). Surface it.
+                //
+                // L4 gap 2: `overlay_check_access` also fires when the slot is
+                // one where our fabricated model and the loaded image disagree,
+                // *whatever* the value's tag. That is the only way an `Int`
+                // written into the wrong `Int` slot is ever reported — it
+                // type-checks, so the cross-type test above passes it.
+                if crate::runtime::env_cache::overlay_corruption_dbg() {
+                    overlay_check_access(
                         self.shared,
                         self.thread,
                         class_id,
                         index,
                         value,
                         desc,
+                        false,
                     );
                 }
                 self.shared.mem.heap.set_field_as(obj, index, value, desc)
@@ -10828,6 +10972,22 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         queue: Option<ObjectRef>,
     ) {
         use cratonvm_gc::ReferenceType;
+        let ref_addr = reference_obj.as_ptr() as usize;
+        let referent_addr = referent.as_ptr() as usize;
+        let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
+        // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
+        // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
+        // rather than a referent, so it must never reach the pre-GC
+        // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        if ref_type == 4 {
+            self.shared
+                .mem
+                .ref_processor
+                .lock()
+                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            return;
+        }
         let rt = match ref_type {
             0 => ReferenceType::Weak,
             1 => ReferenceType::Soft,
@@ -10835,9 +10995,6 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        let ref_addr = reference_obj.as_ptr() as usize;
-        let referent_addr = referent.as_ptr() as usize;
-        let queue_addr = queue.map(|q| q.as_ptr() as usize);
         self.shared.mem.ref_processor.lock().discover_reference(
             rt,
             ref_addr,
@@ -11181,18 +11338,41 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // Check if this is a virtual thread.
         //
         // Two paths matter here:
-        //   1. Synthetic-mode `Thread`: 5-slot layout with `is_virtual` at
-        //      slot 4 (set by the synthetic Thread.Builder.start native).
+        //   1. Synthetic-mode `Thread`: the fabricated layout, with `is_virtual`
+        //      at `SYNTHETIC_THREAD_VIRTUAL_SLOT` (set by the synthetic
+        //      Thread.Builder.start native).
         //   2. Real-JDK mode (JEP 444): a `BoundVirtualThread` (or any
         //      future `VirtualThread`) extends `BaseVirtualThread`. We must
         //      detect this by walking the class hierarchy вЂ” the synthetic
-        //      slot-4 trick won't work because the real Thread layout puts
-        //      different fields at slot 4. Without this detection, virtual
+        //      slot trick won't work because the real Thread layout puts
+        //      different fields there. Without this detection, virtual
         //      threads created by `Thread.ofVirtual().start(r)` wouldn't
         //      release the carrier semaphore on `Thread.sleep`/`park`,
         //      starving the carrier pool under load (e.g. 10K vthreads).
-        let is_virtual_synthetic = header.num_slots() >= 5
-            && matches!(self.shared.mem.heap.get_field(thread_obj, 4), Value::Int(1));
+        //
+        // The synthetic read is gated on the receiver actually HAVING the
+        // fabricated layout, asked by a field NAME the real class declares and
+        // the stub does not (`eetop`). It used to be gated on
+        // `num_slots() >= 5`, which every real `Thread` satisfies (19 fields),
+        // so the read was landing on the real `contextClassLoader` and was
+        // correct only because a reference can never `matches!` an `Int(1)`.
+        // A slot count cannot identify a layout — that lesson is written down
+        // in three other places in this tree.
+        let is_virtual_synthetic = {
+            const VSLOT: usize =
+                cratonvm_native_builtins::jdk25_concurrency::SYNTHETIC_THREAD_VIRTUAL_SLOT;
+            let fabricated = {
+                let cm = self.shared.classes.class_manager.read();
+                resolve_field_index_in_hierarchy(header.class_id, "eetop", &cm.class_store)
+                    .is_none()
+            };
+            fabricated
+                && header.num_slots() as usize > VSLOT
+                && matches!(
+                    self.shared.mem.heap.get_field(thread_obj, VSLOT),
+                    Value::Int(1)
+                )
+        };
         let is_virtual_real_jdk = {
             let cm = self.shared.classes.class_manager.read();
             // Look up `BaseVirtualThread`'s class id once. If not loaded
@@ -13552,9 +13732,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // routed here with a heap dst). Catch it with the live Java stack so
         // the offending call site is pinned. is_heap_addr is region-membership
         // only (no header read) so it is safe on an arbitrary address.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some()
-            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
-        {
+        if heapcopy_dbg() && self.shared.mem.heap.is_heap_addr(addr as usize).is_some() {
             let n = data.len().min(16);
             eprintln!(
                 "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
@@ -13641,6 +13819,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         self.shared.system_properties.write().remove(&normalized)
     }
 
+    #[track_caller]
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         // Prefer the real class if it can be loaded — `ensure_synthetic_class`
         // returns the existing id when the name is already registered, so a
@@ -13688,6 +13867,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     /// out of the returned `VmError`: the classifier is the authority on
     /// *which* refusal this is, and matching on an error's shape would make
     /// this mapping quietly wrong the day a third refusal is added.
+    #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -14804,7 +14984,7 @@ pub(super) fn convert_element_value(
 // `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
 // proves the VM is dispatching and says nothing about *what*, which is the
 // entire diagnosis: the `nioMemLZF:` residual in
-// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` read as "a long
+// the retired `h2-jitban-longtail1` write-up read as "a long
 // interpreter tail with no second hot spot to attack" for two revisions purely
 // because nobody had the callee histogram.
 //
@@ -18988,11 +19168,29 @@ fn invoke_on_class_shared_inner(
     // Resolve it here, after the reflective Method target is known but before
     // bytecode selection, so it cannot dispatch through the unsupported
     // socket/provider protocol.
-    let class_name = {
+    // ONE read guard for both of the questions the hot prefix asks about
+    // `class_id`: its name, and whether it is a class whose exact-name native
+    // must be preferred over an inherited bytecode body. They used to be two
+    // separate `class_manager.read()` calls on every single invoke; see the
+    // block comment on `prefer_exact_class_native` below for what the second
+    // one decides, and `docs/known-issues/h2/` for the profile that made the
+    // acquisition count worth counting.
+    let (class_name, prefer_exact_class_native) = {
         let cm = shared.classes.class_manager.read();
-        cm.get_class(class_id)
+        let class = cm.get_class(class_id);
+        let class_name = class
             .map(|class| class.name.to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A `String`, not an `Arc<str>` clone: the name outlives this guard,
+        // and `Arc::clone` on a hot class is an atomic RMW that every mutator
+        // performs on the SAME cache line — the identical contention this
+        // coalescing exists to reduce (the JIT's dispatch memo holds its names
+        // as `Rc<str>` for the same reason).
+        let stub_or_interface = class
+            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .unwrap_or(false);
+        let prefer = stub_or_interface || class_name.starts_with("cratonvm/internal/");
+        (class_name, prefer)
     };
     // `cratonvm/internal/*` classes (`UnmodifiableList`/`Map`/`Set`/
     // `Collection`/`EntrySet`/`Itr`/`ListItr`/`MapEntry`, ...) are pure
@@ -19030,15 +19228,7 @@ fn invoke_on_class_shared_inner(
     // invokevirtual, a different, already-correct dispatch path) did not.
     // Lambda-proxy receivers are already handled and returned above, so
     // they never reach this branch.
-    if class_name.starts_with("cratonvm/internal/")
-        || shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_synthetic_stub || c.is_interface())
-            .unwrap_or(false)
-    {
+    if prefer_exact_class_native {
         // Generalises the `cratonvm/internal/*` case above: ANY synthetic-
         // stub class (no real bytecode -- either a permanently-synthetic
         // VM-internal representation, e.g. the concrete class CratonVM
@@ -24321,6 +24511,53 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    /// L4 gap 3 — `Object(None)` over a primitive descriptor.
+    ///
+    /// The predicate used to require `Object(Some(_))` here, so a native
+    /// nulling what its model calls a reference field, on a slot the image
+    /// declares `float`, produced no census row at all. The measured instance
+    /// is `native_props_init` writing `PROPS_FIELD_DEFAULTS` (slot 3), which is
+    /// `java.util.Properties`'s inherited `loadFactor`.
+    #[test]
+    fn a_null_written_over_a_primitive_slot_is_a_cross_type_access() {
+        for desc in [b'I', b'J', b'F', b'D', b'Z', b'B', b'C', b'S'] {
+            assert!(
+                overlay_access_is_cross_type(Value::Object(None), desc),
+                "null over '{}' must report",
+                desc as char
+            );
+            // SAFETY: never dereferenced — the predicate only reads the tag.
+            let some = unsafe { ObjectRef::from_raw(8usize as *mut u8) };
+            assert!(
+                overlay_access_is_cross_type(Value::Object(Some(some)), desc),
+                "a non-null reference over '{}' must still report",
+                desc as char
+            );
+        }
+    }
+
+    /// The other side of the same predicate, so widening it did not turn it
+    /// into "always true": benign same-type-class traffic must stay silent, or
+    /// the census drowns and stops being read.
+    #[test]
+    fn same_type_class_traffic_is_not_reported() {
+        // Primitives into primitive slots.
+        assert!(!overlay_access_is_cross_type(Value::Int(7), b'I'));
+        assert!(!overlay_access_is_cross_type(Value::Long(7), b'J'));
+        assert!(!overlay_access_is_cross_type(Value::Float(0.75), b'F'));
+        // References into reference slots — including null, which is what a
+        // native clearing a real reference field legitimately writes.
+        assert!(!overlay_access_is_cross_type(Value::Object(None), b'L'));
+        assert!(!overlay_access_is_cross_type(Value::Object(None), b'['));
+        // The allocator's "no value yet" tag is not a claim by any native
+        // about what the slot holds, so it stays out in both directions.
+        assert!(!overlay_access_is_cross_type(Value::Uninitialized, b'I'));
+        assert!(!overlay_access_is_cross_type(Value::Uninitialized, b'L'));
+        // A primitive into a reference slot is the original signal.
+        assert!(overlay_access_is_cross_type(Value::Int(16), b'L'));
+        assert!(overlay_access_is_cross_type(Value::Int(16), b'['));
     }
 
     /// Wire a thread into the registry exactly the way `spawn_thread`'s

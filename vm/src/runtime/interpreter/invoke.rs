@@ -2703,6 +2703,47 @@ pub(super) fn try_stackless_invoke(
         class_name
     };
 
+    // H2-CID0, CLONE face -- the `java.lang.Enum` half.
+    //
+    // `Enum.clone()` is `protected final Object clone() { throw new
+    // CloneNotSupportedException(); }` and nothing else, so a dispatch that
+    // lands there is never something the program asked for: javac will not
+    // compile a call to it. Arriving here means virtual dispatch was driven by
+    // a receiver whose class is not the one the call site named -- either an
+    // array dispatched through its COMPONENT class id (`jit/helpers.rs` names
+    // this exact shape for enum-typed arrays) or the stale/reclaimed-ObjectRef
+    // family seen through `clone()` instead of through a `checkcast`.
+    //
+    // `java.lang.Thread.clone()` has the identical property and its own,
+    // richer reporter earlier in this file (site "Thread.clone dispatch",
+    // landed 2026-08-03) -- deliberately NOT repeated here, so a real event
+    // produces one verdict rather than two.
+    //
+    // This closes what the retired
+    // `bug-h2-testmultithread-concurrent-update-timeout` write-up asked for:
+    // `TestMultiThread.testConcurrentUpdate` failed 2 runs in 10 with
+    // `General error: "java.lang.CloneNotSupportedException"` on `COMMIT`
+    // (H2's `Page.copy()` -> `Page.clone()`), and neither occurrence produced a
+    // verdict because nothing on the clone path asked the heap. The old-gen
+    // reclamation ring answers even after the allocator has re-served the
+    // block, which is the case where the receiver reads back as a VALID object
+    // of an unrelated class -- exactly how a `Page` becomes something whose
+    // `clone()` throws.
+    //
+    // Cost on a healthy run: one `&str` comparison per stackless invoke, which
+    // fails on length for every method whose name is not five bytes.
+    if method_name == "clone" && class_name == "java/lang/Enum" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            crate::memory::reclaim_guard::report_reclaimed_receiver(
+                shared,
+                recv.as_ptr() as usize,
+                "Enum.clone dispatch",
+                &format!("{class_name}.{method_name}{descriptor}"),
+                shared.mem.heap.class_id_of(recv).as_u32(),
+            );
+        }
+    }
+
     // Cache the descriptor's return-type byte once for the write-side
     // coercion applied to every native callback's pushed return value.
     // Same class of bug as the read-side `getfield` coercion: a primitive

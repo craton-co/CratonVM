@@ -604,7 +604,7 @@ pub(super) fn should_use_loader_initiated_resolution(
     if crate::runtime::env_cache::loader_aware_resolution() {
         return true;
     }
-    match cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+    match cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
     {
         Some(loader_obj) => {
             is_groovy_class_loader(shared, loader_obj)
@@ -787,7 +787,7 @@ pub(super) fn is_isolated_url_loader_definition(
 ) -> bool {
     use cratonvm_native_api::NativeContext as _;
     let Some(loader) =
-        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
     else {
         return false;
     };
@@ -871,6 +871,7 @@ pub(crate) fn resolve_class_loader_aware(
     //     is worth 1.8x on a class-parsing workload.
     if let Some(component) = array_component_class_name(name) {
         if cratonvm_native_builtins::classloader::defining_loader_for(
+            shared.vm_identity,
             referencing_class_id.as_u32(),
         )
         .is_some()
@@ -919,7 +920,7 @@ pub(crate) fn resolve_class_loader_aware(
     // for initiating-resolution map probes merely because another loader was
     // registered elsewhere in the process.
     let has_registered_defining_loader =
-        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
             .is_some();
     let has_loader_namespace = direct_user_loader || has_registered_defining_loader;
     let isolated_url_definition = if has_registered_defining_loader {
@@ -1039,8 +1040,7 @@ pub(crate) fn resolve_class_loader_aware(
             // the side table `should_use_loader_initiated_resolution` already
             // consulted directly instead of silently downgrading to "not a
             // user loader" on a disagreement.
-            _ => cratonvm_native_builtins::classloader::defining_loader_for(
-                referencing_class_id.as_u32(),
+            _ => cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32(),
             )
             .map(|loader_obj| {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
@@ -1238,7 +1238,7 @@ pub(crate) fn drive_defining_loader_load(
         && (name.contains("EnvironmentPostProcessorsFactory")
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
     let loader_obj_opt =
-        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32());
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32());
     if dbg_trace {
         eprintln!(
             "[LOADER-TRACE] drive_defining_loader_load name={name} referencing_class_id={referencing_class_id:?} defining_loader_for={:?}",

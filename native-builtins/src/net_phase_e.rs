@@ -161,7 +161,7 @@ fn spring_dbg_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::nbflags().spring_dbg)
 }
 
-use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
@@ -2005,10 +2005,11 @@ fn native_inet_get_by_address(
         // an IAE escapes their catch and propagates as an unrelated failure.
         return Err(uhex(format!("addr is of illegal length: {len}")));
     };
-    // `getByAddress` has no separately supplied hostname. Use the same
-    // HotSpot-normalized numeric text for both logical fields; otherwise a
-    // caller that reads the host-side value (such as Jetty's connector setup)
-    // can still observe Rust's RFC-5952-compressed IPv6 form.
+    // Normalize to HotSpot's numeric text before storing anything, or a caller
+    // that reads the address (such as Jetty's connector setup) observes Rust's
+    // RFC-5952-compressed IPv6 form instead of the JDK's uncompressed one.
+    // (This comment used to say the text was stored in "both logical fields";
+    // it is not, since `e092b0f3b` — see below.)
     let ip_text = hotspot_ip_string(&ip_str);
     // `getByAddress(byte[])` is handed raw octets and NO name, so the mirror
     // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
@@ -13993,7 +13994,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // killed any class-init touching NetworkInterface (Gradle's user-home
     // services during ProjectBuilder bootstrap). The real init only caches
     // JNI field IDs; a no-op is faithful.
-    r.register(ni, "init", "()V", |_ctx, _args| Ok(None));
+    r.register_with_kind(ni, "init", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
 
     // IMPLEMENTED (wave 4). This used to return an unconditional `null`,
     // justified by "`getAll()` hands out exactly one interface, loopback, which
@@ -14042,7 +14043,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // These mirror the real JNI bodies: `isUp0` is `IFF_UP && IFF_RUNNING`,
     // `isLoopback0` is `IFF_LOOPBACK`, `isP2P0` is `IFF_POINTOPOINT`,
     // `supportsMulticast0` is `IFF_MULTICAST`.
-    r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    r.register_with_kind(ni, "isUp0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let up = match re8_host_iface_by_name(&name) {
             Some(host) => host.flags & RE8_IFF_UP != 0 && host.flags & RE8_IFF_RUNNING != 0,
@@ -14050,8 +14051,8 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             None => true,
         };
         Ok(Some(Value::Int(i32::from(up))))
-    });
-    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let index = args.get(1).and_then(Value::as_int).unwrap_or(0);
         let loopback = match re8_host_iface_by_name(&name) {
@@ -14059,16 +14060,16 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             None => name == RE8_LOOPBACK_NAME || index == RE8_LOOPBACK_INDEX,
         };
         Ok(Some(Value::Int(i32::from(loopback))))
-    });
-    r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |ctx, args| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(ni, "isP2P0", "(Ljava/lang/String;I)Z", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let p2p = re8_host_iface_by_name(&name)
             .map(|host| host.flags & RE8_IFF_POINTOPOINT != 0)
             // Loopback is not point-to-point.
             .unwrap_or(false);
         Ok(Some(Value::Int(i32::from(p2p))))
-    });
-    r.register(
+    }, NativeKind::Bridge);
+    r.register_with_kind(
         ni,
         "supportsMulticast0",
         "(Ljava/lang/String;I)Z",
@@ -14080,19 +14081,20 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 .unwrap_or(false);
             Ok(Some(Value::Int(i32::from(multicast))))
         },
+        NativeKind::Bridge,
     );
-    r.register(ni, "getMTU0", "(Ljava/lang/String;I)I", |ctx, args| {
+    r.register_with_kind(ni, "getMTU0", "(Ljava/lang/String;I)I", |ctx, args| {
         let name = re8_name_arg(ctx, args, 0);
         let mtu = re8_host_iface_by_name(&name)
             .and_then(|host| host.mtu)
             .unwrap_or_else(re8_loopback_mtu);
         Ok(Some(Value::Int(mtu)))
-    });
+    }, NativeKind::Bridge);
     // `getMacAddr0(byte[] inAddr, String name, int ind)` — static, so the name
     // is argument 1. `inAddr` only disambiguates which binding the caller meant
     // on platforms whose lookup is per-address; the Linux/`/sys` answer is
     // per-interface, so it is not needed.
-    r.register(
+    r.register_with_kind(
         ni,
         "getMacAddr0",
         "([BLjava/lang/String;I)[B",
@@ -14103,8 +14105,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             re8_mac_array(ctx, &mac)
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getAll",
         "()[Ljava/net/NetworkInterface;",
@@ -14112,6 +14115,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             let arr = re8_all_interfaces(ctx);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
     // These three must agree with `getAll()` — a blanket null here used to
     // contradict it outright (`getByName("lo")` reported "no such interface"
@@ -14119,7 +14123,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // search the same host enumeration `getAll()` uses, and fall back to the
     // loopback carrier only where `getAll()` itself does. Null stays the answer
     // for an interface that does not exist — the spec'd "no such interface".
-    r.register(
+    r.register_with_kind(
         ni,
         "getByName0",
         "(Ljava/lang/String;)Ljava/net/NetworkInterface;",
@@ -14133,8 +14137,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getByInetAddress0",
         "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
@@ -14150,6 +14155,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback());
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
     // `boundInetAddress0(InetAddress)` — "is this address configured on some
     // local interface?". This one answers a QUESTION rather than handing back a
@@ -14161,7 +14167,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // would have worked — for 127.0.0.1, always. Answer from the same local-IP
     // enumeration `getAll()` uses (`re8_enumerate_local_ips` now folds in the
     // host's configured addresses, so a secondary NIC is no longer a miss).
-    r.register(
+    r.register_with_kind(
         ni,
         "boundInetAddress0",
         "(Ljava/net/InetAddress;)Z",
@@ -14183,8 +14189,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 || re8_enumerate_local_ips().contains(&ip);
             Ok(Some(Value::Int(i32::from(bound))))
         },
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         ni,
         "getByIndex0",
         "(I)Ljava/net/NetworkInterface;",
@@ -14197,6 +14204,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(iface)))
         },
+        NativeKind::Bridge,
     );
 
     // REMOVED (wave 4): the R76 `HostInfoEnvironmentPostProcessor.
@@ -16494,13 +16502,80 @@ mod tests {
             other => panic!("expected InetAddress, got {other:?}"),
         };
 
+        // Control, from the real JDK 25 on these exact 16 bytes:
+        //
+        //   getHostAddress = fe80:0:0:0:67b0:99e:5a9b:287e
+        //   toString       = /fe80:0:0:0:67b0:99e:5a9b:287e
+        //
+        // Two separate facts, and this test asserted them as one. The TEXT is
+        // HotSpot's uncompressed eight-group form (not Rust's RFC-5952
+        // `fe80::67b0:99e:5a9b:287e`). The HOSTNAME is ABSENT — note the
+        // leading `/` with nothing before it. `getByAddress(byte[])` is handed
+        // octets and no name, so the mirror must not invent one; see
+        // `alloc_inet_address_unnamed`, whose doc names this exact factory.
+        //
+        // The original assertion demanded `host == ip`, which is the shape the
+        // unnamed-mirror work was undone from: it renders
+        // `fe80:.../fe80:...` instead of `/fe80:...`. It could only ever have
+        // passed against the bug.
         assert_eq!(
             inet_addr_resolve(&ctx, address),
             Some((
-                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+                String::new(),
                 "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
             )),
-            "getByAddress must preserve HotSpot's uncompressed IPv6 text"
+            "getByAddress must preserve HotSpot's uncompressed IPv6 text AND \
+             leave the mirror unnamed"
+        );
+
+        // The user-visible half of the contract, through the real natives
+        // rather than the side table, because that is where the two facts above
+        // are actually combined.
+        let mut registry = NativeMethodRegistry::new();
+        register_re3_inet_address(&mut registry);
+
+        let to_string = registry
+            .find("java/net/InetAddress", "toString", "()Ljava/lang/String;")
+            .expect("InetAddress.toString native is registered");
+        let rendered = match to_string(&mut ctx, &[Value::Object(Some(address))]).unwrap() {
+            Some(Value::Object(Some(s))) => ctx.read_string(s),
+            other => panic!("expected String from toString, got {other:?}"),
+        };
+        assert_eq!(
+            rendered.as_deref(),
+            Some("/fe80:0:0:0:67b0:99e:5a9b:287e"),
+            "HotSpot renders an unnamed InetAddress with a bare leading slash"
+        );
+
+        // `getHostName()` is where the numeric text legitimately stands in for
+        // the missing name — HotSpot reaches the same answer by attempting a
+        // reverse lookup and falling back to `getHostAddress()`. That fallback
+        // lives in `inet_addr_host_name_value`, NOT in the stored pair, which
+        // is the distinction the old assertion collapsed.
+        let host_name = match inet_addr_host_name_value(&mut ctx, address) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            other => panic!("expected String from getHostName, got {other:?}"),
+        };
+        assert_eq!(
+            host_name.as_deref(),
+            Some("fe80:0:0:0:67b0:99e:5a9b:287e"),
+            "an unnamed mirror answers getHostName() with its numeric text"
+        );
+
+        // The paired half, so the absent name above reads as a DECISION and not
+        // as a mirror that cannot carry one: the named factory still records
+        // it. Without this, deleting the host name everywhere would pass.
+        // HotSpot on the same bytes:
+        //   getByAddress("example.invalid", bytes) -> example.invalid/fe80:0:0:0:…
+        let named =
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
+        assert_eq!(
+            inet_addr_resolve(&ctx, named),
+            Some((
+                "example.invalid".to_string(),
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+            )),
+            "a supplied host name is kept"
         );
     }
 
