@@ -1,119 +1,100 @@
 # Direct `ByteBuffer`s are never reclaimed — `MaxDirectMemorySize` was a one-way budget
 
 ## Status
-**FIXED 2026-08-05** (`fix/direct-buffer-reclaim-20260805`). Retired from
+**FIXED 2026-08-05**, on `dev` (`discover_phantom_cleaner`, wire type 4 — landed
+by a concurrent session while this was being worked). Retired from
 `docs/known-issues/`.
 
-`probes/DirectBufProbe.java` — 400 × 8 MiB transient direct buffers, `-Xmx1g`:
+Independently verified here on the merged build, Azure host, JDK 25, `--Xmx 1g`:
 
-| | result |
+| `probes/DirectBufProbe.java`, 400 × 8 MiB transient buffers | result |
 | --- | --- |
 | stock HotSpot JDK 25 | `OK rounds=400 … totalAllocatedMiB=3200` |
 | CratonVM before | `OutOfMemoryError: Direct buffer memory … used 1073741824, max 1073741824` |
-| CratonVM after | `OK rounds=400 … totalAllocatedMiB=3200` |
+| **CratonVM after** | `OK rounds=400 … totalAllocatedMiB=3200` |
 
-Identical to HotSpot, with and without `--nojit`.
+Identical to HotSpot, **with and without `--nojit`**. `DirectBufProbe2` reports
+`transientBuffersBeforeOOM=64` — the loop's maximum, i.e. no OOM at all —
+against 16 before, again matching HotSpot.
+
+**A residual remains and is filed separately**: H2's `TestMVStore` still reaches
+the cap under sustained multi-threaded churn. See
+`docs/known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
 
 ## What it was
 
-**Four links of one chain were missing, and only all four together move the
-number** — which is why the two fixes attempted on 2026-08-05 before this one
-(recorded in the original write-up, preserved below) measured no change: each
-was necessary and neither was sufficient.
+`jdk.internal.ref.Cleaner` **is** a `PhantomReference`, so it was discovered as
+one: cleared, enqueued onto its queue, and then ignored — a `Cleaner`'s queue is
+the JDK's private `dummyQueue`, which by design has no reader, because in the
+real JDK it is the `ReferenceHandler` thread that special-cases
+`instanceof Cleaner` and calls `clean()` instead of enqueuing. CratonVM has no
+ReferenceHandler, so the thunk never ran and `Bits.reserved` only ever grew.
 
-### 1. The root one: a Cleaner's referent was never allowed to die
+The landed fix adds a fourth discovery wire value meaning *"phantom that RUNS
+instead of enqueueing"*: `RefProcessor::discover_phantom_cleaner` files the
+entry in `phantom_refs` with `runs_cleaner = true`.
 
-`ReferenceProcessor::weak_phantom_active_pairs` is the pass that nulls a
-referent slot *before* the mark phase, so the live `Reference` object cannot
-keep its referent alive. It iterated `weak_refs` and `phantom_refs` — and not
-`cleaner_refs`.
+**Why it must stay a phantom entry is the subtle part, and is what two earlier
+attempts got wrong**: only phantom (and weak) entries have their referent slot
+nulled before the mark phase, and a `Cleaner` is reachable forever from its
+class's own static doubly-linked list. Re-file it under `cleaner_refs` and the
+referent is never nulled, so it never dies, so no action is ever emitted — the
+chain silently produces nothing. Two other links had to be fixed alongside:
 
-The JDK keeps every live `jdk.internal.ref.Cleaner` on a **static
-doubly-linked list**, so a Cleaner whose referent slot is never nulled makes its
-`DirectByteBuffer` permanently reachable. `process_final_refs` then never sees
-the referent die, never sets `cleared`, never emits an action, and
-`Bits.reserved` only ever grows.
+* `run_cleaner_actions` assumed a single object shape (our synthetic
+  `Cleaner$Cleanable`: field 0 action, field 1 cleaned flag). Field 0/1 of a
+  `jdk.internal.ref.Cleaner` are its *reference* fields. It now dispatches on
+  the class and calls `clean()`, which is idempotent in the JDK
+  (`if (!remove(this)) return;`).
+* `Bits.reserveMemory` threw on the first refusal. The JDK's contract is
+  "reserve; if the cap is reached, make the collector reclaim and retry; throw
+  only when that fails too". That retry is load-bearing because direct memory is
+  invisible to the heap's own occupancy trigger — a program can churn gigabytes
+  of `allocateDirect` while the Java heap stays nearly empty, so nothing else
+  has any reason to collect.
 
-`gc/src/reference.rs`'s own Phase 3/4 comment already states that a `Cleaner`
-"takes the phantom rule" — this pass simply never got the memo. That single
-omission is what made the budget one-way.
+## Remaining asymmetry (not fixed, not measured)
 
-### 2. A JDK `Cleaner` was discovered as a plain phantom
+`run_cleaner_actions` still has exactly **one** call site,
+`force_gc_from_native` — i.e. it runs only on an explicit `System.gc()` or on
+the reclaim-and-retry inside `Bits.reserveMemory`. `run_finalizers` is called
+from the ordinary allocation-triggered GC paths as well. So a Cleaner-registered
+resource that is *not* direct memory (a `FileCleanable` closing a descriptor,
+say) has nothing to force its release.
 
-`Cleaner` *is* a `PhantomReference`, so it arrived typed `Phantom`, landed in
-`phantom_refs`, and was cleared + enqueued onto `Cleaner`'s `dummyQueue` —
-which by design has no reader, because in the real JDK it is the
-`ReferenceHandler` thread that special-cases `instanceof Cleaner` and calls
-`clean()` instead of enqueuing. We have no ReferenceHandler.
+Adding `run_cleaner_actions` beside the two ordinary-GC `run_finalizers` calls
+in `maybe_gc` is a one-line-each symmetry fix and was written and test-passed
+during this session — but **not landed**, because no measurement showed it
+changing an outcome, and this is GC-adjacent code. Whoever needs it should bring
+a reproducer (a file-descriptor exhaustion loop is the obvious one).
 
-### 3. `run_cleaner_actions` knew only one object shape
+## Two hypotheses disproven along the way
 
-It assumed a `java.lang.ref.Cleaner$Cleanable` synthetic: field 0 the action,
-field 1 the cleaned flag. Reading field 0/1 of a `jdk.internal.ref.Cleaner`
-reads its *reference* fields. It now dispatches on the class and invokes
-`clean()`, which is idempotent in the JDK (`if (!remove(this)) return;`).
+Worth not re-testing:
 
-### 4. Cleaner actions only ran on an explicit `System.gc()`
-
-`run_cleaner_actions` had exactly one call site — `force_gc_from_native`. An
-ordinary allocation-triggered collection therefore cleared a Cleaner and left
-its action queued forever. `run_finalizers` has always been on both paths; this
-was an asymmetry, not a policy.
-
-`Bits.reserveMemory` also collects and retries before declaring exhaustion now,
-as the JDK's own implementation does. That is load-bearing rather than
-belt-and-braces: direct memory is **off-heap**, so a program that allocates
-nothing else puts no pressure on the Java heap and may never collect on its own.
-
-## How it was found
-
-The original write-up's suggested first step was the one that worked: trace
-`RefProcessor` discovery and name the reference's class. `CRATONVM_DBG_CLEANERS=1`
-is that instrument, kept (read once, since it now sits on the post-GC path). It
-reports whether the drain ran, how many actions it found, and which were JDK
-Cleaners — the three questions that separated links 2, 3 and 4. Link 1 showed up
-as `draining 0 cleaner action(s)` *after* 2–4 were in place, i.e. actions were
-being asked for and none existed, which pointed straight at liveness.
-
-Two hypotheses were disproven cheaply along the way and are worth not
-re-testing: `--nojit` reproduces identically (so conservative JIT-frame roots
-are not what retained the buffers), and weak references clear / phantoms enqueue
-normally throughout (so reference processing as a whole was never broken).
-
-## Validation
-
-Azure host, JDK 25, `--Xmx 1g`:
-
-* `DirectBufProbe`: 3200 MiB, identical to HotSpot, with and without `--nojit`.
-* `DirectBufProbe2`: `transientBuffersBeforeOOM=64` (the loop's maximum, i.e. no
-  OOM at all) against 16 before — again identical to HotSpot.
-* `org.h2.test.store.TestMVStore` no longer hits `OutOfMemoryError: Direct
-  buffer memory`; it runs past the point that used to kill it.
-* A 23-class H2 A/B against the fork point moved nothing: 22 identical, and
-  `TestMVStore` FAIL→TIMEOUT only because it now runs further.
-* `cargo test`: `cratonvm-gc` 968/0, `cratonvm-vm --lib` 2409/0, `cratonvm-jit`
-  1952/0, `cratonvm-native-io` clean.
-* `cargo test -p cratonvm-vm --lib --features synthetic-jdk`: 3921 passed,
-  **5 failed — all five pre-existing on the fork point**, verified by stashing
-  this branch's changes and re-running them (`inet_socket_address_basics`,
-  `linked_hashmap_put_get`, `linked_hashmap_put_if_absent`,
-  `linkedhashmap_first_last_entry_p64`, `scanner_next_line_p51`).
+* **`--nojit` reproduces the original failure identically**, so conservative
+  JIT-frame roots were never what retained the buffers.
+* **Weak references clear and phantoms enqueue normally throughout** — reference
+  processing as a whole was never broken. `DirectBufProbe2` checks both
+  explicitly, which is what narrowed this to "the trigger, not the free path"
+  in the first place (an explicit `cleaner().clean()` always worked).
 
 ## Lesson
 
-A reclamation chain has as many silent failure points as it has links, and
-each one fails *the same way* — nothing happens. Fixing one and re-measuring
-reads as "no effect", which is what made the first two attempts look wrong when
-they were merely incomplete. The instrument that broke the deadlock reported
-each link separately, so a fix that moved one link showed progress even while
-the end-to-end number did not.
+A reclamation chain has as many silent failure points as it has links, and every
+one of them fails the *same* way: nothing happens. Fixing one link and
+re-measuring reads exactly like fixing the wrong thing, which is why the first
+two attempts recorded in the original write-up below look like dead ends and
+were in fact merely incomplete. Instrument each link separately —
+`CRATONVM_DBG_CLEANERS`-style tracing at discovery, at action emission, and at
+action execution — so a partial fix shows partial progress instead of none.
 
 ---
 
 ## The original write-up, as filed
 
-Kept verbatim: its reproducer and its two disproven approaches are what made
-the remaining links findable.
+Kept verbatim: its reproducer and its two disproven approaches are what made the
+remaining links findable.
 
 <details>
 <summary>original text</summary>
