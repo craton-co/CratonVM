@@ -159,12 +159,15 @@ path instead of replacing it, and its input is Latin-1 by construction and
 cannot reach the surrogate cases.
 
 **Kept, as reviewed `NativeKind::Intrinsic`** — section 1.4's own answer, taken
-on kind with no name list anywhere: the four `CRATONVM_NATIVE_STRING_REGEX`
-shapes (`replaceAll`, `replaceFirst`, `matches`,
-`replace(CharSequence,CharSequence)`). They are ~2x faster than HotSpot on the
-`PluginXmlParser.format()` shape they were written for
-(`probes/StringRegexCostProbe`: 47-64 ms vs HotSpot's 100 ms, identical
-digests), which is what an intrinsic is for.
+on kind with no name list anywhere:
+
+* the four `CRATONVM_NATIVE_STRING_REGEX` shapes (`replaceAll`,
+  `replaceFirst`, `matches`, `replace(CharSequence,CharSequence)`). They are
+  ~2x faster than HotSpot on the `PluginXmlParser.format()` shape they were
+  written for (`probes/StringRegexCostProbe`: 47-64 ms vs HotSpot's 100 ms,
+  identical digests), which is what an intrinsic is for;
+* `hashCode()`, and this one is **not** a performance argument — see the next
+  section.
 
 They are also the **first callers of `register_with_kind`**, so the census's
 `kind_stated` column now records that somebody adjudicated these four rather
@@ -181,6 +184,54 @@ raise what the JDK raises:
   because validation code catches it by name. This also fixes every other
   `compile_java_regex` caller, `Pattern.compile` included;
 * a `null` regex / replacement / target is an NPE instead of a null `String`.
+
+## Removing the natives surfaced three defects they were hiding
+
+Dropping a shadow makes the shadowed code reachable, and two of the three
+things underneath it were broken. This is the honest cost of the change and it
+is why the divergence count went from 57 to 37 rather than to zero.
+
+**1. `String.hashCode()` is wrong for UTF-16 strings** —
+[filed](../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md).
+The bytecode hashes the first `length()` BYTES of the backing array, each
+sign-extended to a `char`, instead of the `length()` code units:
+`"ΣΟΣ".hashCode()` is `62956255` where the JLS and HotSpot say
+`924359`. The object itself is fine — `length`, `charAt`, `toCharArray` and
+`equals` on it all agree with HotSpot, which is what localises the fault to
+`hashCode`'s dispatch target. Solving the observed hashes for their input
+sequence gives that exact reading for all four probe strings, sign extension
+included (`0xA3` hashed as `0xFFA3`).
+
+**So `String.hashCode()` is registered `Intrinsic` for CORRECTNESS.** Letting
+the bytecode win would replace a right answer with a wrong one for every
+non-ASCII `String` key in the VM. When the `StringUTF16` defect is fixed, that
+registration should be re-measured and probably deleted — at that point it is a
+pure performance optimisation again (the ~1950x caching win) and has to argue
+on those terms.
+
+**2. `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`**
+where HotSpot throws `StringIndexOutOfBoundsException` —
+[filed](../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md).
+`charAt(-1)` is the control: its bytecode reaches the right class, so this is
+`substring`'s bounds check specifically. The two are siblings under
+`IndexOutOfBoundsException`, so `catch (IndexOutOfBoundsException)` is
+unaffected but `catch (StringIndexOutOfBoundsException)` is not.
+
+This one was **not** re-masked, deliberately: the native's version of those six
+rows was already wrong (right class, `msg=null`), and keeping it would have
+cost the four rows the bytecode fixes — including `substring` splitting a
+surrogate pair, which the native turned into U+FFFD. Silent data corruption on
+a valid input is worse than a loud exception of the wrong class. The trade is
+stated here rather than hidden.
+
+**3. `+` concatenation loses an unpaired surrogate to U+FFFD** —
+[filed](../known-issues/string-concat-loses-unpaired-surrogates.md). Found by
+accident: `probes/StringUtf16HashProbe` builds its lone-surrogate string with
+`new String(char[])` and it survives, while
+`probes/StringPolicyMatrixProbe` builds the same string with `+` and it does
+not. That difference is what proves the residual `LONE` rows are a concat
+defect and not a `charAt` / `trim` / `hashCode` defect — a distinction the
+matrix alone would have got wrong.
 
 ## Verification
 

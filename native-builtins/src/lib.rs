@@ -7605,21 +7605,50 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/util/Locale;)Ljava/lang/String;",
         lang_string::native_string_to_upper_case_uncached,
     );
-    // String.hashCode — use the layout-aware CACHING implementation (reads and
-    // writes the JDK `hash` field) rather than recomputing from scratch on every
-    // call. The previous inline closure here re-decoded the char array and
-    // re-ran the fold every time, with NO caching, so real-JDK String-keyed
-    // hashing was ~1950x slower than HotSpot (which caches in String.hash):
-    // a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it dominated the
-    // Xerces XSD model build (XSElementDecl.hashCode / CMStateSet.hashCode were
-    // ~100% of self-time). `register_synthetic_overrides` already wired the
-    // caching impl, but real-JDK mode (`--java-home`) only runs
-    // `register_essential_natives`, so the cache never took effect there.
-    registry.register(
+    // String.hashCode — the layout-aware CACHING implementation (reads and
+    // writes the JDK `hash` field) rather than recomputing from scratch on
+    // every call. The previous inline closure here re-decoded the char array
+    // and re-ran the fold every time, with NO caching, so real-JDK
+    // String-keyed hashing was ~1950x slower than HotSpot (which caches in
+    // `String.hash`): a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it
+    // dominated the Xerces XSD model build (`XSElementDecl.hashCode` /
+    // `CMStateSet.hashCode` were ~100% of self-time).
+    //
+    // # `Intrinsic`, and why this one is not a performance argument
+    //
+    // Every other `java/lang/String` `Bridge` is dropped in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4). This one is stated
+    // `Intrinsic` so it survives, and the reason is CORRECTNESS, not speed:
+    // the real `String.hashCode()` bytecode is **wrong** here for any string
+    // whose backing array is UTF-16.
+    //
+    // Measured with `probes/StringUtf16HashProbe`, which computes the JLS
+    // formula in plain Java over the receiver's own `charAt` and compares:
+    //
+    //   "ΣΟΣ"   hashCode() = 62956255   JLS = 924359
+    //
+    // The object is not corrupt — `length()`, `charAt` and `equals` on it all
+    // agree with HotSpot. The bytecode path reads the first `length()` BYTES
+    // of the backing array, each sign-extended to a `char`, instead of the
+    // `length()` UTF-16 code units: `(char) value[i]` where it needs
+    // `getChar(value, i)`. Solving the observed hashes for their input
+    // sequence gives that exact reading for all four probe strings, including
+    // the sign extension (`0xA3` hashed as `0xFFA3`).
+    //
+    // So dropping this registration replaces a correct answer with a wrong one
+    // for every non-Latin-1 `String` key in the VM, which is not an edge case:
+    // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
+    // `StringUTF16` defect is filed separately — see
+    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // — and when it is fixed this registration should be re-measured and
+    // probably deleted, because at that point it becomes a pure perf
+    // optimisation again and has to argue for itself on those terms.
+    registry.register_with_kind(
         "java/lang/String",
         "hashCode",
         "()I",
         native_string_hash_code,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);

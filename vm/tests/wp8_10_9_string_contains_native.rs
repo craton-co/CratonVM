@@ -85,7 +85,6 @@ fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
         ("toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;"),
         // The plain ones it also forced.
         ("equals", "(Ljava/lang/Object;)Z"),
-        ("hashCode", "()I"),
         ("endsWith", "(Ljava/lang/String;)Z"),
         ("indexOf", "(Ljava/lang/String;)I"),
         ("lastIndexOf", "(Ljava/lang/String;)I"),
@@ -127,6 +126,34 @@ fn real_jdk_registry_keeps_the_one_genuine_string_bridge() {
          attribute), so it is a legitimate §1.5 bridge and the real-JDK drop must not take it. \
          If this fails, the drop stopped being 'drop the bridges that shadow bytecode' and \
          became 'drop the class'."
+    );
+}
+
+/// `String.hashCode()` survives the drop, and for a reason that is not speed.
+///
+/// The real `String.hashCode()` bytecode is WRONG on this VM for any string
+/// whose backing array is UTF-16: it hashes the first `length()` BYTES of that
+/// array, sign-extended to `char`, instead of the `length()` code units. The
+/// object is fine — `length`, `charAt` and `equals` on it all agree with
+/// HotSpot — so the defect is in what `hashCode` dispatches to. Measured with
+/// `probes/StringUtf16HashProbe`; filed as
+/// `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`.
+///
+/// Dropping this registration therefore replaces a correct answer with a wrong
+/// one for every non-ASCII `String` key in the VM. When the `StringUTF16`
+/// defect is fixed, re-measure and probably delete this registration: at that
+/// point it is a pure performance optimisation again (the ~1950x caching win
+/// it was originally written for) and has to argue on those terms.
+#[test]
+fn real_jdk_registry_keeps_string_hash_code_because_the_bytecode_is_wrong() {
+    let shared = shared();
+    assert_eq!(
+        shared
+            .natives
+            .native_methods
+            .kind_of("java/lang/String", "hashCode", "()I"),
+        Some(cratonvm_native_api::NativeKind::Intrinsic),
+        "java/lang/String.hashCode()I must survive the real-JDK `Bridge` drop, stated          `Intrinsic`. It is not kept for speed: the bytecode it would fall through to          hashes the backing BYTES sign-extended rather than the UTF-16 code units, so          `ΣΟΣ`.hashCode() returns 62956255 where the JLS (and HotSpot) say          924359 — while `charAt`/`length`/`equals` on the same object are all correct. See          docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md."
     );
 }
 
