@@ -5493,6 +5493,64 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: `java/lang/String`'s real class bytes are
+        // authoritative (contract §1.4), so a `Bridge` registered on it does
+        // not survive into a real-JDK registry at all.
+        //
+        // # This is where the forced-native `String` policy went
+        //
+        // FOUR hard-coded lists used to decide this at DISPATCH time — a
+        // 21-name descriptor-blind arm in `check_override`, a 12-shape
+        // inverted whitelist in `force_native_over_real_jdk_bytecode`, a JIT
+        // direct bind for `toLowerCase(Locale)`, and
+        // `is_jdk_string_charset_name_constructor_override`, which the record
+        // that catalogued the first three had missed because it is a
+        // differently-named predicate rather than a `String` list. They
+        // disagreed with each other, so which implementation of
+        // `String.equals`/`hashCode`/`substring` ran depended on how many times
+        // the call site had executed. All four are deleted.
+        //
+        // They are not deleted because they looked redundant. They were
+        // MEASURED inert first: a binary with both interpreter lists removed
+        // produced a byte-identical 392-case `String` transcript in both modes
+        // and identical invocation counts on all 38 exercised `String` registry
+        // slots. Neither list ever decided anything, because
+        // `resolve_step1_native` (`try_stackless_invoke` step 1) resolves the
+        // triple and dispatches whatever it finds before either list runs, and
+        // it has no list of its own. Registration was always the real gate;
+        // this is that gate, stated once, for every dispatch path.
+        //
+        // # Why the rule is a KIND and not another method list
+        //
+        // Adjudicated against the JDK 25 image, 79 of the 80 registrations on
+        // `java/lang/String` target a method the image declares with a `Code`
+        // attribute — §1.4's `NativeShadowsBytecode` — and exactly one,
+        // `intern()`, is genuinely `ACC_NATIVE` and therefore a legitimate
+        // §1.5 bridge. So "drop the bridges, keep `intern`" is the adjudication
+        // itself rather than a list that has to be kept in step with one.
+        //
+        // `Intrinsic` survives on purpose: §1.4's reviewed exception. The
+        // `CRATONVM_NATIVE_STRING_REGEX` family registers under it
+        // (`register_with_kind`, so `kind_stated` is true and the census can
+        // see somebody decided), which is what a same-answer-just-faster
+        // native is supposed to look like — it wins on kind, with no name
+        // anywhere. `SyntheticStub` survives too: it never dispatches under
+        // `--jdk-only`, and in compatible mode it is the fallback for a
+        // synthetic `String` that has no real class bytes behind it.
+        //
+        // Anything promoted into this exception needs the evidence, not the
+        // intent: `probes/StringPolicyMatrixProbe` diffed against HotSpot, and
+        // a measurement that the native is actually faster. The five h2-bnf
+        // shapes were argued to be "trivially equivalent to the real bytecode
+        // for every input" and were wrong about that for unpaired surrogates,
+        // for every out-of-range index's exception message, and for `null`.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/lang/String"
+            && self.current_category == NativeKind::Bridge
+            && !(method_name == "intern" && descriptor == "()Ljava/lang/String;")
+        {
+            return;
+        }
         // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
         // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
         // `Cleanable.clean()`). These were meant only as a fallback for when

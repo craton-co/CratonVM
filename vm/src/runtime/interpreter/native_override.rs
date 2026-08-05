@@ -1110,19 +1110,6 @@ pub(crate) fn is_jdk_string_native_override(
     class_name == "java/lang/StringLatin1" && (method_name, descriptor) == ("inflate", "([BI[CII)V")
 }
 
-pub(crate) fn is_jdk_string_charset_name_constructor_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/lang/String"
-        && method_name == "<init>"
-        && matches!(
-            descriptor,
-            "([BLjava/lang/String;)V" | "([BIILjava/lang/String;)V"
-        )
-}
-
 pub(crate) fn is_spring_mock_response_native_override(
     class_name: &str,
     method_name: &str,
@@ -2750,15 +2737,28 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // JDK-ONLY-WAVE2: the forced-native `java/lang/String` policy, INVERTED-
-    // EXCLUSION form. See [`warm_forced_native_string_candidate`] for the
-    // whitelist itself, for its relationship to the POSITIVE 21-name form in
-    // `check_override`, and for why the two must be deleted together.
-    if class_name == "java/lang/String"
-        && !warm_forced_native_string_candidate(method_name, method_descriptor)
-    {
-        return false;
-    }
+    // The forced-native `java/lang/String` policy — the twelve-shape whitelist
+    // that stood here, its inverted `return false` exclusion, and the two
+    // blocks below it that named `substring`/`charAt`/`length`/`isEmpty`/
+    // `startsWith` — IS GONE, together with `check_override`'s 21-name
+    // positive twin and the JIT's `String.toLowerCase(Locale)` ladder.
+    //
+    // Removed because it was MEASURED inert, not because it looked redundant
+    // (that reasoning is what item 8 cost a session). See
+    // `forced_native_string_policy_is_not_reintroduced` below for the guard,
+    // and
+    // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`
+    // for the measurement: with both lists deleted the 392-case `String`
+    // matrix was byte-identical in both modes and every one of the 38
+    // exercised `java/lang/String` registry slots reported an unchanged
+    // invocation count.
+    //
+    // Neither list ever decided anything. `resolve_step1_native`
+    // (`try_stackless_invoke` step 1) resolves the triple in the registry and
+    // dispatches whatever it finds, with no list, before either of these runs.
+    // The real decision was always "is a native registered for this triple in
+    // real-JDK mode", so that is where the policy now lives — see
+    // `NativeMethodRegistry::register`'s `java/lang/String` real-JDK drop.
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -4064,38 +4064,21 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
-    // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
-    // in the interpreter (java.util.regex), which is 30–600× slower than
-    // HotSpot because every Matcher step crosses the VM→native String-accessor
-    // boundary. We force CratonVM's cached `regex`/`fancy-regex` native
-    // (lang_string.rs), which is Java-faithful (replacement `$N` / `${name}` /
-    // `\`-escapes) and orders of magnitude faster. **Default-ON** (opt-out
-    // `CRATONVM_NATIVE_STRING_REGEX=0` reverts to real Java bytecode as the
-    // safety net); see `env_cache::native_string_regex`. This is what makes
-    // Spring Boot's `PluginXmlParser.format()` chain (4 `replaceAll` + 8 literal
-    // `replace`) complete instead of hanging (SBR-02 / PluginXmlParserTests).
-    if class_name == "java/lang/String"
-        && crate::runtime::env_cache::native_string_regex()
-        && matches!(
-            (method_name, method_descriptor),
-            ("replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
-                | ("replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
-                | ("matches", "(Ljava/lang/String;)Z")
-                // `replace(CharSequence,CharSequence)` is LITERAL (non-regex)
-                // all-occurrences replacement, byte-identical to Rust
-                // `str::replace`; routed through the fast native under the same
-                // gate (SBR-02 secondary finding — the 8-chained-`replace`
-                // PluginXmlParser.format wall). The `(char,char)` overload has
-                // its own unconditional native and is NOT gated here.
-                | (
-                    "replace",
-                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
-                )
-        )
-    {
-        return true;
-    }
+    // The SBR-02 fast-regex arm that named `String.replaceAll` /
+    // `replaceFirst` / `matches` / `replace(CharSequence,CharSequence)` stood
+    // here and is GONE with the rest of the `java/lang/String` policy. The four
+    // natives themselves are NOT gone: they are the family this arm existed to
+    // reach, they are 2x faster than HotSpot on the workload they were written
+    // for (`probes/StringRegexCostProbe`), and they are now registered
+    // `NativeKind::Intrinsic` — which is §1.4's own answer for a reviewed
+    // same-result-just-faster native and needs no name list to win.
+    //
+    // This arm never made them win either. `CRATONVM_NATIVE_STRING_REGEX=0`
+    // does not register them at all, and when it is set they are found by
+    // `resolve_step1_native` on the triple alone. The gate that decides is
+    // registration; see `NativeMethodRegistry::register`'s `java/lang/String`
+    // real-JDK drop, which is where the reviewed set is now stated once.
+    //
     // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
     // `find(int)`/`start`/`end`/`group` fast path (`native_matcher_find_realjdk`
     // et al. in native-builtins/src/lib.rs). Extends the SBR-02 fast-regex
@@ -4121,66 +4104,6 @@ pub(super) fn force_native_over_real_jdk_bytecode(
                 | ("end", "(I)I")
                 | ("group", "()Ljava/lang/String;")
                 | ("group", "(I)Ljava/lang/String;")
-        )
-    {
-        return true;
-    }
-    // `String.substring(int,int)` — gate mismatch fix. `check_override`
-    // (vm_exec.rs, the invoke-slow-path native selector) already lists
-    // `java/lang/String.substring` as forced-native ("RKC16N.6 RECON":
-    // real-JDK String bytecode resolution issues during JDK class clinits),
-    // but that allowlist is CONSULTED ONLY on a vtable cache miss. The
-    // per-call-site cached vtable fast path (this function's own caller)
-    // resolves and caches its native-vs-bytecode decision independently, and
-    // `substring` was never added HERE — so once a call site's vtable entry
-    // warms, every subsequent `substring` call ran the real bytecode
-    // regardless of `check_override`'s intent. `native_string_substring`
-    // (native-builtins/src/lang_string.rs) already has a "read only the
-    // requested range" fast path specifically written to avoid decoding the
-    // WHOLE parent string per call — a real fix that this gate gap left
-    // completely unreachable. Confirmed via runtime instrumentation: a tight
-    // `text.substring(pos, pos+5)` loop over a large parent `String` cost
-    // O(n^2) instead of O(subLen) with this entry absent (see
-    // `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`).
-    if class_name == "java/lang/String"
-        && method_name == "substring"
-        && method_descriptor == "(II)Ljava/lang/String;"
-    {
-        return true;
-    }
-    // PERF (h2-bnf-perf 2026-07-23): same "gate mismatch" family as the
-    // `(II)` substring entry immediately above -- `check_override`
-    // (vm_exec.rs) has listed `charAt`/`length`/`isEmpty`/`startsWith` (and
-    // several more `java/lang/String` methods) as forced-native since
-    // "RKC16N.6 RECON" (a real-JDK bytecode-resolution boot fix), but that
-    // allowlist is only consulted on a genuine vtable cache miss -- this
-    // function (the per-call-site cached vtable fast path) never had the
-    // matching entries, so once a call site's cache warmed, real (fully
-    // interpreted) bytecode ran regardless of `check_override`'s intent,
-    // for the entire remaining lifetime of that call site. `substring(I)`
-    // (one-arg) was in the same boat as the already-fixed `substring(II)`
-    // -- both overloads are covered by `check_override`'s bare
-    // `"substring"` name match, but only the two-arg descriptor had an
-    // entry here. Root-caused via an H2 BNF-autocomplete workload
-    // (`org.h2.bnf.RuleFixed`/`RuleElement`/`Bnf`) whose character-by-
-    // character grammar scanning is dominated by exactly these four calls
-    // in tight loops (`s = s.substring(1)`, `s.charAt(0)`, `s.length()`,
-    // `up.startsWith(name)`). Scoped to the subset of `check_override`'s
-    // String list with straightforward, locale/Unicode-independent
-    // semantics (plain UTF-16 content comparison / indexing) that are
-    // trivially equivalent to the real-JDK bytecode for every input --
-    // deliberately NOT extending this to `trim`/`toLowerCase`/
-    // `toUpperCase`/`replace`/`compareTo*` here, since those have
-    // Unicode/locale edge cases that need their own from-scratch
-    // correctness review before being forced this broadly.
-    if class_name == "java/lang/String"
-        && matches!(
-            (method_name, method_descriptor),
-            ("substring", "(I)Ljava/lang/String;")
-                | ("charAt", "(I)C")
-                | ("length", "()I")
-                | ("isEmpty", "()Z")
-                | ("startsWith", "(Ljava/lang/String;)Z")
         )
     {
         return true;
@@ -4279,13 +4202,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // most of its time in `StringLatin1.inflate`. The native is bytecode-
     // equivalent for the Latin-1 byte[] -> char[] copy and avoids millions of
     // interpreted inner-loop frames.
-    if is_jdk_string_native_override(class_name, method_name, method_descriptor)
-        || is_jdk_string_charset_name_constructor_override(
-            class_name,
-            method_name,
-            method_descriptor,
-        )
-    {
+    if is_jdk_string_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Tiny JDK wrapper arithmetic helpers are already registered as exact
@@ -6507,143 +6424,6 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
         .unwrap_or(false)
 }
 
-/// The class allowlist for [`synthetic_stub_should_yield_to_real_bytecode`]
-/// (and `populate_invoke_cache`'s inline copy of the same predicate, which
-/// cannot call the full helper while holding the class-manager read lock):
-/// classes whose SyntheticStub natives exist only for stub-phase bootstraps
-/// and must yield to loaded real bytecode.
-///
-/// The `java/lang/String` shapes that may go on to force a native on the
-/// **warm** (memoized, per-call-site-cached) dispatch path.
-///
-/// Read the call site as: for `java/lang/String`, only these may proceed;
-/// every other `String` method returns `false` right there and runs real
-/// bytecode. Being on this list is permission to *reach* a later decision, not
-/// a decision — a shape here still has to match one of the blocks below to be
-/// forced.
-///
-/// # JDK-ONLY-WAVE2: this is one of three copies of one policy
-///
-/// The other two are the POSITIVE, 21-**name** (descriptor-blind) arm of
-/// `check_override` in `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner`
-/// (the COLD path — a genuine vtable miss, in practice the first call at a
-/// site), and the JIT's `String.toLowerCase(Locale)` direct-call ladder. THE
-/// FIRST TWO MUST BE DELETED TOGETHER: drop either alone and cold and warm
-/// dispatch disagree about which implementation of `String.equals` /
-/// `hashCode` / `substring` runs, so a `String` method's observable behaviour
-/// starts depending on how many times its call site has executed — the precise
-/// class of JIT-state-dependent bug §7 centralisation exists to prevent.
-///
-/// What must replace both: nothing. `String`'s natives should be registered
-/// `Intrinsic` and taken by `resolve_dispatch` step 2 on kind alone, with no
-/// name list at all.
-///
-/// # The five entries that used to be dead
-///
-/// `substring(I)`, `charAt`, `length`, `isEmpty` and `startsWith` were added
-/// (h2-bnf-perf, 2026-07-23) to a block *below* this exclusion, as a measured
-/// fix for an H2 BNF-autocomplete workload whose grammar scanner is dominated
-/// by exactly those four calls in tight loops. None of them was on the
-/// whitelist, so control never reached that block: the two halves of the same
-/// policy defeated each other, in the same function, and nothing reported it.
-/// The fix had never worked.
-///
-/// They are on the list now, which makes the warm path agree with the cold one
-/// for these five — the cold path has forced them since "RKC16N.6 RECON".
-/// That is a *reduction* in divergence, not a new behaviour: before this, the
-/// first call at a site ran the native and every subsequent call ran bytecode.
-///
-/// Scoped deliberately: these five have locale- and Unicode-independent
-/// semantics (plain UTF-16 indexing and content comparison) that are trivially
-/// equivalent to the real-JDK bytecode for every input. The rest of
-/// `check_override`'s 21 names — `trim`, `toLowerCase`, `toUpperCase`,
-/// `compareTo*`, `split` — are **not** added, because they have Unicode/locale
-/// edge cases that need their own from-scratch correctness review. Forcing
-/// those would be a correctness change wearing a performance change's clothes.
-///
-/// The residual cold/warm disagreement is therefore known, deliberate and
-/// enumerated in `forced_native_string_policy_divergence_is_exactly_the_
-/// unicode_sensitive_names`.
-#[inline]
-pub(crate) fn warm_forced_native_string_candidate(
-    method_name: &str,
-    method_descriptor: &str,
-) -> bool {
-    matches!(
-        (method_name, method_descriptor),
-        // The SBR-02 fast-regex family (`CRATONVM_NATIVE_STRING_REGEX`,
-        // default-ON). A deliberate, flagged optimisation, not an RKC16N.6
-        // workaround — under contract §1.4 these belong as reviewed
-        // `NativeKind::Intrinsic` registrations, which win with no name list.
-        (
-            "replaceAll",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
-        ) | (
-            "replaceFirst",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
-        ) | ("matches", "(Ljava/lang/String;)Z")
-            | (
-                "replace",
-                "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
-            )
-            // The quadratic-parent-allocation fix.
-            | ("substring", "(II)Ljava/lang/String;")
-            // Charset-name constructors.
-            | ("<init>", "([BLjava/lang/String;)V")
-            | ("<init>", "([BIILjava/lang/String;)V")
-            // The five h2-bnf shapes that were unreachable until 2026-08-04.
-            | ("substring", "(I)Ljava/lang/String;")
-            | ("charAt", "(I)C")
-            | ("length", "()I")
-            | ("isEmpty", "()Z")
-            | ("startsWith", "(Ljava/lang/String;)Z")
-    )
-}
-
-/// The `java/lang/String` method **names** the COLD path forces native.
-///
-/// Extracted from `check_override`'s inline `matches!` so the two halves of
-/// this policy can be compared by a test instead of by a reader diffing two
-/// files. Matched by name only — every overload of every listed method — which
-/// is itself part of the divergence: the warm path is keyed on (name,
-/// descriptor).
-///
-/// > RKC16N.6 RECON (Session 94): real-JDK `java/lang/String` bytecode
-/// > resolution is failing for these basic methods during JDK class clinits
-/// > like `java/nio/charset/StandardCharsets.<clinit>`; route to our
-/// > layout-neutral natives (registered in `register_essential_natives`) so the
-/// > boot can advance past `String` dispatch. **Drop when RKC16N.6 lands a
-/// > permanent fix.**
-///
-/// That is the actual defect. Both lists are workarounds for it, and deleting
-/// this one before it is fixed regresses boot —
-/// `java/nio/charset/StandardCharsets.<clinit>` is on the critical path.
-pub(crate) fn cold_forced_native_string_name(method_name: &str) -> bool {
-    matches!(
-        method_name,
-        "charAt"
-            | "length"
-            | "isEmpty"
-            | "equals"
-            | "hashCode"
-            | "indexOf"
-            | "lastIndexOf"
-            | "substring"
-            | "startsWith"
-            | "endsWith"
-            | "trim"
-            | "toString"
-            | "concat"
-            | "replace"
-            | "toLowerCase"
-            | "toUpperCase"
-            | "compareTo"
-            | "compareToIgnoreCase"
-            | "equalsIgnoreCase"
-            | "contains"
-            | "split"
-    )
-}
 
 /// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
 /// dispatch paths** as of 2026-08-04.
@@ -6871,135 +6651,165 @@ mod threadpool_receiver_shape_tests {
 mod forced_native_string_tests {
     use super::*;
 
-    /// Every `java/lang/String` shape either path mentions, with the exact
-    /// (cold, warm) verdict pair expected of it.
+    /// Every `java/lang/String` shape either half of the deleted policy named,
+    /// plus the ones it deliberately left out.
     ///
-    /// Descriptors are the real JDK 25 ones. `cold` is
-    /// [`cold_forced_native_string_name`] — descriptor-blind, so every overload
-    /// of a listed name gets the same answer. `warm` is whether the shape gets
-    /// past [`warm_forced_native_string_candidate`]'s exclusion.
-    const STRING_POLICY: &[(&str, &str, bool, bool)] = &[
-        // ---- agreed: forced on BOTH paths ------------------------------
-        ("substring", "(I)Ljava/lang/String;", true, true),
-        ("substring", "(II)Ljava/lang/String;", true, true),
-        ("charAt", "(I)C", true, true),
-        ("length", "()I", true, true),
-        ("isEmpty", "()Z", true, true),
-        ("startsWith", "(Ljava/lang/String;)Z", true, true),
-        // ---- warm-only: not on the cold name list at all ---------------
-        // The SBR-02 fast-regex family and the charset-name constructors.
-        // `check_override` never listed them, so the cold path runs real
-        // bytecode for the first call at a site and the native thereafter.
+    /// The old table froze *which* shapes the cold and warm halves disagreed
+    /// about. There is nothing left to disagree: no dispatch path matches
+    /// `java/lang/String` by name any more, so the answer for every shape is
+    /// the same one, and that uniformity is what this pins.
+    ///
+    /// Descriptors are the real JDK 25 ones.
+    const STRING_SHAPES: &[(&str, &str)] = &[
+        // The five the h2-bnf block named, and the two `substring` overloads.
+        ("substring", "(I)Ljava/lang/String;"),
+        ("substring", "(II)Ljava/lang/String;"),
+        ("charAt", "(I)C"),
+        ("length", "()I"),
+        ("isEmpty", "()Z"),
+        ("startsWith", "(Ljava/lang/String;)Z"),
+        // The SBR-02 fast-regex family and the charset-name constructors —
+        // the shapes the warm whitelist admitted and the cold list never
+        // mentioned.
         (
             "replaceAll",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            false,
-            true,
         ),
         (
             "replaceFirst",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            false,
-            true,
         ),
-        ("matches", "(Ljava/lang/String;)Z", false, true),
-        ("<init>", "([BLjava/lang/String;)V", false, true),
-        ("<init>", "([BIILjava/lang/String;)V", false, true),
-        // `replace` is on the cold NAME list, so the cold path forces every
-        // overload; the warm path admits only the `CharSequence` one.
+        ("matches", "(Ljava/lang/String;)Z"),
+        ("<init>", "([BLjava/lang/String;)V"),
+        ("<init>", "([BIILjava/lang/String;)V"),
         (
             "replace",
             "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
-            true,
-            true,
         ),
-        ("replace", "(CC)Ljava/lang/String;", true, false),
-        // ---- cold-only: the Unicode/locale-sensitive residue ------------
-        // Deliberately NOT admitted to the warm path: each needs its own
-        // from-scratch correctness review against the real JDK bytecode
-        // before a native may shadow it. This is the remaining divergence,
-        // and it is a decision, not an oversight.
-        ("trim", "()Ljava/lang/String;", true, false),
-        ("toLowerCase", "()Ljava/lang/String;", true, false),
-        ("toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;", true, false),
-        ("toUpperCase", "()Ljava/lang/String;", true, false),
-        ("compareTo", "(Ljava/lang/String;)I", true, false),
-        ("compareToIgnoreCase", "(Ljava/lang/String;)I", true, false),
-        ("equalsIgnoreCase", "(Ljava/lang/String;)Z", true, false),
-        ("split", "(Ljava/lang/String;)[Ljava/lang/String;", true, false),
-        // ---- cold-only: plain, but never reviewed for the warm path -----
-        ("equals", "(Ljava/lang/Object;)Z", true, false),
-        ("hashCode", "()I", true, false),
-        ("indexOf", "(Ljava/lang/String;)I", true, false),
-        ("lastIndexOf", "(Ljava/lang/String;)I", true, false),
-        ("endsWith", "(Ljava/lang/String;)Z", true, false),
-        ("toString", "()Ljava/lang/String;", true, false),
-        ("concat", "(Ljava/lang/String;)Ljava/lang/String;", true, false),
-        ("contains", "(Ljava/lang/CharSequence;)Z", true, false),
-        // ---- on neither path -------------------------------------------
-        ("chars", "()Ljava/util/stream/IntStream;", false, false),
-        ("strip", "()Ljava/lang/String;", false, false),
+        ("replace", "(CC)Ljava/lang/String;"),
+        // The Unicode/locale-sensitive residue the cold list forced and the
+        // warm list refused — the actual divergence, now moot.
+        ("trim", "()Ljava/lang/String;"),
+        ("toLowerCase", "()Ljava/lang/String;"),
+        ("toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;"),
+        ("toUpperCase", "()Ljava/lang/String;"),
+        ("compareTo", "(Ljava/lang/String;)I"),
+        ("compareToIgnoreCase", "(Ljava/lang/String;)I"),
+        ("equalsIgnoreCase", "(Ljava/lang/String;)Z"),
+        ("split", "(Ljava/lang/String;)[Ljava/lang/String;"),
+        // Plain shapes the cold list forced and the warm list never reviewed.
+        ("equals", "(Ljava/lang/Object;)Z"),
+        ("hashCode", "()I"),
+        ("indexOf", "(Ljava/lang/String;)I"),
+        ("lastIndexOf", "(Ljava/lang/String;)I"),
+        ("endsWith", "(Ljava/lang/String;)Z"),
+        ("toString", "()Ljava/lang/String;"),
+        ("concat", "(Ljava/lang/String;)Ljava/lang/String;"),
+        ("contains", "(Ljava/lang/CharSequence;)Z"),
+        // On neither list, then or now.
+        ("chars", "()Ljava/util/stream/IntStream;"),
+        ("strip", "()Ljava/lang/String;"),
     ];
 
-    /// The cold and warm halves of the forced-native `String` policy disagree
-    /// for a **known, enumerated** set of shapes, and agree everywhere else.
+    /// No dispatch path forces a native over `java/lang/String` bytecode by
+    /// name any more — for **any** shape, including the twelve the warm
+    /// whitelist used to admit.
     ///
-    /// This is not an "the two lists are equal" assertion — they are not equal,
-    /// and cannot be made equal without forcing natives for `trim` /
-    /// `toLowerCase` / `compareTo*`, which is a correctness change nobody has
-    /// reviewed. What it freezes is *which* shapes disagree, so that changing
-    /// either half without the other fails here instead of silently making a
-    /// `String` method's behaviour depend on how many times its call site has
-    /// executed.
+    /// This replaces `forced_native_string_policy_divergence_is_exactly_the_
+    /// unicode_sensitive_names`, which froze a divergence rather than removing
+    /// it. The divergence is gone because the policy is: whichever
+    /// `java/lang/String` natives are *registered* in real-JDK mode win, and
+    /// `NativeMethodRegistry::register`'s real-JDK drop decides which those
+    /// are, once, for every path.
+    ///
+    /// Verified by injection: restoring any `class_name == "java/lang/String"`
+    /// arm to `force_native_over_real_jdk_bytecode` fails this immediately.
     #[test]
-    fn forced_native_string_policy_divergence_is_exactly_the_unicode_sensitive_names() {
-        for &(name, descriptor, want_cold, want_warm) in STRING_POLICY {
-            assert_eq!(
-                cold_forced_native_string_name(name),
-                want_cold,
-                "cold-path verdict changed for String.{name}{descriptor}. The cold path is \
-                 `check_override`'s 21-NAME list; it is descriptor-blind, so every overload \
-                 moves together."
-            );
-            assert_eq!(
-                warm_forced_native_string_candidate(name, descriptor),
-                want_warm,
-                "warm-path verdict changed for String.{name}{descriptor}. If you meant to \
-                 admit it, update this table AND check the cold path agrees — a shape forced \
-                 on one path only behaves differently depending on how many times its call \
-                 site has run."
+    fn no_string_shape_is_forced_native_by_name_on_any_dispatch_path() {
+        for &(name, descriptor) in STRING_SHAPES {
+            assert!(
+                !force_native_over_real_jdk_bytecode("java/lang/String", name, descriptor),
+                "String.{name}{descriptor} is forced native by name again. The forced-native \
+                 `java/lang/String` policy was removed on 2026-08-04 after being MEASURED \
+                 inert — a binary with both lists deleted produced a byte-identical 392-case \
+                 `String` transcript in both modes and identical invocation counts on all 38 \
+                 exercised registry slots. If a `String` native must win, register it \
+                 `NativeKind::Intrinsic` and let §1.4 take it on kind; do not add a name here, \
+                 because a name here decides nothing (`resolve_step1_native` dispatches the \
+                 triple before this function runs) while reading exactly like it does."
             );
         }
     }
 
-    /// The five h2-bnf shapes reach a decision instead of being cut off by the
-    /// exclusion above them.
+    /// The predicate is not simply `false` for everything — the assertion above
+    /// has to be capable of failing.
     ///
-    /// They were added (2026-07-23) to a block *below* the exclusion without
-    /// being added to the exclusion's whitelist, so control never reached them:
-    /// a landed, root-caused, measured performance fix that had never once
-    /// executed. This is the regression test for that shape of mistake — a
-    /// whitelist and the block it guards drifting apart inside one function.
+    /// A guard that cannot fail reads exactly like one that works; three were
+    /// found in one evening on this feature. `java/lang/StringUTF16.getChars`
+    /// is a deliberate, still-live entry in the same function, so a `true`
+    /// here proves the `false`s above are decisions rather than a stub.
     #[test]
-    fn the_h2_bnf_string_entries_are_reachable() {
-        for (name, descriptor) in [
-            ("substring", "(I)Ljava/lang/String;"),
-            ("charAt", "(I)C"),
-            ("length", "()I"),
-            ("isEmpty", "()Z"),
-            ("startsWith", "(Ljava/lang/String;)Z"),
-        ] {
+    fn the_string_guard_can_fail() {
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                "java/lang/StringUTF16",
+                "getChars",
+                "([BII[CI)V"
+            ),
+            "`force_native_over_real_jdk_bytecode` no longer forces the one entry that proves \
+             it still forces anything, so `no_string_shape_is_forced_native_by_name_on_any_\
+             dispatch_path` above is vacuous"
+        );
+    }
+
+    /// The source of every dispatch path is free of `java/lang/String` name
+    /// matching.
+    ///
+    /// The predicate test above only covers `force_native_over_real_jdk_bytecode`.
+    /// The policy had three copies, and the one that cost a session to find was
+    /// in a different file — so scan the other two directly.
+    #[test]
+    fn no_dispatch_path_mentions_java_lang_string_by_name() {
+        // (file, what a match there would mean)
+        let scanned: &[(&str, &str)] = &[(
+            include_str!("../../vm/vm_exec.rs"),
+            "vm/src/vm/vm_exec.rs's `check_override` chain",
+        )];
+        for (src, what) in scanned {
+            // Establish the corpus is real before concluding anything from an
+            // absence: a mis-typed `include_str!` path would not compile, but a
+            // file that stopped containing the chain at all would make this
+            // pass for the wrong reason.
             assert!(
-                warm_forced_native_string_candidate(name, descriptor),
-                "String.{name}{descriptor} is excluded before the h2-bnf block that names it \
-                 can run, so that block is dead code again"
+                src.contains("let check_override = method.is_abstract()"),
+                "{what} no longer contains the `check_override` chain, so this scan is \
+                 looking at the wrong text and its absence-of-`String` verdict means nothing"
             );
-            assert!(
-                force_native_over_real_jdk_bytecode("java/lang/String", name, descriptor),
-                "String.{name}{descriptor} passes the exclusion but no block below forces it; \
-                 the warm path now disagrees with `check_override`, which has forced this \
-                 name since RKC16N.6"
-            );
+            // Match the FORCE-NATIVE shape specifically — a disjunct of the
+            // `check_override` chain — rather than every mention of the class
+            // name. `invoke_or_native` also carries a `java/lang/String` arm
+            // that SUPPRESSES a bogus inherited `setOption` dispatch
+            // (`return Ok(None)`), which is the opposite of forcing a native
+            // and must not trip this. Caught by this guard on its first run,
+            // which is the argument for writing it as a scan rather than as a
+            // claim.
+            for (i, line) in src.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !code.starts_with(r#"|| (class_name == "java/lang/String""#),
+                    "{what} has a forced-native `java/lang/String` disjunct again at line \
+                     {}. That arm was deleted on 2026-08-04 after being measured inert; \
+                     re-adding one re-creates the cold/warm divergence whose whole cost was \
+                     that a `String` method's behaviour started depending on how many times \
+                     its call site had executed. If a `String` native must win, register it \
+                     `NativeKind::Intrinsic`: `NativeMethodRegistry::register`'s real-JDK \
+                     drop is where this policy lives now.",
+                    i + 1
+                );
+            }
         }
     }
 }

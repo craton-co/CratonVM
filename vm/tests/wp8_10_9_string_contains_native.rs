@@ -1,207 +1,186 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! WP8.10.9 — `String.contains(CharSequence)` (and `startsWith(String,I)`)
-//! native registration regression.
+//! The `java/lang/String` native surface, and which of it survives into a
+//! real-JDK registry.
 //!
-//! Without these registrations, synthetic-jdk mode raises
-//! `NoSuchMethodError` the moment any boot path calls
+//! # What this file used to assert, and why it changed
+//!
+//! WP8.10.9 registered `String.contains(CharSequence)` and
+//! `String.startsWith(String,int)` because synthetic-jdk mode raised
+//! `NoSuchMethodError` the moment a boot path called
 //! `someName.contains("Module")` (the canonical case is
-//! `vm/tests/wildfly_boot_fixtures/JBossModulesProbe.java::probeJBossModuleClassReachable`).
+//! `vm/tests/wildfly_boot_fixtures/JBossModulesProbe.java`). This file then
+//! asserted those triples were present in the registry of a
+//! `VmConfig::default()` VM — which, in the default build (no `synthetic-jdk`
+//! feature), is a **real-JDK** registry. The requirement was about synthetic
+//! mode; the assertion was taken in the other one.
 //!
-//! Acceptance:
+//! On 2026-08-04 the forced-native `java/lang/String` policy was removed
+//! (`docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
+//! Contract §1.4 — real class bytes are authoritative — is now enforced where
+//! it can be enforced once for every dispatch path: `NativeMethodRegistry::
+//! register` drops every `java/lang/String` `Bridge` in real-JDK mode, so the
+//! real `String.contains` bytecode runs. The WP8.10.9 requirement is untouched:
+//! synthetic mode does not set that drop, and the registrations are still made.
 //!
-//! 1. The hot triple
-//!    `(java/lang/String, contains, (Ljava/lang/CharSequence;)Z)`
-//!    is present in `shared.natives.native_methods` after VM construction.
-//! 2. The same is true for the offset overload of `startsWith`.
-//! 3. The registered native produces the spec-correct result for the
-//!    typical hits/misses + the empty-needle edge case.
+//! So this file now asserts the policy rather than the registration, in the one
+//! mode it can observe:
 //!
-//! Companion: see WP8.10.5 (`is_jdk_class` extension that unblocked
-//! this NSME path) and the probe0 assertion in
-//! `vm/tests/wp8_10_jboss_modules_smoke.rs:202`.
+//! 1. the `java/lang/String` `Bridge` surface is ABSENT from a real-JDK
+//!    registry — including `contains` and `startsWith`, the two WP8.10.9
+//!    named;
+//! 2. `intern()` survives, because the image declares it `ACC_NATIVE` and a
+//!    bridge in front of a genuinely native method is contract §1.5, not a
+//!    shadow;
+//! 3. the four reviewed `NativeKind::Intrinsic` fast-regex shapes survive,
+//!    because §1.4's reviewed exception is decided on kind and needs no name
+//!    list at any dispatch site.
+//!
+//! (2) and (3) are what stop (1) from being a test that a whole class was
+//! deleted: the rule is "drop the bridges that shadow bytecode", and a rule
+//! that dropped everything would satisfy (1) just as well.
 
 use std::sync::Arc;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::types::Value;
-use cratonvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm, Vm};
+use cratonvm_vm::vm::SharedVm;
 
 fn shared() -> Arc<SharedVm> {
     Arc::new(SharedVm::new(VmConfig::default()))
 }
 
+/// Every `java/lang/String` shape whose real-JDK class bytes carry a `Code`
+/// attribute must lose — and be gone from the registry entirely, so no
+/// dispatch path has anything to find.
+///
+/// The list is the shapes the four deleted copies of the policy forced, plus
+/// the two WP8.10.9 named.
 #[test]
-fn string_contains_charsequence_is_registered() {
+fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
+    let shared = shared();
+    let registry = &shared.natives.native_methods;
+
+    let shadowing: &[(&str, &str)] = &[
+        // WP8.10.9's two.
+        ("contains", "(Ljava/lang/CharSequence;)Z"),
+        ("startsWith", "(Ljava/lang/String;I)Z"),
+        // The h2-bnf five.
+        ("substring", "(I)Ljava/lang/String;"),
+        ("charAt", "(I)C"),
+        ("length", "()I"),
+        ("isEmpty", "()Z"),
+        ("startsWith", "(Ljava/lang/String;)Z"),
+        // The quadratic-parent substring fix.
+        ("substring", "(II)Ljava/lang/String;"),
+        // The charset-name constructors — the FOURTH copy of the policy, which
+        // the record counted as three. They were also wrong: `new
+        // String(bytes, "NO-SUCH")` returned a UTF-8 decode instead of raising
+        // `UnsupportedEncodingException`, and `"US-ASCII"` decoded as Latin-1.
+        ("<init>", "([BLjava/lang/String;)V"),
+        ("<init>", "([BIILjava/lang/String;)V"),
+        // The Unicode/locale-sensitive residue the cold list forced.
+        ("trim", "()Ljava/lang/String;"),
+        ("toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;"),
+        ("toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;"),
+        // The plain ones it also forced.
+        ("equals", "(Ljava/lang/Object;)Z"),
+        ("hashCode", "()I"),
+        ("endsWith", "(Ljava/lang/String;)Z"),
+        ("indexOf", "(Ljava/lang/String;)I"),
+        ("lastIndexOf", "(Ljava/lang/String;)I"),
+        ("replace", "(CC)Ljava/lang/String;"),
+        ("toString", "()Ljava/lang/String;"),
+    ];
+
+    for &(name, descriptor) in shadowing {
+        assert!(
+            registry.find("java/lang/String", name, descriptor).is_none(),
+            "java/lang/String.{name}{descriptor} is registered in a real-JDK registry again. \
+             The JDK 25 image declares it with a `Code` attribute, so a registered `Bridge` in \
+             front of it is contract §1.4's `NativeShadowsBytecode` — and, measured against \
+             HotSpot with `probes/StringPolicyMatrixProbe`, these natives were the CAUSE of 57 \
+             of 392 divergences (unpaired surrogates decoded to U+FFFD, out-of-range indices \
+             with no exception message, `null` arguments answered with a default instead of an \
+             NPE). Re-registering one reinstates that. If it must win, review it against the \
+             probe and register it `NativeKind::Intrinsic`."
+        );
+    }
+}
+
+/// `intern()` survives the drop: the image declares it `ACC_NATIVE`, so there
+/// is no bytecode for it to shadow.
+///
+/// Without this, the test above would pass just as happily for a change that
+/// dropped the whole class — a different and much worse change.
+#[test]
+fn real_jdk_registry_keeps_the_one_genuine_string_bridge() {
     let shared = shared();
     assert!(
         shared
             .natives
             .native_methods
-            .find(
-                "java/lang/String",
-                "contains",
-                "(Ljava/lang/CharSequence;)Z"
-            )
+            .find("java/lang/String", "intern", "()Ljava/lang/String;")
             .is_some(),
-        "WP8.10.9 regression: String.contains(CharSequence) MUST be \
-         registered in `register_essential_natives` so synthetic-jdk \
-         mode does not NSME on `name.contains(\"Module\")` from \
-         WildFly / JBoss Modules boot."
+        "java/lang/String.intern()Ljava/lang/String; is gone. It is the ONE `java/lang/String` \
+         registration the JDK 25 image declares `ACC_NATIVE` (79 of the other 80 carry a `Code` \
+         attribute), so it is a legitimate §1.5 bridge and the real-JDK drop must not take it. \
+         If this fails, the drop stopped being 'drop the bridges that shadow bytecode' and \
+         became 'drop the class'."
     );
 }
 
+/// The four reviewed `NativeKind::Intrinsic` fast-regex shapes survive.
+///
+/// They are how §1.4's reviewed exception is expressed now: on the KIND, with
+/// no name list at any dispatch site. Registering them `Bridge` — including by
+/// omission, since the ambient category at that registration site *is* `Bridge`
+/// — silently deletes the SBR-02 fix, which is the failure this pins.
 #[test]
-fn string_starts_with_offset_is_registered() {
+fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
     let shared = shared();
-    assert!(
-        shared
-            .natives
-            .native_methods
-            .find("java/lang/String", "startsWith", "(Ljava/lang/String;I)Z")
-            .is_some(),
-        "WP8.10.9 regression: the (String, int) overload of String.startsWith \
-         MUST be registered alongside the single-arg variant — bytecode that \
-         does `s.startsWith(\"x\", 4)` would otherwise NSME."
-    );
-}
+    let registry = &shared.natives.native_methods;
 
-#[test]
-fn string_contains_true_via_dispatch() {
-    let mut vm = Vm::new(VmConfig::default());
-    let haystack = create_java_string(&vm.shared, "org.jboss.modules.Module");
-    let needle = create_java_string(&vm.shared, "Module");
+    // Same default-ON / opt-out reading as the registration site. With the flag
+    // off the four are deliberately never registered and the real bytecode
+    // runs, so there is nothing to assert — and saying so explicitly keeps a
+    // `CRATONVM_NATIVE_STRING_REGEX=0` environment from turning this into a
+    // failure that looks like a regression.
+    let regex_natives_enabled =
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        };
+    if !regex_natives_enabled {
+        return;
+    }
 
-    let cb = vm
-        .shared
-        .natives
-        .native_methods
-        .find(
-            "java/lang/String",
-            "contains",
-            "(Ljava/lang/CharSequence;)Z",
-        )
-        .expect("contains(CharSequence) must be registered");
-    let mut ctx = NativeContextImpl {
-        shared: &vm.shared,
-        thread: &mut vm.main_thread,
-    };
-    let r = cb(
-        &mut ctx,
-        &[Value::Object(Some(haystack)), Value::Object(Some(needle))],
-    )
-    .expect("contains call should not error");
-    assert_eq!(
-        r,
-        Some(Value::Int(1)),
-        "\"...Module\".contains(\"Module\") must be true"
-    );
-}
+    let reviewed: &[(&str, &str)] = &[
+        (
+            "replaceAll",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        (
+            "replaceFirst",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        ("matches", "(Ljava/lang/String;)Z"),
+        (
+            "replace",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
+        ),
+    ];
 
-#[test]
-fn string_contains_false_via_dispatch() {
-    let mut vm = Vm::new(VmConfig::default());
-    let haystack = create_java_string(&vm.shared, "hello world");
-    let needle = create_java_string(&vm.shared, "xyz");
-
-    let cb = vm
-        .shared
-        .natives
-        .native_methods
-        .find(
-            "java/lang/String",
-            "contains",
-            "(Ljava/lang/CharSequence;)Z",
-        )
-        .expect("contains(CharSequence) must be registered");
-    let mut ctx = NativeContextImpl {
-        shared: &vm.shared,
-        thread: &mut vm.main_thread,
-    };
-    let r = cb(
-        &mut ctx,
-        &[Value::Object(Some(haystack)), Value::Object(Some(needle))],
-    )
-    .expect("contains call should not error");
-    assert_eq!(
-        r,
-        Some(Value::Int(0)),
-        "\"hello world\".contains(\"xyz\") must be false"
-    );
-}
-
-#[test]
-fn string_contains_empty_needle_is_true() {
-    // JDK spec: every String contains the empty string.
-    let mut vm = Vm::new(VmConfig::default());
-    let haystack = create_java_string(&vm.shared, "anything");
-    let empty = create_java_string(&vm.shared, "");
-
-    let cb = vm
-        .shared
-        .natives
-        .native_methods
-        .find(
-            "java/lang/String",
-            "contains",
-            "(Ljava/lang/CharSequence;)Z",
-        )
-        .expect("contains(CharSequence) must be registered");
-    let mut ctx = NativeContextImpl {
-        shared: &vm.shared,
-        thread: &mut vm.main_thread,
-    };
-    let r = cb(
-        &mut ctx,
-        &[Value::Object(Some(haystack)), Value::Object(Some(empty))],
-    )
-    .expect("contains call should not error");
-    assert_eq!(
-        r,
-        Some(Value::Int(1)),
-        "\"anything\".contains(\"\") must be true per JDK String spec"
-    );
-}
-
-#[test]
-fn string_starts_with_offset_via_dispatch() {
-    let mut vm = Vm::new(VmConfig::default());
-    let s = create_java_string(&vm.shared, "cratonvm.boot.fixture");
-    let prefix = create_java_string(&vm.shared, "boot");
-
-    let cb = vm
-        .shared
-        .natives
-        .native_methods
-        .find("java/lang/String", "startsWith", "(Ljava/lang/String;I)Z")
-        .expect("startsWith(String, int) must be registered");
-    let mut ctx = NativeContextImpl {
-        shared: &vm.shared,
-        thread: &mut vm.main_thread,
-    };
-    // "cratonvm.boot.fixture".startsWith("boot", 9) == true
-    let r = cb(
-        &mut ctx,
-        &[
-            Value::Object(Some(s)),
-            Value::Object(Some(prefix)),
-            Value::Int(9),
-        ],
-    )
-    .expect("startsWith call should not error");
-    assert_eq!(r, Some(Value::Int(1)));
-
-    // Off the end → false (not OOBE — that variant per JDK returns false
-    // when offset > length()).
-    let r2 = cb(
-        &mut ctx,
-        &[
-            Value::Object(Some(s)),
-            Value::Object(Some(prefix)),
-            Value::Int(100),
-        ],
-    )
-    .expect("startsWith call should not error on out-of-range offset");
-    assert_eq!(r2, Some(Value::Int(0)));
+    for &(name, descriptor) in reviewed {
+        let kind = registry.kind_of("java/lang/String", name, descriptor);
+        assert_eq!(
+            kind,
+            Some(cratonvm_native_api::NativeKind::Intrinsic),
+            "java/lang/String.{name}{descriptor} must be registered `Intrinsic`, and is \
+             {kind:?}. `Bridge` — which is the AMBIENT category at that registration site, so \
+             it is what dropping `register_with_kind` gets you — means the real-JDK drop \
+             removes it and the SBR-02 fast-regex fix disappears with no error anywhere. That \
+             silent-deletion shape is what the forced-native `String` record exists about."
+        );
+    }
 }

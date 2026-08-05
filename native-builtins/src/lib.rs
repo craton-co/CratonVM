@@ -6844,7 +6844,8 @@ pub fn register_essential_natives_with_shims(
             crate::app_shims::register_app_intrinsic_shims(registry);
         });
     }
-    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // SBR-02 / bug-03: fast regex, and the one `java/lang/String` family that
+    // still wins over real-JDK bytecode. The real `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
     // than HotSpot (every Matcher step crosses the VM→native String-accessor
@@ -6852,32 +6853,57 @@ pub fn register_essential_natives_with_shims(
     // `regex`/`fancy-regex` natives are normally registered only by
     // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
     // are absent here by default and the real bytecode runs (the real-Java
-    // default). When `CRATONVM_NATIVE_STRING_REGEX` is set, register them so the
-    // companion `force_native_over_real_jdk_bytecode` gate routes
-    // `String.replaceAll/replaceFirst/matches` to the cached, Java-faithful
-    // native. Read directly (native-builtins cannot depend on vm::env_cache)
+    // default). Read directly (native-builtins cannot depend on vm::env_cache)
     // with the SAME default-ON / opt-out (`=0`/`false`) semantics as
     // `env_cache::native_string_regex`; registration runs once at VM init so the
     // lookup cost is negligible.
+    //
+    // # `register_with_kind(.., Intrinsic)`, and why it is load-bearing
+    //
+    // Every other `java/lang/String` `Bridge` is DROPPED in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4 — real class bytes are
+    // authoritative), which is where the three deleted forced-native `String`
+    // lists went. These four survive that drop on their KIND, which is exactly
+    // §1.4's reviewed exception and needs no name list at any dispatch site.
+    // Registering them `Bridge` — including by omission, since the ambient
+    // category here is `Bridge` — silently deletes the SBR-02 fix.
+    //
+    // Stated at the site rather than inherited from an enclosing
+    // `set_category`, so the census's `kind_stated` column records that
+    // somebody adjudicated these four rather than that they inherited whatever
+    // the call chain left behind. These are its first callers.
+    //
+    // Reviewed against HotSpot with `probes/StringPolicyMatrixProbe` (392
+    // cases) and measured with `probes/StringRegexCostProbe`: the four are
+    // ~2× faster than HotSpot on the `PluginXmlParser.format()` shape they
+    // were written for, with identical digests. The review is what makes them
+    // `Intrinsic`; being fast is not sufficient, and the review had to be
+    // *repaired* first — see `lang_string.rs`, where these four now raise
+    // `PatternSyntaxException` / NPE / `IndexOutOfBoundsException` where the
+    // JDK does instead of falling back to a literal replacement and returning
+    // a plausible wrong answer.
     let native_string_regex_enabled = crate::nbflags().native_string_regex;
     if native_string_regex_enabled {
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceAll",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_all,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceFirst",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_first,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "matches",
             "(Ljava/lang/String;)Z",
             native_string_matches,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
         // SBR-02 secondary finding: the `replace(CharSequence,CharSequence)`
         // overload is LITERAL all-occurrences replacement (NOT regex), but its
@@ -6888,13 +6914,14 @@ pub fn register_essential_natives_with_shims(
         // `str::replace` (literal, non-overlapping, empty-target inserts at
         // every position — same as Java) so there's no regex-semantics risk;
         // gated together with the regex natives. NOTE: the `(char,char)`
-        // overload already has an unconditional native (`native_string_replace`)
-        // and is unaffected.
-        registry.register(
+        // overload has its own native, which is a `Bridge` and is therefore
+        // dropped in real-JDK mode with the rest.
+        registry.register_with_kind(
             "java/lang/String",
             "replace",
             "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
             native_string_replace_charseq,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
     }
     // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/

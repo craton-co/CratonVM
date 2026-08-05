@@ -3616,15 +3616,17 @@ pub(crate) fn native_string_replace_charseq(
         Some(Value::Object(Some(o))) => {
             invoke_to_string(&mut *scope, *o).unwrap_or_default()
         }
-        // null target → real JDK NPEs; defer to the (graceful) null result the
-        // sibling regex natives use rather than crash. Real callers never pass null.
-        _ => return Ok(Some(Value::Object(None))),
+        // A `null` target is an NPE, matching the JDK. This used to return a
+        // null `String` on the reasoning that "real callers never pass null" —
+        // which is a claim about callers, not about the method, and it made
+        // `s.replace(null, "x")` hand back `null` where HotSpot throws.
+        _ => return Err(regex_arg_npe("target").into()),
     };
     let replacement = match args.get(2) {
         Some(Value::Object(Some(o))) => {
             invoke_to_string(&mut *scope, *o).unwrap_or_default()
         }
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("replacement").into()),
     };
     let this = scope.get(&this_handle);
     let s = scope.read_string(this).unwrap_or_default();
@@ -4432,28 +4434,49 @@ pub(crate) fn native_string_join_iterable(
     ))))
 }
 
+/// A `null` reference argument to one of the SBR-02 fast-regex natives.
+///
+/// The JDK reaches its NPE by dereferencing the argument deep inside
+/// `Pattern.compile` / `Matcher.appendReplacement`, so its message names an
+/// internal field. We cannot reproduce that text without running the bytecode,
+/// and the *class* is what control flow depends on, so raise the right class
+/// with a message naming the parameter that was null.
+///
+/// This is not a detail. Until 2026-08-04 these natives returned a null
+/// `String` (or `false`) for a null argument, so `s.replaceFirst(null, "x")`
+/// produced `null` where HotSpot throws — a wrong value handed to the caller
+/// instead of an exception, which is the failure mode a native shadowing
+/// bytecode is most likely to have and least likely to have noticed.
+fn regex_arg_npe(parameter: &str) -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(format!("null {parameter} argument")),
+    }
+}
+
 pub(crate) fn native_string_replace_all(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("receiver").into()),
     };
     let pattern = match args.get(1) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("regex").into()),
     };
     let replacement = match args.get(2) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("replacement").into()),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_all_java(&s, replacement.as_str())
-    } else {
-        s.replace(&pattern, &replacement)
-    };
+    // A pattern this engine cannot compile is a `PatternSyntaxException`, not a
+    // licence to do something else. This used to fall through to a LITERAL
+    // `str::replace` of the pattern TEXT, so `"Hello, World".replaceAll("[",
+    // "x")` returned the input unchanged where HotSpot throws — a silently
+    // wrong answer produced by the error path of a fast path.
+    let re = compile_java_regex(&pattern, 0)?;
+    let result = re.replace_all_java(&s, replacement.as_str());
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4465,22 +4488,19 @@ pub(crate) fn native_string_replace_first(
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("receiver").into()),
     };
     let pattern = match args.get(1) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("regex").into()),
     };
     let replacement = match args.get(2) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(regex_arg_npe("replacement").into()),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let result = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        re.replace_first_java(&s, replacement.as_str())
-    } else {
-        s.replacen(&pattern, &replacement, 1)
-    };
+    let re = compile_java_regex(&pattern, 0)?;
+    let result = re.replace_first_java(&s, replacement.as_str());
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4492,21 +4512,21 @@ pub(crate) fn native_string_matches(
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => return Err(regex_arg_npe("receiver").into()),
     };
     let pattern = match args.get(1) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        _ => return Err(regex_arg_npe("regex").into()),
     };
     let s = ctx.read_string(this).unwrap_or_default();
-    let matched = if let Ok(re) = compile_java_regex(&pattern, 0) {
-        let anchored = format!("^(?:{})$", re.as_str());
-        match crate::compile_anchored_cached(&anchored) {
-            Some(full) => full.is_match(&s),
-            None => re.is_match(&s),
-        }
-    } else {
-        s == pattern
+    // Same rule as the two above. The old fallback compared the subject to the
+    // pattern TEXT, so `"Hello, World".matches("[")` answered `false` — a
+    // plausible verdict for a question that should have raised.
+    let re = compile_java_regex(&pattern, 0)?;
+    let anchored = format!("^(?:{})$", re.as_str());
+    let matched = match crate::compile_anchored_cached(&anchored) {
+        Some(full) => full.is_match(&s),
+        None => re.is_match(&s),
     };
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
