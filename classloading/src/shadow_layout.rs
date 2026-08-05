@@ -815,6 +815,49 @@ mod production_model_order_tests {
                     "_f14",
                 ],
             ),
+            // Found 2026-08-05 by running the census under three REAL
+            // workloads instead of three probes — the L4 record's own standing
+            // caveat. `Logger` has no `level` field at all (the effective level
+            // lives inside `config`), and `LogManager`'s `loggerRegistry` /
+            // `ready` are VM bookkeeping, so all three are `_vmN` anchored PAST
+            // the real field count where they land on padding.
+            (
+                "java/util/logging/Logger",
+                &[
+                    "config",
+                    "manager",
+                    "name",
+                    "loggerBundle",
+                    "anonymous",
+                    "catalogRef",
+                    "catalogName",
+                    "catalogLocale",
+                    "parent",
+                    "kids",
+                    "callerModuleRef",
+                    "isSystemLogger",
+                    "_vm12",
+                ],
+            ),
+            (
+                "java/util/logging/LogManager",
+                &[
+                    "props",
+                    "systemContext",
+                    "userContext",
+                    "rootLogger",
+                    "readPrimordialConfiguration",
+                    "globalHandlersState",
+                    "configurationLock",
+                    "closeOnResetLoggers",
+                    "listeners",
+                    "initializedCalled",
+                    "initializationDone",
+                    "loggerRefQueue",
+                    "_vm12",
+                    "_vm13",
+                ],
+            ),
             (
                 "java/lang/reflect/Constructor",
                 &[
