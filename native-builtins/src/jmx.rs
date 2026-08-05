@@ -1552,11 +1552,25 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     //     DURATIONS, which nothing in the VM records; also `register_thread_mxbean`.
     let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
+    // `isThreadAllocatedMemoryEnabled` and `isThreadContentionMonitoringEnabled`
+    // are ACC_NATIVE on both images — they read live JVM state, so `false` is a
+    // real answer from a VM that does not track it. The `*Supported` siblings
+    // are ordinary bytecode on `VMManagementImpl` and stay ambient.
+    for name in [
+        "isThreadAllocatedMemoryEnabled",
+        "isThreadContentionMonitoringEnabled",
+    ] {
+        r.register_with_kind(
+            cls,
+            name,
+            "()Z",
+            false_zero,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
     for name in [
         "isThreadAllocatedMemorySupported",
-        "isThreadAllocatedMemoryEnabled",
         "isThreadContentionMonitoringSupported",
-        "isThreadContentionMonitoringEnabled",
         "isObjectMonitorUsageSupported",
         "isRemoteDiagnosticCommandsSupported",
         "isGcNotificationSupported",

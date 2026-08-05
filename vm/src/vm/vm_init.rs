@@ -8050,6 +8050,10 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // The synthetic `ReentrantLock` / `ReentrantReadWriteLock` state tables,
     // keyed by `(vm_identity, identity_hash)`.
     cratonvm_native_builtins::forget_vm_lock_state(vm_identity);
+    // The generated `$ProxyN` class cache and the per-loader proxy module
+    // numbering. Both store `ClassId`s / ids that only this class manager can
+    // interpret.
+    cratonvm_native_builtins::forget_vm_proxy_classes(vm_identity);
     // The `Class.getName()` / simple / canonical / package name memos, keyed
     // by `(vm_identity, class_id)`.
     cratonvm_native_builtins::lang_class::forget_vm_class_name_caches(vm_identity);

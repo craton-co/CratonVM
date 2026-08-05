@@ -6,6 +6,30 @@ behaves today exactly as it did before L5. What is open is that each one is
 tagged `Bridge` while the JDK 25 image says its target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits it on a claim nobody has checked.
 
+> **PARTLY SUPERSEDED 2026-08-05 by a wider measurement.** Three verdicts
+> below rest on a census that asks one class in one image, and two of them do
+> not survive:
+>
+> * The `sun/nio/ch/FileDispatcherImpl` alias rows are **not** "robustness
+>   aliases, not adjudicated bridges" — they inherit the ACC_NATIVE syscall
+>   surface from `UnixFileDispatcherImpl`, which is exactly what §1.5 means.
+>   They state their kind now.
+> * `sun/nio/ch/WindowsFileDispatcherImpl` is **not** "the same syscall layer
+>   on a Windows image". It is on **no** JDK 25 image; the Windows JDK names
+>   that class `FileDispatcherImpl` too. All 28 rows are dead everywhere.
+> * `SocketDispatcher.close` — "dispatched 3× while resolving to no declared
+>   method", flagged here as the row worth a second look — resolves to concrete
+>   bytecode on `sun.nio.ch.UnixDispatcher`. It is an ordinary §1.4 shadow.
+> * `setDirect0` was **not** a wrong descriptor: the registered
+>   `(FileDescriptor, CharBuffer)I` form is the *Windows* signature. What was
+>   missing is the Unix `(FileDescriptor)I` entry point, now registered on its
+>   declarer, so `ExtendedOpenOption.DIRECT` is told "unsupported" instead of
+>   dying on `UnsatisfiedLinkError`.
+>
+> The `RandomAccessFile.close0` and `WindowsSocketOptions` verdicts stand — the
+> first is dead in the whole hierarchy, the second is a genuine Windows bridge.
+> See [`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md).
+
 Sibling record for the crates L5b/L5c did next:
 [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md).
 
