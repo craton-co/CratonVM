@@ -3,6 +3,7 @@
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
+use cratonvm_native_api::vm_scoped::VmScoped;
 use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, NativeHandleScope,
     TypeArgAnnotations,
@@ -68,7 +69,15 @@ pub(crate) fn dbg_bb_enabled() -> bool {
 // already lighter than `String` for read-only sharing.
 // ---------------------------------------------------------------------------
 
-type ClassNameCache = OnceLock<RwLock<FxHashMap<u32, Arc<str>>>>;
+/// Keyed by `(vm_identity, class_id)`, not by `class_id` alone.
+///
+/// Class ids are minted per VM from zero, so two `Vm`s in one process — which
+/// a Rust test binary routinely has running at once — collide immediately:
+/// VM B asking for the name of its class 42 got VM A's answer. That made
+/// `Class.getName()` lie, and with it every `getDeclaredMethod` /
+/// `isProxyClass` / package lookup built on top of it, showing up as
+/// intermittent `NoSuchMethodException`s in an otherwise green parallel run.
+type ClassNameCache = OnceLock<RwLock<FxHashMap<(usize, u32), Arc<str>>>>;
 
 static DOTTED_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
 static SIMPLE_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
@@ -76,21 +85,43 @@ static CANONICAL_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
 static PACKAGE_NAME_CACHE: ClassNameCache = OnceLock::new();
 
 #[inline]
-fn cache_get_or_init(cache: &ClassNameCache) -> &RwLock<FxHashMap<u32, Arc<str>>> {
+fn cache_get_or_init(cache: &ClassNameCache) -> &RwLock<FxHashMap<(usize, u32), Arc<str>>> {
     cache.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
 #[inline]
-fn cache_get(cache: &ClassNameCache, class_id: ClassId) -> Option<Arc<str>> {
+fn cache_get(cache: &ClassNameCache, vm: usize, class_id: ClassId) -> Option<Arc<str>> {
     let map = cache_get_or_init(cache);
-    map.read().get(&class_id.as_u32()).cloned()
+    map.read().get(&(vm, class_id.as_u32())).cloned()
 }
 
 #[inline]
-fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> Arc<str> {
+fn cache_insert(
+    cache: &ClassNameCache,
+    vm: usize,
+    class_id: ClassId,
+    value: Arc<str>,
+) -> Arc<str> {
     let map = cache_get_or_init(cache);
-    map.write().insert(class_id.as_u32(), Arc::clone(&value));
+    map.write()
+        .insert((vm, class_id.as_u32()), Arc::clone(&value));
     value
+}
+
+/// Drop every class-name cache entry belonging to `vm_identity`. Called from
+/// `release_vm_native_state`; without it the tables grow by a whole class
+/// library per disposed VM.
+pub fn forget_vm_class_name_caches(vm_identity: usize) {
+    for cache in [
+        &DOTTED_CLASS_NAME_CACHE,
+        &SIMPLE_CLASS_NAME_CACHE,
+        &CANONICAL_CLASS_NAME_CACHE,
+        &PACKAGE_NAME_CACHE,
+    ] {
+        cache_get_or_init(cache)
+            .write()
+            .retain(|(vm, _), _| *vm != vm_identity);
+    }
 }
 
 /// Dotted form of a class's internal slashed name (`java/lang/Object` в†’
@@ -100,8 +131,8 @@ fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> A
 /// For names with no `/` (primitives like `int`, `void`, or arrays of
 /// primitives like `[I`) the dotted form equals the slashed form and we
 /// still cache the `Arc<str>` clone of the input.
-pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, vm, class_id) {
         return arc;
     }
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
@@ -111,7 +142,7 @@ pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     } else {
         Arc::from(slashed)
     };
-    cache_insert(&DOTTED_CLASS_NAME_CACHE, class_id, dotted)
+    cache_insert(&DOTTED_CLASS_NAME_CACHE, vm, class_id, dotted)
 }
 
 /// Render an array class's internal descriptor as `Class.getTypeName()` does:
@@ -250,16 +281,16 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 /// truncated name (e.g. just `"1"`) and misreport `Not a mock` for every
 /// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
 /// EasyMock investigation).
-pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+pub(crate) fn simple_class_name(vm: usize, class_id: ClassId, raw: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, vm, class_id) {
         return arc;
     }
     if raw.starts_with('[') {
         let simple: Arc<str> = Arc::from(array_descriptor_to_simple_name(raw).unwrap_or_default());
-        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
+        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, vm, class_id, simple);
     }
     let simple: Arc<str> = Arc::from(raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw));
-    cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
+    cache_insert(&SIMPLE_CLASS_NAME_CACHE, vm, class_id, simple)
 }
 
 /// The class's OWN entry in its `InnerClasses` attribute, as
@@ -295,7 +326,7 @@ fn own_inner_class_entry(
 /// anonymous class — JLS 13.1), else the top-level derivation. Cached per
 /// `ClassId`.
 fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     match own_inner_class_entry(ctx, class_id, name) {
@@ -308,9 +339,9 @@ fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &st
         // ("1"), which regression-suite `RReflect` catches as
         // "anonymous getSimpleName empty".
         Some((_outer, inner_name)) => {
-            cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name))
+            cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, Arc::from(inner_name))
         }
-        None => simple_class_name(class_id, name),
+        None => simple_class_name(ctx.vm_identity(), class_id, name),
     }
 }
 
@@ -328,7 +359,7 @@ pub(crate) fn canonical_class_name(
     class_id: ClassId,
     slashed: &str,
 ) -> Arc<str> {
-    if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
@@ -370,15 +401,15 @@ pub(crate) fn canonical_class_name(
     } else {
         Arc::from(slashed.replace('/', "."))
     };
-    cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
+    cache_insert(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, canonical)
 }
 
 /// Package name (dotted) for a class. For `java/lang/Object` returns
 /// `java.lang`; for arrays returns the component package reported by
 /// `Class.getPackageName()` (`java.lang` for primitive arrays); for
 /// default-package classes returns the empty string. Cached per `ClassId`.
-pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+pub(crate) fn package_name_of(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, vm, class_id) {
         return arc;
     }
     let pkg: Arc<str> = if slashed.starts_with('[') {
@@ -388,7 +419,7 @@ pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
     } else {
         Arc::from("")
     };
-    cache_insert(&PACKAGE_NAME_CACHE, class_id, pkg)
+    cache_insert(&PACKAGE_NAME_CACHE, vm, class_id, pkg)
 }
 
 // ---------------------------------------------------------------------------
@@ -970,12 +1001,12 @@ pub(crate) fn native_class_get_name(
                         return Ok(Some(Value::Object(Some(name_obj))));
                     }
                 }
-                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
                     let name_obj = ctx.create_string(&arc);
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
                 if let Some(name) = ctx.class_name_of_id(class_id) {
-                    let dotted = dotted_class_name(class_id, &name);
+                    let dotted = dotted_class_name(ctx.vm_identity(), class_id, &name);
                     let name_obj = ctx.create_string(&dotted);
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
@@ -2198,7 +2229,7 @@ pub(crate) fn native_class_for_name(
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         let cid = ctx.class_id_from_mirror(mirror_ref);
                         let defining_loader = cid.and_then(|id| {
-                            crate::classloader::defining_loader_for(id.as_u32())
+                            crate::classloader::defining_loader_for(ctx.vm_identity(), id.as_u32())
                         });
                         eprintln!(
                             "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
@@ -3471,7 +3502,7 @@ pub(crate) fn native_class_get_simple_name(
     // encode ClassId only via field-0 are excluded to avoid cross-test
     // pollution on ClassId(0).
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             let result = ctx.create_string(&arc);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -3485,6 +3516,7 @@ pub(crate) fn native_class_get_simple_name(
                 let elem_simple = resolve_simple_name(ctx, elem_id, elem).to_string();
                 let simple = cache_insert(
                     &SIMPLE_CLASS_NAME_CACHE,
+                    ctx.vm_identity(),
                     class_id,
                     Arc::from(append_array_suffix(elem_simple, dims)),
                 );
@@ -3584,7 +3616,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     declaring_class_id: ClassId,
 ) -> cratonvm_types::ObjectRef {
     let loader_faithful = crate::classloader::loader_aware_resolution()
-        || crate::classloader::defining_loader_for(declaring_class_id.as_u32()).is_some_and(
+        || crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()).is_some_and(
             |loader| crate::classloader::url_classloader_isolated_from_app(ctx, loader),
         );
     // Arrays inherit the defining loader of their reference component
@@ -3610,7 +3642,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
                     .is_some()
             {
                 if let Some(loader) =
-                    crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+                    crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
                 {
                     let loader_pin = ctx.pin_native_root(loader);
                     let mirror = synthetic_class_mirror(ctx, desc);
@@ -3639,7 +3671,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             // it for an exact already-loaded lookup first, then initiate the
             // descriptor through that loader if necessary.
             if let Some(loader) =
-                crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+                crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
             {
                 if let Some(mirror) =
                     crate::classloader::find_loaded_class_for_loader(ctx, loader, inner)
@@ -8219,7 +8251,7 @@ fn link_isolated_method_signatures(
     declaring_class_id: ClassId,
     methods: &[&MethodMetadata],
 ) -> Result<(), MethodCallFailed> {
-    let Some(loader) = crate::classloader::defining_loader_for(declaring_class_id.as_u32()) else {
+    let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()) else {
         return Ok(());
     };
     if !crate::classloader::url_classloader_isolated_from_app(ctx, loader) {
@@ -10473,7 +10505,7 @@ pub(crate) fn native_class_get_interfaces(
                 // interfaces array (rooted + remapped by the annotation-proxy
                 // GC hooks) instead of the old raw `AtomicU64` pointer that
                 // was never rooted and could dangle after a moving GC.
-                if let Some(arr_ref) = proxy_last_interfaces() {
+                if let Some(arr_ref) = proxy_last_interfaces(ctx.vm_identity()) {
                     return Ok(Some(Value::Object(Some(arr_ref))));
                 }
                 // No proxy has been created yet вЂ” fall through and
@@ -10783,28 +10815,41 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 // a stale `ObjectRef` (use-after-free).
 // ---------------------------------------------------------------------------
 
-fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef>> {
-    static C: OnceLock<Mutex<FxHashMap<(u32, String), ObjectRef>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+/// Keyed by `vm_identity` because the rest of the key is a `ClassId`, and
+/// every VM mints those from zero: without the partition VM 2 looked up
+/// `(42, "Lfoo/Inherited;")`, hit VM 1's entry, and returned a proxy allocated
+/// in a heap that no longer existed. Sequentially that is a freed object;
+/// concurrently it is a live address in the *wrong* heap, and
+/// `safe_native_call`'s return-value `load_and_forward` segfaulted reading its
+/// header (`test_s50_ann_inheritedValue`, 2 runs in 3).
+static ANNOTATION_PROXY_CACHE: VmScoped<FxHashMap<(u32, String), ObjectRef>> = VmScoped::new();
+
+/// Per-proxy child roots, keyed the same way. The inner key is a raw heap
+/// address, which is likewise only meaningful inside one heap.
+static ANNOTATION_PROXY_CHILD_ROOTS: VmScoped<FxHashMap<usize, Vec<ObjectRef>>> = VmScoped::new();
+
+/// The most recently created proxy's interfaces array — one cell per VM, since
+/// the array itself is a heap object.
+static PROXY_LAST_INTERFACES: VmScoped<Option<ObjectRef>> = VmScoped::new();
+
+/// Per-VM teardown for the three side-tables above. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_annotation_proxies(vm_identity: usize) {
+    ANNOTATION_PROXY_CACHE.forget(vm_identity);
+    ANNOTATION_PROXY_CHILD_ROOTS.forget(vm_identity);
+    PROXY_LAST_INTERFACES.forget(vm_identity);
 }
 
-fn annotation_proxy_child_roots() -> &'static Mutex<FxHashMap<usize, Vec<ObjectRef>>> {
-    static C: OnceLock<Mutex<FxHashMap<usize, Vec<ObjectRef>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+fn remember_annotation_proxy_child_roots(vm: usize, proxy: ObjectRef, roots: Vec<ObjectRef>) {
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm, |table| {
+        table.insert(proxy.as_ptr() as usize, roots);
+    });
 }
 
-fn remember_annotation_proxy_child_roots(proxy: ObjectRef, roots: Vec<ObjectRef>) {
-    annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(proxy.as_ptr() as usize, roots);
-}
-
-fn forget_annotation_proxy_child_roots(proxy: ObjectRef) {
-    annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(proxy.as_ptr() as usize));
+fn forget_annotation_proxy_child_roots(vm: usize, proxy: ObjectRef) {
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm, |table| {
+        table.remove(&(proxy.as_ptr() as usize));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -10825,28 +10870,19 @@ fn forget_annotation_proxy_child_roots(proxy: ObjectRef) {
 // `gc_update_annotation_proxy_refs`, wired into roots.rs + gc.rs). No new GC
 // wiring is needed вЂ” the array is now a tracked root and is repointed after
 // every relocation, so the read below is always valid.
-fn proxy_last_interfaces_cell() -> &'static Mutex<Option<ObjectRef>> {
-    static C: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
-}
-
 /// Record the interfaces array of the most recently created proxy so a later
 /// `Class.getInterfaces()` on the shared `Proxy$Instance` mirror can return it
 /// (GC-tracked вЂ” see [`proxy_last_interfaces`]). Called from
 /// `lib.rs::native_proxy_new_instance`.
-pub fn set_proxy_last_interfaces(arr: ObjectRef) {
-    *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(arr);
+pub fn set_proxy_last_interfaces(vm_identity: usize, arr: ObjectRef) {
+    PROXY_LAST_INTERFACES.with(vm_identity, |cell| *cell = Some(arr));
 }
 
 /// Fetch the GC-tracked last-proxy interfaces array, if any. Returns the
 /// CURRENT (post-relocation) `ObjectRef` because the cell is remapped by
 /// [`gc_update_annotation_proxy_refs`].
-pub fn proxy_last_interfaces() -> Option<ObjectRef> {
-    *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+pub fn proxy_last_interfaces(vm_identity: usize) -> Option<ObjectRef> {
+    PROXY_LAST_INTERFACES.peek(vm_identity, |cell| *cell).flatten()
 }
 
 /// Build-or-fetch the cached annotation proxy for `ann` as seen on
@@ -10861,10 +10897,10 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// in the same namespace retains the authoritative loader identity.
 fn annotation_container_loader(ctx: &mut dyn NativeContext, holder_class_id: ClassId) -> Option<ObjectRef> {
     let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
-    crate::classloader::defining_loader_for(holder_class_id.as_u32()).or_else(|| {
+    crate::classloader::defining_loader_for(ctx.vm_identity(), holder_class_id.as_u32()).or_else(|| {
         holder_name.starts_with("org/ehcache/xml/model/").then(|| {
             ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
-                .and_then(|sibling| crate::classloader::defining_loader_for(sibling.as_u32()))
+                .and_then(|sibling| crate::classloader::defining_loader_for(ctx.vm_identity(), sibling.as_u32()))
                 .or_else(|| {
                     let id = ctx.loader_id_of_class(holder_class_id);
                     (id >= 3)
@@ -10881,11 +10917,11 @@ fn cached_annotation_proxy_for_key(
     key: String,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
+    let vm = ctx.vm_identity();
     let key = (holder_class_id.as_u32(), key);
-    if let Some(&cached) = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
+    if let Some(cached) = ANNOTATION_PROXY_CACHE
+        .peek(vm, |table| table.get(&key).copied())
+        .flatten()
     {
         return cached;
     }
@@ -10909,13 +10945,9 @@ fn cached_annotation_proxy_for_key(
         );
     }
     let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
-    let mut guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let cached = *guard.entry(key).or_insert(proxy);
-    drop(guard);
+    let cached = ANNOTATION_PROXY_CACHE.with(vm, |table| *table.entry(key).or_insert(proxy));
     if cached.as_ptr() != proxy.as_ptr() {
-        forget_annotation_proxy_child_roots(proxy);
+        forget_annotation_proxy_child_roots(vm, proxy);
     }
     cached
 }
@@ -10956,28 +10988,17 @@ fn cached_method_annotation_proxy(
 /// GC root scan for the annotation-proxy cache (companion to
 /// [`gc_update_annotation_proxy_refs`]). Pushes every cached proxy so a moving
 /// young GC keeps them live and records their relocation.
-pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
-    let guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    out.extend(guard.values().copied());
-    drop(guard);
-
-    let child_guard = annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for roots in child_guard.values() {
-        out.extend(roots.iter().copied());
-    }
-    drop(child_guard);
-
+pub fn gc_scan_annotation_proxy_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    ANNOTATION_PROXY_CACHE.peek(vm_identity, |table| out.extend(table.values().copied()));
+    ANNOTATION_PROXY_CHILD_ROOTS.peek(vm_identity, |table| {
+        for roots in table.values() {
+            out.extend(roots.iter().copied());
+        }
+    });
     // bug nb-lib-gckeys В§2: also root the last-proxy interfaces array so the
     // shared-mirror `Class.getInterfaces()` fallback never dereferences a
     // reclaimed/relocated array.
-    if let Some(arr) = *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-    {
+    if let Some(arr) = proxy_last_interfaces(vm_identity) {
         out.push(arr);
     }
 }
@@ -10985,53 +11006,51 @@ pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
 /// Post-GC remap for the annotation-proxy cache (companion to
 /// [`gc_scan_annotation_proxy_roots`]). Repoints each cached `ObjectRef` to its
 /// new address after a moving collection.
-pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
+pub fn gc_update_annotation_proxy_refs(
+    vm_identity: usize,
+    pointer_map: &HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
-    let mut guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for obj_ref in guard.values_mut() {
-        let old_addr = obj_ref.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
-    }
-    drop(guard);
-
-    let mut child_guard = annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut remapped = FxHashMap::default();
-    for (proxy_addr, mut roots) in child_guard.drain() {
-        for root in roots.iter_mut() {
-            let old_addr = root.as_ptr() as usize;
+    ANNOTATION_PROXY_CACHE.with(vm_identity, |table| {
+        for obj_ref in table.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
-        let new_proxy_addr = *pointer_map.get(&proxy_addr).unwrap_or(&proxy_addr);
-        remapped.insert(new_proxy_addr, roots);
-    }
-    *child_guard = remapped;
-    drop(child_guard);
+    });
+
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm_identity, |table| {
+        let mut remapped = FxHashMap::default();
+        for (proxy_addr, mut roots) in table.drain() {
+            for root in roots.iter_mut() {
+                let old_addr = root.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            let new_proxy_addr = *pointer_map.get(&proxy_addr).unwrap_or(&proxy_addr);
+            remapped.insert(new_proxy_addr, roots);
+        }
+        *table = remapped;
+    });
 
     // bug nb-lib-gckeys В§2: remap the last-proxy interfaces array alongside
     // the annotation-proxy cache (it shares this hook). Without the repoint
     // the shared-mirror `getInterfaces()` would hand back a stale pointer.
-    let mut cell = proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(arr) = cell.as_mut() {
-        let old_addr = arr.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *arr = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+    PROXY_LAST_INTERFACES.with(vm_identity, |cell| {
+        if let Some(arr) = cell.as_mut() {
+            let old_addr = arr.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *arr = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
         }
-    }
+    });
 }
 
 /// Annotation instances are materialised as REAL `$ProxyN` proxies by default,
@@ -11112,7 +11131,7 @@ fn wrap_annotation_in_real_proxy(
     if let (Some(loader_obj), Some(pin)) = (annotation_loader, annotation_loader_pin) {
         let loader_cur = ctx.read_native_pin(pin, loader_obj);
         if crate::classloader::is_user_defined_loader(ctx, loader_cur) {
-            crate::classloader::register_defining_loader(proxy_cid.as_u32(), loader_cur);
+            crate::classloader::register_defining_loader(ctx.vm_identity(), proxy_cid.as_u32(), loader_cur);
         }
     }
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
@@ -11937,7 +11956,7 @@ fn create_annotation_proxy(
         let (value_container_class_id, value_container_loader) = match default_owner {
             Some(owner) => (
                 Some(*owner),
-                crate::classloader::defining_loader_for(owner.as_u32()),
+                crate::classloader::defining_loader_for(ctx.vm_identity(), owner.as_u32()),
             ),
             None => (
                 container_class_id,
@@ -12039,7 +12058,7 @@ fn create_annotation_proxy(
         }
     }
     ctx.unpin_native_roots(proxy_pin);
-    remember_annotation_proxy_child_roots(proxy, child_roots);
+    remember_annotation_proxy_child_roots(ctx.vm_identity(), proxy, child_roots);
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }
@@ -12925,8 +12944,19 @@ fn build_class_annotation_array(
         .iter()
         .filter(|a| annotation_type_loadable_near(ctx, a, Some(queried_class_id)))
         .collect();
+    // Component is `java/lang/annotation/Annotation`, exactly as
+    // `build_method_annotation_array` and `build_annotation_array_for` already
+    // use — NOT `ClassId::new(0)`. A reference array carries its component class
+    // id in `ObjectHeader.class_id`, so `ClassId::new(0)` made every
+    // `Class.getDeclaredAnnotations()` / `Class.getAnnotations()` result report
+    // `[Ljava.lang.Object;` where HotSpot reports
+    // `[Ljava.lang.annotation.Annotation;` — and, because that same header word
+    // is what a virtual/interface dispatch reads to name the receiver's class,
+    // an `annotationType()` reached through the array surfaced as
+    // `NoSuchMethodError: java.lang.Object.annotationType()`.
+    let comp = annotation_component_class_id(ctx);
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
-    build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
+    build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
     })
 }
@@ -12965,14 +12995,17 @@ pub(crate) fn native_class_get_declared_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            // Even the degenerate result is an `Annotation[]`, not an `Object[]`.
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -13001,14 +13034,17 @@ pub(crate) fn native_class_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            // Even the degenerate result is an `Annotation[]`, not an `Object[]`.
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -13361,9 +13397,13 @@ fn class_annotations_by_type_impl(
         }
     }
 
+    // `getAnnotationsByType(Class<A>)` is declared to return `A[]`, so the array
+    // component is the QUERIED annotation type — not `java/lang/Object`, which
+    // made `Base.class.getAnnotationsByType(Tag.class).getClass().getName()`
+    // report `[Ljava.lang.Object;` where HotSpot reports `[LTag;`.
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+    let arr = build_mirror_array_comp(ctx, ann_class_id, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -13437,9 +13477,10 @@ pub(crate) fn native_method_get_annotations_by_type(
     let matching =
         directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
+    // `A[]`, same as the Class-holder sibling above.
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+    let arr = build_mirror_array_comp(ctx, ann_class_id, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -13526,14 +13567,16 @@ pub(crate) fn native_field_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let (class_id, field_name) = match field_class_and_name(ctx, this) {
         Some(v) => v,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -13618,14 +13661,16 @@ pub(crate) fn native_method_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let (class_id, method_name, method_desc) = match method_class_name_desc(ctx, this) {
         Some(v) => v,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -15002,7 +15047,7 @@ pub(crate) fn native_class_get_package_name(
     // program's lifetime. Cache-eligible mirrors are those owned by the
     // VM reverse map (rules out test-fixture ClassId(0) collisions).
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         // Synthetic lambda proxies aren't in the class store, so
@@ -15021,7 +15066,7 @@ pub(crate) fn native_class_get_package_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let pkg = package_name_of(class_id, &name);
+            let pkg = package_name_of(ctx.vm_identity(), class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
     }
@@ -15490,10 +15535,10 @@ pub(crate) fn native_class_get_package(
     let pkg_name: Arc<str> = if let Some(pkg_name) = lambda_pkg {
         pkg_name
     } else if let Some(class_id) = class_id {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
-            package_name_of(class_id, &name)
+            package_name_of(ctx.vm_identity(), class_id, &name)
         }
     } else if let Some(pos) = name.rfind('/') {
         Arc::from(name[..pos].replace('/', "."))
@@ -16103,10 +16148,10 @@ pub(crate) fn i2_classloader_define_package_class(
     // Cache the dotted package prefix per `ClassId` for VM-registered
     // mirrors only вЂ” same rationale as `native_class_get_package`.
     let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(class_arg) {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
-            package_name_of(class_id, &class_name)
+            package_name_of(ctx.vm_identity(), class_id, &class_name)
         }
     } else if let Some(pos) = class_name.rfind('/') {
         Arc::from(class_name[..pos].replace('/', "."))
@@ -16522,7 +16567,7 @@ pub(crate) fn native_class_get_canonical_name(
         // An empty canonical name is `canonical_class_name`'s sentinel for
         // "this class has no canonical name" (local / anonymous / nested in
         // one, JLS 6.7) — `Class.getCanonicalName()` returns null for those.
-        if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             if arc.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
@@ -16596,11 +16641,11 @@ pub(crate) fn native_class_get_type_name(
     // pure derivation from the slashed internal name and equals what
     // `dotted_class_name` produces вЂ” share the same cache as `Class.getName()`.
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let type_name = dotted_class_name(class_id, &name);
+            let type_name = dotted_class_name(ctx.vm_identity(), class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))));
         }
     }
@@ -16799,7 +16844,7 @@ pub(crate) fn native_class_get_class_loader(
     // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
-    if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+    if let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32()) {
         // This reverse relation is written only by successful defineClass paths
         // and reconciled across GC; it is the authoritative loader identity.
         return Ok(Some(Value::Object(Some(loader))));
@@ -17056,7 +17101,7 @@ fn declaring_class_loader_aware(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> Option<cratonvm_types::ClassId> {
-    let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())?;
+    let loader_obj = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())?;
 
     // Cheap short-circuit FIRST: if the VM's existing global-lookup answer
     // already belongs to the SAME defining loader as `class_id`, it's
@@ -17066,7 +17111,7 @@ fn declaring_class_loader_aware(
     // same-named-outer-class collision) and only pays for loader-driven
     // resolution when there's a genuine mismatch worth fixing.
     if let Some(existing) = ctx.declaring_class(class_id) {
-        if let Some(existing_loader) = crate::classloader::defining_loader_for(existing.as_u32()) {
+        if let Some(existing_loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), existing.as_u32()) {
             if existing_loader.as_ptr() == loader_obj.as_ptr() {
                 return None;
             }
@@ -17389,7 +17434,7 @@ pub(crate) fn native_class_get_declared_classes(
                 // hits: `getDeclaredClasses()` is called on a freshly
                 // isolated outer `Class` whose defining loader was never
                 // separately registered.
-                let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())
+                let loader_obj = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
                     .or_else(|| {
                         let ns_id = ctx.loader_id_of_class(class_id);
                         (ns_id >= 3)
@@ -19018,7 +19063,10 @@ pub(crate) fn native_class_get_protection_domain0(
         }
         let arr = ctx.read_native_pin(arr_pin, arr);
         let cs = ctx.read_native_pin(cs_pin, cs);
-        ctx.set_field(cs, 1, Value::Object(Some(arr)));
+        // BY NAME only: raw slot 1 is `signers` on a real `CodeSource`, so the
+        // raw write parked a `Certificate[]`-shaped array in the signer field
+        // and the by-name write beside it put the real one in `certs`. The
+        // by-name write covers both layouts on its own.
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
     let cs = ctx.read_native_pin(cs_pin, cs);
@@ -19468,11 +19516,11 @@ mod tests {
     #[test]
     fn class_get_name_normalizes_primitive_descriptors() {
         assert_eq!(
-            dotted_class_name(ClassId::new(0xfff0_0001), "Z").as_ref(),
+            dotted_class_name(0, ClassId::new(0xfff0_0001), "Z").as_ref(),
             "boolean"
         );
         assert_eq!(
-            dotted_class_name(ClassId::new(0xfff0_0002), "I").as_ref(),
+            dotted_class_name(0, ClassId::new(0xfff0_0002), "I").as_ref(),
             "int"
         );
     }

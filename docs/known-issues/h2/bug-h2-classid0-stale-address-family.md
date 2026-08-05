@@ -231,6 +231,104 @@ and the scan demonstrably finds pointers — 0.4-1.0 M of them per sweep, all
 `doomed → doomed`, which is the whole-subgraph-condemned-together case the
 promotion-seed comment in `sweep_old_gen_non_moving` warns about.
 
+### The same scan on the COMPACTING arm, and the trap in it (2026-08-05)
+
+The section above measures the **in-place sweep**. Repeating it against the
+**compactor** — at `--Xmx 512m`, which reaches the compacting regime an order of
+magnitude faster (9 major GCs in 25 minutes against 1 in 90 at `1g`) — gives the
+same verdict, but only after a false positive is removed from the instrument.
+
+Unvalidated, `live_old` fired on **every** compaction: about one hit each,
+always the same shape, byte-identical across three independent processes.
+
+```text
+REFERRER class_id=64 num_slots=18 total_size=320 compact=false
+  slot_of_word=88   enumerator_yielded=2   ENUMERATOR_SEES_VICTIM=false
+CELL 5 raw=[0x0000000200000000, 0x00000200100c4020] decodes_as=Discriminant(0)
+```
+
+Discriminant 0 of `Value` is `Int`. The cell reads `Int(2)` — tag and payload in
+its low half — while the victim's pointer sits in the 16-byte cell's **unused
+upper half**: residue from an `Object` that previously occupied the slot and was
+overwritten by a narrower variant. The mutator can never read it, the GC
+correctly ignores it, and the victim really is dead.
+
+**A raw word scan of this heap lies, and it lies in the direction of
+manufacturing a defect.** `live_old` now asks the containing object's own slot
+enumerator — the one every mark source funnels through — whether it actually
+yields the victim, and counts the rest as `stale_padding`. With that in place,
+over 12 compactions across 3 processes and ~2.4 M dropped blocks, `live_old`,
+`young` and `root` are **0** throughout.
+
+The earlier "`1_298_639` referrer words, every printed one `doomed → doomed`"
+nuisance and this one are the same problem seen twice. The fix for the first was
+to categorise instead of printing; the fix for the second is to decode instead
+of comparing bytes. **Both are needed**, and neither subsumes the other.
+
+`Value`-cell residue is also a *proven* mechanism for stale copies of an address
+existing in the heap long after the field stopped holding one — the cheapest
+known source of "an address that no longer names what its holder thinks it
+names", which is what this page is called. What is still not shown is a path by
+which such a copy is ever *read*.
+
+### The decisive run: `UNCLASSIFIED` is NOT always zero (2026-08-05)
+
+*Where that leaves the residual* below asks for exactly one thing: "the decisive
+run is one that ends in a `cannot be cast` with these lines above it." Here it
+is. `TestMVStoreCacheLoop`, `--Xmx 512m`, `CRATONVM_GC=-moving-young`, JIT on,
+referrer scan armed, run ended in 4 `ClassCastException`s:
+
+```text
+[GC] generational: minor=428 major=5
+[GC] oldgen_compact: dropped_watched_referents=312202 dropped_interior_root=1
+                     downgraded_to_inplace=0
+[GC] decision histogram: moving=270 non_moving=158
+[GC] xt_peer_scan: unclassified_peers=16 cycles_with_unclassified=15
+```
+
+and all four compactions in that same run reported
+`LIVE_REFERRERS=0 young=0 root=0`.
+
+**`UNCLASSIFIED` is 16, over 15 cycles.** The 2026-08-03 campaign observed it
+zero on all five sweeps it measured and concluded the root set was complete;
+that conclusion does not hold for the runs that actually fail. Per
+`xt_root_scan`'s own comment, an unclassified peer is one that did not park in
+the signal handler within the deadline — i.e. **still running JIT code, whose
+frame oops are in no root set**. That is precisely a reference no heap-side scan
+can ever see, and it is consistent with every other measurement on this page:
+nothing in the heap names the block, nothing in the root slice names it, and the
+collector nevertheless had an incomplete root set on 15 cycles of the failing
+run.
+
+This does not prove the specific victim was named by an unclassified peer — that
+needs the per-cycle `xt(...)` line beside the reclamation that drops it. It does
+retire the premise that the root set was complete, which is what possibility (1)
+below was waiting on, and it makes cross-thread root coverage the live suspect
+again rather than a hypothesis "refuted in session 2".
+
+The same run also shows `dropped_interior_root=1`: the compaction dropped a
+block an INTERIOR conservative root pointed into. That run carried
+`CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` (the pin disabled, as a control), so this
+is a direct observation of the defect the interior-root fix removes, firing in a
+run that then produced the family's symptom. It is one contributor, not the
+whole family — `LIVE_REFERRERS=0` says the rest of the dropped set was
+genuinely unreferenced.
+
+### A marking fail-open found while reading (2026-08-05)
+
+`compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`
+when the layout registry cannot produce its oop map. `None` is the *legacy
+object* answer, so every caller — `for_each_ref_slot`, `for_each_old_gen_ref`,
+`forward_ref_slots` — then reads a body of packed 8-byte fields as uniform
+16-byte `Value` cells. The reference slots are never visited, so the marker
+drops **every** edge out of that object and the next reclamation frees its
+referents while it is live.
+
+That is this family's exact shape, and it was indistinguishable from an ordinary
+legacy object. Now counted by `COMPACT_OOP_MAP_MISSING` and printed by
+`VmHeap::print_gc_summary` when non-zero. Expected zero; not yet observed
+non-zero, so this is a closed hole rather than a found cause.
+
 ### Root coverage per sweep (2026-08-03)
 
 The follow-on from the referrer scan: if nothing in the heap or the root slice
@@ -293,6 +391,170 @@ distinguishable:
    `CRATONVM_DBG_OLDSWEEP_OWNERS=1` already reports when a freed block **is** an
    overlay owner; nothing reports when a freed block is **referenced by** one,
    and that is the next instrument to write.
+
+### 2026-08-05: the `NoSuchMethodError` face DID produce a reclaim verdict — in YOUNG, from a heap field
+
+The table above records the blocked-frame face as `reclaimed_hole_at` =
+**not reclaimed**, **no ring record**. That was true of every occurrence it had
+then. It is not true of this one, caught on `org.h2.test.db.TestMultiThread`
+with no debug flags set:
+
+```
+WARN  …vm_exec: NoSuchMethodError
+      method="java/lang/Object.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+      caller="org/h2/engine/ConnectionInfo.readProperties(Ljava/util/Properties;)V @pc=95"
+ERROR …gc::guard: receiver points into RECLAIMED memory  obj="0x2005cc39d10"
+      site="invoke dispatch"  location=young TO-space (the inactive semispace)
+ERROR …gc::guard: …and a YOUNG non-moving sweep zeroed a span covering this
+      address.  span="0x2005cc151f8+0x3ff08" interior_off=150296 sweep_cycle=5
+```
+
+Three things it settles, and one it opens.
+
+**The region is YOUNG, not old gen.** Every verdict this page had before was
+`old-gen FREE BLOCK`. This one is the inactive semispace — the from-space a
+moving collection evacuated and then wiped — which is why the old-gen
+reclamation ring has nothing to say about it and why every old-side instrument
+in the sections above is looking in the wrong generation for it.
+
+**The holder is a HEAP FIELD, not a frame local, a root, or a JIT register.**
+`@pc=95` in `ConnectionInfo.readProperties` is:
+
+```
+84: aload_0 ; 85: getfield prop ; 88: aload 8 ; 90: aload 9
+92: invokevirtual java/util/Properties.put(Object,Object)
+```
+
+so the receiver came out of `this.prop` by `getfield`, on a live
+`ConnectionInfo` the frame is executing a method of. That kills the
+blocked-frame framing the old page name asserted, and it also means the
+reference survived *un-rewritten* rather than being *unrooted*: something wrote
+a stale address into that field, or a collection moved the target and did not
+rewrite the field.
+
+**The victim's class is `java.util.Properties`.** That is the one class on this
+page whose CratonVM state lives in an identity-keyed native side table
+(`properties_sidetable`) — i.e. exactly the remaining candidate *Where that
+leaves the residual* names, arrived at independently and from the other end.
+Treat it as corroboration of that lead, not as proof: nothing yet shows the
+side table held the stale address, only that the object whose field went stale
+is of the type the side table backs.
+
+What it opens: the address predates the last semispace swap, and on this
+workload only **~2 moving young collections happen per run** (measured
+`old_gen_scanned` 150-180 on both, i.e. during startup) with every later
+collection taking the non-moving fallback — while the failing `ConnectionInfo`
+is created hundreds of seconds later. Reconciling those two facts is the next
+step.
+
+`CRATONVM_DBG_STALE_OBJREF=1` is the instrument for it: it quarantines the
+just-evacuated from-space instead of wiping it, so a reference that survived a
+moving collection un-rewritten still carries a forwarding pointer and
+`get_header` hard-panics on the first read with holder attribution, instead of
+reading an all-zero header minutes later on another thread.
+
+### A second young witness, and it narrows the question to ROOT COLLECTION
+
+Same binary, same class, later the same day — and this one is as clean as this
+family gets:
+
+```
+WARN  …gc_quiescence: [moving-young] fallback #1: reason=unregistered-jit-frame-on-stack   [18:26:21]
+WARN  …vm_exec: NoSuchMethodError                                                          [18:26:28]
+      method="java/lang/Object.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+      caller="java/sql/DriverManager.getConnection(String,String,String)Connection @pc=19"
+ERROR …gc::guard: receiver is inside a YOUNG span the non-moving sweep zeroed and
+      returned to the free list.  obj="0x2004940a3d0" actual_class_id=0
+      freed_span="0x20049406020+0x75e8" interior_off=17328 sweep_cycle=0 free_seq=2525
+```
+
+`DriverManager.getConnection(String,String,String)` is four bytecodes long
+before the failure:
+
+```
+ 0: new java/util/Properties ; 3: dup ; 4: invokespecial Properties.<init>()V
+ 7: astore_3                               <- `info`, LOCAL 3
+ 8: aload_1 ; 9: ifnull 20
+12: aload_3 ; 13: ldc "user" ; 15: aload_1
+16: invokevirtual Properties.put(Object,Object)     <- fails; @pc=19 is the `pop` after it
+```
+
+So the victim is a **brand-new `java.util.Properties`, held in LOCAL 3 of the
+frame that is executing right now**, reclaimed between its constructor and its
+first use. The seven seconds between the fallback line and the failure are the
+pause: the thread was stopped at a safepoint across that sweep and resumed into
+`put`.
+
+**What that rules out.** `ROOT_IN_DEAD_SPANS` — unconditional, and it RETAINS
+the span rather than freeing it — did **not** fire for this span. That invariant
+compares the doomed spans against `roots` + `finalizer_addrs`, i.e. the exact
+slice the mark phase was handed. Its silence therefore says the address was
+**not in the root slice at all**. Combined with the `SWEEP_LIVENESS` heap-edge
+result (`hits=0`, §above), the mark phase neither dropped a root it was given
+nor missed a heap edge:
+
+> the root slice handed to the sweep did not contain a live top-frame local of
+> a thread stopped at a safepoint.
+
+That is a **root COLLECTION** question, not a mark or sweep question, and it is
+where the next instrument belongs. Note also that all three frame-root paths
+already screen operand-stack roots with `is_heap_addr` rather than the strict
+`is_object_address` header probe (see `scan_frame_roots`' doc comment), so the
+mid-init-object hole that shape would otherwise have is already closed — this
+witness is on the fixed code.
+
+`sweep_cycle=0` is worth keeping too: this is the FIRST non-moving young sweep
+of the process. Whatever the gap is, it does not need a long-running heap or an
+accumulated free list to appear.
+
+### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
+
+Recorded so they are not re-derived; each cost a build-and-soak cycle. These
+are the young-generation counterparts of the old-gen negatives above.
+
+1. **The young non-moving sweep does not drop a root it was handed.** The
+   root-in-dead-span invariant (`ROOT_IN_DEAD_SPANS`, unconditional, and it
+   RETAINS the span rather than freeing it) reported **zero** violations across
+   thousands of sweeps under `CRATONVM_NO_MOVING_YOUNG=1
+   CRATONVM_DBG_GC_STRESS=2097152`, once roots pointing at an EVACUATED source
+   were excluded. That exclusion is the measurement: before it the check fired
+   constantly and every hit was a promoted object whose young source shares a
+   dead run with an unpromoted neighbour. A dead span is a RUN of consecutive
+   dead objects carrying the first one's header — ask `is_forwarded()` of the
+   ROOT's object, not the run's head, or the check is pure noise.
+2. **No heap edge points into a doomed young span either.**
+   `CRATONVM_DBG_SWEEP_LIVENESS=1` on the real class: 14+ non-moving sweeps,
+   `hits=0 root_hits=0` on every one, ~611 000 old-gen objects scanned per cycle
+   against 32 000-60 000 doomed spans. Its young→young half stays vacuous
+   (`young_survivors_scanned=0`) because selective promotion moves every
+   survivor out — a real limit of the assertion, not a clean result.
+3. **`Object.clone()` is not a use-after-move.** `native_object_clone` reads
+   fields off `this` AFTER `ctx.alloc_object`, which is the exact shape of the
+   native stale-local bug class — but `NativeContextImpl::alloc_object` never
+   collects ("a native callback never initiates collection on this path", its
+   own comment), and a counter that fired whenever the receiver moved across
+   that allocation read **0**, including under `CRATONVM_DBG_GC_STRESS`. The
+   pin/read/unpin hardening was written, measured, and reverted rather than
+   left as unjustified cost on `MVStore.Page.copy()`, which clones a page per
+   structural modification.
+4. **Per-bci local liveness is correct for the enhanced-for shape** the
+   `hasNext()` witness came from. The synthetic `Iterator` local is read only
+   across the loop's BACK EDGE, so an analysis that did not reach a fixpoint
+   over it would report the slot dead exactly where the thread parks — and that
+   mask filters a blocked thread's root snapshot. Regression test:
+   `local_liveness::tests::enhanced_for_iterator_is_live_at_the_blocking_call`,
+   at the real byte offsets of `TestMultiThread.testConcurrentUpdate`.
+
+Two instrument lessons from the same window, both of which cost a build:
+
+* **A primitive array reads back class id 0.** Array headers carry the
+  COMPONENT class id (JVMS §4.4.1) and `long[]`/`int[]` have none, so a
+  `ClassId(0)` gate flags every `long[] toc` local in
+  `FileStore.dropUnusedChunks` on every wake. Gate on `kind == Object` too.
+* **Filter frame locals by the frame's own live mask.** The frame audit's first
+  true hit was `H2ConcurrentUpdateLoop.main` local 8 pointing into a young free
+  block — the seed loop's `PreparedStatement`, semantically dead for the rest of
+  the method, i.e. the liveness filter working exactly as designed.
 
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero
@@ -401,7 +663,7 @@ workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
 the 27.
 
 `TimeoutException` is the separate throughput defect tracked on
-`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+`h2-update-path-throughput-20260802.md`, not this one.
 
 #### Eliminated, with measurements
 
@@ -688,7 +950,7 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
-* `bug-h2-testmultithread-concurrent-update-timeout.md` — the class the
+* `h2-update-path-throughput-20260802.md` — the class the
   blocked-frame face was found in, whose own problem is throughput, not this.
 * the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
   same signature; see *Handed over from `TestDiskFull`* above.

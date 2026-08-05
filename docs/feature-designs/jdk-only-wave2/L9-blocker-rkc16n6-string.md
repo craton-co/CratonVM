@@ -72,28 +72,71 @@ implementation, in three separate ways, and no test asked.
 * **`--jdk-only` census**: zero `native-shadows-bytecode` violations for
   `java/lang/String`, from 12; the registry goes from 80 `String` rows to 26.
 * **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, both modes
-  byte-identical to each other.
+  byte-identical to each other. Two follow-up rounds took it to **8** — see
+  *What is left* below for the per-step table. Every step is checked as a SET
+  comparison, never a count: a count cannot see a row *worsen*.
 * **`Compatible` byte-for-byte over `test_classes`**: 9 of 9 identical.
+
+## What is left
+
+The lane took the matrix from **57 -> 8** divergences in four steps, each with a
+0-regression set comparison rather than a count:
+
+| step | divergences | fixed | regressed |
+|---|---:|---:|---:|
+| drop the forced-native `String` policy | 57 -> 37 | 20 | 0 |
+| UTF-16 `hashCode` + concat surrogates | 37 -> 21 | 16 | 0 |
+| out-of-bounds class and message | 21 -> 8 | 13 | 0 |
+
+The 8 that remain are three problems, none of them a `java/lang/String` defect:
+
+| rows | cause |
+|---:|---|
+| 4 | regex: `PatternSyntaxException` message text, and `replaceAll` with a bad group reference does not throw at all |
+| 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null"). VM-wide message synthesis, not `String`. |
+| 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
 
 ## Three defects the removal surfaced
 
 Taking a shadow off makes the shadowed code reachable, and two of the three
-things underneath were broken. All three are filed rather than re-masked,
-except the first, where re-masking is the correct answer and the reason is
-recorded at the registration site:
+things underneath were broken. None of the three ended up re-masked — the
+first looked like it had to be, and did not:
 
-* `String.hashCode()` is **wrong for UTF-16 strings** — it hashes the backing
-  BYTES sign-extended, not the code units. The native is kept, stated
-  `Intrinsic`, for correctness rather than speed
-  ([record](../../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md)).
-* `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
-  instead of `StringIndexOutOfBoundsException`
-  ([record](../../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md)).
-  Deliberately not re-masked — the native was wrong there too, and re-masking
-  would cost the four rows the bytecode fixes, including `substring` splitting
-  a surrogate pair into U+FFFD.
-* `+` concatenation loses an unpaired surrogate
-  ([record](../../known-issues/string-concat-loses-unpaired-surrogates.md)).
+* `String.hashCode()` was **wrong for UTF-16 strings** — it hashed the backing
+  BYTES sign-extended, not the code units. **Root-caused and FIXED 2026-08-05**
+  ([record](../../internal/string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md)).
+  The defect was never in `String` or `StringUTF16` bytecode: it was the
+  `ArraysSupport.vectorizedHashCode` **native**, which read one array slot per
+  element for every `BasicType`. `StringUTF16.hashCode` calls it with `T_CHAR`
+  over a **`byte[]`** of UTF-16 pairs, so it folded bytes where it owed code
+  units. One shadow was hiding a second shadow. The `hashCode()` native this
+  doc originally proposed to keep is therefore **dropped** — the bytecode is
+  correct now, and keeping the native would have frozen the real bug in place
+  where nothing reached it.
+* `String.substring` out-of-range threw `ArrayIndexOutOfBoundsException`
+  instead of `StringIndexOutOfBoundsException`. **The `String` half is FIXED
+  2026-08-05**
+  ([record](../../known-issues/preconditions-ignores-the-exception-formatter.md)
+  — which supersedes the original `string-substring-bounds-…` record, that
+  having named the wrong subsystem: the fault is `Preconditions` ignoring its
+  exception-formatter argument, not anything `substring` does).
+
+  Probing rather than reading found the worse half: for `charAt` the exception
+  **class depended on the SIGN of the index** — `charAt(-1)` reached
+  `Preconditions` and came back `ArrayIndexOutOfBoundsException` while
+  `charAt(12)` came back `StringIndexOutOfBoundsException`. The matrix could not
+  show that, because those rows already differed on message text.
+  `String.checkIndex` is now a third F4 native, and every SIOOBE carries
+  HotSpot's exact message. What is still open is the non-`String` half: NIO's
+  callers of `Preconditions` still get `ArrayIndexOutOfBoundsException` where
+  the JDK throws `IndexOutOfBoundsException`.
+* `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
+  ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
+  `execute_string_concat` accumulated into a Rust `String`, which cannot
+  represent one. It now accumulates `Vec<u16>`. It was **three** loss points,
+  not the one the record named — the argument, the folded recipe literal, and
+  the `TAG_CONST` constant — and a probe written to separate them is the only
+  reason it did not ship half-fixed with its own reproducer green.
 
 ## Residual
 
