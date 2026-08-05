@@ -1118,7 +1118,7 @@ pub fn update_all_roots(
     shared
         .threads
         .thread_registry
-        .fold_pointer_map_into_blocked(pointer_map);
+        .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs

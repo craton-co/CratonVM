@@ -103,6 +103,18 @@ pub struct SlotOrigin {
     pub frame: u32,
     pub idx: u32,
     pub is_stack: bool,
+    /// Was this slot LIVE at its frame's pc when the deposit ran — i.e. one of
+    /// the roots the collector was required to keep?
+    ///
+    /// The write-back does not need this (healing a dead slot is harmless and
+    /// keeps the frame self-consistent), but the fold's invariant check does:
+    /// a DEAD local pointing into a reclaimed span is the per-bci liveness
+    /// analysis working exactly as designed — `ExecutorService.invokeAll`'s
+    /// `tasks` argument, scoped out at the `f.get()` the caller is parked in,
+    /// hits this on every round of `probes/BlockedFrameRootProbe`. Reporting
+    /// those would bury the case that matters. Operand-stack slots are always
+    /// live.
+    pub live: bool,
     /// Address the slot held at the blocking deposit.
     pub orig: usize,
     /// The object's current address, advanced by every GC initiator's fold
