@@ -248,7 +248,12 @@ Three things worth carrying into the other lanes:
   L9's `java/lang/String` migration is those 9. All 10,842 `Bridge` rows still
   inherit their kind.
 
-The gate's own logic is exercised hermetically in the **blocking**
-`jdk-only-blockers-selftest` CI job — 14 checks including an injected
-unadjudicated `Bridge` it must reject and an adjudicated one it must accept, so
-it is shown to fail and shown not to be always-red on every run.
+**Both halves are blocking**, which took a second pass to get right. The
+hermetic self-test runs in `jdk-only-blockers-selftest` — 14 checks including an
+injected unadjudicated `Bridge` it must reject and an adjudicated one it must
+accept, so the gate is shown to fail and shown not to be always-red on every
+run. The *measured* half runs in `build-and-test`'s ubuntu leg, beside
+`Synthetic-stub ratchet`: wired only into the advisory `jdk-only` matrix it
+printed an error and failed nothing, and neither of that job's two reasons to be
+advisory applies to a `Compatible`-mode census with a committed baseline. The
+`jdk-only` matrix keeps its copy as the multi-JDK/OS probe.
