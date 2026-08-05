@@ -44,10 +44,12 @@ this lane. The five workloads above are what this lane's numbers rest on.
 
 The row total falls, and that is intended: a refused fabrication is a class
 that never enters the store. The brief's *"total unchanged unless you intend
-otherwise"* is the case where a class is **reclassified**; here it is
-**refused**, so the drop equals the refusal count exactly (13, 50, 101 — the
-last two include the transitive classes those fabrications would have dragged
-in).
+otherwise"* describes a **reclassification**; this is a **refusal**, so the
+"otherwise" is the intended case. On the strict boot the drop is exactly the
+refusal count — 392 → 379, thirteen classes, thirteen refusals. On the two
+probes it is larger (50 and 101) because a refused stand-in also stops dragging
+in the interfaces and supertypes `fabricate_class` would have loaded to wire it
+up; those classes are legitimately absent, not hidden.
 
 ### The 10 call sites that fire — not 52
 

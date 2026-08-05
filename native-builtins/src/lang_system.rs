@@ -2203,15 +2203,30 @@ fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
 /// that backing map. System Rules reflects on that field by name, so the
 /// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
 /// slot 0, matching the JDK's `m` field slot.
-fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7 residual R1): the
+/// wrapper stands in for `java.util.Collections$UnmodifiableMap`, whose real
+/// bytecode is not running, so under `--jdk-only` it is refused as a catchable
+/// `NoClassDefFoundError` rather than fabricated behind a recorded violation.
+fn wrap_system_env_map(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(map);
-    let wrapper_class = ctx.ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    // Not `?`: the pin above must be released before unwinding.
+    let wrapper_class =
+        match ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2) {
+            Ok(id) => id,
+            Err(err) => {
+                ctx.unpin_native_roots(pin);
+                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+            }
+        };
     let map = ctx.read_native_pin(pin, map);
     let wrapper = ctx.alloc_object(wrapper_class, 2);
     let map = ctx.read_native_pin(pin, map);
     ctx.set_field(wrapper, 0, Value::Object(Some(map)));
     ctx.unpin_native_roots(pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
@@ -2440,7 +2455,7 @@ pub(crate) fn native_system_getenv_all(
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
-        let env = wrap_system_env_map(ctx, map);
+        let env = wrap_system_env_map(ctx, map)?;
         let env = set_system_env_singleton(env);
         return Ok(Some(Value::Object(Some(env))));
     }
@@ -2478,7 +2493,7 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    let env = wrap_system_env_map(ctx, map);
+    let env = wrap_system_env_map(ctx, map)?;
     Ok(Some(Value::Object(Some(env))))
 }
 

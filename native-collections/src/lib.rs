@@ -14176,7 +14176,7 @@ fn native_collections_unmodifiable_list(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src);
+    let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src)?;
     Ok(Some(Value::Object(Some(w))))
 }
 
@@ -15487,7 +15487,30 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn register_factory_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge` (JDK-only wave 2, lane L7 residual R1,
+    // 2026-08-05). Every factory here returns a `cratonvm/internal/*` stand-in
+    // for a `java.util.Collections$Unmodifiable*` / `ImmutableCollections$*` /
+    // comparator object, and every method it registers on those stand-ins only
+    // exists to serve one. `Bridge` asserts "no working real-bytecode fallback
+    // exists"; for this family there plainly is one, in `java.base`, and it
+    // works even though the backing collection is native-backed — a real
+    // unmodifiable wrapper *delegates* every call to the map it was handed, and
+    // that map's natives still answer. (Contrast `HashSet.iterator()`, which
+    // cannot be retagged: the real iterator reads the real `table[]`, which
+    // CratonVM's `HashMap.put` native never fills, so it would return a
+    // silently EMPTY iteration rather than a loud error. That one stays a
+    // refusal until the collections reclassification wave.)
+    //
+    // Under `--jdk-only` these are now dropped at registration — recorded as
+    // `SyntheticNativeRegistered` violations naming this site — and the real
+    // bytecode runs. `Compatible` / `--real-jdk` keep SyntheticStub
+    // registrations, so both are unchanged.
+    //
+    // This is the "retag per subsystem, one PR each, with evidence" the
+    // `register_collections_natives` header asks for, not the bulk flip it
+    // forbids: four named registrars, each with a real-bytecode fallback that
+    // was measured, not assumed.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // List.of
     r.register(
         "java/util/List",
@@ -15800,7 +15823,7 @@ fn freeze_result(
     match result? {
         Some(Value::Object(Some(backing))) => {
             // Immutable `*.of` product → `java.util.ImmutableCollections$*`.
-            let w = alloc_immutable_wrapper(ctx, wrapper_class, backing);
+            let w = alloc_immutable_wrapper(ctx, wrapper_class, backing)?;
             Ok(Some(Value::Object(Some(w))))
         }
         other => Ok(other),
@@ -26725,10 +26748,16 @@ const CMP_TAG_COMPARING_INT: i32 = 6;
 const CMP_TAG_COMPARING_LONG: i32 = 7;
 const CMP_TAG_COMPARING_DOUBLE: i32 = 8;
 
-fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
-    let cmp = alloc_synthetic(ctx, "java/util/Comparator$Native", CMP_NUM_FIELDS);
+fn make_comparator(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
+    // `java.util.Comparator$Native`; it stands in for the comparator objects
+    // the real `Comparator` factory methods return.
+    let cmp = try_alloc_synthetic(ctx, "java/util/Comparator$Native", CMP_NUM_FIELDS)?;
     ctx.set_field(cmp, CMP_FIELD_TAG, Value::Int(tag));
-    cmp
+    Ok(cmp)
 }
 
 /// Compare two values using a Comparator. If the comparator is a tagged factory
@@ -27194,7 +27223,30 @@ fn native_comparator_compare_method(
 
 fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge` (JDK-only wave 2, lane L7 residual R1,
+    // 2026-08-05). Every factory here returns a `cratonvm/internal/*` stand-in
+    // for a `java.util.Collections$Unmodifiable*` / `ImmutableCollections$*` /
+    // comparator object, and every method it registers on those stand-ins only
+    // exists to serve one. `Bridge` asserts "no working real-bytecode fallback
+    // exists"; for this family there plainly is one, in `java.base`, and it
+    // works even though the backing collection is native-backed — a real
+    // unmodifiable wrapper *delegates* every call to the map it was handed, and
+    // that map's natives still answer. (Contrast `HashSet.iterator()`, which
+    // cannot be retagged: the real iterator reads the real `table[]`, which
+    // CratonVM's `HashMap.put` native never fills, so it would return a
+    // silently EMPTY iteration rather than a loud error. That one stays a
+    // refusal until the collections reclassification wave.)
+    //
+    // Under `--jdk-only` these are now dropped at registration — recorded as
+    // `SyntheticNativeRegistered` violations naming this site — and the real
+    // bytecode runs. `Compatible` / `--real-jdk` keep SyntheticStub
+    // registrations, so both are unchanged.
+    //
+    // This is the "retag per subsystem, one PR each, with evidence" the
+    // `register_collections_natives` header asks for, not the bulk flip it
+    // forbids: four named registrars, each with a real-bytecode fallback that
+    // was measured, not assumed.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         "java/util/Comparator$Native",
         "compare",
@@ -27297,7 +27349,7 @@ fn native_comparator_natural_order(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cmp = make_comparator(ctx, CMP_TAG_NATURAL_ORDER);
+    let cmp = make_comparator(ctx, CMP_TAG_NATURAL_ORDER)?;
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -27305,7 +27357,7 @@ fn native_comparator_reverse_order(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cmp = make_comparator(ctx, CMP_TAG_REVERSE_ORDER);
+    let cmp = make_comparator(ctx, CMP_TAG_REVERSE_ORDER)?;
     Ok(Some(Value::Object(Some(cmp))))
 }
 
@@ -27394,7 +27446,7 @@ fn make_comparing(ctx: &mut dyn NativeContext, args: &[Value], tag: i32) -> Meth
     // moving GC. `key_fn` is a raw ObjectRef held across that call and reused
     // afterward in `set_field` -- pin it first and refresh before the write.
     let key_fn_pin = ctx.pin_native_root(key_fn);
-    let cmp = make_comparator(ctx, tag);
+    let cmp = make_comparator(ctx, tag)?;
     let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
     ctx.unpin_native_roots(key_fn_pin);
@@ -27434,7 +27486,7 @@ fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // GC-SAFETY: same `make_comparator` allocation hazard as `make_comparing`
     // above -- pin `this` across it and refresh before the write-back.
     let this_pin = ctx.pin_native_root(this);
-    let cmp = make_comparator(ctx, CMP_TAG_REVERSED);
+    let cmp = make_comparator(ctx, CMP_TAG_REVERSED)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
     ctx.unpin_native_roots(this_pin);
@@ -27478,14 +27530,14 @@ fn make_then_comparing(
     let secondary = match inner_tag {
         None => arg1,
         Some(key_tag) => {
-            let inner = make_comparator(ctx, key_tag);
+            let inner = make_comparator(ctx, key_tag)?;
             let arg1 = ctx.read_native_pin(arg1_pin, arg1);
             ctx.set_field(inner, CMP_FIELD_ARG1, Value::Object(Some(arg1)));
             inner
         }
     };
     let secondary_pin = ctx.pin_native_root(secondary);
-    let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
+    let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING)?;
     let this = ctx.read_native_pin(this_pin, this);
     let secondary = ctx.read_native_pin(secondary_pin, secondary);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
@@ -44275,17 +44327,33 @@ fn unsupported_op() -> MethodCallFailed {
 /// Two slots: slot 0 = backing collection (read by every wrapper native), slot
 /// 1 = the [`UNMOD_FIELD_IMMUTABLE`] marker, left at its default here and set to
 /// `Int(1)` only by `freeze_result` for the immutable `*.of`/`copyOf` factories.
+///
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7). The seven
+/// `cratonvm/internal/Unmodifiable*` views stand in for
+/// `java.util.Collections$Unmodifiable*` and the `ImmutableCollections$*`
+/// family, whose real bytecode is not running — a compatibility substitution
+/// contract §5 forbids under `--jdk-only`, whatever the stand-in is named. It
+/// is refused there, as a catchable `NoClassDefFoundError` naming the class,
+/// instead of being recorded as a violation and then performed anyway.
 fn alloc_unmod_wrapper(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     backing: ObjectRef,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let backing_pin = ctx.pin_native_root(backing);
-    let wrapper = alloc_synthetic(ctx, class_name, 2);
+    // Not `?`: the pin above is this frame's base and must be released before
+    // unwinding, or it and everything pinned above it are stranded.
+    let wrapper = match try_alloc_synthetic(ctx, class_name, 2) {
+        Ok(wrapper) => wrapper,
+        Err(err) => {
+            ctx.unpin_native_roots(backing_pin);
+            return Err(err);
+        }
+    };
     let backing = ctx.read_native_pin(backing_pin, backing);
     ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
     ctx.unpin_native_roots(backing_pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// Allocate an *immutable*-collection wrapper (the `List.of`/`Set.of`/`Map.of`/
@@ -44296,10 +44364,10 @@ fn alloc_immutable_wrapper(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     backing: ObjectRef,
-) -> ObjectRef {
-    let wrapper = alloc_unmod_wrapper(ctx, class_name, backing);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let wrapper = alloc_unmod_wrapper(ctx, class_name, backing)?;
     ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
-    wrapper
+    Ok(wrapper)
 }
 
 /// Read the backing collection out of a wrapper. Recurses if the backing is
@@ -44346,7 +44414,7 @@ fn unmod_delegate_rewrap_map(
             ctx,
             UNMOD_MAP_CLASS,
             m,
-        ))))),
+        )?)))),
         other => Ok(other),
     }
 }
@@ -44375,7 +44443,7 @@ fn unmod_delegate_rewrap_set(
             ctx,
             wrapper_class,
             s,
-        ))))),
+        )?)))),
         other => Ok(other),
     }
 }
@@ -44400,7 +44468,30 @@ fn unmod_delegate_rewrap_navigable_set(
 
 fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge` (JDK-only wave 2, lane L7 residual R1,
+    // 2026-08-05). Every factory here returns a `cratonvm/internal/*` stand-in
+    // for a `java.util.Collections$Unmodifiable*` / `ImmutableCollections$*` /
+    // comparator object, and every method it registers on those stand-ins only
+    // exists to serve one. `Bridge` asserts "no working real-bytecode fallback
+    // exists"; for this family there plainly is one, in `java.base`, and it
+    // works even though the backing collection is native-backed — a real
+    // unmodifiable wrapper *delegates* every call to the map it was handed, and
+    // that map's natives still answer. (Contrast `HashSet.iterator()`, which
+    // cannot be retagged: the real iterator reads the real `table[]`, which
+    // CratonVM's `HashMap.put` native never fills, so it would return a
+    // silently EMPTY iteration rather than a loud error. That one stays a
+    // refusal until the collections reclassification wave.)
+    //
+    // Under `--jdk-only` these are now dropped at registration — recorded as
+    // `SyntheticNativeRegistered` violations naming this site — and the real
+    // bytecode runs. `Compatible` / `--real-jdk` keep SyntheticStub
+    // registrations, so both are unchanged.
+    //
+    // This is the "retag per subsystem, one PR each, with evidence" the
+    // `register_collections_natives` header asks for, not the bulk flip it
+    // forbids: four named registrars, each with a real-bytecode fallback that
+    // was measured, not assumed.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // ---- UnmodifiableCollection (also the shared base for List/Set) -------
     for c in [
         UNMOD_COLLECTION_CLASS,
@@ -44849,7 +44940,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
                 ctx,
                 UNMOD_MAP_CLASS,
                 rev,
-            )))))
+            )?))))
         });
         r.register(
             c,
@@ -45406,7 +45497,7 @@ fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 fn native_unmod_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sub = unmod_delegate(ctx, args, "subList", "(II)Ljava/util/List;")?;
     if let Some(Value::Object(Some(inner))) = sub {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, inner);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, inner)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(sub)
@@ -45429,12 +45520,12 @@ fn native_unmod_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         };
         return Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
             ctx, snapshot, 0,
-        )))));
+        )?))));
     }
 
     let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
     if let Some(Value::Object(Some(itr))) = inner {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_ITR_CLASS, itr);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ITR_CLASS, itr)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(inner)
@@ -45457,7 +45548,7 @@ fn native_unmod_entry_set_iterator(
 ) -> MethodCallResult {
     let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
     if let Some(Value::Object(Some(itr))) = inner {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_ITR_CLASS, itr);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_ITR_CLASS, itr)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(inner)
@@ -45471,7 +45562,7 @@ fn native_unmod_entry_set_iterator(
 fn native_unmod_entry_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let next = unmod_delegate(ctx, args, "next", "()Ljava/lang/Object;")?;
     if let Some(Value::Object(Some(entry))) = next {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(next)
@@ -45509,7 +45600,7 @@ fn native_unmod_entry_set_for_each(
             Some(Value::Object(Some(e))) => e,
             _ => break,
         };
-        let wrapped = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry);
+        let wrapped = alloc_unmod_wrapper(ctx, UNMOD_MAP_ENTRY_CLASS, entry)?;
         ctx.invoke_virtual(
             consumer,
             "accept",
@@ -45534,16 +45625,26 @@ fn unmod_list_snapshot(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Ob
 }
 
 /// Allocate a read-only `ListIterator` over `snapshot`, positioned at `cursor`.
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7) — see
+/// [`alloc_unmod_wrapper`] for why these views are refused under `--jdk-only`.
 fn alloc_unmod_list_itr(
     ctx: &mut dyn NativeContext,
     snapshot: ObjectRef,
     cursor: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // GC-SAFETY: same contract as `make_iterator_from_array` — the shell
     // allocation can relocate the snapshot. Covered by
     // `gc_native_pins::unmodifiable_list_iterator_roots_snapshot_graph_across_allocation`.
     let snapshot_pin = ctx.pin_native_root(snapshot);
-    let it = alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2);
+    // Not `?`: `snapshot_pin` is this frame's pin base and must be released
+    // before unwinding.
+    let it = match try_alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2) {
+        Ok(it) => it,
+        Err(err) => {
+            ctx.unpin_native_roots(snapshot_pin);
+            return Err(err);
+        }
+    };
     let it_pin = ctx.pin_native_root(it);
     let it = ctx.read_native_pin(it_pin, it);
     let snapshot = ctx.read_native_pin(snapshot_pin, snapshot);
@@ -45552,7 +45653,7 @@ fn alloc_unmod_list_itr(
     ctx.set_field(it, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
     let it = ctx.read_native_pin(it_pin, it);
     ctx.unpin_native_roots(snapshot_pin);
-    it
+    Ok(it)
 }
 
 /// `listIterator()` returns a read-only `ListIterator` over the backing list.
@@ -45563,7 +45664,7 @@ fn native_unmod_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
         ctx, snapshot, 0,
-    )))))
+    )?))))
 }
 
 /// `listIterator(int)` returns a read-only `ListIterator` positioned at `index`.
@@ -45584,7 +45685,7 @@ fn native_unmod_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
     Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
         ctx, snapshot, index,
-    )))))
+    )?))))
 }
 
 /// Read the (snapshot, cursor) state out of a list-iterator wrapper.
@@ -45764,7 +45865,7 @@ fn native_unmod_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let ks = unmod_delegate(ctx, args, "keySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = ks {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(ks)
@@ -45774,7 +45875,7 @@ fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let vs = unmod_delegate(ctx, args, "values", "()Ljava/util/Collection;")?;
     if let Some(Value::Object(Some(inner))) = vs {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(vs)
@@ -45788,7 +45889,7 @@ fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let es = unmod_delegate(ctx, args, "entrySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = es {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner);
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(es)
@@ -45833,6 +45934,13 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
         native_collections_singleton_map,
     );
+    // The six `unmodifiable*` factories only, in their own window — this
+    // registrar also holds `emptyMap` / `singleton*` / `synchronized*`, which
+    // are a different question. See `register_unmodifiable_natives` for why
+    // this family has a real-bytecode fallback and the iterator family does
+    // not (JDK-only wave 2, lane L7 residual R1, 2026-08-05).
+    let __unmod_prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(
         c,
         "unmodifiableMap",
@@ -45869,6 +45977,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Ljava/util/Collection;",
         native_collections_unmodifiable_collection,
     );
+    r.set_category(__unmod_prev_cat);
     r.register(
         c,
         "synchronizedList",
@@ -46089,7 +46198,7 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ctx,
         UNMOD_LIST_CLASS,
         backing,
-    )))))
+    )?))))
 }
 
 fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -46100,7 +46209,7 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx,
         UNMOD_SET_CLASS,
         backing,
-    )))))
+    )?))))
 }
 
 fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -46118,7 +46227,7 @@ fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx.unpin_native_roots(src_pin);
     }
     copied?;
-    let wrapper = alloc_immutable_wrapper(ctx, UNMOD_MAP_CLASS, backing);
+    let wrapper = alloc_immutable_wrapper(ctx, UNMOD_MAP_CLASS, backing)?;
     Ok(Some(Value::Object(Some(wrapper))))
 }
 
@@ -46129,7 +46238,7 @@ fn native_collections_unmodifiable_map(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(Some(src))) => {
-            let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, *src);
+            let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, *src)?;
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),
@@ -46149,7 +46258,7 @@ fn native_collections_unmodifiable_set(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(Some(src))) => {
-            let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, *src);
+            let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, *src)?;
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),
@@ -46163,7 +46272,7 @@ fn native_collections_unmodifiable_sorted_set(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(Some(src))) => {
-            let w = alloc_unmod_wrapper(ctx, UNMOD_SORTED_SET_CLASS, *src);
+            let w = alloc_unmod_wrapper(ctx, UNMOD_SORTED_SET_CLASS, *src)?;
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),
@@ -46177,7 +46286,7 @@ fn native_collections_unmodifiable_navigable_set(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(Some(src))) => {
-            let w = alloc_unmod_wrapper(ctx, UNMOD_NAVIGABLE_SET_CLASS, *src);
+            let w = alloc_unmod_wrapper(ctx, UNMOD_NAVIGABLE_SET_CLASS, *src)?;
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),
@@ -46192,7 +46301,7 @@ fn native_collections_unmodifiable_collection(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(Some(src))) => {
-            let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, *src);
+            let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, *src)?;
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),
@@ -55672,7 +55781,8 @@ mod tests {
         let stream = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
         ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
 
-        let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER);
+        let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER)
+            .expect("Compatible mode never refuses a comparator stand-in");
         for (tag_maker, expected) in [
             (
                 make_min_by_collector as fn(&mut dyn NativeContext, Value) -> ObjectRef,
