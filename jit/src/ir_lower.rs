@@ -10489,14 +10489,43 @@ mod tests {
     /// A REFERENCE read is the control: no plausible heap pointer equals
     /// `i64::MIN`, so it keeps the plain compare-and-bail and must NOT start
     /// demanding the peek.
+    ///
+    /// # The two stub bodies must not be identical
+    ///
+    /// This test decides "was `dispatch_threw`'s address baked into the code?"
+    /// by searching the emitted bytes for it, so it is only meaningful while
+    /// `dispatch_threw` and `getfield` have DIFFERENT addresses. Both stubs
+    /// used to be `-> i64 { 0 }`, which compiles to the same `xor eax,eax; ret`
+    /// — and the MSVC linker's identical-COMDAT-folding (`/OPT:ICF`, on in
+    /// release, off in debug) then gave them ONE address. The `L` control arm
+    /// found `getfield`'s baked address, could not tell it from
+    /// `dispatch_threw`'s, and failed: **red in `--release`, green in `debug`,
+    /// for a lowering that was correct all along.**
+    ///
+    /// `fake_getfield` therefore returns a distinct non-zero value (any
+    /// non-sentinel value is a legitimate field read), which no linker may fold
+    /// with `fake_dispatch_threw`'s semantically-required `0`. The assertion
+    /// below pins that: if a future toolchain unifies them anyway, this fails
+    /// with the reason instead of silently inverting a byte search.
     #[test]
     fn a_wide_field_read_refuses_without_the_sentinel_disambiguator() {
         unsafe extern "C" fn fake_getfield(_vm: i64, _obj: i64, _idx: i64) -> i64 {
-            0
+            // NOT `0`: see the doc comment. Any value but `i64::MIN` reads as
+            // an ordinary field value here.
+            7
         }
         extern "C" fn fake_dispatch_threw() -> i64 {
+            // Semantically pinned: `0` means "no out-of-band signal pending".
             0
         }
+        assert_ne!(
+            fake_getfield as *const () as usize,
+            fake_dispatch_threw as *const () as usize,
+            "the two stubs were folded to one address (MSVC /OPT:ICF or an LTO \
+             equivalent), so searching the emitted code for `dispatch_threw` \
+             cannot distinguish it from `getfield` and this test's control arm \
+             is meaningless. Give the stub bodies distinct instructions again."
+        );
         for (tag, ret, needs_peek) in [
             (b'J', 0xadu8, true),
             (b'D', 0xaf, true),
@@ -15083,6 +15112,83 @@ mod tests {
             count_seq(&code[after_prologue..], &restore),
             saves,
             "the deopt stub inlines its own teardown and skipped the restore",
+        );
+    }
+
+    /// The exceptional-exit stub stamps THIS method's own throw bci, once per
+    /// DISTINCT site — the codegen half of the cov-07 residual fix.
+    ///
+    /// `JitSignals::athrow_bci` is consumed by `execute_jit_call` as this
+    /// method's throw site and range-tested against `[start_pc, end_pc)` of
+    /// every entry in its own exception table. A *dispatched callee*'s throw
+    /// resets that field to `-1` (the general `set_jit_pending_exception`);
+    /// only a local `athrow` sets a real bci. So each compiled exit owes its
+    /// own stamp, or the interpreter routes with `throw_pc == usize::MAX` and
+    /// `find_jit_exception_handler` skips every catch-all whose region does not
+    /// span the whole method — i.e. every javac `finally`.
+    ///
+    /// # Why this exists next to the behavioural test
+    ///
+    /// `vm/tests/jit_ir_exception_stub_throw_bci.rs` proves the same property
+    /// end-to-end, but it needs a built `cratonvm` binary AND a JDK, and skips
+    /// itself when either is missing — so on a machine without them the
+    /// property has NO guard at all. This one is pure codegen: it runs on every
+    /// `cargo test -p cratonvm-jit`, needs nothing external, and goes red the
+    /// instant the stamp or the per-bci grouping is removed.
+    #[test]
+    fn the_exception_stub_stamps_one_set_throw_bci_per_distinct_site() {
+        unsafe extern "C" fn fake_set_throw_bci(_bci: i64) {}
+        let addr = fake_set_throw_bci as *const () as usize;
+        assert_ne!(addr, 0, "the stub's guard treats 0 as `no helper wired`");
+
+        // Two distinct bcis across three exits: the third shares 0x1234, so a
+        // per-SITE stub would emit three stamps and a per-BCI stub two. The
+        // values are deliberately unlike any incidental byte run.
+        let emit = |sites: &[usize]| -> Vec<u8> {
+            let mut lo = lowerer_with_resident_xmm(4096, None);
+            lo.set_throw_bci = addr;
+            lo.emit_prologue();
+            for &bci in sites {
+                let patch = lo.buf.pos();
+                lo.buf.emit(&[0, 0, 0, 0]);
+                lo.call_exc_patches.push((patch, bci));
+            }
+            let stub_start = lo.buf.pos();
+            lo.emit_call_exc_stub();
+            lo.buf.as_slice()[stub_start..].to_vec()
+        };
+
+        let code = emit(&[0x1234, 0x5678, 0x1234]);
+        assert_eq!(
+            count_seq(&code, &(addr as u64).to_le_bytes()),
+            2,
+            "three exits over TWO distinct bcis must produce two stamped stubs \
+             — one per distinct throw site, not one per branch site and not one \
+             shared stub for the whole method",
+        );
+        for bci in [0x1234u64, 0x5678] {
+            assert!(
+                contains_seq(&code, &bci.to_le_bytes()),
+                "bci {bci:#x} was never passed to `set_throw_bci`: the stub \
+                 stamped something, but not this exit's own throw site",
+            );
+        }
+        // The helper call clobbers RAX, which the epilogue returns as the
+        // method result. Every stub must reload the sentinel after stamping or
+        // the caller reads the helper's return value as the call's result.
+        assert_eq!(
+            count_seq(&code, &(i64::MIN as u64).to_le_bytes()),
+            2,
+            "each stub must reload the `i64::MIN` sentinel into RAX after the \
+             stamping call clobbers it",
+        );
+
+        // Control: one distinct bci ⇒ exactly one stub, so the count above is
+        // tracking distinct bcis rather than just counting exits.
+        assert_eq!(
+            count_seq(&emit(&[0x1234, 0x1234]), &(addr as u64).to_le_bytes()),
+            1,
+            "two exits sharing one bci must share one stub",
         );
     }
 

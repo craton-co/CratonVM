@@ -2484,6 +2484,58 @@ pub(super) fn coerce_arg(
 // and making the arguments fit: `interpreter/lambda.rs`.
 
 
+/// [`invoke_cached_native_callback`] for the two inline-cache `Native` arms,
+/// which hold the resolved [`NativeMethodId`] and can therefore ask whether the
+/// slot claims **leaf** — see
+/// [`NativeMethodRegistry::set_leaf`](cratonvm_native_api::NativeMethodRegistry::set_leaf).
+///
+/// A leaf goes through `safe_native_call_leaf`, which is the same funnel minus
+/// the pinning, GC probes, thread-state transitions and unwind bookkeeping that
+/// a body doing one field read cannot need. Measured on
+/// `probes/NativeShapeProbe.java` under `--nojit`: `AtomicInteger.get()` cost
+/// 922 ns against a 167 ns empty-loop control, i.e. ~755 ns for a `return
+/// value;`, and essentially all of it was the funnel.
+///
+/// The leafness question is one bounds-checked index into the registry's slot
+/// table on an id the cache already resolved — no hashing, no string compare,
+/// nothing this path was not already holding. Answering `false` for an
+/// unrecognised id keeps an unexpected handle on the full funnel.
+#[inline]
+pub(super) fn invoke_cached_native_callback_leaf_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    native_id: cratonvm_native_api::NativeMethodId,
+    args: &[Value],
+    method_descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    if !shared.natives.native_methods.is_leaf_id(native_id) {
+        return invoke_cached_native_callback(
+            shared,
+            thread,
+            frame_idx,
+            callback,
+            args,
+            method_descriptor,
+        );
+    }
+    // The native ring is deliberately not entered. It exists so a watchdog can
+    // name the native a hung thread is inside; a leaf cannot block, so it can
+    // never be the answer to that question, and `record_enter`/`record_exit`
+    // are two of the calls this path exists to remove.
+    let result = crate::vm::safe_native_call_leaf(shared, thread, callback, args)?;
+    if let Some(value) = result {
+        let ret = crate::jit::return_type(method_descriptor);
+        if ret != b'V' {
+            let value = coerce_value_for_return(value, ret);
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 pub(super) fn invoke_cached_native_callback_impl(
     shared: &SharedVm,

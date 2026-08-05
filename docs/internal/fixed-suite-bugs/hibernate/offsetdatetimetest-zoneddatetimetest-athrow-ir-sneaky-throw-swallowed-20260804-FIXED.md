@@ -291,25 +291,67 @@ family, not this doc.
 
 ## Test suites
 
-* `cargo test --release -p cratonvm-jit --no-fail-fast` — **1920 passed, 1
-  failed** in the lib target; every integration target green (7 / 12 / 14 / 6 /
-  10 / 10 / 9 / 21 / 15 / 141 / 3), including `ir_vs_singlepass`, which holds
+* `cargo test --release -p cratonvm-jit --no-fail-fast` — **1944 passed, 0
+  failed**; every integration target green (7 / 12 / 14 / 6 / 10 / 10 / 9 / 21 /
+  15 / 141 / 3), including `ir_vs_singlepass`, which holds
   `ir_direct_call_exception_sentinel_bails` — the test that exercises the stub
-  this branch changed.
-  The one failure, `ir_lower::tests::a_wide_field_read_refuses_without_the_
-  sentinel_disambiguator`, is **pre-existing red on `dev`**: baselined by
-  checking out `HEAD~1`'s `ir_lower.rs` and re-running the single test, which
-  fails identically (`L: the sentinel peek must be emitted iff the width can
-  collide`).
+  this branch changed. **The crate has no remaining red.**
+
+  It did on this lane's first pass: `ir_lower::tests::a_wide_field_read_refuses_
+  without_the_sentinel_disambiguator` failed, and was correctly baselined as
+  pre-existing on `dev` (checking out `HEAD~1`'s `ir_lower.rs` reproduced it
+  identically). It is now fixed rather than left standing, and it was never a
+  codegen defect. The test asks "was `dispatch_threw`'s address baked into the
+  code?" by searching the emitted bytes — which only works while
+  `dispatch_threw` and `getfield` have DIFFERENT addresses. Both stubs were
+  `-> i64 { 0 }`, compiling to the same `xor eax,eax; ret`, and MSVC's
+  identical-COMDAT-folding (`/OPT:ICF` — on in release, off in debug) gave them
+  ONE address:
+
+  ```
+  getfield=0x7ff7e6d2d890 dispatch_threw=0x7ff7e6d2d890 folded=true
+  ```
+
+  The `L` control arm therefore found `getfield`'s address and could not tell it
+  from `dispatch_threw`'s: **red in `--release`, green in `debug`, for a
+  lowering that was correct all along.** `fake_getfield` now returns a distinct
+  non-zero value (any non-sentinel value is a legitimate field read), and an
+  `assert_ne!` on the two addresses names ICF, so a future toolchain that folds
+  them anyway fails with the reason instead of silently inverting a byte search.
+  Only that test discriminates two helper addresses; its sibling asserts the
+  presence of a single one and was never at risk.
+
 * `cargo test --release -p cratonvm-vm --test jit_ir_athrow_dispatch --test
   jit_ir_exception_stub_throw_bci` — both green.
 
-  The new test is **proven non-vacuous**, not merely green: re-running its
-  compiled test binary with `CRATONVM_BIN` pointed at the pre-fix build
+  The behavioural test is **proven non-vacuous**, not merely green: re-running
+  its compiled test binary with `CRATONVM_BIN` pointed at the pre-fix build
   (`cratonvm-sneaky-base-20260804.exe`, dev tip) fails with `leaked=199144`,
   and its anti-vacuity assertion — `body` reported compiled by the optimizing
-  tier — is satisfied on BOTH arms, so the red is the defect and not a
-  missed compile.
+  tier — is satisfied on BOTH arms, so the red is the defect and not a missed
+  compile.
+
+  That check was performed BY HAND, once, which protects nothing going forward
+  — and the test also **skips itself** when a `cratonvm` binary or a JDK is
+  missing, so on such a machine the property had no guard at all. The
+  unconditional half is `jit::ir_lower::tests::the_exception_stub_stamps_one_
+  set_throw_bci_per_distinct_site`: pure codegen, no external dependency, runs
+  on every `cargo test -p cratonvm-jit`. It pins all three properties of the fix
+  — the stamp exists, stubs are shared per DISTINCT bci (3 exits over 2 bcis ⇒
+  2 stamps; 2 exits over 1 bci ⇒ 1), and each stub reloads the `i64::MIN`
+  sentinel after the stamping call clobbers RAX.
+
+  Its own red was established by **injecting each defect**, not by trusting a
+  green:
+
+  | injected into `emit_call_exc_stub` | result |
+  |---|---|
+  | the stamp removed entirely (the original bug) | FAILED — `left: 0, right: 2` |
+  | stamp kept, collapsed back to one shared stub | FAILED — `left: 1, right: 2` |
+
+  Keep both tests. Only the behavioural one shows the stamp actually reaches the
+  interpreter's handler search and runs the `finally`; byte-level assertions
+  cannot.
 
 ## The original doc's three "next steps", answered
 

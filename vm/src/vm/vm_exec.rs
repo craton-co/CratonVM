@@ -1644,6 +1644,133 @@ pub(crate) fn safe_native_call_prevalidated_objects(
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
+/// The funnel with everything a **leaf** native cannot need taken out.
+///
+/// `callback` must have been registered through
+/// [`NativeMethodRegistry::set_leaf`](cratonvm_native_api::NativeMethodRegistry::set_leaf),
+/// whose doc comment states the four-part contract: no Java-heap allocation,
+/// no safepoint or block, no collection, no JNI-pending exception. Callers
+/// establish that by holding a `NativeMethodId` whose slot answers
+/// `is_leaf_id`; they do not get to decide it themselves.
+///
+/// # What this drops, and why each is dead for a leaf
+///
+/// | funnel step | why a leaf does not need it |
+/// |---|---|
+/// | argument pinning into `native_pin_roots` | pins exist so a collection *during* the callback can remap the arguments. A leaf cannot reach a collection, so nothing can move under it. |
+/// | the STW probe + `safepoint_check` | a leaf is a handful of instructions and returns to a mutator that polls safepoints itself; entering one here buys the collector nothing. |
+/// | `native_array_gc_requested` / `young_spill_pressure` relief | both exist for natives that ALLOCATE. A leaf does not. |
+/// | the remap-args-after-GC rebuild | unreachable once the two GC hooks above are gone. |
+/// | `NativeRunning` / restore `record_transition` pair | the state exists so the STW census WAITS for a native holding raw `ObjectRef`s in Rust locals. A leaf holds them for a few instructions and cannot block, so the thread stays exactly what it was — running Java. |
+/// | the JNI pending-exception drain | contract item 4. |
+/// | the pin-watermark truncate + unpin ring | nothing was pinned. |
+/// | `native_diag_pre_call` / `post_call` | these are already behind a mask that is zero on every production run; the leaf path simply does not offer them. A run that needs them can unset the leaf claim. |
+///
+/// # What it keeps
+///
+/// * **The argument forwarding barrier.** Object arguments have just left the
+///   GC-visible operand stack, and a collection may have run between the frame
+///   read and this call — that is the same window the funnel's own
+///   `load_and_forward` covers, and it is two instructions.
+/// * **`catch_unwind`.** A leaf must not panic, but "must not" is a contract,
+///   not a proof, and a panic escaping into JIT-compiled or interpreter frames
+///   is a process-level failure rather than a bad answer. It costs nothing
+///   when nothing unwinds.
+/// * **The return-value forwarding + `native_pending_return` handoff root**,
+///   so an object-returning leaf hands its result over by the same rule every
+///   other native does and the JIT's post-invoke drain sees what it expects.
+///
+/// Measured effect: `probes/NativeShapeProbe.java`, and
+/// `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+pub(crate) fn safe_native_call_leaf(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
+    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    let mut heap_forwarded: Vec<Value>;
+    let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+        inline_forwarded[..args.len()].copy_from_slice(args);
+        &mut inline_forwarded[..args.len()]
+    } else {
+        heap_forwarded = args.to_vec();
+        &mut heap_forwarded[..]
+    };
+    for value in forwarded_args.iter_mut() {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.mem.heap.load_and_forward(*obj);
+        }
+    }
+
+    let result = {
+        let mut ctx = NativeContextImpl { shared, thread };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&mut ctx, forwarded_args)
+        }))
+    };
+
+    let mut out: MethodCallResult = match result {
+        Ok(method_result) => method_result,
+        Err(payload) => {
+            // A leaf that panicked has broken its contract. Report it with the
+            // same shape the funnel uses — the callee name plus the Java frame
+            // that called it — rather than letting the payload fall on the
+            // floor, because the whole point of the leaf list is that it is
+            // auditable and a violation must be attributable.
+            thread.native_pending_return = None;
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown native method panic".to_string()
+            };
+            let callee = native_callee_name(callback);
+            let top = thread
+                .frames
+                .last()
+                .map(|f| {
+                    format!(
+                        "{}.{}{}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor()
+                    )
+                })
+                .unwrap_or_default();
+            tracing::error!(
+                "LEAF native {} panicked: {} (invoked from {}). A leaf native must not \
+                 panic — see NativeMethodRegistry::set_leaf; drop its leaf claim.",
+                callee,
+                msg,
+                top,
+            );
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("leaf native method panic: {msg}"),
+            }));
+        }
+    };
+
+    thread.native_pending_return = None;
+    match &mut out {
+        Ok(Some(v)) => {
+            if let Value::Object(Some(o)) = v {
+                *o = shared.mem.heap.load_and_forward(*o);
+            }
+            if let Some(o) = value_as_validated_object_ref(shared, *v) {
+                thread.native_pending_return = Some(o);
+            }
+        }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            thread.native_pending_return = Some(*exc);
+        }
+        _ => {}
+    }
+    out
+}
+
 /// DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector.
 ///
 /// A native that returns with FEWER pins than it entered with truncated its
@@ -3846,11 +3973,11 @@ impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
-    /// See `update_root_snapshot` (`vm/src/runtime/interpreter.rs`) for why the
-    /// operand-stack-sourced roots are filtered against `heap.is_object_address`:
-    /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
-    /// roots without heap validation (its file is restricted from edits), and
-    /// the resulting bogus addresses crash the GC at the next mark/move.
+    /// Operand-stack-sourced roots are filtered against `heap.is_heap_addr`
+    /// (alignment + arena containment) — the SAME screen `scan_local_objects`
+    /// applies to locals, and deliberately not the strict `is_object_address`
+    /// header probe. See `scan_frame_roots` in
+    /// `runtime/interpreter/gc_and_alloc.rs` for the full rationale.
     pub(crate) fn deposit_root_snapshot(&mut self) {
         // A thread that is about to PARK cannot consult its per-thread JIT memo
         // caches, but this deposit publishes them as GC roots — so any entry
@@ -3958,7 +4085,11 @@ impl<'a> NativeContextImpl<'a> {
                 let added = snapshot.split_off(before);
                 for o in added {
                     let addr = o.as_ptr() as usize;
-                    if self.shared.mem.heap.is_object_address(addr).is_some() {
+                    // `is_heap_addr`, not `is_object_address` — see
+                    // `scan_frame_roots`. This deposit is the collector's ONLY
+                    // view of the thread once it blocks, so a root dropped here
+                    // is an object reclaimed under a live frame slot.
+                    if self.shared.mem.heap.is_heap_addr(addr).is_some() {
                         snapshot.push(o);
                     }
                 }
@@ -4004,6 +4135,11 @@ impl<'a> NativeContextImpl<'a> {
             let mut origins = self.thread.gc_block_state.slot_origins.lock();
             origins.clear();
             for (fi, fr) in self.thread.frames.iter().enumerate() {
+                // Recorded per slot, not applied as a filter: every slot is
+                // still tracked and written back, but the fold's invariant
+                // check needs to know which of them the collector was actually
+                // obliged to keep. See `SlotOrigin::live`.
+                let live_mask = fr.live_locals_mask_here();
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
@@ -4011,6 +4147,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: li as u32,
                             is_stack: false,
+                            live: li >= 64 || live_mask & (1u64 << li) != 0,
                             orig: a,
                             cur: a,
                         });
@@ -4023,6 +4160,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: si as u32,
                             is_stack: true,
+                            live: true,
                             orig: a,
                             cur: a,
                         });
@@ -4176,6 +4314,74 @@ impl<'a> NativeContextImpl<'a> {
             });
         }
 
+        // DIAGNOSTIC (CRATONVM_DBG_BLOCKGC) — the deposit-side precondition of
+        // the blocked-frame stale-receiver family, checked WITHOUT needing the
+        // rare collection to land in the window.
+        //
+        // This snapshot is the ONLY view a cross-thread collector has of this
+        // thread while it is blocked. So a frame slot that decodes as
+        // `Value::Object(Some(_))`, is LIVE at this frame's pc, and is not in
+        // the snapshot, is an object the collector will not know to keep — and
+        // the owner will read it again on wake. `slot_origins` (recorded just
+        // above) cannot rescue it either: that tracker advances `cur` through
+        // each cycle's pointer map, and an object nothing rooted is never IN a
+        // pointer map.
+        //
+        // What can differ: this walk decodes a slot with `to_value()`, while
+        // the two publishing scans additionally consult the parallel kind
+        // marks (`Frame::local_kinds`, `ValueStack::kinds`) and skip a slot
+        // marked `long`/`double`, so the moving collector cannot relocate a
+        // pointer-shaped primitive. A slot whose kind mark and whose value tag
+        // DISAGREE therefore falls between the two, and is published by
+        // neither. Non-zero output here names that slot.
+        if blockgc_dbg() && raise_blocked_flag {
+            let published: rustc_hash::FxHashSet<usize> =
+                snapshot.iter().map(|r| r.as_ptr() as usize).collect();
+            let heap = &self.shared.mem.heap;
+            let mut gaps = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                let live_mask = fr.live_locals_mask_here();
+                let mut report = |what: &str, idx: usize, a: usize| {
+                    if published.contains(&a) || heap.is_heap_addr(a).is_none() {
+                        return;
+                    }
+                    gaps += 1;
+                    if gaps <= 8 {
+                        eprintln!(
+                            "[blockgc] UNPUBLISHED-LIVE-SLOT tid={} frame#{fi} {}.{} pc={} \
+                             {what}[{idx}] 0x{a:x} — a live object frame slot the blocking \
+                             deposit did not publish as a root",
+                            self.thread.thread_id.0,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.pc,
+                        );
+                    }
+                };
+                for li in 0..fr.locals_len() {
+                    if li < 64 && live_mask & (1u64 << li) == 0 {
+                        continue;
+                    }
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        report("local", li, o.as_ptr() as usize);
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        report("stack", si, o.as_ptr() as usize);
+                    }
+                }
+            }
+            if gaps > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} frames={} snapshot={} UNPUBLISHED-LIVE-SLOTS={}",
+                    self.thread.thread_id.0,
+                    self.thread.frames.len(),
+                    snapshot.len(),
+                    gaps,
+                );
+            }
+        }
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
         // thread can read where THIS thread is parked (cross-thread

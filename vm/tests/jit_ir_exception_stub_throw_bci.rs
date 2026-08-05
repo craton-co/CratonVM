@@ -32,6 +32,22 @@
 //!
 //! Measured on the fix commit, `n = 200 000`: **198 927** skipped `finally`
 //! bodies before, **0** after. HotSpot and `--nojit` are both 0.
+//!
+//! # This test can skip itself — its codegen twin cannot
+//!
+//! Everything below needs a built `cratonvm` binary AND a JDK, and returns
+//! early when either is missing. On a machine without them this file provides
+//! NO coverage, silently. `jit::ir_lower::tests::`
+//! `the_exception_stub_stamps_one_set_throw_bci_per_distinct_site` is the
+//! unconditional half: pure codegen, no external dependency, and red the
+//! instant either the stamp or the per-bci grouping is removed — both verified
+//! by injecting each defect and watching it fail, not by trusting a green.
+//!
+//! Keep both. Only this one shows the stamp actually reaches the interpreter's
+//! handler search and runs the `finally`; byte-level assertions cannot.
+//!
+//! Also note the doc path above moved on retirement, to
+//! `docs/internal/fixed-suite-bugs/hibernate/...-FIXED.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,7 +102,15 @@ public class IrExceptionStubThrowBciProbe {
 }
 "#;
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
@@ -111,7 +135,13 @@ fn cratonvm_binary() -> Option<PathBuf> {
     None
 }
 
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING JDK is
+/// reported differently. See `common::require_jdk`.
 fn jdk_home() -> Option<PathBuf> {
+    common::require_jdk(jdk_home_lookup())
+}
+
+fn jdk_home_lookup() -> Option<PathBuf> {
     for var in &["CRATONVM_TEST_JDK", "JAVA_HOME"] {
         if let Ok(j) = std::env::var(var) {
             let p = PathBuf::from(&j);
