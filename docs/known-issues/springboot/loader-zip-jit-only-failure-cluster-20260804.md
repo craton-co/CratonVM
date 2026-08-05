@@ -332,14 +332,36 @@ present with the JIT off. Not a zip-header bug, and not (on this evidence) a JIT
 footprint bug.
 
 If the OOM spelling does come back, the first thing to run on it is one env var:
-`CRATONVM_JIT=getstatic-helper`. The mistyped-`J`-static family this page
-root-causes is still *structurally* open — `try_emit_inline_getstatic` picks its
-load width purely from the field **descriptor** and never checks that the slot's
-runtime `Value` tag agrees, and `4972cd9c91` guarded exactly one writer
-(`post_clinit_fixup`). `StaticsBlock::new` and `StaticsBlock::grow_to` still
-fill every slot with `Value::Int(0)`, so any `J`/`D` static reaching JIT-
-compiled code through a block those built — rather than through
-`prepare_class`, which does call `default_value_for_descriptor` per slot — is
-mistyped by construction and reads garbage from compiled code while the
-interpreter widens it to a correct 0. Whether that is what this test hits is
-**unmeasured**; the one run says so or rules it out.
+`CRATONVM_JIT=getstatic-helper`.
+
+## The root cause's second door — FIXED 2026-08-05 (`4ac429f2f`)
+
+Auditing the family this page root-causes turned up a live instance of it that
+`4972cd9c91` did not cover. The hazard is a property of the **slot**, not of the
+writer that was patched:
+
+* `try_emit_inline_getstatic` takes its load width purely from the field
+  **descriptor** and never checks that the slot's runtime `Value` tag agrees;
+* `StaticsBlock::new` fills every slot with `Value::Int(0)`;
+* `set_static_shared` built its block that way whenever a static was written
+  **before its class was prepared** — `prepare_class` seeds
+  `default_value_for_descriptor` per slot, but this path bypassed it.
+
+So a `J`/`D` static reaching compiled code through such a block was mistyped by
+construction: the interpreter widens it to a correct `0`, and JIT-compiled code
+pulls 8 bytes at `FIELD_CELL_PAYLOAD64_OFFSET` over a 4-byte payload — the exact
+mechanism that turned `ARRAY_*_BASE_OFFSET` into `0x7ff700000000`.
+
+Both doors now seed through one helper, `typed_default_static_slots`. Block
+length is unchanged (the class's total field count, while slot indices are the
+static-field enumeration order); only the seeded slot *types* change.
+
+The tests assert the `Value` **width**, not the numeric value — every arm is
+zero either way, so a value-based assertion could not fail. Confirmed
+non-vacuous by injecting the old blanket fill: both new tests go red (`J must be
+Long, got Int(0)`) and pass again when it is reverted. All 29 statics unit tests
+stay green, and on Linux all six classes in this page's tables still pass with
+the fix in (29/34/3/37/52/1).
+
+This is a latent-defect fix, **not** a fix for either open item above — neither
+of those reproduces, so nothing here can be claimed to close them.
