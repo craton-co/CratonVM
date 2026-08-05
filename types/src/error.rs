@@ -1032,6 +1032,183 @@ fn format_optional_message(message: &Option<String>) -> String {
     }
 }
 
+impl RuntimeError {
+    /// The Java throwable this error materialises as: `(internal class name,
+    /// detail message)`, or `None` when it has no Java counterpart
+    /// ([`RuntimeError::NotImplemented`], which must stay an internal error).
+    ///
+    /// `None` for the message means the throwable is constructed with its
+    /// no-arg constructor, i.e. `getMessage()` must be null — not an empty
+    /// string. Several variants depend on that distinction; see the comments
+    /// on the individual arms.
+    ///
+    /// This lives on the error rather than in `vm::runtime::exceptions` because
+    /// there are **two** consumers that must agree: the interpreter's throw
+    /// site (`throw_runtime_error`) and the reflective-call wrapper
+    /// (`native-builtins`'s `wrap_as_invocation_target_exception`, which has to
+    /// materialise the same throwable in order to wrap it in an
+    /// `InvocationTargetException`). It used to be a `match` private to the
+    /// former, so the latter could only handle the one variant somebody had
+    /// needed — which is how `Method.invoke` came to propagate a native
+    /// `UnsupportedOperationException` raw instead of wrapping it (H2
+    /// `TestMVStore.testIterate`).
+    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<&str>)> {
+        let pair = match self {
+            RuntimeError::NullPointerException { message } => (
+                "java/lang/NullPointerException",
+                // Empty = the "no message" marker an implicit-dereference NPE
+                // carries when `-XX:-ShowCodeDetailsInExceptionMessages` is
+                // explicitly off (the throw sites must hand a `String` to
+                // `pop_object_ref_ctx_with`, so they cannot pass `None`
+                // themselves). HotSpot's `getMessage()` is null there. A
+                // *deliberate* empty NPE message is not produced anywhere
+                // Rust-side; a Java `new NullPointerException("")` never travels
+                // through `RuntimeError`.
+                match message.as_deref() {
+                    Some("") => None,
+                    other => other,
+                },
+            ),
+            RuntimeError::ArithmeticException { message } => {
+                ("java/lang/ArithmeticException", Some(message.as_str()))
+            }
+            RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
+                ("java/lang/ArrayIndexOutOfBoundsException", None)
+            }
+            RuntimeError::ClassCastException { message } => {
+                ("java/lang/ClassCastException", Some(message.as_str()))
+            }
+            RuntimeError::NegativeArraySizeException { size: _ } => {
+                ("java/lang/NegativeArraySizeException", None)
+            }
+            RuntimeError::StackOverflowError => ("java/lang/StackOverflowError", None),
+            RuntimeError::OutOfMemoryError { message } => {
+                ("java/lang/OutOfMemoryError", Some(message.as_str()))
+            }
+            RuntimeError::ArrayStoreException { message } => {
+                ("java/lang/ArrayStoreException", Some(message.as_str()))
+            }
+            RuntimeError::ClassNotFoundException { class_name } => (
+                "java/lang/ClassNotFoundException",
+                Some(class_name.as_str()),
+            ),
+            RuntimeError::UnsatisfiedLinkError { message } => {
+                ("java/lang/UnsatisfiedLinkError", Some(message.as_str()))
+            }
+            RuntimeError::IllegalMonitorStateException { message } => (
+                "java/lang/IllegalMonitorStateException",
+                Some(message.as_str()),
+            ),
+            RuntimeError::StringIndexOutOfBoundsException { index: _ } => {
+                ("java/lang/StringIndexOutOfBoundsException", None)
+            }
+            RuntimeError::NumberFormatException { message } => {
+                ("java/lang/NumberFormatException", Some(message.as_str()))
+            }
+            RuntimeError::InterruptedException => ("java/lang/InterruptedException", None),
+            RuntimeError::NoSuchFieldException { field_name } => {
+                ("java/lang/NoSuchFieldException", Some(field_name.as_str()))
+            }
+            RuntimeError::NoSuchMethodException { message } => {
+                ("java/lang/NoSuchMethodException", Some(message.as_str()))
+            }
+            RuntimeError::IllegalAccessException { message } => {
+                ("java/lang/IllegalAccessException", Some(message.as_str()))
+            }
+            RuntimeError::InaccessibleObjectException { message } => (
+                "java/lang/reflect/InaccessibleObjectException",
+                Some(message.as_str()),
+            ),
+            RuntimeError::IllegalArgumentException { message } => {
+                ("java/lang/IllegalArgumentException", Some(message.as_str()))
+            }
+            RuntimeError::IOException { message } => ("java/io/IOException", Some(message.as_str())),
+            RuntimeError::EOFException { message } => ("java/io/EOFException", Some(message.as_str())),
+            RuntimeError::UnknownHostException { message } => {
+                ("java/net/UnknownHostException", Some(message.as_str()))
+            }
+            RuntimeError::SocketTimeoutException { message } => {
+                ("java/net/SocketTimeoutException", Some(message.as_str()))
+            }
+            RuntimeError::ConnectException { message } => {
+                ("java/net/ConnectException", Some(message.as_str()))
+            }
+            RuntimeError::ProtocolException { message } => {
+                ("java/net/ProtocolException", Some(message.as_str()))
+            }
+            RuntimeError::BindException { message } => {
+                ("java/net/BindException", Some(message.as_str()))
+            }
+            RuntimeError::FileNotFoundException { path } => {
+                ("java/io/FileNotFoundException", Some(path.as_str()))
+            }
+            RuntimeError::NoSuchFileException { path } => {
+                ("java/nio/file/NoSuchFileException", Some(path.as_str()))
+            }
+            RuntimeError::UnsupportedOperationException { message } => (
+                "java/lang/UnsupportedOperationException",
+                // An empty message means "no message" (e.g. the blocked-mutator
+                // helper for Collections.unmodifiable*/List.of view wrappers,
+                // matching the real JDK's `new UnsupportedOperationException()`
+                // no-arg constructor) — must produce a null `getMessage()`, not a
+                // non-null empty string. `Some("")` would call the
+                // `(Ljava/lang/String;)V` ctor and set detailMessage to "".
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
+            RuntimeError::IllegalStateException { message } => {
+                ("java/lang/IllegalStateException", Some(message.as_str()))
+            }
+            RuntimeError::IllegalThreadStateException { message } => (
+                "java/lang/IllegalThreadStateException",
+                Some(message.as_str()),
+            ),
+            RuntimeError::IllegalCallerException { message } => {
+                // Task #57: route the new variant to `java.lang.IllegalCallerException`
+                // so the Panama native-access gate raises the JDK-conventional class
+                // instead of folding into IllegalStateException.
+                ("java/lang/IllegalCallerException", Some(message.as_str()))
+            }
+            RuntimeError::ConcurrentModificationException => {
+                ("java/util/ConcurrentModificationException", None)
+            }
+            RuntimeError::NoSuchElementException { message } => {
+                ("java/util/NoSuchElementException", Some(message.as_str()))
+            }
+            RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
+            RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
+            RuntimeError::ReadOnlyBufferException => ("java/nio/ReadOnlyBufferException", None),
+            RuntimeError::InputMismatchException { message } => {
+                ("java/util/InputMismatchException", Some(message.as_str()))
+            }
+            RuntimeError::SecurityException { message } => {
+                ("java/lang/SecurityException", Some(message.as_str()))
+            }
+            RuntimeError::MatchException { message } => {
+                ("java/lang/MatchException", Some(message.as_str()))
+            }
+            // The concrete class, not its `IllegalArgumentException` parent: code
+            // that validates a user-supplied regex catches
+            // `PatternSyntaxException` by name, and a parent-class throw is
+            // invisible to that catch. Note the real class declares only
+            // `(String desc, String regex, int index)`, so
+            // `create_exception_object`'s `<init>(String)` path does not populate
+            // `getMessage()` — the same `msg=null` the real `Pattern.compile`
+            // bridge already produces. Getting the class right is the part that
+            // changes control flow; the description text is a separate gap.
+            RuntimeError::PatternSyntaxException { message } => (
+                "java/util/regex/PatternSyntaxException",
+                Some(message.as_str()),
+            ),
+            RuntimeError::NotImplemented { feature: _ } => return None,
+        };
+        Some(pair)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
