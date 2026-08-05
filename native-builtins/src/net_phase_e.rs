@@ -2005,10 +2005,11 @@ fn native_inet_get_by_address(
         // an IAE escapes their catch and propagates as an unrelated failure.
         return Err(uhex(format!("addr is of illegal length: {len}")));
     };
-    // `getByAddress` has no separately supplied hostname. Use the same
-    // HotSpot-normalized numeric text for both logical fields; otherwise a
-    // caller that reads the host-side value (such as Jetty's connector setup)
-    // can still observe Rust's RFC-5952-compressed IPv6 form.
+    // Normalize to HotSpot's numeric text before storing anything, or a caller
+    // that reads the address (such as Jetty's connector setup) observes Rust's
+    // RFC-5952-compressed IPv6 form instead of the JDK's uncompressed one.
+    // (This comment used to say the text was stored in "both logical fields";
+    // it is not, since `e092b0f3b` — see below.)
     let ip_text = hotspot_ip_string(&ip_str);
     // `getByAddress(byte[])` is handed raw octets and NO name, so the mirror
     // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
@@ -16552,6 +16553,22 @@ mod tests {
             host_name.as_deref(),
             Some("fe80:0:0:0:67b0:99e:5a9b:287e"),
             "an unnamed mirror answers getHostName() with its numeric text"
+        );
+
+        // The paired half, so the absent name above reads as a DECISION and not
+        // as a mirror that cannot carry one: the named factory still records
+        // it. Without this, deleting the host name everywhere would pass.
+        // HotSpot on the same bytes:
+        //   getByAddress("example.invalid", bytes) -> example.invalid/fe80:0:0:0:…
+        let named =
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
+        assert_eq!(
+            inet_addr_resolve(&ctx, named),
+            Some((
+                "example.invalid".to_string(),
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+            )),
+            "a supplied host name is kept"
         );
     }
 
