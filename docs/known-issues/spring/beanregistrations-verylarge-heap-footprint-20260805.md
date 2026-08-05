@@ -49,9 +49,27 @@ does not finish either. This is **not** the "CratonVM's default heap is capped
 at 4 GiB while HotSpot's is an uncapped RAM/4 = 8.4 GiB" story.
 
 `-Xlog:gc` on HotSpot at `-Xmx512m` puts its live set after a young collection
-at **~180 MB** (`326M->180M(352M)` near the end of the run). CratonVM's live
-set for the same test, from `jcmd <pid> GC.class_histogram` and
-`GC.heap_info`, is **1.2 GB and still climbing** — roughly 8x.
+at **~180 MB** (`326M->180M(352M)` near the end of the run).
+
+**The corresponding CratonVM number is NOT yet measured — do not quote one.**
+An earlier revision of this doc claimed CratonVM's live set was "1.2 GB and
+still climbing, roughly 8x". That was wrong, and the way it was wrong is worth
+recording:
+
+* `jcmd GC.heap_info`'s young "used" is `young_from_used()` — the from-space
+  **bump-allocation cursor**, i.e. everything allocated since the last young
+  collection, live or not. It is not a live-set figure.
+* `jcmd GC.class_histogram` (`SharedVm::class_histogram`, `vm/src/vm/vm_init.rs`)
+  calls `heap.walk_objects()` with **no preceding collection and no liveness
+  mark** — it histograms every object in the heap, garbage included. HotSpot's
+  `GC.class_histogram` reports live objects.
+
+So the comparison was CratonVM-allocated against HotSpot-live, which proves
+nothing. Getting a real number needs a forced collection immediately before the
+walk, or an instrument that marks. See
+[[verify-what-the-instrument-measures-before-believing-it]] — this is that
+lesson, paid for again.
+
 
 ## Heap accounting: nothing is promoted
 
@@ -62,10 +80,12 @@ Young Generation: 1.2 GB / 2.0 GB (58.9% used)      Young: 1.4 GB / 2.0 GB (70.0
 Old   Generation: 13.1 MB / 4.0 GB (0.3% used)      Old:   13.1 MB / 4.0 GB (0.3% used)
 ```
 
-Old gen is **frozen at 13.1 MB** across many collections while young grows.
-Long-lived data that should have aged out is not aging out — the histogram
-shows `RootBeanDefinition` at 20 003 instances (= 2 x 10001 + 1), which the
-bean factory holds for the whole test, sitting in young.
+Old gen is **frozen at 13.1 MB** across many collections. That figure comes
+from `old_gen_stats()`, which is a real used-bytes accounting rather than a
+cursor, so the flatness is meaningful — but "nothing is promoted" is one
+reading and "promoted then collected by a major GC" is another, and these two
+samples cannot tell them apart. The young column beside it is the allocation
+cursor (above) and should not be read as growth of live data.
 
 Eliminations, so the next person does not redo them:
 
