@@ -112,7 +112,7 @@ an IR body against the C1 body it replaces before keeping it.
 tier's admission chain now asks the single-pass backend's own detectors whether
 they would vectorise a loop in this method, and declines it if so.
 Closeout
-· [brief](archive/perf-01-sieve-ir-body-6x-slower-than-c1.md).
+· [brief](perf-01-sieve-ir-body-6x-slower-than-c1.md).
 
 **The general form was taken on the same day.** What the single-pass backend
 can do and the IR tier cannot is now enumerated in
@@ -151,8 +151,8 @@ read each lane's "first increment".
 | Lane | Owns | Events | Notes |
 |---|---|---:|---|
 | ~~`cov-01`~~ | ~~`ir.rs` arms `0x12`/`0x13`/`0xb2`~~ | ~~189~~ | **CLOSED 2026-08-03** — all three at zero, **+116 bodies (+20%)**. Closeout |
-| ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. Closeout · [brief](archive/cov-02-array-element-access.md) |
-| ~~`cov-03`~~ | ~~`ir.rs` arms `0xb4`/`0xb5`~~ | ~~43~~ → **70** | **CLOSED 2026-08-03** — on the tree it landed on (`cov-01`+`02`+`04`) builder refusals **72 → 2** and bodies **588 → 660 (+12.3%)**; the two survivors are `cov-06`'s. The asymmetry was the **write barrier** and only that: a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier. Wide `J`/`F`/`D` fields landed too. Closeout · [brief](archive/cov-03-field-stores-and-wide-fields.md) |
+| ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. Closeout · [brief](cov-02-array-element-access.md) |
+| ~~`cov-03`~~ | ~~`ir.rs` arms `0xb4`/`0xb5`~~ | ~~43~~ → **70** | **CLOSED 2026-08-03** — on the tree it landed on (`cov-01`+`02`+`04`) builder refusals **72 → 2** and bodies **588 → 660 (+12.3%)**; the two survivors are `cov-06`'s. The asymmetry was the **write barrier** and only that: a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier. Wide `J`/`F`/`D` fields landed too. Closeout · [brief](cov-03-field-stores-and-wide-fields.md) |
 | ~~`cov-04`~~ | ~~`ir.rs` invoke arms + `<init>` elision~~ | ~~69 → 81~~ | **CLOSED 2026-08-03** — all three invoke sites at zero. Every one was an `<init>`. Closeout |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
