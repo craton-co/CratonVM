@@ -58,6 +58,102 @@ pub(super) fn dupx_eager_canon() -> bool {
     })
 }
 
+/// Parse a comma-separated env var into a substring list, `None` when unset or
+/// empty. Used by the single-pass inline-cache bisect levers below.
+fn csv_filter(var: &str) -> Option<Vec<String>> {
+    let raw = cratonvm_types::flags::runtime_var(var).ok()?;
+    let parts: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+/// Per-SITE bisect for the single-pass inline virtual cache.
+///
+/// `CRATONVM_JIT_SP_INLINE_IC=0` turns the whole inline MIC/PIC cascade off,
+/// which is a whole-program answer: it tells you the defect is on that edge but
+/// not WHICH site. These two narrow it. Both match against the composed key
+///
+/// ```text
+/// <caller method label>||<callee class>.<callee method>
+/// ```
+///
+/// so one list can name a caller (`XMLAttributesImpl.addAttributeNS||`), a
+/// callee (`||java/util/Map.get`), or a specific edge. `_ONLY` admits only
+/// matching sites; `_DENY` refuses matching ones and is applied second.
+fn sp_ic_only_filter() -> &'static Option<Vec<String>> {
+    static CACHE: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| csv_filter("CRATONVM_JIT_SP_IC_ONLY"))
+}
+
+fn sp_ic_deny_filter() -> &'static Option<Vec<String>> {
+    static CACHE: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| csv_filter("CRATONVM_JIT_SP_IC_DENY"))
+}
+
+/// Whether the inline cascade may be emitted for this one call site. Cheap when
+/// neither filter is set (two `Option` discriminant checks), which is the
+/// default and the only configuration that runs in production.
+pub(super) fn sp_ic_site_allowed(caller: &str, callee_class: &str, callee_method: &str) -> bool {
+    let only = sp_ic_only_filter();
+    let deny = sp_ic_deny_filter();
+    if only.is_none() && deny.is_none() {
+        return true;
+    }
+    let key = format!("{caller}||{callee_class}.{callee_method}");
+    if let Some(list) = only {
+        if !list.iter().any(|p| key.contains(p.as_str())) {
+            return false;
+        }
+    }
+    if let Some(list) = deny {
+        if list.iter().any(|p| key.contains(p.as_str())) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Split the cascade's two shapes so a bisect can tell the 4-way PIC (which
+/// evicts, and carries the megamorphic tail) from the 1-entry MIC.
+/// `CRATONVM_JIT_SP_INLINE_PIC=0` demotes every site to the MIC shape;
+/// `CRATONVM_JIT_SP_INLINE_MIC=0` leaves only the PIC shape.
+pub(super) fn sp_inline_pic_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_INLINE_PIC").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+pub(super) fn sp_inline_mic_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_INLINE_MIC").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// List every site the cascade is emitted at, so a bisect has a candidate set
+/// to feed back into `CRATONVM_JIT_SP_IC_ONLY` / `_DENY` instead of guessing
+/// method names. One line per emitted site, at compile time — not per call.
+pub(super) fn sp_ic_site_trace() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_IC_SITES").is_some())
+}
+
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
     let mut needs_heap = false;
     let mut multianewarray_ops = Vec::new();

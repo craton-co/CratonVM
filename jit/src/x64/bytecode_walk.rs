@@ -8739,17 +8739,42 @@ impl Compiler {
                             // complete caller state before entering its handler.
                             let protected_precise_handler_call = self.precise_exception_frames
                                 && self.pc_is_protected(pc);
+                            // Per-site bisect levers (`CRATONVM_JIT_SP_IC_ONLY`
+                            // / `_DENY`). Inert unless one is set: the whole
+                            // cascade is a program-wide switch otherwise, which
+                            // localises a defect to this edge but not to a site.
+                            let site_allowed = sp_ic_site_allowed(
+                                &self.method_label,
+                                info_ref.class_name,
+                                info_ref.method_name,
+                            );
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
                                     && sp_inline_ic_enabled()
+                                    && site_allowed
                                     && !regex_backtracking_frame
                                     && !protected_precise_handler_call;
-                            let pic_inline =
-                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let pic_inline = inline_virtual_ic_allowed
+                                && sp_inline_pic_enabled()
+                                && pic_ptr.is_some()
+                                && args_fit;
                             let mic_inline = inline_virtual_ic_allowed
+                                && sp_inline_mic_enabled()
                                 && !pic_inline
                                 && mic_ptr.is_some()
                                 && args_fit;
+                            if sp_ic_site_trace() {
+                                eprintln!(
+                                    "[SP_IC_SITE] {}||{}.{}{} pc={} pic={} mic={}",
+                                    self.method_label,
+                                    info_ref.class_name,
+                                    info_ref.method_name,
+                                    info_ref.descriptor,
+                                    pc,
+                                    pic_inline,
+                                    mic_inline,
+                                );
+                            }
                             // `.done` patches collected from each emitted
                             // fast-path. Multiple in PIC's case (one per
                             // slot), one in MIC's, none if neither inline
