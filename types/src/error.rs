@@ -871,6 +871,19 @@ pub enum RuntimeError {
     #[error("StringIndexOutOfBoundsException: index {index}")]
     StringIndexOutOfBoundsException { index: i32 },
 
+    /// The *parent* of the two above, and not interchangeable with either.
+    ///
+    /// `java.util.Objects.checkIndex`/`checkFromToIndex`/`checkFromIndexSize`
+    /// and every `java.nio` buffer range check that funnels through them are
+    /// specified to raise exactly this class — `jdk.internal.util.Preconditions`
+    /// builds it whenever the caller supplies no exception formatter. Raising
+    /// `ArrayIndexOutOfBoundsException` there instead is not a cosmetic
+    /// difference: it is a *subclass*, so it satisfies
+    /// `catch (IndexOutOfBoundsException)` while a narrower catch, or an
+    /// `instanceof` on the exact class, silently changes answer.
+    #[error("IndexOutOfBoundsException: {message}")]
+    IndexOutOfBoundsException { message: String },
+
     #[error("ClassNotFoundException: {class_name}")]
     ClassNotFoundException { class_name: String },
 
@@ -1102,6 +1115,22 @@ impl RuntimeError {
             RuntimeError::StringIndexOutOfBoundsException { index: _ } => {
                 ("java/lang/StringIndexOutOfBoundsException", None)
             }
+            RuntimeError::IndexOutOfBoundsException { message } => (
+                "java/lang/IndexOutOfBoundsException",
+                // Empty means "no message", following the
+                // `UnsupportedOperationException` arm above. Both classes are
+                // raised from two places with genuinely different contracts:
+                // `Objects.check*` and `Buffer.slice(index, length)` carry
+                // `Preconditions.outOfBoundsMessage` text, while every
+                // ABSOLUTE `Buffer` accessor goes through `Buffer`'s own
+                // formatter, whose body is `new IndexOutOfBoundsException()` —
+                // `getMessage()` there is null on HotSpot, not "".
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             RuntimeError::NumberFormatException { message } => {
                 ("java/lang/NumberFormatException", Some(message.as_str()))
             }

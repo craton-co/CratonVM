@@ -7145,7 +7145,17 @@ mod redefine_immunity_tests {
         // subject has left. That fails CLOSED here (the aggregator lookup finds
         // nothing and the assertion below fires), which is the right direction,
         // and is how the split found it.
-        let src = include_str!("native_override.rs");
+        //
+        // Normalised to LF first. A fourth way for this gate to go stale, and
+        // the one that actually bit: the offset walk below advances by
+        // `line.len() + 1` for the terminator `lines()` stripped, which is a
+        // byte short on every CRLF line. This file is checked out with CRLF on
+        // Windows, so `line_start` drifted two bytes per line, the
+        // `inside_aggregator` window stopped covering the aggregator bodies,
+        // and their own arms were reported as offenders — the identical
+        // failure mode as the hard-coded line band, arrived at from a
+        // different direction.
+        let src = include_str!("native_override.rs").replace("\r\n", "\n");
 
         // The exemption is the RULE, located in the source: an arm may be named
         // only inside the two aggregators, whose entire job is to compose them.

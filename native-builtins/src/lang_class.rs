@@ -23302,7 +23302,12 @@ mod protection_domain_layout_tests {
     /// damage — an ordering dependency invisible at the call site.
     #[test]
     fn the_populator_writes_no_raw_slot_indices() {
-        let src = include_str!("lang_class.rs");
+        // Normalise line endings before searching. The needles below are
+        // LF-shaped, and this file is checked out with CRLF on Windows — where
+        // `find("\n}\n")` matched nothing and this test panicked with
+        // "function body must terminate" for every Windows contributor,
+        // reporting a source-layout problem that did not exist.
+        let src = include_str!("lang_class.rs").replace("\r\n", "\n");
         let start = src
             .find("pub(crate) fn populate_protection_domain_fields")
             .expect("populate_protection_domain_fields must exist");

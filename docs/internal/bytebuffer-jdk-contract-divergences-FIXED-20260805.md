@@ -1,8 +1,12 @@
 # `ByteBuffer` natives: three JDK-contract divergences
 
-**Status:** 🔴 **OPEN**, found 2026-07-31 by `probes/ByteBufferBulkProbe` while
-verifying the bulk-copy rewrite in
-tomcat/32.3.
+**Status:** ✅ **FIXED 2026-08-05.** Retired from `docs/known-issues/`. All
+three are closed; see *How they were closed* at the bottom, which also answers
+the "why these were not fixed in the same change that found them" section below
+— the change that did fix them is not the one that found them.
+
+**Found** 2026-07-31 by `probes/ByteBufferBulkProbe` while verifying the
+bulk-copy rewrite in tomcat/32.3.
 
 All three **pre-date** that rewrite — confirmed by running the probe on the
 pre-fix binary, which produces a byte-identical checksum to the post-fix one
@@ -86,3 +90,66 @@ via absolute `get(int)`, which trips divergence 1 and reported a phantom
 `put([BII)` difference at sizes ≥ 63. `mixBuf` now reads through a cleared
 duplicate. If you extend this probe, do not use absolute accessors past the
 limit unless that is what you are testing.
+
+---
+
+## How they were closed (2026-08-05)
+
+Not by a change aimed at them. The `Preconditions` exception-formatter fix
+([record](preconditions-ignores-the-exception-formatter-FIXED-20260805.md))
+needed "a non-`String` case (an NIO buffer slice)" as its acceptance test, and
+building `probes/PreconditionsFormatterProbe` walked straight into this family.
+
+**1 — absolute accessors not bounds-checked.** Every absolute accessor on
+`java/nio/ByteBuffer` in `native-builtins/src/servlet.rs` now calls one
+`s2_bb_check_abs(ctx, buf, index, width)` helper implementing
+`Buffer.checkIndex(i, nb)`: in range iff `0 <= index` and
+`index + width <= limit`, checked arithmetic. Twelve accessors
+(`get`/`put`/`getShort`/`putShort`/`getChar`/`putChar`/`getInt`/`putInt`/
+`getLong`/`putLong`/`getFloat`) were affected; the probe showed
+`ByteBuffer.allocate(8).get(-1)` returning `0` and `put(8, b)` being dropped on
+the floor, so this was a silent out-of-range **write** as well as a read.
+
+The concern recorded above — "the leniency is load-bearing by design in at
+least one place" — turned out to be about the wrong layer. It lives in
+`s2_bb_get_byte`, a byte-level primitive called from ~15 sites with no
+`MethodCallResult` to raise through, and it stays exactly as it was. The check
+went on the twelve *public* natives, which do have somewhere to throw. Nothing
+about half-built synthetic buffers changed.
+
+**2 — `put(ByteBuffer src)` accepting `src == this`.** Both implementations
+(`servlet.rs` and `native-io/src/lib.rs`) now raise
+`IllegalArgumentException("The source buffer is this buffer")`, which is
+HotSpot's message verbatim.
+
+**3 — bulk forms throwing `ArrayIndexOutOfBoundsException`.** Recorded above as
+"**Not a defect** — AIOOBE *is* a subclass of IOOBE, so every
+`catch (IndexOutOfBoundsException)` caller still matches."
+
+**That reading was too generous, and it is worth keeping as the mistake it
+is.** A subclass satisfies the *widest* catch and breaks every narrower one,
+plus `instanceof` and `getClass()`. The same argument appeared verbatim at
+three independent sites in this codebase, and one of them
+— `Preconditions`' null-formatter fallback — was actively breaking
+`catch (StringIndexOutOfBoundsException)` in application code. The real reason
+these sites reached for AIOOBE was that `RuntimeError` had **no
+`IndexOutOfBoundsException` variant at all**; the absence had been routed
+around 21 times as `IllegalArgumentException { message: "IndexOutOfBoundsException" }`,
+which is not even in the right hierarchy. The variant now exists and all of
+them name the real class.
+
+Two more of the same shape were found alongside and fixed:
+`IllegalStateException` carrying the *strings* `"BufferUnderflowException"` and
+`"BufferOverflowException"` at eight sites, where `RuntimeError` had had both
+variants the whole time.
+
+### Verification
+
+`probes/ByteBufferBulkProbe` on CratonVM now produces
+**`7040159201000546794`** — byte-identical to HotSpot 25, where before it
+produced `2662755913314845620`. That checksum covers every byte produced *and
+every exception type thrown*, so it is the direct measurement this record asked
+for.
+
+`probes/PreconditionsFormatterProbe` additionally pins the class and message of
+all three divergences (its `NIO contract neighbours` block), against HotSpot.

@@ -87,8 +87,12 @@ recorded at the registration site:
   `Intrinsic`, for correctness rather than speed
   ([record](../../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md)).
 * `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
-  instead of `StringIndexOutOfBoundsException`
-  ([record](../../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md)).
+  instead of `StringIndexOutOfBoundsException`. **FIXED 2026-08-05** — and the
+  record cited here was itself wrong about the cause: this was a regression of
+  the shadow removal, not a defect it surfaced. Superseded by
+  [`preconditions-ignores-the-exception-formatter-FIXED-20260805.md`](../../internal/preconditions-ignores-the-exception-formatter-FIXED-20260805.md),
+  which fixed the underlying `Preconditions` override so the bytecode gets both
+  the class and the message right.
   Deliberately not re-masked — the native was wrong there too, and re-masking
   would cost the four rows the bytecode fixes, including `substring` splitting
   a surrogate pair into U+FFFD.
