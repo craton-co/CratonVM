@@ -7862,8 +7862,6 @@ pub static HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
 /// Static `StringLatin1.toLowerCase` helper for the compact-string hot path.
 pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-pub static STRING_LOCALE_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -7877,9 +7875,6 @@ pub fn set_hashmap_get_direct_fn(addr: usize) {
 }
 pub fn set_string_latin1_lower_direct_fn(addr: usize) {
     STRING_LATIN1_LOWER_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-pub fn set_string_locale_lower_direct_fn(addr: usize) {
-    STRING_LOCALE_LOWER_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 pub fn set_concurrent_hashmap_get_direct_fn(addr: usize) {
     CONCURRENT_HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
@@ -16684,35 +16679,22 @@ fn try_compile_inner(
                     }
                 }
 
-                if direct_jit_callee_calls_enabled
-                    && invoke_kind == 0
-                    && class_name == "java/lang/String"
-                    && method_name == "toLowerCase"
-                    && descriptor == "(Ljava/util/Locale;)Ljava/lang/String;"
-                {
-                    // JDK-ONLY-WAVE2: see the marker on the
-                    // `StringLatin1.toLowerCase` bind above — same list.
-                    let entry = direct_native_helper(
-                        &STRING_LOCALE_LOWER_DIRECT_FN,
-                        &class_name,
-                        &method_name,
-                        &descriptor,
-                    );
-                    if entry != 0 {
-                        needs_heap = true;
-                        direct_calls.push((
-                            pc,
-                            JitDirectCall {
-                                entry,
-                                needs_context: true,
-                                num_params: 1,
-                                return_type: b'L',
-                                guard_class_id: 0,
-                            },
-                        ));
-                        continue;
-                    }
-                }
+                // The `java/lang/String.toLowerCase(Ljava/util/Locale;)` direct
+                // bind stood here and is GONE. It was the THIRD copy of the
+                // forced-native `java/lang/String` policy — `check_override`
+                // forced this name, `force_native_over_real_jdk_bytecode`
+                // refused it, and this bound it: three paths, three answers for
+                // one method. The interpreter's two are deleted, so this one
+                // goes with them rather than leaving compiled frames as the
+                // only place a `String` native still shadows the bytecode.
+                //
+                // The perf it bought is not lost: the real
+                // `String.toLowerCase(Locale)` bytecode delegates to
+                // `StringLatin1.toLowerCase`, whose own direct bind above
+                // survives. That one accelerates the real path instead of
+                // replacing it, and its input is Latin-1 by construction, so
+                // it cannot reach the surrogate cases that made the `String`
+                // -level native diverge.
                 // Exact-HashMap `put`/`get` thin direct calls (see
                 // `HASHMAP_PUT_DIRECT_FN`): guard-free registration — the
                 // helper verifies the receiver's exact class at runtime and

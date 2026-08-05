@@ -569,8 +569,8 @@ fn compile_java_regex_uncached(
         return regex::Regex::new(&escaped)
             .map(JavaRegex::Std)
             .map_err(
-                |e| cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("PatternSyntaxException: {e}"),
+                |e| cratonvm_types::error::RuntimeError::PatternSyntaxException {
+                    message: format!("{e}"),
                 },
             );
     }
@@ -614,9 +614,14 @@ fn compile_java_regex_uncached(
     // Fallback: `fancy-regex` for lookaround/backrefs/etc.
     match fancy_regex::Regex::new(&full) {
         Ok(r) => Ok(JavaRegex::Fancy(Box::new(r))),
+        // The concrete `PatternSyntaxException`, not its
+        // `IllegalArgumentException` parent. Both engines rejecting the pattern
+        // is the same event HotSpot reports from `Pattern.compile`, and code
+        // that validates a user-supplied regex catches the concrete class by
+        // name.
         Err(e) => Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("PatternSyntaxException: {e}"),
+            cratonvm_types::error::RuntimeError::PatternSyntaxException {
+                message: format!("{e}"),
             },
         ),
     }

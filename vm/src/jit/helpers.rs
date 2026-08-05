@@ -9318,7 +9318,7 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // Thin direct-call native helpers (`jit_integer_value_of_direct`,
 // `jit_integer_int_value_direct`, `jit_hashmap_put_direct`,
 // `jit_hashmap_get_direct`, `jit_string_latin1_to_lower_direct`,
-// `jit_string_locale_to_lower_direct`, `jit_concurrent_hashmap_get_direct`).
+// `jit_concurrent_hashmap_get_direct`).
 //
 // Each is a VM-side reimplementation of a registered native, baked straight
 // into the emitted `CALL` — no dispatch helper, and so no policy check, on the
@@ -9892,19 +9892,6 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
         args.as_ptr() as i64,
         2,
     )
-}
-
-/// Direct receiver-typed `String.toLowerCase(Locale)` entry — the thin
-/// direct-call form the JIT emits instead of a generic native-dispatch round
-/// trip, which dominates repeated case folding.
-///
-/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
-pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
-    vm_ptr: i64,
-    source: i64,
-    locale: i64,
-) -> i64 {
-    jit_string_latin1_to_lower_direct(vm_ptr, source, 0, locale)
 }
 
 /// Compact-Latin1 sibling: `StringLatin1.toLowerCase(String, byte[], Locale)`,
@@ -14122,9 +14109,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
         cratonvm_jit::set_string_latin1_lower_direct_fn(
             jit_string_latin1_to_lower_direct as *const () as usize,
-        );
-        cratonvm_jit::set_string_locale_lower_direct_fn(
-            jit_string_locale_to_lower_direct as *const () as usize,
         );
         cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
             jit_concurrent_hashmap_get_direct as *const () as usize,

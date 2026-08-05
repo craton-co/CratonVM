@@ -1,10 +1,33 @@
-# L11 — Items 3 + 7: delete the hard-coded lists
+# L11 — Items 3 + 7: delete the hard-coded lists — **item 3 DONE 2026-08-04**
 
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
 `vm/src/vm/vm_exec.rs` (dispatch regions ~14700 and ~22700)
-**Gated on:** **L9** (String) and **L10** (ThreadPoolExecutor). Do not start the
-deletions before those land — both naive directions have already reintroduced
-known defects.
+**Gated on:** ~~**L9** (String)~~ — L9 is closed, and item 3 is done with it;
+see [the outcome record](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
+**L10** (ThreadPoolExecutor) still gates item 7. Do not start item 7's deletion
+before it lands — both naive directions have already reintroduced known
+defects.
+
+## Item 3 is done, and the plan below was wrong about how
+
+Steps 1 and 3 below assumed the `String` lists were load-bearing and that
+deleting them would change dispatch. **They were inert.** A binary with both
+deleted produced a byte-identical 392-case `String` transcript in both modes and
+identical invocation counts on all 38 exercised registry slots, because
+`resolve_step1_native` dispatches a registered native on the triple alone,
+before any list runs. Deleting the lists was therefore free — and, on its own,
+achieved nothing.
+
+What achieved something: moving the decision to REGISTRATION.
+`NativeMethodRegistry::register` now drops every `java/lang/String` `Bridge` in
+real-JDK mode, which is invisible to every dispatch path at once. That is the
+literal meaning of this doc's "replace both with `resolve_dispatch`" once you
+know the lists were never the gate. Four copies went, not three — the fourth,
+`is_jdk_string_charset_name_constructor_override`, was uncounted by the record.
+
+Read step 5's caution before doing item 7 the same way: it is right that this
+routes more traffic onto §7 step 3, and `resolve_step1_native`'s
+`bytecode_available: false` is still open.
 **Conflicts:** L4 also edits `vm_exec.rs`, in the hunter region (~3070–3200).
 Disjoint regions, one file: coordinate, never `git add -A` blind.
 **Effort:** M once unblocked

@@ -260,7 +260,7 @@ The seven, verified 2026-07-31:
 
 Two of the seven are in the `String` family, which makes the JIT a **third**
 location for the forced-native `String` policy documented in
-[the forced-native `String` policy](forced-native-string-policy-two-lists-that-disagree.md).
+[the forced-native `String` policy, FIXED 2026-08-04](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
 Be precise about which: 10204 is `java/lang/String` itself and `toLowerCase` is
 one of the 21 names on `check_override`'s positive list *and* is excluded by
 `force_native_over_real_jdk_bytecode`'s seven-pair whitelist — three paths,

@@ -20611,36 +20611,32 @@ fn invoke_on_class_shared_inner(
                         // builds a genuine `Thread$FieldHolder` for every
                         // real-JDK Thread, so the real `Cleaner` /
                         // `CleanerImpl` bytecode runs unmodified.
-                        // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
-                        // bytecode resolution is failing for these basic methods
-                        // during JDK class clinits like
-                        // java/nio/charset/StandardCharsets.<clinit>; route to
-                        // our layout-neutral natives (registered in
-                        // register_essential_natives) so the boot can advance
-                        // past String dispatch. Drop when RKC16N.6 lands a
-                        // permanent fix.
+                        // The 21-name forced-native `java/lang/String` arm that
+                        // stood here from "RKC16N.6 RECON" (Session 94) until
+                        // 2026-08-04 IS GONE, and so is its warm-path twin in
+                        // `force_native_over_real_jdk_bytecode`. Both were
+                        // measured inert before removal, not argued to be: a
+                        // binary with both deleted produced a byte-identical
+                        // 392-case `String` transcript in BOTH modes and
+                        // identical invocation counts on all 38 exercised
+                        // `java/lang/String` registry slots. They never decided
+                        // anything, because `resolve_step1_native`
+                        // (`try_stackless_invoke` step 1) takes ANY registered
+                        // native for the triple before either list is consulted
+                        // and has no list of its own.
                         //
-                        // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
-                        // policy, POSITIVE FORM (21 method names, matched
-                        // descriptor-blind). The list itself now lives in
-                        // `cold_forced_native_string_name`, beside the WARM
-                        // path's inverted-exclusion twin
-                        // (`warm_forced_native_string_candidate`), so the two
-                        // halves of one policy can be compared by a test
-                        // instead of by a reader diffing two files — see that
-                        // function for the RKC16N.6 defect they both work
-                        // around, for the five entries that were statically
-                        // unreachable until 2026-08-04, and for why they must
-                        // be deleted together.
-                        || (class_name == "java/lang/String"
-                            && crate::runtime::interpreter::cold_forced_native_string_name(
-                                method_name,
-                            ))
+                        // So the policy for `java/lang/String` is decided where
+                        // it was always actually decided — at REGISTRATION, in
+                        // `NativeMethodRegistry::register`'s real-JDK drop —
+                        // and a shape that must lose to real bytecode is simply
+                        // not registered. See
+                        // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
+                        //
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
                         // this cold call-site can warm. Keep this concrete
-                        // bytecode override in sync with interpreter.rs's
-                        // force_native_over_real_jdk_bytecode gate.
+                        // bytecode override in sync with the
+                        // `force_native_over_real_jdk_bytecode` gate.
                         || (class_name == "java/lang/StringUTF16"
                             && method_name == "getChars"
                             && descriptor == "([BII[CI)V")
@@ -21823,11 +21819,6 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_jdk_string_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_jdk_string_charset_name_constructor_override(
                             class_name,
                             method_name,
                             descriptor,

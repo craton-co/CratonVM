@@ -34,13 +34,13 @@ can work on what, simultaneously, without colliding.**
 | [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
 | [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
-| [L9](L9-blocker-rkc16n6-string.md) | **Blocker.** Real `String` bytecode during JDK `<clinit>` | `vm/src/runtime/interpreter/` | — | L |
+| [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
-| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists | `native_override.rs`, `vm_exec.rs` ⚠ | **L9, L10** | M |
+| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3–L9 can all start today, in parallel, by different people.** (L1 and L2 are
-done.)
+**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
+are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -170,3 +170,16 @@ returning the platform loader's `name` String as its parent.** Two divergences
 its probe found are filed as residuals in the lane doc, both pre-existing and
 both outside its owned files (`isAssignableFrom` true across unrelated loaders;
 a duplicate `defineClass` not raising `LinkageError`).
+
+**Update, 2026-08-05 — L9 is closed and item 3 with it.** The blocker did not
+reproduce: its April symptom was a class-load defect fixed the same month by
+RKC16N.9, and all four copies of the forced-native `java/lang/String` policy it
+was about turned out to decide nothing — `resolve_step1_native` dispatches a
+registered native on the triple alone, before any of them runs, which a binary
+with the lists deleted confirmed by producing a byte-identical 392-case
+transcript and identical invocation counts. Two lanes were planned around a
+comment. Item 7 is still blocked on L10.
+
+That also starts item 1's migration: the four reviewed `java/lang/String`
+fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
+so `kind_stated` is no longer `false` on all 11,909 rows.
