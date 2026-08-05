@@ -266,3 +266,15 @@ change to shared machinery `Op::Call`/`Op::CheckCast`/every future fallible
 IR op depends on — a new lane's worth of work, not a hotfix folded into this
 one. Flagged as a follow-up task (spawn_task `task_17edecd2`,
 "Stamp jit_set_throw_bci in IR's shared exceptional-exit stub").
+
+**CLOSED 2026-08-04**, branch `fix/hib-athrow-sneaky-throw-20260804`
+(`a466f953a`), exactly as prescribed above: one stub per distinct throw-site
+bci, each stamping `set_throw_bci`, with every exceptional-exit site routed
+through a single `push_call_exc_patch` so none can reach the stub untagged.
+It **was** independently reproduced first — `probes/IrFinallyBciProbe.java`
+leaked 198 927 skipped `finally` bodies in 200 000 iterations on `dev`
+(`41349f661`) with the caller confirmed IR-compiled, against 0 on HotSpot and
+0 under `--nojit`; 0 after the fix. Pinned by
+`vm/tests/jit_ir_exception_stub_throw_bci.rs`. See
+`fixed-suite-bugs/hibernate/offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`,
+"Defect 2".
