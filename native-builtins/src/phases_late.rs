@@ -3356,17 +3356,19 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     // classloader.rs's four `ClassLoader` initialisers seed
     // `CL_IS_PARALLEL_CAPABLE = 1`, and its reader falls back to `1` for a
     // loader allocated without that slot. So stop answering a constant here
-    // and read the same per-loader slot the winner reads, with the same
+    // and read the same per-loader state the winner reads, with the same
     // fallback — the two now agree whatever the registration order.
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Slot 4 == `classloader.rs::CL_IS_PARALLEL_CAPABLE` (private there).
-        let val = match ctx.get_field(this, 4) {
-            Value::Int(v) => v,
-            // Loader too short to carry the slot: same `true` that
+        // L1: this was a raw `get_field(this, 4)`. On a real JDK image slot 4
+        // is `java.lang.ClassLoader.parallelLockMap` — a `ConcurrentHashMap`
+        // reference, not our flag — so the raw read hit its own fallback by
+        // accident there. Go through the accessor the winning registration
+        // uses: side table first, raw slot only on our synthetic layout.
+        let val = crate::classloader::loader_parallel_capable_of(ctx, this)
+            // Loader this VM never recorded: same `true` that
             // `registerAsParallelCapable()` reports, rather than contradicting it.
-            _ => 1,
-        };
+            .unwrap_or(1);
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
