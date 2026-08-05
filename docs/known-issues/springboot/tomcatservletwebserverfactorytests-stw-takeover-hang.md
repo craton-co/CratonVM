@@ -1,9 +1,44 @@
-# `TomcatServletWebServerFactoryTests`: intermittent STW cross-thread JIT takeover hang — FIXED
+# `TomcatServletWebServerFactoryTests`: intermittent STW cross-thread JIT takeover hang
 
-**Status: FIXED (2026-07-27)**, root-caused from a live thread census, on
-branch `fix/tomcat-stw-takeover-20260726`. Filed 2026-07-26 while verifying
-[`tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`](tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md);
-moved out of `docs/known-issues/` per the triage rule.
+**Status: OPEN — REGRESSED 2026-08-05.** Previously root-caused and fixed
+2026-07-27, on branch `fix/tomcat-stw-takeover-20260726`. Filed 2026-07-26
+while verifying
+[`tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`](../../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md).
+
+## Regression note (2026-08-05)
+
+Full-suite rerun `craton-fullsuite-azure-20260805-s8` (all-jit) hit the
+300s timeout ceiling on this class again:
+`apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-azure-20260805-s8/all-jit/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests.{out,err}.log`.
+
+The `.out.log` shows steady per-test progress (repeated
+`Tomcat initialized with port 0 (http)` / connector start/stop cycles,
+consistent with `132` short-lived embedded-Tomcat lifecycles) reaching at
+least connector instance `http-nio-auto-112` before output simply stops —
+no `SBRUNNER_RESULT` line, no JUnit summary, no further log lines of any
+kind (not even the recurring `[moving-young]` GC warnings that appear
+throughout the rest of the run). That is the same "everything froze
+mid-stream, not just slowed down" signature as the original bug, not a
+slow-but-progressing run. HotSpot passes this class in 75.7s (132/132,
+`hotspot-baseline-latest.tsv` row 136); a genuine host-load slowdown would
+still be producing periodic log output, not going silent.
+
+`ps aux` on the host at investigation time showed no lingering/orphaned
+`cratonvm` process at this run's exact binary path — ruling out the
+"runner's timeout-kill failed to reap it" confound — but did show several
+*other* concurrent `cratonvm`/`cargo build` processes from unrelated
+sessions, so this is plausibly (not confirmed) a genuine STW deadlock,
+recurring either because a *different* blocking native (not one of the
+four SSL-stream natives + accept paths the 2026-07-27 fix bracketed) is
+now missing its `begin_blocking_region()`/`end_blocking_region()` bracket,
+or because the fix regressed. Not re-root-caused this session — the
+2026-07-27 fix's own diagnostic recipe
+(`CRATONVM_DBG_STW_CENSUS=1 CRATONVM_DBG_VM_STATE=1` against a live hung
+process, naming the exact `pending=1,blocked=false` native via
+`state="native:<class>.<method><desc>"`) is the fastest way to confirm and
+localize this on the next pass.
+
+## Original fix (2026-07-27), left as written below
 
 The same session closed every other CratonVM-specific failure in this test
 class, taking it from **129/132 with an intermittent hang** to **132/132**.
