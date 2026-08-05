@@ -49,6 +49,10 @@ pub mod loaders;
 pub mod module;
 pub mod proxy_gen;
 pub mod resolution;
+/// The overlay detector's per-class instrument: CratonVM's fabricated slot
+/// model for a well-known JDK class, diffed against the layout the loaded image
+/// actually declares. See `docs/feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md`.
+pub mod shadow_layout;
 pub mod type_maps;
 pub mod verifier;
 pub mod verify_frame;

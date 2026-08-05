@@ -5853,6 +5853,11 @@ impl ClassManager {
         let class_name_for_hook = Arc::clone(&class.name);
         let class_id_for_hook = id.as_u32();
         self.class_store.add(class);
+        // L4 gap 2/1 — the shadow-layout census. This class was defined from
+        // real bytes; if CratonVM also carries a hand-numbered slot model for
+        // its name, the two layouts are now both known and can be diffed once,
+        // here, instead of guessed at per access.
+        self.report_shadow_layout(id);
 
         // T10.5 — Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
@@ -6312,6 +6317,48 @@ impl ClassManager {
     /// Get a mutable reference to a loaded class by its id.
     pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
         self.class_store.get_mut(id)
+    }
+
+    /// Diff CratonVM's fabricated slot model for this class against the layout
+    /// the loaded image actually declares.
+    ///
+    /// `None` when there is nothing to say: the class has no model in
+    /// [`synthetic_stub_field_model`], or it *is* a fabricated stub (diffing a
+    /// model against itself answers nothing).
+    ///
+    /// This is the overlay detector's answer to the two gaps a per-access type
+    /// check cannot reach — a read of a wrong-field slot, and a same-kind write
+    /// into one. Both are invisible in the value's type tag and both are visible
+    /// here. See [`crate::shadow_layout`].
+    #[must_use]
+    pub fn shadow_layout_diff(&self, id: ClassId) -> Option<crate::shadow_layout::ShadowLayoutDiff> {
+        let name = self.class_store.get(id).map(|c| Arc::clone(&c.name))?;
+        let model = synthetic_stub_fields(&name);
+        crate::shadow_layout::diff_against_model(&self.class_store, id, &model)
+    }
+
+    /// Emit the one-per-class shadow-layout census line for a class that has
+    /// just been defined from real bytes, under `CRATONVM_DBG=overlay`.
+    ///
+    /// Deliberately per class and not per access: the interesting output is the
+    /// slot map, it never changes for a given image, and printing it once keeps
+    /// it readable next to the access-site lines. `overlay-all` widens it from
+    /// "only classes that actually disagree" to every class carrying a model, so
+    /// the `Agrees` rows can be audited too — most of them are anonymous slots
+    /// over real references, which this instrument cannot falsify (see the
+    /// module docs).
+    fn report_shadow_layout(&self, id: ClassId) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_none() {
+            return;
+        }
+        let Some(diff) = self.shadow_layout_diff(id) else {
+            return;
+        };
+        let all = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_ALL").is_some();
+        if diff.disagreement_count() == 0 && !all {
+            return;
+        }
+        eprint!("{}", diff.render());
     }
 
     /// Re-parent a loaded class.
@@ -9482,6 +9529,12 @@ impl ClassManager {
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(id, bytes);
 
+        // L4 — the other path by which a modelled class acquires a real layout:
+        // a stub that was already minted is replaced in place by the real bytes.
+        // The ClassId is deliberately reused, so every native holding a
+        // positional index for the old model now addresses the new one.
+        self.report_shadow_layout(id);
+
         Ok(())
     }
 
@@ -10444,6 +10497,19 @@ pub fn synthetic_stub_instance_field_count(name: &str) -> usize {
         .iter()
         .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
         .count()
+}
+
+/// CratonVM's fabricated slot **model** for `name` — the same table that sizes
+/// a bytecode `new` of the stub and that pads a real class up to the count
+/// native code was written against.
+///
+/// Exposed so the overlay detector can diff the model against the real layout
+/// (`crate::shadow_layout`). Reading it is the only way to say what a
+/// hand-numbered positional access *meant*; the value's type tag alone cannot,
+/// which is the blind spot L4 closes.
+#[must_use]
+pub fn synthetic_stub_field_model(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
+    synthetic_stub_fields(name)
 }
 
 fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
