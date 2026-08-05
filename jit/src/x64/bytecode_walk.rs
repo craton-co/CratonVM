@@ -2046,14 +2046,44 @@ impl Compiler {
                     } else {
                         let a_slot = self.peek_stack();
                         let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let before = self.stack.len();
                         self.load_slot_to_reg(RAX, a_slot);
                         self.push_from_rax(); // […, b, a, aC]
+                        // `push_from_rax` is silent when `push_stack` cannot
+                        // reserve a spill slot: it emits nothing and does NOT
+                        // grow the model. The rotate below indexes `n - 3`, so
+                        // a missed push rotates the WRONG three entries and
+                        // leaves the operand stack one short — silent wrong
+                        // code rather than a bail.
+                        if self.stack.len() != before + 1 {
+                            self.fail("singlepass-codegen/dup_x1-copy-not-pushed");
+                            pc += 1;
+                            continue;
+                        }
                         if a_oop {
                             self.mark_top_as_oop();
                         }
                         let n = self.stack.len();
+                        if dupx_trace() {
+                            eprintln!(
+                                "[DUPX1-TRACE] {} pc={} before={:?} marks={:?}",
+                                self.method_key,
+                                pc,
+                                &self.stack[n - 3..],
+                                &self.stack_oop_marks[n - 3..]
+                            );
+                        }
                         self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
                         self.stack_oop_marks[n - 3..].rotate_right(1);
+                        if dupx_trace() {
+                            eprintln!(
+                                "[DUPX1-TRACE] {} pc={} after ={:?} marks={:?}",
+                                self.method_key,
+                                pc,
+                                &self.stack[n - 3..],
+                                &self.stack_oop_marks[n - 3..]
+                            );
+                        }
                         if dupx_eager_canon() {
                             self.canonicalize_stack();
                         }

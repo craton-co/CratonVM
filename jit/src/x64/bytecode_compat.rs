@@ -36,6 +36,15 @@ pub(super) fn dup_x2_codegen_disabled() -> bool {
     *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X2").is_some())
 }
 
+/// Trace what the dup_x1 rotate did to the model: the three slots and their
+/// oop marks, before and after. `CRATONVM_DBG_DUPX_METHODS` says WHICH compiled
+/// methods carry the opcode; this says what happened inside each one.
+pub(super) fn dupx_trace() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_TRACE").is_some())
+}
+
 /// DBG bisection (spring-bug-11): immediately `canonicalize_stack()` after a
 /// dup_x1/dup_x2 rotate, eliminating the non-canonical rotated frame offsets in
 /// place. If this clears the crash, the defect is a downstream consumer of the
