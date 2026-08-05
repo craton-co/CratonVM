@@ -48,7 +48,15 @@ const RESOURCE_NAME: &str = "META-INF/services/cratonvm.foo.svc";
 /// Honors `CRATONVM_BIN` for callers that want to point at a custom
 /// build; otherwise resolves to the workspace's
 /// `target/release/cratonvm.exe`.
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CRATONVM_BIN") {
         let pb = PathBuf::from(p);
         if pb.exists() {
