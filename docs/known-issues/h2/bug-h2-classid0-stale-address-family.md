@@ -76,7 +76,7 @@ Added because this class is a **cheap, JIT-only reproduction** — ~15 s per
 attempt at `-Dcraton.smoke.forks=1` — and because it was until now filed under a
 throughput page that explicitly told triagers not to look for a crash here. That
 page is retired
-([`../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md));
+(`fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`);
 the throughput finding it was tracking is closed, and this is what is left.
 
 Twenty-six runs at `forks=1`, dev tip, JIT on, in two batches (10 then 16),

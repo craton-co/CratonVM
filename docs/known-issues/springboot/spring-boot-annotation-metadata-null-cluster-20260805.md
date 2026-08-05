@@ -59,7 +59,7 @@ native cache had been widened to serve non-leaf natives, so compiled code
 dispatched targets `invoke_or_native` would never have reached and calls
 returned their own first argument. The GC reading was refuted directly — the
 crashing arm ran **zero** young collections. Fixed and retired to
-`docs/internal/fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
+`fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
 The two null sites here may share that cause; the cheap check is
 `--dump-native-registry` on a JIT arm and a `--nojit` arm, diffed per native.
 That named the cache defect in one comparison after code reading had stalled.

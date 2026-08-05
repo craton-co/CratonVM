@@ -78,7 +78,7 @@ would have installed.
 - Still open: the enumeration catches an advantage somebody wrote down, not one
   nobody did. Closing that needs a backend-parity harness that compiles a
   corpus both ways and compares emitted bytes — see
-  `docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`.
+  `perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`.
 
 ### 2026-08-03 Perf gate: it records its own C2 reach, and it can compile its benchmark again
 
