@@ -9443,7 +9443,9 @@ impl Compiler {
                             // megamorphic misses through this exact library.
                             // It reloads arg0, performs two lock-free probes,
                             // and falls through here only on a real miss.
-                            if let Some(pic) = pic_ptr.filter(|_| inline_virtual_ic_allowed) {
+                            if let Some(pic) = pic_ptr
+                                .filter(|_| inline_virtual_ic_allowed && sp_inline_mega_enabled())
+                            {
                                 let arg_offsets: Vec<i32> = (0..n)
                                     .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
                                     .collect();

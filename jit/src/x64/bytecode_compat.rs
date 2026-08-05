@@ -145,6 +145,20 @@ pub(super) fn sp_inline_mic_enabled() -> bool {
     })
 }
 
+/// The megamorphic hashed stub is emitted whenever a PIC slot exists and the
+/// cascade is allowed — it survives `CRATONVM_JIT_SP_INLINE_PIC=0` and
+/// `_MIC=0`, so those two levers cannot tell it from the 4-way cascade.
+/// `CRATONVM_JIT_SP_INLINE_MEGA=0` isolates it.
+pub(super) fn sp_inline_mega_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_INLINE_MEGA").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
 /// List every site the cascade is emitted at, so a bisect has a candidate set
 /// to feed back into `CRATONVM_JIT_SP_IC_ONLY` / `_DENY` instead of guessing
 /// method names. One line per emitted site, at compile time — not per call.

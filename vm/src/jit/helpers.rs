@@ -123,6 +123,55 @@ fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_DBG_IC_PUBLISH=<substring>` — trace what the helper publishes into
+/// a site's MIC/PIC, matched against `<callee class>.<callee method>`.
+///
+/// The inline cascade emitted by the single-pass backend consumes exactly these
+/// two values and cannot revalidate either: it CALLs `entry_ptrs[i]` and
+/// marshals by `needs_context[i]`. `try_call_compiled_entry_reentrant` — the
+/// path the HELPER takes to the same entry — re-derives the ABI flag from the
+/// resolved `CompiledMethod` and overrides a disagreeing cache, so a wrong flag
+/// is invisible on the helper path and fatal on the inline one. This prints
+/// both the published flag and the entry's own, so the two can be compared at
+/// the moment of publication instead of inferred from the wreckage.
+fn ic_publish_trace_filter() -> &'static Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_IC_PUBLISH").ok())
+}
+
+fn ic_publish_trace(
+    site: &str,
+    info: &JitInvokeInfo,
+    receiver_cid: u32,
+    receiver_class: &str,
+    entry_ptr: u64,
+    needs_ctx: bool,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) {
+    let Some(want) = ic_publish_trace_filter() else {
+        return;
+    };
+    let key = format!("{}.{}", info.class_name, info.method_name);
+    if !key.contains(want.as_str()) {
+        return;
+    }
+    let owner = cratonvm_jit::pin_jit_code_range_owner(entry_ptr as usize);
+    let owner_ctx = owner
+        .as_deref()
+        .map(|c| c.needs_context().to_string())
+        .unwrap_or_else(|| "<unowned>".to_string());
+    let owner_entry = owner.as_deref().map_or(0, |c| c.entry_ptr() as usize);
+    eprintln!(
+        "[IC_PUBLISH] {site} {}.{}{} recv={receiver_class}(cid={receiver_cid}) \
+         entry={entry_ptr:#x} needs_ctx={needs_ctx} owner_needs_ctx={owner_ctx} \
+         owner_entry={owner_entry:#x} mic={mic_ptr:#x} pic={pic_ptr:#x}",
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WS1 diagnostic profiling for the JIT dispatch helpers
 // (env-gated: CRATONVM_DBG_MIC_PROF=1; zero-cost when off beyond one cached
@@ -11877,6 +11926,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // once the address was recycled by a later allocation, the
                 // json-smart "re-parse returned another method's result"
                 // corruption.
+                ic_publish_trace(
+                    "cache-hit",
+                    info,
+                    receiver_cid,
+                    &class_name,
+                    entry_ptr as u64,
+                    needs_ctx,
+                    mic_ptr,
+                    pic_ptr,
+                );
                 mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
@@ -12039,6 +12098,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         );
     }
     if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
+        ic_publish_trace(
+            "resolve",
+            info,
+            receiver_cid,
+            &class_name,
+            entry_ptr,
+            needs_ctx,
+            mic_ptr,
+            pic_ptr,
+        );
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
