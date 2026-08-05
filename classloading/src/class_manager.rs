@@ -10850,8 +10850,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
 
         "java/util/regex/Pattern" => instance_fields(2),
         "java/util/regex/Matcher" => instance_fields(6),
-        // Scanner = 5 fields
-        "java/util/Scanner" => instance_fields(5),
+        // Scanner = 5 slots, of which the first TWO are named and the rest
+        // deliberately are not.
+        //
+        // `native-io`'s Scanner natives resolve every field by NAME on the
+        // receiver, falling back to these indices only for a receiver that does
+        // not declare the name — so what the model has to get right is the
+        // fallback, and what the shadow-layout diff can check is any slot where
+        // the model claims to correspond to the image's slot of the same index.
+        //
+        // Against `javap -p --module java.base java.util.Scanner` (Temurin
+        // 25.0.3) only the first two line up: real slot 0 is `buf` and real
+        // slot 1 is `position`, which is where our model puts them. From slot 2
+        // on the orders diverge — the image has `matcher`, `delimPattern`,
+        // `hasNextPattern` where the model means delimiter, radix, closed, and
+        // the image does not reach `closed` and `radix` until slots 14 and 15.
+        // Naming those three in OUR order was tried and measured: the diff
+        // compares model slot i against image slot i, so it turned one
+        // anonymous-model artifact into three index-wise disagreements that are
+        // not defects — the natives resolve those three by name and never touch
+        // the model index on a real layout. An anonymous slot asserts nothing,
+        // which is the correct thing for a model that does not claim to match.
+        //
+        // Naming `position` is not cosmetic. Every `_fN` is
+        // `Ljava/lang/Object;`, so on a FABRICATED Scanner `set_field` coerced
+        // the `Int` position to null on the way in and `scan_pos` read back 0
+        // forever — `next()` would return the first token and never advance.
+        // Declaring it `I` keeps the value. That is the same defect, and the
+        // same fix, as the `StringReader` position documented in
+        // `native-io/src/lib.rs`.
+        "java/util/Scanner" => pad_to(
+            vec![
+                named_field("buf", "Ljava/nio/CharBuffer;"),
+                named_field("position", "I"),
+            ],
+            5,
+        ),
         // Optional = 1 field
         "java/util/Optional"
         | "java/util/OptionalInt"
