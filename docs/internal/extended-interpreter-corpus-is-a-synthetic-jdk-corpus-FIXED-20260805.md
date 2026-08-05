@@ -5,7 +5,7 @@
 | **Status** | ✅ RESOLVED 2026-08-05. Root-caused, fixed, and re-baselined. Retired from `docs/known-issues/`. |
 | **Area** | `vm/tests/interpreter_tests.rs` (the `CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1` corpus) |
 | **Original symptom** | Opting in yielded `710 passed; 214 failed` serially, and `STATUS_ACCESS_VIOLATION` / SIGSEGV in the default parallel run. |
-| **Now** | `924 passed; 0 failed` serially, and no crash in a full-parallel run, against two pinned lists: 5 real synthetic-library gaps and 11 order-dependent failures. |
+| **Now** | `924 passed; 0 failed` serially and deterministically; no crash in 30+ full-parallel runs. Two pinned lists: 5 real synthetic-library gaps, 11 order-dependent. A residual parallel flake in the proxy cluster is tracked in `corpus-is-order-dependent-20260805`. |
 
 ## What the original triage got wrong
 
@@ -100,8 +100,11 @@ Five process-global tables were converted to per-`vm_identity` rows
 Their GC scan/remap hooks now take a `vm_identity` too — handing one VM's
 object to another VM's collector as a root was the same bug wearing a hat.
 
-After the change: five consecutive full-parallel runs, no crash. The corpus
-also runs ~8× faster than it did serially.
+After the change: 30+ consecutive full-parallel runs, no crash — against
+2-in-3 crashing before. The corpus also runs ~12× faster than serially. What
+survives is a non-fatal parallel flake confined to the proxy/annotation
+cluster; the serial run, which is how the corpus is documented to be invoked,
+is deterministic.
 
 ## What else was fixed on the way
 

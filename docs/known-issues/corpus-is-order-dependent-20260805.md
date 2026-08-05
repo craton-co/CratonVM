@@ -55,6 +55,30 @@ prior VMs makes it not.
 **Do not "fix" these by implementing the feature they appear to be missing** —
 the feature works, as running the test alone proves. Find the table.
 
+## The same defect in the other direction: the parallel run
+
+`--test-threads=1` is deterministic — 924/0, repeatedly. The default parallel
+run is not: roughly half the runs report 1–5 failures, and **every one of them
+is in the `java.lang.reflect.Proxy` / annotation-proxy cluster**
+(`test_s17_proxy_basic`, `test_s17_proxy_is_proxy_class`,
+`test_s50_proxy_create`, `test_s50_proxy_isProxyClass`,
+`test_s50_proxy_objectMethods`, `test_s50_ann_methodValue`,
+`test_s50_ann_methodDefault`, `test_s50_ann_inheritedValue`). They flip in both
+directions: a pinned gap sometimes *passes*, and a normally-passing sibling
+sometimes fails with `ClassCastException: ? cannot be cast to …`.
+
+That `?` is the signature to look for — `class_name_of_id` cannot name the
+source class, i.e. the object belongs to a VM this one has never heard of. So
+the proxy-generation path still shares something across VMs. Already scoped and
+NOT the cause: the annotation-proxy cache and its child roots, the last-proxy
+interfaces cell, the `(vm, loader_id)` proxy module numbering, the four
+class-name memos, the defining-loader tables. `PROXY_CLASS_COUNTER`
+(`native-builtins/src/lib.rs`) is still process-wide and is the obvious next
+thing to look at, along with anything `proxy_gen` keys by generated name.
+
+No run crashes: this is the non-fatal tail of the SIGSEGV the retired write-up
+covers, and the corpus's documented serial invocation is unaffected.
+
 ## Why they are pinned separately
 
 `KNOWN_ORDER_DEPENDENT` absorbs the failure like `KNOWN_SYNTHETIC_JDK_GAPS`
