@@ -264,6 +264,31 @@ fn main() {
     // skips instead of failing. See the `// NEEDS-CLASSPATH` marker.
     java_files.retain(|f| !needs_external_classpath(f));
 
+    // Re-declare the trigger PER FILE, not just for the directory above.
+    //
+    // `cargo:rerun-if-changed=<dir>` does not mean "anything under this
+    // directory": cargo stats the directory itself, and on Windows editing a
+    // file inside it does not move the directory's own mtime. So an edited
+    // `.java` did not re-stage its class here, and the tests that read
+    // `CRATONVM_TEST_CLASSES_DIR` went on loading the previous bytecode.
+    //
+    // That fails in the worst possible direction. A fixture that was EXTENDED
+    // fails with `Err(ExceptionThrown(..))` from a method that does not exist —
+    // confusing, but visible. A fixture that was CHANGED goes on passing
+    // against the version it was meant to replace, silently.
+    //
+    // The directory line stays — it is what catches a file being ADDED or
+    // REMOVED, which no per-file line can.
+    //
+    // NOTE this does NOT cover the committed `.class` files in
+    // `tests/resources/cratonvm/` itself. Several test files boot a VM whose
+    // whole classpath is that directory, so they read the checked-in bytecode
+    // and never see this staging at all; editing one of those fixtures means
+    // regenerating and committing its `.class` by hand.
+    for f in &java_files {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
+
     if java_files.is_empty() {
         return;
     }

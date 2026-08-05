@@ -10607,11 +10607,17 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
-    registry.register(
+    // The `AbstractStringBuilder` half of DF05 — see the
+    // `(Ljava/lang/StringBuilder;)V` sibling in `deprecated_util.rs` for the
+    // full story and the measurement. `Intrinsic` for the same load-bearing
+    // reason: this VM's builders are `char[]`-backed and the real ctor's
+    // `Arrays.copyOfRange` over a `byte[]` reads them one byte at a time.
+    registry.register_with_kind(
         "java/lang/String",
         "<init>",
         "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
         lang_string::native_string_init_abstract_string_builder,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
@@ -38992,7 +38998,10 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // --- Collections extras: unmodifiable wrappers ---
     register_collections_extras_natives(registry);
     register_core_stdlib_extras(registry);
-    register_scanner_natives(registry);
+    // `register_scanner_natives` used to be called here. Its twelve
+    // `java/util/Scanner` registrations were overwritten by `native-io`'s two
+    // lines later in the boot sequence, in every configuration; see the note
+    // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases
 }

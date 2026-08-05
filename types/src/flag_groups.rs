@@ -443,6 +443,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
+    // `overlay-nodedup` — report EVERY model-slot access, not the first per
+    // (class, slot, read/write). The default cap exists because the complete
+    // list of disagreeing slots is already printed once per class by the
+    // shadow-layout census, so a repeat line adds nothing but volume — and
+    // `java/lang/String` slot 1 alone would bury the run. Turn it off when you
+    // want per-site COUNTS rather than per-site presence.
+    E { group: Group::DBG, token: "overlay-nodedup", on_key: Some("CRATONVM_DBG_OVERLAY_NODEDUP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-prune", on_key: Some("CRATONVM_DBG_OVERLAY_PRUNE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
@@ -790,6 +797,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache-loader", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "field-site-slots", on_key: Some("CRATONVM_JIT_FIELD_SITE_SLOTS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "method-site-cache", on_key: Some("CRATONVM_JIT_METHOD_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "loop-work-tierup", on_key: Some("CRATONVM_JIT_LOOP_WORK_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-nopush", on_key: Some("CRATONVM_SHADOW_NOPUSH"), off_key: None, off_word: None },
@@ -1052,6 +1060,67 @@ pub fn lookup(group: Group, token: &str) -> Option<&'static E> {
 /// Every entry belonging to `group`.
 pub fn entries(group: Group) -> impl Iterator<Item = &'static E> {
     INVENTORY.iter().filter(move |e| e.group == group)
+}
+
+/// A hint for an unrecognised `token` in `group`, if one is obvious.
+///
+/// The motivating case is real: disabling a default-ON knob is spelled with a
+/// LEADING MINUS (`CRATONVM_JIT=-self-cache-inherit`), and writing the
+/// English-looking `no-self-cache-inherit` instead produces a token no entry
+/// claims. The flag then never applies, and an A/B that used it measures
+/// nothing while reading as a clean negative — which is exactly how one
+/// hypothesis was wrongly "falsified" in
+/// `docs/known-issues/jit/math-floormod-long-int-returns-minus-one-20260805.md`.
+///
+/// Checked in order of how badly each is likely to mislead:
+///
+/// 1. `no-x` / `disable-x` / `off-x` where `x` exists — the writer wanted `-x`
+///    and got a silent no-op.
+/// 2. an exact match in a DIFFERENT group — right token, wrong variable.
+/// 3. a unique containment match — an ordinary typo or truncation.
+pub fn suggest(group: Group, token: &str) -> Option<String> {
+    let t = token.trim().to_ascii_lowercase();
+
+    for prefix in ["no-", "no_", "disable-", "off-", "not-"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            if lookup(group, rest).is_some() {
+                return Some(format!(
+                    "did you mean `{}=-{}`? a leading minus turns a knob OFF; \
+                     `{}` is not a spelling this parser knows",
+                    group.var(),
+                    rest,
+                    prefix
+                ));
+            }
+        }
+    }
+
+    // A token can legitimately exist in SEVERAL groups (`licm` is both a
+    // `CRATONVM_JIT` knob and a `CRATONVM_DBG` trace). Naming only the first
+    // would send the reader to one arbitrary variable and read as authoritative,
+    // so list every group that claims it and let them pick.
+    let owners: Vec<&'static str> = Group::ALL
+        .iter()
+        .filter(|&&g| g != group && lookup(g, &t).is_some())
+        .map(|g| g.var())
+        .collect();
+    if !owners.is_empty() {
+        return Some(format!(
+            "`{t}` is a token of {}, not {}",
+            owners.join(" / "),
+            group.var()
+        ));
+    }
+
+    // A unique containment match in either direction catches truncations
+    // ("field-site" for "field-site-cache") and extensions alike. An ambiguous
+    // match is deliberately NOT guessed at: a wrong hint is worse than none,
+    // because it invites a second inert run.
+    let mut hits = entries(group).filter(|e| e.token.contains(&t) || t.contains(e.token));
+    if let (Some(first), None) = (hits.next(), hits.next()) {
+        return Some(format!("did you mean `{}={}`?", group.var(), first.token));
+    }
+    None
 }
 
 /// The group and token that own `legacy`, if the inventory claims it.
@@ -1681,6 +1750,56 @@ mod tests {
         assert_eq!(r.unknown_tokens, vec!["CRATONVM_JIT=definitely-not-a-flag"]);
         // The valid neighbour still applied.
         assert_eq!(r.get("CRATONVM_JIT_LICM"), Some(OsString::from("1")));
+    }
+
+    /// The exact mistake that produced a confident, wrong "hypothesis
+    /// falsified" (see the `math-floormod-long-int-returns-minus-one` doc):
+    /// `no-X` looks like English but is not a spelling this parser knows, so
+    /// the knob silently never applies.
+    #[test]
+    fn no_prefix_is_unknown_and_suggests_the_minus_form() {
+        let c = case(&[("CRATONVM_JIT", "no-self-cache-inherit")]);
+        let r = c.resolve();
+        assert_eq!(
+            r.unknown_tokens,
+            vec!["CRATONVM_JIT=no-self-cache-inherit"],
+            "the `no-` form must NOT be silently treated as the disable spelling"
+        );
+        let hint = suggest(Group::JIT, "no-self-cache-inherit")
+            .expect("a `no-X` token whose X exists must be hinted");
+        assert!(
+            hint.contains("-self-cache-inherit"),
+            "hint should name the leading-minus form, got: {hint}"
+        );
+
+        // And the real spelling does apply, so the hint points somewhere true.
+        let ok = case(&[("CRATONVM_JIT", "-self-cache-inherit")]);
+        let ok = ok.resolve();
+        assert!(ok.unknown_tokens.is_empty());
+        assert_eq!(
+            ok.get("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"),
+            Some(OsString::from("1"))
+        );
+    }
+
+    #[test]
+    fn suggest_names_every_group_that_claims_a_misfiled_token() {
+        // `licm` is claimed by BOTH CRATONVM_JIT and CRATONVM_DBG. Naming only
+        // one would point the reader at an arbitrary variable and read as
+        // authoritative, so the hint must list them all.
+        let hint = suggest(Group::GC, "licm").expect("cross-group hit must be hinted");
+        assert!(hint.contains("CRATONVM_JIT"), "got: {hint}");
+        assert!(hint.contains("CRATONVM_DBG"), "got: {hint}");
+        assert!(hint.contains("not CRATONVM_GC"), "got: {hint}");
+    }
+
+    #[test]
+    fn suggest_declines_when_the_match_is_ambiguous() {
+        // A wrong hint invites a second inert run, so an ambiguous token gets
+        // no guess. "s" is a substring of many tokens.
+        assert_eq!(suggest(Group::JIT, "s"), None);
+        // And a token resembling nothing at all gets none either.
+        assert_eq!(suggest(Group::JIT, "zzzzzzzz-not-close-to-anything"), None);
     }
 
     #[test]

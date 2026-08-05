@@ -353,7 +353,12 @@ pub struct MethodState {
     /// codegen genuinely broke. That is what made "1531 of 1642 hot methods
     /// never compile" impossible to act on without re-deriving every entry by
     /// hand — see
-    /// `docs/known-issues/hibernate/smoketests-concurrent-println-timeout-20260723.md`.
+    /// `docs/internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
+    ///
+    /// Those three bans have all since been deleted (2026-07-29 and
+    /// 2026-07-31), so the same workload now reports `ineligible-by-policy=0`.
+    /// The split is what makes that readable as "nothing is banned" rather than
+    /// as a compiler that stopped failing; keep it.
     ///
     /// Recording the decline once, under its own flag, ends the churn on the
     /// first attempt and leaves `tier_fail_count` meaning only what its name
