@@ -12805,7 +12805,23 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     /// clears it from every thread before assigning, so a hand-off between
     /// threads cannot leave it recorded against both.
     fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
-        let owner_tid = owner.and_then(|o| resolve_thread_id_from_thread_obj(self.shared, o));
+        // AQS sets the owner from the owning thread itself — `acquire` passes
+        // `Thread.currentThread()`, `release` passes null — so the mirror handed
+        // in is virtually always this thread's own. Recognising that by pointer
+        // skips `resolve_thread_id_from_thread_obj`, which reads the mirror's
+        // `tid` field and then takes the registry's `java_tid_to_id` mutex, on
+        // a path that runs twice per uncontended `ReentrantLock` pair.
+        //
+        // `java_thread_obj` is this thread's mirror and is GC-remapped in step
+        // with any `ObjectRef` reaching a native, so the pointer compare is
+        // exact rather than heuristic; anything that does not match falls
+        // through to the full resolve, which is also what a genuinely
+        // cross-thread caller needs.
+        let owner_tid = match owner {
+            None => None,
+            Some(o) if self.thread.java_thread_obj == Some(o) => Some(self.thread.thread_id),
+            Some(o) => resolve_thread_id_from_thread_obj(self.shared, o),
+        };
         self.shared
             .threads
             .thread_registry
