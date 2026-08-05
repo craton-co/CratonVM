@@ -171,8 +171,38 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     hunter does not report it**: `overlay_write_is_destructive` only flags
     `Object(Some(_))` over a primitive, so a null write is invisible. The
     census is a floor for that reason too.
-  * **Both built-in class loaders take `Int` writes over four reference slots
-    each.** Whatever those slots hold on the real classes, they are not integers.
+  * **Both built-in class loaders — root cause found 2026-08-04, and it is a
+    different KIND of defect from the two fixed above.** `alloc_classloader`
+    writes CratonVM's seven-slot loader model onto the object, and four of those
+    slots are `Int`:
+
+    | slot | synthetic meaning | real `ClassLoaders$AppClassLoader` |
+    |---:|---|---|
+    | 0 | `CL_LOADER_TYPE` | a reference |
+    | 3 | `CL_CLASSES_LOADED` | a reference |
+    | 4 | `CL_IS_PARALLEL_CAPABLE` | a reference |
+    | 6 | `CL_LOADER_ID` | a reference |
+
+    Reached from `Thread.currentThread()` → `current_thread_object` →
+    `get_or_create_system_cl` while initialising `contextClassLoader`, which is
+    why the Java stack said `BufferedWriter.initialBufferSize()` and why
+    grepping found nothing. Named by `CRATONVM_DBG=overlay-bt`, which exists
+    because of this site.
+
+    **`resolve_field_index_by_class_id` cannot fix these.** `loadFactor` on a
+    `Properties` has a real counterpart to resolve to; `CL_LOADER_TYPE` and
+    `CL_LOADER_ID` are VM-internal bookkeeping with **no real JDK field at
+    all**. There is nowhere correct to put them in a real loader's layout, so
+    on a real image they must not be in the object: they belong in a side table
+    keyed by the loader, exactly as `vh_meta_put` does for `VarHandle`. Note the
+    same function already writes `name`/`parent` twice — once by index, once by
+    name — with a comment explaining that the real natives read the real slots,
+    so the by-name half of this lesson was already learned here and the
+    VM-internal half was not.
+
+    Size: 9 / 6 / 10 / 16 read-and-write sites for the four constants. Not a
+    one-line change, and it is the reason this row is diagnosed rather than
+    fixed.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
     single off-by-one against one layout.
 
@@ -183,7 +213,34 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   probes is not Spring Boot. Treat the table as a floor and re-run under H2 or
   Spring Boot before calling the sweep done.
 
-  Adjudicating and fixing the 24 sites is untouched.
+  ### The 19 open slots are FOUR defects, not nineteen
+
+  Classified 2026-08-04 by tracing each writer (`CRATONVM_DBG=overlay-bt` names
+  the Rust frame; the Java frames mislead). Each kind has a different fix, and
+  applying the wrong one is silent:
+
+  | # | kind | tell | fix | status |
+  |---|---|---|---|---|
+  | 1 | synthetic slots written onto a real layout | the real class declares a field our model does not have | write the slots only when the layout is ours, keyed on a field name the real class declares | **`VarHandle` fixed** |
+  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7 fixed**; `URI`, `Properties` 2 open |
+  | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does | `ClassLoaders` ×2 open |
+  | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | `Proxy` open |
+
+  Kind 3 is the one that cannot be fixed by resolving harder: there is nowhere
+  correct in a real layout to put a `CL_LOADER_ID`. Kind 4 likewise — resolving
+  `java.net.Proxy.type` by name finds a real field, and writing our `int` into
+  it is still wrong, because the real field holds a `Proxy$Type` **enum
+  reference**.
+
+  Two things found while classifying, both worth fixing alongside:
+
+  * **The synthetic `URI` model is duplicated**, with identical constants, in
+    `native-builtins/src/http2.rs` and `native-builtins/src/servlet.rs`. Two
+    copies of a layout is how the `real_protected_stub` allow-lists drifted.
+  * `native_map_init`'s legacy branch still writes raw `MAP_FIELD_*` indices,
+    which is the surviving `Properties` slot-2 row and the whole `HashMap`
+    family. It is kind 2, but converting it touches the layout every other
+    native map operation reads, so it wants its own change and its own A/B.
 * **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
   Note the `ValueLayout` one cannot be converted at all — the marker is explicit
   that there are no real fields to name, so it is a
