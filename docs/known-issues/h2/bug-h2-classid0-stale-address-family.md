@@ -507,6 +507,62 @@ witness is on the fixed code.
 of the process. Whatever the gap is, it does not need a long-running heap or an
 accumulated free list to appear.
 
+### The `hasNext()` witness, reproduced WITH the provenance answer (2026-08-05)
+
+The face the old page was named for — and this time it says where the address
+stood in the owning thread's own bookkeeping:
+
+```
+WARN  …vm_exec: NoSuchMethodError method="java/lang/Object.hasNext()Z"
+      caller="org/h2/test/db/TestMultiThread.testConcurrentUpdate()V @pc=252"
+ERROR …gc::guard: receiver points into RECLAIMED memory  obj="0x2004621fa78"
+      location=young from-space FREE BLOCK (reclaimed)  span="0x2004621c7a0+0x3dd0"
+ERROR …gc::guard: …and this is where that address stood in the OWNING thread's own
+      GC bookkeeping.  in_published_snapshot=false  published_roots=38
+      in_blocked_region=false  frames=4
+      top_frame=org/h2/test/db/TestMultiThread.testConcurrentUpdate pc=252
+```
+
+Read the three of them together:
+
+* `location=young from-space FREE BLOCK (reclaimed)` — not "past the frontier",
+  not the inactive semispace. The address is inside a free block of the
+  CURRENT from-space right now, which is the one answer with no false
+  positives: a live object is never there;
+* **`in_published_snapshot=false`** — the snapshot the collector marks this
+  thread from does not contain the address, while the thread's own top frame
+  holds it. `published_roots=38`, so the snapshot exists and is populated; the
+  slot is simply not in it;
+* `in_blocked_region=false`, `frames=4`, and the failing frame is the TOP
+  frame — so this is not the parked-thread deposit path at all. It is a
+  counted, running mutator whose top frame is the one holding the dangling
+  reference.
+
+Together with `ROOT_IN_DEAD_SPANS` and `SWEEP_LIVENESS` both silent (§above),
+that is three independent instruments agreeing: the mark did not drop a root it
+was handed, no heap edge pointed into the doomed span, and the root slice never
+had the address. **The gap is in publishing, not in marking, sweeping, or
+delivery.**
+
+The next number to get is how OLD the snapshot the collector used was:
+`report_root_slice_provenance` now also prints `last_publish_at_collection`
+against `collections_now`, stamped by `note_root_publish` at both publish sites
+(`update_root_snapshot` and `deposit_root_snapshot_inner`). A non-zero
+difference means at least one collection completed after this thread last
+published — i.e. it was marked from a snapshot that could not contain anything
+allocated since. That is the shape both young witnesses have, and it has a
+plausible mechanism: the publish hook fires on object-RETURNING native calls,
+so a stretch of bytecode that allocates and then calls only void natives (or no
+native at all) never republishes.
+
+**Caveat on the reported pc, so nobody anchors on it.** `@pc=252` does not
+correspond to the `invokeinterface hasNext` at 203 in the javac disassembly of
+this build — 252 is `aload 4` before `awaitTermination`. Either the VM reports
+pcs in its own rewritten bytecode space (the arming rewriter shifts them) or the
+frame pc is read at a different moment than the dispatch. The *method* and the
+*receiver verdict* are the load-bearing parts; do not map this pc onto javap
+output without checking.
+
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
 Recorded so they are not re-derived; each cost a build-and-soak cycle. These

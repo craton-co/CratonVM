@@ -17,20 +17,47 @@
 # because a `timeout` kill prints a truncated transcript that reads exactly like
 # a clean short run -- the specific way the first two strict census runs lied.
 #
+# IT IS A RATCHET, NOT A PASS/FAIL ON GREEN. The corpus is not green today --
+# four defects are filed against it -- so a gate that demanded zero divergence
+# would be red on every build and off within a week, which is the decorative
+# guard this lane exists to avoid. Instead the KNOWN divergences are committed
+# to a baseline and the gate fails when the set GROWS. A divergence that
+# disappears never fails; it prints "re-freeze" and passes, so a fix is never
+# blocked by the gate that measured it.
+#
+# What that buys and what it costs, stated plainly: a NEW divergent section
+# fails the build, which is the whole point. A known-divergent section whose
+# wrong VALUE changes to a different wrong value does NOT fail, because the
+# baseline records section identity rather than content. Freezing content would
+# fail on `vthreads`, whose divergence is intermittent by nature (the
+# ConcurrentHashMap.newKeySet defect is a race), and a gate that flakes is a
+# gate that gets disabled.
+#
 # Usage:
 #   JAVA_HOME=/path/to/real/jdk25 \
 #   CV=target/release/cratonvm \
 #   [OUT=target/jdk-only-strict-probes] \
 #   [TIMEOUT=300] \
 #   [PROBE_LIST="JdkOnlyCensusLoadProbe ..."] \
-#   scripts/jdk-only-strict-probes.sh
+#   scripts/jdk-only-strict-probes.sh [--update-baseline --note "why"]
+#
+# The baseline is keyed `<jdk-feature>-<os>` because the transcripts are a
+# property of the image and the platform, exactly like the bridge ratchet's:
+#   scripts/baselines/jdk-only-strict-corpus-25-linux.txt
+# It is NEVER written by hand -- `--update-baseline` regenerates it from a real
+# run and refuses without a `--note` saying why the set moved.
 #
 # Exit codes:
-#   0  every arm completed and every CratonVM transcript matched HotSpot
-#   2  a prerequisite is missing (no JAVA_HOME, no javac, no cratonvm) -- nothing ran
+#   0  every arm completed and the divergent set is within the baseline
+#   2  a prerequisite is missing, or there is no baseline for this
+#      <feature>-<os> and the gate refuses to adjudicate (never a pass)
 #   3  a probe failed to compile
 #   4  an arm did not complete (non-zero exit, timeout, or crash)
-#   5  a transcript diverged from the HotSpot control
+#   5  the ratchet fired: a section diverged that the baseline does not carry
+#
+# 4 is NEVER baselined. A hang or a crash fails the build whatever the baseline
+# says -- there is no such thing as a known-acceptable truncated transcript,
+# and that is the specific way the first two strict census runs lied.
 #
 # 4 and 5 are separate on purpose: a truncated run and a wrong answer need
 # different triage, and collapsing them into "failed" is how a hang gets filed
@@ -40,6 +67,22 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$ROOT/target/jdk-only-strict-probes}"
 TIMEOUT="${TIMEOUT:-300}"
+
+UPDATE=0
+NOTE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --update-baseline) UPDATE=1; shift ;;
+    --note) NOTE="${2:-}"; shift 2 ;;
+    --note=*) NOTE="${1#--note=}"; shift ;;
+    *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+if [ "$UPDATE" -eq 1 ] && [ -z "$NOTE" ]; then
+  echo "ERROR: --update-baseline requires --note \"why the divergent set moved\"." >&2
+  echo "       A baseline bump with no reason is how a regression gets frozen in." >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------- prerequisites
 
@@ -71,6 +114,99 @@ if [ ! -x "$CV" ]; then
 fi
 
 mkdir -p "$OUT/classes" "$OUT/logs"
+
+# ------------------------------------------------------- the ratchet machinery
+
+# A probe prints exactly one line per section and every line begins with its
+# section name, so a divergence is identified by (probe, arm, section). That is
+# the unit the baseline records.
+#
+# `SECTION-FAILED collections: java.lang.NoClassDefFoundError: ...` is keyed
+# `SECTION-FAILED:collections` rather than `SECTION-FAILED`, so five different
+# sections blowing up are five entries and not one.
+divergent_keys() {
+  # stdin: a unified diff. stdout: one section key per line, sorted, unique.
+  grep -E '^[-+]' \
+    | grep -vE '^(---|\+\+\+)' \
+    | sed -E 's/^[-+]//' \
+    | awk '
+        /^SECTION-FAILED /{ k=$2; sub(/:$/,"",k); print "SECTION-FAILED:" k; next }
+        NF                { print $1 }
+      ' \
+    | sort -u
+}
+
+# Detect the JDK feature version the same way scripts/jdk-only-census.sh does,
+# because the baselines are keyed by it and two different keys must never be
+# derived two different ways.
+detect_jdk_feature() {
+  home="$1"; raw=""
+  if [ -f "$home/release" ]; then
+    raw="$(sed -n 's/^JAVA_VERSION=//p' "$home/release" 2>/dev/null | head -n 1 | tr -d '"' | tr -d '\r')"
+  fi
+  if [ -z "$raw" ] && [ -x "$home/bin/java$EXE" ]; then
+    raw="$("$home/bin/java$EXE" -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n 1 | tr -d '\r')"
+  fi
+  [ -n "$raw" ] || return 1
+  case "$raw" in 1.*) raw="${raw#1.}" ;; esac
+  feature="${raw%%[!0-9]*}"
+  [ -n "$feature" ] || return 1
+  printf '%s\n' "$feature"
+}
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Linux) OSKEY=linux ;;
+  Darwin) OSKEY=macos ;;
+  MINGW*|MSYS*|CYGWIN*) OSKEY=windows ;;
+  *) OSKEY=unknown ;;
+esac
+FEATURE="${JDK_FEATURE:-}"
+if [ -z "$FEATURE" ]; then
+  FEATURE="$(detect_jdk_feature "$JAVA_HOME")" || {
+    echo "ERROR: could not read JAVA_VERSION from $JAVA_HOME/release, and"
+    echo "       $JAVA_HOME/bin/java -version did not name one. The baseline is"
+    echo "       keyed by JDK feature version, so this cannot be adjudicated."
+    exit 2
+  }
+fi
+BASELINE="$ROOT/scripts/baselines/jdk-only-strict-corpus-$FEATURE-$OSKEY.txt"
+echo "baseline key: $FEATURE-$OSKEY"
+
+# --------------------------------------------------- hermetic self-test first
+#
+# The gate's own logic, exercised on fabricated transcripts, before it is
+# pointed at a VM. It asserts BOTH directions: an injected new section is
+# flagged, and a section already in the baseline is not. A ratchet that has
+# never been shown to fire is indistinguishable from one that cannot.
+selftest() {
+  st="$OUT/selftest"; rm -rf "$st"; mkdir -p "$st"
+  printf 'alpha ok=1\nbeta ok=1\ngamma ok=1\n'          > "$st/hotspot"
+  printf 'alpha ok=1\nbeta ok=2\nSECTION-FAILED gamma: boom\n' > "$st/actual"
+  observed="$(diff -u "$st/hotspot" "$st/actual" | divergent_keys)"
+  want="$(printf 'SECTION-FAILED:gamma\nbeta\ngamma\n' | sort -u)"
+  if [ "$observed" != "$want" ]; then
+    echo "ERROR: self-test failed -- key extraction is wrong."
+    echo "  expected: $(echo "$want" | tr '\n' ' ')"
+    echo "  observed: $(echo "$observed" | tr '\n' ' ')"
+    return 1
+  fi
+  # Baseline carrying `beta` must leave `beta` unflagged and still flag the rest.
+  printf 'p/strict/beta\n' > "$st/base"
+  newk="$(printf 'p/strict/%s\n' $observed | sort -u | comm -23 - "$st/base")"
+  case "$newk" in
+    *"p/strict/beta"*) echo "ERROR: self-test failed -- a baselined key was flagged as new."; return 1 ;;
+  esac
+  case "$newk" in
+    *"p/strict/gamma"*) : ;;
+    *) echo "ERROR: self-test failed -- a NEW key was not flagged. The ratchet cannot fire."; return 1 ;;
+  esac
+  return 0
+}
+if ! selftest; then
+  echo "RESULT: REFUSED -- the gate cannot adjudicate because its own logic is broken."
+  exit 2
+fi
+echo "self-test: the ratchet fires on a new section and not on a baselined one"
 
 # ------------------------------------------------------------------ the corpus
 
@@ -164,6 +300,8 @@ run_arm() {
 BAD_EXIT=""
 DIVERGED=""
 BOTH_MODES=""
+OBSERVED="$OUT/observed-keys.txt"
+: > "$OBSERVED"
 
 for probe in $PROBE_LIST; do
   echo ""
@@ -230,6 +368,12 @@ for probe in $PROBE_LIST; do
   diff -u "$OUT/logs/$probe.hotspot.norm" "$OUT/logs/$probe.strict.norm" \
       > "$OUT/logs/$probe.strict.diff" 2>&1 || strict_diff=1
 
+  # Record what diverged, per arm, as `probe/arm/section` — the ratchet's unit.
+  for a in real strict; do
+    divergent_keys < "$OUT/logs/$probe.$a.diff" \
+      | sed "s|^|$probe/$a/|" >> "$OBSERVED"
+  done
+
   if [ "$real_diff" -eq 0 ] && [ "$strict_diff" -eq 0 ]; then
     echo "transcript: byte-identical to HotSpot in both modes"
     continue
@@ -266,13 +410,74 @@ if [ -n "$BOTH_MODES" ]; then
   echo "  (both modes, so pre-existing:$BOTH_MODES)"
 fi
 
+# An incomplete arm is never baselined and always fails, before the ratchet
+# gets a say: a truncated transcript's divergent set is meaningless.
 if [ -n "$BAD_EXIT" ]; then
-  echo "RESULT: NOT GREEN -- an arm did not complete."
+  echo "RESULT: FAIL -- an arm did not complete. Never baselined: a hang or a"
+  echo "        crash is not a known-acceptable transcript."
   exit 4
 fi
-if [ -n "$DIVERGED" ]; then
-  echo "RESULT: NOT GREEN -- a transcript diverged from the HotSpot control."
+
+sort -u "$OBSERVED" -o "$OBSERVED"
+n_obs=$(grep -c . "$OBSERVED" || true)
+
+if [ "$UPDATE" -eq 1 ]; then
+  mkdir -p "$(dirname "$BASELINE")"
+  {
+    echo "# Strict-corpus divergence baseline — jdk $FEATURE, $OSKEY"
+    echo "#"
+    echo "# GENERATED by scripts/jdk-only-strict-probes.sh --update-baseline."
+    echo "# Never hand-edited: every line is a (probe, arm, section) that a real"
+    echo "# three-arm run measured as diverging from the HotSpot control."
+    echo "#"
+    echo "# note: $NOTE"
+    echo "#"
+    echo "# The gate fails when this set GROWS. A line that stops diverging is"
+    echo "# reported and passes, so a fix is never blocked by the gate that"
+    echo "# measured it — re-freeze afterwards to keep the ratchet tight."
+    cat "$OBSERVED"
+  } > "$BASELINE"
+  echo "baseline updated: $BASELINE ($n_obs entries)"
+  echo "RESULT: BASELINE WRITTEN -- re-run without --update-baseline to gate."
+  exit 0
+fi
+
+if [ ! -f "$BASELINE" ]; then
+  echo "RESULT: REFUSED -- no baseline at $BASELINE."
+  echo "  The divergent set is a property of the image and the platform, so a"
+  echo "  baseline from another key cannot adjudicate this one. Produce it with"
+  echo "  a real run:"
+  echo "    JAVA_HOME=$JAVA_HOME CV=$CV bash scripts/jdk-only-strict-probes.sh \\"
+  echo "        --update-baseline --note \"first baseline for $FEATURE-$OSKEY\""
+  echo "  Refusing is not a pass: $n_obs divergent section(s) were measured and"
+  echo "  nothing has adjudicated them."
+  exit 2
+fi
+
+grep -vE '^\s*(#|$)' "$BASELINE" | sort -u > "$OUT/baseline-keys.txt"
+NEW="$(comm -23 "$OBSERVED" "$OUT/baseline-keys.txt")"
+GONE="$(comm -13 "$OBSERVED" "$OUT/baseline-keys.txt")"
+n_base=$(grep -c . "$OUT/baseline-keys.txt" || true)
+
+echo "divergent sections: $n_obs observed, $n_base baselined"
+if [ -n "$GONE" ]; then
+  echo ""
+  echo "NO LONGER DIVERGING (not a failure — re-freeze to keep the ratchet tight):"
+  printf '%s\n' "$GONE" | sed 's/^/  - /'
+fi
+if [ -n "$NEW" ]; then
+  echo ""
+  echo "NEW DIVERGENCES — the ratchet fired:"
+  printf '%s\n' "$NEW" | sed 's/^/  + /'
+  echo ""
+  echo "Each is a section that matched the HotSpot control when the baseline was"
+  echo "frozen and does not now. The per-arm diffs are in $OUT/logs/*.diff."
+  echo "If the change is intended, re-freeze:"
+  echo "    bash scripts/jdk-only-strict-probes.sh --update-baseline --note \"...\""
+  echo "RESULT: FAIL -- the strict corpus regressed against its baseline."
   exit 5
 fi
-echo "RESULT: GREEN -- every arm completed and matched HotSpot."
+
+echo "RESULT: PASS -- every arm completed and no section diverged that the"
+echo "        baseline does not already carry."
 exit 0

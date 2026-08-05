@@ -4188,6 +4188,7 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
+        crate::memory::reclaim_guard::note_root_publish(self.shared, self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -23141,6 +23142,7 @@ fn invoke_on_class_shared_inner(
                         // 2026-08-05 `DriverManager.getConnection` witness
                         // leaves open.
                         crate::memory::reclaim_guard::report_root_slice_provenance(
+                            shared,
                             thread,
                             addr,
                             "invoke dispatch",
@@ -26384,16 +26386,41 @@ mod tests {
             add_real_class_with_field_descriptors(&shared, "cratonvm/test/EpochStill", &["I"]);
         // Sampled AFTER the class is added: defining a class bumps the epoch
         // too (a new class can be someone's previously-missing ancestor).
-        let before = cratonvm_classloading::class_origin_epoch();
-        // Resolving does not touch provenance.
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        assert_eq!(
-            cratonvm_classloading::class_origin_epoch(),
-            before,
+        //
+        // `class_origin_epoch` is PROCESS-GLOBAL, and libtest runs this test
+        // concurrently with every other one that defines a class or calls
+        // `set_origin` -- each of which bumps it. A bare `assert_eq!(after,
+        // before)` therefore asserts something this test does not control, and
+        // it failed for real: `left: 12459, right: 12451`, eight bumps that
+        // arrived from other threads while these two reads ran.
+        //
+        // What the test means is "the READS contribute nothing". A window
+        // interrupted by someone else's write is not evidence against that --
+        // it is a spoiled sample. So retry until one window comes through
+        // clean. If the reads really did bump the epoch then EVERY window is
+        // dirty and this still fails, which is what keeps it honest.
+        const ATTEMPTS: usize = 64;
+        let mut quiet = false;
+        for _ in 0..ATTEMPTS {
+            let before = cratonvm_classloading::class_origin_epoch();
+            // Resolving does not touch provenance.
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            if cratonvm_classloading::class_origin_epoch() == before {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(
+            quiet,
             "reads must not bump the epoch, or every memo is invalidated \
-             immediately and the lock is back on the hot path"
+             immediately and the lock is back on the hot path -- no quiet \
+             window in {ATTEMPTS} attempts"
         );
+        // Re-sampled for the second half: the loop above may have exited on
+        // any attempt, and a concurrent bump between the two halves would
+        // otherwise be attributed to `set_origin` below.
+        let before = cratonvm_classloading::class_origin_epoch();
         {
             let mut cm = shared.classes.class_manager_write();
             let cls = cm.class_store.get_mut(cid).expect("class present");
