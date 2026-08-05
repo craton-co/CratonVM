@@ -268,42 +268,28 @@ item exists to prevent.
 sites* live outside it, so they still have to be routed in. Each one below is a
 single call.
 
-### 1. `drain_deferred_jit_owners_if_quiescent` has the ordering backwards
+### 1. ~~`drain_deferred_jit_owners_if_quiescent` has the ordering backwards~~ — DONE
 
-`jit/src/lib.rs`, `fn drain_deferred_jit_owners_if_quiescent`:
+`drain_deferred_jit_owners_if_quiescent` now takes `deferred_jit_owners().lock()`
+first and evaluates `ACTIVE_JIT_EXECUTIONS.is_zero()` with the guard held, and
+`defer_jit_owner`'s fast path carries the comment saying why its own unlocked
+`is_zero()` is sound (the check follows the caller's unpublication). The window
+described here is closed.
 
-```rust
-fn drain_deferred_jit_owners_if_quiescent() {
-    if jit_leak_code_enabled() { return; }
-    if !ACTIVE_JIT_EXECUTIONS.is_zero() { return; }      // <-- walk happens HERE
-    let retired = std::mem::take(&mut *deferred_jit_owners().lock());  // <-- lock taken HERE
-    drop(retired);
-}
-```
+**The obligation that replaced it** (2026-08-03,
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`)
+is not about ordering at all, and it is the one to check when touching this
+area:
 
-The quiescence walk completes *before* the queue lock is taken, and then
-everything found in the queue is freed — including owners enqueued in between.
-The window:
+> A published body's mapping may be returned **only** from a reclamation the
+> retirement queue authorised, and a thread inside a compiled body always holds
+> an owning reference to it.
 
-1. Thread D leaves JIT, reads `is_zero() == true` at `t0`, and is descheduled.
-2. Thread C enters JIT at `t1 > t0`.
-3. Thread A unpublishes body B at `t2 > t1` (C may be executing B), finds
-   `is_zero() == false`, and pushes B to the queue at `t3`.
-4. Thread D resumes at `t4 > t3`, takes the queue, and frees B — on the strength
-   of a witness from `t0`, before B was unpublished and before C entered.
-
-**Required edit:** take `deferred_jit_owners().lock()` first, then evaluate
-`ACTIVE_JIT_EXECUTIONS.is_zero()` with the guard held, then `mem::take`.
-`fn defer_jit_owner` needs the same treatment: its own
-`ACTIVE_JIT_EXECUTIONS.is_zero()` fast path drops the owner
-immediately, which is sound only because the check follows the caller's
-unpublication — worth a comment saying so, since nothing in the signature
-enforces it.
-
-Nothing here has been observed to fire. It is a narrow window on a path that
-already has three diagnostic flags (`CRATONVM_JIT_LEAK_CODE`,
-`CRATONVM_JIT_NEVER_FREE_CODE`, `CRATONVM_JIT_POISON_FREE`) built to chase
-exactly this family of fault, which is the reason to close it by construction.
+The second clause is what makes a reference count reaching zero a proof rather
+than a guess, and it was false until `try_call_compiled_entry_reentrant` was
+made to pin. Any new long-lived holder of an `Arc<CompiledMethod>` that backs a
+raw entry must be a `cratonvm_jit::RetainedCode`, not a bare `Arc`;
+`published_code_free_audit().1` is the check, and it must stay zero.
 
 ### 2. `ExecutableBuffer::new` is the install accounting point
 
@@ -340,12 +326,20 @@ indistinguishable from every other `try_compile` bail.
 
 ### 3. `impl Drop for ExecutableBuffer` is the reclaim accounting point
 
-It already calls `record_code_free(ptr, capacity, ACTIVE_JIT_EXECUTIONS.get())`,
-whose third argument exists precisely so a crash report can say "this buffer was
-released while N threads were inside compiled code". That number is the same
-question this protocol answers, and today nothing aggregates it. Route it into
-`reclaimed_bytes` / `reclaimed_bodies`, and treat a non-zero active count as a
-protocol violation rather than a diagnostic breadcrumb.
+It calls `record_code_free(ptr, capacity, ACTIVE_JIT_EXECUTIONS.get(), flags)`.
+Route the bytes into `reclaimed_bytes` / `reclaimed_bodies`.
+
+**Do not** treat a non-zero active count as the protocol violation — an earlier
+revision of this section said to, and it is wrong in both directions. The count
+is recorded for discarded compile attempts nothing can point into, and it is
+sampled at the `munmap` rather than at the decision, so a legal reclamation
+routinely reports a non-zero value; conversely a genuine bypass frequently
+reports zero. Measured on `BasicErrorControllerIntegrationTests`: of 90 real
+violations in one run, 73 had an active count of zero.
+
+The violation is `CODE_FREE_PUBLISHED && !CODE_FREE_AUTHORISED`, which
+`ExecutableBuffer::drop` now records into `published_code_free_audit()` and the
+crash handler prints in words. Aggregate *that*.
 
 ### 4. `JitCache::put` / `JitCache::put_osr` are the retire sites
 

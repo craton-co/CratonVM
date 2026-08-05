@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! Regression test for
-//! `docs/known-issues/wildfly-jboss-modules-service-provider-leak.md`.
+//! `fixed-suite-bugs/wildfly/wildfly-jboss-modules-service-provider-leak.md`.
 //!
 //! Drives the exact call WildFly's boot code uses to discover a module's
 //! `Extension` implementations —
@@ -56,7 +56,15 @@ fn controller_jar(modules_root: &Path) -> Option<PathBuf> {
         })
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {

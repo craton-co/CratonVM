@@ -1,9 +1,27 @@
 # `TestDiskFull` livelock reproducer
 
 Harness used to root-cause the `org.h2.test.synth.TestDiskFull` hang
-(2026-08-01). See
-`docs/known-issues/h2/h2-testdiskfull-upstream-transaction-recovery-livelock.md`
-for what it proved.
+(2026-08-01), and to re-verify the verdict on 2026-08-02.
+
+**The verdict, so nobody re-derives it:** `TestDiskFull` wedging in the H2 suite
+is an **upstream H2 defect**, not a CratonVM one.
+`TransactionStore.endLeftoverTransactions()` calls `commit()` on a recovered
+`STATUS_COMMITTED` transaction, whose `commit()` then takes neither
+`store.commit(…)` nor `close()` because both are guarded by `wasActive`, which
+is false for exactly those transactions. The recovered transaction keeps its map
+entries locked for the life of the store, and a later write to one of those keys
+spins forever in `TransactionMap.set` — `Transaction.waitForThisToEnd` returns
+`true` immediately for a blocker parked in `STATUS_COMMITTED`, so `LOCK_TIMEOUT`
+never fires. It is reachable on stock HotSpot (28 unapplied-commit events in 150
+runs there); CratonVM walks into it far more often only because it issues ~3.5×
+more file write operations for the same logical work, which lands the injected
+failure at an earlier logical point where the leftover holds a `table.0` meta key
+that database reopen rewrites. Do **not** patch `apps/h2database` — the suite
+runs stock code. Full analysis, measurements and controls: the retired
+`h2-testdiskfull-upstream-transaction-recovery-livelock` write-up.
+
+Re-verified 2026-08-02 on `origin/dev@86a01abf90`: 8 of 10 runs livelock, same
+leftover keys (`table.0` 2/3/4) as on 2026-08-01.
 
 Nothing in the shared `apps/h2database` checkout is touched: a patched copy of
 three classes is compiled into a private directory that is **prepended** to the

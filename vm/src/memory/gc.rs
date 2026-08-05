@@ -124,6 +124,11 @@ pub fn unload_dead_class_metadata(
     cratonvm_native_builtins::classloader::forget_unloaded_class_mirrors(&dead_mirrors);
 
     {
+        // Second writer of the initiating-resolution memo; advance the
+        // resolution generation so the interpreter's resolved-field site cache
+        // treats its entries as stale (see
+        // `runtime::interpreter::constants`'s `RESOLUTION_EPOCH`).
+        crate::runtime::interpreter::bump_resolution_epoch();
         let mut cache = shared.classes.initiating_resolution_cache.write();
         cache.retain(|_, entries| {
             entries.retain(|_, id| !ids.contains(id));
@@ -136,7 +141,7 @@ pub fn unload_dead_class_metadata(
     // target not represented in its key.
     //
     // ARCH-2026-07-26 (request CR-LR-1 of
-    // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`): this used to
+    // `arch-2026-07-26/stackwalk-and-vtable.md`): this used to
     // call `invalidate_all()`, which takes THREE write locks — but two of them
     // guard `SharedResolutionState::global_methods` / `global_fields`, whose
     // only writers (`cache_method` / `cache_field`) have no production callers,
@@ -151,7 +156,7 @@ pub fn unload_dead_class_metadata(
     let mut jit_entries_retired = 0;
     {
         // PERF (ARCH-2026-07-26, request CR-VT-1 of
-        // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`).
+        // `arch-2026-07-26/stackwalk-and-vtable.md`).
         // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
         // EVERY vtable in the VM — so a per-class loop here costs
         // O(unloaded x all_classes x slots_per_class) under the manager write
@@ -655,7 +660,7 @@ pub fn update_all_roots(
     // this thread, the JIT analogue of the interpreter-frame remap above. Inert
     // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
     // it is the piece that lets a moving collector run while JIT frames are live
-    // (see docs/precise-jit-stack-maps-design.md, Stage 3).
+    // (see fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md, Stage 3).
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
 
     // Shadow-stack precise remap (CRATONVM_SHADOW_STACK) — the rewritable
@@ -1124,7 +1129,7 @@ pub fn update_all_roots(
     shared
         .threads
         .thread_registry
-        .fold_pointer_map_into_blocked(pointer_map);
+        .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs

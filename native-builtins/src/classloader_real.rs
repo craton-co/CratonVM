@@ -131,7 +131,7 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // below can trigger a moving GC; `this` (and, briefly, `cs`) are each
     // reused repeatedly across multiple such hazards, unpinned otherwise.
     // Same "Family 1" stale-ObjectRef pattern as the WildFly boot-crash
-    // fixes (see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md)
+    // fixes (see fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md)
     // -- pin both now and re-read the forwarded reference right before use.
     let this_pin = ctx.pin_native_root(this);
     // defaultDomain → ProtectionDomain(CodeSource(null URL, null certs),
@@ -457,19 +457,28 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         }
     });
 
-    // ClassLoader.getName() — read name field
+    // ClassLoader.getName() — read the real `name` field.
+    //
+    // `null` for an unnamed loader, NOT `""`. `ClassLoader.getName()` is
+    // specified as "the name of this class loader **or null if this class
+    // loader is not named**", and the three unnamed constructors
+    // (`ClassLoader()`, `ClassLoader(ClassLoader)`, and
+    // `ClassLoader(String,ClassLoader)` with a null name) all leave it null.
+    // This used to answer `""`, which is a different value from the one every
+    // caller's null check is written against — measured against HotSpot 25 by
+    // `probes/L1LoaderIdentityProbe` (`parented-getName` / `default-getName` /
+    // `nullparent-getName`), which is also the regression test for it.
+    // `getName()` on the app / platform loaders is unaffected: their real
+    // `name` field is populated by name in `get_or_create_app_loader` /
+    // `get_or_create_platform_loader`.
     r.register(cl, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let name = ctx.get_field_by_name(this, "name");
-        match name {
-            Value::Object(Some(_)) => Ok(Some(name)),
-            _ => {
-                let s = ctx.create_string("");
-                Ok(Some(Value::Object(Some(s))))
-            }
+        match ctx.get_field_by_name(this, "name") {
+            name @ Value::Object(Some(_)) => Ok(Some(name)),
+            _ => Ok(Some(Value::Object(None))),
         }
     });
 
@@ -1090,7 +1099,7 @@ fn stub_may_answer_load_class() -> bool {
 /// here and its body allocates heavily —
 /// `CRATONVM_DBG_STALE_OBJREF` caught a stale deref in a native invoked from
 /// `ClassLoaderServiceImpl.classForName`. See
-/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md.
+/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md.
 fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1323,7 +1332,7 @@ fn cl_real_load_class_base_rooted(
     // it was silently swallowed and step 1 re-resolved the excluded class
     // globally anyway — `@ConditionalOnClass` checks made through such a
     // loader then saw a class the exclusion was written to hide. See
-    // docs/known-issues/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md.
+    // fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md.
     let mut parent_user_defined_authoritative_miss = false;
     if let Some(parent) = parent {
         if crate::classloader::is_user_defined_loader(ctx, parent) {

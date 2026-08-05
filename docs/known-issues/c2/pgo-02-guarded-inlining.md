@@ -1,8 +1,8 @@
 # PGO-02 — speculative inlining needs a guard and a deopt path that can express it
 
 **Status:** not started. **Depends on:** `pgo-01` for static/special sites;
-independent of it for virtual sites. **Owns:** `jit/src/lib.rs` (the
-`plan_inline` region), `jit/src/pgo.rs`.
+independent of it for virtual sites. **Owns:** `../../../jit/src/lib.rs` (the
+`plan_inline` region), `../../../jit/src/pgo.rs`.
 
 ## Current state, verified
 
@@ -21,7 +21,7 @@ inlined frame chain.
 
 Deopt metadata must reconstruct the **full virtual frame chain**: each inlined
 frame with its own correct bci and its own correct method. The 2026-08-01 audit
-(`docs/jit/deopt-metadata-audit.md`) found and fixed six unchecked invariants
+(`../../jit/deopt-metadata-audit.md`) found and fixed six unchecked invariants
 in that metadata, three of them fail-open, including three scope-chain walkers
 that **silently truncated** and returned a well-formed answer about a stack
 that never existed — one of which told two compile-time admission gates that a

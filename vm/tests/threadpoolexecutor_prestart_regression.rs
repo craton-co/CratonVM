@@ -17,7 +17,15 @@ fn probe_source() -> PathBuf {
         .join("ThreadPoolExecutorPrestartProbe.java")
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let path = PathBuf::from(bin);
         if path.exists() {
@@ -56,6 +64,26 @@ fn compile_probe() -> Option<PathBuf> {
             return None;
         }
     };
+    // javac REJECTED THE ARGUMENTS, not the source: an unsupported `--release`
+    // means this javac is older than the level this probe compiles at, so it never
+    // opened the file. That is a missing-toolchain condition — the same one the
+    // `Err(e)` arm above skips for — not a broken probe. Reporting it as "fix the
+    // source" sends the next reader to edit a correct `.java` file.
+    //
+    // Narrowly keyed on javac's own wording for an unsupported release, so a
+    // genuine source error still reaches the assertion below and still fails loudly
+    // (see `probe_compile_guard.rs` for why that must never become a skip).
+    if !out.status.success() {
+        let stderr_probe = String::from_utf8_lossy(&out.stderr);
+        if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+            eprintln!(
+                "[threadpoolexecutor_prestart_regression] javac cannot target --release 21 ({}); skipping. Point \
+                 JAVA_HOME or CRATONVM_JAVA_HOME at a JDK 21+ install.",
+                stderr_probe.lines().next().unwrap_or("").trim()
+            );
+            return None;
+        }
+    }
     // javac RAN and rejected the fixture: skipping here would make this test a
     // permanent vacuous pass.
     assert!(
@@ -73,7 +101,14 @@ fn real_jdk_thread_pool_prestart_keeps_fresh_threads_startable() {
         eprintln!("[threadpoolexecutor_prestart] cratonvm binary unavailable; skipping");
         return;
     };
-    let probe_classes = compile_probe().expect("compile prestart probe");
+    // `compile_probe` returns `None` for the two toolchain conditions it skips
+    // on — javac absent, and a javac too old for the `--release` this probe
+    // compiles at. `.expect()` turned both into a panic that read like a
+    // compile failure.
+    let Some(probe_classes) = compile_probe() else {
+        eprintln!("[threadpoolexecutor_prestart] probe could not be compiled; skipping");
+        return;
+    };
 
     let mut child = Command::new(binary)
         .args([

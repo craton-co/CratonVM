@@ -30,6 +30,7 @@
 //! escalation gate is still honoured where present, but it is now a no-op for
 //! the swallow path because swallowing no longer happens by default.
 
+use std::sync::Arc;
 use crate::classloading::{find_field_recursive, Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
@@ -267,6 +268,52 @@ pub fn ensure_system_stdin_object(
 // ---------------------------------------------------------------------------
 // Free functions: class initialization
 // ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Nesting depth of `<clinit>` frames currently executing on this
+    /// (OS) thread, including nested/re-entrant `<clinit>` calls one
+    /// static initializer transitively triggers. See `in_clinit_shared`.
+    static CLINIT_NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while this thread is executing inside some class's `<clinit>`.
+///
+/// Reflective code paths (e.g. building `java.lang.reflect.Method`
+/// mirrors) must consult this before forcing an UNRELATED class's full
+/// initialization as a side effect of merely exposing its return/parameter
+/// type. JVMS §5.5 triggers initialization only via `new`/`getstatic`/
+/// `putstatic`/`invokestatic` on that exact class, never as a side effect
+/// of reflection over a *different*, currently-initializing class. Forcing
+/// it anyway lets the newly-initialized class observe the in-progress
+/// class's static fields at their pre-assignment default (usually `null`)
+/// instead of failing to resolve at all -- see
+/// `docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md`
+/// for the concrete repro (Netty's `Unpooled.<clinit>` -> `UnpooledByteBufAllocator`
+/// superclass init -> `ResourceLeakDetector.addExclusions` ->
+/// `Class.getDeclaredMethods()` on `AbstractByteBufAllocator`, whose declared
+/// `compositeBuffer()` return type `CompositeByteBuf` was being force-initialized
+/// mid-way through `Unpooled.<clinit>`, before `EMPTY_BUFFER` was assigned).
+pub fn in_clinit_shared() -> bool {
+    CLINIT_NESTING_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII depth counter paired with `in_clinit_shared`. Increment on
+/// `<clinit>` entry, decrement on every exit (including panics unwinding
+/// through the guarded scope).
+struct ClinitDepthGuard;
+
+impl ClinitDepthGuard {
+    fn enter() -> Self {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get() + 1));
+        ClinitDepthGuard
+    }
+}
+
+impl Drop for ClinitDepthGuard {
+    fn drop(&mut self) {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
 
 /// Ensure a class is fully initialized (JVM spec В§5.5).
 ///
@@ -806,6 +853,18 @@ fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassSta
     }
     if matches!(new_state, ClassState::Initialized) {
         super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
+        // Authoritative, monotonic "this class is initialized" event. The JIT's
+        // lock-free init memo used to be written ONLY by `jit_getstatic`, i.e.
+        // only after a compiled static read had already taken the slow path
+        // once. That is too late for the compiler, which must decide whether a
+        // `getstatic` may become a direct load (no helper, so no init check)
+        // BEFORE the method's first compiled execution. Marking it here makes
+        // the memo a general lock-free predicate with no extra bookkeeping:
+        // this is exactly the point at which `<clinit>` has completed
+        // successfully, which is the only condition the memo is allowed to
+        // record (a failed `<clinit>` finalizes as `InitializationError` and is
+        // deliberately not marked).
+        crate::jit::helpers::note_class_initialized(shared, class_id);
     }
     // Remove waiter and notify all blocked threads.
     let removed = shared.classes.class_init_waiters.lock().remove(&class_id);
@@ -1158,6 +1217,7 @@ fn initialize_class_shared(
     }
     if has_clinit {
         tracing::debug!(class = %class_name_for_jfr, "running <clinit>");
+        let _clinit_depth_guard = ClinitDepthGuard::enter();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::invoke_on_class_shared(shared, thread, class_id, "<clinit>", "()V", &[])
         }));
@@ -2143,6 +2203,19 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         (class.name.to_string(), info)
     };
 
+    // Compiled `getstatic` needs a lock-free answer to "is this the class whose
+    // statics the `System.out`/`err`/`in` bootstrap intercept services?" before
+    // it may emit a direct load. Preparation is the earliest point the name is
+    // known, and it always precedes initialization — which the inline path also
+    // requires — so the id is always recorded before any inline decision about
+    // this class can be taken. See `ClassRealm::system_class_id`.
+    if class_name == "java/lang/System" {
+        shared
+            .classes
+            .system_class_id
+            .store(class_id.as_u32(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     // Allocate static field slots with default values, then overlay any
     // resolved ConstantValue. String constants are allocated through the
     // VM's interning string pool so multiple classes that name the same
@@ -2216,6 +2289,39 @@ pub fn default_value_for_descriptor(descriptor: &str) -> Value {
         Some(b'L' | b'[') => Value::Object(None),
         _ => Value::Int(0),
     }
+}
+
+/// Default-value slots for a class's statics block, each typed by its static
+/// field's **descriptor** rather than left at a blanket `Value::Int(0)`.
+///
+/// A statics slot holding a well-formed `Value` of the wrong WIDTH is invisible
+/// from the interpreter (which widens an `Int` where a long is wanted) and
+/// fatal from JIT-compiled code, which lowers `getstatic …:J` to a 64-bit load
+/// at `FIELD_CELL_PAYLOAD64_OFFSET` and reads whatever sits beside an
+/// `Int`-tagged cell. That is the defect behind the Spring Boot loader/zip
+/// cluster, and `4972cd9c91` fixed it for exactly one writer
+/// (`post_clinit_fixup`) — the hazard itself is a property of the slot, not of
+/// that writer.
+///
+/// `StaticsBlock::new` fills every slot with `Value::Int(0)`, so a block NOT
+/// built by `prepare_class` — which does call [`default_value_for_descriptor`]
+/// per slot — starts out mistyped for every `J`/`D` static it holds.
+/// `set_static_shared` builds one that way whenever a static is written before
+/// its class is prepared. This is the shared helper that makes both paths
+/// agree.
+///
+/// `total_len` is the block length the caller wants: historically the class's
+/// TOTAL field count, while slot indices are the STATIC-field enumeration
+/// order. The tail past `static_descriptors` is slack and keeps the zero fill.
+pub fn typed_default_static_slots<S: AsRef<str>>(
+    static_descriptors: &[S],
+    total_len: usize,
+) -> Vec<Value> {
+    let mut slots = vec![Value::Int(0); total_len];
+    for (slot, descriptor) in slots.iter_mut().zip(static_descriptors.iter()) {
+        *slot = default_value_for_descriptor(descriptor.as_ref());
+    }
+    slots
 }
 
 /// Resolve a `ConstantValue` attribute index into a `Value`.
@@ -2346,6 +2452,37 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
 // Post-clinit fixup for swallowed <clinit> exceptions
 // ---------------------------------------------------------------------------
 
+/// Coerce a post-`<clinit>`-fixup value to the `Value` variant a field with
+/// `descriptor` must hold, or `None` when the injected value cannot represent
+/// that type at all.
+///
+/// The fixup call sites write plain integer literals; the field they land in
+/// is whatever the JDK currently declares. When the two disagree the slot ends
+/// up holding a well-formed `Value` of the WRONG width, which the interpreter
+/// silently tolerates (its `getstatic` widens an `Int` where a long is wanted)
+/// and JIT-compiled code does not (a `getstatic …:J` is a 64-bit load of the
+/// slot). See the call site for the `Unsafe.ARRAY_*_BASE_OFFSET` case that
+/// made `Arrays.equals(long[],long[])` return true for unequal arrays.
+fn coerce_static_to_descriptor(descriptor: &str, value: Value) -> Option<Value> {
+    let as_i64 = match value {
+        Value::Int(i) => Some(i as i64),
+        Value::Long(l) => Some(l),
+        _ => None,
+    };
+    match descriptor {
+        "J" => as_i64.map(Value::Long),
+        "I" | "S" | "B" | "C" | "Z" => as_i64.map(|v| Value::Int(v as i32)),
+        "F" => as_i64.map(|v| Value::Float(v as f32)),
+        "D" => as_i64.map(|v| Value::Double(v as f64)),
+        // Reference-typed field: only a reference may be written, and one is
+        // already the right shape (nothing to widen).
+        _ => match value {
+            Value::Object(_) => Some(value),
+            _ => None,
+        },
+    }
+}
+
 /// After swallowing a `<clinit>` failure, populate critical static fields
 /// that downstream code unconditionally dereferences. Without this, swallowed
 /// `<clinit>` failures leave static fields as null/0, causing NPEs in code
@@ -2365,6 +2502,41 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // were read back as default-zero by the interpreter, surfacing as the
     // "0 0 OK" output and the cascade NPE on signum during BigDecimal
     // <clinit>.
+    //
+    // EQUALLY CRITICAL, and the same class of defect one level down: the
+    // injected `Value`'s VARIANT must match the field's declared descriptor.
+    // Every caller below writes an integer literal, and `Unsafe`'s nine
+    // `ARRAY_*_BASE_OFFSET` fields are declared `J` (they became `long` in
+    // JDK 25; the sibling `ARRAY_*_INDEX_SCALE` are still `I`), so they were
+    // being handed a `Value::Int(16)`.
+    //
+    // The interpreter tolerated that — its `getstatic` reads the slot's
+    // `Value` and widens an `Int` where a long is wanted — so nothing failed
+    // for the first eighteen months. JIT-compiled code does not: a
+    // `getstatic …:J` lowers to a 64-bit load of the slot, which over an
+    // `Int`-tagged slot reads adjacent memory. Measured: compiled
+    // `jdk.internal.util.ArraysSupport.mismatch(int[],int[],int)` called
+    // `vectorizedMismatch(a, ARRAY_INT_BASE_OFFSET, …)` with an offset of
+    // 0x7ff700000000 instead of 16, the native's range check then failed, it
+    // returned -1 ("no mismatch"), and `Arrays.mismatch`/`Arrays.equals`
+    // reported two DIFFERENT int[]/long[] arrays as equal. See
+    // the internal record
+    // `fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+    //
+    // So coerce here rather than trusting ~30 call sites to keep tracking the
+    // JDK's field types: the descriptor is right there next to the name, and
+    // a fixup that writes the wrong width is worse than no fixup at all
+    // (a swallowed `<clinit>` at least leaves a well-typed zero).
+    //
+    // A second, independent symptom of the same slot, found in parallel on the
+    // Spring Boot loader shard: `java.util.zip.ZipUtils.get16` is
+    // `getShortUnaligned(b, off + ARRAY_BYTE_BASE_OFFSET)`, so compiled ZIP
+    // central-directory parses addressed 8 bytes before the array data and the
+    // extra-field walk silently found nothing —
+    // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` read the DOS
+    // fallback 1980-01-01 instead of the extended timestamp's 1970-01-01. It
+    // passes cold and fails once the method is hot, which is the tell. See
+    // `fixed-suite-bugs/springboot/spring-boot-loader-residual-20260723-FIXED.md`.
     let set_static_by_name = |field_name: &str, value: Value| {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
@@ -2372,8 +2544,20 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             for f in &cls.fields {
                 if f.is_static() {
                     if &*f.name == field_name {
+                        let descriptor = Arc::clone(&f.descriptor);
                         drop(cm);
-                        super::vm_object::set_static_shared(shared, class_id, static_idx, value);
+                        let Some(typed) = coerce_static_to_descriptor(&descriptor, value) else {
+                            // Refuse rather than write a mistyped slot, and say
+                            // so: the per-class `n/total` warnings below then
+                            // report a shortfall instead of a silent success.
+                            tracing::warn!(
+                                "Post-clinit fixup: refusing to write {class_name}.{field_name} \
+                                 — injected value {value:?} does not fit declared type \
+                                 `{descriptor}`"
+                            );
+                            return false;
+                        };
+                        super::vm_object::set_static_shared(shared, class_id, static_idx, typed);
                         return true;
                     }
                     static_idx += 1;
@@ -3738,7 +3922,7 @@ std::thread_local! {
     /// with the *primordial* thread's frames or none at all — and the two crash
     /// classes that most need a Java stack (virtual-thread resume heap
     /// corruption, STW-takeover deadlock) both fault on workers. See
-    /// `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §6.3.
+    /// `arch-2026-07-26/startup-and-diagnostics.md` §6.3.
     ///
     /// Thread-local rather than a shared registry, deliberately: the crash
     /// handler runs *on the faulting thread* (Rust panic hook, Windows vectored
@@ -4755,5 +4939,111 @@ mod tests {
         });
         assert!(a.join().unwrap().contains("\"A\""));
         assert!(b.join().unwrap().contains("\"B\""));
+    }
+}
+
+#[cfg(test)]
+mod post_clinit_fixup_typing_tests {
+    use super::coerce_static_to_descriptor;
+    use super::typed_default_static_slots;
+    use crate::types::Value;
+
+    /// The defect this guards: `Unsafe`'s nine `ARRAY_*_BASE_OFFSET` fields are
+    /// declared `J`, the fixup hands them an integer literal, and a slot
+    /// holding `Value::Int` where a `long` belongs reads back as garbage from
+    /// JIT-compiled code — `Arrays.equals(long[],long[])` answered `true` for
+    /// unequal arrays. Assert on the VARIANT, not just the numeric value: an
+    /// `assert_eq!(as_i64(...), 16)` passes just as happily on the broken one.
+    #[test]
+    fn a_long_field_gets_a_long_even_when_the_call_site_writes_an_int() {
+        assert!(matches!(
+            coerce_static_to_descriptor("J", Value::Int(16)),
+            Some(Value::Long(16))
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("J", Value::Long(16)),
+            Some(Value::Long(16))
+        ));
+    }
+
+    #[test]
+    fn the_narrow_integral_descriptors_stay_int() {
+        // `ARRAY_*_INDEX_SCALE` (I), `String.LATIN1`/`UTF16` (B),
+        // `UnsafeConstants.BIG_ENDIAN` (Z) all share this arm.
+        for d in ["I", "S", "B", "C", "Z"] {
+            assert!(
+                matches!(coerce_static_to_descriptor(d, Value::Int(4)), Some(Value::Int(4))),
+                "descriptor {d}"
+            );
+            // A long-typed literal narrows rather than being refused: the call
+            // sites are integer constants, not user input.
+            assert!(
+                matches!(coerce_static_to_descriptor(d, Value::Long(4)), Some(Value::Int(4))),
+                "descriptor {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn floating_descriptors_convert_and_references_pass_through() {
+        assert!(matches!(
+            coerce_static_to_descriptor("F", Value::Int(2)),
+            Some(Value::Float(f)) if f == 2.0
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("D", Value::Int(2)),
+            Some(Value::Double(d)) if d == 2.0
+        ));
+        assert!(matches!(
+            coerce_static_to_descriptor("Ljava/lang/Object;", Value::Object(None)),
+            Some(Value::Object(None))
+        ));
+    }
+
+    /// The whole point of [`typed_default_static_slots`]: a `J`/`D` slot must
+    /// NOT come back as `Value::Int(0)`.
+    ///
+    /// `StaticsBlock::new` zero-fills with `Int(0)`, which the interpreter
+    /// widens and JIT-compiled code reads as garbage — it takes the load width
+    /// from the descriptor and pulls 8 bytes over a 4-byte payload. Asserting
+    /// the WIDTH (the `Value` variant), not the numeric value, is what makes
+    /// this test able to fail: every arm below is zero either way.
+    #[test]
+    fn wide_static_slots_default_to_their_descriptor_width_not_int_zero() {
+        let descriptors = ["J", "I", "D", "F", "Ljava/lang/Object;", "[B", "Z"];
+        let slots = typed_default_static_slots(&descriptors, descriptors.len());
+        assert!(matches!(slots[0], Value::Long(0)), "J must be Long, got {:?}", slots[0]);
+        assert!(matches!(slots[1], Value::Int(0)));
+        assert!(matches!(slots[2], Value::Double(d) if d == 0.0), "D must be Double");
+        assert!(matches!(slots[3], Value::Float(f) if f == 0.0));
+        assert!(matches!(slots[4], Value::Object(None)));
+        assert!(matches!(slots[5], Value::Object(None)));
+        assert!(matches!(slots[6], Value::Int(0)));
+    }
+
+    /// The block is historically sized by the class's TOTAL field count while
+    /// slot indices are the STATIC-field enumeration order, so the tail is
+    /// slack. It must stay allocated (callers index into it) and must not run
+    /// off the end when there are fewer descriptors than slots.
+    #[test]
+    fn the_slack_tail_past_the_static_descriptors_is_kept_and_zeroed() {
+        let slots = typed_default_static_slots(&["J"], 4);
+        assert_eq!(slots.len(), 4);
+        assert!(matches!(slots[0], Value::Long(0)));
+        assert!(matches!(slots[3], Value::Int(0)));
+        // Fewer slots than descriptors must truncate, not panic.
+        assert_eq!(typed_default_static_slots(&["J", "D", "I"], 1).len(), 1);
+        assert!(typed_default_static_slots::<&str>(&[], 0).is_empty());
+    }
+
+    /// A mismatch the fixup cannot repair must be REFUSED, not written: a
+    /// mistyped slot is worse than the well-typed zero a swallowed `<clinit>`
+    /// leaves behind, and the caller turns `None` into a visible shortfall in
+    /// the `populated (n/18)` warning.
+    #[test]
+    fn an_impossible_coercion_is_refused() {
+        assert!(coerce_static_to_descriptor("Ljava/lang/String;", Value::Int(16)).is_none());
+        assert!(coerce_static_to_descriptor("[I", Value::Long(16)).is_none());
+        assert!(coerce_static_to_descriptor("J", Value::Object(None)).is_none());
     }
 }

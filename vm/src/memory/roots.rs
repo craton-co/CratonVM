@@ -189,7 +189,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             let added = roots.split_off(before);
             for o in added {
                 let addr = o.as_ptr() as usize;
-                if shared.mem.heap.is_object_address(addr).is_some() {
+                // `is_heap_addr`, matching the locals scan above and the other
+                // three copies of this filter — see `scan_frame_roots` in
+                // `runtime/interpreter/gc_and_alloc.rs`. The strict
+                // `is_object_address` probe used here until 2026-08-04 dropped
+                // genuine young / mid-init roots, and this is the INITIATOR's
+                // own scan: a root it drops has no second chance.
+                if shared.mem.heap.is_heap_addr(addr).is_some() {
                     roots.push(o);
                 }
             }

@@ -1,13 +1,13 @@
 # PGO-01 — the inlining policy has no per-call-site evidence to read
 
-**Status:** not started. **Owns:** `vm/src/runtime/interpreter/invoke.rs`,
-`vm/src/runtime/interpreter.rs`, `jit/src/profile.rs`.
+**Status:** not started. **Owns:** `../../../vm/src/runtime/interpreter/invoke.rs`,
+`../../../vm/src/runtime/interpreter.rs`, `../../../jit/src/profile.rs`.
 
 ## The finding this lane exists for
 
 `MethodProfile::record_call_site` and `record_call_site_borrowed`
-(`jit/src/profile.rs`, around lines 488 and 1135) have **zero callers anywhere
-in `vm/` or `jit/`**. Verified by grep, twice, in two different waves.
+(`../../../jit/src/profile.rs`, around lines 488 and 1135) have **zero callers anywhere
+in `../../../vm` or `../../../jit`**. Verified by grep, twice, in two different waves.
 
 Consequences, all of which are true right now:
 
@@ -17,7 +17,7 @@ Consequences, all of which are true right now:
   `invokespecial` at all**. The receiver-type profile covers virtual and
   interface sites; the static and special sites have nothing.
 
-So the inlining policy in `jit/src/lib.rs` — `plan_inline`,
+So the inlining policy in `../../../jit/src/lib.rs` — `plan_inline`,
 `classify_receiver_shape`, and every budget constant with a written rationale —
 is reading a data source that a real run never populates for a whole class of
 call sites. That policy is tested and correct; it is starved.

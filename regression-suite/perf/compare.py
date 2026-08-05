@@ -4,10 +4,10 @@
     compare.py <baseline-run-dir> <candidate-run-dir> [options]
 
 A run directory is what `run-cratonbench-gate.sh` writes under
-`regression-suite/perf/results/v1/<run-id>/`: `manifest.tsv`, `samples.tsv`,
+`regression-suite/perf/results/v2/<run-id>/`: `manifest.tsv`, `samples.tsv`,
 `summary.tsv`, their JSON twins, and the reliability-gate report.
 
-Two rules make this tool different from eyeballing two medians:
+Three rules make this tool different from eyeballing two medians:
 
 1. **It refuses to render a verdict when either side failed the reliability
    gate**, or was measured with the gate skipped, or has no gate report at
@@ -22,6 +22,13 @@ Two rules make this tool different from eyeballing two medians:
    comparison cannot see, and a p50 delta smaller than either side's
    coefficient of variation is reported as INDISTINGUISHABLE rather than as
    a win or a loss.
+
+3. **It says which phases are not evidence about the optimizing tier.** Since
+   schema 2 every run records how far into the C2/IR pipeline each phase got,
+   and a phase whose `ir_bodies` is 0 in both arms measured the single-pass
+   backend only. That is most of CratonBench (MEAS-02), and quoting one of
+   those deltas as a C2 result is the mistake this section exists to stop —
+   in both directions, "it got faster" and "it did no harm" alike.
 
 Everything is recomputed from the raw per-run samples, never read out of the
 summary: the summary is a convenience, `samples.tsv` is the record.
@@ -269,6 +276,17 @@ def compare_phase(
         "cand_peak_rss_kb": cand.max_of(phase, "peak_rss_kb"),
         "base_compiles_c2": base.max_of(phase, "compiles_c2"),
         "cand_compiles_c2": cand.max_of(phase, "compiles_c2"),
+        # MEAS-02. `compiles_c2` counts compiles whose requested TIER was C2 —
+        # including every one the optimizing pipeline declined and handed back
+        # to the single-pass backend — so it can be non-zero on a phase where
+        # the optimizing backend emitted nothing at all. `ir_bodies` is the
+        # count that cannot be read that way: it is incremented at the point
+        # the optimizing backend produces the body. `None` on a results
+        # directory written before schema 2, which is not the same as 0.
+        "base_ir_admitted": base.max_of(phase, "ir_admitted"),
+        "cand_ir_admitted": cand.max_of(phase, "ir_admitted"),
+        "base_ir_bodies": base.max_of(phase, "ir_bodies"),
+        "cand_ir_bodies": cand.max_of(phase, "ir_bodies"),
         "base_gc_p99_us": base.max_of(phase, "gc_young_p99_us"),
         "cand_gc_p99_us": cand.max_of(phase, "gc_young_p99_us"),
     }
@@ -317,7 +335,9 @@ def format_secondary(results: list[dict[str, object]]) -> str:
         parts = []
         for label, key_a, key_b, unit in (
             ("peak RSS", "base_peak_rss_kb", "cand_peak_rss_kb", "kB"),
-            ("C2 compiles", "base_compiles_c2", "cand_compiles_c2", ""),
+            ("C2-tier compiles", "base_compiles_c2", "cand_compiles_c2", ""),
+            ("C2 admitted", "base_ir_admitted", "cand_ir_admitted", ""),
+            ("C2 bodies", "base_ir_bodies", "cand_ir_bodies", ""),
             ("GC young p99", "base_gc_p99_us", "cand_gc_p99_us", "us"),
         ):
             a, b = r[key_a], r[key_b]
@@ -329,6 +349,44 @@ def format_secondary(results: list[dict[str, object]]) -> str:
     if not rows:
         return ""
     return "Secondary metrics (per-phase maxima across runs; '-' = the VM reported none):\n" + "\n".join(rows)
+
+
+def format_reach_caveat(results: list[dict[str, object]]) -> str:
+    """MEAS-02: name the phases whose delta says nothing about the C2 tier.
+
+    A CratonBench delta has repeatedly been quoted as evidence about the
+    optimizing tier on phases where that tier produced no code, because
+    nothing in the output said which phases those were. This says it.
+
+    Absent (schema < 2) is reported separately from a measured zero: "the run
+    did not record reach" and "the tier produced nothing" license completely
+    different follow-ups, and collapsing them is how the first one gets read
+    as the second.
+    """
+    unreached, unmeasured = [], []
+    for r in results:
+        if r["verdict"] == "NO-DATA":
+            continue
+        a, b = r["base_ir_bodies"], r["cand_ir_bodies"]
+        if a is None or b is None:
+            unmeasured.append(str(r["phase"]))
+        elif a == 0 and b == 0:
+            unreached.append(str(r["phase"]))
+    out = []
+    if unreached:
+        out.append(
+            "C2 reach (MEAS-02): the optimizing backend produced NO body in either arm for:\n"
+            f"  {', '.join(unreached)}\n"
+            "  Those deltas measure the single-pass backend. They are not evidence about the\n"
+            "  optimizing tier in either direction — including 'the C2 change did no harm'."
+        )
+    if unmeasured:
+        out.append(
+            "C2 reach (MEAS-02): NOT RECORDED for "
+            f"{', '.join(unmeasured)} — a pre-schema-2 results directory, or --no-vm-stats.\n"
+            "  Unrecorded is not zero. Re-measure before quoting any of it about C2."
+        )
+    return "\n\n".join(out)
 
 
 def main() -> int:
@@ -434,6 +492,10 @@ def main() -> int:
         if secondary:
             print()
             print(secondary)
+        caveat = format_reach_caveat(results)
+        if caveat:
+            print()
+            print(caveat)
 
     if refusals:
         return 3

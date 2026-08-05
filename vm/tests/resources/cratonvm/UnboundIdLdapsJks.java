@@ -7,7 +7,7 @@
 // the tests that read CRATONVM_TEST_CLASSES_DIR treat "no classes" as "skip".
 //
 // To run it by hand (regression coverage for
-// docs/internal/fixed-suite-bugs/ldap-sslsocketfactory-createsocket-inetaddress-abstractmethoderror-FIXED.md):
+// fixed-suite-bugs/ldap-sslsocketfactory-createsocket-inetaddress-abstractmethoderror-FIXED.md):
 //
 //   javac -cp unboundid-ldapsdk.jar -d <out> UnboundIdLdapsJks.java
 //   cratonvm -cp "<out>;unboundid-ldapsdk.jar" cratonvm.UnboundIdLdapsJks <path/to/test.jks>

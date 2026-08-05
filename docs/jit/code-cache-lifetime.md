@@ -54,6 +54,18 @@ withdrawn while the code that reads it is running.
 | `JitMICSlot::cached_entry_ptr` | `MOV R11,[slot+8]; CALL R11` | `JitMICSlot::compiled_owner` | `clear_compiled_entry` zeroes the entry (Release) **then** releases the owner through `defer_jit_owner` |
 | `JitPICSlot::entry_ptrs[i]` | 4-way inline cascade | `compiled_owners[i]` | `invalidate_targets` / `clear_entries`, same order |
 | `JitPICSlot::mega_entry_ptrs[i]` | `emit_hashed_vtable_stub`'s two-way probe | `mega_compiled_owners[i]` | same order; the emitted probe `TEST R11,R11` before calling, so a zeroed way degrades to the resolving helper |
+| `DispatchCache::entry` (`DISPATCH_CACHE`, `VIRTUAL_DISPATCH_CACHE`, `vm/src/jit/helpers.rs`) | `try_mic_rust_cached_entry` and both dispatch-helper arms, which read the raw address out of the map **without cloning the owner** | `DispatchCache::_owner: Option<RetainedCode>` | `HashMap::clear` in `flush_raw_entry_dispatch_caches` / `flush_class_identity_dispatch_memos`, plus replacement and thread exit — all via `RetainedCode::drop` |
+| `CachedInvokeTarget::Jit::compiled` (`JvmThread::invoke_cache`) | the interpreter's cached invokestatic/invokevirtual arms | itself, as a `RetainedCode` | `get`'s staleness auto-evict, `put` replacement, `evict`, `clear`, thread exit |
+
+The last two are the ones the `jit`-crate inventory above cannot see, and they
+are the ones that broke on 2026-08-03. They are worse than the inline-cache
+slots in one specific way: **a per-thread cache is evicted by the thread
+dispatching through it**, and both eviction paths run *from* the dispatch
+helper, i.e. from inside compiled code. So the eviction can run while a frame of
+the evicted body is on that same thread's stack. `RetainedCode` is what makes
+their release go through the retirement queue rather than through a bare `Arc`
+drop; see
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
 
 Every install into all three funnels through `jit_entry_publishable`, which
 refuses an address that is a live `jit_entry_owners` key with a dead `Weak`, or
@@ -158,9 +170,17 @@ the artifact to `defer_jit_owner`, which drops it immediately only when
 `ACTIVE_JIT_EXECUTIONS.is_zero()` and otherwise queues it until
 `jit_execution_leave` observes zero. The sites are: `JitCache::put` and
 `put_osr` (superseded body), `invalidate_matching` (both maps),
-`clear_all`, and the four inline-cache eviction paths
+`clear_all`, the four inline-cache eviction paths
 (`JitMICSlot::clear_compiled_entry`, `JitPICSlot::install`'s refresh and LFU
-arms, `clear_entries`, `invalidate_targets`).
+arms, `clear_entries`, `invalidate_targets`), and — since 2026-08-03 — every
+`cratonvm_jit::RetainedCode` drop, which is how the two `vm/`-side per-thread
+dispatch caches in §1.2 release their keep-alive.
+
+The queue is the backstop; the primary argument is ownership. A thread inside a
+compiled body always holds an owning `Arc<CompiledMethod>` for it, so a
+reference count reaching zero is itself a proof that no thread is inside.
+`published_code_free_audit().1` counts every release that reached the OS without
+the queue's authorisation and must be zero.
 
 `drain_deferred_jit_owners_if_quiescent` takes the queue lock **before**
 reading the quiescence counter and holds it across both. That ordering is the
@@ -201,12 +221,22 @@ pair across the artifact's drop. Reading the registry:
 
 **Added this pass:** `pin_jit_code_range_owner(addr) -> Option<Arc<CompiledMethod>>`
 — the same lookup with the keep-alive attached. `None` is the safe answer for
-"no live body covers this address"; the alternative was a raw address. It costs
-one `jit_entry_owners` mutex acquisition over the lock-free search, so it
-belongs on per-frame paths (a root scan naming one frame), not on the
-per-stack-word sweep, which wants `snapshot_code_ranges_into` and its
-zero-owner-pointer guarantee. **The vm-side call sites were not changed — see
-§6.**
+"no live body covers this address"; the alternative was a raw address.
+
+**2026-08-03.** The "closed only indirectly, by `defer_jit_owner`" residual
+above was not merely untidy — it was the bug. `try_call_compiled_entry_reentrant`
+(the JIT→JIT dispatch helper) dereferenced the bare `usize` and entered the
+callee holding no reference at all, on a `SAFETY` comment claiming the registry
+owned the artifact. That made JIT→JIT dispatch the one way into a compiled body
+that holds no owning reference to it, and it is the mechanism behind
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+
+It now pins. To make that affordable per dispatch, `JitCodeRange` carries a
+`Weak<CompiledMethod>` and `pin_jit_code_range_owner` upgrades it lock-free
+(one atomic increment); the `jit_entry_owners` mutex is now only the fallback
+for ranges registered without an owner. The per-stack-word sweep still wants
+`snapshot_code_ranges_into` and its zero-owner-pointer guarantee. **The
+remaining vm-side call sites — see §6.2.**
 
 ### 3.4 The name registry was leaking, and lying
 
@@ -382,11 +412,21 @@ and keep it alive until after `jit_cache.put_osr(..)`. No other change.
 Every caller of `cratonvm_jit::lookup_jit_code_range` that dereferences the
 returned `usize` as a `*const CompiledMethod` should call
 `cratonvm_jit::pin_jit_code_range_owner` instead and hold the returned `Arc`
-across the use. The known consumers are the precise-map frame walk
-(`remap_active_jit_frames`) and the cross-thread STW root scan
-(`vm/src/jit/xt_root_scan.rs`). Callers that only need "is this address in JIT
-code" should keep using `snapshot_code_ranges_into`, which hands out no owner
-pointer at all.
+across the use. Callers that only need "is this address in JIT code" should
+keep using `snapshot_code_ranges_into`, which hands out no owner pointer at
+all.
+
+**Done 2026-08-03:** `try_call_compiled_entry_reentrant` — the one that was not
+a root scan but an *entry into the body*, and therefore the one where the
+missing keep-alive was a use-after-free rather than a stale read. The pin is now
+lock-free, so the cost objection that kept this on the "should" list no longer
+applies to the rest.
+
+**Still open:** the precise-map frame walk (`remap_active_jit_frames`) and the
+cross-thread STW root scan (`vm/src/jit/xt_root_scan.rs`). Note that
+`xt_root_scan` must *not* take a lock while a peer is frozen (see the comment at
+its call site); the `Weak::upgrade` form is lock-free and therefore now
+admissible there, which it was not before.
 
 Do **not** change the per-stack-word conservative sweep: it is the one that
 caches a snapshot across a whole scan, and it already takes the safe form.
@@ -408,12 +448,15 @@ is the same `SharedVm::method_epochs` map `stamp_compilation_epoch` already
 uses, extended so `put` can consult it. Worth doing only once there is evidence
 of an in-flight compile surviving a CHA invalidation; nothing observed.
 
-### 6.5 Retire `docs/jit/code-cache-lifecycle.md` §"Reconciliation 1"
+### 6.5 ~~Retire `docs/jit/code-cache-lifecycle.md` §"Reconciliation 1"~~ — DONE 2026-08-03
 
 Its "`drain_deferred_jit_owners_if_quiescent` has the ordering backwards"
-finding is fixed; the lock is taken first and the argument is in the function's
+finding was fixed; the lock is taken first and the argument is in the function's
 comment. Leaving a fixed defect described as open is how a later session spends
-a day re-fixing it.
+a day re-fixing it. That section now says so, and its §3 — which asked for a
+non-zero `active_jit_executions_at_free` to be treated as the protocol
+violation — was corrected at the same time: that test is wrong in both
+directions (73 of 90 real violations in one measured run reported zero).
 
 ---
 

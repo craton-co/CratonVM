@@ -26,7 +26,7 @@
 //! explanations with nothing to separate them. `CRATONVM_DBG_CCE_BT` prints a
 //! rich dump there, but only if it was set BEFORE the run, which is never true
 //! of the run that actually reproduces. See
-//! `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+//! `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
 //!
 //! Both `checkcast` reporters had already drifted from each other (the
 //! interpreter's consults the young-sweep ring, the JIT's does not), which is
@@ -111,7 +111,9 @@ pub(crate) fn report_reclaimed_receiver(
     // unlike the young sweep ring this answers on the FIRST occurrence rather
     // than only on a re-run with the right flag pre-set — and it still answers
     // once the block has been handed out again under a concrete class.
-    if let Some((cid, kind, freed_site, seq)) = cratonvm_gc::gen_heap::old_freed_lookup(addr) {
+    if let Some((cid, kind, freed_site, seq, base, size, flags)) =
+        cratonvm_gc::gen_heap::old_freed_lookup_covering(addr)
+    {
         static F: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
             tracing::error!(
@@ -122,6 +124,12 @@ pub(crate) fn report_reclaimed_receiver(
                 target_class = %target,
                 original_class = %class_name_of(shared, cid),
                 original_kind = kind,
+                freed_block = format!("{base:#x}+{size:#x}"),
+                interior_off = addr - base,
+                was_weak_referent =
+                    flags & cratonvm_gc::gen_heap::OLD_FREED_FLAG_WATCHED != 0,
+                interior_root_pointed_in =
+                    flags & cratonvm_gc::gen_heap::OLD_FREED_FLAG_INTERIOR_ROOT != 0,
                 freed_by = if freed_site == 1 {
                     "in-place old-gen sweep"
                 } else {
@@ -130,13 +138,39 @@ pub(crate) fn report_reclaimed_receiver(
                 free_seq = seq,
                 "receiver is an OLD-GEN block this process RECLAIMED while it was still \
                  referenced. `original_class` is what the block held when it was freed; \
-                 `freed_by` names the mark phase with the gap.",
+                 `freed_by` names the mark phase with the gap. A non-zero `interior_off` \
+                 means the reference was into the block, not at its base.",
             );
         }
     }
-    // The young-sweep ring only records under `CRATONVM_DBG_SWEEP_ZERO`, which
-    // also switches the young collector to the sequential walk — so a hit here
-    // means the run was instrumented, and a miss says nothing either way.
+    // H2-CID0 (2026-08-02): the young-generation twin, and unlike
+    // `sweep_zero_lookup` below it is unconditional — so it answers on the
+    // first occurrence instead of only on a re-run that was armed in advance
+    // (and armed with a flag that changes which young collector runs).
+    if let Some((base, size, cycle, seq)) = cratonvm_gc::gen_heap::young_freed_lookup(addr) {
+        static Y: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if Y.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                obj = format!("{addr:#x}"),
+                site = site,
+                actual_class_id = actual_cid,
+                target_class = %target,
+                freed_span = format!("{base:#x}+{size:#x}"),
+                interior_off = addr - base,
+                sweep_cycle = cycle,
+                free_seq = seq,
+                "receiver is inside a YOUNG span the non-moving sweep zeroed and returned to \
+                 the free list. The span is coalesced, so `freed_span` bounds the victim \
+                 rather than naming it.",
+            );
+        }
+    }
+    // The per-object young-sweep ring only records under
+    // `CRATONVM_DBG_SWEEP_ZERO`, which also switches the young collector to the
+    // sequential walk — so a hit here means the run was instrumented, and a
+    // miss says nothing either way. It is still worth asking, because it names
+    // the victim's original CLASS, which the span ring above cannot.
     if zero_header {
         if let Some((cid, kind, cycle, reason, initiator, blocked)) =
             cratonvm_gc::gen_heap::sweep_zero_lookup(addr)

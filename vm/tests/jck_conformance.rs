@@ -12,7 +12,7 @@
 //! Net, Security, Reflect, Loading, ClassFile, Instructions, Jdbc). Produces a
 //! machine-checkable summary and a regression gate.
 //!
-//! The baseline report lives at `docs/jdk-regression-baseline.md`. Each category
+//! The baseline report lives at `gaps/jdk-regression-baseline.md`. Each category
 //! has a floor — CI fails if the pass count drops below the committed floor.
 //!
 //! Convention for the corpus:
@@ -681,14 +681,14 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
 }
 
 // ---------------------------------------------------------------------------
-// Baseline report (committed under docs/jdk-regression-baseline.md)
+// Baseline report (committed under gaps/jdk-regression-baseline.md)
 // ---------------------------------------------------------------------------
 
 /// Per-category pass floors. CI fails if the current pass count drops below
 /// any of these values. Raise the floor only after a deliberate improvement
 /// has landed AND the new number is reproducible on a clean build.
 ///
-/// These numbers must match `docs/jdk-regression-baseline.md`.
+/// These numbers must match `gaps/jdk-regression-baseline.md`.
 const BASELINE_FLOORS: &[(&str, u32)] = &[
     // Updated 2026-04-16 after T4.2-T4.6 corpus expansion.
     // Total corpus: 421 tests, 109 pass on first run.
@@ -780,7 +780,7 @@ fn jck_regression_gate() {
         failures.is_empty(),
         "NEW-16 regression gate tripped:\n  {}\n\n\
          The regression gate enforces the committed baseline in \
-         docs/jdk-regression-baseline.md. If a regression is intentional \
+         gaps/jdk-regression-baseline.md. If a regression is intentional \
          (e.g. a test was removed), update BASELINE_FLOORS and the baseline \
          doc together in the same commit.",
         failures.join("\n  ")

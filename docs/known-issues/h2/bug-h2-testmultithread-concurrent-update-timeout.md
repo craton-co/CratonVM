@@ -28,7 +28,7 @@ interesting part.
 
 ## The UPDATE path has a real contention component — the INSERT path did not
 
-`docs/internal/repros/h2-insert-scale-20260731/H2UpdateScaleProbe.java` models
+`repros/h2-insert-scale-20260731/H2UpdateScaleProbe.java` models
 `testConcurrentUpdate` exactly (same `NUMBER(18,0)` PK schema, same 10 000-row
 `MERGE` seed, same `UPDATE account SET balance=? WHERE id=?` + `commit` inner
 loop, same `LOCK_TIMEOUT=10000`) with thread and update counts as parameters.
@@ -133,7 +133,7 @@ Worth noting what a `CloneNotSupportedException` IS on this VM: `Object.clone()`
 throws it when the receiver's class is not `Cloneable`, and a receiver whose
 header has been zeroed resolves to `java.lang.Object`, which is not `Cloneable`.
 So this may be a third face of
-`bug-h2-blocked-frame-classid0-dispatch-miss.md` rather than a clone bug —
+`bug-h2-classid0-stale-address-family.md` rather than a clone bug —
 exactly the shape of the already-fixed
 `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
 Not established; `reclaim_guard` is **not** wired into the clone path, so the
@@ -192,7 +192,7 @@ javac -cp <h2>/target/classes -d probe H2UpdateScaleProbe.java
 
 ## Related
 
-* `bug-h2-blocked-frame-classid0-dispatch-miss.md` — a silent memory-safety
+* `bug-h2-classid0-stale-address-family.md` — a silent memory-safety
   defect found in this class. Split out; it is not the cause of the slowness.
 * `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmultithread-concurrent-insert-throughput-RESOLVED-20260801.md`
   — the insert half, with the flat-scaling measurement and the 1-thread profile.

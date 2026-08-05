@@ -13,12 +13,16 @@ Everything here lives in `jit/src/x64.rs` and `jit/src/x64/licm.rs`.
 | Piece | State |
 |---|---|
 | `plan_loop_unroll` as the native unroller's admission oracle | wired (unchanged) |
+| `plan_loop_peel` reachable from the planner | **wired** (the bypassable-header arm) |
+| `plan_loop_version` reachable from the planner | **wired** (all three arms) |
 | Compiling `xform.code` instead of `code` | **wired**, opt-in |
 | Replicating the pc-keyed side tables | **wired**, all 21, one expression |
 | Translating baked-in bcis via `bci_at` | **wired**, 4 sites |
 | `osr_pc_to_native` rebuilt in original-bci space | **wired** (`rebuild_pc_to_native`) |
 | `osr_dead_mask` rebuilt in original-bci space | **wired** |
-| Validated by anything larger than a unit test | **no** |
+| Translating `DeoptimizationPoint::bci` / `FrameState::bci` | **wired** (`build_and_record_deopt_point`) |
+| That translation checked before the artifact is published | **wired** (`rewritten_deopt_points_are_publishable`) |
+| Validated by anything larger than a unit test | **yes** — probes, benches, and three Spring Boot classes armed |
 
 ## How it is enabled
 
@@ -61,11 +65,50 @@ One, because a `LoopXform` describes one rewrite and the primitives in
 `detect_loops` order wins (innermost-first for a nest). Every other loop is
 shifted correctly by the rewriter and simply not duplicated.
 
-The profitability band is character-for-character the native unroller's,
-including its PGO arm and its "a PGO refusal does not fall back to the static
-heuristic" behaviour. So arming changes *which machinery* unrolls a loop, not
-*which loops* are eligible. Legality is `plan_loop_unroll`'s 17 refusals, as
-it already was for the native unroller.
+Three arms, in the order they are tried:
+
+1. **Peel**, for a loop whose header is *bypassable* — one an external branch
+   can enter. The planner used to skip such a loop outright, because every
+   speculating transform in this backend drops its pre-header when it sees one.
+   After peel(1) the steady-state copy is entered only by fall-through and its
+   own back edge, so the loop the emitter finds has a single entry and keeps its
+   hoists.
+2. **Unroll at the PGO factor**, when a profiled trip count is available.
+3. **Unroll at the static heuristic's factor.**
+
+The unroll band is character-for-character the native unroller's, including its
+PGO arm and its "a PGO refusal does not fall back to the static heuristic"
+behaviour. So arming changes *which machinery* unrolls a loop, not *which loops*
+are eligible. Legality is `plan_loop_unroll`'s structural refusals, as it
+already was for the native unroller.
+
+Every arm goes through `plan_versioned`, which asks
+`loop_analysis::analyze_counted_loop_at` + `CountedLoop::prove_trip_count_at_least`
+for a `trip >= copies + 1` witness and, when it gets one that
+`encode_preheader_guard` can emit, produces a **versioned** artifact: the
+transform behind a pre-header check, an untouched copy of the loop on the
+failing edge. `Static`, `Refused` and any versioning refusal fall back to the
+plain transform, which is byte-for-byte what this emitted before versioning
+existed — the guard is a profitability filter, not what makes peel or unroll
+legal.
+
+### Reachability
+
+Off by default: the opt-in is a thread-local nothing in the VM sets, plus the
+process-wide `CRATONVM_JIT=bytecode-loop-xform`.
+
+It used to be dead code *twice* over — arming was not enough, because the first
+whole-compile refusal (`DeoptRealEnabled`) fired on every compile,
+`crate::deopt_real_enabled()` being default-ON. `loop-02` retired that refusal
+along with `PreciseExceptionFrames` and `InvokedynamicPresent`, so arming is now
+sufficient and `CRATONVM_JIT=bytecode-loop-xform` alone reaches loops under the
+default configuration. On `core/spring-boot-autoconfigure` that is 95–98% of
+compiles eligible (it was 0%) and 10–58 methods per test class actually
+rewritten — see `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+
+`the_wired_compile_path_reaches_a_loop_under_the_default_configuration` pins it,
+by reading `crate::deopt_real_enabled()` rather than hard-coding it: the answer
+must not depend on that flag any more.
 
 `compile_with_param_slots` then
 
@@ -140,9 +183,12 @@ Plain data. `direct_calls` goes through the same primitive via a packed tuple
 because `JitDirectCall` (in `jit/src/lib.rs`) has no `Clone`; deriving it there
 would let this call `replicate_pc_keyed` directly.
 
-`loop_unroll_hints` is keyed by back-edge pc, and under `Unroll` an original
-back-edge bci has exactly one image (only the last copy carries the back edge),
-so the rebuilt map stays single-valued.
+`loop_unroll_hints` is keyed by back-edge pc. Under `Unroll` an original
+back-edge bci has exactly one image (only the last copy carries the back edge);
+under versioning it has two — the guarded loop's back edge and the fallback's —
+and the map stays well formed because those are two different keys. Its only
+consumer is the native byte-copy unroller, which is off whenever any of this
+runs.
 
 ### Replicated, payload is a READ-ONLY pointer — sound (3)
 
@@ -151,6 +197,19 @@ so the rebuilt map stays single-valued.
 
 Immutable, caller-owned, outlive the compile. Sharing one target across copies
 is indistinguishable from the single-copy case.
+
+### Not replicated at all: the versioning guard's bytes (0)
+
+A versioned rewrite inserts a pre-header check that is not a copy of anything.
+Its bytes carry the loop header's bci — provenance must stay total, or
+`Compiler::orig_bci` has nothing to answer with — but `outputs_for_bci` skips
+them, so no table entry is ever replicated onto them. Keying a field resolution
+or an inline cache to a synthetic `iload` would be silent, which is the same
+failure mode this whole census exists to prevent.
+
+That the guard *needs* no entry is a property of what it may contain:
+`encode_preheader_guard` emits only `iload`, an integer constant push and one
+`if_icmp*`. None of those consults any of the 21 tables.
 
 ### Replicated, payload is a MUTABLE pointer — sound, argued (2)
 
@@ -189,10 +248,18 @@ Both are still routed through `replicate_pc_keyed` so the census has no
 
 * `exception_ranges` (from `PENDING_EXCEPTION_RANGES`) — replaced wholesale by
   `xform.exception_ranges`, which the rewriter produced.
-* `protected_ranges` (from `PROTECTED_RANGES_REQUEST`) — **not** rewritten,
-  and it does not need to be: its only consumer, `Compiler::pc_is_protected`,
-  is read exclusively on the `precise_exception_frames` paths, which the
-  transform refuses.
+* `protected_ranges` (from `PROTECTED_RANGES_REQUEST`) — **not** rewritten.
+  `Compiler::pc_is_protected` translates its argument through
+  `Compiler::orig_bci` instead, which is the right shape for a table of SPANS
+  rather than of pc-keyed entries: every copy of a bytecode inside a `try` maps
+  back to the one bci the range covers.
+
+  This entry used to say the ranges did not need translating because their only
+  consumer is on the `precise_exception_frames` paths, which the transform
+  refused. That was wrong twice: there are three consumers, and the two in the
+  sibling-tail-call admission (`bytecode_walk.rs`) are not gated on
+  `precise_exception_frames` at all — so the census was already describing a
+  latent wrong answer, before `loop-02` made those paths reachable.
 
 ## Whole-compile refusals
 
@@ -204,46 +271,115 @@ bailing would abandon a method the backend can compile perfectly well.
 | Refusal | Why |
 |---|---|
 | `NotArmed` | the default |
-| `DeoptRealEnabled` | `CRATONVM_DEOPT_REAL`: precise snapshots record a resume bci from the emitter pc |
-| `PreciseExceptionFrames` | same, via `emit_post_invoke_exception_check` / `emit_precise_null_check_field_store` |
-| `InvokedynamicPresent` | see above; the one such path that is live in production |
 | `InlineSitesPresent` | inlined-callee bci space |
 | `NoCandidateLoop` | nothing passed the band + `bypassable_headers` |
 | `Planner(_)` | one of `plan_loop_unroll`'s 17 structural refusals |
 | `ProvenanceNotTotal` | unreachable; re-checked because `orig_bci` rests on it |
 
-There is one more, later and louder: if a transform is in effect and the
-compile nevertheless recorded a `deopt_points` entry, `compile_with_param_slots`
-**discards the method** (returns `None`) rather than publish an output PC as an
-interpreter resume point. The three refusals above make that vector provably
-empty; the check exists so a future emit path cannot silently break it.
+`DeoptRealEnabled`, `PreciseExceptionFrames` and `InvokedynamicPresent` were
+here too. All three named one thing — a path that hands the VM an emitter pc as
+a resume bci — and all three went when
+`build_and_record_deopt_point` started publishing `DeoptimizationPoint::bci`
+through `Compiler::orig_bci`.
+
+There is one more refusal, later and louder: if a transform is in effect,
+`compile_with_param_slots` puts every recorded deopt point through
+`rewritten_deopt_points_are_publishable` and **discards the method** (returns
+`None`) if the translation did not hold, if a point landed on the versioning
+guard's synthetic bytes, or if two copies of one bytecode disagree about a field
+a bci-keyed consumer takes on trust. This used to be "any deopt point at all
+discards the method", which was cheap while the vector was provably empty and is
+not an option now that it is the normal case.
+
+## What executing it found
+
+`CRATONVM_JIT='bytecode-loop-xform,deopt-real=0'` is the first configuration in
+which any of this runs. The first workload put through it —
+`bench/StringRegexOnly.java` — threw `NullPointerException` at `sb.append(i)`,
+deterministically, from n = 20,000 up.
+
+The bisect (`probes/LoopVersionOsrProbe.java` is the reproducer, and its comment
+is the argument) needed three things at once:
+
+* a **versioned** artifact — the same loop with an unprovable trip count gets an
+  unversioned unroll and was always correct;
+* entry through the **OSR** door — the same versioned artifact entered by
+  invocation count was correct;
+* a **second loop** in the method, so the OSR request lands on a header whose
+  compiled state matters.
+
+Cause: `LoopXform::osr_entry_pc` answered the loop header's OSR entry with the
+pre-header **guard**, on the reasoning that re-evaluating it there is exactly
+what a fall-through entry does. That is true of the bytecode and false of the
+machine code. An OSR entry is only valid at a pc whose compiled state the entry
+trampoline can reconstruct from the interpreter frame, and the emitter publishes
+that state at loop headers — the `[osr-meta] published_entries` list is exactly
+that set, and the guard's pc is not in it. The guard sits in the method's
+prologue, where a local can still live in a register the trampoline does not
+seed, so the loop ran with a null receiver.
+
+Fix: every bci in the region, header included, enters the fallback copy — which
+*is* a loop header. The cost is that an OSR-entered method runs the untouched
+loop rather than the transformed one; only entering costs that, not calling.
+
+This is the case for the flag existing. Every unit test passed throughout.
+
+## What IS validated
+
+* Both compile doors, on real Java: the invocation-count door and the OSR door,
+  each producing a versioned artifact whose answers match HotSpot's exactly
+  (`probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
+  `probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java`,
+  `bench/HashMapOnly.java`) — in all three configurations: default,
+  `bytecode-loop-xform`, and `bytecode-loop-xform,deopt-real=0`.
+* An application suite, armed and under the DEFAULT `deopt_real`:
+  `core/spring-boot-autoconfigure`'s `AutoConfigurationSorterTests`,
+  `ConditionalOnClassTests` and `ConditionalOnPropertyTests` — 61 tests, 0
+  failures, ~83 methods rewritten between them, three runs each, and zero
+  discards in all nine
+  (`loop_xform_deopt_bci_unpublishable = loop_xform_deopt_frames_diverge = 0`).
+* `cargo test -p cratonvm-jit --test '*'` with the rewriter armed and
+  `deopt_real` off: 196 tests, all passing, with the transform firing during the
+  run (confirmed with `CRATONVM_DBG=jit-gen`, not assumed — a vacuous pass here
+  would look identical).
+* `cargo test -p cratonvm-vm --lib` armed: no regression against the unarmed
+  run.
 
 ## What is NOT validated
 
-* No suite has run with the rewriter armed. No stress harness, no sanitizer,
-  no benchmark A/B. The unit tests in `x64.rs::loop_unroll_admission` are the
-  only evidence.
-* The end-to-end test compiles one helper-free integer loop and checks the
-  published OSR metadata is `orig_code_len + 1` long with `-1` across the
-  back-edge gap. It does **not** execute the compiled code.
-* Nothing has exercised a rewritten method through a real GC pause, a real
-  deopt, a real OSR entry, or a real exception.
+* No sanitizer or GC-stress configuration has run with the rewriter armed, and
+  neither has Tomcat or H2. The Spring Boot classes above are the only
+  multi-threaded, allocating workload it has seen.
+* No benchmark A/B. Wall-clock on the shared Azure host spreads far too wide to
+  read a transform this size, and the only honest meter there is callgrind.
+* Nothing has exercised a rewritten method through a real GC pause or a real
+  deopt. A real OSR entry is now covered, and that is where the one bug was.
 * Inline-cache sharing across copies is *argued*, not measured. If it is ever
   wrong, the symptom is a megamorphic slot where the native unroller would have
   had `k+1` monomorphic ones — slower, not incorrect.
-* The peel path (`plan_loop_peel`) is not reachable from here. Only
-  `plan_loop_unroll` is wired; the `rebuild_pc_to_native` /
-  `osr_dead_mask` code paths handle peel correctly by construction
-  (`osr_entry_pc` answers the steady-state copy for both kinds) but no peel
-  has ever been compiled.
+* No peel and no versioned method has been compiled by the VM, because no
+  compile reaches the planner (see "Reachability"). Both are compiled by tests
+  — `a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy`
+  puts the planner's rewritten bytes through the real emitter and checks the
+  published OSR metadata — but that is a unit test, not a workload.
+* Versioning's *profitability* claim is unmeasured and unmeasurable today: it
+  trades one body of code for not entering a duplicated body when the loop may
+  not run. Nothing has A/B'd it because nothing runs it.
 
-## Follow-ups this change deliberately did not take
+## Follow-ups
 
 1. `#[derive(Clone)]` on `JitDirectCall` in `jit/src/lib.rs`, which would
    delete the packed-tuple detour.
-2. Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`,
-   which would retire `DeoptRealEnabled`, `PreciseExceptionFrames` and
-   `InvokedynamicPresent` in one move. That is the largest remaining piece.
-3. `loop-transform-wiring.md` still describes the pre-wiring state and lists
-   `OopMapEntry::bytecode_pc` as needing translation. It should be superseded
-   by this file.
+2. ~~Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`~~
+   — done, and it retired `DeoptRealEnabled`, `PreciseExceptionFrames` and
+   `InvokedynamicPresent` together, as predicted. What it did NOT predict:
+   `pc_is_protected` was already asking its question in the wrong space, the
+   versioning guard's bytes had to stop being OSR-eligible, and the copies of
+   one bytecode legitimately disagree about a slot's oop-ness. See
+   `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+3. ~~`loop-transform-wiring.md` still describes the pre-wiring state~~ — it now
+   carries a superseded banner pointing here.
+4. Versioning emits ONE guard. A transform needing a guard *set* (every
+   `VecPlan::guards` entry, say) needs `plan_loop_version` to take a slice and
+   chain the failing edges to one fallback label. The refusal
+   `GuardNotEncodable` on `StrideInRange` is the case that wants it first.

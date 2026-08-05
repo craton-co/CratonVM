@@ -621,6 +621,9 @@ pub(crate) struct MockNativeContext {
     /// to simulate a class with a specific declared field list for
     /// `ObjectStreamClass` / reflection-driven code.
     pub(crate) declared_fields_override: UnsafeCell<HashMap<u32, Vec<FieldMetadata>>>,
+    /// Next id handed out by `allocate_loader_id`. Starts at
+    /// `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` like the real VM's counter.
+    pub(crate) next_loader_id: u32,
     /// Per-class overrides for `inner_classes` (the `InnerClasses` attribute
     /// entries, as `(inner_class_name, outer_class_name, inner_name,
     /// access_flags)`). Empty vec by default (mock has no class metadata);
@@ -798,6 +801,7 @@ impl MockNativeContext {
             blocking_begin_count: 0,
             blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
+            next_loader_id: cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED,
             inner_classes_override: UnsafeCell::new(HashMap::new()),
             declared_methods_override: UnsafeCell::new(HashMap::new()),
             superclass_override: UnsafeCell::new(HashMap::new()),
@@ -1062,6 +1066,27 @@ impl MockNativeContext {
     pub(crate) fn registered_native_threads(&self) -> Vec<(String, bool, bool)> {
         // SAFETY: single-threaded test code.
         unsafe { (*self.registered_native_threads.get()).clone() }
+    }
+
+    /// Slot of `field_name` among the instance fields a test declared for
+    /// `obj`'s class via `set_declared_fields`. This is the one source of
+    /// field-name → slot mapping in the mock that a test controls; the
+    /// `mock_*_field_slot` tables below it are fixed, per-class special cases.
+    ///
+    /// Consulted FIRST by `get_field_by_name` / `set_field_by_name`, so a test
+    /// that declares a class's real layout gets by-name access consistent with
+    /// it. Without this, a test that models the real `java.lang.ClassLoader`
+    /// layout would still have `set_field_by_name(loader, "parent", …)`
+    /// silently do nothing (there is no `parent` entry in any table), which
+    /// reads exactly like the production code failing to write it.
+    fn declared_field_slot(&self, obj: ObjectRef, field_name: &str) -> Option<usize> {
+        // SAFETY: single-threaded test code.
+        let overrides = unsafe { &*self.declared_fields_override.get() };
+        overrides
+            .get(&self.class_id_of_object(obj).as_u32())?
+            .iter()
+            .find(|f| !f.is_static && f.name == field_name)
+            .map(|f| f.slot_index)
     }
 
     /// WP0.2: push declared field metadata for `class_id`.  Overrides
@@ -1619,7 +1644,18 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
     }
 
     fn allocate_loader_id(&mut self) -> u32 {
-        0
+        // The real implementation (`vm_exec::allocate_loader_id`) hands out a
+        // monotonic counter starting at
+        // `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` — 0/1/2 are reserved for
+        // Bootstrap/Extension/Application and are never a user-loader id.
+        // This used to return a constant `0`, which is the ONE value every
+        // caller in `classloader.rs` reads as "no namespace assigned", so any
+        // test exercising an id-assigning path silently measured the
+        // unassigned case. Mirror the real counter instead; it is per-mock,
+        // so tests stay independent of each other.
+        let id = self.next_loader_id;
+        self.next_loader_id += 1;
+        id
     }
 
     fn method_parameter_annotations(
@@ -1797,7 +1833,8 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
+            self.declared_field_slot(obj, field_name)
+                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
@@ -1820,7 +1857,8 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
+            self.declared_field_slot(obj, field_name)
+                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
@@ -1848,6 +1886,21 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         class_id: ClassId,
         field_name: &str,
     ) -> Option<usize> {
+        // Fields a test declared via `set_declared_fields` resolve here too.
+        // The real implementation (`resolve_field_index_in_hierarchy`) walks
+        // the class hierarchy over exactly this metadata. Without it a
+        // predicate of the form "does this class declare <a field only the
+        // REAL JDK class has>" is unfalsifiable under the mock — it could
+        // only ever answer `None`, and a test of it would pass vacuously.
+        // `classloader::cl_has_synthetic_layout` is such a predicate.
+        if let Some(slot) = self
+            .declared_fields(class_id)
+            .iter()
+            .find(|f| !f.is_static && f.name == field_name)
+            .map(|f| f.slot_index)
+        {
+            return Some(slot);
+        }
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
     }
 

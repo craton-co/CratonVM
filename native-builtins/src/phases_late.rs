@@ -1217,16 +1217,33 @@ fn native_quarkus_logging_handle_failed_start(
 // ---------------------------------------------------------------------------
 // ProcessBuilder / Process — actual process execution via std::process
 // ProcessBuilder = 4-field synthetic (command=0, directory=1, env=2, redirect=3)
-// Process = 4-field synthetic (exit_code=0, stdout=1, stderr=2, pid=3)
+// Process = 4-field synthetic (exit_code, stdout, stderr, pid) laid out AFTER
+// the six slots java.lang.Process declares for itself — see
+// JAVA_PROCESS_FIELD_COUNT below.
 // ---------------------------------------------------------------------------
 const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
 const PB_FIELD_ENVIRONMENT: usize = 2;
 
-const PROC_FIELD_EXIT: usize = 0;
-const PROC_FIELD_STDOUT: usize = 1;
-const PROC_FIELD_STDERR: usize = 2;
-const PROC_FIELD_PID: usize = 3;
+/// Leading slots reserved for `java.lang.Process`'s own six instance fields
+/// (`outputWriter`, `outputCharset`, `inputReader`, `inputCharset`,
+/// `errorReader`, `errorCharset`). Real `java.lang.Process` bytecode — the
+/// final concrete `inputReader()`/`errorReader()`/`outputWriter()` — resolves
+/// those to absolute slots 0..=5 on whatever receiver it is handed, so a
+/// synthetic Process that puts its own state there makes that bytecode read
+/// an int fd as a `BufferedReader`. Must stay identical to `native-io`'s
+/// `process::JAVA_PROCESS_FIELD_COUNT`: `native-io`'s `legacy_captured_stream`
+/// reads THIS layout's stdout/stderr string slots through its own
+/// `PROC_FIELD_STDIN_FD`/`PROC_FIELD_STDOUT_FD` constants, an alias that only
+/// holds while both layouts start at the same offset.
+const JAVA_PROCESS_FIELD_COUNT: usize = 6;
+
+const PROC_FIELD_EXIT: usize = JAVA_PROCESS_FIELD_COUNT;
+const PROC_FIELD_STDOUT: usize = JAVA_PROCESS_FIELD_COUNT + 1;
+const PROC_FIELD_STDERR: usize = JAVA_PROCESS_FIELD_COUNT + 2;
+const PROC_FIELD_PID: usize = JAVA_PROCESS_FIELD_COUNT + 3;
+/// Total slots on this (legacy) synthetic Process.
+const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 4;
 
 /// Walk a `java.util.Map`'s entries via its own `entrySet()`/`iterator()`/
 /// `Map.Entry` protocol (virtual dispatch on the receiver's real class, not a
@@ -1518,7 +1535,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 let child_pid = child.id();
                 match child.wait_with_output() {
                     Ok(output) => {
-                        let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 4);
+                        let process =
+                            alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT);
                         // Pin across the create_strings below — a moving young GC there
                         // would relocate the fresh Process (native stale-local family).
                         let process_pin = ctx.pin_native_root(process);
@@ -1850,7 +1868,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
 
     // Process.toHandle() (JDK 9+) — was entirely unregistered on this
     // synthetic receiver class, causing NoSuchMethodError on any
-    // CratonVM-backed Process (docs/known-issues/wildfly-process-tohandle-missing.md).
+    // CratonVM-backed Process (fixed-suite-bugs/wildfly/wildfly-process-tohandle-missing-FIXED.md).
     r.register(
         synthetic_proc,
         "toHandle",
@@ -2988,7 +3006,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
 /// `FileHandler`'s own real fields) -- a raw slot 0/1/2 convention here
 /// silently corrupts `Handler.manager`/`filter`/`formatter` instead of
 /// storing our own bookkeeping. See
-/// docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+/// fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
 ///
 /// Split out into its own `pub` function (rather than staying inline in
 /// `register_p61_logging`) because `register_p61_logging` is called only
@@ -3022,7 +3040,7 @@ pub fn register_p61_file_handler(r: &mut NativeMethodRegistry) {
     // real fields) -- a raw slot 0/1/2 convention here silently corrupts
     // `Handler.manager`/`filter`/`formatter` instead of storing our own
     // bookkeeping. See
-    // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+    // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
     let fh = "java/util/logging/FileHandler";
     // Real `java.util.logging.FileHandler()` is entirely config-driven (no
     // args): Spring Boot's `logging-file.properties` lists it in `handlers=`
@@ -3338,17 +3356,19 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     // classloader.rs's four `ClassLoader` initialisers seed
     // `CL_IS_PARALLEL_CAPABLE = 1`, and its reader falls back to `1` for a
     // loader allocated without that slot. So stop answering a constant here
-    // and read the same per-loader slot the winner reads, with the same
+    // and read the same per-loader state the winner reads, with the same
     // fallback — the two now agree whatever the registration order.
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Slot 4 == `classloader.rs::CL_IS_PARALLEL_CAPABLE` (private there).
-        let val = match ctx.get_field(this, 4) {
-            Value::Int(v) => v,
-            // Loader too short to carry the slot: same `true` that
+        // L1: this was a raw `get_field(this, 4)`. On a real JDK image slot 4
+        // is `java.lang.ClassLoader.parallelLockMap` — a `ConcurrentHashMap`
+        // reference, not our flag — so the raw read hit its own fallback by
+        // accident there. Go through the accessor the winning registration
+        // uses: side table first, raw slot only on our synthetic layout.
+        let val = crate::classloader::loader_parallel_capable_of(ctx, this)
+            // Loader this VM never recorded: same `true` that
             // `registerAsParallelCapable()` reports, rather than contradicting it.
-            _ => 1,
-        };
+            .unwrap_or(1);
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
@@ -4891,8 +4911,8 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     // Groovy's `ClassInfo.getClassInfo(Class)` (backed by
     // `GroovyClassValueJava7 extends ClassValue`) always got back `null`,
     // producing a `ReflectionCache.getCachedClass` NPE during
-    // `GroovySystem.<clinit>` (see docs/known-issues/springboot/
-    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md,
+    // `GroovySystem.<clinit>` (see fixed-suite-bugs/springboot/
+    // core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md,
     // Cluster C "Residual 5"). Dispatching to `computeValue` WITHOUT caching
     // was tried and reverted at the time (see the BUG-W doc's "Update") because
     // it didn't fix that doc's own MethodHandle-intrinsics target — but a
@@ -5072,7 +5092,7 @@ pub fn forget_vm_classvalue_cache(vm_identity: usize) {
 /// Generational backend's `metadata_pin` consumer runs only inside the
 /// old-gen BFS, so a young value deferred to `metadata_pin` with no other
 /// GC root is silently reclaimed. See `gc/src/vm_heap.rs`'s doc for the full
-/// writeup and `docs/known-issues/spb1-springframework-util-investigation.md`
+/// writeup and `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`
 /// for the observed corruption shape this pattern produced elsewhere.
 pub fn gc_scan_classvalue_cache_roots(
     vm_identity: usize,

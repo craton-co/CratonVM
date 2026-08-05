@@ -1027,7 +1027,7 @@ fn cache_get_configuration_property_names(
     // `Value::Int(0)` for an unwritten reference slot, which fails that match
     // and so reports the field as non-null. `ref_field_is_null` reads by
     // resolved index and covers null, unwritten and absent alike.
-    // See `docs/known-issues/c2/by-name-field-reads.md`.
+    // See `docs/feature-designs/by-name-field-reads.md`.
     let data_is_null = match this {
         Some(t) => crate::field_read::ref_field_is_null(ctx, t, "data"),
         None => true,
@@ -2761,7 +2761,7 @@ fn try_build_method_injection(
         // A `@Lookup` method may legally be package-private, and a
         // fork-loaded configuration class is not app-loaded, so hardcoding
         // the application loader here was the same latent defect documented in
-        // `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`.
+        // `configproxy-cglib-loaderid-fixed-20260727.md`.
         // No-op for the common app-loaded case (id 2 decodes to `Application`).
         let super_loader_id = ctx.loader_id_of_class(super_cid).max(0) as u32;
         if ctx

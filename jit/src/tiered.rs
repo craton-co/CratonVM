@@ -51,7 +51,7 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
 /// (constructed very early during VM init, well before any method can reach
 /// a compile threshold). Backs the `elapsed_ms` field of the
 /// `CRATONVM_DBG_TIER_ENQUEUE` diagnostic below -- see
-/// `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` for why
+/// `fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md` for why
 /// "how far into the process's life did this compile trigger" was the key
 /// diagnostic needed to confirm the compile-time-tax mechanism.
 fn process_start() -> &'static std::time::Instant {
@@ -1070,11 +1070,84 @@ struct MethodPromotionSnapshot {
 /// characterize whether a slow run is dominated by code that genuinely never
 /// gets hot enough to promote past the interpreter (as opposed to a stuck
 /// lock, a cache-thrashing hot path, or some other fixable inefficiency) —
-/// see `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+/// see `fixed-suite-bugs/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput-FIXED.md`.
 /// No-op if no [`TieredCompilationManager`] was ever constructed this process
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
 pub fn dump_method_stats_to_stderr() {
+    // The admission gate and the OSR metadata checks, first and unconditional.
+    //
+    // Every number here was previously computed and stored by a `pub fn` with
+    // **no caller anywhere in the tree** — `jit_bail_shortcircuits`,
+    // `jit_code_cache_cap_refusals`, `osr_contract_violations`,
+    // `stale_install_epoch_refusals`. Each one's own doc says it is "expected
+    // to stay zero" and that a diagnostic nobody enables is how a compiler bug
+    // stays unnoticed; none of them could be enabled at all. Printed before the
+    // `DIAG_CORE` early return so a run with no tiered manager still reports
+    // them.
+    //
+    // How to read the three groups:
+    //
+    //   * `admitted`/`refused` per door — a door whose `admitted` is 0 on a
+    //     workload that clearly used it is not calling the gate.
+    //   * `ungated-backend-entries` — MUST be 0. Non-zero means some path
+    //     reached `x64::compile_with_param_slots` without an admission, which
+    //     is the drift `compile_gate` exists to prevent.
+    //   * `osr-contract-violations` / `osr-coordinate-mismatches` — both MUST
+    //     be 0. Non-zero means an artifact's OSR metadata contradicted itself
+    //     and was dropped, so the method silently lost OSR service.
+    {
+        use crate::compile_gate::{admissions, refusals, ungated_backend_entries, CompileDoor};
+        let doors: Vec<String> = CompileDoor::ALL
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}: admitted={} refused={}",
+                    d.label(),
+                    admissions(*d),
+                    refusals(*d)
+                )
+            })
+            .collect();
+        eprintln!(
+            "[cratonvm] JIT admission gate: {} | ungated-backend-entries={} \
+             | bail-list-shortcircuits={} code-cache-cap-refusals={} \
+             | osr-contract-violations={} osr-coordinate-mismatches={} \
+             stale-install-epoch-refusals={}",
+            doors.join(" | "),
+            ungated_backend_entries(),
+            crate::jit_bail_shortcircuits(),
+            crate::jit_code_cache_cap_refusals(),
+            crate::osr_contract::osr_contract_violations(),
+            crate::osr_coords::osr_coordinate_mismatches(),
+            crate::stale_install_epoch_refusals(),
+        );
+        // The OSR lifecycle, on the same line's heels and for the same reason:
+        // the counters were ungated by the `osr-02` lane precisely because "a
+        // silent OSR exit is indistinguishable from never having entered", and
+        // then nothing printed them. This is also the only thing that makes
+        // OVER-refusal visible — a new entry-time refusal that quietly costs a
+        // workload its OSR shows up here as `osr_entered` collapsing while
+        // `osr_refused_entry` rises, and nowhere else. Read `osr_exited`
+        // against `osr_entered`, never alone.
+        //
+        // The four `osr_exit_*` rows partition the exits that arrived carrying
+        // a reconstructed frame, and two of them — `osr_exit_map_missing` and
+        // `osr_exit_bci_unrecorded` — are cross-checks between metadata one
+        // function writes, not classifications, so they MUST read zero.
+        // `regression-suite/perf/osr-exit-differential.sh` parses this line and
+        // fails its run on either of those, or on a forced-exit arm that took
+        // no entry — without which that whole harness would be a test of the
+        // interpreter.
+        eprintln!(
+            "[cratonvm] OSR lifecycle: {}",
+            crate::metrics::osr_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };
@@ -1087,7 +1160,10 @@ pub fn dump_method_stats_to_stderr() {
     // whereas one with a non-zero `tier_fail_count` is a compiler failure.
     // Reporting both as `tier_fail_count=3` is what made an earlier
     // "1531 of 1642 hot methods never compile" reading unactionable.
-    let mut hot_but_stuck: Vec<(u64, bool, u32, bool, String)> = Vec::new();
+    // (invocations, queued, tier_fail_count, ineligible, display name, the
+    // refusal site the compiler recorded for it — see
+    // crate::jit_bail_reason_for).
+    let mut hot_but_stuck: Vec<(u64, bool, u32, bool, String, String)> = Vec::new();
     let mut ineligible_by_policy: u64 = 0;
     {
         let methods = core.methods.lock();
@@ -1115,6 +1191,12 @@ pub fn dump_method_stats_to_stderr() {
                                 state.method_key.method_name,
                                 state.method_key.descriptor
                             ),
+                            crate::jit_bail_reason_for(
+                                &state.method_key.class_name,
+                                &state.method_key.method_name,
+                                &state.method_key.descriptor,
+                            )
+                            .unwrap_or_else(|| "unrecorded".to_string()),
                         ));
                     }
                 }
@@ -1148,7 +1230,7 @@ pub fn dump_method_stats_to_stderr() {
         ineligible_by_policy,
         hot_but_stuck
             .iter()
-            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .count(),
     );
     if !hot_but_stuck.is_empty() {
@@ -1157,7 +1239,7 @@ pub fn dump_method_stats_to_stderr() {
             "[cratonvm] JIT method stats: top {} hot-but-stuck methods (invocations, queued, tier_fail_count, why, name):",
             hot_but_stuck.len().min(30)
         );
-        for (count, queued, fail, inelig, name) in hot_but_stuck.iter().take(30) {
+        for (count, queued, fail, inelig, name, reason) in hot_but_stuck.iter().take(30) {
             let why = if *inelig {
                 "ineligible-by-policy"
             } else if *fail > 0 {
@@ -1166,28 +1248,36 @@ pub fn dump_method_stats_to_stderr() {
                 "not-yet-attempted"
             };
             eprintln!(
-                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {why:<20} {name}"
+                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {why:<20} {name} reason={reason}"
             );
         }
-        // The compile failures are the only actionable entries here — a
-        // policy decline is stuck by design — but they are usually a tiny
-        // minority and get buried under the policy ones when the list is
-        // ranked by invocation count (measured on the Hibernate concurrency
-        // workload: 1513 policy declines vs 6 real failures, none of which
-        // appeared in the top 30). List them separately so the actionable set
-        // is never hidden by the expected one.
+        // The compile failures are the entries worth looking at — a policy
+        // decline is stuck by design — but they are usually a tiny minority
+        // and get buried under the policy ones when the list is ranked by
+        // invocation count (measured on the Hibernate concurrency workload:
+        // 1513 policy declines vs 6 real failures, none of which appeared in
+        // the top 30). List them separately so the actionable set is never
+        // hidden by the expected one.
+        //
+        // This list used to be headed "these are bugs". That over-claimed:
+        // `ineligible` covers only the tier manager's OWN declines, so a
+        // deliberate correctness gate INSIDE the compiler (an RBC.6 handler
+        // that reads a local the exceptional-frame handoff cannot restore, say)
+        // lands here looking like a defect. `reason=` is what tells the two
+        // apart, so print it and let the reader classify.
         let failures: Vec<_> = hot_but_stuck
             .iter()
-            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .collect();
         if !failures.is_empty() {
             eprintln!(
-                "[cratonvm] JIT method stats: {} hot method(s) whose COMPILE FAILED (not policy — these are bugs):",
+                "[cratonvm] JIT method stats: {} hot method(s) whose COMPILE FAILED \
+                 (the compiler was asked and refused; `reason=` names the refusing site):",
                 failures.len()
             );
-            for (count, queued, fail, _, name) in failures.iter().take(30) {
+            for (count, queued, fail, _, name, reason) in failures.iter().take(30) {
                 eprintln!(
-                    "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}"
+                    "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name} reason={reason}"
                 );
             }
         }
@@ -5331,6 +5421,48 @@ mod tests {
 
     // ── Background worker drains an enqueued task off-thread ──────────────
 
+    /// How long a test waits for the background compile thread to reach a
+    /// rendezvous before giving up.
+    ///
+    /// A **liveness** bound, not a latency assertion. None of these tests
+    /// claims anything about how fast a compile is; the budget exists so a
+    /// worker that never runs fails the suite instead of hanging it.
+    ///
+    /// Worth knowing what it is NOT for. All four worker tests below failed on
+    /// this timeout about 1 run in 13 at `--test-threads=32`, which looks
+    /// exactly like an oversubscribed box starving a spawned thread — each test
+    /// starts its own `cratonvm-jit-compiler` (16 MiB stack), so a 32-way run
+    /// has dozens of them. Raising the budget from 5 seconds to 60 changed
+    /// nothing: still 6 failures in 60 runs. The task was not late, it was
+    /// GONE — see [`worker_manager`]. Tuning a timeout is what you do after a
+    /// measurement says it is a timing problem, not instead of measuring.
+    const WORKER_RENDEZVOUS: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A manager for a test that starts a background worker: the same thing
+    /// `TieredCompilationManager::new` builds, with the install epoch PINNED.
+    ///
+    /// A queued task is stamped with the install epoch it was enqueued at, and
+    /// `take_fresh` drops it if the epoch has moved since. That is the
+    /// redefinition rule and it is correct. But `TieredCompilationManager::new`
+    /// reads the epoch from `crate::jit_install_epoch()`, which is
+    /// **process-global**, and every `JitCache::clear_all` anywhere in this test
+    /// binary advances it. So a sibling test clearing its own cache silently
+    /// invalidated this test's queued task; the worker dropped it instead of
+    /// compiling it, and the rendezvous channel never received. The symptom is
+    /// a timeout, which reads as "the worker never ran".
+    ///
+    /// The section below already knew the hazard — "bumping the real
+    /// `crate::JIT_INSTALL_EPOCH` would be non-deterministic (every
+    /// `JitCache::clear_all` anywhere in this test binary advances it)" — and
+    /// injects an epoch source for the tests that are ABOUT epochs. These four
+    /// are not about epochs, which is exactly why nobody pinned theirs.
+    fn worker_manager(policy: CompilationPolicy) -> TieredCompilationManager {
+        TieredCompilationManager::with_install_epoch_source(
+            policy,
+            Some(Arc::new(AtomicU64::new(1))),
+        )
+    }
+
     /// wire-tiered-manager increment 1: crossing the C1 threshold via
     /// `on_method_invocation` enqueues a task, and the background compile thread
     /// dequeues + "compiles" it on a *different* thread, then publishes the tier.
@@ -5351,7 +5483,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         // The compile closure reports (task tier, the thread it ran on) back to
@@ -5388,7 +5520,7 @@ mod tests {
 
         // The worker should pick it up off-thread. Block on the channel (no sleep).
         let (compiled_tier, worker_thread) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must drain the task");
         assert_eq!(compiled_tier, CompilationTier::C1);
         assert_ne!(
@@ -5398,7 +5530,7 @@ mod tests {
 
         // After completion the worker must publish the tier and clear the queue.
         // Spin briefly on the completion counter (bounded, no fixed sleep).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5452,7 +5584,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         let (tx, rx) = mpsc::channel::<CompilationTier>();
@@ -5476,17 +5608,17 @@ mod tests {
         // Worker compiles C1, then the loop auto-enqueues + compiles the C2
         // supersede (Low priority). Deterministic via the channel.
         let first = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("C1 compile must run");
         assert_eq!(first, CompilationTier::C1);
         let second = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("C2 supersede compile must follow a candidate C1 publish");
         assert_eq!(second, CompilationTier::C2);
 
         // Both completions recorded; tier settles at C2; nothing re-queued
         // (request_c2_upgrade is idempotent and gated on current_tier < C2).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() < 2 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5523,7 +5655,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         let mutator_thread = std::thread::current().id();
@@ -5560,7 +5692,7 @@ mod tests {
 
         // Worker drains + compiles off-thread; block on the channel (no sleep).
         let (compiled_tier, optimized, worker_thread) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must drain the task");
         assert_eq!(compiled_tier, CompilationTier::C2);
         assert!(
@@ -5574,7 +5706,7 @@ mod tests {
 
         // After completion the worker publishes the tier (invoke-cache analogue)
         // and clears the queue. Bounded spin on the completion counter.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5633,7 +5765,7 @@ mod tests {
             tiered_enabled: true,
             c1_profiling: true,
         };
-        let mgr = TieredCompilationManager::new(policy);
+        let mgr = worker_manager(policy);
         let key = test_key();
 
         // Rendezvous: worker -> test when it has ENTERED the compile and is
@@ -5678,7 +5810,7 @@ mod tests {
         // The worker has entered the compile and finished its bounded VM-lock
         // critical section; block on the channel (no sleep).
         let seen = entered_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("worker must enter compile and release the VM lock");
         assert_eq!(seen, 0, "worker read the VM-lock-protected state");
 
@@ -5695,7 +5827,7 @@ mod tests {
             stw_tx.send(()).unwrap();
         });
         stw_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(WORKER_RENDEZVOUS)
             .expect("STW initiator must acquire the VM lock while a compile is in-flight");
         stw.join().unwrap();
         assert_eq!(*vm_lock.lock(), 1, "STW path mutated the VM-locked state");
@@ -5708,7 +5840,7 @@ mod tests {
 
         // Let the in-flight compile finish.
         release.wait();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_RENDEZVOUS;
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -5729,8 +5861,10 @@ mod tests {
     // way to hold it still.
     //
     // The scheduling counters are process-wide, so the tests that assert exact
-    // counts take `crate::metrics::METRICS_TEST_LOCK` and reset the table,
-    // exactly as the metrics tests do.
+    // counts use `crate::metrics::SchedulingCapture` — a per-thread view of the
+    // same recorder. They used to take `METRICS_TEST_LOCK` and reset the table
+    // instead, which does not work: the lock serialises the tests that ASSERT
+    // and the other tests here are the PRODUCERS. See the macro's own doc.
 
     /// A manager reading its install epoch from `epoch` instead of the global.
     fn epoch_driven_manager(epoch: &Arc<AtomicU64>) -> TieredCompilationManager {
@@ -5921,8 +6055,13 @@ mod tests {
 
     #[test]
     fn drops_reach_the_process_wide_scheduling_counters() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Counted PER THREAD. `METRICS_TEST_LOCK` + a reset used to stand here
+        // and did not work: the lock serialises the tests that ASSERT, while
+        // every other `tiered` test that drops a request is a PRODUCER holding
+        // nothing. It failed about 1 run in 20 at `--test-threads=32`,
+        // reporting `Some(5)` for a count of 1. `next_fresh_task` records on
+        // its caller's thread, which is this one.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -5932,19 +6071,19 @@ mod tests {
         assert_eq!(mgr.next_fresh_task(), None);
 
         assert_eq!(
-            crate::metrics::scheduling_count("queue_dropped_stale_install_epoch"),
-            Some(1),
+            counts.count("queue_dropped_stale_install_epoch"),
+            1,
             "the drop must be visible in the metrics idiom, not only on the manager"
         );
-        assert_eq!(crate::metrics::scheduling_dropped_total(), 1);
-
-        crate::metrics::reset_scheduling_counts_for_test();
+        // …and it reaches the GLOBAL table too, which is what a sink reads.
+        // Asserted as a floor, because that table is everyone's.
+        assert!(crate::metrics::scheduling_dropped_total() >= 1);
     }
 
     #[test]
     fn invalidate_class_counts_the_requests_it_discards() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Per thread; see the test above.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -5961,21 +6100,17 @@ mod tests {
         mgr.invalidate_class("craton/test/EpochSubject");
 
         assert_eq!(mgr.queue_size(), 1, "only the unrelated class survives");
-        assert_eq!(
-            crate::metrics::scheduling_count("queue_dropped_class_invalidated"),
-            Some(2),
-        );
+        assert_eq!(counts.count("queue_dropped_class_invalidated"), 2);
         assert_eq!(mgr.dropped_requests(), 2);
         // Still dispatchable: invalidating one class must not gate another.
         assert_eq!(mgr.next_fresh_task(), Some(c1_task(&survivor)));
-
-        crate::metrics::reset_scheduling_counts_for_test();
     }
 
     #[test]
     fn shutdown_counts_the_requests_it_abandons() {
-        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
-        crate::metrics::reset_scheduling_counts_for_test();
+        // Per thread; see `drops_reach_the_process_wide_scheduling_counters`.
+        // `shutdown` drains on the caller's thread — there is no worker here.
+        let counts = crate::metrics::SchedulingCapture::start();
 
         let epoch = Arc::new(AtomicU64::new(1));
         let mgr = epoch_driven_manager(&epoch);
@@ -5992,13 +6127,11 @@ mod tests {
 
         assert_eq!(mgr.queue_size(), 0, "shutdown drains rather than leaves");
         assert_eq!(
-            crate::metrics::scheduling_count("queue_shutdown_abandoned"),
-            Some(2),
+            counts.count("queue_shutdown_abandoned"),
+            2,
             "abandoning work at teardown is correct, but it is still countable"
         );
         assert_eq!(mgr.dropped_requests(), 2);
-
-        crate::metrics::reset_scheduling_counts_for_test();
     }
 }
 

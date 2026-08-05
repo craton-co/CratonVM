@@ -455,7 +455,7 @@ thread_local! {
     /// OUTERMOST Java call: `0` means the thread is idle (between calls, parked
     /// in the host event loop) and is modelled as GC-blocked.
     static FOREIGN_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// CR-VXC-3 (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §5.3): the
+    /// CR-VXC-3 (`arch-2026-07-26/vm-exec-closeout.md` §5.3): the
     /// crash handler's publication guard for a foreign-attached thread.
     ///
     /// `crash_handler::java_stack_lines` renders whatever the *faulting* OS

@@ -4,8 +4,8 @@
 //! ES-SEGALLOC regression -- `java.lang.foreign.SegmentAllocator.allocate(long,
 //! long)` interface dispatch on a CratonVM synthetic `Arena` receiver.
 //!
-//! Pre-fix symptom (docs/known-issues/elasticsearch-suite/
-//! ES-FAIL-20260711-foreign-segmentallocator-dispatch.md): any call that
+//! Pre-fix symptom (fixed-suite-bugs/elasticsearch-suite/
+//! ES-FAIL-20260711-foreign-segmentallocator-dispatch-FIXED.md): any call that
 //! routes through a `SegmentAllocator` default method inherited by `Arena`
 //! (`allocate(long)` or `allocate(MemoryLayout)`, both real-JDK bytecode)
 //! threw
@@ -88,7 +88,15 @@ public class ArenaSegmentAllocatorDispatchProbe {
 }
 "#;
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {

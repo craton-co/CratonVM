@@ -100,6 +100,23 @@
 //! over-approximation is the correct polarity for "may I free this?", exactly
 //! as it is for "may I relocate?".
 //!
+//! ## 1.4 Quiescence is the backstop, not the primary argument
+//!
+//! 2026-08-03 (`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`):
+//! the primary reason a reclamation is safe is **ownership**, not this walk. A
+//! thread inside a compiled body always holds an owning `Arc<CompiledMethod>`
+//! for it — the interpreter's call sites hold one across `try_call`, generated
+//! code reaches a callee only through a surface that roots it, and JIT→JIT
+//! dispatch pins via `pin_jit_code_range_owner`. So a reference count reaching
+//! zero is itself a proof that no thread is inside.
+//!
+//! The quiescence walk exists because that argument is only as good as its
+//! weakest holder, and holders are added by people who do not know they have an
+//! obligation. `cratonvm_jit::RetainedCode` routes a keep-alive's release
+//! through the queue by construction, and `published_code_free_audit()` counts
+//! any release that reached the OS without one. That counter must be zero; when
+//! it is not, `CRATONVM_DBG_JIT_CODE_FREE=1` names the release site.
+//!
 //! **Fail-safe rule.** If quiescence cannot be established, the body is
 //! RETAINED and counted as deferred ([`CodeCacheLifecycleRaw::deferred_bodies`],
 //! [`CodeCacheLifecycleRaw::deferred_bytes`],
@@ -162,10 +179,11 @@
 //! `drain_deferred_jit_owners_if_quiescent` drops the queue when it reads zero.
 //! What this module adds:
 //!
-//! 1. **Ordering.** `drain_deferred_jit_owners_if_quiescent` performs the
-//!    `is_zero()` walk *before* taking the queue lock and then frees everything
-//!    it finds, including owners enqueued after the walk. [`CodeCacheLifecycle::sweep`]
-//!    walks with the lock held. See §1.2.
+//! 1. **Ordering.** ~~`drain_deferred_jit_owners_if_quiescent` performs the
+//!    `is_zero()` walk *before* taking the queue lock~~ — fixed on `dev`; it
+//!    now walks with the queue lock held, as [`CodeCacheLifecycle::sweep`]
+//!    does. See §1.2. What that path still lacks is this module's measurement
+//!    and its named fail-safe, below.
 //! 2. **Measurement.** The existing path reclaims silently. Nothing counts
 //!    installed or reclaimed bytes, sweeps, deferrals, failed allocations or
 //!    recompilations, so "the code cache is growing" cannot be distinguished

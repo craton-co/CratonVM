@@ -226,7 +226,7 @@ static NEXT_TM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 // identical `pub(crate)`-promotion precedent already applied to
 // `jca::provider_chain::find`/`make_provider` for the sibling
 // `KeyManagerFactory.getProvider()` fix (see this crate's
-// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
 pub(crate) fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
     KM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -2555,7 +2555,12 @@ fn ocsp_http_post(
     };
 
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    // The host comes from an OCSP responder URL, i.e. text that never passed
+    // through `InetAddress` — fold an IPv4-mapped destination to plain IPv4 so
+    // Windows can dial it (an AF_INET6 socket cannot reach one). See
+    // `outbound_policy::normalize_connect_addr`.
+    let mut stream = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+        .map_err(|e| format!("connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
@@ -2846,11 +2851,21 @@ pub(crate) fn check_revocation_for_verifier(
 // So `do_check_trusted` *cannot* perform the host check itself without the
 // intended host, and silently inventing one would be worse than omitting it.
 // Instead this module exposes `verify_hostname` / `check_endpoint_identity`
-// as the public entry point for the SSL-engine layer (tls.rs) to call at the
-// point where the peer host and the negotiated identification algorithm are
-// actually available. Until that wiring lands, endpoint identity is enforced
-// by whatever caller threads the host in; the chain-trust path is unchanged
-// and never *weakened* by this addition.
+// as the public entry point for the layer that DOES know the peer host and the
+// negotiated identification algorithm; the chain-trust path is unchanged and
+// never *weakened* by this addition.
+//
+// Two callers thread the host in today:
+//
+//   * `http_url_connection::huc_verify_hostname` — the native
+//     `HttpURLConnection` client path.
+//   * `t27_tls::engine_check_endpoint_identity` — the `SSLEngine` lane, after
+//     the handshake and after the application's `TrustManager[]` has had its
+//     say (JSSE's order). This wiring was MISSING until 2026-08-03, which is
+//     the whole of CVE-2018-8034's shape: a `localhost`-only certificate was
+//     accepted for a connection to `127.0.0.1`. If you add a third TLS client
+//     lane, it needs its own call here — an unwired lane performs no host
+//     check at all, and nothing in this module can detect that.
 
 /// Why an endpoint-identity (hostname) check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]

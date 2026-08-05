@@ -54,6 +54,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut multianewarray_ops = Vec::new();
     let mut field_ops = Vec::new();
     let mut typecheck_ops = Vec::new();
+    // cov-05: `checkcast` (0xc0) sites only, a subset of `typecheck_ops`
+    // (which also carries `instanceof`, 0xc1). `ir_compatible` gates on this
+    // one alone — see its doc comment — so a method with no `checkcast` but
+    // at least one `instanceof` may still reach the optimizing pipeline.
+    let mut checkcast_ops: Vec<(usize, u16)> = Vec::new();
     let mut static_field_ops = Vec::new();
     let mut invoke_ops: Vec<(usize, u16, u8)> = Vec::new(); // (pc, cp_index, opcode)
     let mut new_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `new` (0xbb)
@@ -83,7 +88,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                                                                   // imprecise whole-method re-run that could double-execute that side
                                                                   // effect (the real, once-confirmed Liquibase `Scope` corruption). That
                                                                   // premise is stale: the SAME day, a concurrent fix
-                                                                  // (`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
+                                                                  // (`fixed-suite-bugs/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
                                                                   // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
                                                                   // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
                                                                   // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind
@@ -407,6 +412,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 typecheck_ops.push((pc, cp_idx));
+                checkcast_ops.push((pc, cp_idx));
                 needs_heap = true;
                 pc += 3;
             }
@@ -712,6 +718,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         multianewarray_ops,
         field_ops,
         typecheck_ops,
+        checkcast_ops,
         static_field_ops,
         invoke_ops,
         new_ops,
@@ -735,6 +742,12 @@ pub struct JitScanResult {
     pub field_ops: Vec<(usize, u16)>,
     /// For each checkcast/instanceof instruction: (bytecode_pc, cp_index)
     pub typecheck_ops: Vec<(usize, u16)>,
+    /// cov-05: `checkcast` (0xc0) sites only — a subset of `typecheck_ops`.
+    /// `ir::ir_compatible` refuses the whole method on this alone; an
+    /// `instanceof`-only method is not refused here, so by construction every
+    /// pc still in `typecheck_ops` for an *admitted* method is an
+    /// `instanceof` site.
+    pub checkcast_ops: Vec<(usize, u16)>,
     /// For each getstatic/putstatic instruction: (bytecode_pc, cp_index)
     pub static_field_ops: Vec<(usize, u16)>,
     /// For each invoke instruction: (bytecode_pc, cp_index, opcode)

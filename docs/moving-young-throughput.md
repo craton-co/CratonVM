@@ -1,7 +1,7 @@
 # Moving-young collector throughput
 
 Slug: `moving-young-throughput` · 2026-07-26
-Follows `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`,
+Follows `fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`,
 which closed the correctness blocker and left "moving-young is ~3× slower than
 the default sweep" as its first residual.
 
@@ -160,7 +160,7 @@ cycles ran **without precisely remapping the innermost compiled frame**. The
 cycle counts and the hashbrown profile stand — the copy, the from-space walk and
 the bitmap fix are all upstream of that — but the per-cycle cost was measured
 slightly light, and the configuration was not the one that ships now. See
-`docs/internal/default-moving-young-enabled-20260730.md`.
+`default-moving-young-enabled-20260730.md`.
 
 Re-measured on 2026-07-30 with the mirror defect and the coverage-proof false
 positives fixed, bt18 at `-Xmx512m` runs 25 moving cycles with a 4,220 ms

@@ -485,6 +485,7 @@ fn control_input_indices(node: &Node) -> Vec<usize> {
         Op::Merge | Op::Region => (0..node.inputs.len()).collect(),
         // Everything else pins control at input 0 (when it has one at all).
         Op::Return
+        | Op::Throw
         | Op::If
         | Op::Proj(_)
         | Op::Guard { .. }
@@ -495,6 +496,9 @@ fn control_input_indices(node: &Node) -> Vec<usize> {
         | Op::New { .. }
         | Op::NewArray { .. }
         | Op::Call { .. }
+        | Op::ConstString { .. }
+        | Op::ConstClass { .. }
+        | Op::LoadStatic { .. }
         | Op::LambdaIntToDouble => {
             if node.inputs.is_empty() {
                 Vec::new()
@@ -671,12 +675,22 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::NewArray { .. } => (3, 3),
         // [ctrl, mem, args…]
         Op::Call { .. } => (2, ANY),
+        // cov-01 — [ctrl, mem]. Every operand is baked (the literal's address,
+        // the CP index, the field's class and index), so there is no value edge
+        // at all; what the two edges carry is the position in the control and
+        // memory chains a helper call has to keep.
+        Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. } => (2, 2),
         // [ctrl, mem, lambda, index]
         Op::LambdaIntToDouble => (4, 4),
         // [ctrl, cond]
         Op::Guard { .. } => (2, 2),
         // [ctrl, mem, obj]
         Op::MonitorEnter | Op::MonitorExit => (3, 3),
+        // cov-05 — [ctrl, mem, obj], same shape as `MonitorEnter` above.
+        Op::InstanceOf { .. } | Op::CheckCast { .. } => (3, 3),
+        // cov-07 — [ctrl, mem, exc], a terminator like `Op::Return` above but
+        // with a fixed arity: unlike a return, a throw always carries a value.
+        Op::Throw => (3, 3),
         Op::Dead => (0, 0),
     }
 }
@@ -847,10 +861,17 @@ fn check_control(graph: &Graph, v: &mut Violations) {
         if let Some(seen) = reachable.get_mut(graph.entry as usize) {
             *seen = true;
         }
-        let mut found_return = false;
+        // cov-07: `Op::Throw` is as valid a terminator as `Op::Return` — a
+        // method that unconditionally throws (`void fail() { throw new
+        // IllegalStateException(); }`) builds no `Op::Return` at all, and
+        // that is not a severed graph. `Op::Return`'s own reachability is
+        // NOT weakened by this: a graph with a live `Op::Return` still needs
+        // it reachable, this only ADDS `Op::Throw` as an equally acceptable
+        // way for a control path to end.
+        let mut found_terminator = false;
         while let Some(cur) = stack.pop() {
-            if matches!(node_at(graph, cur), Some(n) if n.op == Op::Return) {
-                found_return = true;
+            if matches!(node_at(graph, cur), Some(n) if matches!(n.op, Op::Return | Op::Throw)) {
+                found_terminator = true;
             }
             let Some(succs) = succ.get(cur as usize) else {
                 continue;
@@ -865,15 +886,18 @@ fn check_control(graph: &Graph, v: &mut Violations) {
                 }
             }
         }
-        let has_return = graph.nodes.iter().any(|n| matches!(n.op, Op::Return));
-        if has_return && !found_return {
+        let has_terminator = graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Return | Op::Throw));
+        if has_terminator && !found_terminator {
             v.add(
-                "no Op::Return is reachable from the entry over control edges (the graph's \
-                 terminator was severed)"
+                "no Op::Return/Op::Throw terminator is reachable from the entry over control \
+                 edges (the graph's terminator was severed)"
                     .to_string(),
             );
-        } else if !has_return {
-            v.add("graph has no live Op::Return terminator".to_string());
+        } else if !has_terminator {
+            v.add("graph has no live Op::Return/Op::Throw terminator".to_string());
         }
     }
 }

@@ -496,10 +496,25 @@ fn absolute_paths_are_redacted_unless_verbose() {
              operator's home directory, the build-agent layout and often a \
              customer name. Leaked {image} in:\n{quiet}"
         );
+        // This file was recovered onto `dev` on 2026-07-31 from an auto-commit
+        // in another checkout, and it has been red ever since. It asserted that
+        // redaction keeps the last path component ("jdk-25"), on the reasoning
+        // that the tail is what identifies the JDK. That is a defensible
+        // design, but it is not the one that shipped, and two other places say
+        // so: `types/src/error.rs`'s own test asserts
+        // `redact_paths(path, false) == "<redacted>"` for a whole token, and
+        // `docs/jdk-only-migration.md` shows `java.home: <redacted>`.
+        //
+        // Whole-token redaction wins here because the two specs differ in what
+        // LEAKS, and absent a decision the conservative one should hold: a
+        // trailing component is `jdk-25` on a release build and
+        // `acme-prod-2026` on a customer's. The information is not lost — the
+        // renderer now tells you to re-run with `--explain-jdk-only`, which is
+        // the assertion below and the part of the original intent that was
+        // genuinely missing.
         assert!(
-            quiet.contains("jdk-25"),
-            "…but the last component is what identifies the JDK, so redaction \
-             must keep it:\n{quiet}"
+            quiet.contains("<redacted>"),
+            "an absolute path must be redacted as a whole token:\n{quiet}"
         );
         assert!(
             quiet.contains("--explain-jdk-only"),
@@ -539,8 +554,11 @@ fn to_json_is_a_single_object_with_a_kind_and_no_absent_keys() {
             "to_json returns one complete object so the report can join them \
              with commas: {json}"
         );
+        // Compact separator, no space: `types/src/error.rs` owns this dump and
+        // its own test pins `"kind":"…"`. The difference is cosmetic and the
+        // format is machine-read, so the crate that emits it keeps the say.
         assert!(
-            json.contains(&format!("\"kind\": \"{}\"", v.kind())),
+            json.contains(&format!("\"kind\":\"{}\"", v.kind())),
             "every entry is self-describing: {json}"
         );
         assert!(
@@ -562,7 +580,7 @@ fn to_json_is_a_single_object_with_a_kind_and_no_absent_keys() {
         module: None,
     };
     assert!(
-        v.to_json().contains("\"module\": null"),
+        v.to_json().contains("\"module\":null"),
         "got {}",
         v.to_json()
     );

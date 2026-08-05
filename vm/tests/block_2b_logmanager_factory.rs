@@ -27,7 +27,15 @@ fn probe_dir() -> PathBuf {
     manifest.parent().unwrap().join("apps").join("lm_subclass")
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
@@ -74,6 +82,26 @@ fn ensure_probe_compiled() -> bool {
         // javac RAN and rejected the fixture: skipping here would make this
         // test a permanent vacuous pass.
         Ok(o) => {
+            // javac REJECTED THE ARGUMENTS, not the source: an unsupported `--release`
+            // means this javac is older than the level this probe compiles at, so it never
+            // opened the file. That is a missing-toolchain condition — the same one the
+            // `Err(e)` arm above skips for — not a broken probe. Reporting it as "fix the
+            // source" sends the next reader to edit a correct `.java` file.
+            //
+            // Narrowly keyed on javac's own wording for an unsupported release, so a
+            // genuine source error still reaches the assertion below and still fails loudly
+            // (see `probe_compile_guard.rs` for why that must never become a skip).
+            if !o.status.success() {
+                let stderr_probe = String::from_utf8_lossy(&o.stderr);
+                if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+                    eprintln!(
+                        "[block_2b_logmanager_factory] javac cannot target --release 21 ({}); skipping. Point \
+                         JAVA_HOME or CRATONVM_JAVA_HOME at a JDK 21+ install.",
+                        stderr_probe.lines().next().unwrap_or("").trim()
+                    );
+                    return false;
+                }
+            }
             assert!(
                 o.status.success(),
                 "[block_2b_logmanager] the checked-in probe fixture failed to compile — fix the .java source. \
@@ -85,7 +113,13 @@ fn ensure_probe_compiled() -> bool {
     }
 }
 
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING JDK is
+/// reported differently. See `common::require_jdk`.
 fn jdk_home() -> Option<PathBuf> {
+    common::require_jdk(jdk_home_lookup())
+}
+
+fn jdk_home_lookup() -> Option<PathBuf> {
     if let Ok(j) = std::env::var("CRATONVM_TEST_JDK") {
         let p = PathBuf::from(&j);
         if p.exists() {

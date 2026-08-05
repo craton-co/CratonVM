@@ -2426,7 +2426,60 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(owner)) => *owner,
                 _ => None,
             };
-            ctx.set_field_by_name(this, "exclusiveOwnerThread", Value::Object(owner));
+            // The field index is memoized per receiver class. `set_field_by_name`
+            // takes the class-manager read lock and walks the hierarchy comparing
+            // field-name strings on EVERY call, and this native runs twice per
+            // uncontended `ReentrantLock.lock()`/`unlock()` pair — measured at
+            // 821 ns per call against 7.9 ns for an ordinary Java call
+            // (`probes/AqsAttributionProbe.java`, quiet host).
+            //
+            // The index is a per-class constant: `exclusiveOwnerThread` is the
+            // only instance field `AbstractOwnableSynchronizer` declares, and
+            // `resolve_field_index_in_hierarchy` walks subclass -> super, so a
+            // given subclass resolves to the same slot for the life of that
+            // class. The memo is keyed on the receiver's class id and holds a
+            // few entries because the synchronizer classes in play are few
+            // (`ReentrantLock$NonfairSync`, `$FairSync`, the read/write-lock
+            // syncs, `ThreadPoolExecutor$Worker`) — a one-entry cache would
+            // thrash between a lock and a pool worker.
+            //
+            // A miss falls back to the resolving path, so an unexpected layout
+            // is slow rather than wrong, and an unknown name stays the silent
+            // no-op `set_field_by_name` already was. Class redefinition needs no
+            // invalidation: it allocates a NEW `ClassId`, so a stale entry can
+            // never be consulted for the redefined class.
+            const MEMO_SLOTS: usize = 8;
+            thread_local! {
+                static OWNER_FIELD_INDEX: std::cell::RefCell<[(u32, u32); MEMO_SLOTS]> =
+                    const { std::cell::RefCell::new([(u32::MAX, 0); MEMO_SLOTS]) };
+            }
+            let class_id = ctx.class_id_of_object(this);
+            let raw_cid = class_id.as_u32();
+            let cached = OWNER_FIELD_INDEX.with(|memo| {
+                memo.borrow()
+                    .iter()
+                    .find(|(cid, _)| *cid == raw_cid)
+                    .map(|(_, index)| *index as usize)
+            });
+            match cached {
+                Some(index) => ctx.set_field(this, index, Value::Object(owner)),
+                None => {
+                    if let Some(index) =
+                        ctx.resolve_field_index_by_class_id(class_id, "exclusiveOwnerThread")
+                    {
+                        OWNER_FIELD_INDEX.with(|memo| {
+                            let mut memo = memo.borrow_mut();
+                            // Take a free slot, else evict slot 0. The policy does
+                            // not need to be clever at this size, but the table
+                            // must not be able to grow without bound.
+                            let victim =
+                                memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                            memo[victim] = (raw_cid, index as u32);
+                        });
+                        ctx.set_field(this, index, Value::Object(owner));
+                    }
+                }
+            }
             ctx.record_jmx_owned_synchronizer(this, owner);
             Ok(None)
         },
@@ -4301,30 +4354,71 @@ fn jmx_lock_name(
     format!("{class_name}@{:x}", ctx.identity_hash_code(object))
 }
 
+/// Build a `java.lang.management.MonitorInfo` for `object`, attributed to the
+/// stack frame `locked_frame` at index `locked_depth`.
+///
+/// The two fields are `stackDepth` and `stackFrame` — NOT `lockedStackDepth` /
+/// `lockedStackFrame`, which are the *getter* names (`getLockedStackDepth()` /
+/// `getLockedStackFrame()`). Confirmed against JDK 25 with
+/// `javap -p java.lang.management.MonitorInfo`:
+///
+/// ```text
+/// private int stackDepth;
+/// private java.lang.StackTraceElement stackFrame;
+/// ```
+///
+/// Writing the getter names set nothing (`set_field_by_name` on an unknown name
+/// is a silent no-op), so `getLockedStackFrame()` returned null and
+/// `getLockedStackDepth()` returned the default 0 on *every* MonitorInfo this
+/// VM ever produced. That pair violates the JDK's own invariant — depth >= 0
+/// implies a non-null frame — and `org.apache.tomcat.util.Diagnostics
+/// .getThreadDump` relies on it: it stores the monitor at
+/// `monitorDepths[getLockedStackDepth()]` and then calls
+/// `getLockedStackFrame().toString()`, so `GET /manager/text/threaddump`
+/// answered 500 with an NPE (`TestManagerWebapp.testServlets`).
+///
+/// `className` / `identityHashCode` are inherited from `LockInfo` and *are*
+/// spelled that way, which is why only these two were wrong.
 fn alloc_jmx_monitor_info(
     ctx: &mut dyn NativeContext,
     object: ObjectRef,
+    locked_depth: i32,
     locked_frame: Option<ObjectRef>,
 ) -> ObjectRef {
+    debug_assert_eq!(
+        locked_depth >= 0,
+        locked_frame.is_some(),
+        "MonitorInfo depth/frame must agree: depth >= 0 iff a frame is attributed"
+    );
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(object))
         .unwrap_or_else(|| "java/lang/Object".to_string())
         .replace('/', ".");
     let class_name = ctx.create_string(&class_name);
     let class_pin = ctx.pin_native_root(class_name);
+    let frame_pin = locked_frame.map(|f| (ctx.pin_native_root(f), f));
     let info = alloc_concurrent_synthetic(ctx, "java/lang/management/MonitorInfo", 4);
+    let info_pin = ctx.pin_native_root(info);
     let class_name = ctx.read_native_pin(class_pin, class_name);
+    let info = ctx.read_native_pin(info_pin, info);
     ctx.set_field_by_name(info, "className", Value::Object(Some(class_name)));
     ctx.set_field_by_name(
         info,
         "identityHashCode",
         Value::Int(ctx.identity_hash_code(object)),
     );
-    // The current interpreter exposes a complete frame trace but does not yet
-    // retain the exact monitor-enter BCI. Depth zero is the conservative
-    // location used by HotSpot when a monitor was acquired in native code.
-    ctx.set_field_by_name(info, "lockedStackDepth", Value::Int(0));
-    ctx.set_field_by_name(info, "lockedStackFrame", Value::Object(locked_frame));
+    // The interpreter exposes a complete frame trace but does not retain the
+    // monitor-enter BCI, so every monitor a thread owns is attributed to its
+    // innermost frame (depth 0). That is an approximation of *which* frame took
+    // the lock, but it keeps the depth/frame pair internally consistent and
+    // inside the stack trace's bounds, which is the part callers depend on.
+    ctx.set_field_by_name(info, "stackDepth", Value::Int(locked_depth));
+    let locked_frame = frame_pin.map(|(pin, f)| ctx.read_native_pin(pin, f));
+    ctx.set_field_by_name(info, "stackFrame", Value::Object(locked_frame));
+    if let Some((pin, _)) = frame_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(info_pin);
     ctx.unpin_native_roots(class_pin);
     info
 }
@@ -4346,7 +4440,21 @@ fn alloc_snapshot_thread_info(
     let stack_trace =
         crate::lang_system::build_stack_trace_element_array(ctx, &snapshot.stack_trace);
     let stack_pin = ctx.pin_native_root(stack_trace);
-    let locked_monitors = ctx.new_ref_array(monitor_info_cid, snapshot.locked_monitors.len());
+    // A monitor is reported only when it can be attributed to a stack frame.
+    // `lockedMonitors` means "monitors this thread locked *in a stack frame*",
+    // and HotSpot gets that property structurally: its dumper discovers
+    // monitors while walking Java frames, so a thread with no Java frames
+    // reports none. We have no per-frame monitor map, so we mirror the
+    // property directly — otherwise we would have to invent a depth for a
+    // monitor with nowhere to put it, and `Diagnostics.getThreadDump` indexes
+    // `new Object[stackTrace.length]` with exactly that depth.
+    let attributable = !snapshot.stack_trace.is_empty();
+    let reported_monitors: &[ObjectRef] = if attributable {
+        &snapshot.locked_monitors
+    } else {
+        &[]
+    };
+    let locked_monitors = ctx.new_ref_array(monitor_info_cid, reported_monitors.len());
     let monitors_pin = ctx.pin_native_root(locked_monitors);
     let locked_synchronizers =
         ctx.new_ref_array(lock_info_cid, snapshot.locked_synchronizers.len());
@@ -4354,8 +4462,7 @@ fn alloc_snapshot_thread_info(
 
     let lock_pin = snapshot.lock.map(|o| (ctx.pin_native_root(o), o));
     let thread_pin = snapshot.thread_object.map(|o| (ctx.pin_native_root(o), o));
-    let monitor_pins: Vec<_> = snapshot
-        .locked_monitors
+    let monitor_pins: Vec<_> = reported_monitors
         .iter()
         .map(|&o| (ctx.pin_native_root(o), o))
         .collect();
@@ -4365,18 +4472,26 @@ fn alloc_snapshot_thread_info(
         .map(|&o| (ctx.pin_native_root(o), o))
         .collect();
 
-    let stack_trace_fresh = ctx.read_native_pin(stack_pin, stack_trace);
-    let first_frame = if ctx.array_length(stack_trace_fresh) == 0 {
-        None
-    } else {
-        match ctx.get_array_element(stack_trace_fresh, 0) {
-            Value::Object(Some(frame)) => Some(frame),
-            _ => None,
-        }
-    };
     for (i, (pin, monitor)) in monitor_pins.iter().enumerate() {
         let monitor = ctx.read_native_pin(*pin, *monitor);
-        let info = alloc_jmx_monitor_info(ctx, monitor, first_frame);
+        // Re-read frame 0 out of the pinned stack-trace array on every
+        // iteration: the previous `alloc_jmx_monitor_info` allocated, so a
+        // frame `ObjectRef` cached before the loop could have been relocated.
+        // The array element is also the authority on whether a frame exists at
+        // all — `attributable` says the snapshot had frames, but if the element
+        // reads back null we must NOT claim depth 0 with no frame, which is the
+        // exact inconsistent pair that NPE'd Tomcat's `Diagnostics`.
+        let stack_arr = ctx.read_native_pin(stack_pin, stack_trace);
+        let frame = if ctx.array_length(stack_arr) == 0 {
+            None
+        } else {
+            match ctx.get_array_element(stack_arr, 0) {
+                Value::Object(Some(frame)) => Some(frame),
+                _ => None,
+            }
+        };
+        let depth = if frame.is_some() { 0 } else { -1 };
+        let info = alloc_jmx_monitor_info(ctx, monitor, depth, frame);
         let arr = ctx.read_native_pin(monitors_pin, locked_monitors);
         ctx.set_array_element(arr, i, Value::Object(Some(info)));
     }

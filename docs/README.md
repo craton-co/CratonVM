@@ -50,7 +50,7 @@ and large reference tables without duplicating the manual.
 - [GC Tuning](gc-tuning.md)
 - [Moving-young throughput status](moving-young-throughput.md)
 - [Framework throughput program](framework-throughput.md)
-- [JDK-only mode benchmarks](benchmarks/jdk-only.md) — proposed non-regression
+- [JDK-only mode benchmarks](benchmarking/jdk-only.md) — proposed non-regression
   budgets for `--jdk-only`; no baseline captured yet, so every number there is
   an engineering gate rather than a measurement.
 
@@ -141,7 +141,7 @@ default and is unaffected.**
 - [Threat model](security/jdk-only-threat-model.md) — what the flag does and
   does not change about the VM's trust posture. It is a correctness and
   provenance control, **not** an isolation boundary.
-- [Benchmarks and non-regression budgets](benchmarks/jdk-only.md) — proposed
+- [Benchmarks and non-regression budgets](benchmarking/jdk-only.md) — proposed
   gates; no baseline has been captured yet.
 - [Open wave-2 issues](known-issues/jdk-only/README.md) — gaps deliberately
   deferred rather than papered over, with the evidence that makes them
@@ -201,8 +201,8 @@ preserved links does not block normal documentation work.
 ## Issue and evidence taxonomy
 
 - `docs/known-issues/` contains unresolved bugs and active investigations.
-- After a bug is fixed and covered, move its document to `docs/internal/`.
-- `docs/internal/` is non-normative historical evidence and audit material.
+- After a bug is fixed and covered, move its document to ``.
+- `` is non-normative historical evidence and audit material.
 - `docs/architecture/` describes current architecture that remains useful
   outside a single fix.
 - `docs/feature-designs/` contains proposals and must state when work is not yet

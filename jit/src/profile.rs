@@ -407,14 +407,19 @@ impl LoopTripProfile {
 /// | `branches` | every conditional-branch opcode | all branches |
 /// | `loops` | every back-edge | all loops |
 /// | `receivers` | the receiver-resolution path of `invokevirtual`/`invokeinterface` | **virtual + interface call sites only** |
-/// | `call_sites` | [`Self::record_call_site`] | whatever the interpreter calls it from |
+/// | `call_sites` | [`Self::record_call_site`] | `invokestatic` + `invokespecial` (PGO-01, 2026-08) |
 ///
-/// In particular there is no per-call-site counter for `invokestatic` /
-/// `invokespecial` unless `call_sites` is fed: `receivers` is the only
-/// per-bci execution evidence the store has historically carried, and a
-/// monomorphic static call has no receiver to record. Use
-/// [`Self::call_site_count`], which unifies the two sources and states which
-/// one answered.
+/// `call_sites` is fed from exactly four places in
+/// `vm/src/runtime/interpreter/invoke.rs`: `execute_invokestatic`,
+/// `execute_invokestatic_cached` (every `invokestatic`), `execute_invoke_kind`
+/// and `execute_invokevirtual_cached` gated on `is_special` (every
+/// `invokespecial` — its OTHER callers, `invokevirtual`/`invokeinterface`, are
+/// deliberately NOT recorded here to avoid double-counting a call site both
+/// ways; they rely on `receivers` alone). `receivers` is the only per-bci
+/// execution evidence for virtual/interface sites, and a monomorphic static
+/// or special call has no receiver to record — that's the gap this filled.
+/// Use [`Self::call_site_count`], which unifies the two sources and states
+/// which one answered.
 #[derive(Default)]
 pub struct MethodProfile {
     /// Branch counts keyed by bytecode PC.
@@ -606,6 +611,16 @@ impl MethodProfile {
 /// pattern (for `snapshot_all` / `get_profile`) still applies — it now
 /// runs per-shard.
 const PROFILE_SHARDS: usize = 16;
+
+/// Loop iterations that count as one method invocation for tier-up, used by
+/// [`ProfileStore::add_loop_work`].
+///
+/// 32 is chosen so the shape this exists for actually crosses the bar without
+/// dragging in everything else: a ~300-iteration constant-pool loop credits ~9
+/// invocations per call, so a few dozen classes carry the method over the
+/// default 500 threshold, while a method that loops a handful of times per call
+/// still has to earn compilation mostly on call count.
+const LOOP_WORK_PER_INVOCATION: u32 = 32;
 
 /// Number of shards for the per-method invocation-counter map. Power of two so
 /// the shard mapping is a single mask.
@@ -869,6 +884,49 @@ impl ProfileStore {
             None => {
                 write.insert(packed_key, AtomicU32::new(1));
                 1
+            }
+        }
+    }
+
+    /// Credit `iterations` of completed loop work to a method's invocation
+    /// counter, so a method whose loops do a lot of work across MANY SHORT
+    /// calls tiers up like one that is simply called often.
+    ///
+    /// This is the same counter [`Self::increment_invocation`] drives and the
+    /// same threshold gates, deliberately: HotSpot likewise sums its invocation
+    /// and back-edge counters against a single trigger. Without it a method has
+    /// to earn compilation purely by call count, and a loop body is invisible —
+    /// which is how Tomcat's BCEL annotation scan stayed interpreted. Its
+    /// `ConstantPool.<init>` runs a ~300-iteration constant-pool loop once per
+    /// class: never 500 calls, and never 1000 back-edges inside one frame, so
+    /// neither the invocation counter nor the per-frame OSR counter ever fires.
+    ///
+    /// `iterations` is scaled down by [`LOOP_WORK_PER_INVOCATION`] so a single
+    /// long-running loop cannot instantly saturate the counter and drag in
+    /// every method that merely happens to contain one.
+    #[inline]
+    pub fn add_loop_work(&self, packed_key: u64, iterations: u32) -> u32 {
+        let credit = iterations / LOOP_WORK_PER_INVOCATION;
+        if credit == 0 {
+            return 0;
+        }
+        let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
+        {
+            let read = shard.counts.read();
+            if let Some(cell) = read.get(&packed_key) {
+                return cell
+                    .fetch_add(credit, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(credit);
+            }
+        }
+        let mut write = shard.counts.write();
+        match write.get(&packed_key) {
+            Some(cell) => cell
+                .fetch_add(credit, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(credit),
+            None => {
+                write.insert(packed_key, AtomicU32::new(credit));
+                credit
             }
         }
     }

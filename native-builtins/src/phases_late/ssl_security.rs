@@ -497,7 +497,7 @@ pub(crate) const NEW13_SOCK_SESSION: usize = 4;
 /// `getOutputStream`/`write` work on a socket obtained via the plain
 /// 2-arg `createSocket(host, port)` (the overload Apache HttpClient5's
 /// classic connection pool actually calls, per
-/// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+/// fixed-suite-bugs/netty-client-socket-write-after-close-nsme-FIXED.md).
 pub(crate) fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
     if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
         if id >= 0 {
@@ -1163,7 +1163,7 @@ pub(crate) fn new13_finish_socket(
 /// methods have no Code and threw `AbstractMethodError` for any caller that
 /// invoked one directly (e.g. a test wrapper `KeyManager` delegating to the
 /// array `getKeyManagers()` returned — see
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
 /// "Residual #2 implementation" for the full trace that found this).
 pub(crate) fn kmf_keystore_id_by_identity(
 ) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
@@ -1537,16 +1537,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // field 0 at all, throwing `IllegalStateException("SSLSocketFactory
             // has no owning SSLContext")` instead of connecting — a real-JDK
             // A/B confirmed CratonVM-only failure.
-            let ssl_ctx = crate::t27_tls::get_runtime_default_ssl_context().unwrap_or_else(|| {
-                let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
-                let name = ctx.create_string("TLS");
-                ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
-                ctx.set_field(new_ctx, 1, Value::Int(1));
-                crate::t27_tls::set_runtime_default_ssl_context(new_ctx);
-                new_ctx
-            });
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-            ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
+            //
+            // REGRESSION 2026-08-04: the fix below was correct and still
+            // present, but `net_phase_e::register_re6_ssl_context` carried a
+            // SECOND registration of this same triple that ran later and won
+            // by last-registration-wins, handing back a factory whose field 0
+            // was `None`. That duplicate is deleted; this is the single owner
+            // (asserted by `registry_contracts.rs`). The body moved into
+            // `t27_tls::default_ssl_socket_factory_obj` so the
+            // `HttpsURLConnection` factory getters — which also used to mint
+            // bare carriers — share one implementation.
+            let obj = crate::t27_tls::default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1588,7 +1589,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
                 // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
                 "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -1734,7 +1735,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // CLIENT mode — the caller may still flip it to SERVER mode via
     // `setUseClientMode(false)` before the handshake actually starts, which
     // is exactly the MockWebServer HTTPS-listener pattern
-    // (`docs/internal/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
+    // (`fixed-suite-bugs/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
     // Since the role isn't known yet at this call, the handshake itself is
     // deferred — see `t27_tls::{stash_pending_layered_socket,
     // set_pending_layered_socket_client_mode, drive_pending_layered_handshake}`
@@ -1779,13 +1780,34 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // A factory with no reachable owning `SSLContext` used to be a
+            // hard `IllegalStateException` here. That is not a JDK-faithful
+            // failure mode — no real `SSLSocketFactory` exists without a
+            // context; `getDefault()` and every `SSLContext.getSocketFactory()`
+            // carry one — so an empty field 0 always means one of OUR
+            // synthetic carriers lost it, and the honest answer is the
+            // process default context, which is what the real
+            // `SSLSocketFactory.getDefault()` would have supplied anyway.
+            //
+            // Twice now a single mis-wired carrier has converted into an
+            // exception thrown before any network I/O, taking out a whole
+            // test family (2026-07-23 the bare 0-field `getDefault()`;
+            // 2026-08-04 the duplicate registration that clobbered its fix).
+            // Falling back cannot weaken trust: caller-supplied anchors are
+            // resolved below by factory identity (`p68_factory_trust_roots`),
+            // not through this context, and the default context validates
+            // against the platform trust store — strictly stricter than a
+            // permissive caller-installed TrustManager, never laxer.
             let ssl_context = match ctx.get_field(factory, 0) {
                 Value::Object(Some(context)) => context,
                 _ => {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "SSLSocketFactory has no owning SSLContext".into(),
+                    if crate::nbflags().dbg_tls_auth_ok {
+                        eprintln!(
+                            "[dbg-tls-auth] createSocket(layered): factory has no field-0 \
+                             SSLContext, falling back to the process default"
+                        );
                     }
-                    .into())
+                    crate::t27_tls::default_ssl_context_or_create(ctx)
                 }
             };
             // Same trust-anchor/TrustManager resolution `new13_do_create_socket`
@@ -2115,7 +2137,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // as its mitigation for CVE-2009-3555 and 3SHAKE. Firing the event
     // anyway would tell the application that fresh key material had been
     // derived when none had. See
-    // `docs/internal/fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md`.
+    // `fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md`.
     r.register(
         ssl_sock,
         "addHandshakeCompletedListener",
@@ -2872,7 +2894,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            let address = crate::net_phase_e::alloc_inet_address_for_input(ctx, &host, &host);
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -2915,7 +2937,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
             let address =
-                crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1");
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -2937,6 +2959,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // identified by the tls_id stored in field 0 of the synthetic stream
     // instance. A -1 id or short-read of 0 maps to Java EOF (-1) per
     // InputStream.read semantics.
+    //
+    // PERF NOTE (testssl-testpost bulk TLS, 2026-08-05): this native's own body
+    // is NOT what makes a byte-at-a-time reader slow. Measured against
+    // `SSLSocketOutputStream.flush()` — a registered no-op native on the same
+    // receiver, so the difference is the body and nothing else — one `read()`
+    // costs 814 ns at 1 thread, of which 549 ns is the Java->native transition
+    // and only ~265 ns is everything this closure does. Counters over a full
+    // `testPost` confirmed the two candidate slow spots are absent: the field
+    // read at slot 0 hits every time (16,777,216 of 16,777,216 calls — the
+    // side-table fallback never fires), and the readahead does exactly one real
+    // socket read per 16 KiB (1024 refills, avg 16384 bytes). What remained of
+    // the body was the descriptor lookup behind `get_field`; see
+    // `vm_exec::resolve_field_descriptor_byte_cached`'s stub note.
     let ssl_is = "javax/net/ssl/SSLSocketInputStream";
     r.register(ssl_is, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2970,7 +3005,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // at the barrier: a mutual deadlock, observed as `rounds=64 pending=1
         // taken=0` repeating with no further progress. Same bug shape as the
         // `net_phase_e` HttpClient and S2 selector fixes; see
-        // `docs/internal/fixed-suite-bugs/keycloak/
+        // `fixed-suite-bugs/keycloak/
         // keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`.
         ctx.begin_blocking_region();
         let filled = crate::servlet::s2_tls_fill_readahead(tls_id);
@@ -3035,8 +3070,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
-                for i in 0..n {
-                    ctx.set_array_element(arr, off + i, Value::Int(buf[i] as i8 as i32));
+                // PERF (testssl-testpost bulk TLS): one bulk copy instead of one
+                // virtual `set_array_element` (plus a `Value` box) per byte. The
+                // range was bounds-checked against `arr_len` above, so a `false`
+                // here can only mean the pinned array came back smaller — report
+                // that rather than silently claim bytes that never landed.
+                if !ctx.write_byte_array_from(arr, off, &buf[..n]) {
+                    return Err(RuntimeError::IOException {
+                        message: "SSLSocketInputStream.read: destination array shrank".into(),
+                    }
+                    .into());
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
@@ -3170,12 +3213,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if len == 0 {
             return Ok(None);
         }
-        let mut buf = Vec::with_capacity(len);
-        for i in 0..len {
-            if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-                buf.push(b as u8);
-            }
-        }
+        // PERF (testssl-testpost bulk TLS): one bulk copy instead of one virtual
+        // `get_array_element` per byte. `TestSsl.testPost` alone pushes 16 MiB
+        // per thread through here in 128 KiB blocks.
+        let mut buf = vec![0u8; len];
+        let copied = ctx.read_byte_array_into(arr, off, &mut buf);
+        // The range was bounds-checked against `arr_len` above, so a short copy
+        // means the array is not the byte[] this signature promises. Writing the
+        // zero tail would put bytes on the wire the caller never supplied.
+        buf.truncate(copied);
         // Drain the write — TlsStream::write may return short writes under
         // pressure, which callers would otherwise interpret as silent data
         // loss. Loop until the whole buffer has been accepted.
@@ -3671,7 +3717,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // tracing against Tomcat's `TestClientCert`/
             // `engine_run_trust_check`'s post-handshake
             // `checkClientTrusted` call — see
-            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
             // enforced-FIXED.md`, "Residual #2 implementation" for the full
             // trace). Fixed the same way as the sibling
             // `KeyManagerFactory.getKeyManagers()` fix just above: build
@@ -3938,7 +3984,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // override does exactly this
             // (`manager.chooseClientAlias(keyType, issuers, socket)`,
             // `manager` being whatever `getKeyManagers()` returned) — see
-            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
             // enforced-FIXED.md`, "Residual #2 implementation" for the full trace.
             //
             // Fixed by building the SAME real, natively-backed
@@ -4090,7 +4136,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // were never registered on javax/net/ssl/SSLEngine (only getEnabled* above), the
     // same "missing accessor" shape as the earlier SSLSocket
     // getSupportedCipherSuites/getEnabledCipherSuites gap (see
-    // docs/internal/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
+    // fixed-suite-bugs/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
     // ssleng_alloc allocates every SSLEngine directly on this abstract class (never a
     // concrete subclass), so an unregistered method here always throws
     // AbstractMethodError on any real-JDK caller. Netty's JdkSslContext.<clinit> (via
@@ -4119,7 +4165,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
                 // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
                 "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
                 "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -4916,7 +4962,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // `getEncoded()` → rustls `invalid peer certificate: BadEncoding`.
             // `p59_read_input_stream_fully` keeps the fast BAIS path and adds a
             // generic `read()`-loop fallback for every other stream type. See
-            // docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+            // fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
             let der_data = if let Some(Value::Object(Some(is_ref))) = args.get(1) {
                 match p59_read_input_stream_fully(ctx, *is_ref) {
                     Ok(bytes) if !bytes.is_empty() => Some(bytes),

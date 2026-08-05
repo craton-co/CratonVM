@@ -9,7 +9,7 @@ import org.h2.store.fs.FileUtils;
 /**
  * Accelerated stand-in for org.h2.test.store.TestMVStoreCachePerformance's
  * round 3/4 (`testCache(10, ...)`), which is where
- * docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md
+ * the retired bug-h2-classid0-stale-address-family write-up
  * reproduces. The stock test spends ~700 s in two single-threaded rounds
  * before it ever starts the 10-reader phase, and then runs that phase for
  * only 4 s. This does the population once and then runs the 10-reader phase

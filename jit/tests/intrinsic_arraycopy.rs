@@ -392,6 +392,9 @@ fn compile_despec_arraycopy_with_dispatch(
         0x2a, 0x1b, 0x2c, 0x1d, 0x15, 0x04, 0xb8, 0x00, 0x01, 0xb1, 0, 0,
     ];
     compile_with_param_slots(
+        // Not a door: this test hands the backend hand-built bytecode with no
+        // method identity to admit. See `CompileAdmission::for_backend_test`.
+        &cratonvm_jit::compile_gate::CompileAdmission::for_backend_test(),
         &code,
         code.len(),
         5, // num_params: src, srcPos, dst, dstPos, len
@@ -420,12 +423,14 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(), // pic_slots
         Vec::new(), // ldc_info
         Vec::new(), // ldc_string_info
+        Vec::new(), // ldc_class_info
         Vec::new(), // ldc2w_info
         HashMap::new(),
         HashMap::new(),
         helpers,
         HashSet::new(),
         HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
         None, // string_layout
         &[],
         0,

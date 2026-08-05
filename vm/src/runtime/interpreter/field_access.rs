@@ -8,6 +8,7 @@
 //! its no-panic `deny` gate, where it has one) are inherited here.
 
 use super::*;
+use super::site_cache::{site_stats, FieldSiteCache, MethodSiteCache, MethodSiteInfo};
 
 
 /// Resolve a constant-pool field reference.
@@ -152,12 +153,51 @@ pub(crate) fn resolve_field_ref(
 /// global store. Behaviour is unchanged whenever the referencing class is
 /// NOT user-loader-owned (gate off, or a built-in defining loader) — that
 /// case still resolves via the same global `load_class_concurrent` path.
+/// `CRATONVM_JIT=field-site-cache` — enable the per-thread resolved-field site
+/// cache ([`FieldSiteCache`]). Read once and cached; this sits on the
+/// interpreter's field path. Default-OFF → behaviour byte-for-byte unchanged.
+fn field_site_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_SITE_CACHE").is_some()
+    })
+}
+
+/// `CRATONVM_JIT=field-site-cache-loader` — additionally admit
+/// **loader-sensitive** sites resolved from the loader-local lookup, guarded by
+/// the loader-resolution epoch as well. Implies `field-site-cache`; on its own
+/// it does nothing. Default-OFF and measured separately, because it is the arm
+/// with the wider correctness surface.
+fn field_site_cache_loader_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER").is_some()
+    })
+}
+
 pub(super) fn resolve_field_ref_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
+    // ---- Resolved constant pool: per-thread site cache ------------------
+    // A hit here answers the whole function with an array index, two integer
+    // tag compares and two relaxed atomic loads — no lock, no allocation, no
+    // class resolution. Only sites whose loader-aware revalidation was proven
+    // redundant at fill time are ever stored; see `FieldSiteCache`.
+    let epochs_at_entry = if field_site_cache_enabled() {
+        if let Some(hit) = thread.field_sites.get(current_class_id, cp_index) {
+            let hit = hit.clone();
+            site_stats::bump(site_stats::FIELD_HIT);
+            return Ok(hit);
+        }
+        site_stats::bump(site_stats::FIELD_MISS);
+        // Read BEFORE resolving; see `SiteCache::put`.
+        FieldSiteCache::epochs_now()
+    } else {
+        (0, 0)
+    };
     // A field cache entry may have been populated by a loader-blind helper
     // (verification, JIT metadata, or an earlier legacy path) before this
     // opcode reaches its loader-aware resolver. Do not trust such an entry
@@ -239,6 +279,10 @@ pub(super) fn resolve_field_ref_loader_aware(
         None
     };
 
+    // Whether the owner came from the loader-LOCAL lookup rather than the
+    // re-entrant resolver. Only the former has a writable validity condition
+    // (the two epochs); see `fill_field_site`.
+    let loader_local = loader_local_id.is_some();
     let field_class_id = match loader_local_id {
         Some(id) => id,
         None => resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?,
@@ -250,19 +294,144 @@ pub(super) fn resolve_field_ref_loader_aware(
                 || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
         };
         if cache_matches_owner {
+            fill_field_site(
+                thread,
+                current_class_id,
+                cp_index,
+                loader_sensitive,
+                loader_local,
+                epochs_at_entry,
+                &cached,
+            );
             return Ok(cached);
         }
     }
 
-    resolve_field_in_class(
+    let resolved = resolve_field_in_class(
         shared,
         current_class_id,
         cp_index,
         field_class_id,
         field_class_name,
         field_name,
-    )
+    )?;
+    fill_field_site(
+        thread,
+        current_class_id,
+        cp_index,
+        loader_sensitive,
+        loader_local,
+        epochs_at_entry,
+        &resolved,
+    );
+    Ok(resolved)
 }
+
+/// Offer a freshly-resolved site to the per-thread [`FieldSiteCache`].
+///
+/// A **loader-blind** site (`loader_sensitive == false`) is always offered: its
+/// owner resolution reads the global name → `ClassId` mapping and nothing else,
+/// so the class-definition epoch alone is a complete validity condition.
+///
+/// A **loader-sensitive** site is offered only under
+/// `CRATONVM_JIT=field-site-cache-loader`, and only when the owner came back
+/// from the loader-local lookup (`loader_local` — `class_defined_by_loader_exact`
+/// or the initiating-resolution memo) rather than from a re-entrant
+/// `resolve_class_loader_aware`. That restriction is what makes the validity
+/// condition writable: those two sources are covered exactly by the
+/// class-definition and loader-resolution epochs. A site that needed the
+/// re-entrant resolver keeps paying full revalidation every time, as before.
+///
+/// This split exists because the two cases have different reach. Tomcat's
+/// annotation scan run from a plain classpath is loader-blind, but the same
+/// code inside a real webapp deploy runs under a user-defined loader — so a
+/// fix that only covered the first would be measurable on the probe and inert
+/// where it matters. `CRATONVM_DBG=field-site`'s `reject_loader` counter is
+/// what says which case a given workload is in.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn fill_field_site(
+    thread: &mut JvmThread,
+    current_class_id: ClassId,
+    cp_index: u16,
+    loader_sensitive: bool,
+    loader_local: bool,
+    epochs_at_entry: (u64, u64),
+    resolved: &ResolvedField,
+) {
+    if !field_site_cache_enabled() {
+        return;
+    }
+    if loader_sensitive && !(loader_local && field_site_cache_loader_enabled()) {
+        site_stats::bump(site_stats::FIELD_REJECT_LOADER);
+        return;
+    }
+    thread
+        .field_sites
+        .put(current_class_id, cp_index, epochs_at_entry, resolved.clone());
+    site_stats::bump(site_stats::FIELD_FILL);
+}
+
+/// `CRATONVM_JIT=method-site-cache` — enable the per-thread resolved-method site
+/// cache, which removes `resolve_method_ref` from the inline-cache HIT path of
+/// `invokevirtual`/`invokespecial`/`invokeinterface`/`invokestatic` through a
+/// cached native or intrinsic. Default-OFF → behaviour byte-for-byte unchanged.
+fn method_site_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_METHOD_SITE_CACHE").is_some()
+    })
+}
+
+/// The `(descriptor, num_params)` pair the argument-popping helpers need, from
+/// the per-thread site cache when it can supply it and from `resolve_method_ref`
+/// otherwise.
+///
+/// Only the two values are cached, never the resolved owner or callback: those
+/// have dispatch semantics attached (loader identity, native-shadow
+/// suppression, redefine gates) that this table deliberately knows nothing
+/// about. A descriptor and a parameter count are properties of the
+/// constant-pool `NameAndType` alone, which is why they are safe to answer here
+/// under the module's epoch condition — see `site_cache`'s docs.
+#[inline]
+fn method_site_info(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_class_id: ClassId,
+    cp_index: u16,
+) -> Result<MethodSiteInfo, MethodCallFailed> {
+    if !method_site_cache_enabled() {
+        let (_cn, _mn, descriptor, num_params) =
+            resolve_method_ref(shared, caller_class_id, cp_index)?;
+        return Ok(MethodSiteInfo {
+            descriptor,
+            num_params: u16::try_from(num_params).unwrap_or(u16::MAX),
+        });
+    }
+    if let Some(hit) = thread.method_sites.get(caller_class_id, cp_index) {
+        let hit = hit.clone();
+        site_stats::bump(site_stats::METHOD_HIT);
+        return Ok(hit);
+    }
+    site_stats::bump(site_stats::METHOD_MISS);
+    // Read BEFORE resolving; see `SiteCache::put`.
+    let epochs_at_entry = MethodSiteCache::epochs_now();
+    let (_cn, _mn, descriptor, num_params) = resolve_method_ref(shared, caller_class_id, cp_index)?;
+    let info = MethodSiteInfo {
+        descriptor,
+        // A descriptor cannot declare more than 255 parameter slots (JVMS
+        // §4.3.3), so the clamp is unreachable for anything the verifier let
+        // through; saturating rather than truncating keeps a malformed
+        // descriptor from silently popping the wrong number of operands.
+        num_params: u16::try_from(num_params).unwrap_or(u16::MAX),
+    };
+    thread
+        .method_sites
+        .put(caller_class_id, cp_index, epochs_at_entry, info.clone());
+    site_stats::bump(site_stats::METHOD_FILL);
+    Ok(info)
+}
+
 
 /// Shared tail of [`resolve_field_ref`] / [`resolve_field_ref_loader_aware`]:
 /// given an already-resolved field-owning `field_class_id`, look up
@@ -795,7 +964,7 @@ pub(super) fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8
 /// `execute_invokevirtual_vtable_fast`) popped args the same way but never
 /// re-validated them before building the callee frame. Root-caused via
 /// `org.h2.test.unit.TestUpgrade`'s residual `NoSuchMethodError` — see
-/// `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`.
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`.
 #[inline]
 pub(super) fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     for value in args.iter_mut() {
@@ -905,8 +1074,18 @@ pub(super) fn pop_coerced_invoke_args_virtual(
     frame_idx: usize,
     thread: &mut JvmThread,
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
-    let (_class_name, _method_name, method_descriptor, num_params) =
-        resolve_method_ref(shared, caller_class_id, cp_index)?;
+    // PERF (2026-08-04): this is the inline-cache HIT path — `execute_invoke*_
+    // cached` reaches it after a 99.7%-warm `InvokeCache` lookup — and it used
+    // to call `resolve_method_ref` unconditionally for two of the four values
+    // that returns, paying a `resolution_cache` read lock, a hash probe and
+    // three `Arc<str>` clone/drop pairs per invoke. That drop glue alone was
+    // 1.5% of the Tomcat annotation-scan profile. `method_site_info` answers
+    // from a per-thread direct-mapped table instead; default-OFF.
+    let MethodSiteInfo {
+        descriptor: method_descriptor,
+        num_params,
+    } = method_site_info(shared, thread, caller_class_id, cp_index)?;
+    let num_params = num_params as usize;
     // PERF (2026-07-21): `nth_param_tag_byte` replaces `split_method_descriptor`
     // here — every caller of this Vec<String>/String-allocating parse only
     // ever read the first byte of each parameter token (see
@@ -960,8 +1139,13 @@ pub(super) fn pop_coerced_invoke_args_static(
     frame_idx: usize,
     thread: &mut JvmThread,
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
-    let (_class_name, _method_name, method_descriptor, num_params) =
-        resolve_method_ref(shared, caller_class_id, cp_index)?;
+    // PERF (2026-08-04): see `pop_coerced_invoke_args_virtual` — same removal
+    // of `resolve_method_ref` from the inline-cache HIT path.
+    let MethodSiteInfo {
+        descriptor: method_descriptor,
+        num_params,
+    } = method_site_info(shared, thread, caller_class_id, cp_index)?;
+    let num_params = num_params as usize;
     // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
     // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode

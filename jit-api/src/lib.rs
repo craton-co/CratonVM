@@ -197,7 +197,7 @@ mod descriptor_contract_tests {
 /// capture path safe. Index verification is by *name*, so a redefinition that
 /// reorders an overload set across the capture/read window is the one case
 /// verification cannot catch, and eager capture has no such window. See
-/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6.
+/// `arch-2026-07-26/cross-owner-closeout.md` §6.
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -270,7 +270,7 @@ pub struct CachedBytecodeMethod {
     /// registry generation instead, so a stale negative self-heals at the cost
     /// of one `u32` compare -- the same argument
     /// [`Self::jit_probe_generation`] below already relies on. See
-    /// `docs/internal/arch-2026-07-26/native-dispatch-memoization.md` §3
+    /// `arch-2026-07-26/native-dispatch-memoization.md` §3
     /// Steps 0 and 2 (sites A1-A3).
     ///
     /// # ONE CELL, ONE TRIPLE
@@ -296,7 +296,7 @@ pub struct CachedBytecodeMethod {
     /// all read `std::sync::OnceLock::new()`, which type-infers unchanged. The
     /// rename to `native_call_site` is a pure mechanical follow-up; see the
     /// cross-owner request in
-    /// `docs/internal/arch-2026-07-26/interpreter-completion.md`.
+    /// `arch-2026-07-26/interpreter-completion.md`.
     ///
     /// # JDK-only: this cell does NOT lose the `NativeKind`
     ///
@@ -516,15 +516,11 @@ impl CachedBytecodeMethod {
     #[inline]
     pub fn invoc_key(&self) -> u64 {
         *self.invoc_key.get_or_init(|| {
-            let mut h = 0u32;
-            for &b in self.method_name.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-            }
-            for &b in self.method_descriptor.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-            }
-            // Widening: class ID to u64 for hash key
-            ((self.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+            invoc_key_parts(
+                self.declaring_class_id.as_u32(),
+                &self.method_name,
+                &self.method_descriptor,
+            )
         })
     }
 
@@ -553,6 +549,26 @@ impl CachedBytecodeMethod {
         self.jit_probe_generation
             .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// The canonical `ProfileStore` invocation-counter key for a method.
+///
+/// Single source of the hash, because several sites key the SAME counters and a
+/// divergent hash would silently reset every method's warmup count rather than
+/// fail: [`CachedBytecodeMethod::invoc_key`] memoizes this, and the interpreter's
+/// back-edge tier-up path recomputes it from a live frame (where no
+/// `CachedBytecodeMethod` is in hand). Keep them bit-identical.
+#[inline]
+pub fn invoc_key_parts(declaring_class_id: u32, method_name: &str, method_descriptor: &str) -> u64 {
+    let mut h = 0u32;
+    for &b in method_name.as_bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+    }
+    for &b in method_descriptor.as_bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+    }
+    // Widening: class ID to u64 for hash key
+    ((declaring_class_id as u64) << 32) | (h as u64)
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -1000,7 +1016,7 @@ pub struct JitRuntimeHelpers {
     /// un-taken branch does `throw new SomeException(...)` therefore failed to
     /// compile at all — `resolve_jit_new_site` returned `None` and the whole
     /// compile bailed, permanently after `MAX_TIER_FAIL_RETRIES`
-    /// (docs/internal/jit-compile-bail-unresolved-new-cold-class.md).
+    /// (jit-compile-bail-unresolved-new-cold-class.md).
     ///
     /// This helper moves resolution to run time: the compiler bakes the
     /// *referencing* class id and the CP index, and the helper resolves +
@@ -1033,6 +1049,26 @@ pub struct JitRuntimeHelpers {
     pub monitor_enter: usize,
     /// `monitorexit`. See `monitor_enter`.
     pub monitor_exit: usize,
+    /// Constant-pool-indexed `ldc <Class>` (0x12/0x13 whose CP entry is a
+    /// `CONSTANT_Class`) — `extern "C" fn(vm_ptr: i64, holder_class_id: i64,
+    /// cp_idx: i64) -> i64`. Returns the target class's mirror `ObjectRef`,
+    /// or `0` after publishing a pending exception.
+    ///
+    /// CP-indexed rather than class-id-indexed for the same reason
+    /// [`Self::new_object_cp`] is: resolving the target can run a user
+    /// `ClassLoader.loadClass`, which must not happen inside the compiler, so
+    /// the *referencing* class id and the CP index are baked and resolution
+    /// happens at run time on the executing thread.
+    ///
+    /// Re-consulted on every execution, like [`Self::ldc_string`] and unlike
+    /// a baked immediate: a mirror is a heap object that a moving collector
+    /// can relocate between two invocations of the same compiled body.
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend refuses a
+    /// class-`ldc` site and bails the compile, which is the pre-fix
+    /// behaviour. Appended at the END of the struct so all prior golden
+    /// offsets stay stable.
+    pub ldc_class_cp: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1203,6 +1239,9 @@ helper_fields! {
     // Optional: 0 makes `ir_lower` refuse a graph containing monitor ops.
     (monitor_enter,                  FieldKind::OptionalPtr),
     (monitor_exit,                   FieldKind::OptionalPtr),
+    // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
+    // and bail the compile — the pre-fix behaviour.
+    (ldc_class_cp,                   FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1228,7 +1267,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 62,
+    JitRuntimeHelpers::NUM_FIELDS == 63,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1346,7 +1385,7 @@ mod tests {
         Ok(None)
     }
 
-    /// Step 0 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    /// Step 0 of `arch-2026-07-26/native-dispatch-memoization.md`
     /// §3: the per-entry native-dispatch memo must be substitutable for
     /// `registry.find(class, method, descriptor)` — on a miss, on a hit, and
     /// warm.
@@ -1619,6 +1658,7 @@ mod tests {
             anewarray_object_cp: 0x11A0,
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
+            ldc_class_cp: 0x11B8,
         }
     }
 
@@ -1853,6 +1893,7 @@ mod tests {
             anewarray_object_cp: 0,
             monitor_enter: 0,
             monitor_exit: 0,
+            ldc_class_cp: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2028,8 +2069,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 62.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 62);
+        // And the macro-driven count is the canonical 63.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 63);
     }
 
     #[test]
@@ -2337,6 +2378,11 @@ mod tests {
                 "monitor_exit",
                 std::mem::offset_of!(JitRuntimeHelpers, monitor_exit),
             ),
+            (
+                62,
+                "ldc_class_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, ldc_class_cp),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2391,7 +2437,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 42, "required-pointer count drifted");
-        assert_eq!(opt, 11, "optional-pointer count drifted");
+        assert_eq!(opt, 12, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }

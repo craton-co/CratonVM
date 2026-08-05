@@ -236,9 +236,9 @@ widening the cache entry was out of scope.
 
 ## Related
 
-* [Two divergent real-protected-stub allow-lists](real-protected-stub-allowlists-diverge.md)
+* [Two divergent real-protected-stub allow-lists](jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) (reconciled into one predicate 2026-08-04)
   — the list this hit path pre-filters on.
-* [The forced-native `String` policy](forced-native-string-policy-two-lists-that-disagree.md)
+* [The forced-native `String` policy, FIXED 2026-08-04](forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
   — the same cold-path/warm-path split, with a worse outcome.
 * [Additional wave-2 markers §1](additional-wave2-markers-not-in-the-original-inventory.md)
   — the JIT's MIC and PIC slots have the same missing-kind shape. The re-land

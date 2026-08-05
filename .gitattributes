@@ -18,3 +18,4 @@
 *.sh text eol=lf
 apps/hib-suite-runner/run-hib.sh text eol=lf
 apps/hib-suite-runner/class-overrides.tsv text eol=lf
+apps/hib-suite-runner/known-benign-aborts.tsv text eol=lf

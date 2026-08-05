@@ -35,7 +35,7 @@
 //! memo that has already answered, so every helper here goes through
 //! [`memoized`], which recomputes from source while an override is installed
 //! and never populates its `OnceLock` in that window. See
-//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+//! `libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 
 use cratonvm_types::flags::{MemoSlot, MEMO_UNSET};
 use std::collections::HashSet;
@@ -261,7 +261,7 @@ pub fn osr_backedge_enabled() -> bool {
 /// independent copies of the same env-var parse (this file, a
 /// `classloading::class_manager` copy, and a `native-builtins::classloader`
 /// copy) — they drifted out of lock-step at least once in production (see
-/// `docs/internal/loader-identity.md`). `cratonvm_classloading::
+/// `fixed-suite-bugs/loader-identity.md`). `cratonvm_classloading::
 /// loader_aware_resolution` is now the single source of truth; this
 /// function is kept (same name, same signature, own doc history below) so
 /// none of ITS callers have to change, but it simply forwards to the
@@ -283,8 +283,8 @@ pub fn osr_backedge_enabled() -> bool {
 /// global fast path, so this only engages for classes defined by custom
 /// loaders — but that still covers web-app / OSGi / proxy loaders broadly,
 /// which is why this shipped gated (default off) pending an app-gauntlet
-/// soak; see `docs/known-issues/hib-proxyclassreuse-loader-blind-class-
-/// resolution.md`.
+/// soak; see `fixed-suite-bugs/hibernate/
+/// hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md`.
 ///
 /// **Why the default flipped:** every Apache Groovy dynamic-DSL script run
 /// (e.g. Spring's `GroovyBeanDefinitionReader`/`GenericGroovyApplicationContext`)
@@ -551,7 +551,7 @@ pub fn real_proxy_super() -> bool {
 // cached snapshot lacks, and the real-lane Fork6/Fork6Hard GC-stress repros
 // reported none. Repointing it at the resolved flag would instead have fired
 // the bypass always and made the cache dead code on every run. See
-// docs/internal/rootsnap-cache-bypass-lost-its-trigger-RESOLVED-20260731.md.
+// rootsnap-cache-bypass-lost-its-trigger-RESOLVED-20260731.md.
 
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every
@@ -682,7 +682,7 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // Turning it off cost ~8.4x on ordinary instance-method bytecode — measured on
 // `CalleeTierUpProbe`, 2 432 ns on / 18 047 ns off — because `recycle()`-shaped
 // methods (plain field stores, no handlers) are exactly the ones the ban was
-// never about. See `docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md`.
+// never about. See `fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md`.
 //
 // Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
 #[inline]
@@ -806,7 +806,7 @@ cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
 /// suspect whenever an interpreter-only run starts producing nondeterministic
 /// wrong answers. Being able to A/B it within ONE binary is what let the
 /// Hibernate HQL mis-parse be attributed to the moving young collector instead
-/// (see `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`);
+/// (see `fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`);
 /// keep the switch so the next such question costs one run, not one build.
 #[inline]
 pub fn trivial_getter_fast_path() -> bool {
@@ -1119,6 +1119,21 @@ pub fn jit_ir_call_virtual() -> bool {
     })
 }
 
+/// PGO-02: guarded monomorphic-virtual-call inlining. Default-OFF (absent or
+/// `"0"`/`"false"` => disabled) - a new speculative JIT lowering soaks behind
+/// an opt-in flag per the c2 remediation wave's own rule, not the inverted
+/// default some `ir-*` levers above use. `=1` (or any other non-`"0"`/
+/// `"false"` value) opts in. See
+/// `docs/feature-designs/profile-guided-inlining.md`.
+#[inline]
+pub fn jit_guarded_virtual_inline() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE")
+            .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
+}
+
 #[inline]
 pub fn jit_ir_fp() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
@@ -1243,7 +1258,7 @@ impl RealSelector {
 // `perf record -F 999` attributed ~3.5% of the run to `getenv` and its
 // callers. This is the same defect class as the 2026-07-23 fix for
 // `callee_saved_gpr_local_homes_enabled()` in `vm/src/jit/skip_list.rs` — see
-// `docs/known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`,
+// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`,
 // which is where that one was found and where these were.
 //
 // NOTE: like every other helper in this module, these read the legacy

@@ -1,0 +1,2330 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! The compilation entry points.
+//!
+//! `compile_with_param_slots` is the production entry: it takes the parameter
+//! layout, the per-bci metadata tables the interpreter resolved, and the runtime
+//! helper table, drives `Compiler` through the bytecode walk, and publishes the
+//! `CompiledMethod` together with its OSR entry table, oop maps and deopt
+//! points. `compile` is the legacy wrapper that assumes `arg index == JVM slot`
+//! — correct only for all-category-1 parameter lists, which is why it is a test
+//! and AOT entry rather than the one `try_compile` uses.
+//!
+//! The thread-locals here are the staging channel for metadata that would
+//! otherwise have to thread through an already-enormous argument list. Each is
+//! *taken* (cleared) at the entry that consumes it, so a compile that bails out
+//! cannot leak its staging into the next method compiled on the same worker.
+
+use super::*;
+
+// ---------------------------------------------------------------------------
+// Public compilation entry point
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Compact reference-field layout: per-pc `(byte_offset, is_ref)` for the
+    /// next `compile()` call, set by the interpreter's execute / OSR compile
+    /// paths (which use the `compile` wrapper, not `compile_with_param_slots`
+    /// directly) so their getfield/putfield get inline compact codegen. Taken
+    /// (cleared) by the wrapper. Empty for every other caller (tests, AOT) →
+    /// legacy/helper field path. Same-thread, synchronous compile, no nesting.
+    static PENDING_COMPACT_FIELD_INFO: std::cell::RefCell<Vec<(usize, u32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static PENDING_VERIFIED_MAX_STACK: std::cell::RefCell<Option<usize>> =
+        const { std::cell::RefCell::new(None) };
+    /// `(start_pc, end_pc, handler_pc)` of this method's exception table,
+    /// staged for the next `compile_with_param_slots` on this thread and
+    /// consumed (taken) at its entry, so a compile that bails out cannot leak
+    /// them into the next method compiled on this worker. Empty for every
+    /// caller that does not stage them (tests, AOT, the legacy `compile`
+    /// wrapper, OSR artifacts) and for every handler-free method — byte
+    /// identical codegen there. See `find_bypassable_loop_headers`.
+    static PENDING_EXCEPTION_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Stage the compact-field-info for the next [`compile`] call on this thread.
+/// Call immediately before `compile`; the wrapper takes (clears) it.
+pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
+    PENDING_COMPACT_FIELD_INFO.with(|c| *c.borrow_mut() = info);
+}
+
+/// Stage the reader/verifier max_stack for the next x64 compile on this thread.
+/// Synthetic callers that do not stage it keep using the local estimator.
+pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
+    PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
+}
+
+/// Stage this method's exception table as `(start_pc, end_pc, handler_pc)` for
+/// the next x64 compile on this thread. Call immediately before
+/// `compile_with_param_slots`; it takes (clears) them. Consumed only by
+/// `find_bypassable_loop_headers`, to treat a handler that can be entered from
+/// outside a loop as an external entry into that loop's header.
+pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
+    PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
+}
+
+/// Compile a JVM bytecode method to x86-64 machine code.
+///
+/// When `needs_heap` is true, the compiled code expects a heap pointer as the
+/// hidden first C argument, and Java parameters follow. This enables
+/// JIT-compiled array allocation and element access via helper call-outs.
+///
+/// Legacy entry point: assumes `arg index == JVM slot`, which is correct only
+/// for methods whose parameters are all category-1 (no long/double). Test call
+/// sites use this; the production path (`jit/src/lib.rs::try_compile`) calls
+/// [`compile_with_param_slots`] with the real parameter layout so long/double
+/// parameters land in the slots their body reads.
+///
+/// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
+#[allow(clippy::too_many_arguments)]
+pub fn compile(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    needs_heap: bool,
+    multianewarray_info: Vec<(usize, u8)>,
+    field_info: Vec<(usize, usize, u8)>,
+    typecheck_info: Vec<(usize, *const u8, usize)>,
+    static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
+    anewarray_info: Vec<(usize, u32)>,
+    invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    direct_calls: Vec<(usize, crate::JitDirectCall)>,
+    mic_slots: Vec<(usize, *const crate::JitMICSlot)>,
+    pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
+    ldc_info: Vec<(usize, i64)>,
+    ldc2w_info: Vec<(usize, i64)>,
+    branch_hints: HashMap<usize, bool>,
+    loop_unroll_hints: HashMap<usize, usize>,
+    helpers: &JitRuntimeHelpers,
+    non_escaping_new: std::collections::HashSet<usize>,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+    string_layout: Option<crate::StringFieldLayout>,
+) -> Option<CompiledMethod> {
+    // This wrapper does NOT take an admission token, and that is deliberate.
+    //
+    // It is the legacy test entry point — its "arg index == JVM slot"
+    // assumption is wrong for any method with a `long`/`double` parameter, so
+    // no production path can use it, and none does (the only callers outside
+    // this crate are two `#[cfg(test)]` fixtures in `vm/src/vm.rs`). Threading
+    // a token through it would have meant editing ~140 unit-test call sites to
+    // gate a function production cannot use.
+    //
+    // The escape it leaves is still visible: `for_backend_test` does not open
+    // the thread scope, so anything reaching the backend this way is counted by
+    // `compile_gate::ungated_backend_entries()`, which the VM asserts is zero
+    // over a real run. `compile_with_param_slots` — the entry point the three
+    // real doors use — is the one that requires the token.
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        needs_heap,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        new_info,
+        // Deferred (not-yet-loaded) `new`/`anewarray` sites: the legacy/test
+        // wrapper has no constant pool to defer against, so never any.
+        Vec::new(),
+        anewarray_info,
+        Vec::new(),
+        invoke_info,
+        direct_calls,
+        mic_slots,
+        pic_slots,
+        ldc_info,
+        // ldc_string_info / ldc_class_info: the legacy/test wrapper has no
+        // constant pool to resolve either against, so never any.
+        Vec::new(),
+        Vec::new(),
+        ldc2w_info,
+        branch_hints,
+        loop_unroll_hints,
+        helpers,
+        non_escaping_new,
+        inline_sites,
+        // PGO-02: legacy/test wrapper never plans a guarded virtual inline
+        // (it has no profile-driven admission path at all).
+        HashMap::new(),
+        string_layout,
+        &[],
+        0,
+        0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
+        // Compact field info staged by the caller (interpreter execute/OSR);
+        // empty for tests/AOT → legacy/helper field path.
+        PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Prove that every hot recursive edge in this body is GC-inert.
+///
+/// A raw `invokestatic` (no invoke/direct-call metadata) is the x64 backend's
+/// representation of a self call; `try_compile` only leaves a site raw after
+/// resolving it to the current method. The strict opcode whitelist excludes
+/// allocation, arbitrary helpers, monitors, exception creation, arrays, and
+/// loops. Forward branches and resolved inline `getfield` are harmless.
+pub(super) fn gc_inert_selfrec_candidate(
+    code: &[u8],
+    code_len: usize,
+    field_info: &[(usize, usize, u8)],
+    new_info: &[(usize, u32, usize, bool, bool)],
+    new_deferred_info: &[(usize, u32, u16)],
+    anewarray_info: &[(usize, u32)],
+    anewarray_deferred_info: &[(usize, u32, u16)],
+    invoke_info: &[(usize, *const JitInvokeInfo)],
+    direct_calls: &[(usize, crate::JitDirectCall)],
+    mic_slots: &[(usize, *const crate::JitMICSlot)],
+    pic_slots: &[(usize, *const crate::JitPICSlot)],
+    indy_info: &[(usize, usize, u8, Vec<u8>, usize)],
+) -> bool {
+    if !gc_inert_selfrec_enabled()
+        || !new_info.is_empty()
+        // A deferred `new`/`anewarray` allocates too — the opcode whitelist
+        // below already excludes 0xbb/0xbd, but keep the metadata gate
+        // symmetric with the resolved lists so a future whitelist change
+        // cannot silently admit an allocating body here.
+        || !new_deferred_info.is_empty()
+        || !anewarray_info.is_empty()
+        || !anewarray_deferred_info.is_empty()
+        || !invoke_info.is_empty()
+        || !direct_calls.is_empty()
+        || !mic_slots.is_empty()
+        || !pic_slots.is_empty()
+        || !indy_info.is_empty()
+    {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    let mut self_calls = 0usize;
+    let mut saw_return = false;
+    while pc < code_len {
+        let op = code[pc];
+        let allowed = match op {
+            0x00..=0x11
+            | 0x15..=0x2d
+            | 0x36..=0x4e
+            | 0x57..=0x6b
+            | 0x74..=0x98 => true,
+            // Conditional branches and forward goto only. A backward edge
+            // would need cooperative polling and is therefore not GC-inert.
+            0x99..=0xa7 | 0xc6 | 0xc7 => {
+                if pc + 2 >= code_len {
+                    return false;
+                }
+                let rel = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                rel > 0 && pc.checked_add_signed(rel).is_some_and(|t| t < code_len)
+            }
+            0xac..=0xb1 => {
+                saw_return = true;
+                true
+            }
+            0xb4 => field_info.iter().any(|(field_pc, _, _)| *field_pc == pc),
+            0xb8 => {
+                self_calls += 1;
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    pc == code_len && self_calls != 0 && saw_return
+}
+
+/// Compile a method to native code with an explicit parameter→JVM-slot map.
+///
+/// `param_jvm_slots[i]` is the JVM local slot of the i-th incoming JIT
+/// argument (`this` first for instance methods, then declared params), and
+/// `param_slot_span` is the total JVM slots the parameters occupy (category-2
+/// counted as 2). These let the prologue place long/double parameters in the
+/// slots the body actually reads. Pass `&[]` / `0` for the legacy
+/// "arg index == slot" behavior (see the [`compile`] wrapper).
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_param_slots(
+    // ── The admission gate, enforced by the type system ───────────────
+    //
+    // Proof that the caller passed `compile_gate::admit` — the kill switch,
+    // the permanent bail-list, the bisect levers, the code-cache cap, and the
+    // compile-epoch witness opened BEFORE any constant-pool read. There are
+    // three doors into this function and for a long time only one of them
+    // asked all of that; the other two carried hand-copied subsets, each added
+    // after its own bug. `osr-01`'s brief asked for the paths to be unable to
+    // "drift again", and this parameter is what makes a fourth door written
+    // without the gate a *compile error* rather than a red test.
+    //
+    // The `jit` crate's own tests are not doors — they hand this function
+    // hand-built bytecode with no method identity to admit — and they use
+    // `CompileAdmission::for_backend_test()`, which is deliberately still
+    // visible to `compile_gate::ungated_backend_entries()`.
+    //
+    // Unused in the body on purpose: it is a capability, not data.
+    admission: &crate::compile_gate::CompileAdmission,
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    needs_heap: bool,
+    multianewarray_info: Vec<(usize, u8)>,
+    field_info: Vec<(usize, usize, u8)>,
+    typecheck_info: Vec<(usize, *const u8, usize)>,
+    static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    // CRIT-2 — see `new_info` field doc on the compiler struct.
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
+    // Cold-`new` fix — see `new_deferred_info` on the compiler struct. Sites
+    // whose target class was not loaded at compile time; served by the
+    // CP-indexed `new_object_cp` helper. Disjoint from `new_info`.
+    new_deferred_info: Vec<(usize, u32, u16)>,
+    anewarray_info: Vec<(usize, u32)>,
+    // `anewarray` sibling of `new_deferred_info`.
+    anewarray_deferred_info: Vec<(usize, u32, u16)>,
+    invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    direct_calls: Vec<(usize, crate::JitDirectCall)>,
+    mic_slots: Vec<(usize, *const crate::JitMICSlot)>,
+    // HIGH-7 — Inline 4-way PIC slots passed alongside MIC slots.
+    //
+    // Each entry is `(bytecode_pc, &JitPICSlot as *const _)`. When a
+    // PIC slot is present at a given pc, the codegen in
+    // `Compiler::compile_op_invokevirtual` emits the 4-way inline
+    // cascade in place of the MIC probe (PIC supersedes MIC — it is
+    // a 4-entry superset). The slot itself is allocated and owned by
+    // the caller (`jit/src/lib.rs::try_compile`); it must outlive the
+    // compiled method, which is ensured by attaching the boxed slot
+    // to `CompiledMethod._jit_pic_slots`.
+    //
+    // Callers that don't yet allocate PIC slots (e.g. legacy test
+    // call sites that build short bytecode snippets) pass
+    // `Vec::new()` and the cascade is simply not emitted at any pc.
+    pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
+    ldc_info: Vec<(usize, i64)>,
+    ldc_string_info: Vec<(usize, *const u8, usize)>,
+    // Class-`ldc` sites — see `ldc_class_info` on the compiler struct. Served
+    // by the CP-indexed `ldc_class_cp` helper; disjoint from `ldc_info` and
+    // `ldc_string_info`.
+    ldc_class_info: Vec<(usize, u32, u16)>,
+    ldc2w_info: Vec<(usize, i64)>,
+    branch_hints: HashMap<usize, bool>,
+    loop_unroll_hints: HashMap<usize, usize>,
+    helpers: &JitRuntimeHelpers,
+    non_escaping_new: std::collections::HashSet<usize>,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+    // PGO-02: the guarded variants of a speculative virtual/interface inline
+    // site — `(receiver class id, the body THAT CLASS dispatches to)`, in guard
+    // order, keyed by the same pc as `inline_sites`. One entry is a Monomorphic
+    // plan, two are a Bimorphic one. See
+    // `docs/feature-designs/profile-guided-inlining.md`.
+    //
+    // Element `[0]` is ALSO the `inline_sites` entry for that pc (the primary
+    // body), so the buffer/frame reservations below count it exactly once and
+    // `try_emit_inline(pc)` finds it where it has always been; element `[1]`
+    // exists only here and is added to those reservations explicitly.
+    //
+    // Deliberately NOT threaded through the loop-unroll pc-replication tuple a
+    // few lines below (unlike `inline_sites` itself) — a replicated pc without
+    // an entry here just falls back to normal dispatch for that unrolled copy,
+    // which is always correct, only not optimized.
+    inline_guard_variants: HashMap<usize, Vec<(u32, crate::InlineSite)>>,
+    // Compile-time resolved `java/lang/String` field layout for the String
+    // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
+    // layout unavailable" — String-intrinsic codegen (added by a later
+    // wave) treats it as a bail-to-dispatch. See `crate::StringFieldLayout`.
+    string_layout: Option<crate::StringFieldLayout>,
+    param_jvm_slots: &[usize],
+    param_slot_span: usize,
+    // Stage A.4 (precise oop maps) — bitmask of JVM local slots holding a
+    // reference parameter on entry (bit `k` ⇒ slot `k` is an oop). Seeds the
+    // "must be oop" local dataflow so oop params live at an early safepoint are
+    // precisely covered. `0` on the default path → byte-identical codegen.
+    param_oop_mask: u64,
+    // Compact reference-field layout: per-getfield/putfield `(pc, byte_offset,
+    // is_ref)` so the codegen can emit an inline compact field access (no helper
+    // call, no runtime layout lookup). Empty when the flag is off → the inline
+    // emitters fall back to the legacy 16-byte cell / helper path.
+    compact_field_info: Vec<(usize, u32, bool)>,
+    // deopt-osr Step 9 follow-up (c) — this method's
+    // `"<class>.<method>:<descriptor>"` key, used to consult the per-bci de-spec
+    // registry (`crate::deopt::despec_contains`) and suppress a loop-header
+    // speculative-BCE guard that has repeatedly deopted. `""` (the legacy/test
+    // `compile()` wrapper) disables the consult; the registry is empty in
+    // production, so a non-empty key is still byte-identical there.
+    method_key: &str,
+    // Resolved `invokedynamic` (0xba) call-site info — see the `indy_info`
+    // field doc on the `Compiler` struct. Empty from the legacy `compile()`
+    // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
+    // this is always consistent with an invokedynamic-free method there).
+    indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
+) -> Option<CompiledMethod> {
+    // The drift witness for `compile_gate`. Every production door must hold an
+    // admission token when it gets here; this counts the entries that do not,
+    // which is how a FOURTH door added later announces itself instead of
+    // silently skipping the admission checks the way the OSR and eager
+    // first-call doors did for months. Behaviour-named on purpose: a check that
+    // scanned the source for `compile_with_param_slots(` would have died the
+    // day `x64.rs` was split, as five checks in this repository did.
+    //
+    // Non-zero inside this crate's own tests is expected and meaningless — a
+    // unit test calling the backend is not a door. The assertion that matters
+    // lives in the VM.
+    //
+    // Kept even though `admission` is now required by the signature: the two
+    // layers fail differently. The parameter stops a door written *without*
+    // the gate; this counter stops a door written *with*
+    // `CompileAdmission::for_backend_test()`, which the type system cannot
+    // tell apart from a real one.
+    let _ = admission;
+    crate::compile_gate::note_backend_entry();
+    // A class-`ldc` calls a helper that takes the VM context as its first
+    // argument, exactly like a string-`ldc`, so it forces the context form of
+    // the artifact too.
+    let needs_heap = needs_heap || !ldc_string_info.is_empty() || !ldc_class_info.is_empty();
+    let gc_inert_selfrec = gc_inert_selfrec_candidate(
+        code,
+        code_len,
+        &field_info,
+        &new_info,
+        &new_deferred_info,
+        &anewarray_info,
+        &anewarray_deferred_info,
+        &invoke_info,
+        &direct_calls,
+        &mic_slots,
+        &pic_slots,
+        &indy_info,
+    );
+    let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
+    // One-shot like every other staged request below: take it here so an early
+    // bail cannot leak this method's handler ranges into an unrelated later
+    // compile on this worker thread.
+    let exception_ranges: Vec<(usize, usize, usize)> =
+        PENDING_EXCEPTION_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // Consume the pure-kernel GPR local-homes request FIRST so an early bail
+    // below can never leak it into an unrelated later compile on this thread.
+    let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
+    // A handler-local request is one-shot too, so a compile bailout cannot
+    // accidentally arm the next unrelated method on this worker thread.
+    let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // Same one-shot discipline as the flag above.
+    let protected_ranges = PROTECTED_RANGES_REQUEST
+        .with(|c| c.take())
+        .unwrap_or_default();
+    // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
+    // but the published artifact KEEPS its OSR entries — the trampoline's
+    // register-seeded entry contract is exactly what the assignments
+    // describe. See `set_kernel_reg_homes_osr_request`.
+    let kernel_reg_homes_osr_requested =
+        KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
+
+    // ── Bytecode loop rewriter (opt-in; see `set_bytecode_loop_rewriter_armed`)
+    //
+    // This is the whole interception. Below this point `code`/`code_len` are
+    // the REWRITTEN method and every pc-keyed side table has been lifted into
+    // its PC space, so the ~40 analyses and the emitter are unmodified: they
+    // simply see a different method. Three things make that sound, and all
+    // three are here rather than scattered:
+    //
+    //   (i)   the rewrite itself, refused for anything it cannot describe;
+    //   (ii)  ONE replication of ALL pc-keyed tables, in one expression, so a
+    //         table cannot be forgotten silently;
+    //   (iii) the coordinate change back to interpreter-bci space, which is
+    //         `Compiler::orig_bci` at the three sites that BAKE a bci into
+    //         machine code plus the `osr_pc_to_native` / `osr_dead_mask`
+    //         rebuild at the end of this function.
+    //
+    // `None` on every unarmed compile, at the cost of one thread-local
+    // `Cell<bool>` load, and the whole path below is then the identity.
+    let loop_xform: Option<LoopXform> = match plan_bytecode_loop_xform(
+        code,
+        code_len,
+        &exception_ranges,
+        &loop_unroll_hints,
+        LoopRewriteShape {
+            deopt_real: crate::deopt_real_enabled(),
+            precise_exception_frames,
+            has_indy: !indy_info.is_empty(),
+            has_inline_sites: !inline_sites.is_empty(),
+        },
+    ) {
+        Ok(x) => {
+            crate::metrics::record_loop_xform_event("loop_xform_applied");
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                eprintln!(
+                    "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
+                     body_len={} copies={} code_len {}->{} poll_free={}",
+                    x.kind,
+                    x.versioning.is_some(),
+                    x.header,
+                    x.body_len,
+                    x.copies,
+                    code_len,
+                    x.code_len,
+                    x.poll_free_bytes
+                );
+            }
+            Some(x)
+        }
+        Err(refusal) => {
+            if !matches!(refusal, LoopRewriteRefusal::NotArmed)
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+            {
+                eprintln!("[JIT_GEN] bytecode loop rewrite refused: {refusal:?}");
+            }
+            None
+        }
+    };
+    // Kept for the coordinate change at the end of this function; `code_len`
+    // is about to become the rewritten length.
+    let orig_code_len = code_len;
+    // A rewritten method has a backward branch, and `gc_inert_selfrec_candidate`
+    // (computed above, on the ORIGINAL bytes and tables) rejects every backward
+    // branch — so this conjunction is already true. Written out anyway so the
+    // one predicate computed before the rewrite cannot silently start
+    // describing a method that no longer exists.
+    let gc_inert_selfrec = gc_inert_selfrec && loop_xform.is_none();
+    let (code, code_len): (&[u8], usize) = match &loop_xform {
+        Some(x) => (&x.code[..], x.code_len),
+        None => (code, code_len),
+    };
+    // Handler ranges in output coordinates. A range enclosing the loop is
+    // WIDENED over the copies by the rewriter, which is what keeps a `try`
+    // that lexically encloses the loop covering every copy.
+    let exception_ranges: Vec<(usize, usize, usize)> = match &loop_xform {
+        Some(x) => x.exception_ranges.clone(),
+        None => exception_ranges,
+    };
+    // The per-bci de-spec registry (`crate::deopt::despec_contains`) is keyed
+    // by INTERPRETER bci, but every loop header below is an output pc. Consult
+    // it through the provenance map. Identity when unarmed.
+    let despec_bci = |pc: usize| -> u32 {
+        // Cast: bci fits u32 (checked against u32::MAX by the rewriter)
+        loop_xform.as_ref().and_then(|x| x.bci_at(pc)).unwrap_or(pc) as u32
+    };
+
+    // ── Side-table replication — ATOMIC BY CONSTRUCTION ────────────────
+    //
+    // All 21 pc-keyed tables `compile_with_param_slots` receives, rebound in
+    // ONE expression. Adding a 22nd parameter and forgetting it here is a
+    // compile error at the destructuring, not a silent miscompile: a copy that
+    // lost its `field_info` entry takes the helper-call fallback instead of the
+    // inline access and nothing fails.
+    //
+    // Payloads are CLONED, so the pointer-carrying tables (`typecheck_info`,
+    // `invoke_info`, `mic_slots`, `pic_slots`, `ldc_string_info`) share one
+    // target across the copies. For the read-only ones (a class name, a
+    // resolved-invoke descriptor, an interned string) that is trivially sound.
+    // For the two MUTABLE ones (`mic_slots`, `pic_slots`) it is sound because
+    // an inline cache keyed on a call site sees the same receiver distribution
+    // in every copy — exactly what happens today when a non-unrolled loop runs
+    // many times. It is also what makes them safe to share at all: the caller
+    // (`jit/src/lib.rs::try_compile`) owns and outlives these slots, and
+    // minting fresh ones per copy would need code outside this crate's file.
+    let (
+        multianewarray_info, field_info, typecheck_info, static_field_info,
+        new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
+        invoke_info, direct_calls, mic_slots, pic_slots,
+        ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
+        loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+        indy_info,
+    ) = match &loop_xform {
+        None => (
+            multianewarray_info, field_info, typecheck_info, static_field_info,
+            new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
+            invoke_info, direct_calls, mic_slots, pic_slots,
+            ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
+            loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+            indy_info,
+        ),
+        Some(x) => (
+            x.replicate_pc_keyed(&multianewarray_info),
+            replicate_pc3(x, field_info),
+            replicate_pc3(x, typecheck_info),
+            replicate_pc5(x, static_field_info),
+            replicate_pc5(x, new_info),
+            replicate_pc3(x, new_deferred_info),
+            x.replicate_pc_keyed(&anewarray_info),
+            replicate_pc3(x, anewarray_deferred_info),
+            x.replicate_pc_keyed(&invoke_info),
+            // `JitDirectCall` is not `Clone` (it lives in `jit/src/lib.rs`,
+            // which this agent does not own), so its payload is packed into a
+            // tuple of `Copy` fields, replicated by the same primitive, and
+            // rebuilt. Adding `#[derive(Clone)]` there would let this use
+            // `replicate_pc_keyed` directly.
+            {
+                let packed: Vec<(usize, (usize, bool, usize, u8, u32))> = direct_calls
+                    .into_iter()
+                    .map(|(pc, d)| {
+                        (
+                            pc,
+                            (
+                                d.entry,
+                                d.needs_context,
+                                d.num_params,
+                                d.return_type,
+                                d.guard_class_id,
+                            ),
+                        )
+                    })
+                    .collect();
+                x.replicate_pc_keyed(&packed)
+                    .into_iter()
+                    .map(
+                        |(pc, (entry, needs_context, num_params, return_type, guard_class_id))| {
+                            (
+                                pc,
+                                crate::JitDirectCall {
+                                    entry,
+                                    needs_context,
+                                    num_params,
+                                    return_type,
+                                    guard_class_id,
+                                },
+                            )
+                        },
+                    )
+                    .collect::<Vec<(usize, crate::JitDirectCall)>>()
+            },
+            x.replicate_pc_keyed(&mic_slots),
+            x.replicate_pc_keyed(&pic_slots),
+            x.replicate_pc_keyed(&ldc_info),
+            replicate_pc3(x, ldc_string_info),
+            replicate_pc3(x, ldc_class_info),
+            x.replicate_pc_keyed(&ldc2w_info),
+            x.replicate_pc_keyed(&branch_hints.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, bool>>(),
+            // Keyed by BACK-EDGE pc. Under `Unroll` an original back-edge bci
+            // has exactly one image (the last copy carries the only back edge),
+            // so this stays single-valued.
+            x.replicate_pc_keyed(&loop_unroll_hints.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, usize>>(),
+            x.replicate_pc_keyed(
+                &non_escaping_new
+                    .into_iter()
+                    .map(|pc| (pc, ()))
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .map(|(pc, ())| pc)
+            .collect::<std::collections::HashSet<usize>>(),
+            // Always empty here — `InlineSitesPresent` refuses the transform —
+            // but routed through the same primitive so the census has no
+            // "handled elsewhere" entry.
+            x.replicate_pc_keyed(&inline_sites.into_iter().collect::<Vec<_>>())
+                .into_iter()
+                .collect::<HashMap<usize, crate::InlineSite>>(),
+            replicate_pc3(x, compact_field_info),
+            // NOT empty any more. `InvokedynamicPresent` used to refuse the
+            // transform outright; since the deopt bci translation landed, a
+            // method with an `invokedynamic` is rewritten like any other and
+            // every copy of a `0xba` site needs its own entry here — the site
+            // lowers to an unconditional trap that records a resume snapshot,
+            // and a copy without an entry would bail the whole compile
+            // (`indy_info_idx` miss ⇒ `return false`).
+            replicate_pc5(x, indy_info),
+        ),
+    };
+
+    // Estimate buffer size. A bytecode invoke is not the old ~40-byte helper
+    // call: the current lowering can emit a context bridge, exception/deopt
+    // edge, and MIC/PIC dispatch machinery. Hibernate's concurrent query path
+    // demonstrated that the former 96-byte invoke allowance repeatedly
+    // exhausted otherwise modest 10 KiB buffers, leaving hot methods in the
+    // interpreter. Keep enough headroom for those sites; the code-cache cap
+    // remains the global bound on retained executable memory.
+    //
+    // 512 -> 1024 (2026-08-01). Widening the PIC's inter-slot branch from
+    // `rel8` to `rel32` grew every inline-cache site, and 512 stopped covering
+    // them. Measured on one Spring Boot suite class: TEN methods overflowed per
+    // run, and in every one of them `inline_extra` was 0 and the whole shortfall
+    // sat in this term. Solving each for the per-invoke cost the body actually
+    // needed — `(wanted - code_len * 96 - 8192) / invokes`, which OVER-attributes
+    // (the `code_len * 96` term also pays for the invoke bytecodes) — gives:
+    //
+    //     MapperListener.containerEvent           68 invokes   957 B/invoke
+    //     AbstractBeanDefinition.<init>           83 invokes   824
+    //     OnBeanCondition.getMatchingBeans        34 invokes   728
+    //     ObjectCreateRule.begin                  22 invokes   674
+    //     ResolvableType.getNested                 6 invokes   642
+    //     ClassFileAnnotationMetadata.resolveTypeName 7 invokes 640
+    //     StringUtils.collectionToDelimitedString 16 invokes   578
+    //     AbstractAutowireCapableBeanFactory.populateBean 34   547
+    //     DateTimeFormatterBuilder$NumberPrinterParser.format 36 531
+    //     jdk.internal.classfile.impl.ClassImpl.forEach 21     515
+    //
+    // 1024 covers the worst of them with margin. Unlike the optimizing tier —
+    // which now measures the shortfall and re-runs the lowering at that size
+    // (`ir_lower::lower_inner`) — this backend cannot retry: it consumes six
+    // one-shot thread-local staging requests before the buffer is allocated,
+    // and re-entering it would find them gone. The estimate has to be right the
+    // first time here, so it errs high.
+    // PGO-02 (bimorphic): a two-guard site splices a SECOND body at the same
+    // pc, and that body is not in `inline_sites`. Both this buffer estimate
+    // and the spill reservation below must see it — this backend cannot retry
+    // a short buffer, and an unreserved inlined body writes past the spill
+    // region into the callee-saved area. Skip variant `[0]`, which IS the
+    // `inline_sites` entry and is already counted.
+    let extra_guard_bodies = || {
+        inline_guard_variants
+            .values()
+            .flat_map(|variants| variants.iter().skip(1).map(|(_, s)| s))
+    };
+    let inline_extra: usize = inline_sites
+        .values()
+        .chain(extra_guard_bodies())
+        .map(|s| s.callee_code_len.saturating_mul(64))
+        .sum();
+    let estimated_size = code_len
+        .saturating_mul(96)
+        .saturating_add(8192)
+        .saturating_add(invoke_info.len().saturating_mul(1024))
+        .saturating_add(inline_extra);
+    let mut buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    buf.set_tag("x64-single-pass");
+
+    // Size operand-stack spills from the reader/verifier max_stack when the
+    // production path supplies it. Keep the local estimator as a defensive floor
+    // for legacy tests and future synthetic call sites.
+    let estimated_max_stack = estimate_max_stack(code, code_len);
+    let max_stack = verified_max_stack
+        .map(|verified| verified.max(estimated_max_stack))
+        .unwrap_or(estimated_max_stack);
+    // Bug-4 frame sizing, part B: the invoke-dispatch sites carve their
+    // outgoing args buffer at the CURRENT spill watermark and extend it by
+    // n*8 bytes for the call's duration. At worst (operand stack at
+    // max_stack depth when the deepest-arity call is emitted) the buffer
+    // tops out n slots past the spill region — overlapping the callee-saved
+    // save area, or, past `frame_size`, the callee's own stack (where the
+    // next CALL's return-address push zeroes it). Reserve the worst-case
+    // arity on top of the estimate so the buffer always stays inside the
+    // reserved frame.
+    let max_invoke_args: usize = invoke_info
+        .iter()
+        // SAFETY: invoke_info pointers are kept alive by the caller for the
+        // duration of compilation (same contract as the emission sites).
+        .map(|(_, p)| unsafe { (**p).num_jit_args })
+        .max()
+        .unwrap_or(0);
+    // Inlining allocates extra spill slots for each inlined callee's locals
+    // and operand stack ON TOP of the caller's `max_stack` (and, since the
+    // inline epilogue keeps the return value rather than reclaiming the callee
+    // locals, sequential inlines accumulate). `spill_size` is derived purely
+    // from `max_stack`, so without this reserve the inlined code writes past
+    // the spill region into the callee-saved / shadow area — corrupting live
+    // values (observed as a `ClassCastException: …$TaskOption not an enum` when
+    // a clobbered slot fed an enum-typed field). Reserve, per site,
+    // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
+    // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
+    let inline_stack_reserve: usize = inline_sites
+        .values()
+        .chain(extra_guard_bodies())
+        .map(|s| {
+            let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
+            s.callee_max_locals
+                .max(param_span)
+                .saturating_add(s.callee_code_len)
+        })
+        .sum();
+    let max_stack = max_stack
+        .saturating_add(max_invoke_args)
+        .saturating_add(inline_stack_reserve);
+
+    // LICM: detect loops and find invariant aaload sequences to hoist
+    let loops = detect_loops(code, code_len);
+    // Pre-header placement soundness: a loop header that can be entered by a
+    // branch from outside the loop would run the loop body with an
+    // uninitialised hoist slot / an unrun speculative guard, because
+    // `pc_to_native[header]` deliberately points PAST the pre-header. Drop
+    // every speculating transform for such headers — see
+    // `find_bypassable_loop_headers` for the full derivation and the
+    // `AttributesImpl.ensureCapacity` witness.
+    let bypassable_headers =
+        find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
+    let hoist_info =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
+            Vec::new()
+        } else {
+            find_loop_hoists(code, code_len, &loops)
+        };
+    // Per-bci de-spec (same registry the speculative-BCE guards use): the
+    // hoisted aaload's null+bounds preheader guard deopts at the loop-header
+    // bci; once a header crosses the de-spec threshold, drop its hoists so
+    // the recompile emits the in-loop aaload with its normal checks instead
+    // of re-making the failed speculation. Must run BEFORE `Compiler::new`
+    // pairs `hoist_offsets` with `hoist_info` by index.
+    let hoist_info: Vec<LoopHoist> = hoist_info
+        .into_iter()
+        .filter(|h| {
+            let despec = crate::deopt::despec_contains(method_key, despec_bci(h.loop_header));
+            if despec && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] de-spec: dropping aaload LICM hoist at loop_header \
+                     bci={} for {} (recompile with in-loop checked access)",
+                    h.loop_header, method_key
+                );
+            }
+            !despec
+        })
+        .collect();
+    let hoist_info: Vec<LoopHoist> = hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+
+    // LICM: find loop-invariant integer-arithmetic runs to hoist into the
+    // loop pre-header. These are pure, non-faulting ALU expressions on
+    // loop-invariant locals/constants — see `find_arith_loop_hoists`.
+    let arith_hoist_info =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_ARITH_LICM").is_some() {
+            Vec::new()
+        } else {
+            find_arith_loop_hoists(code, code_len, &loops)
+        };
+    let arith_hoist_info: Vec<ArithLoopHoist> = arith_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+    if !arith_hoist_info.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] arith-LICM hoists={} runs={:?}",
+            arith_hoist_info.len(),
+            arith_hoist_info
+                .iter()
+                .map(|h| (h.seq_start, h.seq_end, h.steps.len()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // Round-8 wave-3 HIGH fix (Fix 3): generic LICM scaffold for
+    // getfield/getstatic loads. The analysis is invoked here so the
+    // pipeline links against the new `loop_analysis` module and
+    // pattern surfaces during compilation; the result is currently
+    // discarded because hoisting itself requires safepoint /
+    // oop-map / regalloc participation that is intentionally
+    // deferred to a later round (see `loop_analysis.rs` module doc).
+    //
+    // TODO(round-12+): wire the returned `InvariantLoad` records
+    // into the emitter as a pre-header hoist consumer alongside the
+    // existing `LoopHoist` (aaload) and `FpLoopHoist` (dload)
+    // mechanisms.
+    {
+        let licm_loops = crate::loop_analysis::detect_loops(code, code_len);
+        let mut total = 0usize;
+        for li in &licm_loops {
+            let v = crate::loop_analysis::find_invariant_loads(li, code);
+            total += v.len();
+        }
+        // Suppress dead_code warnings on the analysis output without
+        // changing emission behavior.
+        let _ = total;
+    }
+
+    // T5.2.1 — SCEV induction variable analysis.
+    //
+    // Produces an `InductionVar` entry per detected counted loop. The
+    // result is stored on the Compiler so downstream passes (unrolling,
+    // vectorization, range-check elimination) can query stride, bound,
+    // and trip count without re-walking the bytecode.
+    let induction_vars = crate::scev::analyze_induction_variables(code, code_len, &loops);
+
+    // T5.2.14 — Null-check elimination dataflow.
+    //
+    // Walks the bytecode once and produces a per-PC bitmask of locals
+    // proven non-null. Future null-check emission paths consult this
+    // via `Compiler::is_local_nonnull(pc, local)` to skip redundant
+    // `TEST reg, reg; JZ throw_npe` sequences.
+    let null_check_info = crate::null_check_elim::analyze(code, code_len);
+
+    // BCE: analyze loops for bounds check elimination
+    // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination
+    // (and SIMD, which also elides per-element checks) so every array access is
+    // bounds-checked — to test whether an elided check causes the out-of-bounds
+    // array-store heap corruption.
+    let no_bce = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BCE").is_some();
+    let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
+        (FxHashSet::default(), Vec::new())
+    } else {
+        // The handler table is REQUIRED by the guard-dominated range reason: a
+        // flow-sensitive fact is a claim about every way control reaches a
+        // point, and an exception edge is one of those. Without the table that
+        // reason refuses outright. `exception_ranges` here is the shadowed
+        // output-coordinate copy, which is the space BCE works in.
+        analyze_bounds_elimination_with_handlers(code, code_len, &loops, Some(&exception_ranges))
+    };
+
+    // Guarded matrix dot-product lowering.  This is a pre-header replacement
+    // like the SIMD reductions below, but it remains useful for Java's
+    // array-of-row `int[][]` layout where the right-hand column is not
+    // contiguous and therefore cannot use ordinary packed loads.  The kill
+    // switch restores the generic scalar emitter for diagnostics.
+    let matrix_dot_enabled =
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MATRIX_DOT").map_or(true, |v| {
+            let value = v.trim();
+            value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+        });
+    let matrix_dot_loops: Vec<MatrixDotLoop> = if matrix_dot_enabled && !no_bce {
+        loops
+            .iter()
+            .filter(|(header, _)| !bypassable_headers.contains(header))
+            .filter_map(|&(header, back_edge)| {
+                let loop_end = back_edge + bytecode_len_at(code, back_edge);
+                let iv = find_induction_variable(code, header, loop_end)?;
+                detect_matrix_dot_loop(code, header, back_edge, iv)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !matrix_dot_loops.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] matrix-dot headers={:?}",
+            matrix_dot_loops
+                .iter()
+                .map(|dot| dot.header_pc)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // SIMD: detect vectorizable int-array-sum loops (requires AVX2)
+    let simd_loops = if has_avx2() && !no_bce {
+        let mut simd = Vec::new();
+        for &(header, back_edge) in &loops {
+            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
+                if let Some(info) = detect_int_array_sum(code, header, back_edge, iv) {
+                    simd.push(info);
+                }
+            }
+        }
+        simd
+    } else {
+        Vec::new()
+    };
+
+    // SIMD FP: detect vectorizable double-array-sum loops (requires AVX2)
+    let simd_fp_loops = if has_avx2() {
+        let mut simd = Vec::new();
+        for &(header, back_edge) in &loops {
+            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
+                if let Some(info) = detect_fp_array_sum(code, header, back_edge, iv) {
+                    simd.push(info);
+                }
+            }
+        }
+        simd
+    } else {
+        Vec::new()
+    };
+
+    // T5.2.15 — Int-array element-wise SIMD detection.
+    //
+    // Unlike reduction, detection here is *unconditional on AVX2* so
+    // the information is available to any downstream pass (e.g.
+    // cost-based vectorization, auto-tuning). Emission code checks
+    // `has_avx2()` before issuing AVX2-only encodings.
+    let simd_element_wise_loops = {
+        let mut ewise = Vec::new();
+        for &(header, back_edge) in &loops {
+            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
+                if let Some(info) = detect_int_array_element_wise(code, header, back_edge, iv) {
+                    ewise.push(info);
+                }
+            }
+        }
+        ewise
+    };
+    // One call, not three inlined copies: the optimizing tier's admission
+    // chain asks the same question through
+    // `single_pass_has_bulk_byte_lowering`, and it has to get the same answer
+    // this does or it will hand the IR tier a method this backend vectorises.
+    let BulkByteLoops {
+        zero_fill: bulk_zero_byte_fill_loops,
+        set_stride: bulk_set_byte_stride_loops,
+        sieve: byte_sieve_loops,
+    } = detect_bulk_byte_loops(code, code_len, &loops, &bypassable_headers);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+        && !(bulk_zero_byte_fill_loops.is_empty()
+            && bulk_set_byte_stride_loops.is_empty()
+            && byte_sieve_loops.is_empty())
+    {
+        eprintln!(
+            "[JIT_GEN] bulk-byte headers: zero-fill={:?} set-stride={:?} sieve={:?}",
+            bulk_zero_byte_fill_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            bulk_set_byte_stride_loops
+                .iter()
+                .map(|f| f.header_pc)
+                .collect::<Vec<_>>(),
+            byte_sieve_loops
+                .iter()
+                .map(|s| s.header_pc)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // Loop unrolling: detect small loops suitable for unrolling
+    // PGO: use profiled trip counts to guide unroll factor when available.
+    // Static heuristic fallback:
+    //   Body ≤20 bytecodes  → 4x unroll (3 extra copies)
+    //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
+    //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
+    //
+    // The size band is a PROFITABILITY heuristic and nothing else. Every
+    // LEGALITY question — reducibility, single entry, inner-cycle
+    // reducibility, branches to the back edge, handler containment,
+    // pre-header bypass, time-to-safepoint — is answered by
+    // `plan_native_unroll`, which gates every entry that reaches
+    // `compiler.unroll_loops`. It must stay the only producer of this vector:
+    // the emitter's `0xa7` arm treats membership as proof that duplicating
+    // the body's machine code is sound. See its doc comment for what the old
+    // `code[back_edge] == 0xa7` + body-size test was missing.
+    //
+    // `loop_xform.is_some()` is redundant with `!native_unroller_enabled()`
+    // (arming the rewriter is what turns the native unroller off, and a
+    // transform can only exist when armed), and is written anyway: this
+    // vector is the emitter's proof that duplicating machine code is sound,
+    // and "the bytecode was already duplicated" must be visible AT the vector
+    // rather than two functions away.
+    let unroll_loops: Vec<(usize, usize, usize)> = if loop_xform.is_some()
+        || !native_unroller_enabled()
+    {
+        Vec::new()
+    } else {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                // Only unroll loops with goto back-edge (not conditional)
+                if back_edge >= code_len || code[back_edge] != 0xa7 {
+                    return None;
+                }
+                let body_size = back_edge - header;
+                if body_size < 5 {
+                    return None;
+                }
+
+                // PGO path: use profiled trip count if available for this back-edge
+                if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
+                    // `saturating_sub`: the old `pgo_factor - 1` underflowed on
+                    // a 0 hint. A 0/1 factor now means "no extra copies", which
+                    // `plan_native_unroll` refuses as `TooManyCopies`.
+                    let extra_copies = pgo_factor.saturating_sub(1);
+                    // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
+                    if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
+                        return plan_native_unroll(
+                            code,
+                            code_len,
+                            header,
+                            back_edge,
+                            extra_copies,
+                            &exception_ranges,
+                            &bypassable_headers,
+                        );
+                    }
+                }
+
+                // Static heuristic fallback
+                let extra_copies = if body_size <= 20 {
+                    3 // 4x unroll
+                } else if body_size <= 50 {
+                    1 // 2x unroll (covers FP-heavy loops like N-Body advance)
+                } else {
+                    return None;
+                };
+                plan_native_unroll(
+                    code,
+                    code_len,
+                    header,
+                    back_edge,
+                    extra_copies,
+                    &exception_ranges,
+                    &bypassable_headers,
+                )
+            })
+            .collect()
+    };
+    if !unroll_loops.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!("[JIT_GEN] unroll admitted={unroll_loops:?}");
+    }
+
+    // FP LICM: detect loop-invariant FP loads to hoist
+    let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);
+    let fp_hoist_info: Vec<FpLoopHoist> = fp_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+
+    // FP strength reduction: detect dmul-by-2.0 → dadd-self inside loops
+    let fp_strength_reduction_pcs =
+        find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
+
+    // Register allocation: graph-coloring allocator for locals.
+    //
+    // A method compiled with precise exceptional frames has its handler frame
+    // rebuilt from REGISTER homes, so the interference graph must know that
+    // protected code can branch to the handler — otherwise a local only the
+    // catch block reads is dead throughout the try and shares its register with
+    // something else. Every other compile passes no handlers and is unchanged.
+    let ra_handlers: &[(usize, usize, usize)] = if precise_exception_frames {
+        &exception_ranges
+    } else {
+        &[]
+    };
+    // `param_jvm_slots` (not just `num_params`): a category-2 parameter spans
+    // two JVM slots, so the allocator must know which slots actually hold an
+    // incoming argument. See `regalloc::param_live_in_mask`.
+    let alloc_result = crate::regalloc::allocate_registers_with_handlers(
+        code,
+        code_len,
+        max_locals,
+        num_params,
+        param_jvm_slots,
+        &loops,
+        ra_handlers,
+    );
+
+    // Pure-kernel GPR local homes (see `kernel_reg_locals_enabled` for the
+    // full safety argument). Consume the per-compile request (set only by the
+    // method-entry compile path) so it can never leak into a later compile,
+    // then engage only for the pure-kernel shape: no calls of any kind, no
+    // field/static ops, no allocation, no typechecks, no inline sites, and no
+    // speculative BCE guards (those deopt with frame-stashed state). Reference
+    // locals are masked back to frame homes, so GC visibility is unchanged.
+    let pure_kernel = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
+        && kernel_reg_locals_enabled()
+        && invoke_info.is_empty()
+        && direct_calls.is_empty()
+        && mic_slots.is_empty()
+        && pic_slots.is_empty()
+        && indy_info.is_empty()
+        && field_info.is_empty()
+        && static_field_info.is_empty()
+        && new_info.is_empty()
+        && new_deferred_info.is_empty()
+        && anewarray_info.is_empty()
+        && anewarray_deferred_info.is_empty()
+        && multianewarray_info.is_empty()
+        && typecheck_info.is_empty()
+        && compact_field_info.is_empty()
+        && inline_sites.is_empty()
+        && speculative_bce_guards.is_empty();
+    // When precise-map general register homes are already enabled, this pure
+    // kernel does not need the narrow allocator to turn homes on again. It is
+    // still a pure kernel, however, and therefore remains eligible for the
+    // call-free deferred operand cache captured by `Compiler::new`.
+    let kernel_reg_homes = pure_kernel && !callee_saved_gpr_local_homes_enabled();
+    let mut alloc_result = if kernel_reg_homes {
+        let mut ar = alloc_result;
+        let ref_mask =
+            crate::regalloc::find_reference_locals(code, code_len, max_locals) | param_oop_mask;
+        for (i, assignment) in ar.assignments.iter_mut().enumerate() {
+            if i >= 64 || (ref_mask >> i) & 1 == 1 {
+                *assignment = None;
+            }
+        }
+        // Recompute the save/restore set from the surviving assignments so
+        // the prologue/epilogue and frame sizing stay consistent.
+        let mut used: Vec<u8> = ar.assignments.iter().flatten().copied().collect();
+        used.sort_unstable();
+        used.dedup();
+        ar.used_callee_saved = used;
+        ar
+    } else {
+        alloc_result
+    };
+    if !matrix_dot_loops.is_empty() {
+        // R12..R15 are private scratch homes for the tight pre-header.  Do not
+        // let graph coloring simultaneously assign a Java local to one of
+        // them; locals displaced here simply retain their canonical frame
+        // homes.  Compiler::new still saves all four registers for ABI
+        // correctness, independently of the local-home diagnostic gates.
+        for assignment in &mut alloc_result.assignments {
+            if matches!(*assignment, Some(R12 | R13 | R14 | R15)) {
+                *assignment = None;
+            }
+        }
+    }
+
+    // Precise escape re-analysis. `jit_scan` produced `non_escaping_new`
+    // with a conservative empty shape map (it has no CP resolver). Now
+    // that `invoke_info` carries every invokespecial's resolved
+    // descriptor, rebuild the shape map and re-run `analyze_escapes`.
+    // This lets a trivial `new; dup; invokespecial <init>()V` keep its
+    // scalar-replacement eligibility while an arg-bearing constructor
+    // (`<init>(I)V`, …) correctly escapes its receiver — the latter
+    // initializes fields in a separate, un-inlined method body that the
+    // JIT frame cannot reproduce. Skipping this re-analysis (or running
+    // it without descriptors) caused boxed values to come back as 0
+    // (the `Integer.valueOf` / `String.toLowerCase` archetype).
+    //
+    // SR-reachability fix (real-frame-deopt x64 backport, Phase B prerequisite):
+    // the precise re-analysis here is the AUTHORITATIVE escape analysis — it
+    // recomputes from scratch with the resolved invokespecial shapes and does not
+    // use `non_escaping_new` as a seed. Gate it on whether the method has any
+    // `new` allocation (`new_info`), NOT on whether `jit_scan`'s conservative
+    // pre-pass found a non-escaping object. `jit_scan` runs `analyze_escapes` with
+    // an EMPTY shape map, whose `None` arm `escape_all!`s every invokespecial
+    // receiver — so it returns an empty `non_escaping_new` for the ubiquitous
+    // `new X(); <init>()V` pattern, and the old `if non_escaping_new.is_empty()`
+    // gate then skipped the precise pass that WOULD recognize it. Net effect of
+    // that bug: single-pass scalar replacement never fired for ordinary
+    // allocations at runtime. Gating on `new_info` instead lets it fire (and is
+    // what makes the Phase B `VirtualObject` deopt path reachable).
+    let non_escaping_new: std::collections::HashSet<usize> = if new_info.is_empty() {
+        non_escaping_new
+    } else {
+        let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
+        for &(ipc, info_ptr) in &invoke_info {
+            // SAFETY: `info_ptr` comes from `invoke_info`, whose entries
+            // are kept live by the caller for the whole compilation.
+            let info = unsafe { &*info_ptr };
+            if info.invoke_kind == 1 {
+                invokespecial_shapes.insert(
+                    ipc,
+                    InvokeSpecialShape {
+                        arg_slots: info.num_jit_args,
+                        is_trivial_void_init: info.method_name == "<init>"
+                            && info.descriptor == "()V",
+                    },
+                );
+            }
+        }
+        analyze_escapes(code, code_len, &invokespecial_shapes)
+    };
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+        && !new_info.is_empty()
+    {
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64::compile escape re-analysis: new_info={} non_escaping_new={:?} invoke_info={}",
+            new_info.len(),
+            { let mut v: Vec<usize> = non_escaping_new.iter().copied().collect(); v.sort(); v },
+            invoke_info.len(),
+        );
+    }
+
+    // Scalar replacement: plan frame-local storage for non-escaping object fields
+    let num_hoists = hoist_info.len();
+    let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
+    let empty_non_escaping = std::collections::HashSet::new();
+    let non_escaping_for_sr =
+        if precise_exception_frames
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some()
+        {
+            &empty_non_escaping
+        } else {
+            &non_escaping_new
+        };
+    let sr_plan = plan_scalar_replacement(
+        code,
+        code_len,
+        non_escaping_for_sr,
+        &new_info,
+        &invoke_info,
+        scalar_base,
+    );
+    let num_scalar_slots = sr_plan.total_slots;
+    let force_inline_new =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some();
+    let cache_jit_thread_for_inline_new = needs_heap
+        && helpers.get_current_thread != 0
+        && helpers.tlab_post_init != 0
+        && helpers.new_object != 0
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none()
+        && new_info
+            .iter()
+            .any(|(_, _, num_fields, has_prim_init, has_finalizer)| {
+                HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE) <= 256
+                    && ((!*has_prim_init && !*has_finalizer) || force_inline_new)
+            });
+    // Inline self-recursion stack check: a raw self-call site is an
+    // `invokestatic` pc with neither an invoke-info entry nor a direct-call
+    // plan (the exact condition the 0xb8 arm's "Self-recursive call"
+    // else-branch keys on -- `try_compile` deliberately skips creating invoke
+    // metadata for them). When one exists, reserve the floor frame slot so
+    // each such site can do the two-instruction `CMP RSP, [rbp - floor]`
+    // instead of a `self_call_stack_guard` helper CALL per recursion level.
+    // The walk uses `bytecode_len_at`; a desync past a variable-length switch
+    // can at worst set the flag spuriously, which only reserves an unused
+    // slot + one prologue helper call (never unsound).
+    let reserve_stack_floor = needs_heap
+        && helpers.self_call_stack_guard != 0
+        && helpers.native_stack_floor_fn != 0
+        && inline_self_guard_enabled()
+        && {
+            let mut found = false;
+            let mut pc = 0usize;
+            while pc < code_len {
+                if code[pc] == 0xb8
+                    && !invoke_info.iter().any(|(p, _)| *p == pc)
+                    && !direct_calls.iter().any(|(p, _)| *p == pc)
+                {
+                    found = true;
+                    break;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            found
+        };
+
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(pure_kernel));
+    let mut compiler = Compiler::new(
+        method_key.to_string(),
+        buf,
+        max_locals,
+        num_params,
+        max_stack,
+        needs_heap,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        hoist_info,
+        arith_hoist_info,
+        alloc_result,
+        !matrix_dot_loops.is_empty(),
+        *helpers,
+        num_scalar_slots,
+        cache_jit_thread_for_inline_new,
+        reserve_stack_floor,
+        gc_inert_selfrec && reserve_stack_floor,
+        precise_exception_frames,
+        // The `0xba` lowering emits a frame-deopt stub that spills 32 registers
+        // into the `SavedRegisters` region, and it does so whether or not
+        // `deopt_real_enabled()`. The frame therefore has to reserve that region
+        // on the same condition — see `deopt_regs_size` in `x64.rs`.
+        !indy_info.is_empty(),
+        protected_ranges,
+    );
+    KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
+    // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
+    // inside `Compiler::new` because it needs `code` and `param_oop_mask`,
+    // neither of which that constructor receives. `compiler.local_assignments`
+    // is final at this point — `Compiler::new` moved the (possibly
+    // kernel-masked, possibly all-`None` when GPR local homes are disabled)
+    // assignment vector into the struct and nothing mutates it afterwards — so
+    // the plan describes exactly the register homes this compile will emit.
+    //
+    // `param_oop_mask` is unioned in for the case `find_reference_locals`
+    // cannot see: a reference PARAMETER that the method never `aload`s. Without
+    // it such a local would look primitive and could be left unpublished while
+    // genuinely holding an oop.
+    //
+    // COST GATE. `plan_safepoint_publication` runs `live_locals_per_pc_with_
+    // coverage`, a second whole-method liveness pass on top of the one
+    // `allocate_registers` just did. R1 consumes only `no_reference_in_registers()`
+    // and never touches the liveness-narrowed `publish_at` vector, so paying for
+    // it on every compile would be a JIT-compile-time regression inside a change
+    // whose entire purpose is a speedup — and would confound measuring it.
+    //
+    // Skip it whenever no local has a register home at all: there the plan
+    // provably cannot change the answer (`register_homed_reference_locals` would
+    // be `0` ⇒ `no_reference_in_registers()` ⇒ `false`, which is exactly what
+    // the `None` fallback's `any(Option::is_some)` also yields), so leaving the
+    // plan absent is behaviour-identical at zero cost. The methods that DO have
+    // register homes are precisely the population R1 exists to speed up.
+    //
+    // FOLLOW-UP: R2 needs `publish_at`, so it will need the pass unconditionally.
+    // Before landing R2, `regalloc` should grow a `publish_always`-only
+    // constructor that skips the liveness walk, or thread `allocate_registers`'
+    // existing liveness result through instead of recomputing it.
+    if compiler.local_assignments.iter().any(Option::is_some) {
+        // Bound separately: `compiler.a = f(&compiler.b)` borrows and assigns
+        // the same struct in one statement, which is needlessly close to the edge.
+        let safepoint_publish = crate::regalloc::plan_safepoint_publication(
+            code,
+            code_len,
+            max_locals,
+            num_params,
+            param_jvm_slots,
+            &compiler.local_assignments,
+            param_oop_mask,
+            ra_handlers,
+        );
+        compiler.safepoint_publish = Some(safepoint_publish);
+    }
+    compiler.param_jvm_slots = param_jvm_slots.to_vec();
+    compiler.param_slot_span = param_slot_span;
+    compiler.method_key = method_key.to_string();
+    // Coordinate change, emitter half: the three sites that BAKE a bci as an
+    // immediate into machine code consult this. It must be installed before
+    // `compile_bytecode` runs — those stubs are emitted at the end of that
+    // call, so no post-pass over the finished `CompiledMethod` could reach
+    // them. `None` (the identity) on every unarmed compile.
+    compiler.bci_provenance = loop_xform.as_ref().map(|x| x.bci_of.clone());
+    // …and which of those output pcs are an image of nothing. See the field.
+    compiler.synthetic_guard_span = loop_xform.as_ref().and_then(|x| x.guard_span());
+    // deopt-osr Step 9 follow-up (c): per-bci de-spec. Drop any speculative-BCE
+    // guard whose loop header was recorded in the de-spec registry (a guard that
+    // repeatedly deopted past the per-bci give-up threshold). Those headers fall
+    // back to per-access bounds checks instead of the speculative elide, so the
+    // method stays compiled (no whole-method blacklist) but no longer re-makes
+    // the failed speculation. Dropping a guard MUST also drop the elisions it
+    // justified: each guard's `covered_pcs` are removed from `bounds_safe_pcs`
+    // so those accesses get their per-element checks back — a dropped guard
+    // with the elisions left in place would be an UNGUARDED speculative elide
+    // (silent out-of-bounds access on exactly the input that kept deopting).
+    // Inert in production / on the `compile()` wrapper: `despec_contains`
+    // returns `false` for an empty key or empty registry, so both sets are
+    // unchanged ⇒ byte-identical codegen.
+    let mut bounds_safe_pcs = bounds_safe_pcs;
+    let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
+        .into_iter()
+        .filter(|g| {
+            let despec = crate::deopt::despec_contains(method_key, despec_bci(g.loop_header));
+            if despec {
+                for covered_pc in &g.covered_pcs {
+                    bounds_safe_pcs.remove(covered_pc);
+                }
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                    eprintln!(
+                        "[cratonvm-deopt] de-spec: suppressing speculative-BCE guard at \
+                         loop_header bci={} for {} (recompile without it; per-element \
+                         checks restored at {:?})",
+                        g.loop_header, method_key, g.covered_pcs
+                    );
+                }
+            }
+            !despec
+        })
+        .collect();
+    // Same obligation as the de-spec drop above, for a header whose pre-header
+    // an outside-the-loop branch can skip: the guard would not have run, so the
+    // elisions it justified must go back to per-access checks (an elide with no
+    // guard is a silent out-of-bounds access).
+    let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
+        .into_iter()
+        .filter(|g| {
+            let bypassable = bypassable_headers.contains(&g.loop_header);
+            if bypassable {
+                for covered_pc in &g.covered_pcs {
+                    bounds_safe_pcs.remove(covered_pc);
+                }
+            }
+            !bypassable
+        })
+        .collect();
+    compiler.bounds_safe_pcs = bounds_safe_pcs;
+
+    // SIMD gating: a SIMD loop transform replaces the per-element accesses of
+    // `arr[i]` for `i` in `[entry_iv, bound)` with an UNCHECKED batch loop, so
+    // it carries the same proof obligation as a BCE elision — for EVERY array
+    // it touches, `bound <= arr.length` (plus a non-negative start index) must
+    // be established either statically (the bound provably IS that array's
+    // length and the IV provably starts >= 0) or by a speculative loop-header
+    // guard that survived de-spec (the guard also tests `iv >= 0`, and is
+    // emitted before the SIMD preheader). An uncovered array — e.g. the OUT
+    // store of `out[i] = a[i] + b[i]` in a loop bounded by `a.length` when
+    // `out` is shorter — would batch-store past the array end with no
+    // exception (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md;
+    // before this gate, `detect_int_array_element_wise` candidates vectorized
+    // with no coupling to the bounds analysis at all).
+    // (`no_bce` also lands here: CRATONVM_JIT_NO_BCE always claimed to disable
+    // "BCE and SIMD", but only the int-sum detection was actually gated on it —
+    // the FP-sum and element-wise transforms kept vectorizing with elided
+    // checks. Routing every SIMD candidate through this coverage check makes
+    // the debug gate true to its documentation.)
+    let simd_covered = |header: usize, arr_local: usize, bound_local: usize, iv_local: usize| {
+        !no_bce
+            && ((find_bound_arraylength_provenance(code, code_len, bound_local) == Some(arr_local)
+                && find_iv_nonneg_start(code, code_len, iv_local))
+                || speculative_bce_guards.iter().any(|g| {
+                    g.loop_header == header
+                        && g.array_local == arr_local
+                        && g.bound_local == bound_local
+                }))
+    };
+    let simd_loops: Vec<SimdIntArraySum> = simd_loops
+        .into_iter()
+        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
+        .collect();
+    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
+        .into_iter()
+        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
+        .collect();
+    let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
+        .into_iter()
+        .filter(|e| {
+            simd_covered(e.header_pc, e.out_local, e.bound_local, e.iv_local)
+                && simd_covered(e.header_pc, e.a_local, e.bound_local, e.iv_local)
+                && simd_covered(e.header_pc, e.b_local, e.bound_local, e.iv_local)
+        })
+        .collect();
+    // A SIMD batch pre-header is emitted under the same placement contract as
+    // the LICM hoists, so a bypassable header must not carry one either.
+    let simd_loops: Vec<SimdIntArraySum> = simd_loops
+        .into_iter()
+        .filter(|s| !bypassable_headers.contains(&s.header_pc))
+        .collect();
+    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
+        .into_iter()
+        .filter(|s| !bypassable_headers.contains(&s.header_pc))
+        .collect();
+    let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
+        .into_iter()
+        .filter(|e| !bypassable_headers.contains(&e.header_pc))
+        .collect();
+    // Index the speculative guards by loop-header PC once, so the per-header
+    // emit loop does an O(1) map lookup instead of an O(guards) filtered scan
+    // at every loop header.
+    {
+        let mut by_header: FxHashMap<usize, Vec<SpeculativeBCEGuard>> = FxHashMap::default();
+        for g in &speculative_bce_guards {
+            by_header.entry(g.loop_header).or_default().push(g.clone());
+        }
+        compiler.speculative_bce_guards_by_header = by_header;
+    }
+    compiler.speculative_bce_guards = speculative_bce_guards;
+    compiler.compact_field_off = compact_field_info
+        .into_iter()
+        .map(|(pc, off, is_ref)| (pc, (off, is_ref)))
+        .collect();
+    compiler.new_info = new_info;
+    compiler.new_deferred_info = new_deferred_info;
+    compiler.anewarray_info = anewarray_info;
+    compiler.anewarray_deferred_info = anewarray_deferred_info;
+    compiler.invoke_info = invoke_info;
+    // Index the call-site argument tags before the walk: the deopt snapshots
+    // built during it consult the index by bci. See `invoke_stack_arg_types`.
+    compiler.index_invoke_arg_types();
+    compiler.indy_info = indy_info;
+    compiler.direct_calls = direct_calls;
+    // deopt-osr Step 8 (test trigger): under CRATONVM_OSR_EXIT_TEST + CRATONVM_DEOPT_REAL,
+    // pick the first (lowest-pc) detected loop header as the synthetic OSR-exit
+    // branch site. `None` in production (either gate off) ⇒ no trigger emitted ⇒
+    // byte-identical code. `detect_loops` returns (header, end) pairs.
+    //
+    // P4 (Step 8 follow-up): `CRATONVM_OSR_EXIT_AFTER=N` also arms the trigger at the
+    // same loop header, but counter-gated (`osr_exit_after_count = Some(N)`) so the
+    // JIT advances ~N iterations before the exit — exercising the true OSR-exit
+    // transfer with genuinely advanced state. Either gate (both require DEOPT_REAL)
+    // selects the bci; AFTER takes precedence over TEST for the emitted form.
+    compiler.osr_exit_after_count = if crate::deopt_real_enabled() {
+        crate::osr_exit_after()
+    } else {
+        None
+    };
+    compiler.osr_exit_test_trigger_bci = if crate::deopt_real_enabled()
+        && (crate::osr_exit_test_enabled() || compiler.osr_exit_after_count.is_some())
+    {
+        loops.iter().map(|&(h, _)| h).min()
+    } else {
+        None
+    };
+    // deopt-osr: the through-JIT deopt-EXIT differential trigger. Under
+    // CRATONVM_DEOPT_EAGER + DEOPT_REAL, force a reason-2 deopt-EXIT at the first
+    // (lowest-pc) loop header. `None` (either gate off / no loop) ⇒ byte-identical.
+    compiler.deopt_eager_bci = if crate::deopt_real_enabled() && crate::deopt_eager_enabled() {
+        loops.iter().map(|&(h, _)| h).min()
+    } else if crate::deopt_real_enabled() {
+        // Phase B e2e: `CRATONVM_DEOPT_EAGER_BCI=<n>` points the eager deopt-EXIT
+        // at a specific straight-line bci (where a scalar object is live in a
+        // local), the only way to drive `VirtualObject` resume through the JIT.
+        // Fire ONLY in a method that actually has a scalar object live at that
+        // bci — so the global env doesn't perturb unrelated methods (e.g. the
+        // driver `main`, which has no scalar replacement).
+        crate::deopt_eager_bci_override().filter(|n| compiler.sr_local_prov_at.contains_key(n))
+    } else {
+        None
+    };
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+        && !compiler.scalar_replaced.is_empty()
+    {
+        let mut keys: Vec<usize> = compiler.sr_local_prov_at.keys().copied().collect();
+        keys.sort();
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] x64 single-pass compile: scalar_replaced={} sr_local_prov_at_pcs={:?} eager_bci={:?} elided_monitor={}",
+            compiler.scalar_replaced.len(),
+            keys,
+            compiler.deopt_eager_bci,
+            compiler.has_elided_monitor,
+        );
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+        eprintln!(
+            "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
+            mic_slots.len(),
+            mic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
+        );
+    }
+    compiler.mic_slots = mic_slots;
+    // HIGH-7 — Inline 4-way PIC fast-path wiring (now active).
+    //
+    // The codegen in `Compiler::compile_op_invokevirtual` (search
+    // `pic_inline`) keys off `compiler.pic_slots`. With the
+    // `pic_slots` parameter now threaded through, callers that
+    // eagerly allocate a `Box<JitPICSlot>` per polymorphic call
+    // site (see `jit/src/lib.rs::try_compile`) activate the inline
+    // cascade. Slots start empty (class_id == 0 at all 4 entries),
+    // so the CMP cascade falls straight through to the helper on
+    // first invocation; once the runtime helper populates a slot,
+    // subsequent dispatches take the inline fast path.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+        eprintln!(
+            "[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
+            pic_slots.len(),
+            pic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
+        );
+    }
+    compiler.pic_slots = pic_slots;
+    compiler.unroll_loops = unroll_loops;
+    compiler.simd_loops = simd_loops;
+    compiler.matrix_dot_loops = matrix_dot_loops;
+    // The pure-kernel deferred cache owns R8/R9 across bytecodes, while the
+    // matrix-dot preheader uses those registers for its batch limit and
+    // wrapping accumulator. Keep upstream's pure-kernel local homes, but
+    // disable only the conflicting operand cache for this exact lowering.
+    if !compiler.matrix_dot_loops.is_empty() {
+        compiler.kernel_operand_cache = false;
+    }
+    compiler.branch_hints = branch_hints.into_iter().collect();
+    compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
+    compiler.ldc_info = ldc_info;
+    compiler.ldc_string_info = ldc_string_info;
+    compiler.ldc_class_info = ldc_class_info;
+    compiler.ldc2w_info = ldc2w_info;
+    compiler.fp_hoist_info = fp_hoist_info;
+    compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
+    compiler.simd_fp_loops = simd_fp_loops;
+    // Phase B (real-frame-deopt x64 backport): build the per-field type map for
+    // scalar-replaced objects by joining the per-access-site `field_info`
+    // (`(pc, field_index, type_tag)`) with the plan's `field_ops` (`pc → new_pc`).
+    // Each accessed field of a scalar object thus learns its JVM type tag, which
+    // drives the `VirtualObject` field `FrameValue` width/ref-ness on deopt. Built
+    // before `field_ops` is moved into `scalar_field_ops` below.
+    {
+        let mut sr_field_types: FxHashMap<(usize, usize), u8> = FxHashMap::default();
+        for &(pc, field_index, type_tag) in &compiler.field_info {
+            if let Some(&new_pc) = sr_plan.field_ops.get(&pc) {
+                sr_field_types.insert((new_pc, field_index), type_tag);
+            }
+        }
+        compiler.sr_field_types = sr_field_types;
+    }
+    compiler.sr_local_prov_at = sr_plan.local_prov_at;
+    compiler.sr_monitor_at = sr_plan.monitor_at;
+    compiler.sr_monitor_scalar_ops = sr_plan.monitor_scalar_ops;
+    compiler.scalar_replaced = sr_plan.objects;
+    compiler.scalar_field_ops = sr_plan.field_ops;
+    compiler.scalar_init_skips = sr_plan.init_skips;
+    compiler.inline_sites = inline_sites.into_iter().collect();
+    compiler.inline_guard_variants = inline_guard_variants.into_iter().collect();
+    // String call-site intrinsics: hand the resolved String field layout to
+    // the compiler so intrinsic codegen can emit inline field loads.
+    compiler.string_layout = string_layout;
+    // T5.2.1 + T5.2.14 — transfer the pre-computed analyses.
+    compiler.induction_vars = induction_vars;
+    compiler.null_check_info = null_check_info;
+    // T5.2.15 — element-wise SIMD detections.
+    compiler.simd_element_wise_loops = simd_element_wise_loops;
+    compiler.bulk_zero_byte_fill_loops = bulk_zero_byte_fill_loops;
+    compiler.bulk_set_byte_stride_loops = bulk_set_byte_stride_loops;
+    compiler.byte_sieve_loops = byte_sieve_loops;
+    // Same R8/R9 ownership conflict the matrix-dot lowering has above: the
+    // sieve preheader keeps the prime count in R8 and its word-scan temporary
+    // in R9, and the strided-store preheader keeps the step in R9. Those are
+    // exactly the pure-kernel deferred operand cache's two scratch registers.
+    if !compiler.byte_sieve_loops.is_empty() || !compiler.bulk_set_byte_stride_loops.is_empty() {
+        compiler.kernel_operand_cache = false;
+    }
+    // T5.2.17 — loop unswitching candidates.
+    compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
+
+    // MED-4 / Fix 3 — pre-build pc-indexed lookup maps for the hot
+    // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)
+    // so each query is O(1) rather than scanning the Vec.
+    compiler.build_pc_indices();
+
+    // Stage 2 (precise oop maps) — forward "must be oop" local-variable
+    // dataflow. Lets `emit_oop_map_for_safepoint` record the canonical frame
+    // slots of register/memory locals that hold object references at each
+    // safepoint (in addition to the operand-stack slots), so a moving GC has
+    // precise, updatable coverage of every live oop. Behaviour-neutral on the
+    // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
+    // already sweeps the whole frame region, so the extra precise entries are
+    // redundant there and re-validated via `heap.is_object_address`.
+    let (lo_masks, lo_reached) =
+        compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
+    compiler.local_oop_masks = lo_masks;
+    compiler.local_oop_reached = lo_reached;
+
+    // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
+    // (gated) snapshot consumes it, so skip the scan entirely in production.
+    if crate::deopt_real_enabled() || precise_exception_frames {
+        compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
+        // Resolve the `Ambiguous` votes per bci where control flow allows it.
+        compiler.local_kinds_refined = refine_ambiguous_local_kinds(
+            code,
+            code_len,
+            &compiler.local_kinds,
+            &exception_ranges,
+        );
+        // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
+        compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
+        // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
+        // The exception table MUST be modelled: these snapshots are taken at
+        // pcs inside protected ranges, and a local only the handler reads is
+        // otherwise computed dead exactly there.
+        let (liveness, covered) = crate::regalloc::live_locals_per_pc_with_handlers(
+            code,
+            code_len,
+            num_params,
+            param_jvm_slots,
+            &exception_ranges,
+        );
+        compiler.local_liveness = liveness;
+        compiler.local_liveness_covered = covered;
+        compiler.exception_ranges_dbg_len = exception_ranges.len();
+    }
+
+    // The operand stack's width source. Placed HERE, immediately before the
+    // walk, because it reads per-pc metadata assigned across a long stretch of
+    // this function: field and static-field types, and call arities from all
+    // three of `indy_info` / `direct_calls` / `invoke_info`.
+    //
+    // Run it any earlier and the vectors it has not seen yet read as ABSENT,
+    // which the analysis treats as an unmodelled call site and poisons on — so
+    // the result is silently empty and every snapshot keeps the coarse
+    // encoding. That is exactly what the first attempt did (placed right after
+    // `invoke_info`, three of its five inputs were still empty): the suites
+    // stayed green and the refusal count did not move at all, which is the
+    // signature of an analysis that answered nothing rather than one that
+    // answered wrong.
+    compiler.analyze_stack_kinds(code, code_len);
+
+    // Emit prologue
+    compiler.emit_prologue();
+    if compiler.failed {
+        let (site, pc, op) = compiler
+            .failed_site
+            .unwrap_or(("singlepass-prologue", 0, 0));
+        crate::note_jit_bail_site_at(site, pc, op);
+        return None;
+    }
+    let entry_offset = 0; // prologue starts at offset 0
+    compiler.body_entry_offset = compiler.buf.pos(); // offset right after prologue
+
+    // Compile bytecode
+    if !compiler.compile_bytecode(code, code_len) {
+        // Publish the refusing bytecode to the caller's bail-site record too:
+        // this line names the opcode but not the method, and `try_compile`'s
+        // `compile-bail` line names the method but not the opcode. Neither is
+        // a diagnosis on its own, and they are not even both printed on the
+        // same run for an OSR/callee compile.
+        //
+        // A refusal raised through the `failed` FLAG names its own site and the
+        // pc/op live when it was raised; the flag is only checked after the
+        // whole dispatch loop, so `dbg_last_pc`/`dbg_last_op` would name
+        // whatever instruction happened to be last instead.
+        let (site, pc, op) = compiler.failed_site.unwrap_or((
+            "singlepass-codegen",
+            compiler.dbg_last_pc,
+            compiler.dbg_last_op,
+        ));
+        crate::note_jit_bail_site_at(site, pc, op);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!("[cratonvm-jitc] codegen-bail site={site} pc={pc} op=0x{op:02x}");
+        }
+        return None;
+    }
+
+    // Patch branches (both forward and backward are handled). A `false`
+    // return means some branch targeted a PC that was never emitted as an
+    // instruction boundary (malformed/unverified bytecode) — reject the
+    // method rather than leave an unpatched jump in executable code.
+    if !compiler.patch_branches() {
+        // Name the target. `pc` here is the branch target with no native
+        // offset and `op` the byte at it — enough to check against a `javap -c`
+        // listing whether the target really is off-boundary (it usually is
+        // not: see `jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
+        let (target, nearest) = compiler.unresolved_branch_target.unwrap_or((0, -1));
+        let target_op = code.get(target).copied().unwrap_or(0);
+        crate::note_jit_bail_site_at(
+            "branch-target-not-an-instruction-boundary",
+            target,
+            target_op,
+        );
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] branch-target-unresolved target={target} op=0x{target_op:02x} \
+                 nearest_emitted_at_or_below={nearest} code_len={code_len}"
+            );
+        }
+        return None;
+    }
+
+    // Patch self-recursive calls to point to entry
+    compiler.patch_self_calls(entry_offset);
+
+    // Lazy-prologue perf lever: now that the body is fully compiled,
+    // `shadow_pushed_any` is final — NOP out the prologue thread-fetch if no
+    // register-resident oop was ever published (no-op when shadow is off).
+    compiler.maybe_nop_out_shadow_fetch();
+
+    // `estimated_size` is a heuristic; a pathological method can emit past it.
+    // The emit hot path records the overflow instead of panicking — bail to
+    // the interpreter here rather than returning a truncated, unsafe method.
+    if compiler.buf.overflowed() {
+        // Name the method and the shortfall. A silent bail here is
+        // indistinguishable from "the JIT chose not to compile this", which is
+        // how a whole class of invoke-heavy methods came to stop being compiled
+        // unnoticed (`resolvabletype-equals-jit-...`): the only
+        // visible symptom was a flood of anonymous `try_patch_*: offset out of
+        // bounds` warnings with no method attached to any of them.
+        tracing::warn!(
+            method = method_key,
+            code_len = code_len,
+            capacity = compiler.buf.capacity(),
+            wanted = compiler.buf.wanted(),
+            "JIT compile bailed: code buffer estimate too small; method stays interpreted"
+        );
+        crate::note_jit_bail_site("code-buffer-estimate-too-small");
+        return None;
+    }
+
+    // The bytecode rewriter's coordinate change, CHECKED rather than assumed.
+    //
+    // `DeoptimizationPoint::bci` is what the VM resumes at, and it is recorded
+    // deep inside the emitter from the emitter's own pc.
+    // `build_and_record_deopt_point` publishes it through `Compiler::orig_bci`;
+    // this re-derives that answer from the emitter pc each point kept
+    // (`deopt_point_pcs`) and discards the METHOD if the translation did not
+    // hold, if a point landed on the versioning guard's synthetic bytes, or if
+    // two copies of one bytecode published disagreeing frames under one bci.
+    // See the helper for why each of those is fatal.
+    //
+    // This replaces the "any deopt point at all discards the method" backstop
+    // that stood here while `deopt_real`, precise exception frames and
+    // `invokedynamic` were refused outright — a vector that was provably empty
+    // then, and is the normal case now.
+    if let Some(x) = &loop_xform {
+        if let Err(why) = rewritten_deopt_points_are_publishable(
+            x,
+            &compiler.deopt_points,
+            &compiler.deopt_point_pcs,
+            orig_code_len,
+        ) {
+            crate::metrics::record_loop_xform_event("loop_xform_deopt_bci_unpublishable");
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                eprintln!("[JIT_GEN] bytecode loop rewrite DISCARDED: {why}");
+            }
+            tracing::warn!(
+                method = method_key,
+                deopt_points = compiler.deopt_points.len(),
+                reason = why.as_str(),
+                "JIT compile bailed: bytecode loop rewrite could not publish its deopt \
+                 points in interpreter-bci space; method stays interpreted"
+            );
+            return None;
+        }
+    }
+
+    // Build the CompiledMethod with OSR metadata.
+    //
+    // `has_dispatch` gates the interpreter's compiled-entry fast path
+    // (`interpreter.rs`: `if !compiled.has_dispatch { ... }`), which skips
+    // `set_jit_thread`. That TLS pointer is what the dispatch helpers
+    // (`jit_invoke_dispatch` / `jit_invoke_virtual_mic`) read via
+    // `jit_thread_mut()`; when it is null they short-circuit and return 0.
+    //
+    // A method with `direct_calls` makes machine-level `CALL`s into other
+    // compiled callees WITHOUT crossing a Rust boundary that could set the
+    // TLS. Those callees inherit whatever `JIT_THREAD` the caller was
+    // entered with, and may themselves dispatch (or transitively call a
+    // method that does). So a method whose only inter-method calls are
+    // direct calls must STILL be entered through the slow path that sets
+    // `JIT_THREAD` — otherwise the callee's dispatch helper sees a null
+    // thread and silently returns 0.
+    //
+    // This was the `Character.getType(char)` miscompile: its sole call,
+    // `invokestatic Character.getType(int)`, resolved to a `direct_call`,
+    // leaving `invoke_info` empty. The fast path skipped `set_jit_thread`,
+    // so the directly-called `getType(int)` ran with a null thread and its
+    // `CharacterData.of(...)` / `getType(...)` dispatches returned 0 →
+    // `Character.getType` returned UNASSIGNED for every Latin-1 letter once
+    // JIT-compiled.
+    let has_dispatch = !compiler.invoke_info.is_empty()
+        || !compiler.direct_calls.is_empty()
+        || !compiler.bounds_check_stubs.is_empty()
+        || !compiler.null_check_store_stubs.is_empty()
+        // RBC.6 — an athrow stashes a pending JIT exception; the
+        // `!has_dispatch` fast entry paths return the raw value WITHOUT
+        // draining it, which would leak the exception (and mis-read the
+        // sentinel as a return value). Force the dispatch-aware route.
+        || compiler.emitted_athrow
+        // Live monitor helpers call `jit_thread_mut()` to identify the owner
+        // and to enter GC-blocked parking on contention. A monitor-only method
+        // otherwise looks call-free and would take the TLS-free fast entry.
+        || compiler.emitted_monitor_call
+        // A fallible `newarray` OOM bail needs the per-thread TLS set so the
+        // helper can GC + construct the OOME (same rationale as direct_calls).
+        || compiler.emitted_alloc_oom_check
+        // Residual-6 companion fix — a failed checkcast stashes a CCE through
+        // the JIT_THREAD TLS and bails with the i64::MIN sentinel; the entry
+        // path must set the TLS and drain the pending exception.
+        || compiler.emitted_checkcast_throw
+        // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
+        // its stack guard stashes a catchable StackOverflowError near native
+        // exhaustion and returns the i64::MIN sentinel, so the method MUST be
+        // entered through the dispatch-aware path that sets `JIT_THREAD` (the
+        // guard constructs the SOE through it) and drains
+        // `JIT_PENDING_EXCEPTION` on return. Without this, the register-only
+        // fast entry mis-read the sentinel as a return value (int-truncated
+        // to 0) and leaked the pending SOE (observed: DeepRec printed
+        // "no-overflow r=0" instead of catching the error).
+        || !compiler.self_call_patches.is_empty()
+        // jit-clinit-gap-has-dispatch fix (2026-07-17): `jit_getstatic`,
+        // `jit_putstatic_*`, and `jit_new_object` all now run
+        // `ensure_class_initialized_shared` (see the matching fix comments
+        // on each in `vm/src/jit/helpers.rs`), which needs `jit_thread_mut()`
+        // to resolve a live `&mut JvmThread` -- exactly the same
+        // `JIT_THREAD` TLS this whole `has_dispatch` flag exists to
+        // guarantee (see the doc comment above: "otherwise the callee's
+        // dispatch helper sees a null thread and silently returns 0").
+        // Before this line, a method whose ONLY JIT-relevant content was
+        // getstatic/putstatic/new sites -- no invoke, no direct call, no
+        // bounds check, nothing else on this list -- compiled with
+        // `has_dispatch=false` and was entered through `execute_jit_call`'s
+        // fast arm (`vm/src/runtime/interpreter.rs`, `if !compiled.
+        // has_dispatch`), which skips `set_jit_thread` entirely. Any of
+        // those three helpers then saw `jit_thread_mut() == None` and
+        // silently skipped the class-init check altogether (the same
+        // "silently returns 0"-shaped failure the `Character.getType`
+        // fix above this comment already fixed for `direct_calls`) --
+        // confirmed via a minimal repro (`static void touch(boolean w) {
+        // if (w) { Init.VALUE = v; } else { dummy++; } }`, no other
+        // dispatch-needing construct) whose compiled artifact had
+        // `has_dispatch=false`, `static_field_info.len()=3`, and observably
+        // wrote the static WITHOUT running `<clinit>` first. `new_info` gets
+        // the same treatment for the identical reason on the `jit_new_object`
+        // side.
+        || !compiler.static_field_info.is_empty()
+        || !compiler.new_info.is_empty()
+        // `jit_new_object_cp` / `jit_anewarray_object_cp` need `jit_thread_mut()`
+        // for even more than the resolved helpers do: class RESOLUTION itself
+        // (a possible user `ClassLoader.loadClass`) runs on that thread, not
+        // just `<clinit>`. A null thread there would leave the site unable to
+        // resolve at all.
+        || !compiler.new_deferred_info.is_empty()
+        || !compiler.anewarray_deferred_info.is_empty()
+        // `jit_ldc_class_cp` needs `jit_thread_mut()` for the same reason the
+        // two above do: the resolution it performs may run a user
+        // `ClassLoader.loadClass`, and a failure has to publish a pending
+        // exception on this thread.
+        || !compiler.ldc_class_info.is_empty();
+    // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
+    // into the artifact (which partially moves `compiler`).
+    let frame_layout = compiler.frame_layout();
+    let method_label = compiler.method_label.clone();
+    let mut cm = if needs_heap {
+        CompiledMethod::new_with_context(compiler.buf)
+    } else {
+        CompiledMethod::new(compiler.buf)
+    };
+    cm.has_dispatch = has_dispatch;
+
+    // RBC.5 — record the declaring classes of every getstatic/putstatic
+    // site (already resolved into `static_field_info` by the caller) so the
+    // interpreter's compiled-entry fast path can ensure-initialize them
+    // once per artifact instead of re-resolving the constant pool on every
+    // call (see `static_init_classes` on `CompiledMethod`).
+    cm.static_init_classes = {
+        let mut ids: Vec<u32> = compiler
+            .static_field_info
+            .iter()
+            .map(|&(_, class_id_raw, ..)| class_id_raw)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    // Store OSR metadata for On-Stack Replacement entry.
+    //
+    // Built and validated by `x64/osr.rs`, which owns the three-coordinate-space
+    // reasoning this needs and the fail-closed rule it ends in. `osr_entry_native`
+    // is handed over by value: nothing below reads it again.
+    osr::publish_entry_metadata(
+        &mut cm,
+        code,
+        code_len,
+        orig_code_len,
+        &loop_xform,
+        compiler.osr_entry_native,
+        &compiler.local_assignments,
+        &compiler.xmm_assignments,
+        &compiler.osr_block_live_in,
+        compiler.num_locals,
+        compiler.num_reg_locals,
+        kernel_reg_homes,
+        kernel_reg_homes_osr_requested,
+        &method_label,
+    );
+    cm.osr_frame_size = compiler.frame_size;
+    cm.osr_callee_saved_base = compiler.callee_saved_base;
+    // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT
+    // callee-saved sets the epilogue restores (GPR + XMM), so it spills the
+    // caller's value for every one of them at the matching slot index. The
+    // prologue/epilogue spill/restore `alloc_used_regs` / `alloc_used_xmms` (the
+    // full allocator-used set, which can include callee-saved regs used for
+    // operand-stack temporaries — NOT just locals); the old trampoline only
+    // spilled a local_assignments-derived subset, so any non-local callee-saved
+    // register was restored from the wrong (or an uninitialised) slot, silently
+    // corrupting the OSR caller's live registers after return.
+    cm.osr_callee_saved_regs = Some(compiler.alloc_used_regs.clone());
+    cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
+    cm.osr_xmm_saved_base = compiler.xmm_saved_base;
+    cm.method_label = method_label;
+    cm.shadow_savebase_slot_off = compiler.shadow_savebase_slot_off;
+    cm.frame_layout = frame_layout;
+    cm.osr_heap_local_offset = compiler.heap_local_offset;
+    cm.jit_thread_slot_off = compiler.jit_thread_slot_off;
+    cm.stack_floor_slot_off = compiler.stack_floor_slot_off;
+    cm.osr_frame_record = compiler.helpers.frame_record;
+
+    // T1.1.a — transfer precise oop maps collected during codegen.
+    // The GC root walker's `JitEntryGuard::enter_with_compiled` path
+    // checks `CompiledMethod::has_precise_oop_maps()` to decide
+    // whether to use them for this frame; when empty, it falls back
+    // to the conservative stack scan for that frame — always a
+    // correct super-set of the precise coverage.
+    cm.oop_maps = compiler.oop_maps;
+    // deopt-osr Step 1: transfer precise deopt-exit snapshots collected at
+    // eligible guards (currently the speculative-BCE loop-header guard). No live
+    // path consumes these yet — emit-and-discard until the in-stub trampoline +
+    // resume land (real-frame-deopt-x64-backport Steps 2-4) — so this is inert
+    // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
+    cm.deopt_points = compiler.deopt_points;
+    cm._deopt_point_boxes = compiler.deopt_boxes;
+    // deopt-osr Step 9 follow-up (a): hand the retained epoch guard (baked as the
+    // 4th arg into every frame-deopt stub) to the artifact so the VM can stamp it
+    // (creation epoch + live-epoch cell) at install. Null on production artifacts
+    // (no frame-deopt stub emitted unless `deopt_real_enabled()`).
+    cm.deopt_epoch_guard = compiler.deopt_epoch_guard;
+    // deopt-osr x64-backport Step 5 — finalize the per-method deopt-resume
+    // coverage gate (mirrors `fully_oop_covered` / `can_osr_exit`). A method may
+    // resume a real-frame deopt only when:
+    //   1. it emitted at least one deopt-exit snapshot (`deopt_points`), and
+    //   2. it scalar-replaced NO objects (`scalar_replaced` empty).
+    // (2) is load-bearing: this backend records a scalar-replaced slot by its
+    // machine provenance (Register/StackSlot), NOT as a `VirtualObject`, so its
+    // snapshot cannot be re-materialized — and lock elision over such an object
+    // makes mid-method resume unsound (the elided-monitor hazard). Until the x64
+    // emitter writes `VirtualObject` deopt slots + an elided-monitor flag, a
+    // scalar-replacing method stays on the safe re-run path. Empty/false unless
+    // `deopt_real_enabled()` (the snapshot emit site is gated), so production
+    // artifacts are unchanged. Consumed at the interpreter deopt sink, which
+    // attempts `resume_real_ir_deopt` only when `compiled.can_deopt_resume`.
+    //
+    // P2.1/P2.2 (cat-2 + FP resume): the snapshot now has a per-slot WIDTH source
+    // (`classify_local_kinds`) and emits typed `RegisterLong`/`StackSlotLong`
+    // (long), `XmmFloat`/`XmmDouble`/`StackSlotFloat`/`StackSlotDouble` (FP) values
+    // that the resume mapper reconstructs as full-width `Value::Long`/`Float`/
+    // `Double`; the deopt stub spills XMM0..15 (under the gate) so the XMM-resident
+    // FP forms resolve. P2.0's blanket wide-local exclusion is fully lifted. Any
+    // slot the classifier can't type (Ambiguous / a register-resident ref /
+    // contradiction) emits `Unsupported`, and the mapper re-runs the whole method
+    // for it — the per-slot fine-grained safety net behind this coarse gate.
+    //
+    // Phase B (real-frame-deopt x64 backport): the scalar-replacement exclusion is
+    // RELAXED. The snapshot builder now emits `FrameValue::VirtualObject` /
+    // `VirtualObjectRef` for a scalar-replaced object live in a local at a deopt
+    // point (its fields read from their frame slots, typed by `sr_field_types`),
+    // which the VM materializer (`deopt_materialize::materialize_virtual_objects`)
+    // rebuilds on resume. So a scalar-replacing method MAY resume — UNLESS it
+    // elided a `monitorenter`/`monitorexit` over a scalar object (`has_elided_monitor`):
+    // an elided lock leaves no `monitors` trace, so the resume would skip the
+    // re-lock (the elided-monitor hazard, deferred to Phase C). `ACC_SYNCHRONIZED`
+    // is independently caught by the VM resume sink's `is_synchronized` bail.
+    cm.can_deopt_resume = !cm.deopt_points.is_empty() && !compiler.has_elided_monitor;
+    // deopt-osr Step 7 — transfer the OSR-exit loop-boundary bci set and set the
+    // per-method gate. Both are empty/false unless `deopt_real_enabled()` was on
+    // (the emit site is gated), so production artifacts are unchanged. Step 8
+    // consults `can_osr_exit` + `osr_exit_points` (under `CRATONVM_DEOPT_REAL`)
+    // to route a mid-loop bail through the deopt trampoline.
+    // Bcis, consumed by the VM's OSR-exit route, so interpreter-bci space —
+    // `filter_map` drops a pc with no provenance instead of publishing it raw.
+    // A LIVE path since the bci translation retired the `deopt_real` and
+    // `invokedynamic` refusals: every copy of a loop-boundary bytecode records
+    // its own exit map, and all of them collapse onto the one original bci, so
+    // deduplicate rather than publish the same bci `copies + 1` times.
+    cm.osr_exit_points = match &loop_xform {
+        Some(x) => {
+            let mut seen = FxHashSet::default();
+            compiler
+                .osr_exit_points
+                .iter()
+                .filter_map(|&pc| x.bci_at(pc))
+                .filter(|bci| seen.insert(*bci))
+                .collect()
+        }
+        None => compiler.osr_exit_points,
+    };
+    // FIX: mirror `can_deopt_resume`'s elided-monitor exclusion above — an
+    // OSR-exit transfer materializes the same kind of reconstructed frame, so
+    // a scalar-replaced object held under an elided `synchronized` block is
+    // the same unsound-resume hazard here as it is for `can_deopt_resume`.
+    cm.can_osr_exit = !cm.osr_exit_points.is_empty() && !compiler.has_elided_monitor;
+    // jit-invokedynamic-groovy-regression fix: a compiled 0xba site is an
+    // UNCONDITIONAL trap (the instruction is never JIT-executed), so any
+    // execution of this artifact that reaches it deopts. Publishing this
+    // artifact's entry where MACHINE CODE calls it directly (a baked
+    // JIT→JIT direct call, a MIC/PIC inline-cache entry) would let the
+    // sentinel + stashed frame bail through a compiled CALLER's epilogue,
+    // where no consumer can resume the callee precisely (the caller's
+    // continuation is already lost). The publication gates (see
+    // `callee_compiler` in vm/src/runtime/interpreter.rs and the MIC/PIC
+    // install sites in vm/src/jit/helpers.rs) consult this flag so every
+    // call to such a method stays on a dispatch helper, whose
+    // `try_resume_trapped_callee` resolves the trap precisely in place.
+    // Only sites that actually lower to a trap count. A fully bridged
+    // method (every indy is a StringConcatFactory call) carries no trap, so it
+    // must not be forced onto the dispatch-helper path for its callers.
+    cm.has_indy_trap = {
+        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        compiler
+            .indy_info
+            .iter()
+            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
+                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            })
+    };
+    // Stage 3 — the frame offset where this method stores the active
+    // safepoint's bytecode PC (0 when the precise gate was off at compile).
+    cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // Stage A.2 (precise oop maps, B-K fix) — a method is "fully precisely
+    // covered" only when EVERY GC-capable safepoint that flushed its
+    // register-locals (`safepoint_pcs`) also recorded a precise oop map
+    // (`mapped_safepoint_pcs`), the precise gate is on (so the sp-id slot
+    // exists and the per-safepoint id is stored), and there is no construct the
+    // current mapping cannot describe (inlined-callee safepoints). OSR entry
+    // used to be a coverage breaker because it bypassed the prologue's shadow
+    // and exact-RBP setup; the OSR trampoline now mirrors both before jumping to
+    // the loop body, so OSR artifacts use the same completeness predicate.
+    // Stage B consults this to decide whether the GC may skip the conservative
+    // backstop for this frame and treat its precise oops as movable. It is a
+    // NECESSARY codegen precondition; the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS`
+    // oracle (Stage G0) is the SUFFICIENT proof that must gate the actual
+    // backstop suppression before the moving path relies on it. Always `false`
+    // on the default path (`sp_id_slot_off == 0`), so it is inert until the gate
+    // is on AND Stage B lands.
+    cm.fully_oop_covered = compiler.precise_maps
+        && compiler.sp_id_slot_off != 0
+        && compiler.inline_sites.is_empty()
+        && compiler
+            .safepoint_pcs
+            .is_subset(&compiler.mapped_safepoint_pcs);
+    // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
+    // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
+    // the `top` watermark) for OSR-entered frames. All 0 when shadow-stack
+    // support was off at compile.
+    cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
+    cm.shadow_savetop_slot_off = compiler.shadow_savetop_slot_off;
+    cm.shadow_off_in_thread = compiler.shadow_off_in_thread;
+
+    // Task #60 — attach unroll-cloned MIC/PIC slots to the
+    // CompiledMethod so they outlive the compiled code. The imm64
+    // baked into duplicated `MOV R10, imm64` instructions is a raw
+    // pointer to one of these boxes; without keeping them alive on the
+    // CompiledMethod, the first GC of the Box would invalidate the
+    // pointer and the next invokevirtual on an unrolled copy would
+    // dereference freed memory.
+    //
+    // The caller-supplied slots (from `lib.rs::try_compile`) remain
+    // owned by the caller and are attached to `_jit_mic_slots` /
+    // `_jit_pic_slots` separately on the lib.rs side. This `extend`
+    // is purely additive — both vectors retain their previous
+    // contents.
+    cm._jit_mic_slots.extend(compiler.cloned_mic_slots);
+    cm._jit_pic_slots.extend(compiler.cloned_pic_slots);
+
+    Some(cm)
+}
+
+/// Estimate the maximum operand stack depth for the method.
+/// Simple conservative estimate: count push-like opcodes.
+pub(super) fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
+    let mut max_depth = 0usize;
+    let mut depth = 0usize;
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // Push operations (aconst_null, load const/local/ref, bipush, sipush → +1)
+            0x01..=0x14 | 0x15..=0x19 | 0x1a..=0x2d => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // Pop operations (binary ops pop 2, push 1 → net -1)
+            0x60..=0x71 | 0x78..=0x83 | 0x94..=0x98 => {
+                depth = depth.saturating_sub(1);
+            }
+            // Store ops pop 1 (i/l/f/d/astore, i/l/f/d/astore_N)
+            0x36..=0x4e => {
+                depth = depth.saturating_sub(1);
+            }
+            // Array load: pop 2 (array, index), push 1 → net -1
+            0x2e..=0x35 => {
+                depth = depth.saturating_sub(1);
+            }
+            // Array store: pop 3 (array, index, value) → net -3
+            0x4f..=0x56 => {
+                depth = depth.saturating_sub(3);
+            }
+            // getstatic: push 1 (value) → net +1
+            0xb2 => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // putstatic: pop 1 (value) → net -1
+            0xb3 => {
+                depth = depth.saturating_sub(1);
+            }
+            // getfield: pop 1 (objectref), push 1 (value) → net 0
+            0xb4 => {}
+            // putfield: pop 2 (objectref, value) → net -2
+            0xb5 => {
+                depth = depth.saturating_sub(2);
+            }
+            // newarray: pop 1 (count), push 1 (ref) → net 0
+            0xbc => {}
+            // new: push 1 object ref (no pop) → +1
+            0xbb => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // anewarray: pop 1 (count), push 1 (ref) → net 0
+            0xbd => {}
+            // arraylength: pop 1 (ref), push 1 (int) → net 0
+            0xbe => {}
+            // Return pops 1 (ireturn, lreturn, freturn, dreturn, areturn)
+            0xac..=0xb0 => {
+                depth = 0;
+            }
+            // void return
+            0xb1 => {
+                depth = 0;
+            }
+            // Unary ops (neg, conversions): pop 1, push 1 → net 0
+            0x74..=0x77 | 0x85..=0x93 => {}
+            // Branch pops (ifXX pop 1, if_icmpXX pop 2, if_acmpXX pop 2)
+            0x99..=0x9e => {
+                depth = depth.saturating_sub(1);
+            }
+            0x9f..=0xa6 => {
+                depth = depth.saturating_sub(2);
+            }
+            // ifnull/ifnonnull pop 1
+            0xc6 | 0xc7 => {
+                depth = depth.saturating_sub(1);
+            }
+            // checkcast: pop 1, push 1 → net 0
+            0xc0 => {}
+            // instanceof: pop 1, push 1 → net 0
+            0xc1 => {}
+            // Pop
+            0x57 => {
+                depth = depth.saturating_sub(1);
+            }
+            // Pop2
+            0x58 => {
+                depth = depth.saturating_sub(2);
+            }
+            // Dup: +1
+            0x59 => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // dup_x1 / dup_x2 add one copy of the top operand.
+            0x5a | 0x5b => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // dup2* can add two category-1 slots; category-2 values are still
+            // one slot in this x64 operand-stack model.
+            0x5c..=0x5e => {
+                depth += 2;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // Swap: 0
+            0x5f => {}
+            // iinc: 0
+            0x84 => {}
+            // goto: 0
+            0xa7 => {
+                depth = 0;
+            }
+            // jsr pushes a returnAddress in legacy bytecode.
+            0xa8 => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // invokestatic/invokevirtual/invokespecial/invokeinterface: conservatively
+            // assume they push 1 result (pops are hard to estimate without descriptors)
+            0xb6..=0xb9 => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            // multianewarray: pops ndims, pushes 1 → net -(ndims-1)
+            0xc5 => {
+                let ndims = code.get(pc + 3).copied().unwrap_or(2) as usize; // Cast: address arithmetic
+                depth = depth.saturating_sub(ndims.saturating_sub(1));
+            }
+            _ => {}
+        }
+        // Advance PC via the canonical length table. The ad-hoc copy this
+        // replaces was missing `ldc` (0x12) and treated tableswitch/
+        // lookupswitch as 1-byte, so the walk stepped through operand bytes
+        // (incl. switch pad/offset tables) as phantom opcodes; a phantom
+        // return zeroed `depth` and could UNDER-estimate the frame's operand
+        // stack (the CM-FASTMATH length-table desync family).
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            break;
+        }
+        pc += len;
+    }
+    // Add safety margin (conservative for invoke stack effects not tracked above)
+    max_depth + 4
+}

@@ -56,15 +56,20 @@ pub mod verify_insn;
 pub mod vtype;
 
 pub use class::{
-    find_field_recursive, find_method_recursive, invokespecial_selection_start, ArrayInfo, Class,
-    ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, RecordComponentInfo,
-    RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
+    class_origin_epoch, find_field_recursive, find_method_recursive, invokespecial_selection_start,
+    ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
+    RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE,
+    RECORD_OBJ_TO_STRING,
 };
 // JDK-only mode (contract §5): every `Class` carries a `ClassOrigin`, and the
 // `--dump-class-origins` census is a `Vec<ClassOriginEntry>`. Both are named at
 // the crate root because the consumers (`vm`, `vm-cli`, `difftest`) already
 // import `Class` from here.
 pub use class_origin::{ClassOrigin, ClassOriginEntry};
+// The per-registration adjudication of a native against the bytes on the class
+// path (`--dump-native-registry` schema 3's `image_declaring_method`). Named at
+// the crate root for the same reason as `ClassOrigin`: `vm` is the consumer.
+pub use class_manager::ImageMethodVerdict;
 pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 pub use class_manager::{
@@ -86,7 +91,7 @@ pub use class_manager::{
     // `CRATONVM_LOADER_AWARE_RESOLUTION` gate. `vm::runtime::env_cache` and
     // `native-builtins::classloader` both delegate to this instead of
     // keeping their own `OnceLock`-cached env-var copy — see
-    // `docs/internal/loader-identity.md`.
+    // `fixed-suite-bugs/loader-identity.md`.
     loader_aware_resolution,
     register_builtin_classloaders,
     set_current_thread_id,
@@ -100,7 +105,7 @@ pub use class_manager::{
     // "nobody has this name" apart from "several loaders each have their own
     // class under it". Every `Option`-returning lookup collapses the two, and a
     // caller that reads the collapse as "absent" loads a second copy — see
-    // `docs/known-issues/c2/classloading-identity-audit.md`.
+    // `docs/feature-designs/classloading-identity-audit.md`.
     NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,

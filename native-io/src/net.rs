@@ -2173,17 +2173,43 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         Handle::None => "0.0.0.0".to_string(),
     };
-    let ia = ctx.new_object("java/net/InetAddress")?;
-    if let Some(Value::Object(Some(ia_obj))) = ia {
-        let host = ctx.create_string(&addr_text);
-        let ip = ctx.create_string(&addr_text);
-        if ctx.object_num_fields(ia_obj) >= 2 {
-            ctx.set_field(ia_obj, 0, Value::Object(Some(host)));
-            ctx.set_field(ia_obj, 1, Value::Object(Some(ip)));
-        }
-        return Ok(Some(Value::Object(Some(ia_obj))));
+    net_inet_address_from_literal(ctx, &addr_text)
+}
+
+/// Build the `InetAddress` for a socket endpoint whose address we only know as
+/// NUMERIC TEXT, by routing through `InetAddress.getByName` rather than filling
+/// in instance slots by hand.
+///
+/// The hand-rolled version allocated the ABSTRACT `java/net/InetAddress` and
+/// wrote the literal into slots 0 and 1 — the legacy two-slot layout. Two
+/// things were wrong with the result: its class was `InetAddress` rather than
+/// the concrete `Inet4Address`/`Inet6Address` an `instanceof` check expects,
+/// and it claimed a hostName equal to its own IP, so `Socket.getLocalAddress()`
+/// printed `127.0.0.1/127.0.0.1` where HotSpot prints `/127.0.0.1` (an address
+/// resolved from a literal has no name to remember).
+///
+/// `getByName` is the JDK's own answer for a literal and already applies both
+/// rules, so this defers to it instead of duplicating them in a crate that
+/// cannot reach `native-builtins`. The freshly created String is pinned across
+/// the re-entrant call, which runs Java and can therefore collect.
+fn net_inet_address_from_literal(
+    ctx: &mut dyn NativeContext,
+    addr_text: &str,
+) -> MethodCallResult {
+    let text = ctx.create_string(addr_text);
+    let pin = ctx.pin_native_root(text);
+    let text = ctx.read_native_pin(pin, text);
+    let built = ctx.invoke(
+        "java/net/InetAddress",
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/InetAddress;",
+        &[Value::Object(Some(text))],
+    );
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
     }
-    Ok(Some(Value::Object(None)))
 }
 
 /// `remotePort(FileDescriptor fd) -> int`
@@ -2224,17 +2250,7 @@ fn net_remote_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         None => "0.0.0.0".to_string(),
     };
-    let ia = ctx.new_object("java/net/InetAddress")?;
-    if let Some(Value::Object(Some(ia_obj))) = ia {
-        let host = ctx.create_string(&addr_text);
-        let ip = ctx.create_string(&addr_text);
-        if ctx.object_num_fields(ia_obj) >= 2 {
-            ctx.set_field(ia_obj, 0, Value::Object(Some(host)));
-            ctx.set_field(ia_obj, 1, Value::Object(Some(ip)));
-        }
-        return Ok(Some(Value::Object(Some(ia_obj))));
-    }
-    Ok(Some(Value::Object(None)))
+    net_inet_address_from_literal(ctx, &addr_text)
 }
 
 // ---------- Capability queries ----------
@@ -2966,7 +2982,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `ServerSocket.close()` (via `NioSocketImpl.close()` ->
     // `NativeDispatcher.preClose`). Companion gap to the `FileKey.init`
     // fix, see
-    // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+    // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register(
         "sun/nio/ch/UnixDispatcher",
         "close0",

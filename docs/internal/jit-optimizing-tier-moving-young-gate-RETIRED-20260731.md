@@ -209,7 +209,7 @@ also switches off the single-pass backend's shadow-stack root publication,
 because `shadow_stack_maps_enabled()` is
 `flags().jit.shadow_stack || moving_young_enabled()`. Adding
 `CRATONVM_SHADOW_STACK=1` back removes the crash. Filed as
-`docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+`docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 
 Meanwhile both classes **complete on default flags**, every run, correct:
 

@@ -1150,7 +1150,7 @@ fn native_response_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `buff`, so keying "null" off `buff == null` alone reported a recycled
 /// chunk as empty-but-set and returned `""` where Tomcat returns `null`
 /// (`TestCharChunk.testToString`,
-/// `docs/internal/fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty.md`).
+/// `fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty-FIXED.md`).
 ///
 /// PERF: `end` is tested first and `isSet` is read **only** when `end == 0`,
 /// so the ordinary non-empty path still performs exactly three
@@ -2792,7 +2792,7 @@ fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     // Registered `()Ljava/util/Random;` — reference-typed, so the by-name read
     // must not be returned raw: it answers `Value::Int(0)` for an unwritten
-    // slot. See `docs/known-issues/c2/by-name-field-reads.md`.
+    // slot. See `docs/feature-designs/by-name-field-reads.md`.
     Ok(Some(field_read::ref_field(ctx, this, "random")))
 }
 
@@ -4096,7 +4096,7 @@ pub mod case_map;
 /// `Value::Object(None)` through the indexed `get_field`. Natives that test a
 /// by-name read for null, or return one straight out of a reference-typed
 /// method, are asking the wrong question and get a plausible answer. See
-/// `docs/known-issues/c2/by-name-field-reads.md`.
+/// `docs/feature-designs/by-name-field-reads.md`.
 pub(crate) mod field_read;
 pub mod lang_class;
 pub mod lang_string;
@@ -4135,6 +4135,7 @@ pub mod servlet;
 // MXBean introspection path during KC16 boot).
 pub mod http2;
 pub mod jmx_openmbean;
+pub mod date_format_fast;
 pub mod t27_tls;
 pub mod t27_tls_cbc;
 pub mod t3_impl;
@@ -4144,7 +4145,7 @@ pub mod tls;
 // raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
 // plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
 pub mod tls_deny;
-// Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
+// Step 1 of the limb-based BigInteger rewrite (gaps/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
 pub(crate) mod bigint;
@@ -4481,7 +4482,7 @@ pub mod antlr_intrinsics;
 /// Grouping only — every family below is still registered unconditionally.
 pub mod app_shims;
 /// Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
-/// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+/// See `gaps/feature_roadmap_interpreter_intrinsic_table.md`.
 pub mod intrinsics;
 pub mod logging_shims;
 pub mod lucene_es;
@@ -6406,7 +6407,7 @@ fn populate_real_thread_holder(
     // garbage. Mirrors the identical BUG-03 pin pattern already used by
     // `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs)
     // for the bootstrap main-thread holder construction. See
-    // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
+    // fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md.
     let pin_base = ctx.pin_native_root(this);
     let target_handle = match target {
         Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
@@ -6771,7 +6772,7 @@ pub fn register_essential_natives_with_shims(
     // If a JBoss Marshalling case ever does need one of these, add it back
     // WITHOUT a feature gate and with a test that fails when it is missing — a
     // gated registration on this path is invisible to every suite run. See
-    // docs/internal/fixed-suite-bugs/serialization/ for the retired report.
+    // fixed-suite-bugs/serialization/ for the retired report.
     //
     // The registrar is still used by the synthetic path
     // (`register_serialization_natives`), where there is no JDK bytecode to run.
@@ -6843,40 +6844,66 @@ pub fn register_essential_natives_with_shims(
             crate::app_shims::register_app_intrinsic_shims(registry);
         });
     }
-    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // SBR-02 / bug-03: fast regex, and the one `java/lang/String` family that
+    // still wins over real-JDK bytecode. The real `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
     // than HotSpot (every Matcher step crosses the VM→native String-accessor
-    // boundary — see docs/internal/wildfly-suite-bugs/bug-03). These fast Rust
+    // boundary — see wildfly-suite-bugs/bug-03). These fast Rust
     // `regex`/`fancy-regex` natives are normally registered only by
     // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
     // are absent here by default and the real bytecode runs (the real-Java
-    // default). When `CRATONVM_NATIVE_STRING_REGEX` is set, register them so the
-    // companion `force_native_over_real_jdk_bytecode` gate routes
-    // `String.replaceAll/replaceFirst/matches` to the cached, Java-faithful
-    // native. Read directly (native-builtins cannot depend on vm::env_cache)
+    // default). Read directly (native-builtins cannot depend on vm::env_cache)
     // with the SAME default-ON / opt-out (`=0`/`false`) semantics as
     // `env_cache::native_string_regex`; registration runs once at VM init so the
     // lookup cost is negligible.
+    //
+    // # `register_with_kind(.., Intrinsic)`, and why it is load-bearing
+    //
+    // Every other `java/lang/String` `Bridge` is DROPPED in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4 — real class bytes are
+    // authoritative), which is where the three deleted forced-native `String`
+    // lists went. These four survive that drop on their KIND, which is exactly
+    // §1.4's reviewed exception and needs no name list at any dispatch site.
+    // Registering them `Bridge` — including by omission, since the ambient
+    // category here is `Bridge` — silently deletes the SBR-02 fix.
+    //
+    // Stated at the site rather than inherited from an enclosing
+    // `set_category`, so the census's `kind_stated` column records that
+    // somebody adjudicated these four rather than that they inherited whatever
+    // the call chain left behind. These are its first callers.
+    //
+    // Reviewed against HotSpot with `probes/StringPolicyMatrixProbe` (392
+    // cases) and measured with `probes/StringRegexCostProbe`: the four are
+    // ~2× faster than HotSpot on the `PluginXmlParser.format()` shape they
+    // were written for, with identical digests. The review is what makes them
+    // `Intrinsic`; being fast is not sufficient, and the review had to be
+    // *repaired* first — see `lang_string.rs`, where these four now raise
+    // `PatternSyntaxException` / NPE / `IndexOutOfBoundsException` where the
+    // JDK does instead of falling back to a literal replacement and returning
+    // a plausible wrong answer.
     let native_string_regex_enabled = crate::nbflags().native_string_regex;
     if native_string_regex_enabled {
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceAll",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_all,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceFirst",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_first,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "matches",
             "(Ljava/lang/String;)Z",
             native_string_matches,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
         // SBR-02 secondary finding: the `replace(CharSequence,CharSequence)`
         // overload is LITERAL all-occurrences replacement (NOT regex), but its
@@ -6887,13 +6914,14 @@ pub fn register_essential_natives_with_shims(
         // `str::replace` (literal, non-overlapping, empty-target inserts at
         // every position — same as Java) so there's no regex-semantics risk;
         // gated together with the regex natives. NOTE: the `(char,char)`
-        // overload already has an unconditional native (`native_string_replace`)
-        // and is unaffected.
-        registry.register(
+        // overload has its own native, which is a `Bridge` and is therefore
+        // dropped in real-JDK mode with the rest.
+        registry.register_with_kind(
             "java/lang/String",
             "replace",
             "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
             native_string_replace_charseq,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
     }
     // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
@@ -7336,7 +7364,7 @@ pub fn register_essential_natives_with_shims(
             // bytecode entirely (see bug-27 comment above), so it must
             // replicate the check itself or a channel opened FileChannel.open(
             // path, READ) silently truncates the real file instead of
-            // rejecting the call (docs/known-issues/h2/
+            // rejecting the call (
             // bug-h2-files-setposixfilepermissions-FIXED.md residual).
             let writable = !matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0));
             if !writable {
@@ -7503,6 +7531,13 @@ pub fn register_essential_natives_with_shims(
         "(I)C",
         crate::lang_string::native_string_char_at,
     );
+    // LEAF: `native_string_length` -> `string_char_count` is three heap reads —
+    // field 0 (`value`), that array's length, and field 1 (`coder`) — with no
+    // allocation, no safepoint and no throw. See
+    // `NativeMethodRegistry::set_leaf`. Measured at 1405 ns from compiled code
+    // against HotSpot's 0.2 ns (`probes/NativeShapeProbe.java`); `String.length`
+    // is one of the most-called methods in any Java program.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/String",
         "length",
@@ -7516,6 +7551,13 @@ pub fn register_essential_natives_with_shims(
         // (reads the compact `value: byte[]` length / coder).
         crate::lang_string::native_string_length,
     );
+    // NOT the `isEmpty` below: it goes through `ctx.read_string`, which decodes
+    // the whole string into a fresh Rust `String`. That is not a Java-heap
+    // allocation, so it does not break the leaf contract outright — but it is
+    // O(n) work behind a predicate, and marking it leaf would advertise a
+    // cheapness it does not have. Left on the funnel until someone rewrites it
+    // against `string_char_count` and measures.
+    registry.set_leaf(false);
     registry.register("java/lang/String", "isEmpty", "()Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -7577,21 +7619,50 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/util/Locale;)Ljava/lang/String;",
         lang_string::native_string_to_upper_case_uncached,
     );
-    // String.hashCode — use the layout-aware CACHING implementation (reads and
-    // writes the JDK `hash` field) rather than recomputing from scratch on every
-    // call. The previous inline closure here re-decoded the char array and
-    // re-ran the fold every time, with NO caching, so real-JDK String-keyed
-    // hashing was ~1950x slower than HotSpot (which caches in String.hash):
-    // a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it dominated the
-    // Xerces XSD model build (XSElementDecl.hashCode / CMStateSet.hashCode were
-    // ~100% of self-time). `register_synthetic_overrides` already wired the
-    // caching impl, but real-JDK mode (`--java-home`) only runs
-    // `register_essential_natives`, so the cache never took effect there.
-    registry.register(
+    // String.hashCode — the layout-aware CACHING implementation (reads and
+    // writes the JDK `hash` field) rather than recomputing from scratch on
+    // every call. The previous inline closure here re-decoded the char array
+    // and re-ran the fold every time, with NO caching, so real-JDK
+    // String-keyed hashing was ~1950x slower than HotSpot (which caches in
+    // `String.hash`): a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it
+    // dominated the Xerces XSD model build (`XSElementDecl.hashCode` /
+    // `CMStateSet.hashCode` were ~100% of self-time).
+    //
+    // # `Intrinsic`, and why this one is not a performance argument
+    //
+    // Every other `java/lang/String` `Bridge` is dropped in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4). This one is stated
+    // `Intrinsic` so it survives, and the reason is CORRECTNESS, not speed:
+    // the real `String.hashCode()` bytecode is **wrong** here for any string
+    // whose backing array is UTF-16.
+    //
+    // Measured with `probes/StringUtf16HashProbe`, which computes the JLS
+    // formula in plain Java over the receiver's own `charAt` and compares:
+    //
+    //   "ΣΟΣ"   hashCode() = 62956255   JLS = 924359
+    //
+    // The object is not corrupt — `length()`, `charAt` and `equals` on it all
+    // agree with HotSpot. The bytecode path reads the first `length()` BYTES
+    // of the backing array, each sign-extended to a `char`, instead of the
+    // `length()` UTF-16 code units: `(char) value[i]` where it needs
+    // `getChar(value, i)`. Solving the observed hashes for their input
+    // sequence gives that exact reading for all four probe strings, including
+    // the sign extension (`0xA3` hashed as `0xFFA3`).
+    //
+    // So dropping this registration replaces a correct answer with a wrong one
+    // for every non-Latin-1 `String` key in the VM, which is not an edge case:
+    // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
+    // `StringUTF16` defect is filed separately — see
+    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // — and when it is fixed this registration should be re-measured and
+    // probably deleted, because at that point it becomes a pure perf
+    // optimisation again and has to argue for itself on those terms.
+    registry.register_with_kind(
         "java/lang/String",
         "hashCode",
         "()I",
         native_string_hash_code,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
@@ -7892,7 +7963,7 @@ pub fn register_essential_natives_with_shims(
     // investigation went down first). Root-caused via a `while
     // (m.find()) { m.group(N); }`-shaped user benchmark that turned out to
     // reduce to plain `String.substring()` on a large parent string scaling
-    // O(n^2); see docs/internal/fixed-suite-bugs/
+    // O(n^2); see fixed-suite-bugs/
     // substring-large-parent-quadratic-allocation-FIXED.md.
     // `native_string_substring`/`native_string_substring_one` already have a
     // "read only the requested range, don't materialize the whole String
@@ -8428,7 +8499,7 @@ pub fn register_essential_natives_with_shims(
         Ok(Some(Value::Int(i32::from(tty))))
     });
 
-    // JDK 25 residual (docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md):
+    // JDK 25 residual (fixed-suite-bugs/springboot/classutils-forname-platform-loader-false-positive.md):
     // JDK 25's `java.io.Console` no longer has `istty()Z` at all -- it was
     // replaced by `private static native int ttyStatus()`, called once from
     // `<clinit>` and stashed in a static `ttyStatus` field that
@@ -8656,7 +8727,7 @@ pub fn register_essential_natives_with_shims(
     });
     // DIAGNOSTIC (temporary, CRATONVM_TRACE_ARRAYS_HASHCODE-gated):
     // `createLayoutFromConfigClass` (Thymeleaf/Groovy MetaClass hang, see
-    // docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md)
+    // fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md)
     // hangs permanently inside real bytecode `jdk.internal.util.ArraysSupport
     // .hashCode(Object[], int, int, int)`, called from `Arrays.hashCode` on
     // a `ParameterizedTypeImpl`'s `actualTypeArguments`. This native
@@ -8857,8 +8928,8 @@ pub fn register_essential_natives_with_shims(
     // surface (added 2026-07-09 by the WildFly process-controller bootstrap
     // batch, b448f2039) shadowed the real OSW bytecode at every dispatch
     // site (WP0.1 native-override-priority) and REGRESSED the StreamEncoder
-    // commit-threshold fix (1773d3df2, docs/known-issues/
-    // dohead-streamencoder-eager-flush-commit-threshold.md):
+    // commit-threshold fix (1773d3df2, fixed-suite-bugs/tomcat/
+    // dohead-streamencoder-eager-flush-commit-threshold-FIXED.md):
     // `write_bytes_from_output_stream_writer` encodes every `write()` call
     // straight to the wrapped stream — one underlying `write([BII)` per
     // Writer call instead of real StreamEncoder's 512-byte batches — which
@@ -9569,11 +9640,18 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // ForkJoinTask is a Runnable subtype in real JDK; calling
-            // its `exec()` method runs the encapsulated logic and
-            // returns Z (true if completed normally). We discard the
-            // boolean since `execute(...)` is void.
-            let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+            // Run the task through the shared side-table path rather than a
+            // bare `exec()` invoke. The bare invoke never RECORDED the task
+            // as done, so the matching `join()` saw `done == false` and ran
+            // the body a SECOND time — a matrix probe against the host JDK
+            // caught `execute(t); t.join()` executing `compute()` twice
+            // (`ran=2` where HotSpot reports `ran=1`). Silent double
+            // execution is a correctness bug for any non-idempotent task.
+            //
+            // `execute` is void and must not raise the task's exception at
+            // the submitter (it surfaces at the matching `join()`/`get()`),
+            // which is exactly `fjp_compute_for_submit`'s policy.
+            let _ = phases_early::fjp_compute_for_submit(ctx, task)?;
             Ok(None)
         },
     );
@@ -9680,6 +9758,14 @@ pub fn register_essential_natives_with_shims(
     // --- java.lang.System (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
+    // LEAF: both clock reads are `_ctx`-free — a `SystemTime::now()` /
+    // `Instant::elapsed()` and an integer cast. Nothing to pin, nothing that
+    // can allocate, safepoint or throw. See `NativeMethodRegistry::set_leaf`.
+    // Measured at 604 ns from compiled code against HotSpot's 32 ns
+    // (`probes/NativeShapeProbe.java`), essentially all of it the funnel — and
+    // `System.nanoTime` is what every timeout, scheduler and benchmark in the
+    // JDK calls.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "currentTimeMillis",
@@ -9692,6 +9778,7 @@ pub fn register_essential_natives_with_shims(
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register(
         "java/lang/System",
         "arraycopy",
@@ -10520,11 +10607,17 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
-    registry.register(
+    // The `AbstractStringBuilder` half of DF05 — see the
+    // `(Ljava/lang/StringBuilder;)V` sibling in `deprecated_util.rs` for the
+    // full story and the measurement. `Intrinsic` for the same load-bearing
+    // reason: this VM's builders are `char[]`-backed and the real ctor's
+    // `Arrays.copyOfRange` over a `byte[]` reads them one byte at a time.
+    registry.register_with_kind(
         "java/lang/String",
         "<init>",
         "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
         lang_string::native_string_init_abstract_string_builder,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
@@ -15612,19 +15705,37 @@ pub fn register_essential_natives_with_shims(
                     .into())
                 }
             };
-            for i in 0..ctx.array_length(constants) {
-                let candidate = match ctx.get_array_element(constants, i) {
+            // Cross-call GC-safety (2026-08-04): `invoke_virtual` runs
+            // `Enum.name()` — Java, and therefore a possible moving young
+            // collection — with `constants` and `candidate` held as bare
+            // `ObjectRef` locals. After one relocation the array walk reads a
+            // vacated from-space array, matches nothing, and this throws
+            // `No enum constant <NAME>` for a constant that exists. Root the
+            // array once and re-read it (and each element) per iteration; the
+            // MATCHED candidate is also re-read through its own root, because
+            // the `name()` call that identified it may itself have moved it.
+            // Companion fix to `native_class_get_enum_constants`, which had the
+            // same defect one call deeper.
+            let mut scope = NativeHandleScope::new(ctx);
+            let constants_h = scope.root(constants);
+            let constants_cur = scope.get(&constants_h);
+            let len = scope.array_length(constants_cur);
+            for i in 0..len {
+                let constants_cur = scope.get(&constants_h);
+                let candidate = match scope.get_array_element(constants_cur, i) {
                     Value::Object(Some(o)) => o,
                     _ => continue,
                 };
+                let candidate_h = scope.root(candidate);
+                let candidate_cur = scope.get(&candidate_h);
                 let name_val =
-                    ctx.invoke_virtual(candidate, "name", "()Ljava/lang/String;", &[])?;
+                    scope.invoke_virtual(candidate_cur, "name", "()Ljava/lang/String;", &[])?;
                 let name_obj = match name_val {
                     Some(Value::Object(Some(s))) => s,
                     _ => continue,
                 };
-                if ctx.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
-                    return Ok(Some(Value::Object(Some(candidate))));
+                if scope.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
             Err(RuntimeError::IllegalArgumentException {
@@ -16988,7 +17099,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/util/logging/Level;",
         // Reference-typed return: an unwritten `level` slot reads back as
         // `Value::Int(0)` through the by-name accessor, not `Object(None)`.
-        // See `docs/known-issues/c2/by-name-field-reads.md`.
+        // See `docs/feature-designs/by-name-field-reads.md`.
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(field_read::ref_field(ctx, this, "level")))
@@ -17619,6 +17730,17 @@ pub fn register_essential_natives_with_shims(
     // analogous SSLSession bug, BUG-TC0622).
     crate::phases_late::register_p68_security_cert(registry);
     register_real_buffer_constructor_natives(registry);
+    // A faithful native `DateFormat.format(Date)` for exactly-SimpleDateFormat
+    // receivers. Registered here — in the real-JDK path, after the phase
+    // registrations — because it must WIN over any earlier entry for the same
+    // triple, and because it deliberately does nothing in synthetic-JDK mode
+    // (it reads real `java.text` field layouts and falls back through
+    // `invoke_virtual_bytecode_only`, which needs the real bodies present).
+    // Every unsupported shape falls through to that bytecode, and every
+    // supported one is cross-checked against it once per output shape — see the
+    // module doc.
+    date_format_fast::register_date_format_fast(registry);
+
     // WP5.4 — TLS ALPN extension (`h2` / `http/1.1`) and SNI dispatch.
     t27_tls::register_alpn_real(registry);
     // WP5.5 — JDK 11+ java.net.http.HttpClient (sync + async, HTTP/1.1 + HTTP/2).
@@ -18687,7 +18809,7 @@ pub fn register_essential_natives_with_shims(
                         // (still correct for "UTC"/"GMT"/custom "+HH:MM"
                         // forms `ZoneId.of` handles natively) if this
                         // catalog doesn't recognize it. See
-                        // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
+                        // fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md.
                         // Try the id verbatim first (preserves display
                         // names/behavior for everything that already
                         // worked, e.g. "UTC"/"GMT"/"Zulu"/"+08:00"/plain
@@ -19073,7 +19195,7 @@ pub fn register_essential_natives_with_shims(
     // Superseded by the TZDB-OFFSET fix below, which reads the real
     // historical cutover for every zone directly from tzdb.dat instead of
     // hand-listing one zone at a time — see
-    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
@@ -19154,20 +19276,29 @@ pub fn register_essential_natives_with_shims(
     }
 
     fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+        // Fallback id when `TimeZone.setDefault(...)` has never run this
+        // process: honour the embedder's `user.timezone` system property
+        // (set at VM init from `-Duser.timezone`/the environment) instead of
+        // hardcoding "UTC", so a configured startup zone is visible before
+        // any Java code calls `setDefault`.
+        let fallback_id = cratonvm_types::flags::runtime_var("user.timezone")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "UTC".to_string());
         if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
             if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
                 let current = ctx.get_static_field(class_id, field_index);
                 if matches!(current, Value::Object(Some(_))) {
                     return current;
                 }
-                let fallback = alloc_synth_timezone(ctx, "UTC");
+                let fallback = alloc_synth_timezone(ctx, &fallback_id);
                 if matches!(fallback, Value::Object(Some(_))) {
                     ctx.set_static_field(class_id, field_index, fallback);
                 }
                 return fallback;
             }
         }
-        alloc_synth_timezone(ctx, "UTC")
+        alloc_synth_timezone(ctx, &fallback_id)
     }
 
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
@@ -19251,7 +19382,7 @@ pub fn register_essential_natives_with_shims(
             // "EST5EDT", "MST7MDT", "PST8PDT" — the four POSIX-rule zone
             // names `TimeZone.getAvailableIDs()` itself returns) as bogus,
             // collapsing them to "GMT"/UTC+0 — see
-            // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
+            // fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md.
             // Now backed by the real tzdb.dat catalog (604 zones + legacy
             // aliases), so this matches exactly what real HotSpot resolves.
             let recognized = id == "GMT"
@@ -19380,11 +19511,9 @@ pub fn register_essential_natives_with_shims(
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let epoch_sec = date_millis.div_euclid(1000);
-        let (total_sec, standard_sec) = legacy_offset_and_standard(ctx, &id, epoch_sec);
-        let total_ms = total_sec.saturating_mul(1000);
-        let dst_ms = (total_sec - standard_sec).saturating_mul(1000);
-        (total_ms, dst_ms)
+        // Single owner of the legacy-ZoneInfo rule — `date_format_fast` calls
+        // the same helper directly, without a Java dispatch per format.
+        crate::tzdb::legacy_offsets_ms(ctx, &id, date_millis)
     }
 
     // `sun.util.calendar.ZoneInfoFile`'s real conversion from tzdb rules to
@@ -19395,7 +19524,7 @@ pub fn register_essential_natives_with_shims(
     // `java.time.zone.ZoneRules` (unfloored) would report. Mirrored here so
     // the legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's
     // legacy behavior bug-for-bug, same as it does post-1900 — see
-    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
     const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
 
     fn legacy_offset_and_standard(
@@ -19528,25 +19657,35 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // `TimeZone.getDefault()` — the VM runs on UTC unless the embedder says
-    // otherwise (`user.timezone`), and returning null here made every
-    // `TimeZone.getDefault().getID()` NPE.
-    registry.register(
-        "java/util/TimeZone",
-        "getDefault",
-        "()Ljava/util/TimeZone;",
-        |ctx, _args| {
-            let id = cratonvm_types::flags::runtime_var("user.timezone")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "UTC".to_string());
-            let tz = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", 1);
-            let s = ctx.create_string(&id);
-            ctx.set_field(tz, 0, Value::Object(Some(s)));
-            let _ = ctx.set_field_by_name(tz, "ID", Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(tz))))
-        },
-    );
+    // `TimeZone.getDefault()` is intentionally NOT re-registered here.
+    //
+    // REGRESSION 2026-08-03: this spot used to carry a second
+    // `registry.register("java/util/TimeZone", "getDefault", ...)` (added
+    // 2026-07-31, `98878a6dd`) that allocated a fresh synthetic TimeZone from
+    // the `user.timezone` system property on every call. `register()` is
+    // documented last-registration-wins on the exact (class, method,
+    // descriptor) triple (see `NativeMethodRegistry::register`), and the real
+    // implementation — `timezone_default_ref` above, registered earlier in
+    // this same function at the `"getDefault"` site next to `getDefaultRef`
+    // — reads the actual `TimeZone.defaultTimeZone` static field, which is
+    // what `TimeZone.setDefault(...)`'s real bytecode writes. The later
+    // registration silently shadowed it, so every `TimeZone.getDefault()`
+    // call after a `setDefault(...)` (and everything built on it —
+    // `ZoneId.systemDefault()` above, every JDBC/native path that consults
+    // the JVM default zone) went back to reporting the VM's *startup* zone
+    // instead of whatever the running program had set. Hibernate's
+    // `Timezones.withDefaultTimeZone()`-based temporal tests
+    // (confirmed on `OffsetDateTimeTest`: `failed=0` -> `failed=60`,
+    // identically under the JIT and `--nojit`) went back to reporting
+    // timezone-offset-sized value corruption — this is native-registration
+    // shadowing, not a JIT or GC defect. `timezone_default_ref` now also
+    // honours `user.timezone` as its
+    // own fallback (used only before the first `setDefault` call), so the
+    // duplicate's one legitimate feature is preserved without reintroducing
+    // the shadow. Lesson: "this native looks wrong / returns null" is never
+    // grounds for a fresh `register()` call on a triple without first
+    // grepping whether an earlier one already owns it — the earlier one may
+    // be the correct implementation, and the later call always wins silently.
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
@@ -22246,12 +22385,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         native_system_set_property,
     );
+    // Re-registration of the SAME body, so the leaf claim has to be restated:
+    // `register` captures the ambient claim into the slot, and a re-register
+    // that does not opt in demotes the triple back to the funnel. That is the
+    // deliberate ordering property of `set_leaf` — see its doc comment.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "nanoTime",
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
     registry.register("java/lang/System", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
@@ -24873,7 +25018,14 @@ fn locale_default() -> &'static parking_lot::Mutex<Option<ObjectRef>> {
 }
 
 /// Side-table mapping a CratonVM-synthesised `java/util/Locale` ObjectRef to
-/// its `(language, country, variant)` strings.
+/// its `(language, script, country, variant)` strings.
+///
+/// The `script` slot is what makes `Locale.forLanguageTag("zh-hant-CN")`
+/// round-trip: `Locale` keeps the script as a first-class subtag (its
+/// `toString()` renders it as the `_#Hant` suffix), and a table that only held
+/// language/country/variant had nowhere to put it, so every script-bearing
+/// tag collapsed onto the script-less locale — Tomcat's
+/// `TestAcceptLanguage.bug56848`, "expected:<zh_CN_#Hant> but was:<zh_CN>".
 ///
 /// CRITICAL: `java.util.Locale` is a real bootstrap class whose instance
 /// fields are `baseLocale` (a `sun.util.locale.BaseLocale`) and
@@ -24892,21 +25044,39 @@ fn locale_default() -> &'static parking_lot::Mutex<Option<ObjectRef>> {
 /// spec-correct "no extensions" shape). The language/country/variant data
 /// lives here instead, keyed by ObjectRef, and every Locale accessor native
 /// reads from this table.
-fn locale_data(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String)>> {
+fn locale_data() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<ObjectRef, (String, String, String, String)>,
+> {
     use std::sync::OnceLock;
     static DATA: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String)>>,
+        parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String, String)>>,
     > = OnceLock::new();
     DATA.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Record a synthetic Locale's `(language, country, variant)` in the side
-/// table. See [`locale_data`] for why instance fields must not be used.
+/// table, with no script subtag. See [`locale_data`] for why instance fields
+/// must not be used, and [`locale_data_set_full`] for the script-bearing form.
 pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant: &str) {
+    locale_data_set_full(obj, lang, "", country, variant);
+}
+
+/// Record a synthetic Locale's full `(language, script, country, variant)`.
+pub(crate) fn locale_data_set_full(
+    obj: ObjectRef,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) {
     locale_data().lock().insert(
         obj,
-        (lang.to_string(), country.to_string(), variant.to_string()),
+        (
+            lang.to_string(),
+            script.to_string(),
+            country.to_string(),
+            variant.to_string(),
+        ),
     );
 }
 
@@ -24914,6 +25084,12 @@ pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant
 /// table. Returns empty strings for a Locale we never recorded (e.g. a
 /// real-JDK-constructed Locale) — callers treat that as the root locale.
 pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
+    let (l, _, c, v) = locale_data_get_full(obj);
+    (l, c, v)
+}
+
+/// Read a synthetic Locale's full `(language, script, country, variant)`.
+pub(crate) fn locale_data_get_full(obj: ObjectRef) -> (String, String, String, String) {
     locale_data().lock().get(&obj).cloned().unwrap_or_default()
 }
 
@@ -28860,7 +29036,7 @@ fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, Stri
 //
 // The functions below fix a genuine O(n^2) bug in THIS native bridge (full
 // input redecode per `find()`/`group()` call, see
-// `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md` for
+// `fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md` for
 // the corrected writeup) — but because the bridge is dropped by default,
 // this fix currently has NO effect on any real-JDK program. It's kept
 // in case `drop_real_layout_synthetic` is ever narrowed (e.g. once the
@@ -28868,7 +29044,7 @@ fn real_pattern_cache() -> &'static Mutex<std::collections::HashMap<(usize, Stri
 // non-default config re-enables this bridge. The ACTUAL performance bug a
 // user hits with `Pattern`/`Matcher` on today's default build is upstream of
 // here, in the real JDK bytecode CratonVM's interpreter actually runs — see
-// `docs/known-issues/substring-large-parent-quadratic-allocation.md`.
+// `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`.
 
 /// One cached decode of a `Matcher`'s input `String`, keyed by the
 /// `Matcher` object's own **identity hash**, not its `ObjectRef`
@@ -29321,13 +29497,13 @@ fn rl_with<R>(key: RlKey, f: impl FnOnce(&mut RlState) -> R) -> R {
 ///
 /// Confirmed live via `gdb -p <pid> -batch -ex 'thread apply all bt'`
 /// during the Tomcat `TestWsRemoteEndpointImplServerDeadlock` investigation
-/// (2026-07-09, docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md):
+/// (2026-07-09, fixed-suite-bugs/tomcat/wsremoteendpoint-close-delay-near-deadlock-FIXED.md):
 /// every one of ~10 worker threads was piled up inside `native_rl_unlock`'s
 /// `monitor_enter`, all blocked on the same wedged monitor, after a prior
 /// `native_rl_lock` caller hit exactly this leak on a `Thread.interrupt()`.
 /// Only surfaced once real `ScheduledThreadPoolExecutor`/`ThreadPoolExecutor`
 /// contention started reaching these natives (see
-/// `docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
+/// `fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
 fn monitor_wait_release(
     ctx: &mut dyn NativeContext,
     obj: ObjectRef,
@@ -30826,7 +31002,7 @@ fn b64_decode_char(c: u8, variant: i32) -> Option<u32> {
 /// (e.g. Netty's `SelfSignedCertificate` cert file, handed to
 /// `generateCertificate` unparsed) built a cert whose `getEncoded()` was empty →
 /// rustls `invalid peer certificate: BadEncoding` on the server handshake. See
-/// docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+/// fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
 pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
     const BEGIN: &[u8] = b"-----BEGIN";
     // Locate the first `-----BEGIN` line; bail (return input) if absent.
@@ -31251,7 +31427,7 @@ mod base64_tests {
 
     /// Every expectation below is a literal line of `Base64Probe`'s output on
     /// HotSpot 25 — see
-    /// `docs/internal/fixed-suite-bugs/repros/base64-decoder-parity/Base64Probe.java`.
+    /// `fixed-suite-bugs/repros/base64-decoder-parity/Base64Probe.java`.
     fn err(input: &str, variant: i32) -> String {
         b64_decode(input.as_bytes(), variant).expect_err("must reject")
     }
@@ -34247,9 +34423,19 @@ fn register_locale_natives(_registry: &mut NativeMethodRegistry) {
 // side table instead. See `locale_data()` for the full rationale.
 
 pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
+    locale_alloc_full(ctx, lang, "", country, "")
+}
+
+/// [`locale_alloc`] with the full subtag set, including the BCP-47 script.
+pub(crate) fn locale_alloc_full(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-    locale_populate(ctx, loc, lang, country, "");
-    loc
+    locale_populate_full(ctx, loc, lang, script, country, variant)
 }
 
 /// Record a synthetic Locale's `(language, country, variant)` in the side
@@ -34276,8 +34462,27 @@ pub(crate) fn locale_populate(
     lang: &str,
     country: &str,
     variant: &str,
-) {
-    locale_data_set(loc, lang, country, variant);
+) -> ObjectRef {
+    locale_populate_full(ctx, loc, lang, "", country, variant)
+}
+
+/// [`locale_populate`] with the BCP-47 script subtag as well.
+///
+/// Returns `loc`'s CURRENT reference: the `BaseLocale` build below allocates
+/// (five objects), so a moving young GC in the middle relocates `loc` out from
+/// under the caller's raw `ObjectRef` — the Family-1 stale-native-local shape.
+/// `loc` is rooted in a handle scope for the duration and read back at the end.
+pub(crate) fn locale_populate_full(
+    ctx: &mut dyn NativeContext,
+    loc: ObjectRef,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) -> ObjectRef {
+    locale_data_set_full(loc, lang, script, country, variant);
+    let mut scope = NativeHandleScope::new(ctx);
+    let loc_h = scope.root(loc);
     // Build the real-JDK `sun.util.locale.BaseLocale` backing object.
     // BaseLocale's instance fields are `language`, `script`, `region`,
     // `variant` (all `String`) plus a lazily-computed `int hash`. We set
@@ -34285,19 +34490,30 @@ pub(crate) fn locale_populate(
     // it lazily). `BaseLocale.equals` compares the four Strings, so using
     // interned Strings (the default for `create_string`) keeps its
     // identity (`==`) comparisons correct across separately-built Locales.
-    match ctx.ensure_class_initialized("sun/util/locale/BaseLocale") {
+    match scope.ensure_class_initialized("sun/util/locale/BaseLocale") {
         Ok(base_cid) => {
-            let nfields = ctx.class_num_total_fields(base_cid).max(5);
-            let base = ctx.alloc_object(base_cid, nfields);
-            let lang_s = ctx.create_string(lang);
-            let script_s = ctx.create_string("");
-            let region_s = ctx.create_string(country);
-            let variant_s = ctx.create_string(variant);
-            ctx.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
-            ctx.set_field_by_name(base, "script", Value::Object(Some(script_s)));
-            ctx.set_field_by_name(base, "region", Value::Object(Some(region_s)));
-            ctx.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
-            ctx.set_field_by_name(loc, "baseLocale", Value::Object(Some(base)));
+            let nfields = scope.class_num_total_fields(base_cid).max(5);
+            let base = scope.alloc_object(base_cid, nfields);
+            let base_h = scope.root(base);
+            let lang_s = scope.create_string(lang);
+            let lang_h = scope.root(lang_s);
+            let script_s = scope.create_string(script);
+            let script_h = scope.root(script_s);
+            let region_s = scope.create_string(country);
+            let region_h = scope.root(region_s);
+            let variant_s = scope.create_string(variant);
+            let base = scope.get(&base_h);
+            let (lang_s, script_s, region_s) = (
+                scope.get(&lang_h),
+                scope.get(&script_h),
+                scope.get(&region_h),
+            );
+            scope.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
+            scope.set_field_by_name(base, "script", Value::Object(Some(script_s)));
+            scope.set_field_by_name(base, "region", Value::Object(Some(region_s)));
+            scope.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
+            let loc_now = scope.get(&loc_h);
+            scope.set_field_by_name(loc_now, "baseLocale", Value::Object(Some(base)));
         }
         Err(e) => {
             // KNOWN GAP (2026-07-14): if `sun/util/locale/BaseLocale`'s own
@@ -34310,8 +34526,8 @@ pub(crate) fn locale_populate(
             // `NoClassDefFoundError` instead of a fresh error. `baseLocale`
             // is left null; any real-bytecode `Locale` method not natively
             // overridden here (`toString`, `equals`, `hashCode`, …) then
-            // NPEs on `this.baseLocale`. See docs/known-issues/vm/
-            // locale-real-jdk-bootstrap-noclassdeffounderror.md.
+            // NPEs on `this.baseLocale`. See fixed-suite-bugs/
+            // locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md.
             tracing::warn!(
                 "locale_populate: could not initialize sun.util.locale.BaseLocale ({e:?}) — \
                  baseLocale left null on this Locale"
@@ -34320,6 +34536,7 @@ pub(crate) fn locale_populate(
     }
     // `localeExtensions` is intentionally left null (the "no extensions"
     // shape that real-JDK `Locale.equals`/`hashCode` expect).
+    scope.get(&loc_h)
 }
 
 /// Read a Locale arg's `(language, country, variant)` — side table first,

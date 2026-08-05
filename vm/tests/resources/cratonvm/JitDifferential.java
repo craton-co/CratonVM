@@ -182,6 +182,49 @@ public class JitDifferential {
     // (no division by zero) so warmup itself never throws.
     // ----------------------------------------------------------------------
 
+    // ----------------------------------------------------------------------
+    // Static-field reads (getstatic) — the inline direct-load type matrix
+    // ----------------------------------------------------------------------
+    // A compiled `getstatic` is a direct load against the declaring class's
+    // statics block, not a `jit_getstatic` call
+    // (jit-getstatic-costs-a-helper-call-FIXED-20260803.md). The
+    // load WIDTH and EXTENSION are picked from the field's descriptor: MOVSXD
+    // for the int category, a 32-bit zero-extending MOV for float, a 64-bit MOV
+    // for long/double/reference. Every rung below is therefore a negative, a
+    // boundary, or a bit pattern whose high half matters — a wrong width or a
+    // wrong extension is invisible for small positive ints and wrong for
+    // everything else.
+    static boolean sZ = true;
+    static byte sB = -128;
+    static char sC = (char) 0xFFFF;   // spelled numerically: the fixture is
+                                      // compiled by whatever javac encoding
+                                      // the build host defaults to
+    static short sS = -32768;
+    static int sI = Integer.MIN_VALUE;
+    static long sJ = Long.MIN_VALUE;
+    static float sF = -0.0f;
+    static double sD = Double.NaN;
+    static String sRef = "static-ref";
+    static int[] sArr = { 7, -7 };
+    static volatile int sVol = -1;
+    // Written AFTER the getter is compiled: proves the baked address is the
+    // live slot and not a snapshot (see `StaticsIndex::base_cell_addr`).
+    static int sMut = 0;
+
+    private static long getZ() { return sZ ? 1L : 0L; }
+    private static long getB() { return sB; }
+    private static long getC() { return sC; }
+    private static long getS() { return sS; }
+    private static long getI() { return sI; }
+    private static long getJ() { return sJ; }
+    private static long getFBits() { return Float.floatToRawIntBits(sF); }
+    private static long getDBits() { return Double.doubleToRawLongBits(sD); }
+    private static String getRef() { return sRef; }
+    private static long getRefLen() { return sRef.length(); }
+    private static long getArr1() { return sArr[1]; }
+    private static long getVol() { return sVol; }
+    private static long getMut() { return sMut; }
+
     private static void warmup() {
         long blackhole = 0;
         for (int k = 0; k < 4000; k++) {
@@ -215,6 +258,9 @@ public class JitDifferential {
             blackhole += viaCall(k);
             blackhole += loopSum(8);
             blackhole += arrIntBounds(WARM_ARR, k & 7);
+            blackhole += getZ() + getB() + getC() + getS() + getI() + getJ();
+            blackhole += getFBits() + getDBits() + getRefLen() + getArr1();
+            blackhole += getVol() + getMut();
         }
         // Defeat dead-code elimination of the warmup so the kernels really
         // run (and so a JIT that prematurely DCE'd them would be caught).
@@ -315,6 +361,30 @@ public class JitDifferential {
         r("loopSum.100", loopSum(100));
     }
 
+    private static void replayStatics() {
+        r("static.Z", getZ());                 // 1
+        r("static.B", getB());                 // -128
+        r("static.C", getC());                 // 65535 (char is unsigned)
+        r("static.S", getS());                 // -32768
+        r("static.I", getI());                 // Integer.MIN_VALUE
+        r("static.J", getJ());                 // Long.MIN_VALUE — also the
+                                               // helper path's deopt sentinel
+        r("static.F.bits", getFBits());        // -0.0f
+        r("static.D.bits", getDBits());        // NaN
+        r("static.ref", getRef());             // "static-ref"
+        r("static.ref.len", getRefLen());      // 10
+        r("static.arr.1", getArr1());          // -7
+        r("static.vol", getVol());             // -1
+
+        // A store after the getter is hot: the compiled read must observe it.
+        sMut = 12345;
+        r("static.mut.a", getMut());
+        sMut = Integer.MIN_VALUE;
+        r("static.mut.b", getMut());
+        sMut = -1;
+        r("static.mut.c", getMut());
+    }
+
     public static void main(String[] args) {
         // Warm the kernels so the JIT run compiles them before replay.
         warmup();
@@ -326,6 +396,7 @@ public class JitDifferential {
         replayFloating();
         replayArrays();
         replayCalls();
+        replayStatics();
 
         // Completion marker — the harness asserts this is present so a
         // mid-replay abort (e.g. a JIT #DE on idiv MIN/-1) is caught as a
