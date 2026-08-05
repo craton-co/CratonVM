@@ -712,8 +712,14 @@ fn regex_cache() -> &'static Mutex<RegexLru> {
 
 /// Small cache for recently-used delimiter regexes.
 fn cached_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    // Fast path: default whitespace delimiter
-    if pattern == r"\s+" {
+    // Fast path: default whitespace delimiter. `\p{javaWhitespace}+` is the
+    // literal pattern real `Scanner.WHITESPACE_PATTERN` carries, and what
+    // `sc.delimiter().pattern()` must therefore print; `\p{javaWhitespace}` is
+    // a Java-only character class that the `regex` crate cannot compile, so it
+    // is mapped here rather than left to `delimiter_regex`'s compile-failure
+    // fallback — a fallback that produces the right answer by accident reads
+    // exactly like one that does not.
+    if pattern == r"\s+" || pattern == SCAN_DEFAULT_DELIM {
         return Ok(default_whitespace_regex().clone());
     }
     // Cache lookup for repeated user-supplied delimiters.
@@ -3817,7 +3823,13 @@ const SCAN_FIELD_POS: usize = 1; // Int — current position in input
 const SCAN_FIELD_DELIM: usize = 2; // Pattern object or null (default \s+)
 const SCAN_FIELD_RADIX: usize = 3; // Int — radix (default 10)
 const SCAN_FIELD_CLOSED: usize = 4; // Int — 0=open, 1=closed
-const SCAN_DEFAULT_DELIM: &str = r"\s+";
+/// The real `Scanner`'s default delimiter, verbatim: `Scanner.WHITESPACE_PATTERN`
+/// is `Pattern.compile("\p{javaWhitespace}+")`, and `sc.delimiter().pattern()`
+/// hands that exact string back. We used to answer `\s+` — the pattern our
+/// tokenizer actually runs — which is a different string with the same meaning,
+/// and a visible API divergence. `cached_regex` maps this spelling onto the
+/// whitespace regex; see the note there.
+const SCAN_DEFAULT_DELIM: &str = r"\p{javaWhitespace}+";
 
 /// Resolve one of the scanner's state fields on the RECEIVER's own class,
 /// falling back to the fabricated model's slot when the receiver does not
@@ -4069,23 +4081,21 @@ fn scanner_peek_token(input: &str, pos: usize, delimiter: &str) -> Option<String
     scanner_next_token(input, pos, delimiter).map(|(tok, _)| tok)
 }
 
-/// Advance position past the token found by scanner_next_token.
-/// The position should be moved past the token AND any trailing delimiter.
+/// Advance position past the token found by `scanner_next_token` — and NOT past
+/// the delimiter that follows it.
+///
+/// This used to skip the trailing delimiter too. That is invisible to a run of
+/// `next()` calls (the next token search skips leading delimiters anyway) and
+/// wrong for everything that reads the position back: after
+/// `new Scanner("10 20 hello<LF>second").next()` the real `Scanner` sits at the
+/// end of `hello`, so `nextLine()` returns the empty remainder of THAT line and
+/// only the second `nextLine()` returns `second`. Consuming the newline here made
+/// the first `nextLine()` return `second` and the second one throw — the exact
+/// shape the JDK's own `java/util/Scanner/NextIntNextLineTest` exists to catch,
+/// and what `probes/L3ScannerLayoutProbe` measures against the host JDK.
+/// `findInLine`, `skip` and `toString`'s `position=` read the same value.
 fn scanner_consume_token(input: &str, pos: usize, delimiter: &str) -> Option<(String, usize)> {
-    let (token, token_end) = scanner_next_token(input, pos, delimiter)?;
-    // Skip trailing delimiter after the token
-    let remaining = &input[token_end..];
-    let re = delimiter_regex(delimiter);
-    let new_pos = if let Some(m) = re.find(remaining) {
-        if m.start() == 0 {
-            token_end + m.end()
-        } else {
-            token_end
-        }
-    } else {
-        token_end
-    };
-    Some((token, new_pos))
+    scanner_next_token(input, pos, delimiter)
 }
 
 /// Find the next line from pos. Returns (line_content, new_pos_after_line_ending).
@@ -19018,12 +19028,15 @@ mod io_tests {
     }
 
     #[test]
-    fn scanner_consume_token_advances_past_delimiter() {
+    fn scanner_consume_token_stops_at_the_delimiter() {
         let input = "hello world foo";
         let (tok, new_pos) = scanner_consume_token(input, 0, r"\s+").unwrap();
         assert_eq!(tok, "hello");
-        // new_pos should be past the trailing whitespace
-        assert!(new_pos > 5);
+        // The real `Scanner` leaves the position at the END OF THE TOKEN, not
+        // past the delimiter that follows it — that difference is what
+        // `nextLine()` after `next()` reads. This assertion used to be
+        // `new_pos > 5`, which froze the divergence.
+        assert_eq!(new_pos, 5);
         // Second consume from new_pos should give "world"
         let (tok2, new_pos2) = scanner_consume_token(input, new_pos, r"\s+").unwrap();
         assert_eq!(tok2, "world");
