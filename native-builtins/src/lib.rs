@@ -7683,10 +7683,25 @@ pub fn register_essential_natives_with_shims(
     // are interleaved.) Kept registered because synthetic-jdk mode still needs
     // it -- there the drop does not apply.
     //
-    // Re-examine with suite numbers when they are available: this is one
-    // microbenchmark on a loaded host, and `String.hashCode` is hot in every
-    // real workload. If it comes back, it comes back with those numbers and a
-    // `register_with_kind` stating the kind.
+    // Those numbers were asked to be re-checked against a real workload on the
+    // Linux host before this was final. Done, same day, on two dev-tip binaries
+    // differing only in this registration's kind: in-VM `javac` over 60 classes
+    // whose constants are UTF-16 `HashMap` keys, A-B-B-A, two rounds —
+    //
+    //   native    97408  95020  95599  87269 ms
+    //   bytecode  98888  86560  90650  87245 ms
+    //
+    // — fully overlapping, on a corpus picked to maximise the effect. The
+    // microbenchmark above also reproduced independently (medians: cold 100 vs
+    // 108 latin1, 148 vs 150 utf16; warm 6/7 vs 3/2; map 120 vs 121). So the
+    // native does not come back.
+    //
+    // A first, NON-interleaved pass of that javac A/B reported 49.8 s against
+    // 71.0 s — a clean 1.43x, every native round below every bytecode round —
+    // and it did not survive A-B-B-A on a loaded host. That is the third perf
+    // claim in this feature to fail re-measurement and the second where the
+    // ordering of the runs decided the answer. On this host an A/B that is not
+    // A-B-B-A interleaved is not a measurement.
     registry.register(
         "java/lang/String",
         "hashCode",
