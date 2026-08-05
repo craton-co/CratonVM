@@ -221,6 +221,38 @@ With the radix row fixed, the next lines of the diff were real, and are fixed:
   CONSTRUCTOR among the kinds that keep the raw descriptor. `MH_DESC` is
   untouched, so dispatch and the `invokeExact` arity check are unchanged.
 
+## Merged with L4, which landed the same day
+
+L4 replaced the value-tag-only detector with a **shadow-layout diff**: it
+compares `synthetic_stub_fields` — the model the natives were written against —
+against the real class's declared fields by NAME, at define time. That finds
+exactly the same-kind writes this record's table could not report, and it
+independently reached L3's step-3 answer ("`Scanner`'s model is
+`instance_fields(5)`, and slots 3/4 are the real `delimPattern` /
+`hasNextPattern`").
+
+It cannot check `Scanner` any further than that, and the reason is the
+follow-up L4 names for itself: **a model slot that is anonymous asserts
+nothing.** `class_manager.rs` still declares
+`"java/util/Scanner" => instance_fields(5)`, five `_fN` slots typed
+`Ljava/lang/Object;`. Naming them is now a mechanical change, because this lane
+established what each one is:
+
+| model slot | name to declare | descriptor |
+|---:|---|---|
+| 0 | `buf` | `Ljava/nio/CharBuffer;` (the input text no longer lives here) |
+| 1 | `position` | `I` |
+| 2 | `delimPattern` | `Ljava/util/regex/Pattern;` |
+| 3 | `radix` | `I` |
+| 4 | `closed` | `Z` |
+
+That is `class_manager.rs`, which L7 owns, and it has a real behavioural
+consequence worth its own A/B rather than a drive-by: today every fabricated
+slot is `Ljava/lang/Object;`, so on a fabricated `Scanner` an `Int` position or
+radix is coerced to null on the way in and reads back as the default. Declaring
+`I` and `Z` fixes that, and would also let `scan_slot`'s by-name resolution
+succeed on the fabricated layout instead of falling through to the model index.
+
 Filed rather than fixed:
 
 * **`close()` now means something, and nothing else honoured it.** The `closed`
