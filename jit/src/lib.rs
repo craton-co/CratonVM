@@ -12378,8 +12378,8 @@ fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
 /// That is worse than a missing feature, because it makes the levers *lie*.
 /// Isolating a miscompile with them is a proof by elimination, and "deny this
 /// package and the crash goes away" only means something if the deny actually
-/// stopped a compile. Measured 2026-08-04 against
-/// `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+/// stopped a compile. Measured 2026-08-04 against the annotation-scan SIGSEGV
+/// (the retired `annotation-scan-arrayread-sigsegv` write-up):
 /// `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` — a prefix matching nothing, so
 /// nothing should compile at all — still left **11 methods compiled** and the
 /// crash still reproduced. Every bisect step read "no effect", which reads as
@@ -26195,8 +26195,8 @@ mod code_cache_lifetime_tests {
     /// The load-bearing case is the last one. `CRATONVM_DBG=jit-bisect-only`
     /// with a prefix matching NOTHING must force EVERY method interpreted —
     /// that is what makes "allow only X, does the crash survive?" a valid
-    /// bisect step. See `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
-    /// the OSR path did not consult this predicate at all, so 21 OSR bodies
+    /// bisect step. See the retired `annotation-scan-arrayread-sigsegv`
+    /// write-up: the OSR path did not consult this predicate at all, so 21 OSR bodies
     /// compiled under exactly that setting and every bisect row read a
     /// meaningless "no effect".
     #[test]

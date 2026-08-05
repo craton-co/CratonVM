@@ -189,9 +189,13 @@ this doc in
 `../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
 territory plus the VM-wide per-call floor — not in admission-gate territory.
 
-⚠️ The same probe **SIGSEGVs on CratonVM** in its `arrayRead` stage on the real
-Tomcat classpath — a separate, deterministic JIT miscompile:
-[`../jit/annotation-scan-arrayread-sigsegv.md`](../jit/annotation-scan-arrayread-sigsegv.md).
+The same probe used to **SIGSEGV on CratonVM** in its `arrayRead` stage on the
+real Tomcat classpath — a separate, deterministic JIT miscompile, unrelated to
+the throughput question this doc is about. Fixed 2026-08-04 (`14a274085`): a
+slot javac reuses as both a live reference and a `long`'s high half must keep
+its OSR register home. `probes/OsrRefSlotReuseProbe.java` is the regression
+guard; the retired `annotation-scan-arrayread-sigsegv` write-up has the
+analysis.
 
 ## Root cause: the parse is never compiled
 
