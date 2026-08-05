@@ -1,135 +1,155 @@
-# Spring Boot loader/zip: a JIT-only failure cluster on `dev` (2026-08-04)
+# Spring Boot loader/zip: the JIT-only failure cluster, root-caused
 
-**Status: OPEN.** Found while regression-sweeping the `java.nio.file.Path`
-trailing-separator fix
-([retired doc](../../internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md));
-it is **not** caused by that fix — it reproduces on an unmodified `dev`
-binary. Filed separately because it is a JIT defect, not a `Path`/`Files` one.
+**Status: the loader/zip half is CLOSED.** Root cause found 2026-08-04 and
+already fixed on `dev` by `4972cd9c91` ("the post-clinit fixup wrote Unsafe's
+long base-offsets as 32-bit ints"), which landed after the binary this page was
+originally filed against. Verified below. Two members of the original table
+were **not** this bug and are re-scoped as separate open issues at the bottom.
 
-## The finding
+## What it was
 
-Four Spring Boot classes fail with the JIT on and **pass with `--nojit`**, on
-the same binary, same host, same classpath:
+`java.util.zip.ZipUtils.get16`/`get32` are how the JDK reads every little-endian
+field of a LOC/CEN header. In JDK 25 they are not byte arithmetic — they are
 
-| Module | Class | JIT on | `--nojit` |
+```java
+public static final int get16(byte[] b, int off) {
+    ...Preconditions.checkIndex...
+    return Short.toUnsignedInt(UNSAFE.getShortUnaligned(b, ARRAY_BYTE_BASE_OFFSET + off, false));
+}
+```
+
+`jdk.internal.misc.Unsafe.ARRAY_*_BASE_OFFSET` are nine **`long`** fields in
+JDK 25 (their `ARRAY_*_INDEX_SCALE` siblings really are `int` — only the
+descriptor tells them apart). CratonVM's `post_clinit_fixup` repopulates all
+eighteen, because `Unsafe.<clinit>` computes them through natives that are not
+registered yet during real-JDK bootstrap. It wrote every one as
+`Value::Int(16)`.
+
+A slot holding a well-formed `Value` of the **wrong width** is invisible from
+one side and fatal from the other:
+
+* the **interpreter** widens an `Int` where a long is wanted, so `getstatic`
+  answered 16 and everything worked — for as long as the fixup has existed;
+* **JIT-compiled** code lowers `getstatic …:J` to a 64-bit load of the slot
+  (`FIELD_CELL_PAYLOAD64_OFFSET`), and over an `Int`-tagged cell that word is
+  whatever sits next to it — a measured `0x7ff700000000` instead of `16`.
+
+So `getShortUnaligned(b, 0x7ff700000000 + off)` read from an address unrelated
+to the array, and every field parsed out of a zip header was garbage. That is
+the whole cluster: `invalid entry compressed size (expected 4259840 but got 2
+bytes)`, `invalid compression method`, `only DEFLATED entries can have EXT
+descriptor`, `invalid entry size (expected 80 but got 1321 bytes)` — four
+spellings of one wrong base offset.
+
+The same defect is what made `Arrays.equals(long[], long[])` return true for
+unequal arrays (`docs/internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`);
+`ArraysSupport.mismatch` reads `ARRAY_INT_BASE_OFFSET` the same way.
+
+## How it was narrowed (the useful part for next time)
+
+Five levers, no rebuild, ~10 s per run, on the binary that reproduces:
+
+| step | lever | result |
+|---|---|---|
+| oracle | default vs `--nojit` | FAIL 4/37 vs PASS |
+| does compilation matter? | `CRATONVM_DBG=jit-bisect-only=zzz` (allow nothing) | PASS — and census: 545 compiled, **0 OSR** |
+| which package? | `jit-bisect-only=java/` \| `org/` \| `net/` \| `jdk/` \| `sun/` | only `java/` FAILs |
+| which class? | `jit-bisect-only=java/util/zip/ZipUtils` | FAIL (7/37) — 2 methods, 4 compilations |
+| which mechanism? | `CRATONVM_JIT=getstatic-helper` | **PASS** ⇒ the inline `getstatic` load, not the field info |
+| confirm | `CRATONVM_JIT=-statics-index` | PASS (it also declines the inline load) |
+
+**Two lever traps cost time here, both worth remembering:**
+
+* `jit-bisect-only` matches **class names only** (`class_name.starts_with`).
+  `jit-bisect-only=…ZipUtils.get16` therefore allows *nothing*, and reads
+  exactly like "that method is innocent". Per-method isolation needs
+  `CRATONVM_JIT=deny=<class.method substring>`, which does match methods.
+* Both filters take comma-separated lists, but the **grouped** spelling cannot
+  carry one: `CRATONVM_DBG` splits its own spec on `,` first, so
+  `jit-bisect-only=a,b` parses as `jit-bisect-only=a` plus an unknown token `b`.
+  Set `CRATONVM_JIT_BISECT_ONLY=a,b` directly for multi-prefix runs.
+
+## Verification
+
+Azure Linux, JDK 25, real-JDK mode. `dev`-old = `6b6fc9a0dc` (the binary this
+page was filed against); `dev`-new = a build of current `dev`.
+
+The attribution is exact, not inferred from dates alone:
+`git merge-base --is-ancestor 4972cd9c91 6b6fc9a0dc` answers **no** — the fix
+(committed 2026-08-04 19:41 UTC) is not in the binary that reproduces
+(2026-08-04 13:29 UTC), and is in the one that does not.
+
+`probes/ZipSpin.java` — reads a jar entry-by-entry, repeatedly, and compares
+every iteration against the first:
+
+| | entries | bytes | 100 iterations |
 |---|---|---|---|
-| `loader/spring-boot-loader-tools` | `ImagePackagerTests` | FAIL 5.4s | **PASS 9.1s** |
-| `loader/spring-boot-loader-tools` | `RepackagerTests` | FAIL 20.1s | **PASS 38.6s** |
-| `loader/spring-boot-loader` | `NestedJarFileTests` | FAIL 4.2s | **PASS 23.2s** |
-| `loader/spring-boot-loader` | `ZipContentTests` | CRASH 210.9s | **PASS 143.2s** |
-| `core/spring-boot` | `OriginTrackedYamlLoaderTests` | FAIL 53.8s | **PASS 385.2s** |
+| HotSpot 25 | 120 | 414187 | OK |
+| CratonVM `dev`-old | **99** | **308737** | then `ZipException` on iteration 1 |
+| CratonVM `dev`-old `--nojit` | 120 | 414187 | OK |
+| CratonVM `dev`-new | 120 | 414187 | **OK** |
 
-(`ZipContentTests`' `--nojit` PASS was measured on the patched binary, its
-JIT-on CRASH on the unpatched one; it is the same class either way — FAIL at
-149.2s in the 08-02 baseline, CRASH at 156.8s in the 08-04 residual triage.)
+Note the first row of `dev`-old: before it ever threw, it silently read **99 of
+120 entries**. A jar loader that loses a fifth of its entries without an error
+is the worst shape this bug had.
 
-Binary: `/data/data/cratonvm/target/release/cratonvm`, `dev` @ `6b6fc9a0dc`
-(**unpatched**). Host: Azure Linux, JDK 25 (`/data/jdk25-real-20260717`).
-Runner: `apps/spring-boot-suite-runner/run-spring-boot-suite.ps1`,
-`-SpringBootRoot /data/data/springboot-jsonreader-deprecation-20260718`.
+Spring Boot classes, one process per class, `dev`-new:
 
-Runs: `.suite/results/suspect6-baseline-A` (JIT on) and
-`.suite/results/zip5-base-nojit` (`-Jit off`).
+| Class | was (`dev`-old, JIT) | now |
+|---|---|---|
+| `loader.tools.ImagePackagerTests` | FAIL 4/37 | **PASS 37/37** |
+| `loader.tools.RepackagerTests` | FAIL | **PASS 52/52** |
+| `loader.jar.NestedJarFileTests` | FAIL | **PASS 34/34** |
+| `loader.jar.SecurityInfoTests` | FAIL (both JIT and `--nojit`) | **PASS 3/3** |
 
-`loader/spring-boot-loader` `SecurityInfoTests` fails in **both** modes
-(FAIL 2.6s with JIT, FAIL 13.5s without) — a separate, non-JIT defect that
-happens to share the same symptom family; do not fold it into this one.
+## Still open, and NOT this bug
 
-All five were **PASS** in the 2026-08-02 Azure full-suite run
-(`.suite/results/craton-fullsuite-azure-20260802`), so this is a regression
-introduced by `dev` commits between 08-02 and 08-04 — not a long-standing gap.
-That range is the natural bisect window.
+Both were in this page's original table because they shared the `--nojit`-passes
+signature. Neither is fixed by `4972cd9c91`, and neither is a zip-header bug.
 
-## Symptom
+### 1. `core/spring-boot` `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` — an OSR miscompile
 
-Every failure surfaces as the JDK's own ZIP reader rejecting a stream it just
-read, i.e. the bytes reaching `java.util.zip` are wrong:
+Still FAILs on current `dev` with the same snakeyaml scanner error at line
+142539 of the generated document (`ry` on its own line, where the appended line
+is `- some list entry`). The test only does this:
 
-```
-java.util.zip.ZipException: invalid entry compressed size (expected 4259840 but got 2 bytes)
-   java.util.zip.ZipInputStream.readEnd(ZipInputStream.java:639)
-   java.util.zip.ZipInputStream.read(ZipInputStream.java:415)
-   java.util.jar.JarInputStream.read(JarInputStream.java:270)
-   java.util.zip.ZipInputStream.closeEntry(ZipInputStream.java:176)
-   java.util.zip.ZipInputStream.getNextEntry(ZipInputStream.java:154)
-   java.util.jar.JarInputStream.<init>(JarInputStream.java:138)
-   org.springframework.boot.loader.tools.AbstractJarWriter.writeLoaderClasses(AbstractJarWriter.java:218)
+```java
+StringBuilder yaml = new StringBuilder();
+while (yaml.length() < 4_194_304) { yaml.append("- some list entry\n"); }
 ```
 
-Other spellings seen in the same run: `invalid compression method`,
-`only DEFLATED entries can have EXT descriptor`,
-`invalid entry size (expected 80 but got 1321 bytes)`. The yaml case is the
-same shape one layer up — snakeyaml's scanner hitting a broken key at
-line 142539 of a 3 MB generated document (`canLoadFilesBiggerThan3Mb`).
+so the **input snakeyaml is handed is already corrupt** — the failure is in
+building the 4 MiB `StringBuilder`, not in parsing it.
 
-The input is **not** the problem. The loader jar that `writeLoaderClasses`
-reads is byte-identical under HotSpot and under CratonVM:
+Established (single runs, on a quiet-enough host):
 
-```
-url=file:/…/spring-boot-loader-tools/build/generated-resources/main/META-INF/loader/spring-boot-loader.jar
-first16=504b0304140000080800000041000000 total=203918
-```
+* `--nojit` PASSes; `CRATONVM_JIT=-osr` PASSes ⇒ **OSR**, not the main compiler.
+  The `jit-compiled` census for this run is 166 methods but there are **9 OSR
+  entries**, which that census does not show (`put_osr`, not `put`) — among them
+  the test method itself and `java/util/Arrays.fill([BIIB)V`.
+* `CRATONVM_JIT=deny=Arrays.fill` still FAILs, so it is not the fill.
+* `deny=canLoadFilesBiggerThan3Mb` and `deny=constructSequenceStep2` each PASS.
 
-and reading it to EOF through `new BufferedInputStream(getResourceAsStream(…))`
-yields the same 203918 bytes in the same 26 reads, with no zero-length read
-and `-1` at the end, on both VMs (`~/trailsep/ResProbe.java`,
-`~/trailsep/EofProbe.java`). So the corruption appears *between* a correct
-byte stream and `java.util.zip`'s view of it — which is where the JIT sits.
+Unconfirmed leads (each observed **once**, and the host then became too loaded
+to repeat them — do not treat these as narrowed): `-osr-dead-locals`,
+`-kernel-reg-osr` and `-kernel-reg-locals` each made it PASS. If that survives
+repetition it points at a local that the OSR entry's dead-mask says is dead
+while a register home still holds a stale value — the coordinate-space family of
+`docs/internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md`
+and `…/jit/arrays-sort-long-osr-miscompile-FIXED.md` (whose fix,
+`14a2740859`, is already in this build and does not cover this).
 
-## The trailing-separator fix turns two of these into HANGs
+**Next step:** repeat those three levers 3× each on a quiet host before
+believing them, then narrow with `deny` inside the OSR set. A standalone
+reproducer of just the append loop (`SbGrow.java`, in this session's scratch)
+did *not* reproduce — it timed out at 4 MiB on CratonVM and completed at 1 MiB,
+so the minimal case still needs finding.
 
-With `fix/nio-path-trailing-separator-20260804` applied,
-`ImagePackagerTests`/`RepackagerTests` stop failing in seconds and instead burn
-the whole per-class timeout (600s, reproduced at 200s/240s/250s ceilings, 5/5
-runs). That is a change of *symptom*, not of cause: the same two classes still
-pass with `--nojit` on the patched binary (`ImagePackagerTests` PASS 20.2s).
-The path fix lets the test get further into the same broken code before the
-corrupt stream shows up, and the state it reaches there happens to be an
-unexitable loop instead of a throw.
+### 2. `loader/spring-boot-loader` `ZipContentTests` — heap, not headers
 
-Watchdog stack dump (`--stack-dump-on-timeout`), identical at 30s and 120s
-except for the `Inflater.inflate` bci, i.e. spinning, not progressing:
-
-```
-[78] org/springframework/boot/loader/tools/AbstractJarWriter.writeLoaderClasses@60
-[79] java/util/jar/JarInputStream.getNextJarEntry@4
-[81] java/util/zip/ZipInputStream.getNextEntry@15
-[82] java/util/zip/ZipInputStream.closeEntry@18       <- while (read(buf) != -1);
-[84] java/util/zip/ZipInputStream.read@67
-[85] java/util/zip/InflaterInputStream.read@91        <- while ((n = inf.inflate(...)) == 0)
-[86] java/util/zip/Inflater.inflate@48 / @67
-```
-
-## What was already ruled out (do not redo)
-
-* **Not the input stream.** See the two probes above.
-* **Not `Path`/`Files`.** The failures reproduce on an unpatched `dev` binary.
-* **Not the `Inflater` natives' error handling.** Two candidate fixes were
-  written, built and measured, and **neither changed the hang**:
-  1. `zip_streams.rs` (`inflater_advance`, shipped): the synthetic-layout
-     inflater kept its input cursor short of the end when zlib made no
-     progress, so `needsInput()` stayed false forever. A real fix on its own
-     merits — but the wrong subsystem for this bug, because that registration
-     is not the live one in real-JDK mode (the live path is the real
-     `java.util.zip.Inflater` bytecode calling `zip_real.rs`'s
-     `inflateBytesBytes`).
-  2. `zip_real.rs`: that live native reports `Z_DATA_ERROR` as
-     `(0 consumed, 0 produced, not finished, no dictionary)` where HotSpot
-     throws `DataFormatException` — which is another unexitable-loop shape on
-     paper. Making it throw was built and measured too: `ImagePackagerTests`
-     still hung, so the change was not kept. **It is still a real JDK-fidelity
-     gap** and is worth fixing on its own terms; it is simply not this bug, and
-     it should not be re-attempted as a fix for this bug.
-
-  The spin is upstream of both. With the JIT off, the same natives see the same
-  jar and the tests pass.
-
-## Next step
-
-Bisect `dev` between the 08-02 full-suite commit and `6b6fc9a0dc` with
-`ImagePackagerTests` as the oracle — it is a 9-second `--nojit` PASS versus a
-5-second JIT FAIL, so each bisect step is cheap. The JIT lever to reach for is
-`CRATONVM_DBG=jit-bisect-only=` (the DBG group — the `CRATONVM_JIT=` spelling
-is rejected on stderr and every arm then reads as "no effect"), and remember a
-`jit-compiled` census of 0 does not prove nothing compiled: check
-`CRATONVM_DBG=osr` too.
+On current `dev` it no longer corrupts: it dies with
+`OutOfMemoryError: Java heap space (alloc_array length 8192)` at `--Xmx 2g`
+inside `nestedZip64CanBeRead`, and PASSes with `--nojit` at the same heap. So
+the JIT arm has a materially larger footprint on this test. Different problem,
+different page; recorded here only so the next reader does not re-file it as a
+zip-header bug.
