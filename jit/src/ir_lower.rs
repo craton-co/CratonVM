@@ -2018,17 +2018,25 @@ fn reloc_emit_enabled() -> bool {
     /// are ENTERED, not with stack depth.
     ///
     /// The single-pass backend solves this the same way (`shadow_pushed_any`).
-    /// Overwriting with `0x90` rather than shifting the body keeps every
+    /// Erasing in place rather than shifting the body keeps every
     /// already-recorded offset — branch patches, deopt points, oop-map native
     /// pcs — valid, which is why this is an erase and not a removal.
+    ///
+    /// It erases with a JUMP over the span, not with a run of `0x90`. This
+    /// half was missing here while the single-pass backend had it, and the
+    /// asymmetry cost real time: the span is ~46 bytes, so every IR method
+    /// that published nothing retired 46 NOPs on entry, on every invocation.
+    /// `CratonBench fib` — a two-line static method entered 2.27e9 times —
+    /// paid it 2.27e9 times and ran ~2x slower on the IR tier than on the
+    /// single-pass body it displaced. Both backends now share
+    /// [`ExecutableBuffer::erase_range_with_jump_over`] so they cannot drift
+    /// apart again.
     fn finish_lazy_thread_fetch(&mut self) {
         if self.shadow_pushed_any {
             return;
         }
         if let Some((start, end)) = self.thread_fetch_span.take() {
-            for off in start..end {
-                let _ = self.buf.try_patch_byte(off, 0x90);
-            }
+            self.buf.erase_range_with_jump_over(start, end);
         }
     }
 
