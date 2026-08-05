@@ -65,6 +65,22 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SRC="$REPO/probes/OsrFrameProbe.java"
 [[ -f "$SRC" ]] || { echo "osr-frame-differential.sh: $SRC is missing" >&2; exit 2; }
 
+# python3 on a POSIX host, `py -3` on Windows. The comparator IS the verdict,
+# so "python3 not found" has to be a loud failure rather than a skipped check.
+# Probed by RUNNING it, not by `command -v`: on Windows a Microsoft Store alias
+# stub sits on PATH as `python3` and exits with an advertisement, so presence on
+# PATH is not the same claim as "this interpreter works".
+PY=""
+if python3 -c "" >/dev/null 2>&1; then
+  PY="python3"
+elif py -3 -c "" >/dev/null 2>&1; then
+  PY="py -3"
+fi
+if [[ -z "$PY" ]]; then
+  echo "osr-frame-differential.sh: no python3; the comparator cannot run" >&2
+  exit 2
+fi
+
 JAVAC="$(command -v javac || true)"
 [[ -x "$JAVAC" ]] || { echo "osr-frame-differential.sh: javac not found" >&2; exit 2; }
 
@@ -118,7 +134,7 @@ fi
 # the replay shape that walked past an earlier version of it — and runs first,
 # so a comparator that has stopped catching anything cannot report a green run.
 echo
-if ! python3 "$HERE/osr-frame-comparator.py" --selftest; then
+if ! $PY "$HERE/osr-frame-comparator.py" --selftest; then
   echo "osr-frame-differential.sh: the comparator's own self-test failed; its" >&2
   echo "  verdict on the real transcripts below cannot be trusted." >&2
   fail=1
@@ -128,7 +144,7 @@ echo
 # `--min-advance 1`: the run under test uses CRATONVM_OSR_EXIT_AFTER=$AFTER, so
 # the compiled body is meant to advance the frame before bailing. Zero would be
 # correct only for the unconditional-at-header trigger.
-python3 "$HERE/osr-frame-comparator.py" --min-advance 1 --only "$ONLY" \
+$PY "$HERE/osr-frame-comparator.py" --min-advance 1 --only "$ONLY" \
     "$WORK/truth.err" "$WORK/test.err" || fail=1
 
 echo
