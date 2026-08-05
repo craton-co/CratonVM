@@ -1796,11 +1796,29 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     // StringToken char-merge in XSD xs:pattern validation = Tomcat DF05). Build the
     // String from the builder's chars instead. (StringBuffer's ctor already works and
     // is intentionally not intercepted.)
-    r.register(
+    //
+    // `register_with_kind(.., Intrinsic)` is LOAD-BEARING. Every other
+    // `java/lang/String` `Bridge` is dropped in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4). This one is `Bridge`
+    // by the ambient category here, so that drop took it — and DF05 came
+    // straight back, in its quieter form: `new String(sb)` for a builder
+    // holding "abcd42Σ" returned `"a b c d"`. The real
+    // ctor's `Arrays.copyOfRange` over the builder's `byte[]` reads
+    // CratonVM's `char[]` one byte at a time, so every second byte is the
+    // high half of a Latin-1 char — zero. Silent content corruption on an
+    // ordinary call, with no exception anywhere.
+    //
+    // It IS a §1.4-reviewed intrinsic: not a faster stand-in for the
+    // bytecode, but the correct answer where the bytecode's premise (the
+    // builder is `byte[]`-backed) does not hold on this VM. It goes away when
+    // `StringBuilder` stops being char[]-backed, not before. Covered by
+    // `probes/StringDroppedNativesProbe`.
+    r.register_with_kind(
         "java/lang/String",
         "<init>",
         "(Ljava/lang/StringBuilder;)V",
         native_string_init_from_string_builder,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     r.register(
         "java/lang/String",
