@@ -231,6 +231,26 @@ independently reached L3's step-3 answer ("`Scanner`'s model is
 `instance_fields(5)`, and slots 3/4 are the real `delimPattern` /
 `hasNextPattern`").
 
+**Re-measured on the merged tree, with L4's detector rather than the one this
+lane's A/B used** (Temurin 25.0.3, Windows, `JdkOnlyCensusLoadProbe`,
+`--real-jdk`): `java/lang/invoke/MemberName` does not appear at all, and the
+only `java/util/Scanner` rows left are
+
+```
+[OVERLAY-LAYOUT] java/util/Scanner — model has 5 slot(s), 1 disagree with the loaded image
+[OVERLAY] suspect native get_field [model-slot]: class=java/util/Scanner slot=1 …
+          model=_f1:Ljava/lang/Object; real=position:I verdict=TYPE
+[OVERLAY] suspect native set_field [model-slot]: … same slot, same verdict
+```
+
+— one read and one write, both at slot 1, which is `position`, the field they
+are supposed to be at. The `verdict=TYPE` disagreement is between the image and
+the *model*, not the image and the write: `instance_fields(5)` declares
+`_f1:Ljava/lang/Object;` where the image declares `position:I`. Both probes are
+still byte-identical to HotSpot 25 in both modes on the merged binary, and
+`cargo test --release` for `cratonvm-native-builtins` (3267) and
+`cratonvm-native-io` (380) is fully green.
+
 It cannot check `Scanner` any further than that, and the reason is the
 follow-up L4 names for itself: **a model slot that is anonymous asserts
 nothing.** `class_manager.rs` still declares
