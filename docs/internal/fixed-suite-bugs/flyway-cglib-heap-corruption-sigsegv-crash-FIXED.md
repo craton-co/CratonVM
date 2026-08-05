@@ -20,13 +20,31 @@ it.
 `read_string` now requires `ObjectKind::Object` before checking the String class
 identity or decoding String fields. Arrays, including `String[]`, are rejected.
 
-## JIT residual
+## JIT residual — the ban is GONE, and HSQLDB is JIT-eligible again
 
 After the heap fix, default JIT still had an independent HSQLDB SIGSEGV during
 the Flyway integration. `CRATONVM_JIT_DENY=org/hsqldb/` consistently completed
-the class, so HSQLDB is now kept interpreted by default at both VM eligibility
-and the JIT crate's final admission gate. It can be re-enabled only for
-bisection with `CRATONVM_JIT_ALLOW_PACKAGES=org/hsqldb/`.
+the class, so HSQLDB was kept interpreted by default at both VM eligibility
+and the JIT crate's final admission gate.
+
+**That ban no longer exists** (updated 2026-08-05). `d1979bec5` (2026-08-01,
+"delete the static ban machinery outright") deleted `vm/src/jit/skip_list.rs`
+and all four of its mirrors at `try_compile`'s final admission gate, including
+both `org/hsqldb/` entries. `CRATONVM_JIT_ALLOW_PACKAGES` was deleted with
+them — it existed only to lift these bans. The single force-interpret lever is
+now `CRATONVM_JIT_DENY` (substring match on `Class.method`).
+
+Leaving this paragraph in the present tense cost a day: the 2026-08-05
+`FlywayAutoConfigurationTests` timeout page cited it to conclude that "this
+run's HSQLDB path is running interpreted", when HSQLDB had been JIT-eligible
+for four days, and looked for the stall inside HSQLDB. It was not there — see
+`docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
+
+The SIGSEGV this ban existed for does not reproduce with HSQLDB JIT-eligible:
+`FlywayAutoConfigurationTests` — 73 Spring contexts, each running Flyway
+against in-memory HSQLDB — passes 73/73 under default JIT on both Windows
+(214s/221s) and Azure Linux (224s/232s), with no SIGSEGV, heap-cell
+corruption, or malformed-String diagnostic.
 
 ## Validation
 

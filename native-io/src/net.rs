@@ -1687,6 +1687,18 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // The guard's scope now ends before any call that can re-enter the
     // registry. Cloning the handle first is cheap: every variant is an `Arc`
     // or a unit.
+    //
+    // FOUND TWICE, INDEPENDENTLY, THE SAME DAY, with the same mechanism and the
+    // same fix. The other diagnosis came from the VM's own watchdog rather than
+    // gdb — `--stack-dump-on-timeout=45` inside `timeout 90`, 6 hangs in 25
+    // runs, all six frame dumps identical (accept thread last in `Net.poll`,
+    // main thread last in `Net.socket0`) — and it carries the A/B this comment
+    // does not: 12 interleaved waves of 10 concurrent probes, **44/120 hangs
+    // before, 0/120 after**. It also establishes that THIS FIX ALONE IS NOT
+    // SUFFICIENT: with only the guard release, the same harness still scored
+    // 10/60. What reaches zero is this plus the EINTR arm in `net_poll_raw`
+    // below, which landed separately on 2026-08-02 for an unrelated symptom.
+    // See docs/known-issues/bounded-socket-operations-hang-about-one-run-in-five.md.
     let target = {
         let map = net_sockets().read();
         match map.get(&fd) {

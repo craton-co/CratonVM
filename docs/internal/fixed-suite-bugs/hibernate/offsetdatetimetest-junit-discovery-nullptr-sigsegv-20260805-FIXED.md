@@ -114,11 +114,18 @@ CratonVM and HotSpot this probe prints `@@DISCOVERED tests=0 containers=1`,
 because the class is a JUnit 6 `class-template` whose children materialise at
 execution time. `tests=0` is the **pass** signal here, not a symptom.
 
-`CRATONVM_BG_COMPILE=0` is not usable as a control on this fixture: it fails
+`CRATONVM_BG_COMPILE=0` was not usable as a control on this fixture: it failed
 100 % of runs with an unrelated `ExceptionInInitializerError` out of
 `jdk/internal/constant/PrimitiveClassDescImpl` reached from
-`VarForm.initMethodTypes`. That is a separate open behaviour of that flag, not
-this bug.
+`VarForm.initMethodTypes`. That 100 % rate briefly read as a deterministic
+reproduction of *this* bug; it is a different defect entirely — the eager
+first-call compile door ran `ConstantDescs.<clinit>`, whose artifact's
+`static_init_classes` pre-walk hoisted a line-249 class-initialization trigger
+to method entry and inverted the JDK's own circular-init cycle. Taken on and
+**FIXED 2026-08-05**:
+`../jit/bg-compile-off-clinit-first-call-compile-order-20260805-FIXED.md`.
+The opt-out now runs this fixture 5/5 clean, so it is usable as a control
+again.
 
 ## 4. Root cause
 

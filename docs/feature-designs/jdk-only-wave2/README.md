@@ -34,13 +34,13 @@ can work on what, simultaneously, without colliding.**
 | [L5b/L5c](../../internal/jdk-only-wave2-L5bc-nativekind-awt-builtins-DONE-20260805.md) **DONE 2026-08-05** | The same migration for the other crates — `native-awt` 21 and `native-builtins` 582 registrations stated; `native-collections` measured and has **zero** to state ([residuals](../../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)) | `native-awt/src/*.rs`, `native-builtins/src/*.rs` | L5 | M |
 | [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
 | [L7](../../internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
-| [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
+| [L8](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L8 is the lane to start today.** (L1–L7 are done; L9 is closed. L10 is the
+**Every lane is done.** (L1–L8 landed; L9 is closed. L10 is the
 remaining blocker, and L11/L12 are gated behind it.)
 
 ## Conflict matrix — read before claiming a second lane
@@ -144,7 +144,11 @@ above looks paranoid.
 4. `Compatible` mode byte-for-byte unchanged.
 5. No process globals for this feature's state.
 6. **Strict corpus green.** The unmeasured half until 2026-08-04, and where the
-   defects turned out to be — see L8.
+   defects turned out to be. **Not green**, and now measured on every CI run by
+   `scripts/jdk-only-strict-probes.sh` — see
+   [L8 retired](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md).
+   Four open records stand between here and green, all four **compatibility**
+   defects that `--jdk-only` did not introduce.
 
 ## State as of 2026-08-05
 
@@ -326,3 +330,45 @@ Three findings worth carrying into the other lanes:
   and produces `NullPointerException: zone` from `java.time`, which names
   nothing. Reverted, and left as a hand-off to whoever owns
   `register_unmodifiable_natives`.
+
+**Update, 2026-08-05 — L8 is retired, and criterion 6 is measured on every
+build.** One new probe over the five surfaces nothing covered (ProcessBuilder,
+security providers, virtual threads, agents/attach, JNI) found four divergences
+on its first run, and two of those were binding failures hiding three more
+underneath. Seven defects: five fixed, four filed. **Zero were introduced by
+`--jdk-only`** — every one was already wrong in `Compatible` mode and had simply
+never been executed, which is this wave's central pattern confirmed again.
+
+Two of the fixes have nothing `--jdk-only`-shaped about their blast radius:
+**no JNI native on a nested class could bind** (`jni_encode` never escaped `$`,
+so the VM looked for `Java_Outer$Inner_m` where the compiler emits
+`Java_Outer_00024Inner_m`), and **`RegisterNatives` always returned
+`JNI_ERR`** (it decoded `JClass` through `jobject_to_obj` while `FindClass`
+returns a raw `ClassId` and the rest of the JNI table decodes it as one).
+Between them, the `FindClass` + `RegisterNatives` idiom every `JNI_OnLoad` is
+built on had never worked. Both were unreachable until a probe shipped an
+actual `.so`.
+
+The lane also closed its own open residual — `Net.poll` held the socket-map
+read guard across the listener park, so a concurrent `Net.socket0` deadlocked
+against it — and it did so from a **frame dump**, not from reading code:
+`--stack-dump-on-timeout=N` inside an outer `timeout` turned "the run stops
+after the nio line" into two named frames, six times out of six.
+
+Three corrections to this document's own numbers:
+
+* the three standing probes reach **674** dispatched slots, not 401, and the
+  registry is **11,526** now that the `String` natives are gone;
+* "take the censuses from the suites, not the probes" is wrong as stated. Three
+  H2 classes reach 729 slots and the probes reach 674, but **305 are suite-only
+  and 250 are probe-only** — neither is a superset. L6/L7/L12 want the union;
+* item 2's floor warning gains a fifth instance, found behaviourally rather than
+  by the hunter: `ProcessBuilder.redirectInput` wrote a `File` into raw slot 3,
+  which on a real `java/lang/ProcessBuilder` is the `redirectErrorStream`
+  **boolean**.
+
+And two of the seven defects were in the **instruments**: the census probe
+printed its ephemeral port (so it diverged from HotSpot on every run while
+being documented as byte-identical), and the new probe used try-with-resources
+on an executor — an unbounded `close()` — breaking the probe rules it was
+written to. A gate whose first catch is its own instrument is working.

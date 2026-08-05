@@ -911,10 +911,10 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
         let chars: Vec<u16> = text.encode_utf16().collect();
 
         if src_end > chars.len() {
-            return Err(RuntimeError::StringIndexOutOfBoundsException {
-                index: src_end as i32,
-            }
-            .into());
+            return Err(
+                RuntimeError::sioobe_range(src_begin as i32, src_end as i32, chars.len() as i32)
+                    .into(),
+            );
         }
 
         for i in src_begin..src_end {
