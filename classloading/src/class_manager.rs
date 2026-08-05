@@ -10557,6 +10557,29 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
     /// Padding preserves the named slots and their indices exactly and appends
     /// anonymous ones, so existing `set_field_by_name` and raw-index access both
     /// keep working.
+    /// A single named field at absolute instance index `index`, with anonymous
+    /// `_fN` slots before it.
+    ///
+    /// For a class whose real superclass declares fields ahead of the one this
+    /// model cares about: `java.io.Reader` puts `lock` and `skipBuffer` before
+    /// `BufferedReader.in`, and `java.io.Writer` puts `writeBuffer` and `lock`
+    /// before `BufferedWriter.out`. Naming the field at 0 claims a name the
+    /// image has somewhere else — the L4 shadow-layout diff reports exactly
+    /// that, and it is invisible to any value-tag check when both are
+    /// references.
+    fn pad_named_at(name: &str, descriptor: &str, index: usize) -> Vec<ClassFileField> {
+        let mut fields: Vec<ClassFileField> = (0..index)
+            .map(|i| ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc(&format!("_f{i}")),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
+                attributes: vec![],
+            })
+            .collect();
+        fields.push(named_field(name, descriptor));
+        fields
+    }
+
     fn pad_to(mut fields: Vec<ClassFileField>, total: usize) -> Vec<ClassFileField> {
         let existing = fields
             .iter()
@@ -10787,7 +10810,26 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             }]
         }
+        // `k`/`v` sit at 2 and 3, not 0 and 1: the real class extends
+        // `AbstractMap`, which declares `keySet` and `values` ahead of them.
+        // The model named them at 0/1 until 2026-08-05, so both sat on the
+        // inherited view fields — reference over reference, invisible to any
+        // value-tag check, reported by the L4 shadow-layout diff. The only
+        // writer (`native_collections_singleton_map`) goes by name, so this is
+        // a model-only correction.
         "java/util/Collections$SingletonMap" => vec![
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("_f0"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("_f1"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
+                attributes: vec![],
+            },
             ClassFileField {
                 access_flags: FieldAccessFlags::PRIVATE,
                 name: cratonvm_types::intern_arc("k"),
@@ -10874,13 +10916,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
         "java/io/InputStreamReader" => vec![named_field("in", "Ljava/io/InputStream;")],
+        // `in` is at 2 on a real `BufferedReader`: `java.io.Reader` declares
+        // `lock` and `skipBuffer` ahead of it. Naming it at 0 put it on `lock`.
         "java/io/BufferedReader" => {
-            vec![named_field("in", "Ljava/io/Reader;")]
+            pad_named_at("in", "Ljava/io/Reader;", 2)
         }
         "java/io/OutputStreamWriter" => {
             vec![named_field("out", "Ljava/io/OutputStream;")]
         }
-        "java/io/BufferedWriter" => pad_to(vec![named_field("out", "Ljava/io/Writer;")], 3),
+        // `out` is at 2 on a real `BufferedWriter`: `java.io.Writer` declares
+        // `writeBuffer` and `lock` ahead of it. Naming it at 0 put it on
+        // `writeBuffer`, a `char[]`.
+        //
+        // Slot 0 stays anonymous rather than being named `writeBuffer`, because
+        // `Files.newBufferedWriter` parks a VM-internal fd there and
+        // `bw_delegate_out` uses "is slot 0 an Int?" to tell its own fd-backed
+        // object from a real one. That overlay is a separate defect (kind 3 —
+        // a VM value with no real field, which belongs in a side table); this
+        // change corrects the model only and deliberately does not disturb it.
+        "java/io/BufferedWriter" => pad_named_at("out", "Ljava/io/Writer;", 2),
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
         // PrintStream/PrintWriter = 1 field (fd)
@@ -11940,11 +11994,27 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // JDK layout has additional internals (`signers`, `codeSigners`) that
         // are computed lazily; a 2-field stub is enough for our
         // reflectively-retrieved PD to expose `getLocation()` + `getCertificates()`.
+        // DECLARATION ORDER, like its `ProtectionDomain` sibling: `javap -p
+        // --module java.base java.security.CodeSource` gives `location,
+        // signers, certs, sp, factory, locationNoFragString`.
+        //
+        // The model was `(location, certs)` — the CONSTRUCTOR's argument order,
+        // `CodeSource(URL, Certificate[])` — so `certs` sat on `signers`. Same
+        // mistake as `ProtectionDomain`, in the class right next to it. Slot 0
+        // is `location` either way, which is why the dozen raw
+        // `get_field(cs, 0)` readers around the tree were all correct and only
+        // slot 1 was wrong.
         "java/security/CodeSource" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("location"),
                 descriptor: cratonvm_types::intern_arc("Ljava/net/URL;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("signers"),
+                descriptor: cratonvm_types::intern_arc("[Ljava/security/CodeSigner;"),
                 attributes: vec![],
             },
             ClassFileField {
