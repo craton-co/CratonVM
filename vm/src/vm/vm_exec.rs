@@ -19233,11 +19233,29 @@ fn invoke_on_class_shared_inner(
     // Resolve it here, after the reflective Method target is known but before
     // bytecode selection, so it cannot dispatch through the unsupported
     // socket/provider protocol.
-    let class_name = {
+    // ONE read guard for both of the questions the hot prefix asks about
+    // `class_id`: its name, and whether it is a class whose exact-name native
+    // must be preferred over an inherited bytecode body. They used to be two
+    // separate `class_manager.read()` calls on every single invoke; see the
+    // block comment on `prefer_exact_class_native` below for what the second
+    // one decides, and `docs/known-issues/h2/` for the profile that made the
+    // acquisition count worth counting.
+    let (class_name, prefer_exact_class_native) = {
         let cm = shared.classes.class_manager.read();
-        cm.get_class(class_id)
+        let class = cm.get_class(class_id);
+        let class_name = class
             .map(|class| class.name.to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A `String`, not an `Arc<str>` clone: the name outlives this guard,
+        // and `Arc::clone` on a hot class is an atomic RMW that every mutator
+        // performs on the SAME cache line — the identical contention this
+        // coalescing exists to reduce (the JIT's dispatch memo holds its names
+        // as `Rc<str>` for the same reason).
+        let stub_or_interface = class
+            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .unwrap_or(false);
+        let prefer = stub_or_interface || class_name.starts_with("cratonvm/internal/");
+        (class_name, prefer)
     };
     // `cratonvm/internal/*` classes (`UnmodifiableList`/`Map`/`Set`/
     // `Collection`/`EntrySet`/`Itr`/`ListItr`/`MapEntry`, ...) are pure
@@ -19275,15 +19293,7 @@ fn invoke_on_class_shared_inner(
     // invokevirtual, a different, already-correct dispatch path) did not.
     // Lambda-proxy receivers are already handled and returned above, so
     // they never reach this branch.
-    if class_name.starts_with("cratonvm/internal/")
-        || shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_synthetic_stub || c.is_interface())
-            .unwrap_or(false)
-    {
+    if prefer_exact_class_native {
         // Generalises the `cratonvm/internal/*` case above: ANY synthetic-
         // stub class (no real bytecode -- either a permanently-synthetic
         // VM-internal representation, e.g. the concrete class CratonVM
