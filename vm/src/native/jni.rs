@@ -5919,7 +5919,14 @@ fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) 
 /// Free a JValue array returned by `va_list_to_jvalues`.
 unsafe fn free_jvalues(ptr: *const JValue, len: usize) {
     if !ptr.is_null() && len > 0 {
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(
+        // Rebuild the `Box<[JValue]>` that `va_list_to_jvalues` forgot.
+        // `slice_from_raw_parts_mut` builds the fat pointer directly, instead
+        // of materialising a `&mut [JValue]` and casting it back to a raw
+        // pointer: the reference form asserts an exclusive borrow of memory
+        // this function is about to hand to `Box::from_raw`, which is what
+        // `clippy::cast_slice_from_raw_parts` (denied here) objects to. Same
+        // pointer, same length, no intermediate reference.
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             ptr as *mut JValue,
             len,
         )));

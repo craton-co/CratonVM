@@ -95,11 +95,35 @@ for MODE in --real-jdk --jdk-only; do
 done
 
 echo "" >> "$LOG"
-echo "=== distinct (class, slot, value kind, real descriptor) sites ===" >> "$LOG"
+echo "=== distinct (op, class, slot, value kind, real descriptor) sites ===" >> "$LOG"
+# The hunter's line reads `suspect native set_field [reasons]:` / `... get_field
+# [reasons]:` since L4 (2026-08-05) — it used to read `destructive native
+# set_field:` and cover writes only. Both spellings are matched so this script
+# can score a PRE-L4 binary and a post-L4 one in the same A/B, which is the
+# whole point of running it twice.
 cat "$OUT"/ov-*.txt 2>/dev/null \
-  | grep "destructive native set_field" \
+  | grep -E "(destructive|suspect) native (set|get)_field" \
   | sed -E 's/value=(Int|Long|Float|Double|Object)\([^)]*\)/value=\1/' \
-  | sed -E 's/^.*class=/class=/' \
+  | sed -E 's/ model=[^ ]* real=[^ ]* verdict=[A-Za-z]+//' \
+  | sed -E 's/^.*(set_field|get_field)[^:]*:.*class=/\1 class=/' \
+  | sort | uniq -c | sort -rn >> "$LOG"
+
+echo "" >> "$LOG"
+echo "=== shadow-layout diff: classes whose model disagrees with the image ===" >> "$LOG"
+# L4 step 3. One line per class, emitted at define time, independent of whether
+# any native ever touches the class — so this half of the census does not depend
+# on the probe reaching the code.
+cat "$OUT"/ov-*.txt 2>/dev/null \
+  | grep "^\[OVERLAY-LAYOUT\] " \
+  | grep -v "^\[OVERLAY-LAYOUT\]   " \
+  | sed -E 's/^\[OVERLAY-LAYOUT\] //' \
+  | sort -u >> "$LOG"
+
+echo "" >> "$LOG"
+echo "=== shadow-layout diff: disagreeing slots ===" >> "$LOG"
+cat "$OUT"/ov-*.txt 2>/dev/null \
+  | grep -E "^\[OVERLAY-LAYOUT\]   slot .* (TYPE|NAME) " \
+  | sed -E 's/^\[OVERLAY-LAYOUT\]   //' \
   | sort | uniq -c | sort -rn >> "$LOG"
 
 echo "MEASURECOMPLETE" >> "$LOG"

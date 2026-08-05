@@ -237,13 +237,55 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 ## Open
 
-- **`OffsetDateTimeTest`** — SIGSEGV during JUnit discovery (`ReflectionUtils.findMethods`
-  / `LifecycleMethodUtils`), before any test body runs. Fault address `0x0E` (near-null)
-  with **zero GC cycles** having occurred in-process — explicitly ruled out as a witness
-  of the `ClassId(0)` stale-pointer family (see that doc's own two checks). Likely a JIT
-  codegen null-check bug in compiled reflection-heavy code. Single occurrence, not yet
-  confirmed deterministic. See
-  `offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805.md`.
+- ~~`SmokeTests#testQueryConcurrency` — 120 s JUnit timeout, "needs ~5.2x, gated
+  on the tiered manager"~~ — **RETIRED 2026-08-05** to
+  `../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
+  Every load-bearing number in that page was stale by more than an order of
+  magnitude and two of its three reproduction instructions could not be
+  followed: the three probes it said were "left behind" were never committed,
+  and the environment variable its central experiment turns on
+  (`CRATONVM_JIT_ALLOW_PACKAGES`) was deleted with `vm/src/jit/skip_list.rs` on
+  2026-07-31. Re-measured against HotSpot with a line fitted through real
+  6/14/26-fork runs: **~22x, not 38.6x**, needing **~1.3x**, not 5.2x. Run
+  against its real 120 s cap on a contended box it now **passes 2 of 5
+  attempts** with the full `sql=40012` workload (118.6 s and 126.0 s), against
+  the 614 608 ms the old page recorded — i.e. it belongs in the
+  "timeout-marginal class + contended host" category with `BatchTest` and
+  `DynamicBatchFetchTest` above, not in one needing a breakthrough. The JIT is
+  a **~1.6x win**
+  over `--nojit` on this workload, not the 1.5–2.2x loss the page's conclusion
+  rested on, and `ineligible-by-policy=0` — the wholesale `org/hibernate/`,
+  `org/h2/` and AQS bans behind its "99.6% banned by design" reading are gone.
+  Two sub-defects closed on the way (the JIT had **no TLAB path for arrays at
+  all**; a short code buffer retired a method permanently instead of being
+  re-measured), the three probes now exist, and both the probe and the repro
+  harness now refuse a **vacuous green** — the fixture discards `invokeAll`'s
+  Futures, so an `HqlLexer.<clinit>` NPE makes it report `ok=1` in 15 s having
+  executed nothing. The ~1-in-13 crash seen while measuring is **not** this
+  page: it is the `ClassId(0)` family, now recorded as a fifth reproduction on
+  `../h2/bug-h2-classid0-stale-address-family.md`.
+
+- ~~`OffsetDateTimeTest` — SIGSEGV during JUnit discovery~~ — **FIXED 2026-08-05**,
+  retired to
+  `../../internal/fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`.
+  Not the JIT codegen null-check bug the open page guessed: the null check is
+  emitted and it *passes* — the faulting register held `1`, and `1 + 0xC` is the
+  `0x0D`/`0x0E` fault address, an `int` delivered where an `Annotation[]` belongs.
+  The per-thread JIT dispatch memos are keyed on a `JitInvokeInfo` **address**, and
+  those boxes are freed with their `CompiledMethod`, so a recycled address let one
+  call site serve another's resolution — `NATIVE_SITE_CACHE` calling the previous
+  site's native (the SIGSEGV) and `VIRTUAL_TARGET_CACHE` resolving against the
+  previous site's class (`NoSuchMethodError: java.lang.Object.annotationType()`).
+  Four of the eight site-keyed memos were revalidated by neither trigger.
+  Reproduced at 20–45 % in ~2 s per run with `DiscoveryProbe` (discovery only —
+  note `@@DISCOVERED tests=0 containers=1` is the PASS signal for this
+  class-template, on HotSpot too); 0/60 after the fix against 7/20 on the pre-fix
+  binary, interleaved. The class now runs `found=488 ok=324 aborted=164`,
+  **byte-identical to a real-HotSpot control**, and is recorded in
+  `apps/hib-suite-runner/known-benign-aborts.tsv` alongside its three temporal
+  siblings. An unrelated API-fidelity defect fixed on the way —
+  `Class.getDeclaredAnnotations()` and every `getAnnotationsByType` built
+  `[Ljava.lang.Object;` arrays — is measured in that page as **not** the cause.
 
 - ~~`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT~~
   — **FIXED 2026-08-04**, retired to

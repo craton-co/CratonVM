@@ -28,19 +28,20 @@ can work on what, simultaneously, without colliding.**
 |---|---|---|---|---|
 | [L1](L1-classloader-side-table.md) **DONE 2026-08-05** | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
-| [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
-| [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
-| [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
-| [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
-| [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
+| [L3](L3-scanner-membername-residual.md) **DONE 2026-08-05** | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs`, **`native-io/src/lib.rs`** | — | S |
+| [L4](L4-overlay-detector-blind-spots.md) **DONE 2026-08-05** | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only), `classloading/src/shadow_layout.rs` | — | M |
+| [L5](../../internal/jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
+| [L5b/L5c](../../internal/jdk-only-wave2-L5bc-nativekind-awt-builtins-DONE-20260805.md) **DONE 2026-08-05** | The same migration for the other crates — `native-awt` 21 and `native-builtins` 582 registrations stated; `native-collections` measured and has **zero** to state ([residuals](../../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)) | `native-awt/src/*.rs`, `native-builtins/src/*.rs` | L5 | M |
+| [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
+| [L7](../../internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3–L7 can all start today, in parallel, by different people.** (L1, L2 and
-L8 are done; L9 is closed.)
+**Every lane is done.** (L1–L8 landed; L9 is closed. L10 is the
+remaining blocker, and L11/L12 are gated behind it.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -51,8 +52,9 @@ exist:
 |---|---|---|
 | L2 ↔ L10 | `native-collections/src/lib.rs` | **Resolved:** L2 landed 2026-08-04; L10 rebases onto it. |
 | L4 ↔ L11 | `vm/src/vm/vm_exec.rs` | L4 owns the overlay hunter (~line 3070–3200); L11 owns dispatch (~14700, ~22700). Disjoint regions in one file — coordinate, do not both `git add -A`. |
-| L3 ↔ L12 | `lang_invoke.rs` | L3 is a handful of lines; land it first. |
-| L5/L6/L12 ↔ each other | `register_with_kind` semantics | Only L5 changes call sites; L6 only reads the census; L12 §4 is JIT-side. Safe. |
+| L3 ↔ L12 | `lang_invoke.rs` | **Resolved:** L3 landed 2026-08-05; L12 rebases onto it. |
+| L3 ↔ L5 | `native-io/src/lib.rs` | **Resolved the same way.** L3 had to take this file — the Scanner writer was there, not in `phases_early.rs` — but it touched only the `Scanner` natives and the delimiter regex cache, no `register*` call site. |
+| L5/L6/L12 ↔ each other | `register_with_kind` semantics | **Resolved:** L6 landed 2026-08-05 and changed no call site — it reads the census and freezes two numbers. L5's migration now has to move them; re-freeze with `sh regression-suite/bridge-ratchet.sh --update-baseline --note "…"` in the same change. L12 §4 is JIT-side. |
 
 `native-collections/src/lib.rs` is 55k lines and `vm_exec.rs` is 26k — two
 people in either will conflict even in "different" areas. Treat whole-file
@@ -85,7 +87,10 @@ CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home $JDK -cp probes
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=ClassName cratonvm ...
 # native adjudication
 cratonvm --real-jdk --java-home $JDK --explain-jdk-only --dump-native-registry c.json -cp probes JdkOnlyCensusLoadProbe
-python3 scripts/jdk-only-adjudicate.py c.json
+python3 scripts/jdk-only-adjudicate.py c.json     # section 7 is the ratchet's block
+# ...and the gate over it (takes its own census; needs no probe)
+JAVA_HOME=$JDK sh regression-suite/bridge-ratchet.sh
+sh regression-suite/bridge-ratchet.sh --selftest  # hermetic, no VM, no JDK
 # both at once
 JAVA_HOME=$JDK CV=... PROBES=... scripts/jdk-only-measure-refusals-and-overlays.sh
 ```
@@ -119,13 +124,16 @@ above looks paranoid.
   three `ClassLoader` REFERENCE slots were safe because they "are already
   written by name too" — but the by-name write and the index write land on
   DIFFERENT fields (`name` is slot 1, and the index write put the parent
-  ClassLoader there). `overlay_write_is_destructive` only flags cross-type-class
+  ClassLoader there). The value-tag predicate only flags cross-type-class
   coercions, so zero of it appeared in any census.
   `classloader_parent` was returning the platform loader's own name String as
   its parent, and nothing measured it until a behavioural probe was diffed
   against the host JDK. **Read the writer against `javap` of the real class;
-  the census is a floor, and for reference-into-reference it is a floor of
-  zero.**
+  the census is a floor, and for reference-into-reference it was a floor of
+  zero.** *(Corrected 2026-08-05: L4's shadow-layout diff compares our model
+  against the image by NAME and found 23 such slots on its first run. The floor
+  is zero only where the model slot is anonymous — `_fN`, which asserts
+  nothing.)*
 
 ## Definition of done (contract §11)
 
@@ -148,8 +156,10 @@ Closed: items 8, 9, 10; item 11 §1 (answered — its cost is zero), §5
 (retracted), §12, §13. Fixed outside the list: `--jdk-only` could not start a
 thread; `MethodType.toString()`; eight missing system properties.
 
-Item 2: 24 measured slots → **15 open**. Item 1: instrument built, migration not
-started. Items 3/7: blocked on L9/L10.
+Item 2: 24 measured slots → **15 open** (→ **12** after L3, 2026-08-05: the two
+`Scanner` rows and the `MemberName` row are gone, leaving `URI` ×2 and
+`Proxy`). Item 1: instrument built, migration not started. Items 3/7: blocked
+on L9/L10.
 
 **Update, later on 2026-08-04 — L2 landed.** The `Properties` family is gone
 from the census (slots 2 and 3 → 0) along with the `HashMap` slot-2 `Int` over
@@ -160,9 +170,11 @@ the three standing probes plus the new `probes/MapLayoutMatrixProbe`: 6
 classes / 15 slots before, 5 / 12 after — not comparable to the 24 above, see
 the evidence record for why. `Compatible` corpus byte-identical.
 
-Two things that block a clean read of item 2's remaining rows, both L4's:
+~~Two things that block a clean read of item 2's remaining rows, both L4's:
 a null written over a primitive is still invisible to the hunter, and a
-same-kind wrong-slot write always was. **Every count in item 2 is a floor.**
+same-kind wrong-slot write always was.~~ **Both closed 2026-08-05 — see the L4
+update below.** Every count in item 2 is still a floor, now because three probes
+are not Spring Boot rather than because the instrument is half-blind.
 
 **Update, 2026-08-05 — L1 landed.** The eight `ClassLoaders` census rows are
 gone (slots 0/3/4/6 on each built-in loader → 0), A/B'd against the pre-fix
@@ -188,34 +200,175 @@ That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
 so `kind_stated` is no longer `false` on all 11,909 rows.
 
-**Update, 2026-08-05 — L8 is retired, and criterion 6 is now measured on every
+**Update, 2026-08-05 — L3 landed, and item 2's table is down to `URI` and
+`Proxy`.** `java/util/Scanner` slots 3/4 and `java/lang/invoke/MemberName` slot
+4 are gone from the census (1 → 0, 1 → 0 and 7 → 0), A/B'd against the pre-fix
+binary over both standing probes × both modes with the benign `HashMap` row
+byte-identical and no other row present in either arm. Two new probes,
+`L3ScannerLayoutProbe` and `L3MemberNameProbe`, are byte-identical to HotSpot
+25 in both modes; the Scanner one FAILS on the pre-fix binary, which is what
+makes the census delta mean something.
+
+Three things worth carrying into the remaining lanes:
+
+* **A lane brief scoped from the census under-reports its own defect — again.**
+  L1 found this with the `ClassLoader` reference slots; L3 found the `Scanner`
+  model was writing FIVE wrong fields, of which the census could see two. The
+  other three are reference-into-reference. Read the writer against `javap`.
+* **The file named in a brief may not be where the code is.** The brief said
+  `phases_early.rs`, three fields; `overlay-bt` said `native-io/src/lib.rs`,
+  five. There were two Scanner implementations over two different layouts, and
+  the one in the brief had been dead in every configuration since
+  `register_io_natives` started running two lines after `register_builtins`.
+  The dead copy is deleted rather than kept in sync.
+* **Kind 3 does not always need a side table.** `MemberName`'s vmindex sentinel
+  was an `Int` written to a reference slot, which `set_field` coerces to null —
+  the very condition the census reports. It had never reached the object in any
+  layout, so both readers already answered 0 and removing the write is
+  behaviour-preserving. A comment called it "critical". Check whether a value
+  survives its own write before building storage for it.
+
+L3 also fixed three host-JDK divergences the new probe surfaced next to the
+layout rows (the default delimiter's pattern string, `next()` leaving the
+position past the delimiter — the shape the JDK's own `NextIntNextLineTest`
+exists to catch — and a constructor `MethodHandle`'s `type()` returning
+`void`), and made `Scanner.close()` mean something. Those change `Compatible`
+mode, from silently wrong to matching HotSpot, exactly as L2's
+`try_set_jdk_map_field` fix did; criterion 4 is about not perturbing
+`Compatible`, not about preserving its bugs.
+
+**Update, 2026-08-05 — L4 landed, and item 2's work list roughly quadrupled.**
+The census goes from **4 distinct sites to 135** on the same three probes in
+both modes, with every pre-fix row preserved at its count. Reads are
+instrumented (70 read sites where there were none), `Object(None)` over a
+primitive is flagged (two new write rows the pre-fix binary is silent on), and
+the same-kind wrong-slot case is covered by a **shadow-layout diff**:
+`synthetic_stub_fields` is the model the natives were written against, so when
+the class also has real bytes the two layouts are diffed once at define time and
+every disagreeing index reported.
+
+That diff found **23 slots across 12 classes where our model names a different
+field than the image declares** (152 disagreeing slots in all, across 73 of the
+156 modelled classes the probes reach) — the kind-5 family this README's own lesson
+below calls "a floor of zero". `java/lang/ThreadGroup` has both `name`/`parent`
+and `daemon`/`maxPriority` **transposed**; `java/lang/Thread` slot 5 writes a
+`ClassLoader` over `holder`; `ProtectionDomain`, `CodeSource`, the buffered
+IO wrappers and `java/lang/reflect/{Field,Method,Constructor}` are all in the
+list. None is fixed — each is its own change with its own A/B, and the list is
+the lane's output. L4 also settled L3 step 3 in passing: `Scanner`'s model is
+`instance_fields(5)`, and slots 3/4 are the real `delimPattern` /
+`hasNextPattern`.
+
+**The lesson below needs one correction, not a rewrite.** "For
+reference-into-reference the census is a floor of zero" was true of a detector
+that only compared value tags. Comparing our *model* against the image by NAME
+is a different signal and it finds them. What stays unfindable is the case where
+the model slot is anonymous (`_fN`) — there the model asserts nothing. Naming
+more of `synthetic_stub_fields` is what shrinks that, and it is the follow-up.
+
+**Update, 2026-08-05 — L6 landed; the `NativeKind` work is now measurable.**
+`regression-suite/bridge-ratchet.sh` + `scripts/jdk-only-bridge-ratchet.py`
+freeze the unadjudicated-`Bridge` population against
+`scripts/baselines/jdk-only-bridge-ratchet.json`, slack-free, with a vacuity
+floor. Frozen on dev `d010d611b4` / JDK 25.0.3 / linux at **10,069 of 10,842
+`Bridge` rows with no `ACC_NATIVE` target**, of which **4,755 shadow concrete
+bytecode** (separately ratcheted — that is the subgroup §7 step 3's decline can
+reach). Re-measured, not copied: the brief's 10,084/10,844 was 2026-08-04, before
+L1/L2/L9 and the `String` residuals.
+
+Three things worth carrying into the other lanes:
+
+* **The baseline key is `<jdk-feature>/<os>`, and a missing entry is a refusal
+  (exit 2), never a pass.** The registrars are platform-conditional, so a Linux
+  baseline scoring a Windows census is the mix `scripts/jdk-only-census.sh`'s
+  header exists to prevent. Only `25/linux` is committed; three of the four
+  `jdk-only` CI legs report themselves ungated rather than green.
+* **`JdkOnlyCensusLoadProbe` is the wrong workload for a gate, and neither
+  number needs it.** Registration happens in `SharedVm::new` and the image
+  adjudication parses class-path bytes without loading anything, so a one-line
+  probe yields a byte-identical block — verified, not assumed. The broad probe
+  hung in its `net` section on 1 of 3 runs on a loaded host, and a hung probe
+  writes no census.
+* **`kind_stated` is now false on all but 9 rows, and on *every* `Bridge` row.**
+  L9's `java/lang/String` migration is those 9. All 10,842 `Bridge` rows still
+  inherit their kind.
+
+**Both halves are blocking**, which took a second pass to get right. The
+hermetic self-test runs in `jdk-only-blockers-selftest` — 14 checks including an
+injected unadjudicated `Bridge` it must reject and an adjudicated one it must
+accept, so the gate is shown to fail and shown not to be always-red on every
+run. The *measured* half runs in `build-and-test`'s ubuntu leg, beside
+`Synthetic-stub ratchet`: wired only into the advisory `jdk-only` matrix it
+printed an error and failed nothing, and neither of that job's two reasons to be
+advisory applies to a `Compatible`-mode census with a committed baseline. The
+`jdk-only` matrix keeps its copy as the multi-JDK/OS probe.
+
+**Update, 2026-08-05 — L7 landed, and the lane doc is retired to
+`docs/internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md`.** A
+strict boot now fabricates **zero** compatibility classes (13 before), and the
+two breadth probes drop 17 → 1 and 18 → 5. `Compatible`-mode stdout is
+byte-identical on all three workloads against the pre-fix binary. Another
+number joins the *"a number in a record is a claim"* list: **"52 call sites"
+was 39 live in 25 files, of which 10 fire** — the rest of the gap was
+`#[cfg(all(test, feature = "synthetic-jdk"))]` and `proxy_gen.rs`'s test module
+being counted as production.
+
+Three findings worth carrying into the other lanes:
+
+* **The census could not name a native until 2026-08-05.** All seven
+  native-minted classes were attributed to one forwarding line in
+  `NativeContextImpl`; `#[track_caller]` now runs down through the trait
+  declarations and the three allocation funnels. And `requested_by` records the
+  *first* requester of a name — including one that was **refused** — so a later
+  successful fabrication of the same name is attributed to the refusing site.
+* **`ensure_synthetic_class` cannot be deleted by migrating call sites.** Three
+  of the 39 *are* the infallible allocation funnels, with ~2,300 callers
+  between them. That, not the call sites, is what step 3 is gated on.
+* **A fabrication cannot be made fallible before its native is retagged**, when
+  the class stands in for a real JDK method the JDK's own bootstrap calls.
+  Measured: refusing `cratonvm/internal/Unmodifiable*` reaches a zero census
+  and produces `NullPointerException: zone` from `java.time`, which names
+  nothing. Reverted, and left as a hand-off to whoever owns
+  `register_unmodifiable_natives`.
+
+**Update, 2026-08-05 — L8 is retired, and criterion 6 is measured on every
 build.** One new probe over the five surfaces nothing covered (ProcessBuilder,
 security providers, virtual threads, agents/attach, JNI) found four divergences
 on its first run, and two of those were binding failures hiding three more
-underneath. Seven defects: five fixed, four filed (one of the five fixed is the
-lane's own open residual). **Zero were introduced by `--jdk-only`** — every one
-was already wrong in Compatible mode and had simply never been executed, which
-is the fourth independent confirmation of this wave's central pattern.
+underneath. Seven defects: five fixed, four filed. **Zero were introduced by
+`--jdk-only`** — every one was already wrong in `Compatible` mode and had simply
+never been executed, which is this wave's central pattern confirmed again.
 
-Two of the fixes are worth naming here because their blast radius is not
-`--jdk-only`-shaped at all: **no JNI native on a nested class could bind**
-(`jni_encode` never escaped `$`), and **`RegisterNatives` always returned
-`JNI_ERR`** (it decoded `JClass` as an object handle while `FindClass` returns
-a `ClassId`). Between them, the `FindClass` + `RegisterNatives` idiom every
-`JNI_OnLoad` is built on had never worked.
+Two of the fixes have nothing `--jdk-only`-shaped about their blast radius:
+**no JNI native on a nested class could bind** (`jni_encode` never escaped `$`,
+so the VM looked for `Java_Outer$Inner_m` where the compiler emits
+`Java_Outer_00024Inner_m`), and **`RegisterNatives` always returned
+`JNI_ERR`** (it decoded `JClass` through `jobject_to_obj` while `FindClass`
+returns a raw `ClassId` and the rest of the JNI table decodes it as one).
+Between them, the `FindClass` + `RegisterNatives` idiom every `JNI_OnLoad` is
+built on had never worked. Both were unreachable until a probe shipped an
+actual `.so`.
 
-Two corrections to this document's own numbers, both from the same census
-instrument pointed at a suite for the first time:
+The lane also closed its own open residual — `Net.poll` held the socket-map
+read guard across the listener park, so a concurrent `Net.socket0` deadlocked
+against it — and it did so from a **frame dump**, not from reading code:
+`--stack-dump-on-timeout=N` inside an outer `timeout` turned "the run stops
+after the nio line" into two named frames, six times out of six.
 
-* the three standing probes reach **674** slots, not 401, and the registry is
-  **11,526** now that the `String` natives are gone;
-* "take the censuses from the suites, not the probes" is wrong as stated.
-  Three H2 classes reach 729 slots and the probes reach 674, but **305 are
-  suite-only and 250 are probe-only** — neither is a superset. L5/L6/L7 should
-  read the union.
+Three corrections to this document's own numbers:
 
-Item 2's floor warning gains a fifth instance: `ProcessBuilder.redirectInput`
-wrote a `File` into raw slot 3, which on a real `java/lang/ProcessBuilder` is
-the `redirectErrorStream` **boolean**. A reference-into-primitive write, exactly
-what the hunter is meant to catch, found instead by a probe diffing behaviour
-against HotSpot.
+* the three standing probes reach **674** dispatched slots, not 401, and the
+  registry is **11,526** now that the `String` natives are gone;
+* "take the censuses from the suites, not the probes" is wrong as stated. Three
+  H2 classes reach 729 slots and the probes reach 674, but **305 are suite-only
+  and 250 are probe-only** — neither is a superset. L6/L7/L12 want the union;
+* item 2's floor warning gains a fifth instance, found behaviourally rather than
+  by the hunter: `ProcessBuilder.redirectInput` wrote a `File` into raw slot 3,
+  which on a real `java/lang/ProcessBuilder` is the `redirectErrorStream`
+  **boolean**.
+
+And two of the seven defects were in the **instruments**: the census probe
+printed its ephemeral port (so it diverged from HotSpot on every run while
+being documented as byte-identical), and the new probe used try-with-resources
+on an executor — an unbounded `close()` — breaking the probe rules it was
+written to. A gate whose first catch is its own instrument is working.

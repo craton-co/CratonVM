@@ -5073,12 +5073,19 @@ struct ClassValueCacheEntry {
 
 const CLASSVALUE_CACHE_CAP: usize = 65_536;
 
-fn classvalue_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), ClassValueCacheEntry>> {
-    static CLASSVALUE_CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u64, u64), ClassValueCacheEntry>>,
-    > = std::sync::OnceLock::new();
-    CLASSVALUE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// Keyed by `vm_identity` on top of the identity-hash pair. Identity hashes
+/// are 32-bit and minted per VM, so two live VMs collide readily — and the
+/// VALUE is a heap `ObjectRef`, which is only meaningful in the heap that
+/// allocated it. `reset_classvalue_cache` used to clear this from `Vm::new`,
+/// which is safe only for strictly sequential VMs.
+static CLASSVALUE_CACHE: cratonvm_native_api::vm_scoped::VmScoped<
+    std::collections::HashMap<(u64, u64), ClassValueCacheEntry>,
+> = cratonvm_native_api::vm_scoped::VmScoped::new();
+
+/// Per-VM teardown for the `ClassValue` memoization cache. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_classvalue_cache(vm_identity: usize) {
+    CLASSVALUE_CACHE.forget(vm_identity);
 }
 
 /// GC root scan hook for the `ClassValue` memoization cache — reports every
@@ -5095,27 +5102,29 @@ fn classvalue_cache(
 /// writeup and `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`
 /// for the observed corruption shape this pattern produced elsewhere.
 pub fn gc_scan_classvalue_cache_roots(
+    vm_identity: usize,
     out: &mut Vec<ObjectRef>,
     metadata_pin_deferrable: &dyn Fn(usize) -> bool,
 ) {
-    let cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
-    for entry in cache.values() {
-        if cratonvm_types::metadata_pin::metadata_weak_mode()
-            && metadata_pin_deferrable(entry.value.as_ptr() as usize)
-        {
-            if let Some(loader) = entry
-                .owner_class_id
-                .and_then(cratonvm_types::loader_pin::loader_pin_addr)
+    CLASSVALUE_CACHE.peek(vm_identity, |cache| {
+        for entry in cache.values() {
+            if cratonvm_types::metadata_pin::metadata_weak_mode()
+                && metadata_pin_deferrable(entry.value.as_ptr() as usize)
             {
-                cratonvm_types::metadata_pin::add_metadata_pin(
-                    loader,
-                    entry.value.as_ptr() as usize,
-                );
-                continue;
+                if let Some(loader) = entry
+                    .owner_class_id
+                    .and_then(cratonvm_types::loader_pin::loader_pin_addr)
+                {
+                    cratonvm_types::metadata_pin::add_metadata_pin(
+                        loader,
+                        entry.value.as_ptr() as usize,
+                    );
+                    continue;
+                }
             }
+            out.push(entry.value);
         }
-        out.push(entry.value);
-    }
+    });
 }
 
 /// Post-GC remap for the `ClassValue` memoization cache (companion to
@@ -5123,44 +5132,37 @@ pub fn gc_scan_classvalue_cache_roots(
 /// remapping — the keys are identity-hash-based and stable across a moving
 /// collection. Wired into `gc.rs` alongside
 /// `lang_system::gc_update_system_singleton_refs`.
-pub fn gc_update_classvalue_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_classvalue_cache_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
-    let mut cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
-    for entry in cache.values_mut() {
-        let old_addr = entry.value.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            entry.value = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+    CLASSVALUE_CACHE.with(vm_identity, |cache| {
+        for entry in cache.values_mut() {
+            let old_addr = entry.value.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                entry.value = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
         }
-    }
+    });
 }
 
 /// Remove every ClassValue entry owned by unloaded classes.
-pub fn forget_unloaded_classvalue_entries(class_ids: &[u32]) {
+pub fn forget_unloaded_classvalue_entries(vm_identity: usize, class_ids: &[u32]) {
     if class_ids.is_empty() {
         return;
     }
     let ids: std::collections::HashSet<u32> = class_ids.iter().copied().collect();
-    classvalue_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, entry| {
+    CLASSVALUE_CACHE.with(vm_identity, |cache| {
+        cache.retain(|_, entry| {
             entry
                 .owner_class_id
                 .map_or(true, |class_id| !ids.contains(&class_id))
-        });
-}
-
-/// Clear the `ClassValue` memoization cache. Called when creating a new VM to
-/// avoid stale `ObjectRef`s from a previous VM instance (mirrors
-/// `lang_system::reset_system_singletons`).
-pub fn reset_classvalue_cache() {
-    classvalue_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        })
+    });
 }
 
 /// Registers `java.lang.ClassValue#get`/`#remove` (see `register_p67_misc`'s
@@ -5221,18 +5223,17 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                         key.1
                     );
                 }
-                if let Some(entry) = classvalue_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&key)
+                if let Some(cached) = CLASSVALUE_CACHE
+                    .peek(ctx.vm_identity(), |cache| cache.get(&key).copied())
+                    .flatten()
                 {
                     if cv_trace {
                         eprintln!(
                             "[cv-native] cache HIT -> {:#x}",
-                            entry.value.as_ptr() as usize
+                            cached.value.as_ptr() as usize
                         );
                     }
-                    return Ok(Some(Value::Object(Some(entry.value))));
+                    return Ok(Some(Value::Object(Some(cached.value))));
                 }
                 let result = ctx.invoke_virtual(
                     this,
@@ -5248,19 +5249,20 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                 }
                 if let Some(Value::Object(Some(v))) = result {
                     let owner_class_id = ctx.class_id_from_mirror(cls).map(|id| id.as_u32());
-                    let mut cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
-                    if !cache.contains_key(&key) && cache.len() >= CLASSVALUE_CACHE_CAP {
-                        if let Some(victim) = cache.keys().next().copied() {
-                            cache.remove(&victim);
+                    CLASSVALUE_CACHE.with(ctx.vm_identity(), |cache| {
+                        if !cache.contains_key(&key) && cache.len() >= CLASSVALUE_CACHE_CAP {
+                            if let Some(victim) = cache.keys().next().copied() {
+                                cache.remove(&victim);
+                            }
                         }
-                    }
-                    cache.insert(
-                        key,
-                        ClassValueCacheEntry {
-                            owner_class_id,
-                            value: v,
-                        },
-                    );
+                        cache.insert(
+                            key,
+                            ClassValueCacheEntry {
+                                owner_class_id,
+                                value: v,
+                            },
+                        );
+                    });
                 }
                 Ok(result)
             },
@@ -5269,10 +5271,9 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
                 let key = classvalue_key(ctx, this, cls);
-                classvalue_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&key);
+                CLASSVALUE_CACHE.with(ctx.vm_identity(), |cache| {
+                    cache.remove(&key);
+                });
             }
             Ok(None)
         });

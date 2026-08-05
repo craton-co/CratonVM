@@ -1133,9 +1133,7 @@ fn cl_real_load_class_base_rooted(
             _ => None,
         };
         let isolated = crate::classloader::url_classloader_isolated_from_app(ctx, this);
-        let platform_singleton = *crate::classloader::platform_loader_store_dbg()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let platform_singleton = crate::classloader::platform_loader_dbg(ctx.vm_identity());
         eprintln!(
             "[OBSREG-DBG] cl_real_load_class_base ENTER this={:?} this_class={:?} name={} parent_field={:?} parent_class={:?} isolated_from_app={} platform_singleton={:?}",
             this, this_cls, internal, parent_field, parent_cls, isolated, platform_singleton

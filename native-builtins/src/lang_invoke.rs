@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{
     LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
 };
@@ -1032,67 +1032,92 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
-    r.register(
+    r.register_with_kind(
         vh,
         "get",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.set(Object...) → void
-    r.register(vh, "set", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(vh, "set", "([Ljava/lang/Object;)V", varhandle_set, NativeKind::Bridge);
 
     // VarHandle.compareAndSet(Object...) → boolean
-    r.register(
+    r.register_with_kind(
         vh,
         "compareAndSet",
         "([Ljava/lang/Object;)Z",
         varhandle_compare_and_set,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getAndSet(Object...) → Object
-    r.register(
+    r.register_with_kind(
         vh,
         "getAndSet",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get_and_set,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getVolatile(Object...) → Object (same as get for now — no hardware fences)
-    r.register(
+    r.register_with_kind(
         vh,
         "getVolatile",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.setVolatile(Object...) → void
-    r.register(vh, "setVolatile", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(
+        vh,
+        "setVolatile",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
 
     // VarHandle.getOpaque / getAcquire — read semantics
-    r.register(
+    r.register_with_kind(
         vh,
         "getOpaque",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         vh,
         "getAcquire",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.setOpaque / setRelease — write semantics
-    r.register(vh, "setOpaque", "([Ljava/lang/Object;)V", varhandle_set);
-    r.register(vh, "setRelease", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(
+        vh,
+        "setOpaque",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vh,
+        "setRelease",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
 
     // VarHandle.compareAndExchange
-    r.register(
+    r.register_with_kind(
         vh,
         "compareAndExchange",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_compare_and_exchange,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getAndAdd and its ordering variants — single Object-return
@@ -1100,11 +1125,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // the generic Object descriptor first and unbox_poly_return coerces the
     // result back to the call-site numeric type (H2 uses [III)I).
     for name in &["getAndAdd", "getAndAddAcquire", "getAndAddRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_add,
+            NativeKind::Bridge,
         );
     }
 
@@ -1115,11 +1141,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseOrAcquire",
         "getAndBitwiseOrRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_or,
+            NativeKind::Bridge,
         );
     }
     for name in &[
@@ -1127,11 +1154,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseAndAcquire",
         "getAndBitwiseAndRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_and,
+            NativeKind::Bridge,
         );
     }
     for name in &[
@@ -1139,11 +1167,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseXorAcquire",
         "getAndBitwiseXorRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_xor,
+            NativeKind::Bridge,
         );
     }
 
@@ -1157,27 +1186,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "weakCompareAndSetAcquire",
         "weakCompareAndSetRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Z",
             varhandle_compare_and_set,
+            NativeKind::Bridge,
         );
     }
     for name in &["compareAndExchangeAcquire", "compareAndExchangeRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_compare_and_exchange,
+            NativeKind::Bridge,
         );
     }
     for name in &["getAndSetAcquire", "getAndSetRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_set,
+            NativeKind::Bridge,
         );
     }
     r.set_category(__prev_cat);
@@ -4166,9 +4198,9 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => (REF_INVOKE_STATIC, IS_METHOD, ACC_STATIC),
     };
 
-    // Build the MemberName (6 declared instance fields: clazz, name, type,
-    // flags, method, resolution).
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", 6);
+    // Build the MemberName. Its declared layout is documented on the `MN_*`
+    // constants next to `native_mhn_resolve`.
+    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
 
     // clazz: Class mirror of the declaring class. Fall back to a synthetic
     // mirror only if the class is genuinely unloadable.
@@ -4182,17 +4214,24 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
     };
-    ctx.set_field_by_name(mn, "clazz", Value::Object(Some(clazz_mirror)));
+    mn_set(
+        ctx,
+        mn,
+        "clazz",
+        MN_CLAZZ,
+        Value::Object(Some(clazz_mirror)),
+    );
 
     // name
     let name_str = ctx.create_string(&name);
-    ctx.set_field_by_name(mn, "name", Value::Object(Some(name_str)));
+    mn_set(ctx, mn, "name", MN_NAME, Value::Object(Some(name_str)));
 
-    // type: MethodType for methods/constructors; Class for fields. Write to
-    // both the named slot AND raw slot 2 (declared layout) so JDK code that
-    // accesses `type` via either route sees the populated value — important
-    // because real-JDK field resolution can drift when the class is partially
-    // resolved during early bootstrap.
+    // type: MethodType for methods/constructors; Class for fields. This used to
+    // write the named slot AND raw slot 2, "so JDK code that accesses `type`
+    // via either route sees the populated value". They are the same slot on
+    // both layouts, and `mn_set` picks whichever route the receiver actually
+    // has — the by-name write is a silent no-op on a fabricated layout, and the
+    // raw write is what a real one needs resolved on the receiver.
     let type_value = if kind_flag == IS_FIELD {
         let field_type_slice = field_type_from_desc(&desc, ref_kind);
         Value::Object(Some(field_type_mirror(ctx, &field_type_slice)))
@@ -4201,19 +4240,18 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
         Value::Object(mt)
     };
-    ctx.set_field_by_name(mn, "type", type_value);
-    ctx.set_field(mn, 2, type_value);
+    mn_set(ctx, mn, "type", MN_TYPE, type_value);
 
     // flags: kind_flag | (modifiers) | (refKind << 24). We don't track real
     // method modifiers — use ACC_PUBLIC plus ACC_STATIC for static refs so
     // `getModifiers()` reads sensibly.
     let flags = kind_flag | ACC_PUBLIC | acc_static | (ref_kind << 24);
-    ctx.set_field_by_name(mn, "flags", Value::Int(flags));
+    mn_set(ctx, mn, "flags", MN_FLAGS, Value::Int(flags));
 
-    // method slot (4): non-zero sentinel — matches alloc_resolved_member_name.
-    ctx.set_field(mn, 4, Value::Int(1));
-    // resolution slot (5): null marks MemberName as resolved per JDK.
-    ctx.set_field(mn, 5, Value::Object(None));
+    // vmindex sentinel — our layout only; see `mn_set_vmindex`.
+    mn_set_vmindex(ctx, mn, 1);
+    // `resolution == null` marks the MemberName resolved per the JDK.
+    mn_set(ctx, mn, "resolution", MN_RESOLUTION, Value::Object(None));
 
     // Construct InfoFromMemberName(Lookup, MemberName, byte). Field layout
     // (verified via javap): { MemberName member, int referenceKind }. We
@@ -5645,12 +5683,22 @@ pub(crate) fn alloc_method_handle(
     // `GroovyBugError: argument array length and parameter array length should
     // be the same` when dispatching any instance call (e.g. Gradle/Groovy
     // SpringRepositoriesExtension). STATIC/CONSTRUCTOR/GETTER keep raw `desc`.
+    //
+    // A CONSTRUCTOR handle needs the mirror adjustment at the other end: the
+    // bytecode descriptor of `<init>` returns `V`, but `findConstructor` and
+    // `unreflectConstructor` hand back a handle whose type RETURNS THE CLASS —
+    // `(int)Bean`, not `(int)void`, which `probes/L3MemberNameProbe` diffs
+    // against the host JDK. `MH_DESC` keeps the raw `(...)V` for dispatch and
+    // the `invokeExact` arity check, exactly as for the receiver-prepend above.
     let recv_desc;
     let type_desc: &str = if (kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL)
         && !class.is_empty()
         && desc.starts_with('(')
     {
         recv_desc = format!("(L{};{}", class, &desc[1..]);
+        recv_desc.as_str()
+    } else if kind == MH_KIND_CONSTRUCTOR && !class.is_empty() && desc.ends_with(")V") {
+        recv_desc = format!("{}L{};", &desc[..desc.len() - 1], class);
         recv_desc.as_str()
     } else {
         desc
@@ -8059,7 +8107,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // invoke(...) — polymorphic signature with automatic type adaptation.
     // Boxing/unboxing and widening conversions are applied implicitly.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(
+    r.register_with_kind(
         mh,
         "invoke",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -8094,12 +8142,13 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 auto_box_return(ctx, result, &desc)
             }
         },
+        NativeKind::Bridge,
     );
 
     // invokeExact(...) — strict type checking: argument count must match.
     // Throws WrongMethodTypeException if arity mismatches.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(
+    r.register_with_kind(
         mh,
         "invokeExact",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -8128,6 +8177,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 auto_box_return(ctx, result, &desc)
             }
         },
+        NativeKind::Bridge,
     );
     r.register(
         mh,
@@ -9396,6 +9446,123 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // T15 — java/lang/invoke/MethodHandleNatives
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-LAYOUT: `java.lang.invoke.MemberName`'s six declared instance
+// fields, in declaration order. Confirmed with
+// `javap -p --module java.base java.lang.invoke.MemberName` against Temurin
+// 25.0.3 — not from memory, and not from the JDK-source comments that used to
+// be copied into each native here (two of them disagreed with each other about
+// slot 4).
+//
+//   0 clazz      Ljava/lang/Class;
+//   1 name       Ljava/lang/String;
+//   2 type       Ljava/lang/Object;                       (MethodType or Class)
+//   3 flags      I
+//   4 method     Ljava/lang/invoke/ResolvedMethodName;
+//   5 resolution Ljava/lang/Object;                       (null == resolved)
+//
+// `vmindex` and `vmtarget` are `@Injected` in HotSpot: the class file declares
+// NO field for either, so on a real layout there is no slot for them at all.
+// That is what made slot 4 a defect — see `mn_set_vmindex`.
+const MN_CLAZZ: usize = 0;
+const MN_NAME: usize = 1;
+const MN_TYPE: usize = 2;
+const MN_FLAGS: usize = 3;
+/// The synthetic model's "vmindex" slot. On a real `MemberName` this index is
+/// `method`, a `ResolvedMethodName` REFERENCE — see [`mn_set_vmindex`].
+const MN_VMINDEX: usize = 4;
+const MN_RESOLUTION: usize = 5;
+const MN_FIELD_COUNT: usize = 6;
+
+/// JDK-ONLY-LAYOUT: does this `MemberName` have OUR fabricated layout, or is it
+/// a real `java.lang.invoke.MemberName`?
+///
+/// Same shape, and for the same reason, as [`vh_has_synthetic_layout`]: ask for
+/// a field NAME the real class declares and a VM-fabricated stub cannot have.
+/// `ensure_synthetic_class` names fabricated slots `_f0.._fN` and types them
+/// all `Ljava/lang/Object;`, so a real `MemberName` — and only a real one —
+/// declares an instance field called `method`.
+///
+/// **Not a field count.** `alloc_concurrent_synthetic` returns an object with
+/// at least the requested slot count either way, so `object_num_fields(mn) >=
+/// MN_FIELD_COUNT` cannot tell the two layouts apart; that exact predicate was
+/// written for `VarHandle` first, measured completely inert, and replaced by a
+/// name test. See the doc comment on `vh_has_synthetic_layout`.
+fn mn_has_synthetic_layout(ctx: &mut dyn NativeContext, mn: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(mn);
+    !ctx.declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "method")
+}
+
+/// Resolve one of `MemberName`'s named fields on the RECEIVER's own class,
+/// falling back to the fabricated model's slot index when the receiver does not
+/// declare it.
+///
+/// The five named slots happen to sit at the same indices on both layouts
+/// today, but "happen to" is what this whole work item is about: the sibling
+/// defect in `native-collections` resolved `loadFactor` against a hard-coded
+/// `java/util/HashMap` and wrote that index into whatever receiver it held.
+/// Resolving on the receiver makes reads and writes agree by construction
+/// instead of by coincidence.
+fn mn_slot(ctx: &mut dyn NativeContext, mn: ObjectRef, name: &str, model: usize) -> usize {
+    let class_id = ctx.class_id_of_object(mn);
+    ctx.resolve_field_index_by_class_id(class_id, name)
+        .unwrap_or(model)
+}
+
+fn mn_set(ctx: &mut dyn NativeContext, mn: ObjectRef, name: &str, model: usize, v: Value) {
+    let slot = mn_slot(ctx, mn, name, model);
+    ctx.set_field(mn, slot, v);
+}
+
+fn mn_get(ctx: &mut dyn NativeContext, mn: ObjectRef, name: &str, model: usize) -> Value {
+    let slot = mn_slot(ctx, mn, name, model);
+    ctx.get_field(mn, slot)
+}
+
+/// Publish the "resolved" vmindex sentinel — on OUR layout only.
+///
+/// JDK-ONLY-LAYOUT, kind 3 (VM-internal value with no real field at all), the
+/// same kind as `CL_LOADER_ID` in `classloader.rs`. `vmindex` is `@Injected`:
+/// HotSpot adds it to the object at VM level and the class file declares
+/// nothing for it, so on a real `MemberName` there is no slot that means
+/// vmindex. Index 4 there is `method`, a `ResolvedMethodName` reference, and
+/// four natives were writing `Int(1)` into it — 7 hits per
+/// `JdkOnlyBreadthProbe` run in the 2026-08-04 census, `Int` over `L`.
+///
+/// **The sentinel never survived that write.** `set_field` coerces by the
+/// declared descriptor, and `coerce_field_value_by_descriptor` maps an `Int`
+/// written to an `L` slot to `Object(None)` (gc/src/heap.rs) — which is
+/// precisely the condition `overlay_write_is_destructive` reports. So on a real
+/// image every one of those writes stored null, every `get_field(mn, 4)` read
+/// back `Object(None)`, and both vmindex readers below already fell to their
+/// `_ => 0` arm. Skipping the write on a real layout is therefore behaviour-
+/// preserving for the readers, and it stops nulling `method`.
+///
+/// The comment this replaces claimed the non-zero sentinel was "critical"
+/// because the JDK's `SplitConstantPool` throws
+/// `ConstantPoolException("Bad CP index: 0")` on `entryByIndex(0)`. Whatever
+/// that was true of, it cannot have been this write in real-JDK mode: the value
+/// has never reached the object there.
+fn mn_set_vmindex(ctx: &mut dyn NativeContext, mn: ObjectRef, vmindex: i32) {
+    if mn_has_synthetic_layout(ctx, mn) {
+        ctx.set_field(mn, MN_VMINDEX, Value::Int(vmindex));
+    }
+}
+
+/// Read the vmindex sentinel back. Mirrors [`mn_set_vmindex`]: on a real layout
+/// there is no vmindex slot, so the answer is 0 — which is what the raw slot-4
+/// read returned there anyway, once the coercion had done its work.
+fn mn_get_vmindex(ctx: &mut dyn NativeContext, mn: ObjectRef) -> i32 {
+    if !mn_has_synthetic_layout(ctx, mn) {
+        return 0;
+    }
+    match ctx.get_field(mn, MN_VMINDEX) {
+        Value::Int(i) => i,
+        _ => 0,
+    }
+}
+
 /// `MethodHandleNatives.resolve(MemberName self, Class<?> caller, int lookupMode, boolean speculativeResolve)`
 ///
 /// Resolves a MemberName object by looking up the referenced class/method/field.
@@ -9403,18 +9570,13 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// MemberName fields (clazz, name, type) and creates a resolved MemberName with
 /// the vmindex and vmtarget fields populated.
 ///
-/// MemberName layout (from JDK source):
-///   field 0: Class<?> clazz - the declaring class
-///   field 1: String name - member name
-///   field 2: Object type - MethodType or Class (field type)
-///   field 3: int flags - access flags + ref kind
-///   field 4: Object resolution (vmtarget/vmindex as int)
+/// For the layout — and for why the vmindex sentinel is no longer written into
+/// slot 4 — see the `MN_*` constants and [`mn_set_vmindex`] above.
 pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = MemberName self, args[1] = caller Class, args[2] = lookupMode, args[3] = speculativeResolve
     let member_name = crate::obj_arg(args, 0)?;
 
-    // Read the class mirror from field 0
-    let class_mirror = match ctx.get_field(member_name, 0) {
+    let class_mirror = match mn_get(ctx, member_name, "clazz", MN_CLAZZ) {
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Object(Some(member_name)))), // no class → return as-is
     };
@@ -9424,14 +9586,13 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
         None => return Ok(Some(Value::Object(Some(member_name)))),
     };
 
-    // Read the name string from field 1
-    let name = match ctx.get_field(member_name, 1) {
+    let name = match mn_get(ctx, member_name, "name", MN_NAME) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
 
-    // Read flags from field 3 to determine what kind of member this is
-    let flags = match ctx.get_field(member_name, 3) {
+    // What kind of member this is.
+    let flags = match mn_get(ctx, member_name, "flags", MN_FLAGS) {
         Value::Int(f) => f,
         _ => 0,
     };
@@ -9447,14 +9608,15 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let _ = ctx.ensure_class_initialized(&class_name);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
 
-    // Mark as resolved by setting field 4 (vmindex) to a non-zero sentinel
-    // The JDK checks this field to determine if resolution succeeded.
-    ctx.set_field(member_name, 4, Value::Int(1));
+    // Mark as resolved with the non-zero vmindex sentinel — on our fabricated
+    // layout only. See `mn_set_vmindex`: a real `MemberName` has no vmindex
+    // field, and slot 4 there is `method`.
+    mn_set_vmindex(ctx, member_name, 1);
 
     // If this is a method reference (refKind 5-9), verify the method exists
     if ref_kind >= 5 && ref_kind <= 9 {
-        // Read descriptor from type field (field 2) if it's a MethodType
-        if let Value::Object(Some(mt)) = ctx.get_field(member_name, 2) {
+        // Read descriptor from the `type` field if it is a MethodType
+        if let Value::Object(Some(mt)) = mn_get(ctx, member_name, "type", MN_TYPE) {
             let desc = descriptor_from_method_type(ctx, mt);
             if !name.is_empty() && !desc.is_empty() {
                 let exists = ctx.method_exists(&class_name, &name, &desc);
@@ -9542,10 +9704,10 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             };
             let flags = IS_FIELD | (modifiers & 0xFFFF) | (ref_kind << 24);
 
-            ctx.set_field_by_name(member_name, "clazz", clazz);
-            ctx.set_field_by_name(member_name, "name", name);
-            ctx.set_field_by_name(member_name, "type", ty);
-            ctx.set_field_by_name(member_name, "flags", Value::Int(flags));
+            mn_set(ctx, member_name, "clazz", MN_CLAZZ, clazz);
+            mn_set(ctx, member_name, "name", MN_NAME, name);
+            mn_set(ctx, member_name, "type", MN_TYPE, ty);
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(flags));
         }
         "java/lang/reflect/Method" => {
             let clazz = ctx.get_field_by_name(ref_obj, "clazz");
@@ -9562,11 +9724,11 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             };
             let flags = IS_METHOD | (modifiers & 0xFFFF) | (ref_kind << 24);
 
-            ctx.set_field_by_name(member_name, "clazz", clazz);
-            ctx.set_field_by_name(member_name, "name", name);
+            mn_set(ctx, member_name, "clazz", MN_CLAZZ, clazz);
+            mn_set(ctx, member_name, "name", MN_NAME, name);
             // `type` (MethodType) is populated by the Java constructor
             // (`invokevirtual Method.getGenericReturnType` etc.); leave as-is.
-            ctx.set_field_by_name(member_name, "flags", Value::Int(flags));
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(flags));
         }
         "java/lang/reflect/Constructor" => {
             let clazz = ctx.get_field_by_name(ref_obj, "clazz");
@@ -9577,12 +9739,18 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             let flags = IS_CONSTRUCTOR | (modifiers & 0xFFFF) | (REF_NEW_INVOKE_SPECIAL << 24);
             let _ = REF_INVOKE_SPECIAL;
 
-            ctx.set_field_by_name(member_name, "clazz", clazz);
+            mn_set(ctx, member_name, "clazz", MN_CLAZZ, clazz);
             // name = "<init>" — the constructor's name
             let name_str = ctx.create_string("<init>");
             let member_name = ctx.read_native_pin(member_name_pin, member_name);
-            ctx.set_field_by_name(member_name, "name", Value::Object(Some(name_str)));
-            ctx.set_field_by_name(member_name, "flags", Value::Int(flags));
+            mn_set(
+                ctx,
+                member_name,
+                "name",
+                MN_NAME,
+                Value::Object(Some(name_str)),
+            );
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(flags));
 
             // Populate `type` (the MethodType, MemberName slot 2). Unlike the
             // Method case — where the Java `MemberName(Method)` constructor
@@ -9619,19 +9787,19 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             ctx.set_field(mt, 1, Value::Object(Some(ptypes_ref)));
             populate_method_type_form(ctx, mt);
             let member_name = ctx.read_native_pin(member_name_pin, member_name);
-            ctx.set_field_by_name(member_name, "type", Value::Object(Some(mt)));
+            mn_set(ctx, member_name, "type", MN_TYPE, Value::Object(Some(mt)));
         }
         _ => {
             // Unknown ref object — bail quietly.
         }
     }
 
-    // Mark resolved (legacy-safe index-based resolution marker). Re-read
-    // `member_name` once more (see the pin-setup comment above the match):
-    // whichever branch ran, this is the authoritative final refresh.
+    // Mark resolved. Re-read `member_name` once more (see the pin-setup
+    // comment above the match): whichever branch ran, this is the
+    // authoritative final refresh.
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
     ctx.unpin_native_roots(member_name_pin);
-    ctx.set_field(member_name, 4, Value::Int(1));
+    mn_set_vmindex(ctx, member_name, 1);
     Ok(None)
 }
 
@@ -9752,12 +9920,7 @@ pub(crate) fn native_mhn_object_field_offset(
     args: &[Value],
 ) -> MethodCallResult {
     let member_name = crate::obj_arg(args, 0)?;
-    // Field index is stored in field 4 (vmindex)
-    let vmindex = match ctx.get_field(member_name, 4) {
-        Value::Int(i) => i as i64,
-        _ => 0,
-    };
-    Ok(Some(Value::Long(vmindex)))
+    Ok(Some(Value::Long(mn_get_vmindex(ctx, member_name) as i64)))
 }
 
 /// `MethodHandleNatives.staticFieldOffset(MemberName self)`
@@ -9784,10 +9947,7 @@ pub(crate) fn native_mhn_get_member_vm_info(
     args: &[Value],
 ) -> MethodCallResult {
     let member_name = crate::obj_arg(args, 0)?;
-    let vmindex = match ctx.get_field(member_name, 4) {
-        Value::Int(i) => i,
-        _ => 0,
-    };
+    let vmindex = mn_get_vmindex(ctx, member_name);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
     // GC-safety: `box_value` below can trigger a collection that relocates
     // `arr`/`member_name` (both captured/produced above and read again
@@ -9839,9 +9999,7 @@ fn alloc_resolved_member_name(
     name: &str,
     desc: &str,
 ) -> ObjectRef {
-    // MemberName has 6 declared instance fields in real JDK 25:
-    //   0:clazz 1:name 2:type 3:flags 4:method 5:resolution
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", 6);
+    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
 
     // clazz: use the host class mirror (must be a valid Class mirror for
     // downstream `mn.getDeclaringClass()` reads).
@@ -9853,34 +10011,35 @@ fn alloc_resolved_member_name(
             // happen since LambdaForm is always loaded before this path.
             alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
         });
-    ctx.set_field_by_name(mn, "clazz", Value::Object(Some(clazz_mirror)));
+    mn_set(
+        ctx,
+        mn,
+        "clazz",
+        MN_CLAZZ,
+        Value::Object(Some(clazz_mirror)),
+    );
 
     // name: Java String
     let name_str = ctx.create_string(name);
-    ctx.set_field_by_name(mn, "name", Value::Object(Some(name_str)));
+    mn_set(ctx, mn, "name", MN_NAME, Value::Object(Some(name_str)));
 
     // type: MethodType built from desc (fall back to ()V if desc is garbage)
     let mt = build_method_type_from_descriptor(ctx, desc)
         .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
     if let Some(mt) = mt {
-        ctx.set_field_by_name(mn, "type", Value::Object(Some(mt)));
+        mn_set(ctx, mn, "type", MN_TYPE, Value::Object(Some(mt)));
     }
 
     // flags: IS_METHOD (0x10000) | ACC_STATIC (0x0008) | REF_invokeStatic (6) << 24
     let flags: i32 = 0x1_0000 | 0x0008 | (6 << 24);
-    ctx.set_field_by_name(mn, "flags", Value::Int(flags));
+    mn_set(ctx, mn, "flags", MN_FLAGS, Value::Int(flags));
 
-    // method slot (4): non-zero sentinel. Our natives also mirror this write
-    // through native_mhn_resolve. Use a non-zero Int so downstream vmindex
-    // readers (native_mhn_object_field_offset, native_mhn_get_member_vm_info)
-    // see a non-zero value — this is critical because the JDK's
-    // SplitConstantPool throws `ConstantPoolException("Bad CP index: 0")` on
-    // `entryByIndex(0)`, and various MH paths look up CP indices derived
-    // from MemberName's vmindex / method fields.
-    ctx.set_field(mn, 4, Value::Int(1));
+    // vmindex: the non-zero "resolved" sentinel, on our fabricated layout only.
+    // See `mn_set_vmindex` — index 4 on a real `MemberName` is `method`.
+    mn_set_vmindex(ctx, mn, 1);
 
-    // resolution slot (5): null means `isResolved() == true` per JDK source.
-    ctx.set_field(mn, 5, Value::Object(None));
+    // `resolution == null` is what the real `MemberName.isResolved()` reads.
+    mn_set(ctx, mn, "resolution", MN_RESOLUTION, Value::Object(None));
 
     mn
 }
@@ -10166,8 +10325,21 @@ mod tests {
     }
 
     // C33: alloc_resolved_member_name must produce a MemberName that reads
-    // as fully resolved (resolution == null) with a non-zero vmindex sentinel
-    // at slot 4, a non-null name/type/clazz, and a non-zero flags field.
+    // as fully resolved (resolution == null) with a non-zero vmindex sentinel,
+    // a non-null name/type/clazz, and a non-zero flags field.
+    //
+    // Read through the same accessors the production code writes through
+    // (`mn_get`, `mn_get_vmindex`). The earlier version of this test read
+    // `clazz`/`name`/`type`/`flags` with `get_field_by_name` and the vmindex
+    // with a raw `get_field(mn, 4)` — a split that only agreed because
+    // `MockNativeContext` keeps by-name and by-index writes in two separate
+    // maps and the production code wrote BOTH. `MockNativeContext` declares no
+    // fields and resolves no field names, so `mn_*` here takes the fabricated-
+    // layout branch, which is the layout this allocation path produces when the
+    // real `MemberName` is absent. The real-layout branch is not mock-testable
+    // (it needs a loaded class); it is measured by the overlay census instead —
+    // 7 `Int`-over-`L` writes at slot 4 per `JdkOnlyBreadthProbe` run before the
+    // fix, 0 after.
     #[test]
     fn c33_alloc_resolved_member_name_populates_all_slots() {
         let mut ctx = MockNativeContext::new();
@@ -10177,23 +10349,19 @@ mod tests {
             "interpret_V",
             "()V",
         );
-        // clazz (slot 0) — Class mirror
-        match ctx.get_field_by_name(mn, "clazz") {
+        match mn_get(&mut ctx, mn, "clazz", MN_CLAZZ) {
             Value::Object(Some(_)) => {}
             other => panic!("expected clazz to be non-null, got {:?}", other),
         }
-        // name (slot 1) — String
-        match ctx.get_field_by_name(mn, "name") {
+        match mn_get(&mut ctx, mn, "name", MN_NAME) {
             Value::Object(Some(_)) => {}
             other => panic!("expected name to be non-null, got {:?}", other),
         }
-        // type (slot 2) — MethodType
-        match ctx.get_field_by_name(mn, "type") {
+        match mn_get(&mut ctx, mn, "type", MN_TYPE) {
             Value::Object(Some(_)) => {}
             other => panic!("expected type to be non-null, got {:?}", other),
         }
-        // flags (slot 3) — int with IS_METHOD | ACC_STATIC | REF_invokeStatic<<24
-        match ctx.get_field_by_name(mn, "flags") {
+        match mn_get(&mut ctx, mn, "flags", MN_FLAGS) {
             Value::Int(f) => {
                 assert!(f != 0, "flags must be non-zero");
                 assert!((f & 0x1_0000) != 0, "IS_METHOD bit must be set");
@@ -10204,16 +10372,30 @@ mod tests {
             }
             other => panic!("expected flags to be Int, got {:?}", other),
         }
-        // slot 4 (method / vmindex sentinel) — non-zero
-        match ctx.get_field(mn, 4) {
-            Value::Int(v) => assert_ne!(v, 0, "vmindex sentinel must be non-zero"),
-            other => panic!("expected Int at slot 4, got {:?}", other),
-        }
-        // slot 5 (resolution) — null means isResolved() == true in real JDK
-        match ctx.get_field(mn, 5) {
+        assert_ne!(
+            mn_get_vmindex(&mut ctx, mn),
+            0,
+            "vmindex sentinel must be non-zero on our own layout"
+        );
+        // resolution == null is what the real `MemberName.isResolved()` reads.
+        match mn_get(&mut ctx, mn, "resolution", MN_RESOLUTION) {
             Value::Object(None) => {}
-            other => panic!("expected null at resolution slot 5, got {:?}", other),
+            other => panic!("expected null at the resolution slot, got {:?}", other),
         }
+    }
+
+    // The fabricated-layout predicate must answer "ours" for an object whose
+    // class declares no `method` field, which is what `MockNativeContext` (and
+    // `ensure_synthetic_class`, whose slots are named `_f0.._fN`) reports. The
+    // real-layout half is measured by the census; see the note above.
+    #[test]
+    fn mn_synthetic_layout_predicate_is_true_without_a_method_field() {
+        let mut ctx = MockNativeContext::new();
+        let mn = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+        assert!(
+            mn_has_synthetic_layout(&mut ctx, mn),
+            "a class declaring no instance field named `method` is not a real MemberName"
+        );
     }
 
     // C33: the three IBG native bypass functions must each return a non-null

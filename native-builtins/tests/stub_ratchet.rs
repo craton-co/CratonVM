@@ -60,7 +60,29 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// Set this constant to `<N>` and keep [`SLACK`] at zero. See
 /// `docs/contributing/stub-ratchet.md`.
-const BASELINE_SYNTHETIC_STUBS: usize = 157;
+///
+/// # 157 → 165, 2026-08-05 (JDK-only wave 2, lane L7 item 4)
+///
+/// The ratchet moved **up**, and the explanation its own failure message asks
+/// for is that this change added no fake: it re-labelled eight that were
+/// already there and were hidden from this count by the wrong tag.
+///
+/// The eight are `java/util/function/Function.{identity,compose,andThen}`,
+/// `UnaryOperator.identity`, and `Function$Identity.{apply,andThen,compose}`.
+/// Every one of them fabricates a `Function$Identity` / `Function$AndThen` /
+/// `Function$Compose` stand-in, and **no JDK declares any of those names** —
+/// real `Function.identity()` is one line of invokedynamic returning `t -> t`,
+/// and `compose`/`andThen` are default methods that return a lambda. They were
+/// tagged `Bridge`, which asserts "no working real-bytecode fallback exists".
+/// There is one, in `java.base`, and `--jdk-only` now runs it: the
+/// `JdkOnlyBreadthProbe` `lambdas` line is byte-identical to HotSpot 25.
+///
+/// So the count rising is this gate becoming *more* honest, not less: the
+/// backlog it exists to measure was under-reported by eight. The direction to
+/// be suspicious of is a `SyntheticStub` quietly becoming a `Bridge`, which
+/// lowers this number while changing nothing — and which is exactly the shape
+/// L6's unadjudicated-`Bridge` ratchet is being built to catch.
+const BASELINE_SYNTHETIC_STUBS: usize = 165;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
@@ -163,7 +185,7 @@ fn essential_registry_is_populated() {
 //
 // The same zero-stub invariant is asserted against a hand-built synthetic mix
 // in `native-api/tests/jdk_only_registry.rs`; here it is asserted against the
-// real boot-path registrar, which is the one that has 157 stubs in it.
+// real boot-path registrar, which is the one that has 165 stubs in it.
 // ---------------------------------------------------------------------------
 
 /// Vacuity floor for the *strict* registry, mirroring `MIN_TOTAL_REGISTRATIONS`
@@ -205,7 +227,7 @@ fn strict_census() -> (usize, usize, usize) {
 /// mode contains zero `SyntheticStub` entries.**
 ///
 /// This passes *today*, and it is worth being precise about why: not because
-/// the 157 stubs are gone, but because `register()` refuses them at the door
+/// the 165 stubs are gone, but because `register()` refuses them at the door
 /// under `JdkOnly`. That is exactly the property CI's zero-stub census asserts
 /// against a booted VM, so it is worth pinning here too — it is the cheap,
 /// hermetic version of the same check, with no JDK image and no subprocess.
@@ -308,23 +330,23 @@ fn strict_registry_drops_only_the_stubs() {
 /// THE END-STATE GATE, deliberately `#[ignore]`d.
 ///
 /// [`strict_registry_has_zero_synthetic_stubs`] passes today for a weak reason:
-/// `register()` refuses the stubs at the door. The 157 registrations still
+/// `register()` refuses the stubs at the door. The 165 registrations still
 /// exist in `native-builtins/src/`, still run on every boot, and are still what
 /// an ordinary `--real-jdk` run dispatches into. **Refused is not retired.**
 ///
 /// This test asserts the strong property — strict mode has *nothing to refuse*
 /// — and stays ignored until all three of the following have landed:
 ///
-/// 1. **Reclassify or delete the 157 `SyntheticStub` registrations** in
+/// 1. **Reclassify or delete the 165 `SyntheticStub` registrations** in
 ///    `native-builtins/src/`, subsystem by subsystem: each one becomes a real
 ///    `Bridge`/`Intrinsic` because it genuinely crosses a VM boundary, or it
 ///    goes away so the real JDK bytecode runs. This is explicitly *not* wave 1
 ///    work (contract §8: "do not edit `native-builtins/src/lib.rs`; the
-///    157-stub reclassification is a separate wave with its own
+///    165-stub reclassification is a separate wave with its own
 ///    subsystem-per-PR discipline").
 /// 2. **Drive [`BASELINE_SYNTHETIC_STUBS`] to 0 in the same change** that
 ///    removes the last one. The ratchet is slack-free by design; leaving the
-///    baseline at 157 after the stubs are gone would silently re-admit 157 new
+///    baseline at 165 after the stubs are gone would silently re-admit 165 new
 ///    ones.
 /// 3. **Un-ignore this test** (delete the `#[ignore]`) so the zero is held,
 ///    and promote the CI `jdk-only` job from advisory to blocking, which is the
@@ -333,7 +355,7 @@ fn strict_registry_drops_only_the_stubs() {
 /// Until then it is run on demand:
 /// `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --ignored --nocapture`
 #[test]
-#[ignore = "wave 1 is measurement: the 157 stubs are refused at registration, not yet retired"]
+#[ignore = "wave 1 is measurement: the 165 stubs are refused at registration, not yet retired"]
 fn strict_mode_refuses_nothing() {
     let (_strict_stubs, _strict_total, refused) = strict_census();
 
