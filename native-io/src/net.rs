@@ -2856,50 +2856,74 @@ fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
 // T19.5 registration
 // ---------------------------------------------------------------------------
 
-// JDK-ONLY-CLASSIFY: bridge — the strongest bridge evidence in the repo. 36 of
-// this function's registrations resolve to methods that are ACC_NATIVE in JDK
-// 25 (`sun.nio.ch.Net.socket0`, `bind0`, `connect0`, `listen`, `localPort`,
-// `setIntOption0`, `poll*`, …); they are socket syscalls with no bytecode
-// fallback anywhere in the image, so `NativeKind::Bridge` is correct on the
-// merits and must survive `--jdk-only`. Caveat for the next wave: 17 further
-// registrations here name classes absent from the boot image (platform-specific
-// `sun.nio.ch.*Impl` variants), and those are dead registrations on this JDK
-// rather than bridges — split them out before claiming the whole function.
+// JDK-ONLY-CLASSIFY: bridge — the strongest bridge evidence in the repo, and
+// the split the previous version of this marker asked for has now been made.
+// The schema-3 census (JDK 25, 2026-08-05) adjudicates 46 of this function's 67
+// registrations as ACC_NATIVE on the image (`sun.nio.ch.Net.socket0`, `bind0`,
+// `connect0`, `listen`, `accept`, `available`, `localPort`, `setIntOption0`,
+// `poll`, the `poll*Value` constants, `UnixDispatcher.close0`/`preClose0`,
+// `SocketDispatcher.read0`/`write0`, `IOUtil.configureBlocking`/`setfdVal` and
+// the whole `jdk.net.LinuxSocketOptions` family). They are socket syscalls with
+// no bytecode fallback anywhere in the image, so `NativeKind::Bridge` is
+// correct on the merits and must survive `--jdk-only`; each of those 46 states
+// its kind at its own call site now instead of inheriting it.
+//
+// The remaining 21 keep the ambient category, because the image does not back
+// them: 9 name `jdk/net/WindowsSocketOptions`, absent from a Unix image; 11
+// (`Net.socket0(ZZZ)I`, `Net.close`, `Net.read0`, `Net.write0`,
+// `SocketDispatcher.close0(I)V`/`close`/`invalidateAndClose`, and the four
+// `SocketChannelImpl`/`ServerSocketChannelImpl` `read0`/`write0` aliases) name
+// a method the class does not declare; 1 (`NativeDispatcher.preClose`) shadows
+// concrete bytecode. Note `SocketDispatcher.close` is DISPATCHED (3 invocations in the
+// census run) while resolving to no declared method — that pair is the one
+// worth a second look. Per-row table:
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
 /// Register the `sun/nio/ch/Net` TCP-native surface. Safe to call more than
 /// once — later registrations override earlier ones at the same signature.
 pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
+    use cratonvm_native_api::NativeKind;
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.set_category(NativeKind::Bridge);
     let net = "sun/nio/ch/Net";
 
     // Lifecycle
-    r.register(net, "socket0", "(ZZZZ)I", net_socket0);
+    r.register_with_kind(net, "socket0", "(ZZZZ)I", net_socket0, NativeKind::Bridge);
     // Some JDK builds drop the fastLoopback parameter.
     r.register(net, "socket0", "(ZZZ)I", net_socket0);
-    r.register(
+    r.register_with_kind(
         net,
         "bind0",
         "(Ljava/io/FileDescriptor;ZZLjava/net/InetAddress;I)V",
         net_bind0,
+        NativeKind::Bridge,
     );
-    r.register(net, "listen", "(Ljava/io/FileDescriptor;I)V", net_listen);
-    r.register(
+    r.register_with_kind(
+        net,
+        "listen",
+        "(Ljava/io/FileDescriptor;I)V",
+        net_listen,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
         net,
         "accept",
         "(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;[Ljava/net/InetSocketAddress;)I",
         net_accept,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "connect0",
         "(ZLjava/io/FileDescriptor;Ljava/net/InetAddress;I)I",
         net_connect0,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "shutdown",
         "(Ljava/io/FileDescriptor;I)V",
         net_shutdown,
+        NativeKind::Bridge,
     );
     r.register(net, "close", "(Ljava/io/FileDescriptor;)V", net_close);
 
@@ -2909,21 +2933,41 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     r.register(net, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     // DF04: bytes-readable query (ioctl FIONREAD). NioSocketImpl.available()
     // → Socket.getInputStream().available() dispatches here.
-    r.register(
+    r.register_with_kind(
         net,
         "available",
         "(Ljava/io/FileDescriptor;)I",
         net_available,
+        NativeKind::Bridge,
     );
     // NIO-SERVER-SOCKET: the blocking `NioSocketImpl` read/write path goes
     // through `sun/nio/ch/SocketDispatcher.read0/write0` (nd.read/nd.write),
     // NOT `Net.read0`. Wire those to the same handlers so a real
     // java.net.Socket round-trips bytes through our `TcpStream`. `close0`
     // takes a raw int fd (the dispatcher's NativeDispatcher.close path).
+    //
+    // Only the `SocketDispatcher` pair is an adjudicated bridge: JDK 25
+    // declares `read0`/`write0` ACC_NATIVE there and nowhere else in this trio
+    // — `SocketChannelImpl` and `ServerSocketChannelImpl` do not declare them
+    // at all. Those two are belt-and-braces aliases nobody has adjudicated, so
+    // the loop is split and they keep the ambient category.
+    r.register_with_kind(
+        "sun/nio/ch/SocketDispatcher",
+        "read0",
+        "(Ljava/io/FileDescriptor;JI)I",
+        net_read0,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "sun/nio/ch/SocketDispatcher",
+        "write0",
+        "(Ljava/io/FileDescriptor;JI)I",
+        net_write0,
+        NativeKind::Bridge,
+    );
     for cls in [
         "sun/nio/ch/SocketChannelImpl",
         "sun/nio/ch/ServerSocketChannelImpl",
-        "sun/nio/ch/SocketDispatcher",
     ] {
         r.register(cls, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
         r.register(cls, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
@@ -2983,16 +3027,17 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `NativeDispatcher.preClose`). Companion gap to the `FileKey.init`
     // fix, see
     // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "close0",
         "(Ljava/io/FileDescriptor;)V",
         net_close,
+        NativeKind::Bridge,
     );
     // `preClose0` exists to unblock concurrent socket I/O before the final
     // close runs. Wake any blocked read/write by shutting down the old stream
     // handle, but leave Java's FileDescriptor fields intact for close0.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "preClose0",
         "(Ljava/io/FileDescriptor;)V",
@@ -3001,77 +3046,87 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             close_net_fd_descriptor(ctx, fd_obj, false);
             Ok(None)
         },
+        NativeKind::Bridge,
     );
 
     // Options
-    r.register(
+    r.register_with_kind(
         net,
         "setIntOption0",
         "(Ljava/io/FileDescriptor;ZIIIZ)V",
         net_set_int_option0,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "getIntOption0",
         "(Ljava/io/FileDescriptor;ZII)I",
         net_get_int_option0,
+        NativeKind::Bridge,
     );
 
     // Address queries
-    r.register(
+    r.register_with_kind(
         net,
         "localInetAddress",
         "(Ljava/io/FileDescriptor;)Ljava/net/InetAddress;",
         net_local_inet_address,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "localPort",
         "(Ljava/io/FileDescriptor;)I",
         net_local_port,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "remoteInetAddress",
         "(Ljava/io/FileDescriptor;)Ljava/net/InetAddress;",
         net_remote_inet_address,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "remotePort",
         "(Ljava/io/FileDescriptor;)I",
         net_remote_port,
+        NativeKind::Bridge,
     );
 
     // Capability flags
-    r.register(net, "isIPv6Available0", "()Z", net_is_ipv6_available);
-    r.register(
+    r.register_with_kind(net, "isIPv6Available0", "()Z", net_is_ipv6_available, NativeKind::Bridge);
+    r.register_with_kind(
         net,
         "isReusePortAvailable0",
         "()Z",
         net_is_reuse_port_available,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "canIPv6SocketJoinIPv4Group0",
         "()Z",
         net_can_ipv6_join_ipv4_group,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         net,
         "isExclusiveBindAvailable",
         "()I",
         net_is_exclusive_bind_available,
+        NativeKind::Bridge,
     );
     // initIDs() — the JDK calls this once in <clinit> to populate cached field
     // offsets; for us it's a no-op since we use name-based field lookup.
-    r.register(net, "initIDs", "()V", |_c, _a| Ok(None));
+    r.register_with_kind(net, "initIDs", "()V", |_c, _a| Ok(None), NativeKind::Bridge);
 
     // `NioSocketImpl` flips the OS fd to non-blocking when it enforces a
     // Java-level SO_TIMEOUT. `net_read0` then returns IOStatus.UNAVAILABLE and
     // `Net.poll` handles the timed wait. This must alter the real stream; a
     // no-op makes read0 block until peer close and incorrectly report EOF.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/IOUtil",
         "configureBlocking",
         "(Ljava/io/FileDescriptor;Z)V",
@@ -3115,8 +3170,15 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    r.register(net, "poll", "(Ljava/io/FileDescriptor;IJ)I", net_poll);
+    r.register_with_kind(
+        net,
+        "poll",
+        "(Ljava/io/FileDescriptor;IJ)I",
+        net_poll,
+        NativeKind::Bridge,
+    );
 
     // NIO-SERVER-SOCKET: `jdk/net/WindowsSocketOptions` natives. Without these,
     // `jdk.net.ExtendedSocketOptions.<clinit>` throws UnsatisfiedLinkError on
@@ -3185,21 +3247,21 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // so this is the only registration of the family.
     {
         let lso = "jdk/net/LinuxSocketOptions";
-        r.register(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
+        r.register_with_kind(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
-        });
-        r.register(lso, "quickAckSupported0", "()Z", |_c, _a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "quickAckSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_supported(
                 ExtOpt::QuickAck,
                 true,
             )))))
-        });
-        r.register(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_supported(
                 ExtOpt::IncomingNapiId,
                 false,
             )))))
-        });
+        }, NativeKind::Bridge);
         // IP_DONTFRAGMENT is NOT gated by a native probe
         // (`ipDontFragmentSupported()` is plain Java returning true), so these
         // two are genuinely reachable — and they are now IMPLEMENTED rather than
@@ -3210,22 +3272,22 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // `IP_MTU_DISCOVER` (v4) / `IPV6_MTU_DISCOVER` (v6) is selectable —
         // which is exactly what `LinuxSocketOptions.c` does. The Windows twin
         // above has had a real implementation since the same round.
-        r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, a| {
+        r.register_with_kind(lso, "getIpDontFragment0", "(IZ)Z", |_c, a| {
             Ok(Some(Value::Int(i32::from(linux_dont_fragment_get(a)?))))
-        });
-        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "setIpDontFragment0", "(IZZ)V", |_c, a| {
             linux_dont_fragment_set(a)?;
             Ok(None)
-        });
-        r.register(lso, "getQuickAck0", "(I)Z", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "getQuickAck0", "(I)Z", |_c, a| {
             Ok(Some(Value::Int(i32::from(
                 ext_opt_get(a, ExtOpt::QuickAck)? != 0,
             ))))
-        });
-        r.register(lso, "setQuickAck0", "(IZ)V", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "setQuickAck0", "(IZ)V", |_c, a| {
             ext_opt_set(a, ExtOpt::QuickAck)?;
             Ok(None)
-        });
+        }, NativeKind::Bridge);
         // `-1` stays the answer for a socket with no peer credentials, because
         // it is this native's OWN documented failure sentinel, not a
         // placeholder: `ExtendedSocketOptions.getSoPeerCred` decodes the long as
@@ -3233,33 +3295,33 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // domain socket")` — which is exactly right for the TCP sockets that
         // make up almost every caller. What changed is that a real AF_UNIX
         // socket now gets its real SO_PEERCRED instead of the sentinel.
-        r.register(lso, "getSoPeerCred0", "(I)J", |_c, a| {
+        r.register_with_kind(lso, "getSoPeerCred0", "(I)J", |_c, a| {
             Ok(Some(Value::Long(ext_opt_peer_cred(a))))
-        });
-        r.register(lso, "getIncomingNapiId0", "(I)I", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "getIncomingNapiId0", "(I)I", |_c, a| {
             Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::IncomingNapiId)?)))
-        });
-        r.register(lso, "getTcpKeepAliveProbes0", "(I)I", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "getTcpKeepAliveProbes0", "(I)I", |_c, a| {
             Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveProbes)?)))
-        });
-        r.register(lso, "getTcpKeepAliveTime0", "(I)I", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "getTcpKeepAliveTime0", "(I)I", |_c, a| {
             Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveTime)?)))
-        });
-        r.register(lso, "getTcpKeepAliveIntvl0", "(I)I", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "getTcpKeepAliveIntvl0", "(I)I", |_c, a| {
             Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveIntvl)?)))
-        });
-        r.register(lso, "setTcpKeepAliveProbes0", "(II)V", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "setTcpKeepAliveProbes0", "(II)V", |_c, a| {
             ext_opt_set(a, ExtOpt::KeepAliveProbes)?;
             Ok(None)
-        });
-        r.register(lso, "setTcpKeepAliveTime0", "(II)V", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "setTcpKeepAliveTime0", "(II)V", |_c, a| {
             ext_opt_set(a, ExtOpt::KeepAliveTime)?;
             Ok(None)
-        });
-        r.register(lso, "setTcpKeepAliveIntvl0", "(II)V", |_c, a| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(lso, "setTcpKeepAliveIntvl0", "(II)V", |_c, a| {
             ext_opt_set(a, ExtOpt::KeepAliveIntvl)?;
             Ok(None)
-        });
+        }, NativeKind::Bridge);
     }
 
     // NIO-SERVER-SOCKET: `IOUtil.newFD(int)` calls `setfdVal(fd, value)` to
@@ -3268,7 +3330,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError` right after `Net.socket0`. We write the value into
     // the descriptor's `fd` field (slot 0), matching `IOUtil.fdVal`'s reader
     // and `net_fd_from_descriptor`.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/IOUtil",
         "setfdVal",
         "(Ljava/io/FileDescriptor;I)V",
@@ -3278,30 +3340,31 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(fd_obj, "fd", Value::Int(val));
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // KEEP: the `poll*Value()` family is specified to return the platform's
     // POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL/POLLCONN bit constants — the real
     // JNI implementations return exactly these compile-time values too. A
     // constant here is the whole method, not a placeholder; `NET_POLL*` are the
     // platform-correct values `net_poll` itself compares against.
-    r.register(net, "pollinValue", "()S", |_c, _a| {
+    r.register_with_kind(net, "pollinValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLIN)))
-    });
-    r.register(net, "polloutValue", "()S", |_c, _a| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(net, "polloutValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLOUT)))
-    });
-    r.register(net, "pollerrValue", "()S", |_c, _a| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(net, "pollerrValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLERR)))
-    });
-    r.register(net, "pollhupValue", "()S", |_c, _a| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(net, "pollhupValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLHUP)))
-    });
-    r.register(net, "pollnvalValue", "()S", |_c, _a| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(net, "pollnvalValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLNVAL)))
-    });
-    r.register(net, "pollconnValue", "()S", |_c, _a| {
+    }, NativeKind::Bridge);
+    r.register_with_kind(net, "pollconnValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLCONN)))
-    });
+    }, NativeKind::Bridge);
     r.set_category(__prev_cat);
 }
 
