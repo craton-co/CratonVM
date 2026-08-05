@@ -72,25 +72,29 @@ implementation, in three separate ways, and no test asked.
 * **`--jdk-only` census**: zero `native-shadows-bytecode` violations for
   `java/lang/String`, from 12; the registry goes from 80 `String` rows to 26.
 * **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, both modes
-  byte-identical to each other. The two follow-up fixes below took it to
-  **21** (37 -> 21: 16 fixed, **0 regressed**, and no still-divergent row
-  changed value — a count alone cannot see a row *worsen*).
+  byte-identical to each other. Two follow-up rounds took it to **8** — see
+  *What is left* below for the per-step table. Every step is checked as a SET
+  comparison, never a count: a count cannot see a row *worsen*.
 * **`Compatible` byte-for-byte over `test_classes`**: 9 of 9 identical.
 
-## What is left, and what each remaining row costs
+## What is left
 
-The 21 residual matrix rows are not 21 problems. They are four:
+The lane took the matrix from **57 -> 8** divergences in four steps, each with a
+0-regression set comparison rather than a count:
 
-| group | rows | cause |
-|---|---:|---|
-| A | **13** | `msg=null` on out-of-bounds exceptions. The *class* is right (F4); only the message text is missing. This is [`preconditions-ignores-the-exception-formatter`](../../known-issues/preconditions-ignores-the-exception-formatter.md), still open. One fix, 13 rows. |
-| B | 4 | regex message text, plus `replaceAll` with a bad group reference not throwing at all |
-| C | 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null") vs our own text. A VM-wide feature, not a `String` defect. |
-| D | 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
+| step | divergences | fixed | regressed |
+|---|---:|---:|---:|
+| drop the forced-native `String` policy | 57 -> 37 | 20 | 0 |
+| UTF-16 `hashCode` + concat surrogates | 37 -> 21 | 16 | 0 |
+| out-of-bounds class and message | 21 -> 8 | 13 | 0 |
 
-Group A is the only one whose fix is scoped to this lane, and it is the largest.
-Group C is deliberately out of scope: it is `NullPointerException` message
-synthesis for the whole VM, not anything `String` does.
+The 8 that remain are three problems, none of them a `java/lang/String` defect:
+
+| rows | cause |
+|---:|---|
+| 4 | regex: `PatternSyntaxException` message text, and `replaceAll` with a bad group reference does not throw at all |
+| 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null"). VM-wide message synthesis, not `String`. |
+| 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
 
 ## Three defects the removal surfaced
 
@@ -109,15 +113,23 @@ first looked like it had to be, and did not:
   doc originally proposed to keep is therefore **dropped** — the bytecode is
   correct now, and keeping the native would have frozen the real bug in place
   where nothing reached it.
-* `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
-  instead of `StringIndexOutOfBoundsException`
+* `String.substring` out-of-range threw `ArrayIndexOutOfBoundsException`
+  instead of `StringIndexOutOfBoundsException`. **The `String` half is FIXED
+  2026-08-05**
   ([record](../../known-issues/preconditions-ignores-the-exception-formatter.md)
-  — supersedes the original `string-substring-bounds-…` record, which named the
-  wrong subsystem: the fault is `Preconditions` ignoring its exception-formatter
-  argument, not anything `substring` does).
-  Deliberately not re-masked — the native was wrong there too, and re-masking
-  would cost the four rows the bytecode fixes, including `substring` splitting
-  a surrogate pair into U+FFFD.
+  — which supersedes the original `string-substring-bounds-…` record, that
+  having named the wrong subsystem: the fault is `Preconditions` ignoring its
+  exception-formatter argument, not anything `substring` does).
+
+  Probing rather than reading found the worse half: for `charAt` the exception
+  **class depended on the SIGN of the index** — `charAt(-1)` reached
+  `Preconditions` and came back `ArrayIndexOutOfBoundsException` while
+  `charAt(12)` came back `StringIndexOutOfBoundsException`. The matrix could not
+  show that, because those rows already differed on message text.
+  `String.checkIndex` is now a third F4 native, and every SIOOBE carries
+  HotSpot's exact message. What is still open is the non-`String` half: NIO's
+  callers of `Preconditions` still get `ArrayIndexOutOfBoundsException` where
+  the JDK throws `IndexOutOfBoundsException`.
 * `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
   ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
   `execute_string_concat` accumulated into a Rust `String`, which cannot

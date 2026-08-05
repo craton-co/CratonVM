@@ -437,11 +437,12 @@ pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
     );
 
     // Win32ErrorMode — Windows-only, safe noop returning 0
-    registry.register(
+    registry.register_with_kind(
         "sun/io/Win32ErrorMode",
         "setErrorMode",
         "(J)J",
         native_win32_set_error_mode,
+        NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }

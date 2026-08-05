@@ -976,6 +976,46 @@ jobs:
           [ -x "$CV" ] || CV=target/debug/cratonvm.exe
           CV="$CV" bash regression-suite/run.sh
 
+      # ACCEPTANCE CRITERION (design §11, criterion 6): the strict corpus is
+      # green. This is the criterion that went unmeasured until 2026-08-04, and
+      # measuring it immediately found that `--jdk-only` could not start a
+      # thread; the second widening, on 2026-08-05, found four more divergences
+      # in one run. It is where the defects are, so it runs on every build
+      # rather than when someone remembers to look.
+      #
+      # Three arms on ONE image and ONE set of class files: real HotSpot,
+      # `--real-jdk`, `--jdk-only`. The HotSpot control is not optional — a
+      # divergence present in both CratonVM modes is a compatibility defect
+      # that `--jdk-only` did not introduce, and without the control there is
+      # no way to say which kind you have. The script fails 4 for an arm that
+      # did not complete and 5 for a transcript that diverged, kept separate
+      # because a `timeout` kill prints a truncated transcript that reads
+      # exactly like a clean short run.
+      #
+      # `continue-on-error` on this STEP, not the job: the corpus is not green
+      # today (see docs/known-issues/vm/ for the two open records this gate
+      # reports), and a step that fails the whole job would be turned off
+      # within a week. Delete the `continue-on-error` line — nothing else —
+      # once the two records are closed, and criterion 6 becomes blocking.
+      #
+      # `JAVA_HOME` is what actions/setup-java exported for this matrix leg, so
+      # the corpus is measured against both JDK 21 and JDK 25.
+      - name: Strict corpus (three-arm probe gate)
+        continue-on-error: true
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+
+      - name: Upload strict-corpus transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-strict-probes-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: target/jdk-only-strict-probes/logs/
+          if-no-files-found: warn
+
       # Semantic differential gate over the strict-mode seed corpus
       # (difftest/seeds-jdk-only: lambda identity, dynamic proxies, reflection
       # accessors, a missing optional dependency — the four shapes where a

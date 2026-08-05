@@ -2498,7 +2498,7 @@ mod tests {
             RuntimeError::IllegalMonitorStateException {
                 message: "not owner".to_string(),
             },
-            RuntimeError::StringIndexOutOfBoundsException { index: 99 },
+            RuntimeError::sioobe_index(99, 5),
             RuntimeError::NoSuchFieldException {
                 field_name: "missing".to_string(),
             },

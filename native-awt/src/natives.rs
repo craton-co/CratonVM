@@ -820,11 +820,12 @@ fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     );
     // sun.awt.PlatformGraphicsInfo.hasDisplays0()Z — native display probe.
     // No native display backend → no displays.
-    registry.register(
+    registry.register_with_kind(
         "sun/awt/PlatformGraphicsInfo",
         "hasDisplays0",
         "()Z",
         |_ctx, _args| bool_ok(false),
+        NativeKind::Bridge,
     );
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessMessage — diagnostic
     // text shown when a headless app touches a graphics-only API.
@@ -2495,17 +2496,21 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             NativeKind::Bridge,
         );
     }
-    // The thirteenth does not: `java.awt.image.ComponentSampleModel` declares
-    // no `initIDs` at all (schema-3 census `declared: false`, confirmed with
-    // `javap -p java.awt.image.ComponentSampleModel` — its superclass
-    // `SampleModel` owns the one native ID cache for the family). Registering
-    // it is harmless, but it is not an adjudicated bridge, so it keeps the
-    // ambient category from `lib.rs::register_awt_natives`.
-    registry.register(
+    // The thirteenth is split out only because the census reports it
+    // differently, NOT because it is a different kind of thing — a correction
+    // to what L5b wrote here on the strength of `declared: false`.
+    // `java.awt.image.ComponentSampleModel` does not declare `initIDs` itself;
+    // `InheritedDeclProbe` resolves it up the hierarchy and finds `initIDs()V`
+    // **native** on the superclass `java.awt.image.SampleModel`, which is what
+    // dispatch binds to. `declared: false` on one class is not the same claim
+    // as "no ACC_NATIVE target", and reading it that way is how 1,939 rows
+    // tree-wide were mis-filed. So this states its kind too.
+    registry.register_with_kind(
         "java/awt/image/ComponentSampleModel",
         "initIDs",
         "()V",
         |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
     );
 }
 

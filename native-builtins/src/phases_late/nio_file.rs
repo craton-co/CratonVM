@@ -6607,6 +6607,70 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // The (class, method, descriptor) triples a JDK 25 image declares
+    // ACC_NATIVE, measured against linux-x64 AND windows-x64 25.0.4+7 on
+    // 2026-08-05. `java.io.UnixFileSystem` exists only on the Linux image and
+    // `java.io.WinNTFileSystem` only on the Windows one, so each is judged
+    // against its own platform and the union is what this table holds.
+    //
+    // Everything registered below that is NOT in here is one of two things:
+    // the un-suffixed spelling, which is the Java wrapper that calls the JNI
+    // entry point (a contract §1.4 shadow, not a §1.5 bridge), or a
+    // descriptor/name the other platform uses. Both keep the ambient category
+    // so the census goes on reporting them as unadjudicated.
+    const FS_IMAGE_NATIVE: &[(&str, &str, &str)] = &[
+    ("java/io/UnixFileSystem", "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/io/UnixFileSystem", "checkAccess0", "(Ljava/io/File;I)Z"),
+    ("java/io/UnixFileSystem", "createDirectory0", "(Ljava/io/File;)Z"),
+    ("java/io/UnixFileSystem", "createFileExclusively0", "(Ljava/lang/String;)Z"),
+    ("java/io/UnixFileSystem", "delete0", "(Ljava/io/File;)Z"),
+    ("java/io/UnixFileSystem", "getBooleanAttributes0", "(Ljava/io/File;)I"),
+    ("java/io/UnixFileSystem", "getLastModifiedTime0", "(Ljava/io/File;)J"),
+    ("java/io/UnixFileSystem", "getLength0", "(Ljava/io/File;)J"),
+    ("java/io/UnixFileSystem", "getNameMax0", "(Ljava/lang/String;)J"),
+    ("java/io/UnixFileSystem", "getSpace0", "(Ljava/io/File;I)J"),
+    ("java/io/UnixFileSystem", "initIDs", "()V"),
+    ("java/io/UnixFileSystem", "list0", "(Ljava/io/File;)[Ljava/lang/String;"),
+    ("java/io/UnixFileSystem", "rename0", "(Ljava/io/File;Ljava/io/File;)Z"),
+    ("java/io/UnixFileSystem", "setLastModifiedTime0", "(Ljava/io/File;J)Z"),
+    ("java/io/UnixFileSystem", "setPermission0", "(Ljava/io/File;IZZ)Z"),
+    ("java/io/UnixFileSystem", "setReadOnly0", "(Ljava/io/File;)Z"),
+    ("java/io/WinNTFileSystem", "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/io/WinNTFileSystem", "checkAccess0", "(Ljava/io/File;I)Z"),
+    ("java/io/WinNTFileSystem", "createDirectory0", "(Ljava/io/File;)Z"),
+    ("java/io/WinNTFileSystem", "createFileExclusively0", "(Ljava/lang/String;)Z"),
+    ("java/io/WinNTFileSystem", "delete0", "(Ljava/io/File;Z)Z"),
+    ("java/io/WinNTFileSystem", "getBooleanAttributes0", "(Ljava/io/File;)I"),
+    ("java/io/WinNTFileSystem", "getDriveDirectory", "(I)Ljava/lang/String;"),
+    ("java/io/WinNTFileSystem", "getFinalPath0", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/io/WinNTFileSystem", "getLastModifiedTime0", "(Ljava/io/File;)J"),
+    ("java/io/WinNTFileSystem", "getLength0", "(Ljava/io/File;)J"),
+    ("java/io/WinNTFileSystem", "getNameMax0", "(Ljava/lang/String;)I"),
+    ("java/io/WinNTFileSystem", "getSpace0", "(Ljava/io/File;I)J"),
+    ("java/io/WinNTFileSystem", "initIDs", "()V"),
+    ("java/io/WinNTFileSystem", "list0", "(Ljava/io/File;)[Ljava/lang/String;"),
+    ("java/io/WinNTFileSystem", "listRoots0", "()I"),
+    ("java/io/WinNTFileSystem", "rename0", "(Ljava/io/File;Ljava/io/File;)Z"),
+    ("java/io/WinNTFileSystem", "setLastModifiedTime0", "(Ljava/io/File;J)Z"),
+    ("java/io/WinNTFileSystem", "setPermission0", "(Ljava/io/File;IZZ)Z"),
+    ("java/io/WinNTFileSystem", "setReadOnly0", "(Ljava/io/File;)Z"),
+    ];
+    /// Register a `FileSystem` native, stating `Bridge` only when the image
+    /// backs this exact triple. See `FS_IMAGE_NATIVE`.
+    fn fs_reg(
+        r: &mut NativeMethodRegistry,
+        cls: &str,
+        name: &str,
+        desc: &str,
+        cb: cratonvm_native_api::NativeCallback,
+    ) {
+        if FS_IMAGE_NATIVE.contains(&(cls, name, desc)) {
+            r.register_with_kind(cls, name, desc, cb, cratonvm_native_api::NativeKind::Bridge);
+        } else {
+            r.register(cls, name, desc, cb);
+        }
+    }
+
     // --- WinNTFileSystem / UnixFileSystem native methods ---
     //
     // These are JNI natives in the real JDK. We implement them using std::fs.
@@ -6618,7 +6682,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // why registering only the bare name silently registers a method nothing
     // calls on a modern JDK.
     for fs_cls in &["java/io/WinNTFileSystem", "java/io/UnixFileSystem"] {
-        r.register(
+        r.register_with_kind(
             fs_cls,
             "canonicalize0",
             "(Ljava/lang/String;)Ljava/lang/String;",
@@ -6632,6 +6696,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let s = ctx.create_string(&canonical);
                 Ok(Some(Value::Object(Some(s))))
             },
+            cratonvm_native_api::NativeKind::Bridge,
         );
 
         // getBooleanAttributes returns a bitmask:
@@ -6640,7 +6705,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `getBooleanAttributes0` is the raw JNI native (JDK 22+) and
         // `getBooleanAttributes` the pre-22 spelling / public wrapper; they
         // differ only in BA_HIDDEN, which is why they get different bodies.
-        r.register(
+        r.register_with_kind(
             fs_cls,
             "getBooleanAttributes0",
             "(Ljava/io/File;)I",
@@ -6649,8 +6714,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let path = file_read_path(ctx, file_ref);
                 Ok(Some(Value::Int(fs_boolean_attributes0(&path))))
             },
+            cratonvm_native_api::NativeKind::Bridge,
         );
-        r.register(
+        fs_reg(
+            r,
             fs_cls,
             "getBooleanAttributes",
             "(Ljava/io/File;)I",
@@ -6662,7 +6729,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         );
 
         for name in ["getLastModifiedTime", "getLastModifiedTime0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let millis = std::fs::metadata(&path)
@@ -6678,7 +6745,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
 
         for name in ["getLength", "getLength0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let len = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
@@ -6725,7 +6792,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
 
         for name in ["createDirectory", "createDirectory0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let ok = std::fs::create_dir(&path).is_ok();
@@ -6733,7 +6800,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             });
         }
 
-        r.register(
+        r.register_with_kind(
             fs_cls,
             "rename0",
             "(Ljava/io/File;Ljava/io/File;)Z",
@@ -6745,9 +6812,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let ok = std::fs::rename(&from, &to).is_ok();
                 Ok(Some(Value::Int(if ok { 1 } else { 0 })))
             },
+            cratonvm_native_api::NativeKind::Bridge,
         );
 
-        r.register(fs_cls, "delete0", "(Ljava/io/File;)Z", |ctx, args| {
+        fs_reg(r, fs_cls, "delete0", "(Ljava/io/File;)Z", |ctx, args| {
             let file_ref = obj_arg(args, 1)?;
             let path = file_read_path(ctx, file_ref);
             let ok = std::fs::remove_file(&path)
@@ -6760,7 +6828,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // that `UnixFileSystem.delete0` does not have — a different method,
         // not a different spelling, so it needs its own registration or
         // `File.delete()` is an `UnsatisfiedLinkError` on Windows.
-        r.register(fs_cls, "delete0", "(Ljava/io/File;Z)Z", |ctx, args| {
+        fs_reg(r, fs_cls, "delete0", "(Ljava/io/File;Z)Z", |ctx, args| {
             let file_ref = obj_arg(args, 1)?;
             let allow_read_only = matches!(args.get(2), Some(v) if v.as_int().unwrap_or(0) != 0);
             let path = file_read_path(ctx, file_ref);
@@ -6780,7 +6848,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         });
 
         for name in ["setLastModifiedTime", "setLastModifiedTime0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;J)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;J)Z", |ctx, args| {
                 // Real-JDK `File.setLastModified(long)` bytecode delegates here.
                 // This used to be a stub that claimed success without touching
                 // the file, so any caller that reached the bytecode path (rather
@@ -6808,7 +6876,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `canWrite()` (which IS a real permission query) then contradicted
         // it. Same body as the direct `java/io/File.setReadOnly()` native.
         for name in ["setReadOnly", "setReadOnly0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let ok = std::fs::metadata(&path)
@@ -6826,7 +6894,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // Never registered before, so all three were an `UnsatisfiedLinkError`
         // for any caller that reached the real `FileSystem` bytecode.
         for name in ["setPermission", "setPermission0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;IZZ)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;IZZ)Z", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let access = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
@@ -6840,7 +6908,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `File.createNewFile()` / `File.createTempFile(...)` bytecode. Same
         // story as `setPermission`: never registered under either spelling.
         for name in ["createFileExclusively", "createFileExclusively0"] {
-            r.register(fs_cls, name, "(Ljava/lang/String;)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/lang/String;)Z", |ctx, args| {
                 let path_ref = obj_arg(args, 1)?;
                 let path = ctx.read_string(path_ref).unwrap_or_default();
                 match std::fs::OpenOptions::new()
@@ -6875,7 +6943,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // gets a correct answer for the mocked instances but a fake one for
         // real `File`s in the same JVM process.
         for name in ["getSpace", "getSpace0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;I)J", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;I)J", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let space_type = match args.get(2) {
                     Some(Value::Int(v)) => *v,
@@ -6896,7 +6964,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // Was "does the path exist?" for every mode, so `canWrite()` said
         // `true` for a file `setReadOnly()` had just locked down.
         for name in ["checkAccess", "checkAccess0"] {
-            r.register(fs_cls, name, "(Ljava/io/File;I)Z", |ctx, args| {
+            fs_reg(r, fs_cls, name, "(Ljava/io/File;I)Z", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
                 let path = file_read_path(ctx, file_ref);
                 let access = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
@@ -6918,7 +6986,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `UnixFileSystem`, `int` on `WinNTFileSystem`. Registering only the
         // `I` form left the Unix native unresolved, since a native is looked
         // up by descriptor as well as name.
-        r.register(
+        fs_reg(
+            r,
             fs_cls,
             "getNameMax0",
             "(Ljava/lang/String;)I",
@@ -6930,7 +6999,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Int(file_system_name_max(&path))))
             },
         );
-        r.register(
+        fs_reg(
+            r,
             fs_cls,
             "getNameMax0",
             "(Ljava/lang/String;)J",
@@ -6953,7 +7023,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // every `startsWith(canonicalBase)` containment check against a
         // non-prefixed base failed. `strip_unc` is the same helper
         // `file_canonicalize_path_uncached` already applies for this reason.
-        r.register(
+        fs_reg(
+            r,
             fs_cls,
             "getFinalPath0",
             "(Ljava/lang/String;)Ljava/lang/String;",
@@ -6974,14 +7045,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // through a declared method.
 
         // `File.listRoots()` -> a bitmask with bit 0 = `A:`.
-        r.register(fs_cls, "listRoots0", "()I", |_ctx, _args| {
+        fs_reg(r, fs_cls, "listRoots0", "()I", |_ctx, _args| {
             Ok(Some(Value::Int(fs_list_roots_bitmask())))
         });
 
         // The per-drive working directory, minus its `X:` prefix — what
         // `_wgetdcwd` gives the JDK. Reached only for drive-relative paths
         // (`C:foo`), which `WinNTFileSystem.resolve` has to expand.
-        r.register(
+        fs_reg(
+            r,
             fs_cls,
             "getDriveDirectory",
             "(I)Ljava/lang/String;",
@@ -7011,7 +7083,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // The real native caches jfieldIDs; there is nothing for us to cache,
         // but the class's `<clinit>` calls it and an unregistered native there
         // fails class initialisation outright.
-        r.register(fs_cls, "initIDs", "()V", |_ctx, _args| Ok(None));
+        r.register_with_kind(fs_cls, "initIDs", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
     }
 
     // Round 24 — Files.write(Path, Iterable<? extends CharSequence>, OpenOption...)
