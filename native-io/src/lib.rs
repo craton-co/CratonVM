@@ -6476,17 +6476,34 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // populate — and threw `NullPointerException` in both modes, measured by
     // `probes/L3ScannerSearchProbe`. It lives here now, beside `findInLine` and
     // `skip`, which share its state accessors and its regex engine.
-    registry.register(
+    //
+    // Registered as INTRINSIC, with the kind STATED rather than inherited.
+    // `java.util.Scanner` declares no ACC_NATIVE method, so a `Bridge` tag —
+    // which contract §1.5 defines by an ACC_NATIVE target — would be wrong,
+    // and the L6 ratchet says so in as many words: two new Bridge rows
+    // shadowing concrete bytecode is a regression it refuses, and raising the
+    // baseline is explicitly not the fix. Intrinsic is what these are: a Rust
+    // fast path replicating a method that HAS real bytecode and has to match
+    // it, which is the category the implementation in `phases_early.rs` used
+    // before it moved here.
+    //
+    // The other 35 registrations in this function are still `Bridge` by
+    // inheritance and still wrong for the same reason — see the
+    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
+    // GOOD direction and belongs with whoever re-freezes it.
+    registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/lang/String;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_string,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
-    registry.register(
+    registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_pattern,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
 
     // Interface dispatch: Iterator
