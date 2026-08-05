@@ -19018,7 +19018,10 @@ pub(crate) fn native_class_get_protection_domain0(
         }
         let arr = ctx.read_native_pin(arr_pin, arr);
         let cs = ctx.read_native_pin(cs_pin, cs);
-        ctx.set_field(cs, 1, Value::Object(Some(arr)));
+        // BY NAME only: raw slot 1 is `signers` on a real `CodeSource`, so the
+        // raw write parked a `Certificate[]`-shaped array in the signer field
+        // and the by-name write beside it put the real one in `certs`. The
+        // by-name write covers both layouts on its own.
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
     let cs = ctx.read_native_pin(cs_pin, cs);
