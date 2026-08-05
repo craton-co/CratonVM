@@ -947,6 +947,17 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     // The plan-validated resume point (see above), not the raw `rframe.bci`.
     frame.pc = resume_bci;
 
+    // osr-02 frame comparator: record the RESUMED frame, after the write.
+    //
+    // After, not before, and not from `rframe`: what the brief asks about is
+    // the state the interpreter resumes on, and that is not always what the
+    // reconstruction proposed. An `Unsupported` source slot is deliberately
+    // left at the live frame's current value (see the mapping loop above), so a
+    // record built from `rframe` would describe a frame that never exists.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_exit(frame, resume_bci);
+    }
+
     if trace {
         eprintln!(
             "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={resume_bci} \

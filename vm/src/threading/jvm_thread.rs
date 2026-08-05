@@ -103,6 +103,18 @@ pub struct SlotOrigin {
     pub frame: u32,
     pub idx: u32,
     pub is_stack: bool,
+    /// Was this slot LIVE at its frame's pc when the deposit ran — i.e. one of
+    /// the roots the collector was required to keep?
+    ///
+    /// The write-back does not need this (healing a dead slot is harmless and
+    /// keeps the frame self-consistent), but the fold's invariant check does:
+    /// a DEAD local pointing into a reclaimed span is the per-bci liveness
+    /// analysis working exactly as designed — `ExecutorService.invokeAll`'s
+    /// `tasks` argument, scoped out at the `f.get()` the caller is parked in,
+    /// hits this on every round of `probes/BlockedFrameRootProbe`. Reporting
+    /// those would bury the case that matters. Operand-stack slots are always
+    /// live.
+    pub live: bool,
     /// Address the slot held at the blocking deposit.
     pub orig: usize,
     /// The object's current address, advanced by every GC initiator's fold
@@ -487,6 +499,28 @@ pub struct JvmThread {
     /// `active_jit_executions` = 2 and 3.
     pub invoke_cache: InvokeCache<cratonvm_jit::RetainedCode>,
 
+    /// Per-thread resolved-field site cache — the interpreter's "resolved
+    /// constant pool" for `getfield`/`putfield`/`getstatic`/`putstatic`.
+    ///
+    /// The authoritative `SharedVm::resolution_cache` already memoizes
+    /// `(referencing class, cp index) -> ResolvedField`, but reaching it costs an
+    /// `OrderedPlRwLock` read, and `resolve_field_ref_loader_aware` then
+    /// *revalidates* every hit by re-deriving the field-owning class from its
+    /// name — two `String` allocations, two further `class_manager` read
+    /// acquisitions and a full `resolve_class_loader_aware`. This side table
+    /// skips all of it for the sites where that revalidation is a tautology.
+    /// See [`crate::runtime::interpreter::site_cache`] for the validity
+    /// argument — read it before adding a `put` call site.
+    pub field_sites: crate::runtime::interpreter::FieldSiteCache,
+
+    /// Per-thread resolved-method site cache — the same "resolved constant
+    /// pool" for the `(descriptor, num_params)` pair that the argument-popping
+    /// helpers need. On the inline-cache HIT path those used to call
+    /// `resolve_method_ref` for two of its four return values, paying a
+    /// `resolution_cache` read lock, a hash probe and three `Arc<str>`
+    /// clone/drop pairs per invoke.
+    pub method_sites: crate::runtime::interpreter::MethodSiteCache,
+
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
     /// On invoke-cache misses, `execute_invokevirtual_vtable_fast` checks whether
@@ -709,6 +743,8 @@ impl JvmThread {
             jit_hashmap_string_node_cache: Vec::new(),
             string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
+            field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
+            method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

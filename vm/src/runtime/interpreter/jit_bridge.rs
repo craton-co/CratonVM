@@ -1541,6 +1541,22 @@ pub(super) fn try_osr(
         }
     };
 
+    // osr-02 frame comparator: record the ENTRY frame — the state compiled code
+    // is about to start from. Here, because the entry has validated and nothing
+    // has run yet.
+    //
+    // Without this record the comparator cannot see a replay at all: compiled
+    // iterations produce no back-edge arrivals, so "entered at frame 5, ran to
+    // 12, resumed at 5" and "entered at 5 and advanced nothing" are the same
+    // sequence of arrival indices, both strictly increasing. A hand-written
+    // fixture modelling the historical defect passed without it. Paired with
+    // the next exit record this makes the advance a MEASURED quantity —
+    // `index(X) - index(E)` over the un-compiled run's own trajectory, not
+    // anything the JIT claims.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_entry(&thread.frames[frame_idx], entry_pc);
+    }
+
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
     // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the
@@ -1851,6 +1867,33 @@ pub(super) fn try_osr(
         cratonvm_jit::metrics::record_osr_event("osr_exited");
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             dbg_deopt_sink("osr-exit", &rframe, "");
+            // The lane's step 4, and the only place it can be answered: the
+            // artifact records a set of loop-boundary exit-map bcis
+            // (`osr_exit_points`) and until now nothing compared it with where
+            // exits are actually taken. Counted before the identity gate,
+            // because the classification is about THIS artifact's own view of
+            // the bci the frame names; whether the frame is ours to transfer is
+            // the separate question the gate below answers.
+            //
+            // Ungated, for the same reason `osr_entered` / `osr_exited` are: an
+            // exit at a bci this artifact records nothing for otherwise leaves
+            // no trace at all.
+            let exit_site = compiled.classify_osr_exit_site(rframe.bci);
+            cratonvm_jit::metrics::record_osr_event(exit_site.metric());
+            if matches!(exit_site, cratonvm_jit::osr_exit::OsrExitSite::Unrecorded)
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit at bci={} which {}.{}{} records neither an \
+                     exit map nor a deopt point for ({} exit points, {} deopt points)",
+                    rframe.bci,
+                    &*class_name_arc,
+                    &*method_name_arc,
+                    &*descriptor_arc,
+                    compiled.osr_exit_points.len(),
+                    compiled.deopt_points.len(),
+                );
+            }
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
             // could belong to a NESTED compiled callee of the OSR'd code whose
             // sentinel bubbled up here; transferring THAT frame into this live
@@ -2483,6 +2526,17 @@ pub(super) fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: C
     elidable
 }
 
+/// `CRATONVM_JIT=sync-methods` — admit `ACC_SYNCHRONIZED` methods to the
+/// invocation-counter compile path, where the interpreter's call wrapper owns
+/// the implicit monitor. Read once and cached; this sits on the hot
+/// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
+fn jit_sync_methods_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
+    })
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -2530,10 +2584,31 @@ pub(super) fn try_jit_upgrade_with_gate(
     if gate.generation > 0 {
         return None;
     }
-    // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
-    // Do not let a cached interpreter target become a compiled monitor-less
-    // body through the invocation-counter upgrade path.
-    if cached.is_synchronized {
+    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
+    // the *caller* supplies it. Both interpreter entry points into compiled code
+    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
+    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
+    // class mirror's) monitor for the whole native activation and releases it on
+    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
+    // through those two, so admitting a synchronized method here is contained.
+    //
+    // The three entries that would NOT be wrapped each refuse a synchronized
+    // callee independently, and must keep doing so:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
+    //     `named_method_is_synchronized` gate;
+    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
+    //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
+    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
+    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
+    // deploy interpreted — the method was rejected here *before* it was ever
+    // counted, which is why `jit-method-stats` reported it neither compiled nor
+    // `hot_but_stuck_in_interpreter`. See
+    // docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
+    if cached.is_synchronized && !jit_sync_methods_enabled() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
