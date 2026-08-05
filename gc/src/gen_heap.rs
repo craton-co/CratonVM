@@ -13657,8 +13657,18 @@ fn report_doomed_referrers(
     // can be read as a fraction of a known total:
     //   dead_old  doomed->doomed, i.e. a subgraph condemned together;
     //   unowned   a word in old-gen backing store that is inside no walked
-    //             object at all (free-list space, padding, a reserved tail).
+    //             object at all (free-list space, padding, a reserved tail);
+    //   stale     the containing object IS marked, and its own slot enumerator
+    //             does not yield the victim. Overwhelmingly a 16-byte legacy
+    //             `Value` cell that once held an `Object` and was overwritten
+    //             by a narrower variant, leaving the old pointer in the cell's
+    //             UNUSED upper half. The mutator can never read it and the GC
+    //             correctly ignores it, so counting it as a defect is a false
+    //             alarm — and before this split it was the ONLY thing
+    //             `live_old` ever fired on (~1 per compaction, always the same
+    //             class pair, byte-identical across three processes).
     let mut live_old = 0usize;
+    let mut stale = 0usize;
     let mut dead_old = 0usize;
     let mut unowned = 0usize;
     let mut young = 0usize;
@@ -13716,6 +13726,60 @@ fn report_doomed_referrers(
                     // A word INSIDE the doomed block itself is not a referrer.
                     Some((owner, _)) if owner == w => {}
                     Some((owner, true)) => {
+                        // Marked is necessary, not sufficient. Ask the object's
+                        // own slot enumerator — the one every mark source
+                        // funnels through — whether it actually yields this
+                        // victim. See the `stale` note above for what the
+                        // difference turned out to be.
+                        // SAFETY: `owner` is an object base `walk_objects`
+                        // yielded, so its header and body are valid.
+                        let oh = unsafe { &*(owner as *const ObjectHeader) };
+                        let mut yields_victim = false;
+                        // SAFETY: as above — `for_each_ref_slot`'s contract.
+                        unsafe {
+                            for_each_ref_slot(owner as *mut u8, oh, |p, _| {
+                                if p as usize == w {
+                                    yields_victim = true;
+                                }
+                            });
+                        }
+                        if !yields_victim {
+                            stale += 1;
+                            if stale <= 2 {
+                                // Print the raw cell once or twice so the
+                                // reason is on the page rather than in a
+                                // commit message. A legacy slot is a 16-byte
+                                // `Value`, so a word at body offset `n*16 + 8`
+                                // is the payload half and the discriminant sits
+                                // 8 bytes below it.
+                                let body_off = (at - owner).saturating_sub(HEADER_SIZE);
+                                let cell = body_off / SLOT_SIZE;
+                                let cell_at = owner + HEADER_SIZE + cell * SLOT_SIZE;
+                                // SAFETY: the word is inside the object's body,
+                                // which `walk_objects` sized, so the whole
+                                // 16-byte cell is in bounds.
+                                let (c0, c1) = unsafe {
+                                    (
+                                        *(cell_at as *const u64),
+                                        *((cell_at + 8) as *const u64),
+                                    )
+                                };
+                                eprintln!(
+                                    "[{label}-referrers] stale-padding: {owner:#x} \
+                                     (class_id={}, {}) cell {cell} @{cell_at:#x} \
+                                     raw=[{c0:#018x}, {c1:#018x}] holds {w:#x} in a half its \
+                                     decoder does not read — NOT a referrer",
+                                    oh.class_id.as_u32(),
+                                    if crate::heap::compact_oop_scan(oh).is_some() {
+                                        "compact"
+                                    } else {
+                                        "legacy"
+                                    },
+                                );
+                            }
+                            off += 8;
+                            continue;
+                        }
                         live_old += 1;
                         if printed < 24 {
                             printed += 1;
@@ -13760,7 +13824,8 @@ fn report_doomed_referrers(
     // three numbers the line is an inert-lever reading dressed up as evidence.
     eprintln!(
         "[{label}-referrers] doomed={} DEFECTS(live_old={live_old} young={young} \
-         root={root_hits}) benign(dead_old={dead_old} unowned={unowned}) \
+         root={root_hits}) benign(dead_old={dead_old} unowned={unowned} \
+         stale_padding={stale}) \
          scanned(old_bytes={} young_bytes={} roots={}) \
          xt(passes={} taken_over={} UNCLASSIFIED={} xt_roots={} hw_windows={} hw_roots={})",
         doomed.len(),
