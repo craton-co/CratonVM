@@ -3128,10 +3128,35 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // generated-body path. Without this, the 2nd access of a given
     // (proxyClass, method) returns null (e.g. repeatable `getAnnotationsByType`).
     if handler_class == "java/lang/annotation/AnnotationProxy" {
-        let mname = match ctx.get_field_by_name(method_obj, "name") {
+        // The member NAME is the whole routing key here. Reading it off the
+        // `Method`'s `name` FIELD only works while the receiver has the layout
+        // this code assumes: `get_field_by_name` answers `Object(None)` for a
+        // name it cannot resolve, and an empty name then falls through to the
+        // generic `handler.invoke(...)` tail below — which asks an
+        // `AnnotationProxy` for a member literally called `invoke`, finds none,
+        // and hands back **null for every annotation member regardless of its
+        // declared type**. That is indistinguishable, at the call site, from a
+        // genuinely absent member: Byte Buddy's
+        // `AnnotationDescription$ForLoadedAnnotation.getValue` turns it into
+        // `asValue(null, int.class)` → null → NPE on `.filter(...)`, whether
+        // the member is an `int`, an enum or a `Class`. Fall back to the real
+        // `Method.getName()` before giving up.
+        let mut mname = match ctx.get_field_by_name(method_obj, "name") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
+        if mname.is_empty() {
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(method_obj, "getName", "()Ljava/lang/String;", &[])
+            {
+                mname = ctx.read_string(s).unwrap_or_default();
+            }
+            if crate::nbflags().dbg_annproxy_wrap {
+                eprintln!(
+                    "[DBG_WRAP] invokeProxy: Method.name field was unreadable; getName() -> {mname:?}"
+                );
+            }
+        }
         // Object-inherited methods: `ctx.invoke("AnnotationProxy", mname, ...)`
         // below does not reliably resolve these (the by-name path used by this
         // 2nd call site doesn't reach `annotation_proxy_dispatch_impl`'s

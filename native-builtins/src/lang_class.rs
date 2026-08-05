@@ -10880,6 +10880,7 @@ fn cached_annotation_proxy_for_key(
     holder_class_id: ClassId,
     key: String,
     ann: &cratonvm_native_api::AnnotationData,
+    ann_class_id: ClassId,
 ) -> ObjectRef {
     let key = (holder_class_id.as_u32(), key);
     if let Some(&cached) = annotation_proxy_cache()
@@ -10908,7 +10909,13 @@ fn cached_annotation_proxy_for_key(
             }
         );
     }
-    let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
+    let proxy = create_annotation_proxy_with_type(
+        ctx,
+        ann,
+        ann_class_id,
+        Some(holder_class_id),
+        container_loader,
+    );
     let mut guard = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -10920,6 +10927,24 @@ fn cached_annotation_proxy_for_key(
     cached
 }
 
+/// [`cached_annotation_proxy`] for the `getAnnotation`-style call sites, which
+/// hold only the holder class. `None` when the annotation's own type does not
+/// resolve — the same omission `getDeclaredAnnotations()` makes, rather than a
+/// proxy whose `annotationType()` is null.
+fn cached_annotation_proxy_resolving(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> Option<ObjectRef> {
+    let ann_class_id = resolve_annotation_type_near(ctx, ann, Some(queried_class_id))?;
+    Some(cached_annotation_proxy(
+        ctx,
+        queried_class_id,
+        ann,
+        ann_class_id,
+    ))
+}
+
 /// Build-or-fetch the cached annotation proxy for a class annotation. Keep the
 /// historical key shape for class entries so existing class annotation identity
 /// remains unchanged.
@@ -10927,8 +10952,15 @@ fn cached_annotation_proxy(
     ctx: &mut dyn NativeContext,
     queried_class_id: ClassId,
     ann: &cratonvm_native_api::AnnotationData,
+    ann_class_id: ClassId,
 ) -> ObjectRef {
-    cached_annotation_proxy_for_key(ctx, queried_class_id, ann.type_descriptor.clone(), ann)
+    cached_annotation_proxy_for_key(
+        ctx,
+        queried_class_id,
+        ann.type_descriptor.clone(),
+        ann,
+        ann_class_id,
+    )
 }
 
 /// Cache key for an annotation declared directly on a reflected method or
@@ -10944,12 +10976,14 @@ fn cached_method_annotation_proxy(
     method_name: &str,
     method_desc: &str,
     ann: &cratonvm_native_api::AnnotationData,
+    ann_class_id: ClassId,
 ) -> ObjectRef {
     cached_annotation_proxy_for_key(
         ctx,
         declaring_class_id,
         method_annotation_proxy_key(method_name, method_desc, &ann.type_descriptor),
         ann,
+        ann_class_id,
     )
 }
 
@@ -11695,17 +11729,132 @@ fn resolve_annotation_class_via_loader(
     result
 }
 
+/// The deferred sentinel for an annotation-valued member (or array entry)
+/// whose own annotation type is unresolvable. Reuses the process-wide,
+/// permanently-rooted `TypeNotPresentException` instance so this path never
+/// allocates — see [`shared_unresolvable_class_sentinel`] for why that matters
+/// inside the element loop.
+fn unresolvable_nested_annotation_sentinel(
+    ctx: &mut dyn NativeContext,
+    nested: &cratonvm_native_api::AnnotationData,
+) -> Option<ObjectRef> {
+    if crate::nbflags().iae_trace_ok {
+        eprintln!(
+            "ANN-NESTED-UNRESOLVABLE type_descriptor={} — member deferred to TypeNotPresentException",
+            nested.type_descriptor
+        );
+    }
+    shared_unresolvable_class_sentinel(ctx)
+}
+
+/// Resolve the `ClassId` backing an annotation's declared TYPE — the single
+/// source of truth for [`annotation_type_loadable_near`] (which decides whether
+/// an annotation is surfaced at all) and [`create_annotation_proxy_with_type`]
+/// (which builds it).
+///
+/// The two MUST agree. When the filter admits an annotation whose type the
+/// builder then fails to resolve, the builder publishes an `AnnotationProxy`
+/// with a **null type mirror** — and, because the `AnnotationDefault` backfill
+/// is gated on this same ClassId, with none of its defaulted members filled in.
+/// Every reflective annotation walker then dereferences a null:
+/// Spring's `AnnotationsScanner.isIgnorable(annotation.annotationType())`,
+/// JUnit's `AnnotationUtils.findRepeatableAnnotations`
+/// (`candidateAnnotationType.equals(containerType)`), and Byte Buddy's
+/// `ForFieldBinding.bind` (`declaringType(annotation).represents(void.class)`,
+/// where `declaringType()` is exactly such a never-backfilled
+/// `Class`-valued member defaulting to `void.class`).
+///
+/// Order mirrors HotSpot's `AnnotationParser`: the declaring class's
+/// ("container's") own loader, then that class's namespace, then the
+/// loader-blind global index, and only then a load. The `_near` retry AFTER the
+/// load is what the two lookups used to disagree about: `class_id_by_name` is
+/// `find_unique_class_by_name`, which answers `None` for an AMBIGUOUS name, so
+/// the moment a second loader defines the same annotation type the global
+/// lookup goes blind while the scoped one still resolves.
+fn resolve_annotation_type_class_id(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    container_class_id: Option<ClassId>,
+    container_loader: Option<ObjectRef>,
+) -> Option<ClassId> {
+    // `resolve_annotation_class_via_loader` re-enters Java (`loadClass`) and
+    // allocates, so the loader reference has to stay rooted across it.
+    let loader_pin = container_loader.map(|loader| ctx.pin_native_root(loader));
+    let via_loader = match (container_loader, loader_pin) {
+        (Some(loader), Some(pin)) => {
+            let loader_cur = ctx.read_native_pin(pin, loader);
+            match resolve_annotation_class_via_loader(ctx, loader_cur, class_name) {
+                Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                // The loader threw (the classloader-isolation filter case) or
+                // returned nothing. Fall through to the global resolution
+                // below, preserving the prior best-effort behaviour.
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(pin) = loader_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    via_loader
+        .or_else(|| container_class_id.and_then(|h| ctx.class_id_by_name_near(class_name, h)))
+        .or_else(|| ctx.class_id_by_name(class_name))
+        .or_else(|| {
+            let _ = ctx.load_class(class_name);
+            ctx.class_id_by_name(class_name).or_else(|| {
+                container_class_id.and_then(|h| ctx.class_id_by_name_near(class_name, h))
+            })
+        })
+        .or_else(|| {
+            // Last resort, mirroring the `Enum`-valued member arm: resolve
+            // through the declaring member's INITIATING loader. A bare global
+            // lookup can miss an application dependency that is visible to
+            // that member and can lose identity under an isolated loader.
+            container_class_id
+                .and_then(|h| ctx.class_id_by_name_via_referencing_class(h, class_name).ok())
+        })
+}
+
+/// [`create_annotation_proxy_with_type`] for callers that have not already
+/// resolved the annotation's type. `None` means the type is unresolvable, in
+/// which case NO proxy is built — a proxy with a null `annotationType()` must
+/// never reach Java (see [`resolve_annotation_type_class_id`]).
+fn create_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    ann: &cratonvm_native_api::AnnotationData,
+    container_class_id: Option<ClassId>,
+    container_loader: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    let class_name = annotation_desc_to_class_name(&ann.type_descriptor)?;
+    let owned = class_name.to_string();
+    let cid =
+        resolve_annotation_type_class_id(ctx, &owned, container_class_id, container_loader)?;
+    Some(create_annotation_proxy_with_type(
+        ctx,
+        ann,
+        cid,
+        container_class_id,
+        container_loader,
+    ))
+}
+
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
+///
+/// `ann_class_id` is the already-resolved annotation interface — see
+/// [`resolve_annotation_type_class_id`]. Taking it as a parameter (rather than
+/// re-deriving it here) is what keeps the "is this annotation surfaced at all?"
+/// decision and the proxy's type mirror from ever disagreeing.
 ///
 /// `container_loader` is the defining ClassLoader of the class on which the
 /// annotation is declared (the "container" in HotSpot's `AnnotationParser`).
 /// When present (a user-defined loader), Class-valued members are resolved
 /// through it so classloader-isolation patterns are honored; `None` keeps the
 /// global resolution used for app/bootstrap-loaded classes.
-fn create_annotation_proxy(
+fn create_annotation_proxy_with_type(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
+    ann_class_id: ClassId,
     container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
@@ -11739,77 +11888,27 @@ fn create_annotation_proxy(
     ctx.unpin_native_roots(desc_pin);
     let mut child_roots = vec![desc_str_cur];
 
-    let mut ann_class_id_opt = None;
-    // Try to get the Class mirror for the annotation type. Load the annotation
-    // class on demand if it hasn't been loaded yet вЂ” JUnit4's TestClass scanner
-    // calls Annotation.annotationType() expecting a non-null Class (C44). If
-    // this field is null, BlockJUnit4ClassRunner reports a dummy failure
-    // because runsTopToBottom(Class) NPEs on equals().
-    if let Some(class_name) = annotation_desc_to_class_name(&ann.type_descriptor) {
-        // Resolve the annotation TYPE through the declaring class's loader (the
-        // "container" in HotSpot's `AnnotationParser`) when one is supplied, so a
-        // child/isolating loader's OWN copy of the annotation interface is used.
-        // The type mirror backs `annotation.getClass()` and
-        // `annotation.annotationType()`, both of which must report the declaring
-        // loader for classloader-isolation patterns
-        // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
-        // A meta-annotation that the child loader is NOT eligible to override
-        // delegates to the parent here, so it correctly reports the parent loader.
-        // Falls back to the global store for built-in loaders / on any loader
-        // failure (preserving the prior best-effort behavior).
-        // Resolve the annotation type through the declaring class's loader.
-        // ModifiedClassPathClassLoader deliberately owns child copies of the
-        // JAXB API and runtime; matching HotSpot requires this exact identity,
-        // not its application-loader sibling.
-        let via_loader = match (container_loader, container_loader_pin) {
-            (Some(loader), Some(pin)) => {
-                let loader_cur = ctx.read_native_pin(pin, loader);
-                match resolve_annotation_class_via_loader(ctx, loader_cur, class_name) {
-                    Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
-                    Err(_) => None,
-                }
-            }
-            _ => None,
-        };
-        // App-loader classes do not have an ObjectRef recorded in
-        // `defining_loader_for`, but they still carry a loader id in the class
-        // manager. Prefer that namespace before the flat global index: once an
-        // isolated Spring test has loaded a child copy of `OnBeanCondition`, a
-        // global lookup can otherwise make an annotation on an app-loader
-        // configuration class instantiate the child condition class.
-        let via_container_scope = container_class_id.and_then(|holder| {
-            ctx.class_id_by_name_near(class_name, holder)
-                .map(|cid| (cid, ctx.get_class_mirror(cid)))
-        });
-        let cid_mirror = via_loader.or(via_container_scope).or_else(|| {
-            let cid = ctx.class_id_by_name(class_name).or_else(|| {
-                // load_class returns the mirror; we only need the ClassId, so just
-                // trigger the load and re-query by name.
-                let _ = ctx.load_class(class_name);
-                ctx.class_id_by_name(class_name)
-            })?;
-            Some((cid, ctx.get_class_mirror(cid)))
-        });
-        if let Some((cid, mirror)) = cid_mirror {
-            ann_class_id_opt = Some(cid);
-            let mirror_pin = ctx.pin_native_root(mirror);
-            proxy = ctx.read_native_pin(proxy_pin, proxy);
-            let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
-            ctx.set_field(
-                proxy,
-                ANN_PROXY_TYPE_MIRROR,
-                Value::Object(Some(mirror_cur)),
-            );
-            let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
-            ctx.unpin_native_roots(mirror_pin);
-            child_roots.push(mirror_cur);
-        } else if crate::nbflags().iae_trace_ok {
-            eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
-                ann.type_descriptor, ann.type_descriptor);
-        }
-    } else if crate::nbflags().iae_trace_ok {
-        eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} вЂ” annotation_desc_to_class_name returned None",
-            ann.type_descriptor);
+    // The type mirror backs `annotation.getClass()` and
+    // `annotation.annotationType()`, both of which must report the declaring
+    // loader for classloader-isolation patterns
+    // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader) and
+    // both of which callers dereference WITHOUT a null check. The ClassId was
+    // resolved by `resolve_annotation_type_class_id` before this function was
+    // entered, precisely so this field can never be null.
+    let ann_class_id_opt = Some(ann_class_id);
+    {
+        let mirror = ctx.get_class_mirror(ann_class_id);
+        let mirror_pin = ctx.pin_native_root(mirror);
+        proxy = ctx.read_native_pin(proxy_pin, proxy);
+        let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
+        ctx.set_field(
+            proxy,
+            ANN_PROXY_TYPE_MIRROR,
+            Value::Object(Some(mirror_cur)),
+        );
+        let mirror_cur = ctx.read_native_pin(mirror_pin, mirror);
+        ctx.unpin_native_roots(mirror_pin);
+        child_roots.push(mirror_cur);
     }
 
     // Collect explicit elements with their declared return-type descriptor
@@ -12421,8 +12520,25 @@ pub(crate) fn annotation_element_to_java_typed(
                 (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                 _ => None,
             };
-            let proxy = create_annotation_proxy(ctx, nested, container_class_id, loader_cur);
-            normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
+            match create_annotation_proxy(ctx, nested, container_class_id, loader_cur) {
+                Some(proxy) => normalize_single_annotation_array(
+                    ctx,
+                    Value::Object(Some(proxy)),
+                    return_type_desc,
+                ),
+                // The nested annotation's own type is unresolvable. This arm
+                // used to hand back a proxy with a null `annotationType()` —
+                // unlike the top-level array builders, it never consulted the
+                // loadability filter. Store the deferred sentinel the
+                // Class-valued arm already uses: the member THROWS on access
+                // (HotSpot fails harder still — `getDeclaredAnnotations()`
+                // itself raises NoClassDefFoundError for the unresolvable
+                // element type), and no null-typed annotation escapes.
+                None => match unresolvable_nested_annotation_sentinel(ctx, nested) {
+                    Some(sentinel) => Value::Object(Some(sentinel)),
+                    None => Value::Object(None),
+                },
+            }
         }
         AnnotationElementValue::Array(elems) => {
             // Pick a component class for the array based on the element kind so
@@ -12664,7 +12780,16 @@ pub(crate) fn annotation_element_to_java_typed(
             // handling) never sees it — it gets a plain array back, and a
             // later `Class[]`→`String[]` conversion NPEs on the missing
             // element instead.
-            let is_class_component = comp_name_owned == "java/lang/Class";
+            //
+            // The same collapse now covers ANNOTATION-valued arrays, whose
+            // entries can carry the sentinel too when a contained annotation's
+            // own type is unresolvable — the `@Repeatable`-container shape that
+            // JUnit's `AnnotationUtils.findRepeatableAnnotations` walks
+            // (`candidateAnnotationType.equals(containerType)` on every entry).
+            // Detecting the sentinel by class rather than by declared component
+            // is unambiguous: JLS §9.6.1 admits only primitives, `String`,
+            // `Class`, enums, annotations and arrays of those as member values,
+            // so a `TypeNotPresentException` in this array is always one of ours.
             // Record only the INDEX of a sentinel hit, not the `Value` itself
             // — a later iteration's allocation could relocate it, so re-read
             // it fresh from the (freshly re-pinned) array after the loop
@@ -12696,7 +12821,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     }
                     _ => v,
                 };
-                if is_class_component && sentinel_index.is_none() {
+                if sentinel_index.is_none() {
                     if let Value::Object(Some(o)) = v_cur {
                         if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
                             == Some("java/lang/TypeNotPresentException")
@@ -12830,43 +12955,50 @@ fn annotation_type_loadable(
 
 /// Is this annotation's TYPE resolvable, as seen from `declaring_class_id`?
 ///
-/// `class_id_by_name` is `find_unique_class_by_name`: it deliberately answers
-/// `None` when a name is AMBIGUOUS, i.e. defined by more than one loader. Under
-/// classloader isolation (Spring's `@CompileWithForkedClassLoader` fork
-/// re-defines the whole framework, including the annotation types themselves)
-/// that makes every annotation on a member of a re-defined class look
-/// unloadable, so `getDeclaredAnnotations()` silently returned an EMPTY array
-/// while `getAnnotation(X)` -- which never consults this filter -- kept working.
-/// Spring's `MergedAnnotations.from(field)` goes through
-/// `getDeclaredAnnotations()`, so `@Autowired` detection found nothing and
-/// `AutowiredAnnotationBeanPostProcessor.processAheadOfTime` returned null for
-/// every forked test (`beans.factory.annotation
-/// .AutowiredAnnotationBeanRegistrationAotContributionTests`, 13 of 14 methods).
-///
-/// Resolve relative to the declaring class first (`class_id_by_name_near`,
-/// the same relation `create_annotation_proxy` uses to pick the proxy's
-/// annotation type), and only fall back to the global unique-name lookup.
+/// A thin `is_some()` over [`resolve_annotation_type_class_id`] — see
+/// [`resolvable_annotations`] for why the two must be the SAME lookup.
 fn annotation_type_loadable_near(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
     declaring_class_id: Option<ClassId>,
 ) -> bool {
-    let Some(name) = annotation_desc_to_class_name(&ann.type_descriptor) else {
-        return false;
-    };
-    if let Some(near) = declaring_class_id {
-        if ctx.class_id_by_name_near(name, near).is_some() {
-            return true;
-        }
-    }
-    if ctx.class_id_by_name(name).is_some() {
-        return true;
-    }
-    let _ = ctx.load_class(name);
-    if ctx.class_id_by_name(name).is_some() {
-        return true;
-    }
-    declaring_class_id.is_some_and(|near| ctx.class_id_by_name_near(name, near).is_some())
+    resolve_annotation_type_near(ctx, ann, declaring_class_id).is_some()
+}
+
+fn resolve_annotation_type_near(
+    ctx: &mut dyn NativeContext,
+    ann: &cratonvm_native_api::AnnotationData,
+    declaring_class_id: Option<ClassId>,
+) -> Option<ClassId> {
+    let name = annotation_desc_to_class_name(&ann.type_descriptor)?.to_string();
+    let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
+    resolve_annotation_type_class_id(ctx, &name, declaring_class_id, container_loader)
+}
+
+/// Partition `annotations` into the ones whose declared type resolves, pairing
+/// each with the resolved `ClassId`.
+///
+/// The JDK's `sun.reflect.annotation.AnnotationParser` OMITS any annotation
+/// whose type class is not resolvable (a compile-only annotation like
+/// `org.apiguardian.api.API`, whose jar isn't on the runtime classpath) — it
+/// does NOT surface a broken/null annotation, and neither may we.
+///
+/// Threading the resolved `ClassId` through to
+/// [`create_annotation_proxy_with_type`] — rather than letting the builder
+/// re-derive it — is what makes that guarantee structural: the filter and the
+/// builder cannot disagree, because there is only one lookup.
+fn resolvable_annotations<'a>(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: Option<ClassId>,
+    annotations: &'a [cratonvm_native_api::AnnotationData],
+) -> Vec<(&'a cratonvm_native_api::AnnotationData, ClassId)> {
+    annotations
+        .iter()
+        .filter_map(|a| {
+            let cid = resolve_annotation_type_near(ctx, a, declaring_class_id)?;
+            Some((a, cid))
+        })
+        .collect()
 }
 
 fn build_annotation_array(
@@ -12891,20 +13023,18 @@ fn build_annotation_array_for(
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
     let comp = annotation_component_class_id(ctx);
-    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
-        .iter()
-        .filter(|a| annotation_type_loadable_near(ctx, a, declaring_class_id))
-        .collect();
+    let resolvable = resolvable_annotations(ctx, declaring_class_id, annotations);
     let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
     let container_loader_pin =
         container_loader.map(|loader| ctx.pin_native_root(loader));
-    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    // GC-safe: `create_annotation_proxy_with_type` allocates (see `build_mirror_array`).
     let array = build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         let loader_cur = match (container_loader, container_loader_pin) {
             (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
             _ => None,
         };
-        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, loader_cur)
+        let (ann, ann_cid) = resolvable[i];
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)
     });
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
@@ -12920,14 +13050,12 @@ fn build_class_annotation_array(
     queried_class_id: ClassId,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    // Omit annotations whose type isn't loadable вЂ” see `annotation_type_loadable`.
-    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
-        .iter()
-        .filter(|a| annotation_type_loadable_near(ctx, a, Some(queried_class_id)))
-        .collect();
+    // Omit annotations whose type isn't loadable вЂ” see `resolvable_annotations`.
+    let resolvable = resolvable_annotations(ctx, Some(queried_class_id), annotations);
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
-        cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
+        let (ann, ann_cid) = resolvable[i];
+        cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)
     })
 }
 
@@ -12941,18 +13069,17 @@ fn build_method_annotation_array(
     method_desc: &str,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
-        .iter()
-        .filter(|a| annotation_type_loadable_near(ctx, a, Some(declaring_class_id)))
-        .collect();
+    let resolvable = resolvable_annotations(ctx, Some(declaring_class_id), annotations);
     let component = annotation_component_class_id(ctx);
     build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
+        let (ann, ann_cid) = resolvable[i];
         cached_method_annotation_proxy(
             ctx,
             declaring_class_id,
             method_name,
             method_desc,
-            resolvable[i],
+            ann,
+            ann_cid,
         )
     })
 }
@@ -13093,8 +13220,9 @@ pub(crate) fn native_class_get_declared_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = cached_annotation_proxy(ctx, class_id, ann);
-            return Ok(Some(Value::Object(Some(proxy))));
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                return Ok(Some(Value::Object(Some(proxy))));
+            }
         }
     }
     Ok(Some(Value::Object(None)))
@@ -13131,8 +13259,9 @@ pub(crate) fn native_class_get_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = cached_annotation_proxy(ctx, class_id, ann);
-            return Ok(Some(Value::Object(Some(proxy))));
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                return Ok(Some(Value::Object(Some(proxy))));
+            }
         }
     }
 
@@ -13145,8 +13274,9 @@ pub(crate) fn native_class_get_annotation(
                 if ann.type_descriptor == target_desc {
                     // Key by the queried class (class_id), matching HotSpot's
                     // per-class annotationData for inherited annotations.
-                    let proxy = cached_annotation_proxy(ctx, class_id, ann);
-                    return Ok(Some(Value::Object(Some(proxy))));
+                    if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                        return Ok(Some(Value::Object(Some(proxy))));
+                    }
                 }
             }
             current = ctx.superclass_of(super_id);
@@ -13361,10 +13491,15 @@ fn class_annotations_by_type_impl(
         }
     }
 
-    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    // GC-safe: `create_annotation_proxy_with_type` allocates (see
+    // `build_mirror_array`). Resolve every type up front so an unresolvable one
+    // is OMITTED here rather than published as a null-`annotationType()` proxy
+    // — see `resolvable_annotations`.
+    let resolvable = resolvable_annotations(ctx, Some(class_id), &matching);
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
+    let arr = build_mirror_array(ctx, resolvable.len(), |ctx, i| {
+        let (ann, ann_cid) = resolvable[i];
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -13437,10 +13572,15 @@ pub(crate) fn native_method_get_annotations_by_type(
     let matching =
         directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
-    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    // GC-safe: `create_annotation_proxy_with_type` allocates (see
+    // `build_mirror_array`). Resolve every type up front so an unresolvable one
+    // is OMITTED here rather than published as a null-`annotationType()` proxy
+    // — see `resolvable_annotations`.
+    let resolvable = resolvable_annotations(ctx, Some(class_id), &matching);
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
+    let arr = build_mirror_array(ctx, resolvable.len(), |ctx, i| {
+        let (ann, ann_cid) = resolvable[i];
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -13603,8 +13743,10 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = annotation_container_loader(ctx, class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, Some(class_id), container_loader);
-            return Ok(Some(Value::Object(Some(proxy))));
+            if let Some(proxy) = create_annotation_proxy(ctx, ann, Some(class_id), container_loader)
+            {
+                return Ok(Some(Value::Object(Some(proxy))));
+            }
         }
     }
     Ok(Some(Value::Object(None)))
@@ -13741,9 +13883,17 @@ pub(crate) fn native_method_get_annotation(
     }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy =
-                cached_method_annotation_proxy(ctx, class_id, &method_name, &method_desc, ann);
-            return Ok(Some(Value::Object(Some(proxy))));
+            if let Some(ann_cid) = resolve_annotation_type_near(ctx, ann, Some(class_id)) {
+                let proxy = cached_method_annotation_proxy(
+                    ctx,
+                    class_id,
+                    &method_name,
+                    &method_desc,
+                    ann,
+                    ann_cid,
+                );
+                return Ok(Some(Value::Object(Some(proxy))));
+            }
         }
     }
     Ok(Some(Value::Object(None)))
