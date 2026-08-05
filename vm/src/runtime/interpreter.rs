@@ -3989,6 +3989,22 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    // osr-02 frame comparator: record the back-edge ARRIVAL here, ahead of
+    // every early return below.
+    //
+    // The placement is the whole point. This function is the one funnel all
+    // fourteen back-edge sites go through, and the records have to be taken
+    // under conditions that do NOT depend on OSR — the ground-truth arm runs
+    // `--nojit`, where every check below would decline. A hook placed after the
+    // virtual-thread test, the `CRATONVM_JIT_OSR` gate or the backoff schedule
+    // would emit in one arm and not the other, and the comparison would be
+    // between two different things rather than between two runs of one.
+    //
+    // Costs one `OnceLock` bool load when the flag is unset, on a path that
+    // already performs several cached environment reads.
+    if osr_frame_trace::enabled() {
+        osr_frame_trace::record_arrival(&thread.frames[*frame_idx], entry_pc);
+    }
     if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
         return OsrBackoffOutcome::Skip;
     }
@@ -7353,6 +7369,10 @@ mod native_override;
 pub use native_override::*;
 mod jit_bridge;
 pub use jit_bridge::*;
+// The frame-level half of the osr-02 exit differential: back-edge arrivals and
+// OSR-exit resumed frames, in one format, under one flag. Inert unless
+// `CRATONVM_DBG_OSR_FRAME_TRACE` names a class substring.
+mod osr_frame_trace;
 
 // ---------------------------------------------------------------------------
 // Helper: loader-faithful ARRAY class resolution (JVMS §5.3.3)
