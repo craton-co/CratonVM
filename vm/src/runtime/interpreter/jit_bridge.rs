@@ -1541,6 +1541,22 @@ pub(super) fn try_osr(
         }
     };
 
+    // osr-02 frame comparator: record the ENTRY frame — the state compiled code
+    // is about to start from. Here, because the entry has validated and nothing
+    // has run yet.
+    //
+    // Without this record the comparator cannot see a replay at all: compiled
+    // iterations produce no back-edge arrivals, so "entered at frame 5, ran to
+    // 12, resumed at 5" and "entered at 5 and advanced nothing" are the same
+    // sequence of arrival indices, both strictly increasing. A hand-written
+    // fixture modelling the historical defect passed without it. Paired with
+    // the next exit record this makes the advance a MEASURED quantity —
+    // `index(X) - index(E)` over the un-compiled run's own trajectory, not
+    // anything the JIT claims.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_entry(&thread.frames[frame_idx], entry_pc);
+    }
+
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
     // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the

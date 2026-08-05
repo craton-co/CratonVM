@@ -431,6 +431,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "owner-filter", on_key: Some("CRATONVM_DBG_OWNER_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-after", on_key: Some("CRATONVM_OSR_EXIT_AFTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-test", on_key: Some("CRATONVM_OSR_EXIT_TEST"), off_key: None, off_word: None },
+    // Takes a VALUE, not a presence: a class-name substring restricting the
+    // frame trace. The grouped spelling expands to `=1`, which matches no class
+    // name, so `CRATONVM_DBG=osr-frame-trace` arms nothing on its own — which is
+    // deliberate. An unfiltered frame trace emits a line per back edge in the
+    // JDK. Set `CRATONVM_DBG_OSR_FRAME_TRACE=<substring>` directly. Declared
+    // here anyway, because an undeclared name is served from live `getenv`
+    // rather than the latched snapshot and is invisible to the override hook.
+    E { group: Group::DBG, token: "osr-frame-trace", on_key: Some("CRATONVM_DBG_OSR_FRAME_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
