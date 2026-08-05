@@ -57,11 +57,23 @@ time, ranges disjoint), and all seven phase checksums identical.
 
 ## What it leaves open
 
-A **1.32x residual** against the 2026-07-23 single-pass body, which is the other
-per-call instrumentation the IR body carries and the single-pass body did not —
-the prologue slot zeroings, the frame record on entry *and after every call
-return*, the per-call bytecode-index store, and the epilogue savetop-restore on
-all four exits. **Every one is provably dead under the same
-`!shadow_pushed_any` condition that erases the fetch**, so the next increment is
-to record those spans and erase them the same way. Deliberately not bundled in,
-so the 1.74x attributes to one change.
+A **1.32x residual** against the 2026-07-23 single-pass body — the other
+per-call instrumentation the IR body carries and the single-pass body did not.
+Most of it is **not** a defect:
+
+- the frame record (`mov [fs:...],rbp`) on entry and after every call return is
+  the innermost-RBP mirror the stack walker reads;
+- the per-call safepoint-id store is what `vm/src/jit/conservative_roots.rs`
+  reads to pick the active oop map for **precise root scanning**.
+
+Neither is shadow-dependent, and deleting metadata is not the way to close a
+gap. The only genuinely dead part is the **epilogue savetop-restore** on all
+four exits (~3 instructions of ~73): with nothing published there is no push to
+unwind, so its guard can only fall through. That is worth about 1.32x -> 1.27x.
+The prologue slot zeroings should *stay* even though they look like bookkeeping
+for that guard — the slot remains readable, and garbage there instead of a
+deterministic zero is the exact shape of an already-documented SIGSEGV on the
+single-pass side.
+
+The remainder is the same open policy question `perf-01` raised: nothing today
+compares an IR body against the C1 body it replaces before keeping it.
