@@ -7717,10 +7717,25 @@ pub fn register_essential_natives_with_shims(
     // are interleaved.) Kept registered because synthetic-jdk mode still needs
     // it -- there the drop does not apply.
     //
-    // Re-examine with suite numbers when they are available: this is one
-    // microbenchmark on a loaded host, and `String.hashCode` is hot in every
-    // real workload. If it comes back, it comes back with those numbers and a
-    // `register_with_kind` stating the kind.
+    // Those numbers were asked to be re-checked against a real workload on the
+    // Linux host before this was final. Done, same day, on two dev-tip binaries
+    // differing only in this registration's kind: in-VM `javac` over 60 classes
+    // whose constants are UTF-16 `HashMap` keys, A-B-B-A, two rounds —
+    //
+    //   native    97408  95020  95599  87269 ms
+    //   bytecode  98888  86560  90650  87245 ms
+    //
+    // — fully overlapping, on a corpus picked to maximise the effect. The
+    // microbenchmark above also reproduced independently (medians: cold 100 vs
+    // 108 latin1, 148 vs 150 utf16; warm 6/7 vs 3/2; map 120 vs 121). So the
+    // native does not come back.
+    //
+    // A first, NON-interleaved pass of that javac A/B reported 49.8 s against
+    // 71.0 s — a clean 1.43x, every native round below every bytecode round —
+    // and it did not survive A-B-B-A on a loaded host. That is the third perf
+    // claim in this feature to fail re-measurement and the second where the
+    // ordering of the runs decided the answer. On this host an A/B that is not
+    // A-B-B-A interleaved is not a measurement.
     registry.register(
         "java/lang/String",
         "hashCode",
@@ -38850,13 +38865,44 @@ fn native_array_new_instance_multi(
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WP2.5-B — generated-proxy-class cache, keyed on
-/// `(loader_id, ordered_iface_class_ids)`. One generated `$ProxyN` class
-/// per (loader, ordered-interface-list) — the JDK `ProxyGenerator` does the
-/// same, keying on interface order so `getInterfaces()` round-trips the
-/// user-requested order.
+/// `(vm_identity, loader_id, ordered_iface_class_ids)`. One generated
+/// `$ProxyN` class per (VM, loader, ordered-interface-list) — the JDK
+/// `ProxyGenerator` does the same minus the VM, keying on interface order so
+/// `getInterfaces()` round-trips the user-requested order.
+///
+/// The `vm_identity` is load-bearing, not hygiene. Every other component of
+/// this entry is a per-VM number: `loader_id` is a small per-VM integer, the
+/// key's `ClassId`s are minted per VM from zero, and **the VALUE is a
+/// `ClassId`** — a handle that means nothing outside the class manager that
+/// issued it. Without the partition, VM B asking for a proxy over its
+/// interface `ClassId(42)` hit VM A's entry and was handed VM A's generated
+/// `$ProxyN` id. `class_name_of_id` then answered `None` for it, which is the
+/// `?` in the `ClassCastException: ? cannot be cast to …` that made the
+/// proxy/annotation corpus tests flip in roughly half of all parallel runs —
+/// in both directions, since the borrowed id sometimes happened to satisfy
+/// the cast and sometimes not.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
-    Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
+    Option<
+        rustc_hash::FxHashMap<
+            (usize, u32, Vec<cratonvm_types::ClassId>),
+            cratonvm_types::ClassId,
+        >,
+    >,
 > = parking_lot::RwLock::new(None);
+
+/// Drop every generated-proxy-class row belonging to `vm_identity`. Called
+/// from `release_vm_native_state`; the rows hold `ClassId`s into a class
+/// manager that is going away.
+pub fn forget_vm_proxy_classes(vm_identity: usize) {
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, _), _| *vm != vm_identity);
+    }
+    let mut modules = PROXY_LOADER_MODULES.write();
+    if let Some(map) = modules.as_mut() {
+        map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
 
 /// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
 /// per-loader counters; a global counter is sufficient here since the
