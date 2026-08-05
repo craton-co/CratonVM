@@ -239,6 +239,21 @@ those counts, so `run-hib.sh categorize` routes it to `passed.txt` and a
 untracked despite its own header requiring it to be force-added past the
 `apps/` gitignore; it is now tracked and LF-pinned like its sibling.
 
+Suite state on the merged tree:
+
+* `apps/hib-suite-runner`, `passed.txt[0..240)`, real JDK, JIT on — **240/240
+  PASS** on the fixed binary (two slices, 60 + 180).
+* `cargo test -p cratonvm-native-builtins --lib` — 3267 passed, 0 failed.
+* `cargo test -p cratonvm-vm --lib` — 2401 passed, **2 failed**:
+  `native::jni::tests::jni_function_table_extended_to_234` and
+  `jni_nio_slots_not_stub`. Both are pre-existing and unrelated — re-run on
+  unmodified `dev` (`a0a648dfc`) they fail identically, same assertion, same
+  folded address. They are the `/OPT:ICF` casualties already recorded in
+  `../../native-call-funnel-per-call-floor-item2-20260805.md` §"`/OPT:ICF` —
+  four tests, one cause": `jni_get_module` compiles to the same bytes as
+  `jni_stub`, so the linker folds them and `assert_ne!` on the two addresses
+  cannot hold.
+
 Regression fixtures:
 
 * `vm/tests/reflective_annotation_array_component.rs` — pins all ten
