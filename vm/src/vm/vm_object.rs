@@ -1037,11 +1037,15 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      class, interleaved with `String.class.getConstructor(String.class)`,
     //      all returned the right `Constructor` against a real JDK 21 image.
     //      Nothing raised, and no `expected object reference, got int(N)`.
-    //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the
-    //      overlay-corruption hunter in `vm_exec.rs` (`overlay_write_is_destructive`)
-    //      exists precisely to report a primitive written to a reference slot,
-    //      and this write should appear in its output if the hazard is live.
-    //      **CLEAN.** The hunter reported nothing on that run.
+    //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the overlay
+    //      hunter in `vm_exec.rs` (`overlay_access_is_cross_type`) exists
+    //      precisely to report a primitive written to a reference slot, and
+    //      this write should appear in its output if the hazard is live.
+    //      **CLEAN.** The hunter reported nothing on that run. Note the hunter
+    //      was widened on 2026-08-05 (L4): it now also instruments READS and
+    //      fires on any slot where CratonVM's fabricated model and the loaded
+    //      image disagree, so this check is worth re-running — the 2026-08-04
+    //      silence was over a strictly narrower detector.
     //   3. Confirm which readers still depend on slot 0: the reverse map
     //      (`class_mirrors_reverse` / `class_id_from_mirror`) is the primary
     //      path, and `mirror_class_id` in `native-builtins/src/lang_class.rs`

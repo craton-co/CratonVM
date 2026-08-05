@@ -574,6 +574,28 @@ jobs:
         shell: bash
         run: sh scripts/jdk-only-census.sh --selftest
 
+      # The L6 bridge ratchet's own logic, on the same terms and for the same
+      # reasons: stdlib-only python, seconds, no cargo build, no JDK image, no
+      # cratonvm binary, so it belongs in this job rather than paying for a
+      # build four times in the `jdk-only` matrix below. `--selftest` is handled
+      # before every prerequisite check in regression-suite/bridge-ratchet.sh.
+      #
+      # What it proves is that the gate can fail: it injects an unadjudicated
+      # `Bridge` (a registration onto a method the image declares with concrete
+      # bytecode) into a synthetic census and requires rejection, AND injects an
+      # adjudicated one it must accept — so the gate is shown not to be merely
+      # always-red. It also pins every refusal path to exit 2, because a gate
+      # that cannot answer must not report a pass. The gate's *measured* half
+      # needs a JDK and runs in the `jdk-only` job below.
+      #
+      # BLOCKING, like its neighbour and for the same reason: it depends on no
+      # runtime image, no committed baseline and no corpus, so it is
+      # deterministic today. If it goes red, the ratchet in the job below is not
+      # evidence of anything.
+      - name: Bridge-ratchet gate self-test (no build, no JDK, no network)
+        shell: bash
+        run: sh regression-suite/bridge-ratchet.sh --selftest
+
   # JDK-only mode (`--jdk-only`), per docs/feature-designs/jdk-only-mode.md.
   # "Real class bytes are authoritative": no fabricated compatibility classes,
   # no `NativeKind::SyntheticStub` registered or invoked.
@@ -832,6 +854,68 @@ jobs:
             grep -n '"compatibility-stub"' "$f" | head -n 40
             exit 1
           fi
+
+      # THE BRIDGE RATCHET
+      # (docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+      #
+      # Contract §1.5 defines a `Bridge` by its `ACC_NATIVE` target. 10,069 of
+      # the 10,842 `Bridge` registrations have none, every one of them inherited
+      # its kind from an ambient `set_category`, and nothing stopped that number
+      # rising. This freezes it, slack-free, against
+      # scripts/baselines/jdk-only-bridge-ratchet.json.
+      #
+      # IT TAKES ITS OWN CENSUS, on purpose. The `image_declaring_method` column
+      # this gate reads is populated only under `--explain-jdk-only`, which
+      # scripts/jdk-only-census.sh does not pass — so the dumps produced above
+      # carry a null column and could not answer this question. The extra run
+      # boots the VM and prints one line; the numbers are workload-independent
+      # (registration happens in `SharedVm::new`, and the image adjudication
+      # parses class-path bytes without loading anything), which was verified
+      # against the breadth-first `JdkOnlyCensusLoadProbe` rather than assumed.
+      #
+      # BASELINES ARE KEYED `<jdk-feature>/<os>` and only `25/linux` is
+      # committed, so three of this matrix's four legs REFUSE (exit 2) instead
+      # of scoring one image's census against another image's numbers. A refusal
+      # is reported and does NOT fail the step — it is not a pass either, and
+      # the notice says so. Exit 1, the ratchet actually firing, does fail.
+      # Gating another leg is one `--update-baseline` run against the image that
+      # leg pins; never a hand-edited number.
+      #
+      # run.sh's convention: this job builds debug, so CV is pointed at it
+      # rather than paying for a release build.
+      - name: Bridge ratchet (unadjudicated Bridge registrations)
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          rc=0
+          CV="$CV" sh regression-suite/bridge-ratchet.sh || rc=$?
+          case "$rc" in
+            0)
+              echo "bridge ratchet: pass."
+              ;;
+            2)
+              echo "::notice::bridge ratchet: no committed baseline for this matrix leg."
+              echo "  The key is <jdk-feature>/<os> and only 25/linux is committed. This"
+              echo "  leg is not gated; that is a gap, not a pass. Take a baseline with"
+              echo "  'sh regression-suite/bridge-ratchet.sh --update-baseline --note ...'"
+              echo "  on the image this leg pins."
+              ;;
+            1)
+              echo "::error::bridge ratchet FIRED: a Bridge registration was added whose"
+              echo "  target the JDK image does not declare ACC_NATIVE. Contract 1.5 defines"
+              echo "  a Bridge by that target. State the kind at the registration site with"
+              echo "  register_with_kind() and make it SyntheticStub/Intrinsic, or delete it"
+              echo "  so the real bytecode runs. Do not raise the baseline. See the table"
+              echo "  printed above for which bucket grew."
+              exit 1
+              ;;
+            *)
+              echo "::error::bridge-ratchet.sh exited $rc (3 = a prerequisite is missing, or"
+              echo "  the census run was killed by its timeout, so nothing was measured)."
+              exit "$rc"
+              ;;
+          esac
 
       # PRECONDITION NOW MET — re-verified against `regression-suite/run.sh` at
       # this commit, where it was NOT met one commit ago. The suite expands

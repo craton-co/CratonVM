@@ -34,6 +34,16 @@ below it is the original filing.
 | 10 — `System.exit` bypasses the census | [`jdk-only-system-exit-census-FIXED-20260804.md`](../../internal/jdk-only-system-exit-census-FIXED-20260804.md) |
 | 8 — the real-protected-stub allow-lists | [`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) |
 
+## 2026-08-05 — one record added
+
+[`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
+`native-io` `Bridge` registrations that L5's `register_with_kind` migration
+declined to claim, because the JDK 25 image declares no `ACC_NATIVE` target for
+them. Reclassification questions, not migration ones. The largest is 25 `Bridge`
+registrations on VM-minted `cratonvm/synthetic/Process*` classes — the
+`Function$Identity` shape (a surviving `Bridge` whose receiver class §5 forbids)
+found in a second place.
+
 **Found and fixed while working this list, not filed here before:**
 [`--jdk-only` could not start a thread](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).
 §7 step 3's decline fell through to `UnsatisfiedLinkError` rather than to the
