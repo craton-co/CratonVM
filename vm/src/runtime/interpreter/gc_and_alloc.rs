@@ -3604,6 +3604,31 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             }
         }
     }
+    // H2-CID0: once per collection per thread, ask whether any LIVE frame slot
+    // now points into memory the collector reclaimed. The blocked-region
+    // deposit/wake pair covers a PARKED thread; this covers a RUNNING one, and
+    // it bounds the loss window to "since the previous safepoint" — which no
+    // reader-side reporter can do, because by the time a `checkcast` or an
+    // `invoke` trips over the address, any number of collections have passed.
+    //
+    // One relaxed load per publish on the common path; the frame walk runs only
+    // when the collection counter actually moved. Unconditional, and that is
+    // the point: this family has been chased across four sessions on runs that
+    // were never armed.
+    {
+        thread_local! {
+            static AUDIT_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.mem.heap.collection_count();
+        let prev = AUDIT_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            crate::memory::reclaim_guard::audit_thread_frames(
+                shared,
+                thread,
+                "running frame slot (safepoint)",
+            );
+        }
+    }
     // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
     // thread, verify no frame slot holds an already-forwarded (quarantined)
     // address at the safepoint publish. A hit here bounds the miss window to

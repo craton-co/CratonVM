@@ -6369,6 +6369,83 @@ impl GenerationalHeap {
         // `young_from`/`young_to` for the NEXT cycle — is identical to the
         // plain `young_from.reset()` this replaces; only the mechanics of
         // clearing memory differ.
+        // ---- CRATONVM_DBG_SWEEP_LIVENESS, MOVING path (H2-CID0) ------------
+        //
+        // Everything this flag checked lived in `sweep_young_non_moving`, so
+        // the whole assertion was silent on a cycle that actually COPIED. That
+        // is a real hole, because the family's reader-side verdict has now
+        // named a copying-cycle address:
+        //
+        //   NoSuchMethodError method="java/lang/Object.put(...)"
+        //        caller="org/h2/engine/ConnectionInfo.readProperties @pc=95"
+        //   gc::guard: receiver points into RECLAIMED memory …
+        //        location=young TO-space (the inactive semispace)
+        //
+        // `pc=95` is `this.prop.put(key, value)` — the receiver came out of a
+        // HEAP FIELD via `getfield`, and the address it holds is in the
+        // semispace a moving collection evacuated and is about to wipe.
+        // Neither the root-side nor the dead-span-side invariant can see that:
+        // the object SURVIVED (some other reference kept it), it is the
+        // referring FIELD that was never rewritten.
+        //
+        // Ask it directly, at the one moment the answer still exists — after
+        // every fixup this cycle will do, before the arena is reset: does any
+        // OLD-generation slot still point into the from-space we just
+        // evacuated? A hit is an old->young edge the card table did not
+        // deliver, and it names the referrer's class and slot.
+        //
+        // Costs a full old-gen walk per MOVING young collection, which is why
+        // it is behind the flag. It uses the old-gen guard this collector call
+        // already holds: `parking_lot::Mutex` is not reentrant, so re-locking
+        // here deadlocks the collector at a safepoint with every mutator
+        // stopped — the first version's `try_lock` reported SKIPPED on every
+        // cycle, which is how that was found.
+        if gc_flags().dbg_sweep_liveness {
+            let lo = young_from.base_ptr() as usize;
+            let hi = lo + young_from.used();
+            let mut hits = 0usize;
+            let mut old_scanned = 0usize;
+            let mut first: Option<(usize, u32, usize, usize, bool)> = None;
+            for (obj_ptr, _size) in old_gen.walk_objects() {
+                old_scanned += 1;
+                // SAFETY: `walk_objects` yields valid old-gen object starts.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // SAFETY: a walked old-gen object has a valid header and an
+                // in-bounds body — `for_each_ref_slot`'s contract.
+                unsafe {
+                    for_each_ref_slot(obj_ptr, h, |ref_ptr, slot| {
+                        let victim = ref_ptr as usize;
+                        if victim >= lo && victim < hi {
+                            hits += 1;
+                            if first.is_none() {
+                                // SAFETY: `victim` is inside the mapped,
+                                // not-yet-reset from-space arena.
+                                let vh = &*(victim as *const ObjectHeader);
+                                first = Some((
+                                    victim,
+                                    h.class_id.as_u32(),
+                                    obj_ptr as usize,
+                                    slot,
+                                    vh.is_forwarded(),
+                                ));
+                            }
+                        }
+                    });
+                }
+            }
+            eprintln!(
+                "[SWEEP-LIVENESS moving] hits={hits} old_gen_scanned={old_scanned} \
+                 from_space=0x{lo:x}..0x{hi:x}",
+            );
+            if let Some((victim, cid, referrer, slot, fwd)) = first {
+                eprintln!(
+                    "[SWEEP-LIVENESS moving]   an OLD-GEN slot still points into the evacuated \
+                     from-space: victim=0x{victim:x} forwarded={fwd} <- referrer=0x{referrer:x} \
+                     class_id={cid} slot={slot}. The arena is wiped next, so this field will \
+                     read an all-zero header.",
+                );
+            }
+        }
         if crate::stale_objref_debug::enabled() {
             let cycles = crate::stale_objref_debug::quarantine_cycles();
             let mut reuse = if quarantine.len() >= cycles {
