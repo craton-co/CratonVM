@@ -47,8 +47,19 @@
 //! `synthetic_stub_fields`) the diff is much sharper: a name that does not match
 //! the real declaration at that index is [`SlotVerdict::NameMismatch`], and that
 //! catches the reference-into-reference case too. Naming more of the model is
-//! therefore the way to widen this instrument, and is recorded as the follow-up
-//! rather than done here.
+//! therefore the way to widen this instrument.
+//!
+//! # `_vmN`: the slots that cannot be named right
+//!
+//! Some slots hold a value the *VM* invented — an fd, a wrapped stream, a
+//! discriminator — for which the real class declares no field anywhere. Neither
+//! spelling above describes one honestly: naming it after the real field at that
+//! index would make the diff agree with an overlay, and leaving it anonymous
+//! makes the diff go quiet about one. `_vmN` is the third spelling, and it
+//! always reports ([`SlotVerdict::VmInternal`]) when a real field exists
+//! underneath. `java/io/BufferedWriter` slot 0 is the worked example: an fd from
+//! `Files.newBufferedWriter` sitting on `java.io.Writer.writeBuffer`, which read
+//! as an innocuous `pad` for as long as the slot was anonymous.
 
 use crate::class::{Class, ClassId, ClassStore};
 use cratonvm_reader::field::ClassFileField;
@@ -74,6 +85,23 @@ pub enum SlotVerdict {
     /// model's slot count; a write here is stored and can never be seen by real
     /// bytecode.
     ModelOverruns,
+    /// The model declares this slot `_vmN`: a value the *VM* keeps on the
+    /// object — a file descriptor, a wrapped stream, a discriminator — for
+    /// which the real JDK class has no field at all. A real field does exist at
+    /// this index, so the VM's value is sitting on the JDK's storage.
+    ///
+    /// This is **kind 3** in
+    /// `docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`,
+    /// and it is the one family a corrected model cannot fix: there is nowhere
+    /// right to put the value, so it wants a side table (or an index anchored
+    /// past the real field count, which reads back as
+    /// [`SlotVerdict::ModelOverruns`] — harmless, and the shape to aim for).
+    ///
+    /// Naming these explicitly is what keeps them countable. The alternative —
+    /// leaving the slot anonymous — makes the census go quiet without anything
+    /// being fixed, which is exactly how `java/io/BufferedWriter` slot 0 hid a
+    /// live fd write behind a `pad`.
+    VmInternal,
 }
 
 impl SlotVerdict {
@@ -85,7 +113,10 @@ impl SlotVerdict {
     /// not make the access-site hunter fire.
     #[must_use]
     pub fn is_disagreement(self) -> bool {
-        matches!(self, SlotVerdict::TypeMismatch | SlotVerdict::NameMismatch)
+        matches!(
+            self,
+            SlotVerdict::TypeMismatch | SlotVerdict::NameMismatch | SlotVerdict::VmInternal
+        )
     }
 
     /// Short tag used in the census output and the per-access log line.
@@ -96,6 +127,7 @@ impl SlotVerdict {
             SlotVerdict::TypeMismatch => "TYPE",
             SlotVerdict::NameMismatch => "NAME",
             SlotVerdict::ModelOverruns => "pad",
+            SlotVerdict::VmInternal => "VM",
         }
     }
 }
@@ -193,6 +225,17 @@ fn is_anonymous_model_field(name: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Is this model field one of `vm_internal_field`'s `_vmN` slots — a value the
+/// VM parks on the object for which the real class declares no field?
+///
+/// Distinct from an anonymous `_fN` slot, which only means "the model has
+/// nothing to say here". `_vmN` is a positive claim, and against a real layout
+/// it is always a finding — see [`SlotVerdict::VmInternal`].
+fn is_vm_internal_model_field(name: &str) -> bool {
+    name.strip_prefix("_vm")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The real instance field at absolute index `index`, walking the superclass
 /// chain.
 ///
@@ -269,7 +312,11 @@ pub fn diff_against_model(
     for (index, mf) in model_instance.iter().enumerate() {
         let real = real_field_at_index(store, class_id, index);
         let verdict = match real {
+            // A `_vmN` slot past the real layout is the shape we WANT — the
+            // value is anchored on padding nobody else owns — so the overrun
+            // arm has to come first, and it stays a `pad`, not a finding.
             None => SlotVerdict::ModelOverruns,
+            Some(_) if is_vm_internal_model_field(&mf.name) => SlotVerdict::VmInternal,
             Some(rf) => {
                 if is_reference_descriptor(&mf.descriptor) != is_reference_descriptor(&rf.descriptor)
                 {
@@ -445,6 +492,65 @@ mod tests {
         );
         assert_eq!(diff.slot(1).unwrap().verdict, SlotVerdict::Agrees);
         assert_eq!(diff.disagreement_count(), 1);
+    }
+
+    /// Kind 3: the model parks a VM value on a slot the JDK owns. Neither
+    /// alternative spelling reports it — an anonymous `_fN` over a real
+    /// reference is unfalsifiable, and naming the slot after the real field
+    /// makes the diff *agree* with the overlay. `_vmN` is the only spelling
+    /// that says "a value with no home is living here".
+    #[test]
+    fn a_vm_internal_slot_over_a_real_field_is_reported() {
+        let mut store = ClassStore::new();
+        let cid = add_real(
+            &mut store,
+            "java/io/Writer",
+            None,
+            vec![field("writeBuffer", "[C"), field("lock", "Ljava/lang/Object;")],
+        );
+        // What `java/io/BufferedWriter`'s model says today.
+        let model = vec![
+            field("_vm0", "Ljava/lang/Object;"),
+            field("lock", "Ljava/lang/Object;"),
+        ];
+        let diff = diff_against_model(&store, cid, &model).expect("diff");
+        assert_eq!(diff.slot(0).unwrap().verdict, SlotVerdict::VmInternal);
+        assert_eq!(diff.slot(0).unwrap().verdict.tag(), "VM");
+        assert!(diff.is_disagreeing(0));
+        assert_eq!(diff.slot(1).unwrap().verdict, SlotVerdict::Agrees);
+        assert_eq!(diff.disagreement_count(), 1);
+
+        // The control: spelling the same slot anonymously reports NOTHING, which
+        // is the state this verdict exists to end. If this half ever starts
+        // failing, `_vmN` has stopped being load-bearing.
+        let anonymous = vec![
+            field("_f0", "Ljava/lang/Object;"),
+            field("lock", "Ljava/lang/Object;"),
+        ];
+        let quiet = diff_against_model(&store, cid, &anonymous).expect("diff");
+        assert_eq!(quiet.disagreement_count(), 0);
+    }
+
+    /// A `_vmN` past the real field count is the SHAPE TO AIM FOR — the value
+    /// sits on padding nobody owns — so it must not be reported. Otherwise
+    /// fixing an overlay by anchoring it past the layout would look like
+    /// causing one.
+    #[test]
+    fn a_vm_internal_slot_anchored_past_the_layout_is_a_pad() {
+        let mut store = ClassStore::new();
+        let cid = add_real(
+            &mut store,
+            "java/io/Writer",
+            None,
+            vec![field("writeBuffer", "[C")],
+        );
+        let model = vec![
+            field("writeBuffer", "[C"),
+            field("_vm1", "Ljava/lang/Object;"),
+        ];
+        let diff = diff_against_model(&store, cid, &model).expect("diff");
+        assert_eq!(diff.slot(1).unwrap().verdict, SlotVerdict::ModelOverruns);
+        assert_eq!(diff.disagreement_count(), 0);
     }
 
     #[test]
@@ -641,9 +747,19 @@ mod production_model_order_tests {
                 &["_f0", "_f1", "k", "v"],
             ),
             // java.io.Reader contributes lock, skipBuffer ahead of `in`.
-            ("java/io/BufferedReader", &["_f0", "_f1", "in"]),
+            // Slot 0 is `_vm0`, not `_f0`: `native_br_init` copies the wrapped
+            // reader's fd there, over `Reader.lock`.
+            ("java/io/BufferedReader", &["_vm0", "skipBuffer", "in"]),
             // java.io.Writer contributes writeBuffer, lock ahead of `out`.
-            ("java/io/BufferedWriter", &["_f0", "_f1", "out"]),
+            // Slot 0 is `_vm0`: `Files.newBufferedWriter` parks an fd there,
+            // over `Writer.writeBuffer`.
+            ("java/io/BufferedWriter", &["_vm0", "lock", "out"]),
+            // A real InputStreamReader/OutputStreamWriter declares NO `in`/`out`
+            // — the wrapped stream lives inside the StreamDecoder/StreamEncoder.
+            // The synthetic natives park one at slot 0 (and, for the reader,
+            // slot 1) anyway, so those slots are `_vmN`.
+            ("java/io/InputStreamReader", &["_vm0", "_vm1", "sd"]),
+            ("java/io/OutputStreamWriter", &["_vm0", "lock", "se"]),
             // Declaration order, NOT the CodeSource(URL, Certificate[]) ctor.
             ("java/security/CodeSource", &["location", "signers", "certs"]),
             // Fixed earlier the same day; pinned here so the whole family is
@@ -656,16 +772,84 @@ mod production_model_order_tests {
                 "java/lang/ThreadGroup",
                 &["parent", "name", "maxPriority", "daemon"],
             ),
+            // AccessibleObject declares TWO fields, and Executable adds two more
+            // on top for Method/Constructor. Leaving them out shifted every
+            // slot from index 1 down.
+            (
+                "java/lang/reflect/AccessibleObject",
+                &["override", "accessCheckCache"],
+            ),
+            (
+                "java/lang/reflect/Field",
+                &[
+                    "override",
+                    "accessCheckCache",
+                    "clazz",
+                    "slot",
+                    "name",
+                    "type",
+                    "modifiers",
+                    "trustedFinal",
+                ],
+            ),
+            (
+                "java/lang/reflect/Method",
+                &[
+                    "override",
+                    "accessCheckCache",
+                    "parameterData",
+                    "declaredAnnotations",
+                    "clazz",
+                    "slot",
+                    "name",
+                    "returnType",
+                    "parameterTypes",
+                    "exceptionTypes",
+                    "modifiers",
+                    // `pad_to(.., 15)` keeps the model's width at
+                    // `create_method_object`'s legacy floor without naming the
+                    // nine real fields between `modifiers` and `callerSensitive`.
+                    "_f11",
+                    "_f12",
+                    "_f13",
+                    "_f14",
+                ],
+            ),
+            (
+                "java/lang/reflect/Constructor",
+                &[
+                    "override",
+                    "accessCheckCache",
+                    "parameterData",
+                    "declaredAnnotations",
+                    "clazz",
+                    "slot",
+                    "parameterTypes",
+                    "exceptionTypes",
+                    "modifiers",
+                ],
+            ),
         ];
+        // Accumulate rather than assert per case. A `for` loop of `assert_eq!`
+        // stops at the first wrong class, so reverting the whole table to the
+        // pre-fix models reports ONE row and says nothing about the other eight
+        // — which makes the test look far stronger than it is when it is used
+        // (as it was) as the non-vacuity check for a family-wide fix.
+        let mut wrong: Vec<String> = Vec::new();
         for (class, want) in cases {
             let got = instance_names(class);
-            assert_eq!(
-                got.iter().map(String::as_str).collect::<Vec<_>>(),
-                *want,
-                "{class}'s fabricated model must match the real JDK declaration \
-                 order (javap -p --module java.base {})",
-                class.replace('/', ".")
-            );
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            if got != *want {
+                wrong.push(format!("  {class}\n    model: {got:?}\n    real:  {want:?}"));
+            }
         }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} fabricated models disagree with the real JDK declaration \
+             order (javap -p --module java.base <class>):\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
     }
 }

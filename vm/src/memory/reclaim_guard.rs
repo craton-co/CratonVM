@@ -308,3 +308,61 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
         }
     }
 }
+
+/// Report where a reclaimed receiver stood in THIS thread's own GC bookkeeping
+/// at the moment it was used.
+///
+/// The collector cannot read a peer's frames — it only ever sees the snapshot
+/// that peer published — so "was the root slice complete?" is not a question
+/// the sweep can answer about anyone but itself. It IS answerable here, on the
+/// thread that owns the frame, at the moment the stale address surfaces.
+///
+/// The 2026-08-05 `DriverManager.getConnection` witness is exactly this shape:
+/// a brand-new `java.util.Properties` in LOCAL 3 of the running frame, zeroed
+/// by young sweep cycle 0 while the thread sat at a safepoint, and
+/// `ROOT_IN_DEAD_SPANS` — which compares the doomed spans against the root
+/// slice the mark phase was handed — stayed silent. That narrows it to root
+/// COLLECTION, and this line says which half:
+///
+/// * `in_published_snapshot=false` — the snapshot this thread published is
+///   missing a slot its own frames hold, i.e. the publish is stale or filtered;
+/// * `in_published_snapshot=true` — the snapshot had it and the collector did
+///   not use it (a delivery problem, not a publishing one).
+///
+/// Reached only from terminal error paths, so it costs nothing until something
+/// has already gone wrong; it takes the snapshot mutex, which is why it is a
+/// separate call rather than folded into `report_reclaimed_receiver` (that one
+/// is reached in bulk on healthy runs).
+pub(crate) fn report_root_slice_provenance(thread: &JvmThread, addr: usize, site: &'static str) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+    let snap = thread.root_snapshot.lock();
+    let in_snapshot = snap.iter().any(|r| r.as_ptr() as usize == addr);
+    let snap_len = snap.len();
+    drop(snap);
+    let blocked = thread
+        .gc_block_state
+        .in_blocked_region
+        .load(std::sync::atomic::Ordering::Acquire);
+    let top = thread
+        .frames
+        .last()
+        .map(|f| format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc))
+        .unwrap_or_else(|| "<no frame>".to_string());
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        in_published_snapshot = in_snapshot,
+        published_roots = snap_len,
+        in_blocked_region = blocked,
+        frames = thread.frames.len(),
+        top_frame = %top,
+        "…and this is where that address stood in the OWNING thread's own GC \
+         bookkeeping. `in_published_snapshot=false` means the snapshot the \
+         collector marks this thread from did not contain a slot the thread's \
+         frames hold — a root COLLECTION gap, not a mark or sweep one.",
+    );
+}
