@@ -80,6 +80,10 @@ public final class SmokeConcProbe {
 		cfg.setProperty( "hibernate.cache.use_second_level_cache", "false" );
 		cfg.setProperty( "hibernate.cache.use_query_cache", "false" );
 		cfg.setProperty( "hibernate.connection.pool_size", String.valueOf( threads * 2 ) );
+		// Needed for the plan-cache counters below. The real fixture also runs
+		// with statistics on (it calls `statistics.clear()` in the test body),
+		// so this does not make the probe cheaper than what it models.
+		cfg.setProperty( "hibernate.generate_statistics", "true" );
 
 		try ( SessionFactory sf = cfg.buildSessionFactory() ) {
 			seed( sf );
@@ -93,6 +97,7 @@ public final class SmokeConcProbe {
 			runForks( warmupForks, iterations, threads, unit );
 
 			ROWS.set( 0 );
+			sf.getStatistics().clear();
 			final long start = System.nanoTime();
 			runForks( forks, iterations, threads, unit );
 			final long elapsedMs = ( System.nanoTime() - start ) / 1_000_000L;
@@ -112,6 +117,21 @@ public final class SmokeConcProbe {
 							+ "units=%d ms=%d units_per_s=%d rows=%d PROJECTED_TEST_MS=%d%n",
 					mode, forks, iterations, threads, warmupForks,
 					units, elapsedMs, rate, rows, projected );
+
+			// The workload issues the same three HQL strings for every unit, so
+			// after the warm-up the query-plan cache should serve all of them
+			// and ANTLR should not run again. A miss count that tracks the unit
+			// count instead means every `createQuery` re-parses — which is a
+			// different (and much larger) problem than slow execution, and it
+			// is invisible in a wall-clock number. Reported always, because a
+			// regression here would otherwise read as "the VM got slower".
+			System.out.printf(
+					"@@SMOKECONC-PLANCACHE hit=%d miss=%d units=%d queries_per_unit=%d%n",
+					sf.getStatistics().getQueryPlanCacheHitCount(),
+					sf.getStatistics().getQueryPlanCacheMissCount(),
+					units,
+					"full".equals( mode ) ? 3 : "parse".equals( mode ) ? 3
+							: "exec".equals( mode ) ? 1 : 0 );
 
 			if ( rows != expectedRows ) {
 				System.out.printf(

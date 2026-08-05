@@ -4,7 +4,9 @@
 # `org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency`.
 #
 # Docs: docs/internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md
-#       docs/known-issues/hibernate/smoketests-concurrent-println-timeout-20260723.md (the 120 s timeout)
+#       docs/internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md
+#         (the 120 s timeout, retired 2026-08-05 — read its correction table
+#          before quoting any number from an older revision of this comment)
 #
 # The class is the only Hibernate fixture that parks the JUnit main thread in
 # `ExecutorService.invokeAll` for 50x400 tasks while five workers churn the

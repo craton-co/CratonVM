@@ -13790,6 +13790,29 @@ fn first_unsupported_precise_frame_site(
     // Rbc6FieldProbe.java`'s `getfieldLongHandlerLocal` is the witness: one
     // `long 1000003L` literal in the protected range was the whole reason it
     // stayed interpreted while its `int` twin compiled.
+    // `instanceof` (0xc1) is deliberately NOT in this set, and it is the only
+    // member of the old `0xbb..=0xc1` range that left it.
+    //
+    // Every other opcode here is excluded because it CAN throw and its lowering
+    // does not publish a frame. `instanceof` cannot throw at all in this
+    // backend: its arm emits a single call to `helpers.instanceof_check`
+    // (`vm::jit::helpers::jit_instanceof`), and that helper returns `0` or `1`
+    // on every path — a null or implausible receiver, a non-UTF-8 class name, an
+    // address the heap does not recognise, and a target class it cannot resolve
+    // all fail soft to `0`. It never calls `set_jit_pending_exception`, and the
+    // codegen emits no post-call exception check after it because there is
+    // nothing to check. A site that raises no exception cannot hand a handler an
+    // unpublished frame, so gating on it protected nothing.
+    //
+    // It cost real coverage: `JitPreciseHandlerFrame.loopStep`'s first draft had
+    // an `instanceof` in its protected range, which refused the whole method and
+    // made that regression test read 0 mismatches in BOTH arms of its own A/B —
+    // the fixture says so in its own comment. On the Hibernate concurrency
+    // workload it is one of five distinct opcodes blocking five of the hottest
+    // still-interpreted methods (`reason=rbc6-handler-reads-unsafe-local`, which
+    // now names the pc and opcode). The other four — `new` (0xbb), `ldc` (0x12),
+    // `getstatic` (0xb2) and `athrow` (0xbf) — genuinely throw and stay here
+    // until their lowerings publish the snapshot.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
@@ -13798,7 +13821,7 @@ fn first_unsupported_precise_frame_site(
                 | 0x4f..=0x56 // array stores
                 | 0x6c | 0x6d | 0x70 | 0x71 // integer divide/remainder
                 | 0xb2..=0xba // fields, invokes, and invokedynamic
-                | 0xbb..=0xc1 // allocations, arraylength, athrow, and casts
+                | 0xbb..=0xc0 // allocations, arraylength, athrow, and checkcast
                 | 0xc5 // multianewarray
         )
     };
@@ -25006,6 +25029,9 @@ mod tests {
     /// enhanced-for's synthetic iterator — assigned before the try, read by the
     /// back edge, and reachable from the handler only through its trailing
     /// `goto`.
+    // Calls `precise_exception_frame_sites_supported`, whose admitted-opcode
+    // set is the x64 backend's — its siblings below carry the same gate.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn handler_falling_through_to_a_loop_back_edge_reads_the_iterator_local() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
@@ -25226,6 +25252,72 @@ mod tests {
             with_aaload.len(),
             &aaload_table,
         ));
+    }
+
+    /// `instanceof` inside a protected range no longer withholds coverage
+    /// (2026-08-05). It was never a throwing opcode in this backend: the 0xc1
+    /// arm emits one call to `jit_instanceof`, which returns 0 or 1 on every
+    /// path and never stashes a pending exception, and the codegen emits no
+    /// post-call exception check after it because there is nothing to check.
+    ///
+    /// This is a static-admission test. The behavioural acceptance test is
+    /// `JitPreciseHandlerFrame.instanceofStep`
+    /// (`vm/tests/jit_local_exception_handler_tests.rs`), whose handler reads a
+    /// non-parameter local and whose protected range holds an `instanceof`
+    /// alongside a throwing `invokeinterface` — run THAT before touching the
+    /// list again.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn protected_instanceof_is_precise_exception_covered() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // `JitPreciseHandlerFrame.instanceofStep`'s shape, reduced: the range
+        // holds an `instanceof` and an `invokeinterface`, the handler follows.
+        let code = vec![
+            0x2b, // 0: aload_1
+            0xc1, 0x00, 0x01, // 1: instanceof #1
+            0x57, // 4: pop
+            0x2b, // 5: aload_1
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 6: invokeinterface #2, count=1
+            0x57, // 11: pop
+            0xb1, // 12: return
+            0x4c, // 13: astore_1
+            0xb1, // 14: return
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 13,
+            handler_pc: 13,
+            catch_type: 0,
+        }];
+        assert!(
+            precise_exception_frame_sites_supported(&code, code.len(), &table),
+            "an `instanceof` in a protected range must not withhold coverage"
+        );
+        assert_eq!(
+            first_unsupported_precise_frame_site(&code, code.len(), &table),
+            None
+        );
+
+        // The neighbour it used to share a range arm with is UNCHANGED:
+        // `checkcast` (0xc0) does throw, and the site must still be named.
+        let mut with_checkcast = code.clone();
+        with_checkcast.splice(1..1, [0xc0, 0x00, 0x03]);
+        let cc_table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 16,
+            handler_pc: 16,
+            catch_type: 0,
+        }];
+        assert_eq!(
+            first_unsupported_precise_frame_site(
+                &with_checkcast,
+                with_checkcast.len(),
+                &cc_table,
+            ),
+            Some((1, 0xc0)),
+            "checkcast must still withhold coverage, and must name its own pc"
+        );
     }
 
     /// `getfield`/`putfield` inside a protected range no longer withhold
