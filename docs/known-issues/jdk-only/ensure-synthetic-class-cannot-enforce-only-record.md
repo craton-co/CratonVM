@@ -17,11 +17,19 @@ path the three measured workloads reach.
 | workload | rows before → after | `compatibility-stub` before → after |
 |---|---|---|
 | `StrictBoot` (a `main` that prints one line) | 392 → 379 | **13 → 0** |
-| `JdkOnlyCensusLoadProbe` | 704 → 654 | **17 → 1** |
-| `JdkOnlyBreadthProbe` | 828 → 727 | **18 → 5** |
+| `JdkOnlyCensusLoadProbe` | 704 → 656 | **17 → 0** |
+| `JdkOnlyBreadthProbe` | 828 → 709 | **18 → 0** |
 
 `--jdk-only-report`'s `counts.compatibility_classes` agrees. The row total falls
-because a refused fabrication is a class that never enters the store.
+because a refused fabrication is a class that never enters the store, and
+because the retagged factories now hand back real `java.base` classes the
+census counts under `boot-image` instead.
+
+Two further probes, as a check that these three were not a lucky sample:
+`L1LoaderIdentityProbe` 13 → **0** with byte-identical stdout, and
+`MapLayoutMatrixProbe` 15 → **1**. That last row is `java/util/Enumeration$Impl`
+from `native-builtins/src/classloader.rs`'s `getResources` helpers — see
+*What is still open*.
 
 **Ten call sites fire, not 52** — the union over the three workloads:
 
@@ -86,26 +94,34 @@ callers: `try_alloc_synthetic` (native-collections) and
 `try_alloc_concurrent_synthetic` (native-builtins), added by L7 alongside the
 infallible ones.
 
-**Residual R1 — the last 1 / 5 compatibility classes.**
-`JdkOnlyCensusLoadProbe` still fabricates `cratonvm/internal/UnmodifiableSet`;
-`JdkOnlyBreadthProbe` also fabricates `UnmodifiableList`, `UnmodifiableListItr`,
-`UnmodifiableMap` and `java/util/Comparator$Native`. They are minted by
-`native-collections`' `alloc_unmod_wrapper` / `alloc_unmod_list_itr` /
-`make_comparator` and by `native-builtins::lang_system::wrap_system_env_map`.
+**The unmodifiable/factory/comparator family is closed — and the order was the
+whole lesson.** After the bootstrap migration, `JdkOnlyCensusLoadProbe` still
+fabricated `cratonvm/internal/UnmodifiableSet` and `JdkOnlyBreadthProbe` four
+more, from `native-collections`' `alloc_unmod_wrapper` / `alloc_unmod_list_itr`
+/ `make_comparator` and `native-builtins::lang_system::wrap_system_env_map`.
 
-Making those fallible was **tried, measured, and reverted**, and the
-measurement is the useful part: it does reach 0 / 0 / 0 compatibility classes,
-and it breaks real JDK `<clinit>`s, because `java.util.Collections.unmodifiable*`
-and `List.of` are real methods the JDK's own bootstrap calls. On that build the
-breadth probe produced `SECTION-FAILED zip: NullPointerException: zone` and
-`SECTION-FAILED reflection: NoSuchMethodError:
-cratonvm.synthetic.AnonymousObject$16.newInstance` — neither naming a refused
-class — and went from 4 to 8 failures. The allocation half must not land before
-the corresponding natives are retagged so the real `Collections$UnmodifiableMap`
-bytecode runs. That is safe for this family (a real unmodifiable wrapper
-delegates to the backing map, whose natives still work) and it belongs to
-whoever owns `register_unmodifiable_natives`, under the "retag per subsystem,
-one PR each, with evidence" discipline that registrar's own header demands.
+Making those allocators fallible **on their own** reaches 0 / 0 / 0 and breaks
+real JDK `<clinit>`s, because `java.util.Collections.unmodifiable*` and
+`List.of` are real methods the JDK's own bootstrap calls. Measured on that
+build: `SECTION-FAILED zip: NullPointerException: zone` and `SECTION-FAILED
+reflection: NoSuchMethodError: cratonvm.synthetic.AnonymousObject$16.newInstance`
+— neither naming a refused class, which is the opposite of a diagnosable
+refusal — with the breadth probe going 4 → 8 failures.
+
+**Retag first, then refuse.** `register_factory_natives`,
+`register_unmodifiable_natives`, `register_comparator_natives` and the six
+`Collections.unmodifiable*` factories are now `SyntheticStub`, so `--jdk-only`
+drops them and `java.base`'s bytecode runs; the allocators are fallible behind
+that. 0 / 0 / 0, with the strict failure count *unchanged* at 5 and 4.
+
+The test that decides whether a family can be retagged is **not** "does a real
+class with this name exist" — it is **"does the real product delegate, or does
+it read the backing object's own fields?"** A real `Collections$UnmodifiableMap`
+delegates every call to the map it was handed, and that map's CratonVM natives
+still answer, so it works. A real `HashMap$KeyIterator` reads the real
+`table[]`, which CratonVM's `HashMap.put` native never fills, so retagging
+`HashSet.iterator()` would return a silently EMPTY iteration instead of a loud
+error. That family stays a refusal until the collections reclassification wave.
 
 ## What is wrong (unchanged in shape)
 
@@ -184,10 +200,16 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
 1. ~~Migrate the call sites that fire~~ — done 2026-08-05, all ten.
 2. ~~Make `vm_init.rs`'s bootstrap block fail loudly under `JdkOnly`~~ — done;
    `StrictBoot` reaches `main` with **zero** fabricated compatibility classes.
-3. Make the three allocation funnels fallible (~2,300 call sites), then delete
+3. ~~Retag the unmodifiable / factory / comparator natives, then migrate their
+   allocators~~ — done 2026-08-05; all three measured workloads are at zero.
+4. The four shapes that are still refused rather than removed —
+   `java/util/HashMap$KeyItr`, `cratonvm/internal/ArrayListSubList`,
+   `StreamCollector`, `SystemLogger` — plus `java/util/Enumeration$Impl` in
+   `classloader.rs`'s `getResources` helpers. Each needs its native retagged
+   first, and each is blocked on state that lives in a CratonVM native rather
+   than in the real object's fields (see the delegate-vs-read test above).
+5. Make the three allocation funnels fallible (~2,300 call sites), then delete
    `ensure_synthetic_class`.
-4. R1 above: retag `register_unmodifiable_natives`' factories, then migrate
-   their allocators.
 
 ## How to verify a fix
 

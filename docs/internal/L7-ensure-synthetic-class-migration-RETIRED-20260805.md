@@ -19,23 +19,33 @@ workload, 2026-08-05.
 | workload | rows before → after | `compatibility-stub` before → after |
 |---|---|---|
 | `StrictBoot` (a `main` that prints one line) | 392 → 379 | **13 → 0** |
-| `JdkOnlyCensusLoadProbe` | 704 → 654 | **17 → 1** |
-| `JdkOnlyBreadthProbe` | 828 → 727 | **18 → 5** |
+| `JdkOnlyCensusLoadProbe` | 704 → 656 | **17 → 0** |
+| `JdkOnlyBreadthProbe` | 828 → 709 | **18 → 0** |
 
 `--jdk-only-report`'s `counts.compatibility_classes` agrees: 13 / 17 / 18 →
-0 / 1 / 5. `counts.synthetic_stub_invocations` is 0 before and after.
+**0 / 0 / 0**. `counts.synthetic_stub_invocations` is 0 before and after.
 
 Two further probes, added afterwards as a check that the three above were not a
 lucky sample:
 
 | workload | `counts.compatibility_classes` before → after | strict stdout |
 |---|---|---|
-| `L1LoaderIdentityProbe` | 13 → 1 | **byte-identical** |
-| `MapLayoutMatrixProbe` | 15 → 3 | 2 of 9 sections now `NoClassDefFoundError: java/util/HashMap$KeyItr` |
+| `L1LoaderIdentityProbe` | 13 → **0** | **byte-identical** |
+| `MapLayoutMatrixProbe` | 15 → **1** | 2 of 9 sections now `NoClassDefFoundError: java/util/HashMap$KeyItr` |
 
-`L1LoaderIdentityProbe` is the interesting one: twelve fabrications removed and
-*not one byte* of its output changed, which is what "these were substitutions
-nothing depended on" looks like when it is true.
+`L1LoaderIdentityProbe` is the interesting one: thirteen fabrications removed
+and *not one byte* of its output changed, which is what "these were
+substitutions nothing depended on" looks like when it is true.
+
+`MapLayoutMatrixProbe`'s last row is `java/util/Enumeration$Impl`, minted by
+`native-builtins/src/classloader.rs`'s `enumeration_from_url_strings` /
+`enumeration_from_rooted_urls` / `empty_enumeration_impl` behind
+`ClassLoader.getResources`. It fires on none of the three workloads the brief
+names. Left alone deliberately: `classloader.rs` is L1's owned file, and unlike
+the families below this one has no drop-in real-bytecode fallback — the VM owns
+the classpath, so `getResources` is a genuine `Bridge` and it is only its
+*return shape* that is a substitution. Named here so the next lane starts from
+a location rather than a grep.
 
 The brief also asked for H2 or Spring Boot. **Not measured:** neither corpus is
 provisioned on this build host (`apps/h2database/h2` is an empty directory, no
@@ -47,9 +57,11 @@ that never enters the store. The brief's *"total unchanged unless you intend
 otherwise"* describes a **reclassification**; this is a **refusal**, so the
 "otherwise" is the intended case. On the strict boot the drop is exactly the
 refusal count — 392 → 379, thirteen classes, thirteen refusals. On the two
-probes it is larger (50 and 101) because a refused stand-in also stops dragging
+probes it is larger (48 and 119) because a refused stand-in also stops dragging
 in the interfaces and supertypes `fabricate_class` would have loaded to wire it
-up; those classes are legitimately absent, not hidden.
+up, and because the retagged factories hand back real `java.base` classes the
+census counts under `boot-image` instead; those rows moved, they did not
+vanish.
 
 ### The 10 call sites that fire — not 52
 
@@ -206,12 +218,46 @@ only *before* the `real_protected_stub_class` gate, which is `false` for
 | gate | result |
 |---|---|
 | `native-builtins --test stub_ratchet` | 4 passed — after re-freezing the baseline, see below |
-| `native-api` | 20 passed |
+| `native-api` | 315 passed across 7 binaries, 0 failed |
 | `classloading --test jdk_only_class_origin` | 12 passed |
-| `native-collections` | 92 passed across 12 binaries, 0 failed |
+| `native-collections` | 202 passed across 13 binaries, 0 failed |
 | `native-io` | 380 passed, 0 failed |
-| `native-builtins --lib` | 3269 passed, 1 failed — `net_phase_e::…re3_get_by_address…`, pre-existing on `origin/dev`, see below |
 | `vm --test jdk_only_dispatch` | 12 passed, 0 failed |
+| `vm --lib` | 2403 passed, 0 failed |
+| `native-builtins --lib` | 3275 passed, 0 failed (after the dev merge — see below) |
+| `vm --lib --features synthetic-jdk` | 3914 passed, 5 failed — **all five identical on pristine `origin/dev`**, see below |
+| `regression-suite/bridge-ratchet.sh` | PASS, selftest 14/14; baseline re-frozen, see below |
+
+**The synthetic-jdk `vm` gate is red on `origin/dev` itself**, which contradicts
+the standing note that it is blocking at zero. Measured on `f80fa34b6` in a
+clean worktree, same command: `inet_socket_address_basics`,
+`linked_hashmap_put_get`, `linked_hashmap_put_if_absent`,
+`linkedhashmap_first_last_entry_p64`, `scanner_next_line_p51` — five failures,
+byte-identical assertions to this branch's (`linked_hashmap_put_get` returns
+`Object(…)` where the test wants `Int(42)`, on both). This branch adds none of
+them.
+
+A sixth, `jit::helpers::tests::jit_getfield_never_tears_against_concurrent_jit_putfield_int`,
+appeared 3 times in 55 runs here and 0 in 30 on pristine — but it is a
+scheduling flake, not a signal. The test spawns two raw threads hammering one
+heap slot through `jit_putfield_int` / `jit_getfield`; it performs no native
+dispatch, loads no class, and fabricates nothing, so nothing in this change can
+reach it. Its final assertion is `seen_a > 0 && seen_b > 0` — *"test may not be
+exercising real contention"* — which is a statement about thread scheduling,
+and every observed failure was during the window when the build host was at
+load 150–400 with 2,000+ sessions. 25 consecutive passes once the box quieted.
+
+`native-builtins --lib` failed once *before* the dev merge, on
+`net_phase_e::re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout`,
+and it was **not this change**: `origin/dev` moved past this branch's fork
+point (`d010d611b4`) and `742fee6fa fix(net): the getByAddress unit test
+asserted the contract the JDK does not have` fixed exactly that test. Worth
+recording how that was nearly misdiagnosed: the first A/B ran the test
+*filtered* on a pristine tree and *unfiltered* here, which is not an A/B at all
+— and the pristine tree had silently been created from the *newer*
+`origin/dev`, so it would have exonerated the branch for the wrong reason. The
+verdict only became sound after running the full suite on both trees and
+diffing the two commits' `net_phase_e.rs`.
 
 **`stub_ratchet`'s baseline moved 157 → 165**, which is a ratchet moving the
 wrong way and therefore needs the explanation the test's own failure message
@@ -239,60 +285,102 @@ catchable `NoClassDefFoundError` naming the class:
 | class | sections |
 |---|---|
 | `java/util/HashMap$KeyItr` | censusload `collections`, `net`, `concurrent`; breadth `time` |
-| `cratonvm/internal/ArrayListSubList` | censusload `text`; breadth `regex`, `textformat` |
+| `cratonvm/internal/ArrayListSubList` | censusload `text`; breadth `regex` |
+| `cratonvm/internal/UnmodifiableList` | breadth `textformat` |
 | `cratonvm/internal/StreamCollector` | censusload `interfaces` |
 | `cratonvm/internal/SystemLogger` | breadth `serialization` |
 
-This is exposure, not regression: those four shapes were being substituted for
-real JDK types on every strict run, silently. `counts.synthetic_stub_invocations`
+This is exposure, not regression: those shapes were being substituted for real
+JDK types on every strict run, silently. `counts.synthetic_stub_invocations`
 was 0 the whole time, which is exactly why the *class-origin* census — not the
 invocation counter — is the instrument §11 gates on.
 
-**They cannot be fixed the way `Function$Identity` was**, and the measurement
-says why. Under `--jdk-only` the strict report already lists
-`java/util/HashMap.{put,get,entrySet}`, `HashSet.size`,
-`ArrayList.{get,iterator,size}` and 40 more as `native-shadows-bytecode`: the
-map's state lives in CratonVM natives, not in the real `table[]`. Retagging
-`HashSet.iterator()` so the real bytecode runs would iterate an empty real
-table and return a **silently wrong** answer instead of a loud one. That is the
-collections reclassification wave (L10/L11), and it has to come first.
+The count did not grow when R1 landed: censusload stayed at 5 failures and
+breadth at 4, while the census went 1 → 0 and 5 → 0. Retagging the factories
+first is what bought that, and the next section is the measurement that says
+why it was necessary.
 
-(`native-shadows-bytecode` drops 63→48 and 65→48 on the two probes. That is not
-an improvement — sections that die early stop dispatching. Do not read it as
-one.)
+**The four remaining ones cannot be fixed the way `Function$Identity` and the
+unmodifiable family were**, and the measurement says why. Under `--jdk-only`
+the strict report already lists `java/util/HashMap.{put,get,entrySet}`,
+`HashSet.size`, `ArrayList.{get,iterator,size}` and 40 more as
+`native-shadows-bytecode`: the map's state lives in CratonVM natives, not in
+the real `table[]`. Retagging `HashSet.iterator()` so the real bytecode runs
+would iterate an empty real table and return a **silently wrong** answer
+instead of a loud one. That is the collections reclassification wave
+(L10/L11), and it has to come first.
 
-## Residuals handed off
+The distinction is the whole content of R1: a factory whose product
+**delegates** to the collection it was handed (`Collections.unmodifiableMap`,
+`List.of`) can be retagged today, because the backing collection's natives
+still answer. A factory whose product **reads the backing object's real
+fields** (`HashSet.iterator`) cannot, because nothing fills them.
 
-**R1 — the last 1 / 5 compatibility classes.** After the bootstrap migration,
-`JdkOnlyCensusLoadProbe` fabricates one (`cratonvm/internal/UnmodifiableSet`)
-and `JdkOnlyBreadthProbe` five (`UnmodifiableList`, `UnmodifiableListItr`,
-`UnmodifiableMap`, `UnmodifiableSet`, `java/util/Comparator$Native`). They are
-minted by `native-collections`' `alloc_unmod_wrapper` /
-`alloc_unmod_list_itr` / `make_comparator` and by
-`native-builtins::lang_system::wrap_system_env_map` — *not* by the site the
-census names (see the attribution caveat above).
+(`native-shadows-bytecode` drops 63→48 and 65→43 on the two probes. That is not
+an improvement — sections that die early stop dispatching, and the retagged
+factories stop dispatching on purpose. Do not read it as one.)
 
-**Making those four fallible was tried, measured, and reverted.** It does reach
-0 / 0 / 0 — and it breaks real JDK `<clinit>`s, because
-`java.util.Collections.unmodifiable*` and `List.of` are real methods that the
-JDK's own bootstrap calls. Observed on that build: `SECTION-FAILED zip:
+## R1 — closed, and the order mattered
+
+After the bootstrap migration, `JdkOnlyCensusLoadProbe` still fabricated one
+(`cratonvm/internal/UnmodifiableSet`) and `JdkOnlyBreadthProbe` five
+(`UnmodifiableList`, `UnmodifiableListItr`, `UnmodifiableMap`,
+`UnmodifiableSet`, `java/util/Comparator$Native`), minted by
+`native-collections`' `alloc_unmod_wrapper` / `alloc_unmod_list_itr` /
+`make_comparator` and by `native-builtins::lang_system::wrap_system_env_map` —
+*not* by the site the census named (see the attribution caveat above).
+
+**Making those allocators fallible on their own was tried first, and it is
+wrong.** It does reach 0 / 0 / 0, and it breaks real JDK `<clinit>`s, because
+`java.util.Collections.unmodifiable*` and `List.of` are real methods the JDK's
+own bootstrap calls. Observed on that build: `SECTION-FAILED zip:
 java.lang.NullPointerException: zone` and `SECTION-FAILED reflection:
-NoSuchMethodError: cratonvm.synthetic.AnonymousObject$16.newInstance`, neither
-of which names a refused class. Breadth went 4 → 8 failures, and two of them
-became unattributable. The allocation half must not land before those natives
-are retagged so the real `Collections$UnmodifiableMap` bytecode runs — which,
-unlike the `HashSet.iterator()` case, *is* safe, because a real unmodifiable
-wrapper delegates to the backing map and the backing map's natives still work.
-That belongs to whoever owns `register_unmodifiable_natives`, under the
-"retag per subsystem, one PR each, with evidence" discipline its own header
-demands.
+NoSuchMethodError: cratonvm.synthetic.AnonymousObject$16.newInstance` — neither
+naming a refused class, which is the opposite of a diagnosable refusal. Breadth
+went 4 → 8 failures and two of them became unattributable.
 
-**R2 — `ensure_synthetic_class` cannot be deleted, and the reason is not the 39
+**Retag first, then refuse.** `register_factory_natives`,
+`register_unmodifiable_natives`, `register_comparator_natives` and the six
+`Collections.unmodifiable*` factories are `SyntheticStub`, so `--jdk-only`
+drops them and `java.base`'s own bytecode runs; the allocators are fallible
+behind that. Result: **0 / 0 / 0**, with the failure count unchanged at 5 and 4
+— no cascade, no new unattributable error, `lambdas` still byte-identical to
+HotSpot.
+
+Two notes for whoever audits this:
+
+* **L6's bridge ratchet moved the good way and is re-frozen in this change**,
+  as its own output demands: `bridge_without_acc_native` 10,069 → **9,705**
+  (−364) and `bridge_shadows_bytecode` 4,755 → **4,696** (−59), with
+  `total_rows` unchanged at 11,916 — the 364 rows moved from `bridge` to
+  `synthetic-stub`, they did not disappear. That is the same 364 registrations
+  this change retagged, counted independently by a gate that takes its own
+  census from a running VM.
+* `stub_ratchet`, by contrast, **does not move at all** — still 165. Its census
+  runs `register_essential_natives` only, and `register_collections_natives` is
+  installed separately by `vm_init`, so none of the 364 is in its population.
+  That is a real blind spot in that gate: the two ratchets disagree by 364 rows
+  about how many synthetic stubs the VM registers. Not this lane's to fix, but
+  worth knowing before quoting "165" as the backlog.
+* `Bridge` was wrong for this family on its own terms — it asserts "no working
+  real-bytecode fallback exists" — and the fallback works *because the wrapper
+  delegates*. That is the test to apply to the next family, not "does a real
+  class with this name exist".
+
+## Residual handed off
+
+**`ensure_synthetic_class` cannot be deleted, and the reason is not the 39
 call sites.** Three of them *are* the infallible allocation funnels
 (`native-collections::alloc_synthetic`, `native-io::alloc_synthetic`,
 `native-builtins::alloc_concurrent_synthetic`), which have roughly 2,300
 callers between them, none returning `Result`. The record's step 3 is gated on
 making those funnels fallible, not on the call sites. Both records are updated
 to say so.
+
+The other open ends are named where they live: the four
+`HashMap$KeyItr`/`ArrayListSubList`/`StreamCollector`/`SystemLogger` refusals
+above (collections reclassification wave), and `Enumeration$Impl` in
+`classloader.rs` (L1's file, and the only one of the set without a drop-in
+real-bytecode fallback).
 
 [r2]: ../known-issues/jdk-only/vm-internal-classes-mislabelled-compatibility-stub.md
