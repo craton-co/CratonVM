@@ -6360,9 +6360,16 @@ pub(crate) fn create_method_object(
     // Synthetic-JDK mode can load `java/lang/reflect/Method` without any real
     // field table. Production `set_field_by_name` silently skips those writes,
     // while Method.getName()/getReturnType()/toString() still need readable
-    // mirror state. Fall back to the legacy flat mirror layout only when the
-    // named JDK layout did not land; real-JDK Method objects keep their normal
-    // inherited-field offsets untouched.
+    // mirror state.
+    //
+    // The gate is "does this class HAVE a named field table", NOT "did the
+    // named writes land". Those are different questions, and answering the
+    // second one was a corruption bug: on a real-layout `Method` the flat
+    // `METHOD_LEGACY_SLOT_*` indices are other live fields, so a failed named
+    // write turned into `clazz` being overwritten with the RETURN TYPE (slot 2)
+    // — Byte Buddy then reported `public abstract int int.value() does not
+    // represent interface …Argument`. See `method_class_has_named_layout`.
+    let has_named_layout = method_class_has_named_layout(ctx, class_id);
     let named_method_layout_landed = matches!(
         ctx.get_field_by_name(obj, "name"),
         Value::Object(Some(actual)) if actual == name_str
@@ -6370,7 +6377,15 @@ pub(crate) fn create_method_object(
         ctx.get_field_by_name(obj, "clazz"),
         Value::Object(Some(actual)) if actual == class_mirror
     );
-    if !named_method_layout_landed {
+    if has_named_layout && !named_method_layout_landed && crate::nbflags().iae_trace_ok {
+        eprintln!(
+            "METHOD-NAMED-WRITE-MISSED class={} name={} — real layout present but \
+             clazz/name did not read back; leaving the JDK fields alone",
+            ctx.class_name_of_id(meta.declaring_class_id).unwrap_or_default(),
+            meta.name
+        );
+    }
+    if !has_named_layout {
         ctx.set_field(
             obj,
             METHOD_LEGACY_SLOT_CLAZZ,
@@ -6664,10 +6679,14 @@ pub(crate) fn write_method_accessible(
         base + METHOD_EXTRA_OFFSET_ACCESSIBLE,
         Value::Int(if value { 1 } else { 0 }),
     );
+    // Same rule as `create_method_object`: the flat legacy index is only a
+    // spare slot on a Method class with NO named field table. On a real layout
+    // index 6 belongs to some other JDK field. See `method_class_has_named_layout`.
     if matches!(
         ctx.get_field_by_name(method_obj, "override"),
         Value::Object(None)
-    ) {
+    ) && !method_class_has_named_layout(ctx, class_id)
+    {
         ctx.set_field(
             method_obj,
             METHOD_LEGACY_SLOT_OVERRIDE,
@@ -6687,6 +6706,39 @@ pub(crate) fn write_method_accessible_external(
 
 // --- Method getters ---
 
+/// Does this reflection object's class carry the REAL JDK named field table?
+///
+/// The flat `METHOD_LEGACY_SLOT_*` indices are a stand-in for synthetic-JDK
+/// mode, where `java/lang/reflect/Method` is loaded with no field table at all.
+/// On a REAL-layout `Method` those indices are not a "fallback" — they are
+/// other, live fields. Writing `ret_mirror` at index 2 there does not supply a
+/// missing return type, it OVERWRITES whatever the JDK declares at index 2; and
+/// reading index 0 back for `clazz` yields that field rather than the declaring
+/// class.
+///
+/// That is not theoretical. With Mockito's inline mock maker retransforming JDK
+/// classes, Byte Buddy reported
+/// `public abstract int int.value() does not represent interface
+/// net.bytebuddy.implementation.bind.annotation.Argument` — the declaring type
+/// of `Argument.value()` read back as `int`, which is that method's RETURN type.
+/// Same family: `Method.getName()` answering something that fails Byte Buddy's
+/// bean-naming check, and `getReturnType()` answering a non-`Class`.
+///
+/// So the legacy slots are only ever correct when there is no named layout to
+/// collide with. Probe for `clazz`, which every real `Method`/`Constructor`
+/// declares.
+fn method_class_has_named_layout(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
+    ctx.resolve_field_index_by_class_id(class_id, "clazz")
+        .is_some()
+}
+
+fn method_object_has_named_layout(
+    ctx: &dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> bool {
+    method_class_has_named_layout(ctx, ctx.class_id_of_object(method_obj))
+}
+
 fn method_object_field_value_or_legacy(
     ctx: &dyn NativeContext,
     method_obj: cratonvm_types::ObjectRef,
@@ -6695,6 +6747,12 @@ fn method_object_field_value_or_legacy(
 ) -> Value {
     let named = ctx.get_field_by_name(method_obj, field_name);
     if matches!(named, Value::Object(Some(_))) {
+        return named;
+    }
+    // A genuinely-null named field (`signature` on a non-generic method,
+    // `annotations` on an unannotated one) must stay null rather than pick up
+    // whatever unrelated field shares the legacy index.
+    if method_object_has_named_layout(ctx, method_obj) {
         return named;
     }
     let legacy = ctx.get_field(method_obj, legacy_slot);
@@ -6712,6 +6770,9 @@ fn method_int_field_value_or_legacy(
 ) -> Value {
     let named = ctx.get_field_by_name(method_obj, field_name);
     if matches!(named, Value::Int(_)) {
+        return named;
+    }
+    if method_object_has_named_layout(ctx, method_obj) {
         return named;
     }
     let legacy = ctx.get_field(method_obj, legacy_slot);
@@ -11779,10 +11840,16 @@ fn unresolvable_nested_annotation_sentinel(
 /// where `declaringType()` is exactly such a never-backfilled
 /// `Class`-valued member defaulting to `void.class`).
 ///
-/// Order mirrors HotSpot's `AnnotationParser`: the declaring class's
-/// ("container's") own loader, then that class's namespace, then the
-/// loader-blind global index, and only then a load. The `_near` retry AFTER the
-/// load is what the two lookups used to disagree about: `class_id_by_name` is
+/// This is the ADMISSION half — deliberately loader-free. It must not call
+/// `loadClass` on a user-defined loader: that is a re-entrant Java call, and
+/// running one per annotation per `getDeclaredAnnotations()` (on top of the one
+/// the builder already makes) measurably changed behaviour under Mockito's
+/// inline retransformer. The builder still does the loader-aware lookup for
+/// IDENTITY — it just falls back to this answer instead of to nothing.
+///
+/// Order: the declaring class's namespace, then the loader-blind global index,
+/// then a load. The `_near` retry AFTER the load is what the admission filter
+/// and the builder used to disagree about — `class_id_by_name` is
 /// `find_unique_class_by_name`, which answers `None` for an AMBIGUOUS name, so
 /// the moment a second loader defines the same annotation type the global
 /// lookup goes blind while the scoped one still resolves.
@@ -11790,29 +11857,9 @@ fn resolve_annotation_type_class_id(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     container_class_id: Option<ClassId>,
-    container_loader: Option<ObjectRef>,
 ) -> Option<ClassId> {
-    // `resolve_annotation_class_via_loader` re-enters Java (`loadClass`) and
-    // allocates, so the loader reference has to stay rooted across it.
-    let loader_pin = container_loader.map(|loader| ctx.pin_native_root(loader));
-    let via_loader = match (container_loader, loader_pin) {
-        (Some(loader), Some(pin)) => {
-            let loader_cur = ctx.read_native_pin(pin, loader);
-            match resolve_annotation_class_via_loader(ctx, loader_cur, class_name) {
-                Ok(mirror) => ctx.class_id_from_mirror(mirror),
-                // The loader threw (the classloader-isolation filter case) or
-                // returned nothing. Fall through to the global resolution
-                // below, preserving the prior best-effort behaviour.
-                Err(_) => None,
-            }
-        }
-        _ => None,
-    };
-    if let Some(pin) = loader_pin {
-        ctx.unpin_native_roots(pin);
-    }
-    via_loader
-        .or_else(|| container_class_id.and_then(|h| ctx.class_id_by_name_near(class_name, h)))
+    container_class_id
+        .and_then(|h| ctx.class_id_by_name_near(class_name, h))
         .or_else(|| ctx.class_id_by_name(class_name))
         .or_else(|| {
             let _ = ctx.load_class(class_name);
@@ -11830,6 +11877,32 @@ fn resolve_annotation_type_class_id(
         })
 }
 
+/// The IDENTITY half: the declaring class's ("container's") own loader, as
+/// HotSpot's `AnnotationParser` does — a child/isolating loader's OWN copy of
+/// the annotation interface must back `annotationType()` and `getClass()`
+/// (`MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`,
+/// `ModifiedClassPathClassLoader`'s child copies of the JAXB API). `None` when
+/// there is no user-defined loader, the loader threw (the classloader-isolation
+/// filter case), or the mirror does not map back to a ClassId — every one of
+/// which leaves the caller on the admission answer.
+fn resolve_annotation_type_via_container_loader(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    container_loader: Option<ObjectRef>,
+) -> Option<ClassId> {
+    // `resolve_annotation_class_via_loader` re-enters Java (`loadClass`) and
+    // allocates, so the loader reference has to stay rooted across it.
+    let loader = container_loader?;
+    let loader_pin = ctx.pin_native_root(loader);
+    let loader_cur = ctx.read_native_pin(loader_pin, loader);
+    let resolved = match resolve_annotation_class_via_loader(ctx, loader_cur, class_name) {
+        Ok(mirror) => ctx.class_id_from_mirror(mirror),
+        Err(_) => None,
+    };
+    ctx.unpin_native_roots(loader_pin);
+    resolved
+}
+
 /// [`create_annotation_proxy_with_type`] for callers that have not already
 /// resolved the annotation's type. `None` means the type is unresolvable, in
 /// which case NO proxy is built — a proxy with a null `annotationType()` must
@@ -11842,8 +11915,7 @@ fn create_annotation_proxy(
 ) -> Option<ObjectRef> {
     let class_name = annotation_desc_to_class_name(&ann.type_descriptor)?;
     let owned = class_name.to_string();
-    let cid =
-        resolve_annotation_type_class_id(ctx, &owned, container_class_id, container_loader)?;
+    let cid = resolve_annotation_type_class_id(ctx, &owned, container_class_id)?;
     Some(create_annotation_proxy_with_type(
         ctx,
         ann,
@@ -11856,10 +11928,14 @@ fn create_annotation_proxy(
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
 ///
-/// `ann_class_id` is the already-resolved annotation interface — see
-/// [`resolve_annotation_type_class_id`]. Taking it as a parameter (rather than
-/// re-deriving it here) is what keeps the "is this annotation surfaced at all?"
-/// decision and the proxy's type mirror from ever disagreeing.
+/// `ann_class_id` is the annotation interface the ADMISSION filter accepted —
+/// see [`resolve_annotation_type_class_id`]. The loader-aware lookup still runs
+/// here (identity matters: a child loader's own copy must back
+/// `annotationType()`), but it can now only REFINE that answer, never replace it
+/// with nothing. Before, the builder re-derived the type independently and a
+/// failure left the proxy with a null type mirror and — since the
+/// `AnnotationDefault` backfill is gated on the same ClassId — with none of its
+/// defaulted members filled in.
 ///
 /// `container_loader` is the defining ClassLoader of the class on which the
 /// annotation is declared (the "container" in HotSpot's `AnnotationParser`).
@@ -11907,9 +11983,21 @@ fn create_annotation_proxy_with_type(
     // `annotation.annotationType()`, both of which must report the declaring
     // loader for classloader-isolation patterns
     // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader) and
-    // both of which callers dereference WITHOUT a null check. The ClassId was
-    // resolved by `resolve_annotation_type_class_id` before this function was
-    // entered, precisely so this field can never be null.
+    // both of which callers dereference WITHOUT a null check. Prefer the
+    // container loader's own copy; fall back to the admitted ClassId, so the
+    // field can never be null.
+    let ann_class_id = {
+        let loader_cur = match (container_loader, container_loader_pin) {
+            (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+            _ => None,
+        };
+        annotation_desc_to_class_name(&ann.type_descriptor)
+            .map(|n| n.to_string())
+            .and_then(|name| {
+                resolve_annotation_type_via_container_loader(ctx, &name, loader_cur)
+            })
+            .unwrap_or(ann_class_id)
+    };
     let ann_class_id_opt = Some(ann_class_id);
     {
         let mirror = ctx.get_class_mirror(ann_class_id);
@@ -12963,8 +13051,7 @@ fn resolve_annotation_type_near(
     declaring_class_id: Option<ClassId>,
 ) -> Option<ClassId> {
     let name = annotation_desc_to_class_name(&ann.type_descriptor)?.to_string();
-    let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
-    resolve_annotation_type_class_id(ctx, &name, declaring_class_id, container_loader)
+    resolve_annotation_type_class_id(ctx, &name, declaring_class_id)
 }
 
 /// Partition `annotations` into the ones whose declared type resolves, pairing
