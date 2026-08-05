@@ -95,7 +95,21 @@ fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static st
         // surfaced through `Provider.getInfo()` and consulted by the
         // `getService` debug-log path so an unbacked-provider lookup
         // can be diagnosed without spelunking the source.
-        parking_lot::Mutex::new(vec![
+        //
+        // THE LIST IS PER-PLATFORM. `SunMSCAPI` wraps the Windows CryptoAPI
+        // and ships only in the Windows JDK: `java.security` registers it
+        // from a `#ifdef windows` block, and `sun.security.mscapi.SunMSCAPI`
+        // is not present in a Linux or macOS image at all. The capture above
+        // was evidently taken on Windows and the name was seeded
+        // unconditionally, so `Security.getProviders()` on Linux answered a
+        // thirteen-element list with `SunMSCAPI` at index 11 where HotSpot 25
+        // on the same machine answers twelve without it — and
+        // `Security.getProvider("SunMSCAPI")` handed back a live Provider
+        // advertising 16 services for a class that raises
+        // ClassNotFoundException. Any code that iterates the chain in order,
+        // or that treats "the provider exists" as "the platform supports it",
+        // sees a provider that cannot service anything.
+        let mut seed = vec![
             ("SUN".to_string(), 25.0, COVERAGE_SUN),
             ("SunRsaSign".to_string(), 25.0, COVERAGE_SUN_RSA_SIGN),
             ("SunEC".to_string(), 25.0, COVERAGE_SUN_EC),
@@ -107,9 +121,12 @@ fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static st
             ("SunPCSC".to_string(), 25.0, COVERAGE_UNBACKED),
             ("JdkLDAP".to_string(), 25.0, COVERAGE_UNBACKED),
             ("JdkSASL".to_string(), 25.0, COVERAGE_UNBACKED),
-            ("SunMSCAPI".to_string(), 25.0, COVERAGE_SUN_MSCAPI),
-            ("SunPKCS11".to_string(), 25.0, COVERAGE_UNBACKED),
-        ])
+        ];
+        if cfg!(target_os = "windows") {
+            seed.push(("SunMSCAPI".to_string(), 25.0, COVERAGE_SUN_MSCAPI));
+        }
+        seed.push(("SunPKCS11".to_string(), 25.0, COVERAGE_UNBACKED));
+        parking_lot::Mutex::new(seed)
     })
 }
 
@@ -1118,17 +1135,23 @@ fn seed_direct_native_engine_services() {
     }
     put_alias(JCE, "Cipher", "AESWrap", "AES/KW/NoPadding");
 
-    const MSCAPI: &str = "SunMSCAPI";
-    for algorithm in ["RSA", "RSA/ECB/PKCS1Padding"] {
-        put_service(MSCAPI, "Cipher", algorithm, "sun.security.mscapi.CRSACipher");
-    }
-    put_service(MSCAPI, "SecureRandom", "Windows-PRNG", "sun.security.mscapi.PRNG");
-    for algorithm in [
-        "MD2withRSA", "MD5withRSA", "NONEwithRSA", "RSASSA-PSS", "SHA1withRSA", "SHA256withRSA",
-        "SHA384withRSA", "SHA512withRSA", "SHA1withECDSA", "SHA224withECDSA", "SHA256withECDSA",
-        "SHA384withECDSA", "SHA512withECDSA",
-    ] {
-        put_service(MSCAPI, "Signature", algorithm, "sun.security.mscapi.CSignature");
+    // Windows only — the provider itself is absent from the seed chain on
+    // every other platform (see `provider_chain`), and seeding its services
+    // anyway would leave `Security.getProvider("SunMSCAPI")` answering a live
+    // 16-service Provider for a name no image on this host declares.
+    if cfg!(target_os = "windows") {
+        const MSCAPI: &str = "SunMSCAPI";
+        for algorithm in ["RSA", "RSA/ECB/PKCS1Padding"] {
+            put_service(MSCAPI, "Cipher", algorithm, "sun.security.mscapi.CRSACipher");
+        }
+        put_service(MSCAPI, "SecureRandom", "Windows-PRNG", "sun.security.mscapi.PRNG");
+        for algorithm in [
+            "MD2withRSA", "MD5withRSA", "NONEwithRSA", "RSASSA-PSS", "SHA1withRSA",
+            "SHA256withRSA", "SHA384withRSA", "SHA512withRSA", "SHA1withECDSA",
+            "SHA224withECDSA", "SHA256withECDSA", "SHA384withECDSA", "SHA512withECDSA",
+        ] {
+            put_service(MSCAPI, "Signature", algorithm, "sun.security.mscapi.CSignature");
+        }
     }
     put_service("SunJSSE", "Signature", "MD5andSHA1withRSA", "sun.security.ssl.RSASignature");
 }
@@ -3171,7 +3194,21 @@ mod tests {
                 "{unbacked} coverage string must be the canonical unbacked-disclosure constant"
             );
         }
-        for backed in ["SUN", "SunRsaSign", "SunJCE", "SunEC", "SunJSSE", "SunMSCAPI"] {
+        // `SunMSCAPI` is deliberately absent from the seed chain off Windows
+        // (it wraps CryptoAPI and ships only in the Windows JDK), so asserting
+        // it is present would be a gate that fails on the platform where the
+        // right answer is "not there".
+        let mut backed_names = vec!["SUN", "SunRsaSign", "SunJCE", "SunEC", "SunJSSE"];
+        if cfg!(target_os = "windows") {
+            backed_names.push("SunMSCAPI");
+        } else {
+            assert!(
+                find("SunMSCAPI").is_none(),
+                "SunMSCAPI must NOT be seeded off Windows: HotSpot's own \
+                 Security.getProviders() does not carry it there"
+            );
+        }
+        for backed in backed_names {
             assert!(
                 !is_unbacked_provider(backed),
                 "{backed} backs at least one algorithm and must not be flagged unbacked"

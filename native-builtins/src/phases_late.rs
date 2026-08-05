@@ -1656,29 +1656,36 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(map))))
     });
 
-    // redirectInput/Output/Error — store redirect target and return this
-    r.register(
-        pb,
-        "redirectInput",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 3, args[1]); // store redirect file in field 3
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(
-        pb,
-        "redirectOutput",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
-    r.register(
-        pb,
-        "redirectError",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
+    // redirectInput/Output/Error(File) are DELIBERATELY NOT REGISTERED.
+    //
+    // Each real overload is a one-liner that delegates to the `Redirect`
+    // overload — `redirectOutput(File f) { return redirectOutput(Redirect.to(f)); }`
+    // — and the `Redirect` spellings already work end to end: this file's
+    // `start()` shim does not run in real-JDK mode (verified with
+    // `CRATONVM_DBG_PB=1`: no `[PB-START-ENTRY]`), so the real
+    // `ProcessBuilder.start()` bytecode builds `redirects[]` and
+    // `native-io`'s `ProcessImpl`/`forkAndExec` natives honour it. A probe
+    // measured `Redirect.appendTo(file)` and `Redirect.INHERIT` byte-identical
+    // to HotSpot on the same run where the three File overloads below failed.
+    //
+    // What the three registrations did instead, all three wrong:
+    //
+    //   * `redirectOutput(File)` and `redirectError(File)` returned the
+    //     receiver and DROPPED the file. `pb.redirectOutput(f)` then
+    //     `pb.redirectOutput()` answered `PIPE`, and the child's output went
+    //     nowhere — silently, with no exception and no empty file to notice.
+    //   * `redirectInput(File)` stored the File into raw slot 3. On a real
+    //     `java/lang/ProcessBuilder` slot 3 is `redirectErrorStream`, a
+    //     BOOLEAN, so this was a reference-into-primitive overlay write — the
+    //     defect class wave 2's census hunts — and the redirect itself still
+    //     never happened, so `new ProcessBuilder("cat").redirectInput(f)`
+    //     left the child reading a pipe nobody would ever write to and the
+    //     parent's `readAllBytes()` blocked forever. That hang, not the
+    //     dropped output, is what a suite sees.
+    //
+    // Registering a native for a method whose real body is a delegation is a
+    // net loss twice over: it can only reimplement what the delegate already
+    // does, and it hides the delegate when it gets it wrong.
 
     // Redirect enum constants
     r.register(
