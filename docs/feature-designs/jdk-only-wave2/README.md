@@ -30,7 +30,7 @@ can work on what, simultaneously, without colliding.**
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
-| [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
+| [L5](../../internal/jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
 | [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
 | [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
@@ -39,8 +39,8 @@ can work on what, simultaneously, without colliding.**
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
-are done; L9 is closed.)
+**L3, L4, L6, L7 and L8 can all start today, in parallel, by different
+people.** (L1, L2 and L5 are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 

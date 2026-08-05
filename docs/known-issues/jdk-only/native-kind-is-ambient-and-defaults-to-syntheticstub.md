@@ -5,6 +5,30 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-05 — step 2 has started, and it is not a codemod
+
+L5 (retired; see
+[`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) for what
+it left open) migrated the four `JDK-ONLY-CLASSIFY: bridge` registrars in
+`native-io`. **`register_with_kind` no longer has zero callers: `kind_stated` is
+now true on 96 rows, up from 9** (the 9 pre-existing ones are the `String` and
+`deprecated_util` intrinsics that landed 2026-08-05, not part of L5). Every
+count below that says "`kind_stated` is `false` on all 11,909 rows" is
+superseded by that; nothing else in this record moved, and no native's kind
+changed.
+
+The result worth carrying forward is **how far short of the registrar the unit
+of adjudication turned out to be.** Of the 204 registrations in those four
+registrars, only 87 have an `ACC_NATIVE` target on the JDK 25 image. Not one of
+the four could have its `set_category` scope deleted, because not one of them is
+wholly adjudicated — and two of them register a single native under several
+platform class names from one loop, so *one registration site produced rows with
+different verdicts*. A migration that converted whole registrars would have
+reported 204 adjudicated bridges where the truth is 87, which is the failure this
+record exists to prevent, in the migration step rather than in the original
+tagging. **Expect the same shape in L5b/L5c: split the site, do not claim the
+function.**
+
 ## What changed on 2026-08-04 — step 2 exists, and the blocking evidence gap is closed
 
 *What specifically must change* lists three steps. Step 1 (provenance) was
@@ -75,7 +99,8 @@ script refuses rather than printing zeroes that read like a clean result.
 
 **`kind_stated` is `false` on all 11,909 rows.** `register_with_kind` exists and
 has **zero callers**. Step 2's migration has not begun — which the section below
-says, but the census makes it a measurement rather than a claim.
+says, but the census makes it a measurement rather than a claim. *(Superseded
+2026-08-05: 96 rows now state their kind. See the section above.)*
 
 **The `Bridge` population, adjudicated against the image:**
 
@@ -336,7 +361,9 @@ requires knowing, per registration, whether the tag was *chosen* or *inherited*.
    cb, kind)`) and migrate registrars to it subsystem by subsystem, so the kind
    is a local fact rather than a property of the call stack. **Start with the
    `JDK-ONLY-CLASSIFY`-marked registrars**, which already carry an adjudicated
-   verdict.
+   verdict. *(Entry point: done. `native-io`'s four `bridge` registrars: done
+   2026-08-05, 87 of 204 registrations — the marked verdict is a starting point,
+   not a licence to convert the whole function; adjudicate per row.)*
 3. Only then reclassify. Flip the default last: once every registration states
    its kind, `current_category` can default to something that fails loudly (or
    be deleted).
