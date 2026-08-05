@@ -327,9 +327,45 @@ leave behind (temp files, accumulated heap, or shared static state), not a
 property of that test. Disk and memory were ruled out at the time of the
 failure: 15 G free on `/tmp`, 25 G RAM available.
 
-**Re-scoped:** a low-rate, whole-class-context flake in `nestedZip64CanBeRead`,
-present with the JIT off. Not a zip-header bug, and not (on this evidence) a JIT
-footprint bug.
+**ROOT-CAUSED 2026-08-05 - it is the DISK, and it is not a VM bug.**
+
+`ZipContentTests` builds a zip that deliberately exceeds the ZIP SIZE LIMIT
+(`openWhenZip64ThatExceedsZipSizeLimitOpensZip`) plus a 65537-entry zip64. One
+run takes free space on `/` from **15219 MB down to 143 MB** - measured by
+sampling `df` for the duration of a single solo run. The host has ~15 GB free,
+so the class barely fits, and *anything* else using disk at the same time tips
+it over:
+
+```
+MethodSource [... methodName = 'openWhenZip64ThatExceedsZipSizeLimitOpensZip']
+=> java.io.IOException: No space left on device (os error 28)
+```
+
+That reproduces on demand: a solo run started with 7.2 GB free failed exactly
+this way, and the same class passes 12/12 when the disk is empty. Six
+concurrent copies fail 6/6 - which is why an earlier "6/6 reproduction" in this
+investigation was an artifact of the harness, not a finding.
+
+This explains every observation on this item:
+
+* **why `--nojit` fails too** (1 of 9 whole-class runs) - the disk does not care
+  whether the compiler is on, which is what falsified "JIT-only";
+* **why it is intermittent** - it depends on what else is on the disk;
+* **why it passes 12/12 sequentially on an idle host** but was filed from a host
+  above load 30, where concurrent builds and test runs were consuming the disk;
+* **why the symptom sometimes reads as zip corruption** - a file truncated by
+  ENOSPC produces `Zip64 'End Of Central Directory Record' not found at position
+  8027398`, which looks exactly like a header bug and is how this got into a JIT
+  cluster page in the first place.
+
+**Guarded so it cannot be re-filed as a VM bug.** `sb-class-oracle.sh` now
+checks free space before running this class and emits
+`SKIP-INSUFFICIENT-DISK <n>MB free, need >=16000MB` instead of a FAIL verdict.
+Override with `ZIP_NEED_MB`.
+
+The original `OutOfMemoryError: Java heap space` spelling is NOT explained by
+disk and is not re-tested here; if it returns at `--Xmx 2g`, that is a separate
+question from this one.
 
 If the OOM spelling does come back, the first thing to run on it is one env var:
 `CRATONVM_JIT=getstatic-helper`.
