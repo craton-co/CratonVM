@@ -2689,7 +2689,29 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Function.compose/andThen
+    // Function.compose/andThen/identity — `SyntheticStub`, not the enclosing
+    // registrar's `Bridge` (JDK-only wave 2, lane L7 item 4, 2026-08-05).
+    //
+    // All three mint a `Function$Compose` / `Function$AndThen` /
+    // `Function$Identity` stand-in, and no JDK declares any of those names:
+    // the real `Function.compose`/`andThen` are default methods that return a
+    // lambda, and `identity()` returns `t -> t`. So there IS a working
+    // real-bytecode fallback, which is exactly what `Bridge` asserts there is
+    // not — and under `--jdk-only` the `Bridge` tag meant strict mode invoked
+    // them and then fabricated the stand-in behind a recorded violation.
+    // Tagged `SyntheticStub`, strict mode drops the registration (recording a
+    // `SyntheticNativeRegistered` violation naming this site) and the real
+    // default methods run. `Compatible` / `--real-jdk` keep SyntheticStub
+    // registrations, so both are byte-for-byte unchanged.
+    //
+    // `Function.identity` is registered a second time, later and with the same
+    // treatment, by `register_function_identity_natives` in
+    // `native-builtins/src/lib.rs`; registration is last-write-wins, so that
+    // one is the copy a `Compatible` run actually dispatches. Both are tagged
+    // the same way on purpose — a strict run must not depend on which of two
+    // registrars ran last.
+    let __func_prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let func = "java/util/function/Function";
     r.register(
         func,
@@ -2702,8 +2724,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let before_pin = pinned_object_value(ctx, before);
-            let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Function$Compose", 2);
+            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/function/Function$Compose",
+                2,
+            )?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2726,8 +2751,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let after_pin = pinned_object_value(ctx, after);
-            let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Function$AndThen", 2);
+            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/function/Function$AndThen",
+                2,
+            )?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2745,10 +2773,15 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "identity",
         "()Ljava/util/function/Function;",
         |ctx, _args| {
-            let proxy = alloc_concurrent_synthetic(ctx, "java/util/function/Function$Identity", 0);
+            let proxy = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/function/Function$Identity",
+                0,
+            )?;
             Ok(Some(Value::Object(Some(proxy))))
         },
     );
+    r.set_category(__func_prev_cat);
 
     // Consumer.andThen
     let cons = "java/util/function/Consumer";

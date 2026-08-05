@@ -25878,18 +25878,39 @@ fn system_logger_emit(
 }
 
 /// Allocate a `System.Logger` receiver named `name`.
-pub(crate) fn craton_alloc_system_logger(ctx: &mut dyn NativeContext, name: Value) -> ObjectRef {
+///
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7). This stands in for
+/// whatever `System.LoggerFinder` would have produced from real bytecode, so
+/// under `--jdk-only` the fabrication is refused and the refusal propagates as
+/// a `ClassNotFoundException` naming `cratonvm/internal/SystemLogger` — rather
+/// than being recorded as a violation and then performed anyway.
+pub(crate) fn craton_alloc_system_logger(
+    ctx: &mut dyn NativeContext,
+    name: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Native stale-local family: `name` must survive the class registration
     // and the allocation below, both of which can move the young generation.
     let name_pin = match name {
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let class_id = ctx
-        .class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS)
-        .unwrap_or_else(|| {
-            ctx.ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
-        });
+    let class_id = match ctx.class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS) {
+        Some(id) => id,
+        None => match ctx.try_ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
+        {
+            Ok(id) => id,
+            Err(err) => {
+                // Release the pin taken above before unwinding: an early
+                // return past `unpin_native_roots` leaks the frame.
+                if let Some((handle, _)) = name_pin {
+                    ctx.unpin_native_roots(handle);
+                }
+                // Catchable `NoClassDefFoundError`, not the uncatchable
+                // `InternalError` the `?` conversion would give.
+                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+            }
+        },
+    };
     let slots = SYSTEM_LOGGER_SLOTS.max(ctx.class_num_total_fields(class_id));
     let logger = ctx
         .try_alloc_object_gc_safe(class_id, slots)
@@ -25907,7 +25928,7 @@ pub(crate) fn craton_alloc_system_logger(ctx: &mut dyn NativeContext, name: Valu
     if let Some((handle, _)) = name_pin {
         ctx.unpin_native_roots(handle);
     }
-    logger
+    Ok(logger)
 }
 
 /// `System.getLogger(String)`, `System.getLogger(String, ResourceBundle)` and
@@ -25918,7 +25939,7 @@ pub(crate) fn native_system_get_logger(
     args: &[Value],
 ) -> MethodCallResult {
     let name = args.first().copied().unwrap_or(Value::Object(None));
-    let logger = craton_alloc_system_logger(ctx, name);
+    let logger = craton_alloc_system_logger(ctx, name)?;
     Ok(Some(Value::Object(Some(logger))))
 }
 
@@ -37096,7 +37117,21 @@ fn native_return_first_arg(_ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_function_identity(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let proxy = alloc_concurrent_synthetic(ctx, "java/util/function/Function$Identity", 0);
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). `Function$Identity`
+    // has no class file anywhere — real `Function.identity()` is `t -> t`, an
+    // invokedynamic lambda — so this is a fabrication `--jdk-only` forbids.
+    //
+    // Under strict mode this native is no longer registered at all (the
+    // registrar tags it `SyntheticStub` below, and `register()` refuses that
+    // category under `JdkOnly`), so this line is unreachable there. Making it
+    // fallible anyway is what stops the two defects cancelling each other
+    // again: if the retag is ever reverted, the fabrication fails loudly and
+    // names the class instead of being recorded as a violation and performed.
+    let proxy = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+        ctx,
+        "java/util/function/Function$Identity",
+        0,
+    )?;
     Ok(Some(Value::Object(Some(proxy))))
 }
 
@@ -37415,7 +37450,41 @@ fn register_function_identity_natives(registry: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError: Function$Identity.andThen`. Tag as Bridge
     // (needed in both modes) instead -- same class of bug/fix as the
     // `native-builtins/src/jmx.rs` JMX cluster retag, both landed together.
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    //
+    // 2026-08-05 (JDK-only wave 2, lane L7 item 4) — retagged `SyntheticStub`,
+    // and the 2026-07-14 reasoning above is NOT re-litigated. That bisect was
+    // about `CRATONVM_NO_STUBS` / `set_drop_synthetic_stubs(true)`, an
+    // operator's blunt global switch that is opt-in and still off by default,
+    // so `Compatible` / `--real-jdk` behaviour is byte-for-byte unchanged by
+    // this line: SyntheticStub registrations are kept in both.
+    //
+    // What changes is `--jdk-only`, and it fixes a defect the lane doc calls
+    // out by name. `Function$Identity` was `Bridge`, so strict mode registered
+    // AND invoked it — but the class it allocates has no class file anywhere
+    // and is minted by `alloc_concurrent_synthetic`, which contract §5 forbids
+    // under `JdkOnly`. The two defects cancelled: the fabrication recorded the
+    // violation and proceeded, so the census reported it while the run
+    // continued in the forbidden state. Fixing either half alone exposes the
+    // other, which is why both land together here — this retag, plus
+    // `native_function_identity`'s migration to the fallible allocator.
+    //
+    // Bridge was the wrong tag on its own terms. `Bridge` means "no working
+    // real-bytecode fallback exists"; for the two `identity()` factories there
+    // plainly is one — `java.base`'s own `Function.identity()` / `UnaryOperator
+    // .identity()`, each a one-line invokedynamic returning `t -> t`. Dropped
+    // here, strict mode runs those instead.
+    //
+    // The other three triples are the instance methods of the fabricated
+    // stand-in. They do not fall back to anything, because with the factories
+    // dropped no `Function$Identity` object is ever created and the class is
+    // never fabricated — they simply become unreachable, which is the point.
+    // Leaving them `Bridge` would keep asserting that a class with no bytes
+    // anywhere is a boundary the VM must cross.
+    //
+    // The drop is recorded, not silent: `register()` pushes a
+    // `SyntheticNativeRegistered` violation naming this call site, so
+    // `--jdk-only-report` shows exactly which five triples went missing.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         "java/util/function/Function",
         "identity",

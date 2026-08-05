@@ -15931,6 +15931,10 @@ const EVENT_CREATE: i32 = 1;
 const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
+/// `#[track_caller]` so the class-origin census's `requested_by` names the
+/// native that wanted the shape, not this one forwarding line — see the
+/// matching note on `NativeContext::ensure_synthetic_class`.
+#[track_caller]
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,

@@ -1,227 +1,216 @@
 # `ClassManager::ensure_synthetic_class` can record a JDK-only violation but cannot refuse one
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **DANGEROUS: under `--jdk-only` this
-API records the violation and then fabricates the class anyway, so the run
-reports a violation while continuing in the exact state the contract forbids.**
+**Status:** OPEN, **and no longer dangerous on any measured workload.** Filed
+2026-07-31; instrumented 2026-08-04; **migrated 2026-08-05 by JDK-only wave-2
+lane L7**, which took the census, migrated every call site that fires, and
+replaced this record's "52 call sites" with a measured 10. What remains is
+step 3 — deleting the infallible entry point — and the reason it is still open
+is not the call sites. See *What is still open*.
 
-> **Evidence provenance.** The original filing quoted a
-> `synthetic_name_origin`-based body that **no longer exists**; the re-land
-> replaced it with a four-argument `fabricate_class(name, num_fields, origin,
-> enforce)` and a shared `admit_compatibility_class` policy choke point. The
-> quotations below are from the re-landed code in
-> `C:\craton\wt-jdk-only` (branch `feat/jdk-only-mode`), read 2026-07-31. The
-> *defect* is unchanged; only its shape is.
+The original defect: under `--jdk-only` this API recorded the violation and
+then fabricated the class anyway, so the run reported a violation while
+continuing in the exact state the contract forbids. That is now false for every
+path the three measured workloads reach.
 
-## What changed on 2026-08-04 — the migration has a work list now
+## The measurement (2026-08-05, real JDK 25, `--jdk-only`)
 
-The scale section below scopes this at **52 live call sites in 27 files**, which
-is a grep, and grep is why the item reads as intractable. The
-`requested_by` instrument ([observability item 9], closed the same day) turns it
-into a census: `admit_compatibility_class` is `#[track_caller]`, threaded
-through `fabricate_class` and all three `ensure_*` entry points, so every
-recorded violation now names the Rust call site that asked.
-
-A `--jdk-only` boot against a real JDK 21 image fabricates 14 classes from
-**three** call sites:
-
-| Class(es) | Call site | Verdict |
+| workload | rows before → after | `compatibility-stub` before → after |
 |---|---|---|
-| the 11 `cratonvm/internal/Unmodifiable*` | `vm/src/vm/vm_init.rs:1227` | **stay `CompatibilityStub`** — see below |
-| `cratonvm/synthetic/AnonymousObject$N` | `vm/src/vm/vm_exec.rs:9814` | **migrated** to `ensure_generated_class(VmInternal)` |
-| `java/util/Enumeration$Impl` | `vm/src/vm/vm_init.rs:1052` | step 2 below, still open |
-| `java/util/Comparator$Native` | `vm/src/vm/vm_init.rs:1110` | step 2 below, still open |
+| `StrictBoot` (a `main` that prints one line) | 392 → 379 | **13 → 0** |
+| `JdkOnlyCensusLoadProbe` | 704 → 654 | **17 → 1** |
+| `JdkOnlyBreadthProbe` | 828 → 727 | **18 → 5** |
 
-That is the difference between a to-do list and a list of names. The other ~49
-call sites exist, but they are reached by workloads a trivial strict boot does
-not run; the way to size them is to take this census from the workload you care
-about, not to migrate 52 sites blind.
+`--jdk-only-report`'s `counts.compatibility_classes` agrees. The row total falls
+because a refused fabrication is a class that never enters the store.
 
-**The `Unmodifiable*` family is adjudicated as staying.** They are the largest
-group and the most tempting to reclassify — no class file exists under
-`cratonvm/internal/UnmodifiableList`, which is the `VmInternal` shape. But they
-stand in for `java.util.Collections$UnmodifiableList` and friends: the real
-`Collections.unmodifiableList()` bytecode is not running, and that is a
-compatibility substitution whatever the stand-in is named. Migrating them is the
-dangerous direction in *Blast radius* — it silences the violation, keeps
-fabricating, and makes the zero-stub census green while the substitution
-continues.
+**Ten call sites fire, not 52** — the union over the three workloads:
 
-[observability item 9]: ../../internal/jdk-only-observability-surface-FIXED-20260804.md
+| site | class(es) |
+|---|---|
+| `vm/src/vm/vm_init.rs:1052` | `java/util/Enumeration$Impl` |
+| `vm/src/vm/vm_init.rs:1110` | `java/util/Comparator$Native` |
+| `vm/src/vm/vm_init.rs:1227` | 11 × `cratonvm/internal/Unmodifiable*` |
+| `native-collections/src/lib.rs:4844` | `cratonvm/internal/ArrayListSubList` |
+| `native-collections/src/lib.rs:12143` | `java/util/HashMap$KeyItr` |
+| `native-collections/src/lib.rs:15904` | `cratonvm/internal/StreamCollector` |
+| `native-collections/src/lib.rs:39187` | `java/util/TreeSet$Itr` |
+| `native-builtins/src/lib.rs:25891` | `cratonvm/internal/SystemLogger` |
+| `native-builtins/src/lib.rs:37099` | `java/util/function/Function$Identity` |
+| `native-builtins/src/phases_late/streams.rs:2730` | `java/util/function/Function$AndThen` |
+
+All ten are migrated. The retired lane write-up
+(`L7-ensure-synthetic-class-migration-RETIRED-20260805`) carries the full
+before/after, the `Compatible`-mode diff and the HotSpot control.
+
+### The instrument was wrong until it was fixed
+
+Every one of the seven native-minted classes was attributed to a single line —
+`vm_exec.rs:13670`, the `NativeContextImpl::ensure_synthetic_class` forwarder
+that all ~2,000 native allocation sites funnel through. `#[track_caller]` is now
+threaded through the two `NativeContext` trait declarations, their two impls,
+and the three allocation funnels. Control: totals and stub counts
+byte-identical before and after that change; only `requested_by` moved.
+
+**Caveat, and it bites:** `origin_requesters` records the *first* requester of a
+class name, and a refusal records one. Once a site refuses a name, a later
+*successful* fabrication of the same name by a different site is still
+attributed to the refusing one. The residual rows below are reported as
+`vm_init.rs:484` — the refusal helper — but are minted in `native-collections`.
+
+### The population, recounted
+
+**39 live sites in 25 files**, not 52 in 27. The difference is entirely
+mis-scoped test code: `vm/src/vm.rs`'s six sit behind
+`#[cfg(all(test, feature = "synthetic-jdk"))]`, which a `#[cfg(test)]` scan
+misses, and all four of `proxy_gen.rs`'s are in its test module — so this
+record's *"`proxy_gen.rs` has 5 sites in the current tree, not 1; each needs its
+own adjudication"* was counting tests.
 
 ## What is still open
 
-* **Step 1**, the migration itself, for everything except
-  `AnonymousObject$N`. The judgement per site is unchanged; what is new is that
-  the census tells you which sites a given workload actually reaches.
-* **Step 2** — making `vm_init.rs`'s bootstrap block fail loudly under
-  `JdkOnly` instead of fabricating `Enumeration$Impl` / `Comparator$Native`
-  behind a recorded violation. Untouched, and it is the one with real risk: a
-  strict boot that refuses these either proves the natives bound to them are
-  already refused (in which case the classes were dead weight) or stops booting.
-  That is a run, not an argument, and it has not been done.
-* **Step 3**, deleting `ensure_synthetic_class`, which step 1 gates.
+**Step 3 — deleting `ensure_synthetic_class` — and the blocker is not the call
+sites.** Three of the 39 *are* the infallible allocation funnels themselves:
 
-## What is wrong
+* `native-collections::alloc_synthetic`
+* `native-io::alloc_synthetic`
+* `native-builtins::alloc_concurrent_synthetic`
 
-`classloading/src/class_manager.rs` ~2918:
+Between them they have roughly **2,300 callers**, none of which returns a
+`Result`. Deleting `ensure_synthetic_class` means making those three fallible,
+which is that many call sites — not the 39, and certainly not "52". Any plan
+that sizes this work off a grep of `.ensure_synthetic_class(` is sizing the
+wrong thing.
+
+The fallible siblings those funnels need already exist and now have real
+callers: `try_alloc_synthetic` (native-collections) and
+`try_alloc_concurrent_synthetic` (native-builtins), added by L7 alongside the
+infallible ones.
+
+**Residual R1 — the last 1 / 5 compatibility classes.**
+`JdkOnlyCensusLoadProbe` still fabricates `cratonvm/internal/UnmodifiableSet`;
+`JdkOnlyBreadthProbe` also fabricates `UnmodifiableList`, `UnmodifiableListItr`,
+`UnmodifiableMap` and `java/util/Comparator$Native`. They are minted by
+`native-collections`' `alloc_unmod_wrapper` / `alloc_unmod_list_itr` /
+`make_comparator` and by `native-builtins::lang_system::wrap_system_env_map`.
+
+Making those fallible was **tried, measured, and reverted**, and the
+measurement is the useful part: it does reach 0 / 0 / 0 compatibility classes,
+and it breaks real JDK `<clinit>`s, because `java.util.Collections.unmodifiable*`
+and `List.of` are real methods the JDK's own bootstrap calls. On that build the
+breadth probe produced `SECTION-FAILED zip: NullPointerException: zone` and
+`SECTION-FAILED reflection: NoSuchMethodError:
+cratonvm.synthetic.AnonymousObject$16.newInstance` — neither naming a refused
+class — and went from 4 to 8 failures. The allocation half must not land before
+the corresponding natives are retagged so the real `Collections$UnmodifiableMap`
+bytecode runs. That is safe for this family (a real unmodifiable wrapper
+delegates to the backing map, whose natives still work) and it belongs to
+whoever owns `register_unmodifiable_natives`, under the "retag per subsystem,
+one PR each, with evidence" discipline that registrar's own header demands.
+
+## What is wrong (unchanged in shape)
+
+`classloading/src/class_manager.rs`:
 
 ```rust
 pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId
 ```
 
-The return type is a bare `ClassId`. There is no error channel. A refusal cannot
-be expressed, so the function passes `enforce: false` and fabricates regardless
-of mode:
-
-```rust
-pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-    self.fabricate_class(
-        name,
-        num_fields,
-        ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
-        // Record the violation, then fabricate anyway — there is no error
-        // channel on this signature.
-        false,
-    )
-    .expect("non-enforcing fabrication never returns Err")
-}
-```
-
-`enforce` is documented on `fabricate_class` (~3037) exactly as the defect
-describes it: *"`true` returns the `ClassNotFoundException` the contract asks
-for, `false` records the violation and fabricates anyway. Either way the
-violation is recorded, and either way `Compatible` mode fabricates."*
+The return type is a bare `ClassId`. There is no error channel, so the function
+passes `enforce: false` and fabricates regardless of mode. `enforce` is
+documented on `fabricate_class` exactly as the defect describes it: *"`true`
+returns the `ClassNotFoundException` the contract asks for, `false` records the
+violation and fabricates anyway. Either way the violation is recorded, and
+either way `Compatible` mode fabricates."*
 
 Contract §5 requires the opposite: *"Under `JdkOnly`, every path that today
 fabricates a class … must instead return the specification-appropriate
 `ClassNotFoundException` / `NoClassDefFoundError` and record a
 `CompatibilityClassRequested` violation."*
 
-**The `load_class` chain does enforce.** This is the important distinction: an
-absent enterprise or JDK class arriving through ordinary class loading is
-correctly refused (`create_synthetic_stub`, ~7289, which routes through
-`admit_compatibility_class` at ~2455). It is this *direct* API — used by VM
-bootstrap and by natives that want an allocation shape — that cannot.
+**The `load_class` chain does enforce.** An absent enterprise or JDK class
+arriving through ordinary class loading is correctly refused
+(`create_synthetic_stub`, routing through `admit_compatibility_class`). It is
+this *direct* API — used by VM bootstrap and by natives that want an allocation
+shape — that cannot.
 
-The re-land made the policy a single choke point, which is a genuine
-improvement worth keeping: `admit_compatibility_class` is called from exactly
-two places (`create_synthetic_stub` and `fabricate_class`), *"so there is no
-third place a stub can be minted without the policy seeing it."* The problem is
-no longer "the policy can be bypassed"; it is "the policy is seen and then
-overridden by a signature".
+`admit_compatibility_class` is called from exactly two places
+(`create_synthetic_stub` and `fabricate_class`), *"so there is no third place a
+stub can be minted without the policy seeing it."* The problem was never "the
+policy can be bypassed"; it was "the policy is seen and then overridden by a
+signature".
 
-## The fallible siblings exist — and have zero callers
+## The fallible siblings, and what a refusal has to look like
 
-Both entry points the original filing asked for were re-landed:
-
-* `try_ensure_synthetic_class(name, n) -> Result<ClassId, VmError>` (~2941) —
-  `ClassNotFoundException` under `JdkOnly`, which constant-pool resolution
-  already translates to `NoClassDefFoundError`. Byte-for-byte
+* `try_ensure_synthetic_class(name, n) -> Result<ClassId, VmError>` —
+  `ClassNotFoundException` under `JdkOnly`. Byte-for-byte
   `ensure_synthetic_class` under `Compatible`.
-* `ensure_generated_class(name, n, origin)` (~2969) — for arrays, hidden
-  classes, lambdas, proxies, reflection accessors and VM-internal shapes
-  (contract §1 item 6). Never refused, in either mode; `debug_assert`s that the
-  caller did not pass a `CompatibilityStub` origin.
+* `ensure_generated_class(name, n, origin)` — for arrays, hidden classes,
+  lambdas, proxies, reflection accessors and VM-internal shapes (contract §1
+  item 6). Never refused, in either mode; `debug_assert`s that the caller did
+  not pass a `CompatibilityStub` origin.
 
-**Neither has a single caller outside `class_manager.rs`** (ripgrep,
-2026-07-31). The migration is the work; the API was never the blocker. Note in
-particular that `try_ensure_synthetic_class`'s doc comment names its intended
-chief caller — *"the `java/util/function/Function$Identity` stand-in minted by
-the stream/function natives"* — and that caller still goes through
-`ensure_synthetic_class` via `alloc_concurrent_synthetic`. See
-[the ambient-`NativeKind` record](native-kind-is-ambient-and-defaults-to-syntheticstub.md)
-for why that particular one is now load-bearing in a new way.
+**A refusal must be catchable, which needed a third piece.**
+`impl From<ClassIdentityError> for MethodCallFailed` yields
+`MethodCallFailed::InternalError`, documented as *"not catchable by Java code —
+aborts execution entirely"*. That is the right shape for a VM invariant and the
+wrong one for a policy refusal. `native_api::refusal_to_java_failure` (added
+2026-08-05) builds the throwable instead: `NoClassDefFoundError` for a policy
+refusal, message = the internal name, matching the VM-side
+`raise_no_class_def_found` so a refusal reaching Java from a native and one from
+constant-pool resolution are indistinguishable to a `catch` block;
+`IncompatibleClassChangeError` for an ambiguous name. It falls back to the
+uncatchable form only when the throwable itself cannot be constructed.
 
-## Scale (re-counted 2026-07-31 against the re-landed tree)
+For a caller with no error channel at all — the VM bootstrap block — "refuse
+diagnosably" means the recorded violation *plus* a `tracing::warn!` that the
+CLI's default WARN/stderr filter prints with no extra flag and that states the
+consequence. `vm_init::ensure_bootstrap_compat_class` is the shape to copy.
 
-`.ensure_synthetic_class(` matches **66 times across 30 files** (ripgrep,
-workspace, `--include=*.rs`). Excluding 12 hits inside `class_manager.rs`'s own
-`mod tests` (from line 14007) and 2 integration-test hits
-(`vm/tests/jdk_only_dispatch.rs`, `classloading/tests/jdk_only_class_origin.rs`)
-leaves **52 live call sites in 27 files**. The heaviest callers:
+## The `Unmodifiable*` family is adjudicated as staying `CompatibilityStub`
 
-| File | Sites |
-|---|---|
-| `vm/src/vm/vm_init.rs` | 5 |
-| `native-builtins/src/lang_system.rs` | 5 |
-| `classloading/src/proxy_gen.rs` | 5 |
-| `native-io/src/process.rs` | 4 |
-| `vm/src/vm/vm_exec.rs` | 3 |
-| `vm/src/native/jni.rs` | 3 |
-| `vm/src/vm.rs`, `native-collections/src/lib.rs`, `native-builtins/src/{lib,lang_string,keystore,util_concurrent_ext}.rs` | 2 each |
-| 15 further `native-builtins` / `native-io` modules | 1 each |
-
-*(The original filing said 64 live sites in 28 files, derived from a count of 68
-that included two documentation hits. Both numbers describe the same population;
-the current figure is the one to work from.)*
-
-## The concrete symptom this produces today
-
-`vm/src/vm/vm_init.rs`'s bootstrap block mints `java/util/Enumeration$Impl`
-(~1052) and `java/util/Comparator$Native` (~1107) through this API and then
-wires them up with `get_class_mut`. Under `JdkOnly` the fabrication is recorded
-as a violation and happens anyway, so the wiring succeeds and the run continues
-in the state §5 forbids.
-
-**UNVERIFIED against the re-landed tree:** the original filing quoted a wave-1
-note in that block predicting the *other* outcome — that the fabrication would
-be refused, `get_class_mut` would find nothing, and *"the strict boot silently
-loses `Enumeration$Impl` / `Comparator$Native` … rather than failing loudly."*
-That note is not in the re-landed `vm_init.rs`, and with `enforce: false` the
-refusal it describes cannot occur on this path. Which of the two behaviours a
-strict boot actually shows needs a run, not a reading. Either way the boot does
-not fail loudly, which is the point of the item.
-
-## The migration recipe (from the in-code `JDK-ONLY-WAVE2` marker, ~2899)
-
-> `ensure_synthetic_class` returns a bare `ClassId` — there is no error channel
-> — and it has ~70 callers across ~33 files, almost all of them inside
-> `native-builtins` allocation helpers such as `alloc_concurrent_synthetic`,
-> which likewise return a value rather than a `Result`. … Migration recipe for
-> wave 2, per call site:
->   1. If the caller is generating a legitimate VM class (a lambda, a proxy, a
->      reflection accessor, an internal allocation shape), switch it to
->      `ensure_generated_class` with the matching `ClassOrigin` — it is never
->      refused, in either mode.
->   2. If the caller is standing in for a class whose real bytes should have
->      been found, switch it to `try_ensure_synthetic_class` and propagate the
->      `ClassNotFoundException` up through the native's own error path.
->   3. When no caller remains, delete this method.
-
-## Why it was not fixed in wave 1
-
-Touching 52 call sites across `classloading`, `vm`, `native-builtins`,
-`native-collections`, `native-io` and `vm/src/native/jni.rs` means editing files
-owned by six other agents in the same wave, and every one of those call sites
-needs a *judgement*: is this class a compatibility substitution (→ `try_…`) or a
-legitimately-generated shape (→ `ensure_generated_class`)? That judgement cannot
-be made mechanically and cannot be validated without running the regression
-suite. Contract §10 scopes wave 1 to measurement.
+They are the largest group and the most tempting to reclassify — no class file
+exists under `cratonvm/internal/UnmodifiableList`, which is the `VmInternal`
+shape. But they stand in for `java.util.Collections$UnmodifiableList` and
+friends: the real `Collections.unmodifiableList()` bytecode is not running, and
+that is a compatibility substitution whatever the stand-in is named.
+Reclassifying them is the dangerous direction in *Blast radius* — it silences
+the violation, keeps fabricating, and makes the zero-stub census green while
+the substitution continues. L7 acted on that verdict: the bootstrap site
+**refuses** them rather than relabelling them. See
+[VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md).
 
 ## What specifically must change
 
-1. Migrate call sites **subsystem by subsystem**, deciding per site between the
-   two entry points, which already exist. `proxy_gen.rs` (5 sites) and the
-   `cratonvm/synthetic/AnonymousObject$N` allocation shape in `vm_exec.rs` are
-   the clearest `ensure_generated_class` candidates — see
-   [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md).
-2. Make `vm_init.rs`'s bootstrap block fail loudly under `JdkOnly` instead of
-   fabricating `Enumeration$Impl` / `Comparator$Native` behind a recorded
-   violation.
-3. Delete `ensure_synthetic_class`.
+1. ~~Migrate the call sites that fire~~ — done 2026-08-05, all ten.
+2. ~~Make `vm_init.rs`'s bootstrap block fail loudly under `JdkOnly`~~ — done;
+   `StrictBoot` reaches `main` with **zero** fabricated compatibility classes.
+3. Make the three allocation funnels fallible (~2,300 call sites), then delete
+   `ensure_synthetic_class`.
+4. R1 above: retag `register_unmodifiable_natives`' factories, then migrate
+   their allocators.
 
 ## How to verify a fix
 
-* A `--jdk-only` boot on a complete real JDK image must reach `main` with **zero**
-  `compatibility-class-requested` violations in the `--jdk-only-report` JSON.
-  Any remaining violation names the exact class and the reason.
-* Grep gate: `.ensure_synthetic_class(` must match zero non-test sites.
+* A `--jdk-only` boot on a complete real JDK image must reach `main` with
+  **zero** compatibility-class *fabrications* in the `--jdk-only-report` JSON
+  (`counts.compatibility_classes`). **Not** zero violations:
+  `admit_compatibility_class` records the request before it refuses it,
+  deliberately, so the violation list is the backlog and the count is the
+  result. `StrictBoot` is at 0 with 13 recorded requests.
+* Grep gate: `.ensure_synthetic_class(` must match zero non-test sites. 39
+  today.
 * `--dump-class-origins` must show no `compatibility-stub` rows for non-array
   JDK/application/dependency classes (contract §11).
 * `Compatible` mode must be byte-for-byte unchanged — the existing regression
-  suite plus `native-builtins/tests/stub_ratchet.rs` (`BASELINE_SYNTHETIC_STUBS
-  = 157`, `SLACK = 0`).
+  suite plus `native-builtins/tests/stub_ratchet.rs`. That baseline moved
+  157 → 165 on 2026-08-05 and the constant's doc comment explains why (a
+  relabelling of eight already-existing fakes, not eight new ones); it must not
+  move again without the same kind of explanation.
+* Count **call sites**, not violations, when checking migration progress:
+  `admit_compatibility_class` dedupes by class name (`origin_violations_seen`),
+  so a migrated caller that stops fabricating a name some *other* caller also
+  requests will not change the violation count. And see the `requested_by`
+  first-writer caveat above before trusting an attribution.
 
 ## Blast radius if done wrong
 
@@ -231,10 +220,9 @@ suite. Contract §10 scopes wave 1 to measurement.
 * Migrating a **compatibility stub** to `ensure_generated_class` is the
   dangerous direction: it silences the violation, keeps fabricating, and makes
   the zero-stub census report green while the substitution is still happening.
-  Contract §11's acceptance criterion becomes unfalsifiable.
-* Because `ensure_generated_class` only `debug_assert!`s on a `CompatibilityStub`
-  origin, a release build will not catch the second mistake at all.
-* Note that `admit_compatibility_class` dedupes by class name
-  (`origin_violations_seen`), so a migrated caller that stops fabricating a
-  name some *other* caller also requests will not change the violation count.
-  Count call sites, not violations, when checking migration progress.
+  Contract §11's acceptance criterion becomes unfalsifiable. Because
+  `ensure_generated_class` only `debug_assert!`s on a `CompatibilityStub`
+  origin, a release build will not catch this at all.
+* Migrating an allocator whose class stands in for a **real JDK method the JDK
+  itself calls during `<clinit>`** breaks the boot in a way that does not name
+  the refused class — R1's measured outcome. Retag the native first.

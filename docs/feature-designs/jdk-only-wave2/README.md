@@ -32,15 +32,15 @@ can work on what, simultaneously, without colliding.**
 | [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
 | [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
 | [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
-| [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
+| L7 **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
-are done; L9 is closed.)
+**L3–L6 and L8 can all start today, in parallel, by different people.** (L1,
+L2 and L7 are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -183,3 +183,31 @@ comment. Item 7 is still blocked on L10.
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
 so `kind_stated` is no longer `false` on all 11,909 rows.
+
+**Update, 2026-08-05 — L7 landed, and the lane doc is retired to
+`docs/internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md`.** A
+strict boot now fabricates **zero** compatibility classes (13 before), and the
+two breadth probes drop 17 → 1 and 18 → 5. `Compatible`-mode stdout is
+byte-identical on all three workloads against the pre-fix binary. Another
+number joins the *"a number in a record is a claim"* list: **"52 call sites"
+was 39 live in 25 files, of which 10 fire** — the rest of the gap was
+`#[cfg(all(test, feature = "synthetic-jdk"))]` and `proxy_gen.rs`'s test module
+being counted as production.
+
+Three findings worth carrying into the other lanes:
+
+* **The census could not name a native until 2026-08-05.** All seven
+  native-minted classes were attributed to one forwarding line in
+  `NativeContextImpl`; `#[track_caller]` now runs down through the trait
+  declarations and the three allocation funnels. And `requested_by` records the
+  *first* requester of a name — including one that was **refused** — so a later
+  successful fabrication of the same name is attributed to the refusing site.
+* **`ensure_synthetic_class` cannot be deleted by migrating call sites.** Three
+  of the 39 *are* the infallible allocation funnels, with ~2,300 callers
+  between them. That, not the call sites, is what step 3 is gated on.
+* **A fabrication cannot be made fallible before its native is retagged**, when
+  the class stands in for a real JDK method the JDK's own bootstrap calls.
+  Measured: refusing `cratonvm/internal/Unmodifiable*` reaches a zero census
+  and produces `NullPointerException: zone` from `java.time`, which names
+  nothing. Reverted, and left as a hand-off to whoever owns
+  `register_unmodifiable_natives`.

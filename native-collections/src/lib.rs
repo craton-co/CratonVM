@@ -2061,6 +2061,11 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 /// Allocate a synthetic object, trying to load the real class first.
+///
+/// `#[track_caller]` so the class-origin census's `requested_by` names the
+/// native that wanted the shape, not this one forwarding line — see the
+/// matching note on `NativeContext::ensure_synthetic_class`.
+#[track_caller]
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
     // S111r7: when `<clinit>` fails (e.g. transient state where a class
     // is mid-initialization on a parent frame), fall back to a name-only
@@ -2101,6 +2106,73 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
         },
     };
     ctx.alloc_object(cid, num_fields)
+}
+
+/// The fallible spelling of [`alloc_synthetic`] — same operation, with the
+/// refusal `--jdk-only` requires.
+///
+/// [`alloc_synthetic`] reaches `ensure_synthetic_class`, which under
+/// [`CompatibilityMode::JdkOnly`] records a `CompatibilityClassRequested`
+/// violation and then fabricates anyway, because its signature has no error
+/// channel. This one goes through `try_ensure_synthetic_class`, so the policy's
+/// refusal actually reaches the caller as a `ClassNotFoundException` naming the
+/// class — which for a shape like `java/util/HashMap$KeyItr` is the honest
+/// answer: no class file with that name exists in any JDK, so a strict run that
+/// gets one is running a synthetic collection iterator in place of the real
+/// bytecode.
+///
+/// Under the default `Compatible` mode the two are byte-for-byte identical.
+///
+/// Every native returning `MethodCallResult` should prefer this spelling;
+/// `ClassIdentityError` converts with `?`.
+///
+/// [`CompatibilityMode::JdkOnly`]: cratonvm_types::compat::CompatibilityMode
+#[track_caller]
+fn try_alloc_synthetic(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Same real-class preference, and the same two fallbacks, as the
+    // infallible spelling above. Only the final "no class of this name exists
+    // anywhere" arm differs: it asks the policy instead of overriding it.
+    //
+    // `refusal_to_java_failure`, not the `?` conversion: the latter yields
+    // `MethodCallFailed::InternalError`, which is uncatchable and aborts the
+    // run. A policy refusal has to arrive as the `NoClassDefFoundError` the
+    // contract names, so the program can see and handle it.
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(class_id) => {
+            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if resolved_name == class_name || class_name == "java/lang/Object" {
+                class_id
+            } else {
+                match ctx.class_id_by_name(class_name) {
+                    Some(id) => id,
+                    None => refused_class(ctx, class_name, num_fields)?,
+                }
+            }
+        }
+        Err(_) => match ctx.class_id_by_name(class_name) {
+            Some(id) => id,
+            None => refused_class(ctx, class_name, num_fields)?,
+        },
+    };
+    Ok(ctx.alloc_object(cid, num_fields))
+}
+
+/// `try_ensure_synthetic_class`, with the refusal converted to a catchable
+/// Java throwable. Shared by [`try_alloc_synthetic`]'s two arms.
+#[track_caller]
+fn refused_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<ClassId, MethodCallFailed> {
+    match ctx.try_ensure_synthetic_class(class_name, num_fields) {
+        Ok(id) => Ok(id),
+        Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+    }
 }
 
 /// Allocate a *real* JDK object of `class_name` with its natural field count and
@@ -4836,7 +4908,11 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // throws `UnsupportedOperationException` (fail loud) rather than diverging.
     // See `register_al_sublist_natives` and the `ASL_*` handlers below.
     let parent_size = size;
-    let view = alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS);
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7): the real
+    // `ArrayList.subList` returns a `java.util.ArrayList$SubList` running real
+    // bytecode, so handing back this stand-in under `--jdk-only` is exactly the
+    // substitution §5 forbids. Refuse there instead, naming the class.
+    let view = try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS)?;
     ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(this)));
     ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
     ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
@@ -12135,7 +12211,19 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let k = read_pinned_elem(ctx, key_handles[i], *k);
         ctx.set_array_element(keys_arr, i, k);
     }
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
+    // `java.util.HashMap$KeyItr` — the real one is `HashMap$KeyIterator` — so a
+    // strict run that gets this shape is running a snapshot iterator in place
+    // of the real bytecode. Refuse there, naming the class.
+    // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
+    // `unpin_native_roots` below would strand it and everything pinned above it.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+        Ok(itr) => itr,
+        Err(err) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(err);
+        }
+    };
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
@@ -15896,7 +15984,8 @@ fn drain_spliterator_to_array_capped(
     spl: ObjectRef,
     safety_cap: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let collector = alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7).
+    let collector = try_alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2)?;
     let storage = alloc_ref_array(ctx, 16);
     ctx.set_field(collector, 0, Value::Object(Some(storage)));
     ctx.set_field(collector, 1, Value::Int(0));
@@ -39178,9 +39267,12 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // The back-reference to the owning set lets `TreeSet$Itr.remove()` delete
     // the last-returned element from the live set (real-JDK `Iterator.remove`
     // contract) rather than throwing UnsupportedOperationException.
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
+    // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
+    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
     let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
-        alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    });
+        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+    })?;
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -39745,9 +39837,12 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ctx.set_array_element(snap, i, v);
         }
     }
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
+    // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
+    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
     let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
-        alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    });
+        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+    })?;
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
