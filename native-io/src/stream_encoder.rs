@@ -892,7 +892,10 @@ pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
             None => return Ok(Some(Value::Object(None))),
         };
         let name = name_of(ctx, this);
-        let s = ctx.create_string(&name);
+        // The real `StreamEncoder.encodingName()` reports the HISTORICAL name
+        // for any `HistoricallyNamedCharset`, which is most of `java.base`:
+        // `new OutputStreamWriter(os, UTF_8).getEncoding()` is "UTF8".
+        let s = ctx.create_string(engine::historical_charset_name(&name));
         Ok(Some(Value::Object(Some(s))))
     });
     registry.register(se, "isOpen", "()Z", |ctx, args| {
