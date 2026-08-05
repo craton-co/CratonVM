@@ -11212,13 +11212,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
+        // DECLARATION ORDER IS THE REAL JDK'S, and must stay that way.
+        //
+        // It was `name, parent, daemon, maxPriority` until 2026-08-05 — BOTH
+        // pairs transposed against the image, which declares
+        // `parent, name, maxPriority, daemon` (JDK 21 through 25, `javap -p
+        // --module java.base java.lang.ThreadGroup`). Every field here has a
+        // real counterpart at a different index, so the model was wrong in the
+        // one way no value-tag census can see: a `ThreadGroup` reference over a
+        // `String` reference and an `int` over an `int` both type-check. The
+        // L4 shadow-layout diff reported all four
+        // (`docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`).
+        //
+        // The natives in `native-builtins/src/phases_late/concurrent.rs`
+        // resolve these by NAME first and only fall back to a hard-coded index,
+        // so on a real image they were already correct — the transposition bit
+        // wherever a raw index was used instead, and it kept the census
+        // reporting four rows that were not defects. The fallback constants
+        // there are the real order now too; the two tables must move together.
         "java/lang/ThreadGroup" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("parent"),
@@ -11227,14 +11239,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("daemon"),
-                descriptor: cratonvm_types::intern_arc("Z"),
+                name: cratonvm_types::intern_arc("name"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("maxPriority"),
                 descriptor: cratonvm_types::intern_arc("I"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("daemon"),
+                descriptor: cratonvm_types::intern_arc("Z"),
                 attributes: vec![],
             },
         ],
