@@ -10960,8 +10960,100 @@ unsafe fn try_fast_lambda_int_to_double_apply(
 // invocation hits the inline cascade emitted in `jit/src/x64.rs`.
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // matching the compiled method's extern "C" calling convention.
+/// DIAGNOSTIC (temporary, `CRATONVM_DBG_MIC_RET=1`): a compiled virtual/interface
+/// site whose descriptor promises a reference return must not hand back a value
+/// that is not a live heap object. Reports the site, the receiver's class and the
+/// returned value's class so a wrong-target dispatch is named rather than
+/// inferred from the crash it eventually produces.
+unsafe fn mic_return_diag(vm_ptr: i64, info_ptr: i64, args_ptr: i64, num_args: i64, ret: i64) {
+    if ret == 0 || ret == i64::MIN || vm_ptr == 0 || info_ptr == 0 {
+        return;
+    }
+    let info = &*(info_ptr as *const JitInvokeInfo);
+    let Some(rp) = info.descriptor.rfind(')') else {
+        return;
+    };
+    let rt = info.descriptor.as_bytes().get(rp + 1).copied().unwrap_or(0);
+    if rt != b'L' && rt != b'[' {
+        return;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    let bits = ret as u64;
+    let obj = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+        vm.mem.heap.is_object_address(bits as usize)
+    } else {
+        None
+    };
+    let actual = match obj {
+        Some(o) => {
+            let kind = vm.mem.heap.kind_of(o);
+            let name = throwable_class_name(vm, o).unwrap_or_else(|| "<unknown>".to_string());
+            format!("{name} kind={kind:?}")
+        }
+        None => "<NOT A HEAP OBJECT>".to_string(),
+    };
+    let recv = if num_args > 0 && args_ptr != 0 {
+        let r = *(args_ptr as *const i64);
+        let rb = r as u64;
+        if r != 0 && (rb & 0x7) == 0 && rb < (1u64 << 48) {
+            match vm.mem.heap.is_object_address(rb as usize) {
+                Some(o) => throwable_class_name(vm, o).unwrap_or_else(|| "<unknown>".into()),
+                None => format!("<raw {r:#x}>"),
+            }
+        } else {
+            format!("<raw {r:#x}>")
+        }
+    } else {
+        "<none>".to_string()
+    };
+    let bad = obj.is_none()
+        || (rt == b'[' && vm.mem.heap.kind_of(obj.unwrap()) == cratonvm_types::ObjectKind::Object);
+    if bad {
+        eprintln!(
+            "[mic-ret] BAD site={}.{}{} receiver={} ret={:#x} actual={}",
+            info.class_name, info.method_name, info.descriptor, recv, ret, actual
+        );
+    } else if mic_ret_diag_verbose() {
+        eprintln!(
+            "[mic-ret] ok site={}.{}{} receiver={} actual={}",
+            info.class_name, info.method_name, info.descriptor, recv, actual
+        );
+    }
+}
+
+/// Whether the temporary `CRATONVM_DBG_MIC_RET` return-shape audit is armed.
+fn mic_ret_diag() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_RET").is_some())
+}
+
+/// `CRATONVM_DBG_MIC_RET=all` also reports the well-formed returns, so the audit
+/// can be proven live rather than assumed from an empty log.
+fn mic_ret_diag_verbose() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_MIC_RET").as_deref() == Ok("all")
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn jit_invoke_virtual_mic(
+    vm_ptr: i64,
+    info_ptr: i64,
+    args_ptr: i64,
+    num_args: i64,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) -> i64 {
+    let r = jit_invoke_virtual_mic_inner(vm_ptr, info_ptr, args_ptr, num_args, mic_ptr, pic_ptr);
+    if mic_ret_diag() {
+        mic_return_diag(vm_ptr, info_ptr, args_ptr, num_args, r);
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn jit_invoke_virtual_mic_inner(
     vm_ptr: i64,
     info_ptr: i64,
     args_ptr: i64,
