@@ -18801,12 +18801,24 @@ pub(crate) fn populate_protection_domain_fields(
     let perms_v = Value::Object(Some(perms));
     let principals_v = Value::Object(Some(principals));
 
-    // Synthetic layout (codesource, permissions, classloader, principals).
-    ctx.set_field(pd, 0, codesource);
-    ctx.set_field(pd, 1, perms_v);
-    ctx.set_field(pd, 2, classloader);
-    ctx.set_field(pd, 3, principals_v);
-    // Real-JDK layout by name (authoritative вЂ” runs last).
+    // By NAME only, which is right on both layouts.
+    //
+    // This used to write slots 0..3 first, in the order
+    // `(codesource, permissions, classloader, principals)` — the JDK
+    // CONSTRUCTOR's argument order, not the field declaration order, which is
+    // `(codesource, classloader, principals, permissions)`. On a real
+    // `java.security.ProtectionDomain` that put the permissions in
+    // `classloader`, the loader in `principals` and the principals in
+    // `permissions`. All four are references, so the overlay hunter's
+    // value-tag test could never see it; the L4 shadow-layout diff, which
+    // compares by name, is what named it.
+    //
+    // It was never observable, because the by-name pass below writes the same
+    // four fields and ran last — the deleted comment said "authoritative —
+    // runs last", which is a load-bearing ordering nobody could see from the
+    // call site. So the raw pass was dead weight on a real layout and
+    // redundant on a fabricated one (the model names all four there too), and
+    // removing it deletes the ordering dependency along with the wrong writes.
     ctx.set_field_by_name(pd, "codesource", codesource);
     ctx.set_field_by_name(pd, "permissions", perms_v);
     ctx.set_field_by_name(pd, "classloader", classloader);
@@ -20966,9 +20978,20 @@ mod tests {
     #[test]
     fn t19_n1_class_get_protection_domain0_with_code_source_returns_pd() {
         // Simulate a class loaded from `file:/opt/app.jar` with two signer
-        // cert blocks. getProtectionDomain0 should return a non-null PD
-        // whose first slot (codesource) is non-null and whose codesource's
-        // first slot (location) is a String equal to the URL.
+        // cert blocks. `getProtectionDomain0` must return a non-null PD whose
+        // four fields resolve BY NAME to the right kinds, and whose CodeSource
+        // carries the location and the two cert blocks.
+        //
+        // This test used to read `pd[0]` / `cs[0]` / `cs[1]` by raw index and
+        // to expect a *String* at `cs[0]`. Both were artefacts of a blind spot
+        // in the mock, not of the VM: `MockNativeContext::set_field_by_name`
+        // answered `None` for any modelled class with no hand-written
+        // `mock_*_field_slot` helper, so the by-name half of every dual write
+        // in this file silently did nothing here and everything in the VM. The
+        // mock now falls back to the production
+        // `synthetic_stub_field_model`, which is what a fabricated class
+        // actually resolves against — and with the by-name writes live, the
+        // URL object wins slot 0 exactly as it does in the VM.
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("com/example/Signed").unwrap();
         // Seed overrides for this class.
@@ -20984,25 +21007,37 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected ProtectionDomain, got {other:?}"),
         };
-        // PD.codesource must be non-null
-        let cs = match ctx.get_field(pd, 0) {
+        // Every ProtectionDomain field, BY NAME — which is the only way the
+        // production populator writes them since the raw 0..3 pass (in the
+        // constructor's argument order, not the declaration order) was
+        // removed.
+        let cs = match ctx.get_field_by_name(pd, "codesource") {
             Value::Object(Some(c)) => c,
-            other => panic!("expected CodeSource at pd[0], got {other:?}"),
+            other => panic!("expected CodeSource at pd.codesource, got {other:?}"),
         };
-        // CS.location (slot 0) must be a String equal to the URL
-        let loc = match ctx.get_field(cs, 0) {
-            Value::Object(Some(s)) => s,
-            other => panic!("expected location String at cs[0], got {other:?}"),
-        };
-        assert_eq!(
-            ctx.read_string(loc).as_deref(),
-            Some("file:/opt/app.jar"),
-            "CodeSource.location must equal the class code base URL"
+        assert!(
+            matches!(ctx.get_field_by_name(pd, "permissions"), Value::Object(Some(_))),
+            "pd.permissions must be a non-null PermissionCollection"
         );
-        // CS.certs (slot 1) must be a 2-element Object[]
-        let certs_arr = match ctx.get_field(cs, 1) {
+        assert!(
+            matches!(ctx.get_field_by_name(pd, "principals"), Value::Object(Some(_))),
+            "pd.principals must be a non-null (possibly empty) array"
+        );
+        // The model's ORDER — which is what the rotation broke — is asserted
+        // by `protection_domain_layout_tests`, not here; the mock's
+        // `resolve_field_index_by_class_id` deliberately does not consult the
+        // fabricated model (see its doc comment).
+        // CodeSource.location — the URL object the by-name write installs.
+        // (The synthetic String form the raw write used to leave here is gone;
+        // `lookup_define` reads this by name and copes with either shape.)
+        assert!(
+            matches!(ctx.get_field_by_name(cs, "location"), Value::Object(Some(_))),
+            "CodeSource.location must be populated"
+        );
+        // CS.certs must be a 2-element Object[]
+        let certs_arr = match ctx.get_field_by_name(cs, "certs") {
             Value::Object(Some(a)) => a,
-            other => panic!("expected certs array at cs[1], got {other:?}"),
+            other => panic!("expected certs array at cs.certs, got {other:?}"),
         };
         assert_eq!(
             ctx.array_length(certs_arr),
@@ -23168,6 +23203,71 @@ Implementation-Title: opensaml-core-api\r\n\
                 // forwarded to a loader.
             }
             Ok(()) => panic!("expected rejection for a path-separated name"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod protection_domain_layout_tests {
+    /// Real JDK 21–25 `java.security.ProtectionDomain`, instance fields in
+    /// DECLARATION order — not the constructor's argument order, which is
+    /// `(CodeSource, PermissionCollection, ClassLoader, Principal[])` and is
+    /// how the model came to be wrong. Spelled out here so this is a claim
+    /// about the IMAGE that a JDK upgrade can falsify.
+    const REAL_PD_PREFIX: [(&str, &str); 4] = [
+        ("codesource", "Ljava/security/CodeSource;"),
+        ("classloader", "Ljava/lang/ClassLoader;"),
+        ("principals", "[Ljava/security/Principal;"),
+        ("permissions", "Ljava/security/PermissionCollection;"),
+    ];
+
+    #[test]
+    fn the_model_is_the_real_declaration_order_not_the_constructor_order() {
+        let model = cratonvm_classloading::synthetic_stub_field_model("java/security/ProtectionDomain");
+        let got: Vec<(String, String)> = model
+            .iter()
+            .filter(|f| !f.is_static())
+            .map(|f| (f.name.to_string(), f.descriptor.to_string()))
+            .collect();
+        let want: Vec<(String, String)> = REAL_PD_PREFIX
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        assert_eq!(
+            got, want,
+            "the fabricated ProtectionDomain model must be the real \
+             DECLARATION order (javap -p --module java.base \
+             java.security.ProtectionDomain). The constructor signature is a \
+             different order and is not the layout."
+        );
+    }
+
+    /// `populate_protection_domain_fields` must not address this class by raw
+    /// slot index. It used to write 0..3 in the constructor order and then the
+    /// same four by name, relying on the by-name pass running last to undo the
+    /// damage — an ordering dependency invisible at the call site.
+    #[test]
+    fn the_populator_writes_no_raw_slot_indices() {
+        let src = include_str!("lang_class.rs");
+        let start = src
+            .find("pub(crate) fn populate_protection_domain_fields")
+            .expect("populate_protection_domain_fields must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function body must terminate");
+        let body = &body[..end];
+        assert!(
+            body.contains("set_field_by_name(pd, \"codesource\""),
+            "the by-name writes must still be there, or this test asserts nothing"
+        );
+        for slot in 0..4 {
+            let needle = format!("set_field(pd, {slot},");
+            assert!(
+                !body.contains(&needle),
+                "`{needle}` addresses ProtectionDomain by raw index; resolve on \
+                 the receiver by name instead"
+            );
         }
     }
 }

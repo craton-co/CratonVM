@@ -1,10 +1,47 @@
+# L5 — `register_with_kind` migration, `native-io` — **DONE 2026-08-05**
+
+> **Retired.** Every `JDK-ONLY-CLASSIFY: bridge` registrar in `native-io` now
+> states its kind at the registration sites the image backs: **87 registrations
+> converted, `kind_stated` 9 → 96, zero `kind` changes, `BASELINE_SYNTHETIC_STUBS`
+> unmoved at 157, and the `CRATONVM_NO_STUBS=1` drop list byte-identical at 436
+> entries.** The lane's step 3 (confirm the static adjudication agrees) is what
+> decided the split: the other 117 registrations in those four registrars have no
+> `ACC_NATIVE` target on the image and were deliberately **left inherited**, so
+> the census keeps saying "nobody adjudicated this" about them.
+>
+> L6's `bridge-ratchet.sh`, which landed the same day, is **unmoved at 10,069 /
+> 4,755 — and could not have moved.** It counts `Bridge` rows with no
+> `ACC_NATIVE` target; the 87 rows L5 stated are precisely the rows that have
+> one. A `register_with_kind` migration moves `kind_stated`; only a
+> reclassification moves L6's number.
+>
+> The plan below is unchanged from what was executed. What it left open is a
+> reclassification question, not a migration one, and it is filed as an open
+> record: **`docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md`**.
+> The largest item there — 25 `Bridge` registrations on VM-minted
+> `cratonvm/synthetic/Process*` classes — is the `Function$Identity` shape found
+> in a second place, and belongs to whoever takes L7.
+>
+> One deviation from the plan as written, and it is the interesting one. Step 1
+> says "convert its `register(...)` calls … and delete the now-redundant
+> `set_category` scope". **No scope could be deleted**, in any of the four
+> registrars, because none of them turned out to be wholly adjudicated — not
+> even `random_access_file.rs`, where 10 of 11 are `ACC_NATIVE` and the
+> eleventh (`close0()V`) is not declared by JDK 25 at all. Two registrars
+> additionally register one native under several platform class names from a
+> single loop, so a single *site* produced rows with different verdicts; those
+> loops were split rather than claimed whole, which is exactly what `net.rs`'s
+> own marker had asked for.
+
+---
+
 # L5 — `register_with_kind` migration, starting with `native-io`
 
 **Owns:** `native-io/src/*.rs`
 **Gated on:** nothing.
 **Effort:** M per crate. This lane is the template; L5b/L5c repeat it for other
 crates and can run in parallel **once this one has set the pattern**.
-**Evidence:** [`native-kind-is-ambient-and-defaults-to-syntheticstub.md`](../../known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md)
+**Evidence:** [`native-kind-is-ambient-and-defaults-to-syntheticstub.md`](../known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md)
 
 ## Goal
 
