@@ -83,6 +83,15 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | `java/net/URI` | 5 | `Object` | `I` | 2 |
   | `java/net/URI` | 2 | `Int` | `L` | 2 |
   | `java/net/Proxy` | 0 | `Int` | `L` | 2 |
+  | `jdk/internal/math/FloatingDecimal$1` | 0 | `Object(None)` | `I` | 2 — **new 2026-08-05 (L4 gap 3)** |
+  | `ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter` | 0 | `Object(None)` | `I` | 2 — **new 2026-08-05 (L4 gap 3)** |
+
+  **This table is the WRITE half, and after L4 it is the smaller half.** The
+  widened detector's 135 sites include 70 reads and a separate per-class
+  shadow-layout census whose rows are not `(value kind, real desc)` tuples at
+  all; the section
+  [below](#the-detector-was-widened-2026-08-05-and-the-number-went-up) carries
+  them rather than stretching this table into a shape it was not built for.
 
   **13 classes, 24 distinct slots**, from three small probes. Reading it:
 
@@ -299,12 +308,66 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
     single off-by-one against one layout.
 
-  Two limits, so nobody reads this as complete. The detector covers
+  ~~Two limits, so nobody reads this as complete. The detector covers
   `NativeContextImpl::set_field` only: **reads are uninstrumented, and a
-  same-kind wrong-slot write is invisible** — an `Int` into the wrong `Int` slot
-  passes silently, and that is half the defect this record describes. And three
-  probes is not Spring Boot. Treat the table as a floor and re-run under H2 or
-  Spring Boot before calling the sweep done.
+  same-kind wrong-slot write is invisible**~~ — **both closed 2026-08-05 as lane
+  L4**, together with the `Object(None)`-over-a-primitive blind spot noted under
+  `Properties` above. Three probes is still not Spring Boot; every count here
+  remains a floor, for that reason rather than the detector's.
+
+  ### The detector was widened 2026-08-05, and the number went up
+
+  Lane [L4](../../feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md)
+  closed the three gaps. Same three probes, both modes, JDK 25, A/B against a
+  pre-fix binary built from the same tree:
+
+  | | pre | post |
+  |---|---:|---:|
+  | distinct `(op, class, slot, value kind, real desc)` sites | 4 | **135** |
+  | of which reads | 0 | **70** |
+  | modelled classes reached / of those disagreeing | — | 156 / **73** |
+  | disagreeing slots | — | **152** (129 by type class, 23 by name) |
+  | slots where our model NAMES a different field than the image | — | **23** across 12 classes (10 accessed) |
+
+  Every pre-fix row survives with its count (`MemberName` 50 → 50, both
+  `Scanner` rows 2 → 2, `HashMap` slot 1 8,314 → 8,312, inside its own ±4
+  spread), which is what makes the two numbers comparable rather than merely
+  both large.
+
+  Three things this record must now say differently:
+
+  * **Kind 5 is findable.** The paragraph below that says "no amount of
+    re-running the census will find another one" was true of the *old* detector
+    and is false of this one. CratonVM's `synthetic_stub_fields` model is diffed
+    against the real layout at define time (`classloading/src/shadow_layout.rs`),
+    so a slot where our model says `name:String` and the image says
+    `parent:ThreadGroup` is reported whether or not any value tag disagrees.
+    **`java/lang/ThreadGroup` has both `name`/`parent` and `daemon`/`maxPriority`
+    transposed** — the identical shape to the `ClassLoaders` defect L1 found by
+    hand, in a class nobody had looked at. So are `java/lang/Thread` slot 5
+    (`contextClassLoader` over `holder`), `java/security/ProtectionDomain` 1/2/3,
+    `java/security/CodeSource` 1, `java/io/BufferedWriter` / `BufferedReader` /
+    `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
+    / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
+    0/1. **None is fixed yet**; each is its own change with its own A/B, and the
+    list is this lane's output.
+  * **The `Object(None)` half is no longer verified only by unit test.** Two new
+    cross-type WRITE rows appear that the pre-fix binary is silent on, both
+    `Object(None)` over an `int`: `jdk/internal/math/FloatingDecimal$1` slot 0
+    and `ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter` slot 0. The
+    `Properties` slot-3 row the lane predicted does **not** appear — L2 step 3
+    had already removed that write. The prediction was stale, not wrong.
+  * **`java/util/Scanner`'s model is `instance_fields(5)`, not 3**, and slots 3
+    and 4 are the real `delimPattern` and `hasNextPattern`, both
+    `java.util.regex.Pattern` references. That settles L3 step 3's "either the
+    model grew or a different writer is involved" without running a tracer.
+
+  What the widened detector **still** cannot see, so the next reader does not
+  re-derive it: an anonymous `_fN` model slot over a real *reference* field is
+  unfalsifiable — the model declares `Ljava/lang/Object;` and so does every
+  reference field in the JDK. That is the residual half of kind 5, and the way
+  to shrink it is to name more of `synthetic_stub_fields`, not to run the census
+  again. A class with no arm in that table is outside the diff entirely.
 
   ### The 19 open slots are FOUR defects, not nineteen
 
@@ -325,18 +388,27 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   it is still wrong, because the real field holds a `Proxy$Type` **enum
   reference**.
 
-  **Kind 5, added 2026-08-05 by the L1 fix — the one the detector cannot
-  see.** A VM-internal reference written into a real reference slot. Same
-  wrong-field write as kind 1, but `overlay_write_is_destructive` only flags
-  cross-type-class coercions, so nothing in the census above reports it and no
-  amount of re-running the census will find another one. The three `ClassLoader`
-  reference slots (1/2/5) were all of this kind, and one of them was returning
-  a `String` where every caller expected a `ClassLoader`. **The only instrument
-  that finds kind 5 is a behavioural probe diffed against the host JDK**
-  (`probes/L1LoaderIdentityProbe`), or reading the writer against `javap` of the
-  real class. Any file that writes a hand-numbered slot model onto a class that
-  can become real has kind-5 exposure that this record's table under-reports by
-  construction. See L4 — its "same-kind writes" blind spot is this.
+  **Kind 5, added 2026-08-05 by the L1 fix — and made findable the same day by
+  L4.** A VM-internal reference written into a real reference slot. Same
+  wrong-field write as kind 1, but the value-tag predicate only flags
+  cross-type-class coercions, so nothing in the census above reported it. The
+  three `ClassLoader` reference slots (1/2/5) were all of this kind, and one of
+  them was returning a `String` where every caller expected a `ClassLoader`.
+
+  **The original filing of this paragraph said "no amount of re-running the
+  census will find another one" and that the only instrument is a behavioural
+  probe. That was true of the detector as it stood and is no longer true.** The
+  shadow-layout diff compares CratonVM's `synthetic_stub_fields` model against
+  the real layout by NAME, which is a signal the value's type tag does not
+  carry — and on its first run it found 23 such slots across 12 classes,
+  including `java/lang/ThreadGroup` with two field pairs transposed. What is
+  still unfindable is the narrower case where the model slot is **anonymous**
+  (`_fN`, declared `Ljava/lang/Object;`): there the model asserts nothing, so
+  there is nothing to disagree with, and only a behavioural probe diffed against
+  the host JDK (`probes/L1LoaderIdentityProbe`) or reading the writer against
+  `javap` will do. Any file that writes a hand-numbered slot model onto a class
+  that can become real still has that exposure. Naming the model's fields is
+  what converts it into something checkable.
 
   Two things found while classifying, both worth fixing alongside:
 

@@ -320,6 +320,29 @@ that field to — skipped when no real image is configured. That turns this
 document from a snapshot into an invariant. It is out of scope for wave 1
 (measurement, not enforcement) and is recorded here as the follow-up.
 
+**Half of it exists as of 2026-08-05 (wave-2 lane L4).**
+`classloading/src/shadow_layout.rs` diffs `synthetic_stub_fields` — §2.1's
+table, the one that decides every anonymous slot's meaning — against the real
+layout of the loaded image, at class-define time, and reports every index where
+the two disagree under `CRATONVM_DBG=overlay`. It is a runtime census rather
+than a build-time gate, and it checks the **fabrication table**, not the
+`*_FIELD_*` constants in the native crates, so the follow-up above still stands
+for those. But it answers §4 question 4 (*do the constant families address the
+right fields?*) for every class whose model is a **named** list, and it answers
+§3.3 (*inconsistent arity for the same class*) directly by printing the model
+size next to the real one.
+
+What it cannot check is the case §2.1 creates: an `instance_fields(n)` arm
+declares every slot `Ljava/lang/Object;`, which is a placeholder and not a
+claim, so a real *reference* field at that index is unfalsifiable. **Converting
+an arm from `instance_fields(n)` to a named list is therefore not cosmetic — it
+is what makes the slot checkable**, and §5 step 3 already prescribes it for a
+different reason. On its first run the diff found 23 disagreeing slots across 15
+classes from the arms that *are* named, including `java/lang/ThreadGroup` with
+`name`/`parent` and `daemon`/`maxPriority` both transposed — plus 129 slots
+where the model's placeholder reference type meets a real primitive, over 73 of
+the 156 modelled classes three small probes reach.
+
 ---
 
 ## 6. Verdict summary
