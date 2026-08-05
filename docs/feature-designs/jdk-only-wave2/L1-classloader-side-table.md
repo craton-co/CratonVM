@@ -209,7 +209,18 @@ defects too, not strict-mode ones):
   same-named classes defined by two unrelated loaders; HotSpot says `false`. The
   classes ARE distinct and correctly loader-attributed (`iso-distinct-classes`
   and both `iso-loader-N` match HotSpot), so this is `isAssignableFrom`
-  comparing by name. `lang_class`.
+  comparing by name — and **it is deliberate**, not an oversight:
+  `lang_class::loader_aware_reflect_assignable` returns `true` on a matching
+  binary name on purpose, to paper over CratonVM's ids legitimately differing
+  for the same logical class across loaders ("a class defined by a user loader
+  can extend that loader's copy of a superclass while the reflective Method
+  mirror still carries the global copy"). Reflective Spring/Hibernate paths
+  depend on that relaxation, so tightening it to HotSpot's answer is a
+  behavioural change with suite-wide blast radius and wants its own lane and
+  its own A/B. Left alone deliberately. It is gated on
+  `loader_aware_resolution()` and skipped for the `java*`/`jdk`/`sun` namespaces
+  (`is_global_resolution_namespace`), so the exposure is application classes
+  only.
 
 Fixed in passing, because it is in an owned file and the probe measured it:
 `ClassLoader.getName()` returned `""` for an unnamed loader where the JDK
