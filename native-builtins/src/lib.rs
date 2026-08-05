@@ -39022,7 +39022,10 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // --- Collections extras: unmodifiable wrappers ---
     register_collections_extras_natives(registry);
     register_core_stdlib_extras(registry);
-    register_scanner_natives(registry);
+    // `register_scanner_natives` used to be called here. Its twelve
+    // `java/util/Scanner` registrations were overwritten by `native-io`'s two
+    // lines later in the boot sequence, in every configuration; see the note
+    // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases
 }

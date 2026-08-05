@@ -11851,21 +11851,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // ---- T19.N1: java.security ProtectionDomain / CodeSource ----
         // Minimal-viable field layouts so `Class.getProtectionDomain0` can
         // populate the reflected-protection-domain returned to user code.
-        // ProtectionDomain = 4 fields (codesource, permissions, classloader,
-        // principals).  Matches the constructor signature
-        //   ProtectionDomain(CodeSource cs, PermissionCollection p, ClassLoader cl, Principal[] ps)
-        // that real JDK bytecode targets.
+        //
+        // ProtectionDomain = 4 fields in the REAL DECLARATION ORDER:
+        // `codesource, classloader, principals, permissions` (`javap -p
+        // --module java.base java.security.ProtectionDomain`; the two trailing
+        // booleans `hasAllPerm` / `staticPermissions` are not modelled because
+        // no native touches them).
+        //
+        // **A constructor signature is not a field layout, and that is exactly
+        // how this went wrong.** Until 2026-08-05 the arm was ordered
+        // `(codesource, permissions, classloader, principals)` and said so:
+        // *"Matches the constructor signature ProtectionDomain(CodeSource,
+        // PermissionCollection, ClassLoader, Principal[]) that real JDK
+        // bytecode targets."* The signature is right and irrelevant — the JDK
+        // declares those fields in a different order, so three of the four sat
+        // at the wrong index. All four are references, so no value-tag check
+        // could see it; the L4 shadow-layout diff reported slots 1, 2 and 3.
+        //
+        // Nothing was observably broken, because
+        // `populate_protection_domain_fields` wrote the raw slots and then the
+        // same four by name, in that order. That raw pass is gone, which is
+        // what makes this order load-bearing rather than decorative.
         "java/security/ProtectionDomain" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("codesource"),
                 descriptor: cratonvm_types::intern_arc("Ljava/security/CodeSource;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("permissions"),
-                descriptor: cratonvm_types::intern_arc("Ljava/security/PermissionCollection;"),
                 attributes: vec![],
             },
             ClassFileField {
@@ -11878,6 +11889,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("principals"),
                 descriptor: cratonvm_types::intern_arc("[Ljava/security/Principal;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("permissions"),
+                descriptor: cratonvm_types::intern_arc("Ljava/security/PermissionCollection;"),
                 attributes: vec![],
             },
         ],

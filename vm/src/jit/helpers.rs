@@ -3191,6 +3191,26 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         return jit_newarray_oom(vm, length as usize);
     };
     let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    // Fastest path: bump this thread's TLAB, taking no lock at all. Unlike the
+    // `new` site there is no inline TLAB bump in codegen for arrays, so this
+    // helper is not a slow path — it is the ONLY path a JIT-compiled
+    // `newarray` has, and every probe/alloc pair below takes the global
+    // `young_from` mutex twice, the second time across the zeroing. That made
+    // JIT array allocation a process-wide serialisation point: aggregate
+    // `new long[16]` throughput was flat across threads while `new Object()`
+    // scaled (`AllocScaleProbe`). The interpreter's `gc_alloc_array` has had
+    // this arm since `7888b80b6`; this is the JIT's.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_array_guarded_refill(
+            thread,
+            vm,
+            ClassId::new(0),
+            elem_type,
+            length as usize,
+        ) {
+            return jit_newarray_finish(obj_ref, atype, length);
+        }
+    }
     // Fast path: probe the young gen with the REAL allocation size and, on
     // success, allocate without the fallible retry dance. This preserves the
     // common-case cost of the original helper.
@@ -4380,6 +4400,20 @@ pub unsafe extern "C" fn jit_anewarray_object(
     let data_size =
         cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference).unwrap_or(0);
     let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    // Lock-free TLAB bump first — see the same arm in `jit_newarray` for why
+    // this is the only path a JIT-compiled array allocation has, and what the
+    // global `young_from` mutex below cost when it was the only option.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Some(arr) = crate::runtime::interpreter::tlab_alloc_array_guarded_refill(
+            thread,
+            vm,
+            class_id,
+            ArrayElementType::Reference,
+            length as usize,
+        ) {
+            return arr.as_ptr() as i64;
+        }
+    }
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
@@ -10911,7 +10945,10 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     // roots and the nested helper preserves normal Java dispatch semantics.
     let jit_args = [receiver.as_ptr() as i64, index as i64];
     let vm_ptr = vm as *const _ as i64;
-    let _guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+    let _guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+        &*compiled,
+        Some(thread.frames.len()),
+    );
     let bits = if compiled.needs_context() {
         compiled.try_call_with_context(vm_ptr, &jit_args)
     } else {

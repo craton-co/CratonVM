@@ -257,6 +257,12 @@ header exists to not repeat.
 **Exit codes:** `0` pass · `1` the gate fired · `2` refused to adjudicate (never
 a pass) · `3` a prerequisite is missing.
 
+**In CI it is blocking**, in `build-and-test`'s ubuntu leg beside the
+synthetic-stub ratchet — that leg is the `25/linux` key the committed baseline
+covers, and all three non-zero exits fail the job. The advisory `jdk-only`
+matrix runs it too, across JDK 21/25 × ubuntu/windows, where the three legs with
+no committed baseline report themselves ungated rather than green.
+
 **The guard is shown to fail on every run.** `--selftest` runs first,
 hermetically, and injects an unadjudicated `Bridge` into a synthetic census
 that the gate must reject — plus an *adjudicated* one it must accept, so the

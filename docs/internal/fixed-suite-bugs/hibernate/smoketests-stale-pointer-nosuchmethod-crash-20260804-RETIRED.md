@@ -21,10 +21,15 @@ What the page contributed and what is left of it:
   where a future occurrence goes. Do not re-file a per-suite witness page for
   it; file the evidence there.
 
-The 120 s throughput timeout on this same test method is a separate, still-open
-issue: `../../../known-issues/hibernate/smoketests-concurrent-println-timeout-20260723.md`.
-Every run in §2 below hit it, on both binaries — that is the reproducible
-failure of this test, and it is not this page's subject.
+The 120 s throughput timeout on this same test method was a separate issue,
+**also retired, on 2026-08-05**:
+`smoketests-concurrent-query-throughput-20260723-RETIRED.md`. Every run in §2
+below hit it, on both binaries — that was the reproducible failure of this test,
+and it is not this page's subject. Note before citing anything from it: that
+page's numbers were stale by more than an order of magnitude when re-measured
+(the gap was ~22x, not 38.6x, and the JIT was a ~1.6x win rather than a
+1.5–2.2x loss), so read its correction table rather than any figure quoted from
+it second-hand — including from this paragraph's earlier wording.
 
 ---
 

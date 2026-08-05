@@ -188,8 +188,8 @@ of zero". It is not any more. Live sites, from three small probes:
 | `java/lang/ThreadGroup` | 2 | `daemon:Z` | `maxPriority:I` |
 | `java/lang/ThreadGroup` | 3 | `maxPriority:I` | `daemon:Z` |
 | ~~`java/lang/Thread`~~ | ~~5~~ | ~~`contextClassLoader:ClassLoader`~~ | ~~`holder:Thread$FieldHolder`~~ **FIXED 08-05** |
-| `java/security/ProtectionDomain` | 1 | `permissions` | `classloader` |
-| `java/security/ProtectionDomain` | 2 | `classloader` | `principals:[Principal` |
+| ~~`java/security/ProtectionDomain`~~ | ~~1~~ | ~~`permissions`~~ | ~~`classloader`~~ **FIXED 08-05** |
+| ~~`java/security/ProtectionDomain`~~ | ~~2~~ | ~~`classloader`~~ | ~~`principals:[Principal`~~ **FIXED 08-05** |
 | `java/security/CodeSource` | 1 | `certs:[Certificate` | `signers:[CodeSigner` |
 | `java/io/BufferedWriter` | 0 | `out:Writer` | `writeBuffer:[C` |
 | `java/lang/reflect/Field` | 4 | `type:Class` | `name:String` |
@@ -201,7 +201,7 @@ had looked at. Not accessed by these probes but reported by the diff:
 `java/io/BufferedReader`, `InputStreamReader`, `OutputStreamWriter` (slot 0
 `in`/`out` over `lock`/`writeBuffer`), `java/lang/reflect/Method` and
 `Constructor` (slots 1/3/4/6), `java/util/Collections$SingletonMap` (`k`/`v`
-over `keySet`/`values`), and `ProtectionDomain` slot 3.
+over `keySet`/`values`). `ProtectionDomain` slot 3 went with slots 1 and 2 — **all three FIXED 2026-08-05**.
 
 **None of these is fixed here.** L4 owns the detector; each row is a separate
 change with its own A/B, and filing them as a work list is this lane's output.

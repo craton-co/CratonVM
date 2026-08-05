@@ -5079,8 +5079,54 @@ fn main() {
     // `environ` sound: 431 read sites still call `std::env::var` directly and
     // cannot see a resolved source. See `cratonvm_types::flag_groups`.
     let (legacy_direct, unknown_tokens) = cratonvm_types::flag_groups::expand_process_env();
-    for t in &unknown_tokens {
-        eprintln!("[cratonvm] unknown configuration token: {t}");
+    // An unrecognised token is FATAL, not a warning.
+    //
+    // It used to print and continue, which is the worst of both worlds: the
+    // knob the caller asked for is not applied, the run completes normally, and
+    // a scripted A/B that captures only the tail of the output — or only greps
+    // for PASS/FAIL — never sees the notice. The experiment then measures
+    // nothing while reading as a clean result. That is not hypothetical: it is
+    // how `CRATONVM_JIT=no-self-cache-inherit` (the disable spelling is
+    // `-self-cache-inherit`) produced a confident, wrong "hypothesis
+    // falsified" in
+    // `docs/known-issues/jit/math-floormod-long-int-returns-minus-one-20260805.md`.
+    //
+    // Failing closed makes a typo impossible to mistake for a measurement.
+    // `CRATONVM_ALLOW_UNKNOWN_TOKENS=1` restores the old warn-and-continue for
+    // anyone who genuinely needs it (e.g. a shared script that must run against
+    // several VM revisions whose token sets differ).
+    if !unknown_tokens.is_empty() {
+        let allow = std::env::var_os("CRATONVM_ALLOW_UNKNOWN_TOKENS").is_some();
+        for t in &unknown_tokens {
+            eprintln!("[cratonvm] unknown configuration token: {t}");
+            // `GROUPVAR=token` — split back so a suggestion can be offered.
+            if let Some((var, tok)) = t.split_once('=') {
+                let tok = tok.split('=').next().unwrap_or(tok);
+                let tok = tok.strip_prefix('-').unwrap_or(tok);
+                let tok = tok.strip_prefix('+').unwrap_or(tok);
+                if let Some(group) = cratonvm_types::flag_groups::Group::ALL
+                    .iter()
+                    .find(|g| g.var() == var)
+                {
+                    if let Some(hint) = cratonvm_types::flag_groups::suggest(*group, tok) {
+                        eprintln!("[cratonvm]   {hint}");
+                    }
+                }
+            }
+        }
+        if allow {
+            eprintln!(
+                "[cratonvm] continuing anyway: CRATONVM_ALLOW_UNKNOWN_TOKENS is set. \
+                 The knob(s) above are NOT applied."
+            );
+        } else {
+            eprintln!(
+                "[cratonvm] refusing to start: an unknown token is not applied, so this run \
+                 would silently not be the configuration you asked for. Fix the spelling, or \
+                 set CRATONVM_ALLOW_UNKNOWN_TOKENS=1 to continue with it ignored."
+            );
+            std::process::exit(2);
+        }
     }
 
     // Seed the phase-accounting epoch. This is the earliest point it can go:
