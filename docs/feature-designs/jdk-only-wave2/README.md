@@ -32,15 +32,15 @@ can work on what, simultaneously, without colliding.**
 | [L4](L4-overlay-detector-blind-spots.md) **DONE 2026-08-05** | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only), `classloading/src/shadow_layout.rs` | — | M |
 | [L5](../../internal/jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
 | [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
-| [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
+| [L7](../../internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L7 and L8 can both start today, in parallel, by different people.**
-(L1, L2, L3, L4, L5 and L6 are done; L9 is closed.)
+**L8 is the lane to start today.** (L1–L7 are done; L9 is closed. L10 is the
+remaining blocker, and L11/L12 are gated behind it.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -297,3 +297,31 @@ run. The *measured* half runs in `build-and-test`'s ubuntu leg, beside
 printed an error and failed nothing, and neither of that job's two reasons to be
 advisory applies to a `Compatible`-mode census with a committed baseline. The
 `jdk-only` matrix keeps its copy as the multi-JDK/OS probe.
+
+**Update, 2026-08-05 — L7 landed, and the lane doc is retired to
+`docs/internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md`.** A
+strict boot now fabricates **zero** compatibility classes (13 before), and the
+two breadth probes drop 17 → 1 and 18 → 5. `Compatible`-mode stdout is
+byte-identical on all three workloads against the pre-fix binary. Another
+number joins the *"a number in a record is a claim"* list: **"52 call sites"
+was 39 live in 25 files, of which 10 fire** — the rest of the gap was
+`#[cfg(all(test, feature = "synthetic-jdk"))]` and `proxy_gen.rs`'s test module
+being counted as production.
+
+Three findings worth carrying into the other lanes:
+
+* **The census could not name a native until 2026-08-05.** All seven
+  native-minted classes were attributed to one forwarding line in
+  `NativeContextImpl`; `#[track_caller]` now runs down through the trait
+  declarations and the three allocation funnels. And `requested_by` records the
+  *first* requester of a name — including one that was **refused** — so a later
+  successful fabrication of the same name is attributed to the refusing site.
+* **`ensure_synthetic_class` cannot be deleted by migrating call sites.** Three
+  of the 39 *are* the infallible allocation funnels, with ~2,300 callers
+  between them. That, not the call sites, is what step 3 is gated on.
+* **A fabrication cannot be made fallible before its native is retagged**, when
+  the class stands in for a real JDK method the JDK's own bootstrap calls.
+  Measured: refusing `cratonvm/internal/Unmodifiable*` reaches a zero census
+  and produces `NullPointerException: zone` from `java.time`, which names
+  nothing. Reverted, and left as a hand-off to whoever owns
+  `register_unmodifiable_natives`.

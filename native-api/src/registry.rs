@@ -3686,6 +3686,17 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ///
     /// The default implementation falls back to `ClassId::new(0)` so mocks
     /// and non-VM contexts still compile; real VM contexts override it.
+    ///
+    /// # Provenance
+    ///
+    /// `#[track_caller]`, and it must stay that way. `ClassManager::
+    /// admit_compatibility_class` records the Rust `Location::caller()` as the
+    /// census's `requested_by`, and without this attribute every native in the
+    /// workspace is reported as the one line of `NativeContextImpl` that
+    /// forwards the call — which is what the 2026-08-05 census found (all
+    /// seven native-minted classes attributed to `vm_exec.rs:13670`). The
+    /// attribute is free at runtime for callers that never fabricate.
+    #[track_caller]
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         self.try_ensure_synthetic_class(name, num_fields)
             .unwrap_or(ClassId::new(0))
@@ -3727,6 +3738,9 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// that overrides only `ensure_synthetic_class` (several test harnesses
     /// do) keeps working: this default is what *its* callers get, unchanged
     /// from before this method existed.
+    ///
+    /// `#[track_caller]` for the same reason as the infallible spelling above.
+    #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
