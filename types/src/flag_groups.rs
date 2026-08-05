@@ -786,6 +786,13 @@ pub const INVENTORY: &[E] = &[
     // a one-flag bisect for the false-positive filter in
     // `conservative_roots::is_plausible_return_pc`.
     E { group: Group::JIT, token: "retpc-validate", on_key: None, off_key: Some("CRATONVM_JIT_NO_RETPC_VALIDATE"), off_word: None },
+    // Default-**OFF** since 2026-08-05. The per-call-site native fast path for
+    // compiled code serves a registered native ahead of the inline cache, so the
+    // same site can also be bound to a bytecode body — one call site, two
+    // implementations, whichever warmed first wins. See
+    // `jit::helpers::native_site_cache_enabled` for the measured failure rates
+    // and for everything that was tried and did not repair it.
+    E { group: Group::JIT, token: "native-site-cache", on_key: Some("CRATONVM_JIT_NATIVE_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache", on_key: Some("CRATONVM_ROOTSNAP_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache-survive-gc", on_key: Some("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "safepoint-polls", on_key: Some("CRATONVM_JIT_SAFEPOINT_POLLS"), off_key: None, off_word: None },

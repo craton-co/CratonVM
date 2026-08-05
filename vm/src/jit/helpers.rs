@@ -7533,6 +7533,58 @@ pub fn leaf_native_hit_count() -> u64 {
 static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Is the per-call-site native fast path for compiled code enabled?
+///
+/// **Default OFF since 2026-08-05.** `CRATONVM_JIT=native-site-cache` turns it
+/// back on for measurement and for the work that has to make it sound.
+///
+/// # Why it is off
+///
+/// The path serves a registered native at the TOP of `jit_invoke_dispatch` /
+/// `jit_invoke_virtual_mic`, ahead of the inline cache and the compile probes.
+/// That is upstream of the route those calls used to take, and the two routes
+/// do not agree for every triple: the MIC can bind the same site to a compiled
+/// or interpreted BYTECODE body, so one call site ends up with two
+/// implementations, and which one runs depends on which warmed first. For a
+/// native whose state does not live where the bytecode reads it, that is
+/// corruption — silent, timing-dependent, and it does not name its origin.
+///
+/// Measured on `module/spring-boot-batch-data-mongodb`'s
+/// `BatchDataMongoAutoConfigurationTests` (13 tests, `--nojit` green, HotSpot
+/// green), one binary, one host, the mechanism switched at runtime:
+///
+/// | site cache | runs | runs with ≥1 failure |
+/// |---|---:|---:|
+/// | off (pre-2026-08-04 route) | 14 | **0** |
+/// | leaves only (2026-08-04) | 12 | 3 (7, 1 and 1 failures) |
+/// | every registered native (2026-08-05) | 8 | **8** (9-12 failures, one SIGSEGV) |
+///
+/// The failures are the whole 2026-08-05 corruption family — `NoSuchMethodError`
+/// naming a receiver of the wrong class, `NoClassDefFoundError` for a class that
+/// is on the classpath, `ClassCastException` between unrelated types, NPEs
+/// inside ByteBuddy and Mockito — never the same set twice.
+///
+/// # What was tried and did NOT fix it
+///
+/// * resolving the superclass walk from the receiver's `ClassId` instead of its
+///   NAME (a real defect, fixed and kept — see
+///   `resolve_native_owner_for_receiver` — but not this one);
+/// * preserving `native_pending_return` across a primitive-returning native, so
+///   an earlier native's object return keeps its handoff root;
+/// * the full funnel (`safe_native_call`) instead of the prevalidated one;
+/// * refusing any site whose target has a real bytecode body;
+/// * `CRATONVM_JIT=-scan-cache`, and a 12 GB heap (so it is not simply
+///   GC pressure or the JIT scan cache).
+///
+/// So the entry point stays, the counters stay, and the flag decides. See
+/// `docs/internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+pub(crate) fn native_site_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NATIVE_SITE_CACHE").is_some()
+    })
+}
+
 /// Non-leaf natives dispatched from a resolved call site this run.
 pub fn site_cached_native_hit_count() -> u64 {
     SITE_CACHED_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -7738,7 +7790,9 @@ fn resolve_native_site(
     // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
     // and `invoke_or_native` has a specific rule for that walk which has to be
     // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
-    let Some((owner_class, id)) = resolve_native_owner_for_receiver(vm, &lookup_class, info) else {
+    let Some((owner_class, id)) =
+        resolve_native_owner_for_receiver(vm, &lookup_class, receiver_class_id, info)
+    else {
         return site_refusal::note(4);
     };
     // `Thread.currentThread()` is served from the thread mirror instead of the
@@ -7814,10 +7868,28 @@ fn resolve_native_site(
 /// resolving on the receiver class alone (`ReentrantLock$NonfairSync`) found
 /// nothing and refused the site.
 ///
+/// # The walk must start from the receiver's `ClassId`, never from its name
+///
+/// `dispatch_class` is only a NAME, and a name does not identify a class once
+/// more than one loader has defined it — `get_loaded_class_id(name)` then
+/// answers with whichever one the global table happens to hold.
+/// `invoke_or_native` says this in as many words at its own tail ("A virtual
+/// call's receiver IS the authoritative answer"), and this test class is the
+/// everyday case: `FilteredClassLoader` gives `autoconfigurationBacksOffEntirely
+/// IfSpringMongoDbAbsent` a second, child-first definition of classes the other
+/// twelve tests already loaded through the app loader. Resolving the walk
+/// against the other loader's copy reads ANOTHER class's method table, so rules
+/// 2 and 3 answer about a class the receiver is not an instance of — and the
+/// entry that installs is then guarded by the REAL receiver's class id, so it
+/// keeps firing. `receiver_class_id` is passed in for exactly this reason and
+/// the name is used only for the registry lookups, which are name-keyed by
+/// construction.
+///
 /// Cold: fill time only.
 fn resolve_native_owner_for_receiver(
     vm: &SharedVm,
     dispatch_class: &str,
+    receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
 ) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
     let registry = &vm.natives.native_methods;
@@ -7831,7 +7903,10 @@ fn resolve_native_owner_for_receiver(
         return None;
     }
     let cm = vm.classes.class_manager.try_read()?;
-    let mut cid = cm.get_loaded_class_id(dispatch_class)?;
+    let mut cid = match receiver_class_id {
+        Some(cid) => cid,
+        None => cm.get_loaded_class_id(dispatch_class)?,
+    };
     if cm
         .get_class(cid)
         .is_some_and(|c| c.find_method(info.method_name, info.descriptor).is_some())
@@ -9355,6 +9430,11 @@ unsafe fn try_jit_site_cached_native_dispatch(
     info_key: JitSiteKey,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // Default OFF — see `native_site_cache_enabled` for the measurements and
+    // for what this path does that its predecessor did not.
+    if !native_site_cache_enabled() {
+        return None;
+    }
     // Every bail below is counted, including these pre-resolution ones. An
     // uncounted `return None` here is what made the first cut of this path
     // unexplainable: `AtomicInteger.get` showed neither a hit nor a refusal,
@@ -12372,6 +12452,34 @@ mod tests {
         r
     }
 
+    /// The per-call-site native fast path is DEFAULT OFF, and a run that has not
+    /// asked for it must not get it.
+    ///
+    /// This is not a style preference. With the path on, one call site can have
+    /// two implementations — the registered native it serves here, and a
+    /// bytecode body the inline cache bound at the same site — and which one
+    /// runs depends on which warmed first. Measured on
+    /// `BatchDataMongoAutoConfigurationTests`: 0 of 14 runs failed with the path
+    /// off, 3 of 12 with leaves only, 8 of 8 with every registered native. See
+    /// [`native_site_cache_enabled`] for the full table and for the four
+    /// repairs that did not fix it.
+    ///
+    /// Asserting on the flag READER rather than on the table entry is
+    /// deliberate: the token could stay declared while the reader defaults to
+    /// true, and that flip is exactly what this test exists to catch.
+    #[test]
+    fn native_site_cache_is_off_unless_asked_for() {
+        assert!(
+            std::env::var_os("CRATONVM_JIT_NATIVE_SITE_CACHE").is_none(),
+            "this test asserts the DEFAULT; unset CRATONVM_JIT_NATIVE_SITE_CACHE to run it"
+        );
+        assert!(
+            !native_site_cache_enabled(),
+            "the JIT native site cache is default-OFF (2026-08-05); turning it \
+             back on re-opens the 2026-08-05 Spring Boot corruption family"
+        );
+    }
+
     /// The leaf fast path skips `vm_exec::invoke_or_native` entirely, and that
     /// function opens with a cascade of hand-written gates that can route a
     /// call somewhere OTHER than its own registry slot. If a triple is ever
@@ -12381,7 +12489,8 @@ mod tests {
     ///
     /// `site_name_is_special_cased` is the fill-time refusal that prevents
     /// it. This pins the two together: the actual boot-time leaf set, against
-    /// the actual predicate.
+    /// the actual predicate. It still matters with the path default-OFF: the
+    /// refusal is what a re-landing has to keep.
     #[test]
     fn leaf_native_sites_avoid_invoke_or_native_special_cases() {
         let registry = registry_with_builtins();
