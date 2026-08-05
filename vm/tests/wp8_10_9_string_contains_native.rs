@@ -234,11 +234,15 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
 /// present. Both passed while the drop was silently deleting **four**
 /// registrations nobody had thought to name:
 ///
-/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` -- the F4 workaround for a
-///   generic `Preconditions` override that throws the wrong exception class.
-///   Without them `"Hello, World".substring(-1)` raised
+/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` / `checkIndex` -- the F4
+///   workaround for a generic `Preconditions` override that throws the wrong
+///   exception class. Without them `"Hello, World".substring(-1)` raised
 ///   `ArrayIndexOutOfBoundsException`, which `catch
-///   (StringIndexOutOfBoundsException)` does not catch;
+///   (StringIndexOutOfBoundsException)` does not catch. `checkIndex` joined
+///   them 2026-08-05 for the same reason on `charAt`: a NEGATIVE index reached
+///   `Preconditions` and came back `ArrayIndexOutOfBoundsException` while an
+///   index past the end came back `StringIndexOutOfBoundsException`, so the
+///   class depended on the SIGN of the argument;
 /// * `<init>(Ljava/lang/StringBuilder;)V` and its `AbstractStringBuilder`
 ///   sibling -- DF05. Without them `new String(sb)`, for a builder holding
 ///   seven characters, returned four: the real ctor's `Arrays.copyOfRange`
@@ -293,6 +297,7 @@ Intrinsic <init>(Ljava/lang/StringBuilder;)V\n\
 Intrinsic chars()Ljava/util/stream/IntStream;\n\
 Intrinsic checkBoundsBeginEnd(III)V\n\
 Intrinsic checkBoundsOffCount(III)I\n\
+Intrinsic checkIndex(II)V\n\
 Intrinsic codePointAt(I)I\n\
 Intrinsic codePointCount(II)I\n\
 Intrinsic codePoints()Ljava/util/stream/IntStream;\n\
