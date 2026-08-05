@@ -28,7 +28,7 @@ can work on what, simultaneously, without colliding.**
 |---|---|---|---|---|
 | [L1](L1-classloader-side-table.md) **DONE 2026-08-05** | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
-| [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
+| [L3](L3-scanner-membername-residual.md) **DONE 2026-08-05** | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs`, **`native-io/src/lib.rs`** | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) **DONE 2026-08-05** | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only), `classloading/src/shadow_layout.rs` | — | M |
 | [L5](../../internal/jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
 | [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
@@ -39,8 +39,8 @@ can work on what, simultaneously, without colliding.**
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3, L7 and L8 can all start today, in parallel, by different people.**
-(L1, L2, L4, L5 and L6 are done; L9 is closed.)
+**L7 and L8 can both start today, in parallel, by different people.**
+(L1, L2, L3, L4, L5 and L6 are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -51,7 +51,8 @@ exist:
 |---|---|---|
 | L2 ↔ L10 | `native-collections/src/lib.rs` | **Resolved:** L2 landed 2026-08-04; L10 rebases onto it. |
 | L4 ↔ L11 | `vm/src/vm/vm_exec.rs` | L4 owns the overlay hunter (~line 3070–3200); L11 owns dispatch (~14700, ~22700). Disjoint regions in one file — coordinate, do not both `git add -A`. |
-| L3 ↔ L12 | `lang_invoke.rs` | L3 is a handful of lines; land it first. |
+| L3 ↔ L12 | `lang_invoke.rs` | **Resolved:** L3 landed 2026-08-05; L12 rebases onto it. |
+| L3 ↔ L5 | `native-io/src/lib.rs` | **Resolved the same way.** L3 had to take this file — the Scanner writer was there, not in `phases_early.rs` — but it touched only the `Scanner` natives and the delimiter regex cache, no `register*` call site. |
 | L5/L6/L12 ↔ each other | `register_with_kind` semantics | **Resolved:** L6 landed 2026-08-05 and changed no call site — it reads the census and freezes two numbers. L5's migration now has to move them; re-freeze with `sh regression-suite/bridge-ratchet.sh --update-baseline --note "…"` in the same change. L12 §4 is JIT-side. |
 
 `native-collections/src/lib.rs` is 55k lines and `vm_exec.rs` is 26k — two
@@ -150,8 +151,10 @@ Closed: items 8, 9, 10; item 11 §1 (answered — its cost is zero), §5
 (retracted), §12, §13. Fixed outside the list: `--jdk-only` could not start a
 thread; `MethodType.toString()`; eight missing system properties.
 
-Item 2: 24 measured slots → **15 open**. Item 1: instrument built, migration not
-started. Items 3/7: blocked on L9/L10.
+Item 2: 24 measured slots → **15 open** (→ **12** after L3, 2026-08-05: the two
+`Scanner` rows and the `MemberName` row are gone, leaving `URI` ×2 and
+`Proxy`). Item 1: instrument built, migration not started. Items 3/7: blocked
+on L9/L10.
 
 **Update, later on 2026-08-04 — L2 landed.** The `Properties` family is gone
 from the census (slots 2 and 3 → 0) along with the `HashMap` slot-2 `Int` over
@@ -191,6 +194,43 @@ comment. Item 7 is still blocked on L10.
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
 so `kind_stated` is no longer `false` on all 11,909 rows.
+
+**Update, 2026-08-05 — L3 landed, and item 2's table is down to `URI` and
+`Proxy`.** `java/util/Scanner` slots 3/4 and `java/lang/invoke/MemberName` slot
+4 are gone from the census (1 → 0, 1 → 0 and 7 → 0), A/B'd against the pre-fix
+binary over both standing probes × both modes with the benign `HashMap` row
+byte-identical and no other row present in either arm. Two new probes,
+`L3ScannerLayoutProbe` and `L3MemberNameProbe`, are byte-identical to HotSpot
+25 in both modes; the Scanner one FAILS on the pre-fix binary, which is what
+makes the census delta mean something.
+
+Three things worth carrying into the remaining lanes:
+
+* **A lane brief scoped from the census under-reports its own defect — again.**
+  L1 found this with the `ClassLoader` reference slots; L3 found the `Scanner`
+  model was writing FIVE wrong fields, of which the census could see two. The
+  other three are reference-into-reference. Read the writer against `javap`.
+* **The file named in a brief may not be where the code is.** The brief said
+  `phases_early.rs`, three fields; `overlay-bt` said `native-io/src/lib.rs`,
+  five. There were two Scanner implementations over two different layouts, and
+  the one in the brief had been dead in every configuration since
+  `register_io_natives` started running two lines after `register_builtins`.
+  The dead copy is deleted rather than kept in sync.
+* **Kind 3 does not always need a side table.** `MemberName`'s vmindex sentinel
+  was an `Int` written to a reference slot, which `set_field` coerces to null —
+  the very condition the census reports. It had never reached the object in any
+  layout, so both readers already answered 0 and removing the write is
+  behaviour-preserving. A comment called it "critical". Check whether a value
+  survives its own write before building storage for it.
+
+L3 also fixed three host-JDK divergences the new probe surfaced next to the
+layout rows (the default delimiter's pattern string, `next()` leaving the
+position past the delimiter — the shape the JDK's own `NextIntNextLineTest`
+exists to catch — and a constructor `MethodHandle`'s `type()` returning
+`void`), and made `Scanner.close()` mean something. Those change `Compatible`
+mode, from silently wrong to matching HotSpot, exactly as L2's
+`try_set_jdk_map_field` fix did; criterion 4 is about not perturbing
+`Compatible`, not about preserving its bugs.
 
 **Update, 2026-08-05 — L4 landed, and item 2's work list roughly quadrupled.**
 The census goes from **4 distinct sites to 135** on the same three probes in
