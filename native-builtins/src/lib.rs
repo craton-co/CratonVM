@@ -6844,7 +6844,8 @@ pub fn register_essential_natives_with_shims(
             crate::app_shims::register_app_intrinsic_shims(registry);
         });
     }
-    // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
+    // SBR-02 / bug-03: fast regex, and the one `java/lang/String` family that
+    // still wins over real-JDK bytecode. The real `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
     // than HotSpot (every Matcher step crosses the VM→native String-accessor
@@ -6852,32 +6853,57 @@ pub fn register_essential_natives_with_shims(
     // `regex`/`fancy-regex` natives are normally registered only by
     // `register_synthetic_overrides` (compiled out in real-JDK mode), so they
     // are absent here by default and the real bytecode runs (the real-Java
-    // default). When `CRATONVM_NATIVE_STRING_REGEX` is set, register them so the
-    // companion `force_native_over_real_jdk_bytecode` gate routes
-    // `String.replaceAll/replaceFirst/matches` to the cached, Java-faithful
-    // native. Read directly (native-builtins cannot depend on vm::env_cache)
+    // default). Read directly (native-builtins cannot depend on vm::env_cache)
     // with the SAME default-ON / opt-out (`=0`/`false`) semantics as
     // `env_cache::native_string_regex`; registration runs once at VM init so the
     // lookup cost is negligible.
+    //
+    // # `register_with_kind(.., Intrinsic)`, and why it is load-bearing
+    //
+    // Every other `java/lang/String` `Bridge` is DROPPED in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4 — real class bytes are
+    // authoritative), which is where the three deleted forced-native `String`
+    // lists went. These four survive that drop on their KIND, which is exactly
+    // §1.4's reviewed exception and needs no name list at any dispatch site.
+    // Registering them `Bridge` — including by omission, since the ambient
+    // category here is `Bridge` — silently deletes the SBR-02 fix.
+    //
+    // Stated at the site rather than inherited from an enclosing
+    // `set_category`, so the census's `kind_stated` column records that
+    // somebody adjudicated these four rather than that they inherited whatever
+    // the call chain left behind. These are its first callers.
+    //
+    // Reviewed against HotSpot with `probes/StringPolicyMatrixProbe` (392
+    // cases) and measured with `probes/StringRegexCostProbe`: the four are
+    // ~2× faster than HotSpot on the `PluginXmlParser.format()` shape they
+    // were written for, with identical digests. The review is what makes them
+    // `Intrinsic`; being fast is not sufficient, and the review had to be
+    // *repaired* first — see `lang_string.rs`, where these four now raise
+    // `PatternSyntaxException` / NPE / `IndexOutOfBoundsException` where the
+    // JDK does instead of falling back to a literal replacement and returning
+    // a plausible wrong answer.
     let native_string_regex_enabled = crate::nbflags().native_string_regex;
     if native_string_regex_enabled {
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceAll",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_all,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "replaceFirst",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             native_string_replace_first,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
-        registry.register(
+        registry.register_with_kind(
             "java/lang/String",
             "matches",
             "(Ljava/lang/String;)Z",
             native_string_matches,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
         // SBR-02 secondary finding: the `replace(CharSequence,CharSequence)`
         // overload is LITERAL all-occurrences replacement (NOT regex), but its
@@ -6888,13 +6914,14 @@ pub fn register_essential_natives_with_shims(
         // `str::replace` (literal, non-overlapping, empty-target inserts at
         // every position — same as Java) so there's no regex-semantics risk;
         // gated together with the regex natives. NOTE: the `(char,char)`
-        // overload already has an unconditional native (`native_string_replace`)
-        // and is unaffected.
-        registry.register(
+        // overload has its own native, which is a `Bridge` and is therefore
+        // dropped in real-JDK mode with the rest.
+        registry.register_with_kind(
             "java/lang/String",
             "replace",
             "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
             native_string_replace_charseq,
+            cratonvm_native_api::NativeKind::Intrinsic,
         );
     }
     // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout `Matcher.find()`/
@@ -7504,6 +7531,13 @@ pub fn register_essential_natives_with_shims(
         "(I)C",
         crate::lang_string::native_string_char_at,
     );
+    // LEAF: `native_string_length` -> `string_char_count` is three heap reads —
+    // field 0 (`value`), that array's length, and field 1 (`coder`) — with no
+    // allocation, no safepoint and no throw. See
+    // `NativeMethodRegistry::set_leaf`. Measured at 1405 ns from compiled code
+    // against HotSpot's 0.2 ns (`probes/NativeShapeProbe.java`); `String.length`
+    // is one of the most-called methods in any Java program.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/String",
         "length",
@@ -7517,6 +7551,13 @@ pub fn register_essential_natives_with_shims(
         // (reads the compact `value: byte[]` length / coder).
         crate::lang_string::native_string_length,
     );
+    // NOT the `isEmpty` below: it goes through `ctx.read_string`, which decodes
+    // the whole string into a fresh Rust `String`. That is not a Java-heap
+    // allocation, so it does not break the leaf contract outright — but it is
+    // O(n) work behind a predicate, and marking it leaf would advertise a
+    // cheapness it does not have. Left on the funnel until someone rewrites it
+    // against `string_char_count` and measures.
+    registry.set_leaf(false);
     registry.register("java/lang/String", "isEmpty", "()Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -7578,21 +7619,50 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/util/Locale;)Ljava/lang/String;",
         lang_string::native_string_to_upper_case_uncached,
     );
-    // String.hashCode — use the layout-aware CACHING implementation (reads and
-    // writes the JDK `hash` field) rather than recomputing from scratch on every
-    // call. The previous inline closure here re-decoded the char array and
-    // re-ran the fold every time, with NO caching, so real-JDK String-keyed
-    // hashing was ~1950x slower than HotSpot (which caches in String.hash):
-    // a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it dominated the
-    // Xerces XSD model build (XSElementDecl.hashCode / CMStateSet.hashCode were
-    // ~100% of self-time). `register_synthetic_overrides` already wired the
-    // caching impl, but real-JDK mode (`--java-home`) only runs
-    // `register_essential_natives`, so the cache never took effect there.
-    registry.register(
+    // String.hashCode — the layout-aware CACHING implementation (reads and
+    // writes the JDK `hash` field) rather than recomputing from scratch on
+    // every call. The previous inline closure here re-decoded the char array
+    // and re-ran the fold every time, with NO caching, so real-JDK
+    // String-keyed hashing was ~1950x slower than HotSpot (which caches in
+    // `String.hash`): a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it
+    // dominated the Xerces XSD model build (`XSElementDecl.hashCode` /
+    // `CMStateSet.hashCode` were ~100% of self-time).
+    //
+    // # `Intrinsic`, and why this one is not a performance argument
+    //
+    // Every other `java/lang/String` `Bridge` is dropped in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4). This one is stated
+    // `Intrinsic` so it survives, and the reason is CORRECTNESS, not speed:
+    // the real `String.hashCode()` bytecode is **wrong** here for any string
+    // whose backing array is UTF-16.
+    //
+    // Measured with `probes/StringUtf16HashProbe`, which computes the JLS
+    // formula in plain Java over the receiver's own `charAt` and compares:
+    //
+    //   "ΣΟΣ"   hashCode() = 62956255   JLS = 924359
+    //
+    // The object is not corrupt — `length()`, `charAt` and `equals` on it all
+    // agree with HotSpot. The bytecode path reads the first `length()` BYTES
+    // of the backing array, each sign-extended to a `char`, instead of the
+    // `length()` UTF-16 code units: `(char) value[i]` where it needs
+    // `getChar(value, i)`. Solving the observed hashes for their input
+    // sequence gives that exact reading for all four probe strings, including
+    // the sign extension (`0xA3` hashed as `0xFFA3`).
+    //
+    // So dropping this registration replaces a correct answer with a wrong one
+    // for every non-Latin-1 `String` key in the VM, which is not an edge case:
+    // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
+    // `StringUTF16` defect is filed separately — see
+    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // — and when it is fixed this registration should be re-measured and
+    // probably deleted, because at that point it becomes a pure perf
+    // optimisation again and has to argue for itself on those terms.
+    registry.register_with_kind(
         "java/lang/String",
         "hashCode",
         "()I",
         native_string_hash_code,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
@@ -9688,6 +9758,14 @@ pub fn register_essential_natives_with_shims(
     // --- java.lang.System (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
+    // LEAF: both clock reads are `_ctx`-free — a `SystemTime::now()` /
+    // `Instant::elapsed()` and an integer cast. Nothing to pin, nothing that
+    // can allocate, safepoint or throw. See `NativeMethodRegistry::set_leaf`.
+    // Measured at 604 ns from compiled code against HotSpot's 32 ns
+    // (`probes/NativeShapeProbe.java`), essentially all of it the funnel — and
+    // `System.nanoTime` is what every timeout, scheduler and benchmark in the
+    // JDK calls.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "currentTimeMillis",
@@ -9700,6 +9778,7 @@ pub fn register_essential_natives_with_shims(
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register(
         "java/lang/System",
         "arraycopy",
@@ -22300,12 +22379,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         native_system_set_property,
     );
+    // Re-registration of the SAME body, so the leaf claim has to be restated:
+    // `register` captures the ambient claim into the slot, and a re-register
+    // that does not opt in demotes the triple back to the funnel. That is the
+    // deliberate ordering property of `set_leaf` — see its doc comment.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "nanoTime",
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
     registry.register("java/lang/System", "gc", "()V", |ctx, _args| {
         ctx.force_gc();

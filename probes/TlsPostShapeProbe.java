@@ -196,6 +196,123 @@ public class TlsPostShapeProbe extends TomcatBaseTest {
     }
 
     /**
+     * The discriminating experiment for {@code TestSsl.testPost}'s intermittent
+     * mid-transfer connection death.
+     *
+     * <p>testPost's own comment says the author expected the connector timeout
+     * to be the fragile part ("Increase timeout as default (3s) can be too low
+     * for some CI systems" — it sets 20 s). The failure's shape is consistent
+     * with that: a clean EOF at an arbitrary offset, correct data up to it, no
+     * client-side exception. But shape is not proof, and Tomcat's Poller closes
+     * a timed-out socket with NO log statement, so no amount of server logging
+     * will show it.
+     *
+     * <p>What settles it is making the timeout the ONLY variable. This runs
+     * testPost's exact client — 8 threads, 16 MiB each, 128 KiB blocks with
+     * {@code sleep(10)}, single-byte readback — against a connector configured
+     * with the timeout passed in {@code -Dprobe.connectionTimeout}. If the
+     * deaths stop when the window is widened and nothing else changes, the
+     * mechanism is the timeout. If they survive it, this is a real
+     * connection-handling defect under concurrent bulk TLS and a much more
+     * serious finding.
+     *
+     * <p>Why the timeout can fire with nobody at fault: the Poller's check is
+     * {@code now - getLastWrite() > writeTimeout}, i.e. WALL CLOCK. A
+     * stop-the-world collection stops the client threads and Tomcat's threads
+     * together but not the clock, so a long enough pause (or a cluster of them)
+     * makes the server time out a connection no one was neglecting. Run with
+     * {@code CRATONVM_DBG=gcpause} to see the pauses next to the result.
+     */
+    @Test
+    public void timeoutDiscriminator() throws Exception {
+        // Read from the environment, not `-D`: the suite runner fixes the JVM
+        // argument list on purpose (that is the whole point of run-one.ps1), and
+        // a repro that edits it is a different experiment.
+        int connTimeout = envInt("PROBE_CONNECTION_TIMEOUT", 20000);
+        int rounds = envInt("PROBE_ROUNDS", 3);
+        javax.net.SocketFactory socketFactory = TesterSupport.configureClientSsl();
+        Tomcat tomcat = getTomcatInstance();
+        TesterSupport.initSsl(tomcat);
+        tomcat.getConnector().setProperty("connectionTimeout", Integer.toString(connTimeout));
+        TesterSupport.configureSSLImplementation(tomcat,
+                "org.apache.tomcat.util.net.jsse.JSSEImplementation", false);
+        Context ctxt = getProgrammaticRootContext();
+        Tomcat.addServlet(ctxt, "post", new EchoServlet());
+        ctxt.addServletMappingDecoded("/post", "post");
+        tomcat.start();
+        System.out.println("[timeout] connectionTimeout=" + connTimeout + " rounds=" + rounds);
+        for (int r = 0; r < rounds; r++) {
+            postRound((SSLSocketFactory) socketFactory, connTimeout, r);
+        }
+    }
+
+    private static int envInt(String name, int dflt) {
+        String v = System.getenv(name);
+        if (v == null || v.isEmpty()) {
+            return dflt;
+        }
+        return Integer.parseInt(v.trim());
+    }
+
+    /** One testPost-shaped round: 8 threads, write 16 MiB, read it back byte by byte. */
+    private void postRound(SSLSocketFactory factory, int connTimeout, int round) throws Exception {
+        final int threads = 8;
+        final int port = getPort();
+        final AtomicLong errors = new AtomicLong();
+        final CountDownLatch latch = new CountDownLatch(threads);
+        long t0 = System.nanoTime();
+        for (int t = 0; t < threads; t++) {
+            new Thread(() -> {
+                try {
+                    SSLSocket socket = (SSLSocket) factory.createSocket("localhost", port);
+                    OutputStream os = socket.getOutputStream();
+                    os.write("POST /post HTTP/1.1\r\n".getBytes());
+                    os.write("Host: localhost\r\n".getBytes());
+                    os.write(("Content-Length: " + POST_DATA.length + "\r\n\r\n").getBytes());
+                    for (int i = 0; i < POST_DATA.length / BLOCK; i++) {
+                        os.write(POST_DATA, 0, BLOCK);
+                        Thread.sleep(10);
+                    }
+                    os.flush();
+                    InputStream is = socket.getInputStream();
+                    byte[] endOfHeaders = "\r\n\r\n".getBytes();
+                    int found = 0;
+                    while (found != endOfHeaders.length) {
+                        int c = is.read();
+                        if (c == -1) {
+                            System.out.println("[timeout] round=" + round + " EOF in headers");
+                            errors.incrementAndGet();
+                            break;
+                        } else if (c == endOfHeaders[found]) {
+                            found++;
+                        } else {
+                            found = 0;
+                        }
+                    }
+                    for (int i = 0; i < POST_DATA.length; i++) {
+                        int read = is.read();
+                        if (POST_DATA[i] != read) {
+                            System.out.println("[timeout] round=" + round
+                                    + " Byte in position [" + i + "] had value [" + read + "]");
+                            errors.incrementAndGet();
+                            break;
+                        }
+                    }
+                    socket.close();
+                } catch (Exception e) {
+                    System.out.println("[timeout] round=" + round + " EXC " + e);
+                    errors.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            }, "post-" + t).start();
+        }
+        latch.await();
+        System.out.printf("[timeout] connectionTimeout=%d round=%d wall=%.1fs errors=%d%n",
+                connTimeout, round, (System.nanoTime() - t0) / 1e9, errors.get());
+    }
+
+    /**
      * Only the shape the in-native counters are about, so an instrumented run
      * (which pays two {@code Instant::now()} per call) stays affordable.
      */

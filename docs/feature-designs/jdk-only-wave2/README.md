@@ -26,7 +26,7 @@ can work on what, simultaneously, without colliding.**
 
 | Lane | What | Owned files (the parallelism contract) | Gated on | Effort |
 |---|---|---|---|---|
-| [L1](L1-classloader-side-table.md) | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
+| [L1](L1-classloader-side-table.md) **DONE 2026-08-05** | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
@@ -34,12 +34,13 @@ can work on what, simultaneously, without colliding.**
 | [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
 | [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
 | [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
-| [L9](L9-blocker-rkc16n6-string.md) | **Blocker.** Real `String` bytecode during JDK `<clinit>` | `vm/src/runtime/interpreter/` | — | L |
+| [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
-| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists | `native_override.rs`, `vm_exec.rs` ⚠ | **L9, L10** | M |
+| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L1–L9 can all start today, in parallel, by different people.** (L2 is done.)
+**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
+are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -113,6 +114,18 @@ above looks paranoid.
   compile error) and ssh drops mid-command. Check `MemAvailable` before
   building; treat load > 80 as invalidating; verify a background job exists
   rather than assuming your launch survived.
+* **The census cannot see a same-kind wrong-field write, so a lane brief
+  written from the census under-reports its own defect.** L1's step 4 said the
+  three `ClassLoader` REFERENCE slots were safe because they "are already
+  written by name too" — but the by-name write and the index write land on
+  DIFFERENT fields (`name` is slot 1, and the index write put the parent
+  ClassLoader there). `overlay_write_is_destructive` only flags cross-type-class
+  coercions, so zero of it appeared in any census.
+  `classloader_parent` was returning the platform loader's own name String as
+  its parent, and nothing measured it until a behavioural probe was diffed
+  against the host JDK. **Read the writer against `javap` of the real class;
+  the census is a floor, and for reference-into-reference it is a floor of
+  zero.**
 
 ## Definition of done (contract §11)
 
@@ -125,7 +138,7 @@ above looks paranoid.
 6. **Strict corpus green.** The unmeasured half until 2026-08-04, and where the
    defects turned out to be — see L8.
 
-## State as of 2026-08-04
+## State as of 2026-08-05
 
 Closed: items 8, 9, 10; item 11 §1 (answered — its cost is zero), §5
 (retracted), §12, §13. Fixed outside the list: `--jdk-only` could not start a
@@ -146,3 +159,27 @@ the evidence record for why. `Compatible` corpus byte-identical.
 Two things that block a clean read of item 2's remaining rows, both L4's:
 a null written over a primitive is still invisible to the hunter, and a
 same-kind wrong-slot write always was. **Every count in item 2 is a floor.**
+
+**Update, 2026-08-05 — L1 landed.** The eight `ClassLoaders` census rows are
+gone (slots 0/3/4/6 on each built-in loader → 0), A/B'd against the pre-fix
+binary on JDK 25 with every other row byte-identical, and loader identity is
+pinned against HotSpot 25 by `probes/L1LoaderIdentityProbe`. It also took the
+three same-kind REFERENCE slots its own brief had ruled out — which is the
+second half of the floor warning above, now with a concrete instance: **it was
+returning the platform loader's `name` String as its parent.** Two divergences
+its probe found are filed as residuals in the lane doc, both pre-existing and
+both outside its owned files (`isAssignableFrom` true across unrelated loaders;
+a duplicate `defineClass` not raising `LinkageError`).
+
+**Update, 2026-08-05 — L9 is closed and item 3 with it.** The blocker did not
+reproduce: its April symptom was a class-load defect fixed the same month by
+RKC16N.9, and all four copies of the forced-native `java/lang/String` policy it
+was about turned out to decide nothing — `resolve_step1_native` dispatches a
+registered native on the triple alone, before any of them runs, which a binary
+with the lists deleted confirmed by producing a byte-identical 392-case
+transcript and identical invocation counts. Two lanes were planned around a
+comment. Item 7 is still blocked on L10.
+
+That also starts item 1's migration: the four reviewed `java/lang/String`
+fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
+so `kind_stated` is no longer `false` on all 11,909 rows.

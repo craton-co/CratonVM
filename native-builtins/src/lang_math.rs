@@ -19,6 +19,18 @@ use crate::lang_string::{
 pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: &str) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    // LEAF: every body from `abs` through `IEEEremainder` below is arithmetic
+    // on the argument `Value`s — none of them touches `ctx` at all (the
+    // parameter is `_ctx` throughout), so none can allocate, safepoint,
+    // collect, or raise a JNI-pending exception. `random` is included: its
+    // state is a thread-local SplitMix64 word.
+    //
+    // This is exactly the case the funnel was measured to dominate:
+    // `probes/NativeShapeProbe.java` had `Math.abs(int)` — a table-listed
+    // interpreter intrinsic — at 330 ns from compiled code against 0.8 ns on
+    // HotSpot, because "intrinsic" only chose the callback, it did not skip
+    // `safe_native_call`. See `NativeMethodRegistry::set_leaf`.
+    registry.set_leaf(true);
     registry.register(class, "abs", "(I)I", native_math_abs_int);
     registry.register(class, "abs", "(J)J", native_math_abs_long);
     registry.register(class, "abs", "(F)F", native_math_abs_float);
@@ -55,6 +67,11 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "signum", "(F)F", native_math_signum_float);
     registry.register(class, "cbrt", "(D)D", native_math_cbrt);
     registry.register(class, "IEEEremainder", "(DD)D", native_math_ieee_remainder);
+    // End of the leaf block. The `*Exact` family below raises
+    // `ArithmeticException` on overflow, which is a `MethodCallFailed` return
+    // and would qualify — but they are left on the funnel until something
+    // measures them, so the leaf list stays "audited", not "assumed".
+    registry.set_leaf(false);
 
     // --- Exact arithmetic (Phase 13 Step 1) ---
     registry.register(class, "addExact", "(II)I", native_math_add_exact_int);

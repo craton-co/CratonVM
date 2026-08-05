@@ -191,7 +191,7 @@ Per the wave-1 marker, all of them collapse into one structural rule:
 * Deleting only the four marked sites leaves the four unmarked ones enforcing a
   policy the other four no longer apply, i.e. the same cold-path/warm-path split
   documented in
-  [the forced-native `String` policy](forced-native-string-policy-two-lists-that-disagree.md).
+  [the forced-native `String` policy, FIXED 2026-08-04](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
 * Reclassifying `native_es_execute` to `SyntheticStub` while
   `CRATONVM_NO_STUBS` / `--jdk-only` is in play **drops the registration
   entirely** (see
