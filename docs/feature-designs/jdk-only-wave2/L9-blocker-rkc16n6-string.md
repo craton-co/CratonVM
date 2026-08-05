@@ -101,11 +101,13 @@ first looked like it had to be, and did not:
   Deliberately not re-masked — the native was wrong there too, and re-masking
   would cost the four rows the bytecode fixes, including `substring` splitting
   a surrogate pair into U+FFFD.
-* `+` concatenation loses an unpaired surrogate
-  ([record](../../known-issues/string-concat-loses-unpaired-surrogates.md)).
-  Still open, and now located exactly: `execute_string_concat` accumulates into
-  a Rust `String`, which cannot represent an unpaired surrogate. Not a
-  one-liner, and scoped out of this lane deliberately.
+* `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
+  ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
+  `execute_string_concat` accumulated into a Rust `String`, which cannot
+  represent one. It now accumulates `Vec<u16>`. It was **three** loss points,
+  not the one the record named — the argument, the folded recipe literal, and
+  the `TAG_CONST` constant — and a probe written to separate them is the only
+  reason it did not ship half-fixed with its own reproducer green.
 
 ## Residual
 

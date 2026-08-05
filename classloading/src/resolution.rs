@@ -258,8 +258,11 @@ pub enum SwitchLabel {
 pub enum ResolvedCallSite {
     /// String concatenation (StringConcatFactory.makeConcatWithConstants).
     StringConcat {
-        recipe: Arc<str>,
-        constant_args: Vec<Arc<str>>,
+        /// UTF-16 code units, deliberately not `Arc<str>`: a recipe can embed a
+        /// lone surrogate from a folded string literal, and a Rust `str` cannot
+        /// hold one -- it becomes U+FFFD. Same for the `TAG_CONST` constants.
+        recipe: Arc<[u16]>,
+        constant_args: Vec<Arc<[u16]>>,
         target_descriptor: Arc<str>,
     },
     /// Lambda / method reference (LambdaMetafactory.metafactory).
@@ -1961,7 +1964,9 @@ mod tests {
             class_id,
             cp_index,
             ResolvedCallSite::StringConcat {
-                recipe: Arc::from("Hello, \u{0001}!"),
+                recipe: Arc::from(
+                    "Hello, \u{0001}!".encode_utf16().collect::<Vec<u16>>().as_slice(),
+                ),
                 constant_args: vec![],
                 target_descriptor: Arc::from("(Ljava/lang/String;)Ljava/lang/String;"),
             },
