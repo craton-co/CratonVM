@@ -267,7 +267,13 @@ Filed rather than fixed:
   HotSpot*, the same way L2's `try_set_jdk_map_field` fix did.
 * ~~**`register_t2_3_completion_natives` is never called**~~ — **FIXED,
   2026-08-05; see *The two follow-ups* below.**
-* **`Scanner.match()` is unimplemented on every path.** Our natives never
+* ~~**`Scanner.match()` is unimplemented on every path.**~~ — **FIXED
+  2026-08-05; see *`Scanner.match()`* below.** The note as filed said the fix
+  had to drive a real `Matcher` on every token path. It did not: the state is
+  recorded in Rust and a real `Matcher` is built only when `match()` is called.
+  The original filed text is kept below because the difference between the
+  proposed shape and the built one is the point.
+* ~~**`Scanner.match()` is unimplemented on every path.**~~ Our natives never
   populate the real `matcher` / `matchValid` state, so `match()` throws
   `IllegalStateException` after `next()`, `nextInt()` and `findInLine()` alike,
   where HotSpot 25 returns `ab`, `7` and `42`. Measured, not inferred. Closing
@@ -392,3 +398,73 @@ Three probes — `L3ScannerLayoutProbe`, `L3MemberNameProbe`,
 `Scanner` and `MemberName`, `0 disagree` on the layout line. Bridge ratchet:
 PASS on the unchanged linux baseline. `cargo test`: `cratonvm-classloading`
 759, `cratonvm-native-io` 386, `cratonvm-native-builtins` 3270, all green.
+
+---
+
+# `Scanner.match()`, 2026-08-05
+
+Filed by this lane, then taken. Three of the answers were counter-intuitive, so
+`probes/ScannerMatchStateProbe` was written and run against Temurin 25.0.3
+**before** any code, and it is the specification:
+
+| operation | HotSpot 25 |
+|---|---|
+| nothing yet | `IllegalStateException` |
+| `next()` | the token, `[ab]@0,2` |
+| `nextLine()` | the line **and its terminator** — 8 chars for `one two` plus its newline, 3 for a CRLF line |
+| `findInLine` / `findWithinHorizon` / `skip` | the searched match, with the caller's groups |
+| a search that finds nothing | clears it |
+| **`hasNext()`** | **clears it** |
+| **`hasNextLine()` / `hasNextInt()`** | **leave the LOOKAHEAD's match**, `[ cd]@2,5`, `[8]@2,3` |
+| `useDelimiter()`, `reset()`, `close()` | leave it alone — `match()` works on a closed Scanner |
+| twice in a row | same answer; it is a read, not a consume |
+
+Guessing any of the bold rows produces a divergence nothing else would catch.
+
+**The shape changed from the filed proposal, and the reason is measured.** The
+note said to drive a real `Matcher` on every token operation and store it in the
+receiver's `matcher` field. That materializes a Java `String` of the whole input
+per `next()`. Recording the span in Rust and building the `Matcher` only inside
+`match()` costs nothing detectable instead — `probes/ScannerTokenCostProbe`,
+50k tokens, interleaved in both orders, six runs each: **63.7 ms before, 64.5 ms
+after**, inside a 55–70 ms per-run spread.
+
+What is NOT done differently is the object: `match()` returns
+`Pattern.compile(p).matcher(input).find(start).toMatchResult()` — a JDK object
+produced by JDK code. The filed note's warning against fabricating a
+`MatchResult` stands, and the `useDelimiter` `Pattern` is why.
+
+## Two VM defects found on the way, both filed
+
+* **`Pattern.quote`'s `\Q…\E` does not match non-ASCII in CratonVM.**
+  `Pattern.compile(Pattern.quote("éé")).matcher("éé ab").find(0)` is `true` on
+  HotSpot and `false` here, while the unquoted `é+` matches on both. The literal
+  patterns recorded for tokens escape per character instead, which is more
+  portable anyway; without that this lane's probe had exactly one bad line.
+* **`--jdk-only` breaks real JDK methods that reach a refused fabrication.**
+  `Matcher.toMatchResult()` throws `NoClassDefFoundError:
+  cratonvm/internal/UnmodifiableMap`, and `Pattern.compile(",").split("1,2,3")`
+  throws `NoClassDefFoundError: cratonvm/internal/ArrayListSubList` — both from
+  PLAIN JAVA, no Scanner involved. Bisected to `ba19e21ea` (L7 R1), which
+  started refusing those fabrications without the collection natives that RETURN
+  them catching up; a registry diff across the two revisions shows 350
+  registrations gone, all on the refused classes. The refusal is right; the
+  other half is missing.
+
+  `match()` therefore falls back to the `Matcher` itself, which also implements
+  `MatchResult`, so every method answers identically and only `getClass()`
+  differs. The probe prints that class rather than hiding it, which is why
+  `--jdk-only` differs from HotSpot on exactly one line of twenty-seven. It also
+  turned this lane's earlier `L3ScannerLayoutProbe` red in strict mode on its
+  `usable.split` line — the probe catching a regression from another lane, which
+  is what it is for.
+
+## Verification
+
+`ScannerMatchStateProbe` byte-identical to HotSpot 25 in `--real-jdk` on
+Windows and Azure Linux; in `--jdk-only` identical on all 26 behavioural lines,
+differing only on `result.class`. `L3ScannerSearchProbe` and `L3MemberNameProbe`
+unchanged and identical in both modes on both platforms. Bridge ratchet PASS on
+the unchanged linux baseline (9705 / 4696 — L7 moved those numbers, not this
+change). `cargo test --release -p cratonvm-native-io --lib`: 389. Regression
+suite 28/0.
