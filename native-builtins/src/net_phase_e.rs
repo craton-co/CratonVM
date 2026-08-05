@@ -2005,10 +2005,11 @@ fn native_inet_get_by_address(
         // an IAE escapes their catch and propagates as an unrelated failure.
         return Err(uhex(format!("addr is of illegal length: {len}")));
     };
-    // `getByAddress` has no separately supplied hostname. Use the same
-    // HotSpot-normalized numeric text for both logical fields; otherwise a
-    // caller that reads the host-side value (such as Jetty's connector setup)
-    // can still observe Rust's RFC-5952-compressed IPv6 form.
+    // Normalize to HotSpot's numeric text before storing anything, or a caller
+    // that reads the address (such as Jetty's connector setup) observes Rust's
+    // RFC-5952-compressed IPv6 form instead of the JDK's uncompressed one.
+    // (This comment used to say the text was stored in "both logical fields";
+    // it is not, since `e092b0f3b` — see below.)
     let ip_text = hotspot_ip_string(&ip_str);
     // `getByAddress(byte[])` is handed raw octets and NO name, so the mirror
     // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
@@ -16473,6 +16474,25 @@ mod tests {
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
     }
 
+    // The name half of this was stale from 2026-08-05 04:49 to 2026-08-05,
+    // asserting that `getByAddress(byte[])` records a hostName equal to the
+    // address text. `e092b0f3b` deliberately stopped recording one and did not
+    // touch this test, so the crate's suite went red on dev.
+    //
+    // Which side was right was settled against the real JDK rather than by
+    // editing the assertion to match the code — `probes/InetGetByAddressProbe`
+    // on HotSpot 25.0.3+9, `toString()` printed BEFORE any `getHostName()`
+    // call (which does a reverse lookup and caches into the holder, changing
+    // what a later `toString()` prints):
+    //
+    //   getByAddress(bytes)                  -> /fe80:0:0:0:67b0:99e:5a9b:287e
+    //   getByAddress("example.invalid", …)   -> example.invalid/fe80:0:0:0:…
+    //   getByName("fe80::67b0:99e:5a9b:287e")-> /fe80:0:0:0:67b0:99e:5a9b:287e
+    //
+    // `InetAddress.toString()` is `Objects.toString(holder().getHostName(),
+    // "") + "/" + getHostAddress()`, so an empty left-hand side IS the
+    // observation that the holder's name is null. The code was right; the
+    // expectation below now pins both halves.
     #[test]
     fn re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout() {
         let mut ctx = MockNativeContext::new();
@@ -16497,10 +16517,25 @@ mod tests {
         assert_eq!(
             inet_addr_resolve(&ctx, address),
             Some((
-                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+                String::new(),
                 "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
             )),
-            "getByAddress must preserve HotSpot's uncompressed IPv6 text"
+            "getByAddress(byte[]) must preserve HotSpot's uncompressed IPv6 \
+             text AND remember no host name"
+        );
+
+        // The paired half, so the empty name above reads as a decision and not
+        // as a side table that cannot hold one. Without it, deleting the name
+        // everywhere would still pass.
+        let named =
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
+        assert_eq!(
+            inet_addr_resolve(&ctx, named),
+            Some((
+                "example.invalid".to_string(),
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+            )),
+            "a supplied host name is kept — HotSpot: example.invalid/fe80:0:0:0:…"
         );
     }
 
