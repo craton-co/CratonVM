@@ -374,18 +374,39 @@ pub(crate) fn unsafe_wp1_2_natives(registry: &mut NativeMethodRegistry) {
 
 
 /// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
-/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object that
-/// `Files.newBufferedWriter` allocates. The synthetic object stores its file
-/// descriptor as an `Int` in slot 0; a real BufferedWriter's slot 0 holds an
-/// object reference (the `lock`/`out` Writer set by the JDK constructor).
+/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object the
+/// `synthetic-jdk` build's `native_bw_init` produces.
 ///
 /// Returns `Some(out)` — the wrapped `Writer` — for a real BufferedWriter, so
-/// the `BufferedWriter` natives can forward the I/O to real bytecode instead
-/// of misreading slot 0 as an fd and dropping the write. Returns `None` for
-/// the synthetic fd-backed object, leaving the slot-0 fd fast-path in place.
+/// the `BufferedWriter` natives forward the I/O to real bytecode. Returns
+/// `None` for a fd-backed object, leaving the slot-0 fd fast-path in place.
+///
+/// # Why the slot-0 test is `#[cfg]`-gated
+///
+/// The test is "does raw slot 0 hold an `Int`?", and it used to run in every
+/// build. Its old doc claimed a real BufferedWriter's slot 0 holds "the
+/// `lock`/`out` Writer set by the JDK constructor" — which is true of no JDK:
+/// `java.io.Writer` declares `writeBuffer` first and `lock` second, so slot 0
+/// is the `char[]` and `out` is slot 2. The question being asked was never the
+/// question the comment described.
+///
+/// It answered correctly anyway, for an unrelated reason: bytecode `new` writes
+/// an explicit `Object(None)` into every reference slot, because an all-zero
+/// slot decodes as `Int(0)` and NOT as null (the R-niche rule in
+/// `gc/src/gen_heap.rs`). A BufferedWriter arriving from an allocator that
+/// skips those defaults — `alloc_object` without descriptors, which is what
+/// `alloc_concurrent_synthetic` uses — would have read `Int(0)` and been
+/// classified as fd-backed **on fd 0**.
+///
+/// In the default build nothing writes an fd into a `java/io/BufferedWriter`
+/// any more (`Files.newBufferedWriter`'s fd path was deleted on 2026-08-05, see
+/// `phases_late/nio_file.rs`), so the read is gated to the `synthetic-jdk`
+/// build, where slot 0 belongs to the fabricated model and the question is the
+/// right one to ask.
 fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    #[cfg(feature = "synthetic-jdk")]
     if let Value::Int(_) = ctx.get_field(this, 0) {
-        return None; // synthetic fd-backed BufferedWriter (Files.newBufferedWriter)
+        return None; // fd-backed BufferedWriter (native_bw_init)
     }
     match ctx.get_field_by_name(this, "out") {
         Value::Object(Some(o)) => Some(o),

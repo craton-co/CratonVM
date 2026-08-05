@@ -5994,86 +5994,32 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `fsp_scan_open_options` reads the same array and also reports CREATE_NEW
     // and NOFOLLOW_LINKS, which this path has to honour too.)
 
-    // Phase B (RB.8): Files.newBufferedWriter — open the path for
-    // writing via the fd_table and return a synthetic BufferedWriter
-    // (3-field: fd, write-buffer index, write-buffer char[]).  The
-    // minimal BufferedWriter natives registered below forward
-    // write/flush/close/newLine to the fd. Charset argument is
-    // currently honoured via UTF-8 output (matching the JDK default).
-    // Takes the path as a `&str`, not an `ObjectRef`: the caller has to read it
-    // BEFORE scanning the options (that scan can re-enter `toString()` and move
-    // the `Path`), so there is no reason to carry the object this far.
-    fn open_buffered_writer(
-        ctx: &mut dyn NativeContext,
-        p: &str,
-        flags: P57OpenFlags,
-    ) -> MethodCallResult {
-        let p = p.to_string();
-        // NOFOLLOW_LINKS: refuse a symlink final component before the open.
-        if flags.nofollow {
-            if let Some(refused) = p57_nofollow_reject(&p) {
-                return Err(refused);
-            }
-        }
-        if flags.create_new && std::path::Path::new(&p).exists() {
-            return Err(p57_file_already_exists(ctx, &p));
-        }
-        let append = flags.append;
-        // GAP I2 — see `newFileChannel`.
-        match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
-            Ok(fd) => {
-                let bw = alloc_concurrent_synthetic(ctx, "java/io/BufferedWriter", 3);
-                ctx.set_field(bw, 0, Value::Int(fd as i32));
-                // slot 1 (bufferedchar count), slot 2 (charset name) left 0/null —
-                // pending_chars/carry buffer unused in this direct-fd mode.
-                ctx.set_field(bw, 1, Value::Int(0));
-                ctx.set_field(bw, 2, Value::Object(None));
-                Ok(Some(Value::Object(Some(bw))))
-            }
-            // A capability refusal is a `SecurityException`, not an
-            // `IOException`: it happened before the syscall and must not be
-            // retried. An I/O failure keeps the message it always had.
-            Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
-                Err(denied.into())
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("newBufferedWriter({}): {}", p, e),
-            }
-            .into()),
-        }
-    }
-
-    // REAL-BY-DEFAULT (2026-06-18): the synthetic fd-backed BufferedWriter that
-    // `Files.newBufferedWriter` returned silently DROPPED all character data (the
-    // real `BufferedWriter -> OutputStreamWriter -> StreamEncoder` flush path never
-    // reached the fd). Default: run the REAL `Files.newBufferedWriter` bytecode
-    // (`BufferedWriter(OutputStreamWriter(Files.newOutputStream(p), encoder))`),
-    // which round-trips correctly on CratonVM and flows through the real-aware
-    // `bw_delegate_out` BufferedWriter natives below. Opt back into the broken
-    // synthetic with `CRATONVM_SYNTHETIC_BUFFERED_WRITER=1`. See
-    // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
-    if crate::nbflags().synthetic_buffered_writer {
-        r.register(
-            files,
-            "newBufferedWriter",
-            "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
-            |ctx, args| {
-                let p = p57_read_path(ctx, obj_arg(args, 0)?);
-                let flags = fsp_scan_open_options(ctx, args.get(1).copied());
-                open_buffered_writer(ctx, &p, flags)
-            },
-        );
-        r.register(
-        files,
-        "newBufferedWriter",
-        "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
-        |ctx, args| {
-            let p = p57_read_path(ctx, obj_arg(args, 0)?);
-            let flags = fsp_scan_open_options(ctx, args.get(2).copied());
-            open_buffered_writer(ctx, &p, flags)
-        },
-    );
-    } // end if CRATONVM_SYNTHETIC_BUFFERED_WRITER — synthetic fd-backed newBufferedWriter
+    // DELETED 2026-08-05: the fd-backed `Files.newBufferedWriter` that used to
+    // live here, and the `CRATONVM_SYNTHETIC_BUFFERED_WRITER` flag that gated
+    // it back on.
+    //
+    // It allocated a `java/io/BufferedWriter`, wrote the OS file descriptor
+    // into raw slot 0 — `java.io.Writer.writeBuffer` on the real layout, a
+    // `char[]` the JDK owns — and left the six BufferedWriter natives below to
+    // recognise their own object by asking whether that slot held an `Int`.
+    // That is kind 3 in
+    // `docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`:
+    // a VM value with no real field to live in.
+    //
+    // It was already default-OFF (real bytecode has been the default since
+    // 2026-06-18, because this path "silently DROPPED all character data"), and
+    // measuring the flagged arm before touching it showed it had no working
+    // configuration left at all: `probes/BufferedWriterDiscriminatorProbe`
+    // produced ZERO bytes for every one of its five `newBufferedWriter` writes,
+    // and the overlay trace showed the fd being written once
+    // (`set_field slot=0 value=Int(3)`) and every subsequent read of that slot
+    // on the same object returning `Object(None)` — the fd destroyed before its
+    // first use.
+    //
+    // So it is deleted rather than repaired or relocated to a side table: it is
+    // the only writer of that overlay in a default build, and the default path
+    // (real `BufferedWriter(OutputStreamWriter(Files.newOutputStream(p)))`) is
+    // byte-identical to HotSpot across every line of that probe.
 
     // Minimal BufferedWriter natives backed by the fd stored at slot 0.
     // These are also registered in synthetic-jdk mode by phases_late, but
