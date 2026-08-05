@@ -338,6 +338,21 @@ pub struct ThreadRegistry {
         FxHashMap<usize, ThreadId>,
         std::collections::VecDeque<usize>,
     )>,
+    /// Reverse index from an owned `AbstractOwnableSynchronizer`'s heap address
+    /// to the thread its `jmx_locked_synchronizers` list currently records it
+    /// on — the same shape, and for the same reason, as `thread_obj_to_park`
+    /// above: without it, one AQS ownership transition costs Θ(threads) map
+    /// walks and mutex acquisitions, and there are two of them per uncontended
+    /// `ReentrantLock.lock()`/`unlock()` pair.
+    ///
+    /// Strictly derived state. [`Self::set_jmx_owned_synchronizer`] is its only
+    /// producer, and it updates this map and the per-thread lists together;
+    /// [`Self::update_thread_objs_after_gc`] rekeys it whenever a moving
+    /// collection relocates a recorded synchronizer, in the same pass that
+    /// remaps the lists themselves. An entry naming a reaped thread is inert —
+    /// `threads.get` answers `None` and the removal is skipped, exactly as the
+    /// linear scan used to skip a missing entry.
+    synchronizer_owner: Mutex<FxHashMap<usize, ThreadId>>,
 }
 
 /// Upper bound on retained former-mirror addresses (see
@@ -372,6 +387,7 @@ impl ThreadRegistry {
                 FxHashMap::default(),
                 std::collections::VecDeque::new(),
             )),
+            synchronizer_owner: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -1320,15 +1336,57 @@ impl ThreadRegistry {
 
     /// `AbstractOwnableSynchronizer` has one exclusive owner. Remove a
     /// synchronizer from any former owner before attaching it to the new one.
+    ///
+    /// # Why this keeps a reverse index instead of scanning
+    ///
+    /// This runs on **every AQS ownership transition** — `acquire` passes the
+    /// owner, `release` passes `null`, so it is twice per uncontended
+    /// `ReentrantLock.lock()`/`unlock()` pair (censused in
+    /// `probes/LockNativeCensusProbe.java`). The original body walked EVERY
+    /// registered thread and took EVERY thread's `jmx_locked_synchronizers`
+    /// mutex to `retain` the one it was removing, so the cost of one
+    /// uncontended lock grew with the number of threads in the VM — a property
+    /// no correct JVM has, and one that a single-threaded microbenchmark like
+    /// `probes/AqsBreakdownProbe.java` cannot see at all.
+    /// `probes/AqsOwnerScaleProbe.java` is the differential that does.
+    ///
+    /// `synchronizer_owner` is a derived mirror of the per-thread lists: this
+    /// function is their only mutator besides the GC remap in
+    /// `update_thread_objs_after_gc` (which rekeys the index in the same pass,
+    /// because the key is a heap address and a moving collection relocates it)
+    /// and thread reaping. So the previous owner can be looked up instead of
+    /// searched for, and the transition touches at most two threads' lists.
+    ///
+    /// A stale index entry naming a thread that has since exited resolves to
+    /// `None` in `threads.get` and is simply dropped — the same no-op the scan
+    /// performed for a thread whose entry was already gone.
     pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
+        let key = synchronizer.as_ptr() as usize;
+        let previous = {
+            let mut index = self.synchronizer_owner.lock();
+            match owner {
+                Some(owner) => index.insert(key, owner),
+                None => index.remove(&key),
+            }
+        };
         let threads = self.threads.read();
-        for entry in threads.values() {
-            entry
-                .jmx_locked_synchronizers
-                .lock()
-                .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+        if let Some(previous) = previous {
+            if Some(previous) != owner {
+                if let Some(entry) = threads.get(&previous) {
+                    entry
+                        .jmx_locked_synchronizers
+                        .lock()
+                        .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+                }
+            }
         }
         if let Some(owner) = owner {
+            // `previous == Some(owner)` means this synchronizer was already
+            // recorded against this thread (a reentrant acquire re-running the
+            // setter); pushing again would double-count it in the snapshot.
+            if previous == Some(owner) {
+                return;
+            }
             if let Some(entry) = threads.get(&owner) {
                 entry.jmx_locked_synchronizers.lock().push(synchronizer);
             }
@@ -1920,6 +1978,10 @@ impl ThreadRegistry {
         // Vacated mirror addresses + owning tid, recorded into
         // `former_mirror_addrs` AFTER `threads` is dropped (lock order).
         let mut vacated: Vec<(usize, ThreadId)> = Vec::new();
+        // `(old_addr, new_addr, owner)` for every recorded owned synchronizer
+        // this collection relocated; applied to `synchronizer_owner` after
+        // `threads` is dropped, same lock discipline as `vacated`.
+        let mut synchronizer_rekeys: Vec<(usize, usize, ThreadId)> = Vec::new();
         for (tid, entry) in threads.iter_mut() {
             if let Some(ref mut obj) = entry.java_thread_obj {
                 let old_addr = obj.as_ptr() as usize;
@@ -1944,8 +2006,21 @@ impl ThreadRegistry {
             for obj in entry.jmx_locked_monitors.lock().iter_mut() {
                 remap_jmx(obj);
             }
+            // `synchronizer_owner` is keyed by these very addresses, so the
+            // rekeying happens in the same pass that rewrites them: a key left
+            // pointing at a vacated address would make the next
+            // `set_jmx_owned_synchronizer` for that lock miss its previous
+            // owner and record it against two threads at once. The `(old, new,
+            // owner)` triples are collected here and applied after `threads` is
+            // dropped, keeping this function's "acquire, use, drop, then call
+            // out" lock discipline.
             for obj in entry.jmx_locked_synchronizers.lock().iter_mut() {
+                let old_addr = obj.as_ptr() as usize;
                 remap_jmx(obj);
+                let new_addr = obj.as_ptr() as usize;
+                if new_addr != old_addr {
+                    synchronizer_rekeys.push((old_addr, new_addr, *tid));
+                }
             }
             // B1 fix — repoint a pending async-exception slot too. It stores
             // the raw address of a posted `Throwable`; a moving collection
@@ -1971,6 +2046,19 @@ impl ThreadRegistry {
             for (old_addr, new_addr) in rekeyed {
                 if let Some(ps) = idx.remove(&old_addr) {
                     idx.insert(new_addr, ps);
+                }
+            }
+        }
+        if !synchronizer_rekeys.is_empty() {
+            let mut index = self.synchronizer_owner.lock();
+            for (old_addr, new_addr, tid) in synchronizer_rekeys {
+                // Only move an entry this index actually owns AND that still
+                // names the thread whose list we just remapped: a synchronizer
+                // recorded against someone else is that owner's row to move,
+                // and it will be moved by its own iteration of the loop above.
+                if index.get(&old_addr) == Some(&tid) {
+                    index.remove(&old_addr);
+                    index.insert(new_addr, tid);
                 }
             }
         }
@@ -2010,10 +2098,52 @@ impl ThreadRegistry {
     /// are this fold (keyed by those addresses) and the wake-side apply,
     /// so the chain stays consistent.
     pub fn fold_pointer_map_into_blocked(&self, pointer_map: &HashMap<usize, usize>) {
+        self.fold_pointer_map_into_blocked_audited(pointer_map, None)
+    }
+
+    /// [`Self::fold_pointer_map_into_blocked`] plus the post-fold invariant
+    /// check, for the production call site that can hand over the heap.
+    ///
+    /// The invariant: once this fold returns, no address a blocked thread will
+    /// resume on may lie in the INACTIVE young semispace. That arena is what
+    /// the moving cycle just evacuated and zeroed, so a reference into it is a
+    /// still-referenced object the collector took — the "all-zero header
+    /// `java.lang.Object` receiver" family — and it is detectable HERE, in the
+    /// cycle that caused it, with the frame and slot that hold it. Every other
+    /// witness of this bug is downstream: a `NoSuchMethodError` against
+    /// `java.lang.Object`, a `checkcast` failure, an out-of-bounds field read —
+    /// each an unbounded distance from the collection with the gap, and each
+    /// naming only the victim's *use* site.
+    ///
+    /// The check that runs UNCONDITIONALLY is the precise one: a
+    /// `slot_origins` entry — the exact `(frame, slot)` tracker, filled by the
+    /// blocking deposit and advanced through each cycle's pointer map — whose
+    /// `cur` lands in the vacated arena. Its report carries
+    /// `was_a_scanned_root`, which forks the fix: `false` means the deposit
+    /// never published that slot (a root COVERAGE gap), `true` means the
+    /// collector was handed the address and left it behind (an EVACUATION
+    /// gap).
+    ///
+    /// The whole-snapshot version of the same question is behind
+    /// `CRATONVM_DBG_BLOCKGC`, because a snapshot legitimately carries
+    /// conservative candidates that are not object starts and which
+    /// `forward_object` correctly declines to relocate.
+    ///
+    /// `heap` is `None` only from tests that drive the fold directly with a
+    /// synthetic pointer map.
+    pub fn fold_pointer_map_into_blocked_audited(
+        &self,
+        pointer_map: &HashMap<usize, usize>,
+        heap: Option<&crate::memory::VmHeap>,
+    ) {
         if pointer_map.is_empty() {
             return;
         }
         let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some();
+        // One arena lock for the whole fold; the per-address test below is two
+        // integer compares, so the audit is affordable unconditionally and does
+        // not need a flag to have been set before the run that reproduces.
+        let vacated = heap.and_then(|h| h.young_inactive_semispace_range());
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -2065,6 +2195,50 @@ impl ThreadRegistry {
                 for so in origins.iter_mut() {
                     if let Some(&new) = pointer_map.get(&so.cur) {
                         so.cur = new;
+                    }
+                }
+                if let Some((lo, hi)) = vacated {
+                    // Built lazily: a frame slot landing in the vacated arena
+                    // is the rare case, and this set is only needed to report
+                    // one.
+                    let mut in_snapshot: Option<rustc_hash::FxHashSet<usize>> = None;
+                    for so in origins.iter() {
+                        // A DEAD local in the vacated arena is the per-bci
+                        // liveness analysis working as designed, not a defect
+                        // — see `SlotOrigin::live`.
+                        if !so.live || so.cur < lo || so.cur >= hi {
+                            continue;
+                        }
+                        let published = in_snapshot
+                            .get_or_insert_with(|| {
+                                snapshot.iter().map(|r| r.as_ptr() as usize).collect()
+                            })
+                            .contains(&so.cur);
+                        // The remap above rewrote the snapshot in place, so a
+                        // hit means the collector had this exact address as a
+                        // root and left it behind; a miss means the deposit
+                        // never published it.
+                        blocked_root_gap_report(
+                            tid.0, so.frame, so.idx, so.is_stack, so.orig, so.cur, published,
+                        );
+                    }
+                }
+            }
+            // The whole-snapshot version of the same question. Gated, unlike
+            // the per-slot check above, because the snapshot legitimately
+            // carries CONSERVATIVE candidates — register/stack words and
+            // JIT-band scans that are not object starts — and `forward_object`
+            // correctly declines to relocate those, so they land in the vacated
+            // arena on every moving cycle by design. Only a hit that is ALSO a
+            // frame slot is unambiguous, and that is what the check above
+            // reports unconditionally.
+            if dbg {
+                if let Some((lo, hi)) = vacated {
+                    for r in snapshot.iter() {
+                        let a = r.as_ptr() as usize;
+                        if a >= lo && a < hi {
+                            blocked_snapshot_gap_report(tid.0, a);
+                        }
                     }
                 }
             }
@@ -2358,6 +2532,74 @@ impl ThreadRegistry {
     }
 }
 
+/// Rate limit for the two blocked-root-gap reporters below. The defect
+/// cascades — one blocked thread typically has many slots pointing at the
+/// same lost subgraph — and the first handful carry all the information.
+const BLOCKED_ROOT_GAP_REPORTS: u64 = 12;
+
+/// A blocked thread's frame slot still points into the arena this moving
+/// cycle evacuated: the object it names was NOT relocated, so on wake the
+/// slot reads the all-zero header the collector left behind.
+///
+/// `in_snapshot` is the fork that decides where the fix goes. `false` (the
+/// common case) means `deposit_root_snapshot`'s frame scan never published
+/// this slot, so the collector could not have known to evacuate it — a
+/// root-coverage gap in the deposit. `true` means the collector held this
+/// exact address as a root and left it behind anyway — an evacuation gap.
+fn blocked_root_gap_report(
+    tid: u64,
+    frame: u32,
+    idx: u32,
+    is_stack: bool,
+    orig: usize,
+    cur: usize,
+    in_snapshot: bool,
+) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, Ordering::Relaxed) >= BLOCKED_ROOT_GAP_REPORTS {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        tid = tid,
+        frame = frame,
+        slot = if is_stack { "stack" } else { "local" },
+        idx = idx,
+        deposited_addr = format!("{orig:#x}"),
+        current_addr = format!("{cur:#x}"),
+        was_a_scanned_root = in_snapshot,
+        "blocked-thread frame slot points into the semispace this moving cycle just \
+         evacuated — the object was not relocated and the slot will read an all-zero \
+         `java.lang.Object` header on wake. `was_a_scanned_root=false` means the \
+         blocking deposit never published this slot (root-coverage gap); `true` means \
+         the collector was handed it and did not evacuate it (evacuation gap).",
+    );
+}
+
+/// A blocked thread's deposited root snapshot still names the evacuated
+/// arena after the fold remapped it.
+///
+/// `CRATONVM_DBG_BLOCKGC` only. Most hits are benign by construction: the
+/// snapshot carries conservative candidates (register/stack words, JIT-band
+/// scans) that are not object starts, and `forward_object` declines to
+/// relocate anything `young_object_starts` does not vouch for. A hit is only
+/// interesting when the SAME address is also a frame slot — which
+/// [`blocked_root_gap_report`] reports on its own, unconditionally.
+fn blocked_snapshot_gap_report(tid: u64, addr: usize) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, Ordering::Relaxed) >= BLOCKED_ROOT_GAP_REPORTS {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        tid = tid,
+        obj = format!("{addr:#x}"),
+        "blocked-thread root snapshot still names the semispace this moving cycle just \
+         evacuated, after the fold's remap — the collector scanned this root and did not \
+         relocate it. The next collection would scan the same stale address.",
+    );
+}
+
 impl Default for ThreadRegistry {
     fn default() -> Self {
         Self::new()
@@ -2395,6 +2637,112 @@ mod tests {
         let id2 = registry.next_thread_id();
         assert_eq!(id1, ThreadId(1));
         assert_eq!(id2, ThreadId(2));
+    }
+
+    /// Fabricated, never-dereferenced heap addresses. Everything the owned-
+    /// synchronizer index does with an `ObjectRef` is take `as_ptr()` and use
+    /// it as a map key / identity comparison, so these never need to be real
+    /// objects — and making them real would mean booting a heap for a test
+    /// about bookkeeping.
+    fn fake_synchronizer(addr: usize) -> ObjectRef {
+        // SAFETY: this ref is only ever compared and hashed by address; no
+        // code under test reads through it.
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    fn owned_synchronizers(registry: &ThreadRegistry, tid: ThreadId) -> Vec<usize> {
+        registry
+            .jmx_lock_snapshot(tid)
+            .map(|snapshot| snapshot.3.iter().map(|o| o.as_ptr() as usize).collect())
+            .unwrap_or_default()
+    }
+
+    /// An AQS ownership transition must leave the synchronizer recorded against
+    /// exactly one thread — the property the old Θ(threads) scan bought by
+    /// walking every thread and taking every thread's mutex, twice per
+    /// uncontended `ReentrantLock.lock()`/`unlock()` pair.
+    ///
+    /// The reverse index replaces the scan; this pins that it still answers the
+    /// same. `probes/AqsOwnerScaleProbe.java` is the companion measurement —
+    /// with the scan in place, an uncontended lock got ~2x more expensive going
+    /// from 1 to 256 live threads while a `synchronized` control stayed flat.
+    #[test]
+    fn an_ownership_transition_records_the_synchronizer_against_exactly_one_thread() {
+        let registry = ThreadRegistry::new();
+        let (a, b, c) = (ThreadId(1), ThreadId(2), ThreadId(3));
+        for (tid, name) in [(a, "a"), (b, "b"), (c, "c")] {
+            registry.register(tid, name, None);
+        }
+        let lock = fake_synchronizer(0x1000);
+
+        // acquire on A
+        registry.set_jmx_owned_synchronizer(Some(a), lock);
+        assert_eq!(owned_synchronizers(&registry, a), vec![0x1000]);
+        assert!(owned_synchronizers(&registry, b).is_empty());
+
+        // A reentrant acquire re-runs the setter; it must not double-record.
+        registry.set_jmx_owned_synchronizer(Some(a), lock);
+        assert_eq!(owned_synchronizers(&registry, a), vec![0x1000]);
+
+        // Hand-off to B without an intervening release: A must lose it.
+        registry.set_jmx_owned_synchronizer(Some(b), lock);
+        assert!(
+            owned_synchronizers(&registry, a).is_empty(),
+            "the former owner must not keep a lock it no longer holds"
+        );
+        assert_eq!(owned_synchronizers(&registry, b), vec![0x1000]);
+
+        // release
+        registry.set_jmx_owned_synchronizer(None, lock);
+        for tid in [a, b, c] {
+            assert!(
+                owned_synchronizers(&registry, tid).is_empty(),
+                "a released synchronizer is owned by nobody"
+            );
+        }
+
+        // A second, distinct lock is independent of the first.
+        let other = fake_synchronizer(0x2000);
+        registry.set_jmx_owned_synchronizer(Some(c), lock);
+        registry.set_jmx_owned_synchronizer(Some(c), other);
+        let mut held = owned_synchronizers(&registry, c);
+        held.sort_unstable();
+        assert_eq!(held, vec![0x1000, 0x2000]);
+        registry.set_jmx_owned_synchronizer(None, lock);
+        assert_eq!(owned_synchronizers(&registry, c), vec![0x2000]);
+    }
+
+    /// The index is keyed by a heap address, so a moving collection that
+    /// relocates a held synchronizer has to rekey it in the same pass that
+    /// remaps the per-thread lists. Without that, the next transition for the
+    /// lock misses its previous owner and records it against two threads.
+    #[test]
+    fn a_moving_collection_rekeys_the_owned_synchronizer_index() {
+        let registry = ThreadRegistry::new();
+        let (a, b) = (ThreadId(1), ThreadId(2));
+        registry.register(a, "a", None);
+        registry.register(b, "b", None);
+
+        registry.set_jmx_owned_synchronizer(Some(a), fake_synchronizer(0x1000));
+        let mut pointer_map = HashMap::new();
+        pointer_map.insert(0x1000usize, 0x9000usize);
+        registry.update_thread_objs_after_gc(&pointer_map);
+
+        assert_eq!(
+            owned_synchronizers(&registry, a),
+            vec![0x9000],
+            "the list itself is remapped"
+        );
+
+        // Now hand the (relocated) lock to B. If the index still held the
+        // vacated key, A would keep its stale entry and both threads would
+        // report owning it.
+        registry.set_jmx_owned_synchronizer(Some(b), fake_synchronizer(0x9000));
+        assert!(
+            owned_synchronizers(&registry, a).is_empty(),
+            "the index followed the object, so the former owner was found"
+        );
+        assert_eq!(owned_synchronizers(&registry, b), vec![0x9000]);
     }
 
     #[test]

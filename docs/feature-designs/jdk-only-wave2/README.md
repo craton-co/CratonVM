@@ -26,8 +26,8 @@ can work on what, simultaneously, without colliding.**
 
 | Lane | What | Owned files (the parallelism contract) | Gated on | Effort |
 |---|---|---|---|---|
-| [L1](L1-classloader-side-table.md) | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
-| [L2](L2-native-map-init-by-name.md) | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
+| [L1](L1-classloader-side-table.md) **DONE 2026-08-05** | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
+| [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
 | [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
@@ -39,7 +39,8 @@ can work on what, simultaneously, without colliding.**
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L1–L8 can all start today, in parallel, by different people.** L9 is closed.
+**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
+are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -48,7 +49,7 @@ exist:
 
 | Pair | Collides on | Resolution |
 |---|---|---|
-| L2 ↔ L10 | `native-collections/src/lib.rs` | **Serialize.** L2 is smaller — land it first, then L10 rebases. |
+| L2 ↔ L10 | `native-collections/src/lib.rs` | **Resolved:** L2 landed 2026-08-04; L10 rebases onto it. |
 | L4 ↔ L11 | `vm/src/vm/vm_exec.rs` | L4 owns the overlay hunter (~line 3070–3200); L11 owns dispatch (~14700, ~22700). Disjoint regions in one file — coordinate, do not both `git add -A`. |
 | L3 ↔ L12 | `lang_invoke.rs` | L3 is a handful of lines; land it first. |
 | L5/L6/L12 ↔ each other | `register_with_kind` semantics | Only L5 changes call sites; L6 only reads the census; L12 §4 is JIT-side. Safe. |
@@ -113,6 +114,18 @@ above looks paranoid.
   compile error) and ssh drops mid-command. Check `MemAvailable` before
   building; treat load > 80 as invalidating; verify a background job exists
   rather than assuming your launch survived.
+* **The census cannot see a same-kind wrong-field write, so a lane brief
+  written from the census under-reports its own defect.** L1's step 4 said the
+  three `ClassLoader` REFERENCE slots were safe because they "are already
+  written by name too" — but the by-name write and the index write land on
+  DIFFERENT fields (`name` is slot 1, and the index write put the parent
+  ClassLoader there). `overlay_write_is_destructive` only flags cross-type-class
+  coercions, so zero of it appeared in any census.
+  `classloader_parent` was returning the platform loader's own name String as
+  its parent, and nothing measured it until a behavioural probe was diffed
+  against the host JDK. **Read the writer against `javap` of the real class;
+  the census is a floor, and for reference-into-reference it is a floor of
+  zero.**
 
 ## Definition of done (contract §11)
 
@@ -125,19 +138,48 @@ above looks paranoid.
 6. **Strict corpus green.** The unmeasured half until 2026-08-04, and where the
    defects turned out to be — see L8.
 
-## State as of 2026-08-04
+## State as of 2026-08-05
 
 Closed: items 8, 9, 10; item 11 §1 (answered — its cost is zero), §5
 (retracted), §12, §13. Fixed outside the list: `--jdk-only` could not start a
 thread; `MethodType.toString()`; eight missing system properties.
 
-Item 2: 24 measured slots → **15 open**. Item 1: instrument built, migration
-**started** — the four reviewed `java/lang/String` fast-regex natives are
-`register_with_kind`'s first callers, so `kind_stated` is no longer `false` on
-all 11,909 rows. **Item 3 is closed** with L9; item 7 is still blocked on L10.
+Item 2: 24 measured slots → **15 open**. Item 1: instrument built, migration not
+started. Items 3/7: blocked on L9/L10.
 
-L9's closure is worth reading even if you are not near `String`: the blocker did
-not reproduce (its April symptom was a class-load defect fixed the same month by
-RKC16N.9), and all four copies of the policy it was about turned out to decide
-nothing — `resolve_step1_native` dispatches a registered native on the triple
-alone, before any of them runs. Two lanes were planned around a comment.
+**Update, later on 2026-08-04 — L2 landed.** The `Properties` family is gone
+from the census (slots 2 and 3 → 0) along with the `HashMap` slot-2 `Int` over
+`[`; `map_state`, `map_resize`, `resync_view_set`,
+`hashmap_serialized_capacity` and both `HashMap` constructors resolve `table`
+on the receiver instead of on a fixed `java/util/HashMap`. Re-measured with
+the three standing probes plus the new `probes/MapLayoutMatrixProbe`: 6
+classes / 15 slots before, 5 / 12 after — not comparable to the 24 above, see
+the evidence record for why. `Compatible` corpus byte-identical.
+
+Two things that block a clean read of item 2's remaining rows, both L4's:
+a null written over a primitive is still invisible to the hunter, and a
+same-kind wrong-slot write always was. **Every count in item 2 is a floor.**
+
+**Update, 2026-08-05 — L1 landed.** The eight `ClassLoaders` census rows are
+gone (slots 0/3/4/6 on each built-in loader → 0), A/B'd against the pre-fix
+binary on JDK 25 with every other row byte-identical, and loader identity is
+pinned against HotSpot 25 by `probes/L1LoaderIdentityProbe`. It also took the
+three same-kind REFERENCE slots its own brief had ruled out — which is the
+second half of the floor warning above, now with a concrete instance: **it was
+returning the platform loader's `name` String as its parent.** Two divergences
+its probe found are filed as residuals in the lane doc, both pre-existing and
+both outside its owned files (`isAssignableFrom` true across unrelated loaders;
+a duplicate `defineClass` not raising `LinkageError`).
+
+**Update, 2026-08-05 — L9 is closed and item 3 with it.** The blocker did not
+reproduce: its April symptom was a class-load defect fixed the same month by
+RKC16N.9, and all four copies of the forced-native `java/lang/String` policy it
+was about turned out to decide nothing — `resolve_step1_native` dispatches a
+registered native on the triple alone, before any of them runs, which a binary
+with the lists deleted confirmed by producing a byte-identical 392-case
+transcript and identical invocation counts. Two lanes were planned around a
+comment. Item 7 is still blocked on L10.
+
+That also starts item 1's migration: the four reviewed `java/lang/String`
+fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
+so `kind_stated` is no longer `false` on all 11,909 rows.

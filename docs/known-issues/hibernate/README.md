@@ -237,17 +237,20 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 ## Open
 
-- [`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md)
-  (REOPENED 2026-08-04) — moved back here from
-  `../../internal/fixed-suite-bugs/hibernate/` after a fresh 2026-08-04 `dev`
-  tip run (`a43a74ded`) reproduced the exact original 2026-07-07 symptom:
-  `testInPredicate` fails with `TimeoutException ... timed out after 120
-  seconds` under default JIT (155-183s solo repro), while `--nojit` passes
-  cleanly in ~71.5s. The 2026-07-08 "RETIRED" verdict on the original doc was
-  premature — it closed on the strength of one passing run. Root cause not
-  freshly re-confirmed this session (the original dispatch-heavy JIT tier-up
-  analysis is the leading hypothesis, not re-proven); the real fix it points
-  at (lock-free per-hit tier-up dispatch) was never landed.
+- ~~`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT~~
+  — **FIXED 2026-08-04**, retired to
+  `../../internal/hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md`.
+  Not the dispatch-heavy tier-up tax the two earlier investigations settled on:
+  `try_jit_compile_callee_slow` scanned an **inherited** method's bytecode
+  against the **subclass's** constant pool, so those indices resolved to
+  unrelated entries and the scan's conservative arm permanently
+  `mark_jit_bail_listed`ed the method. Every hot SQM accessor is inherited, so
+  `CRATONVM_DBG=mic-prof` reported `hit_entry=0` — compiled code's inline cache
+  never once held a callable entry, and 2.2M dispatches out of compiled code
+  took the entryless helper path instead of a direct call. One argument
+  (`callee_class_id` → `declaring_id`): `testInPredicate` now passes under
+  default JIT in 65-88 s (2/2) where it took 198-320 s and timed out before, and
+  JIT-on is now *faster* than `--nojit` on this test.
 
 - ~~Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`~~
   — `HIB-MAPRESIZE-STALE.1`, **FIXED 2026-08-03**, retired to

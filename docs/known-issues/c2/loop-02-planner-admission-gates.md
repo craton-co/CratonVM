@@ -2,8 +2,8 @@
 
 **Status:** closed 2026-08-03. Three of the four refusals are gone; the fourth
 is kept on measured grounds recorded below. **Owns:**
-`jit/src/x64/loop_rewrite.rs`, plus the coordinate change in
-`jit/src/x64/deopt_stubs.rs` and its check in `jit/src/x64/driver.rs`.
+`../../../jit/src/x64/loop_rewrite.rs`, plus the coordinate change in
+`../../../jit/src/x64/deopt_stubs.rs` and its check in `../../../jit/src/x64/driver.rs`.
 
 ## The finding
 
@@ -55,7 +55,7 @@ One change: **`DeoptimizationPoint::bci` and `FrameState::bci` are published
 through `Compiler::orig_bci`**, the rewrite's own provenance map, at the single
 place they are built (`build_and_record_deopt_point`). It is the identity when
 nothing was rewritten, so the default compile path is byte-identical —
-`jit/tests/x64_artifact_corpus.rs` is the check that says so.
+`../../../jit/tests/x64_artifact_corpus.rs` is the check that says so.
 
 Everything else in that function keeps the emitter pc, because everything else
 is an analysis **of the rewritten method**: `local_liveness`, the oop masks,
@@ -80,7 +80,7 @@ Three things were needed that this doc's plan did not mention:
   and two of them are not.)
 * **The versioning guard's synthetic bytes are no longer OSR-eligible.**
   `LoopXform::osr_entry_pc` already refused an OSR *entry* there — that was the
-  `probes/LoopVersionOsrProbe.java` wrong-code bug. But eligibility also gates
+  `../../../probes/LoopVersionOsrProbe.java` wrong-code bug. But eligibility also gates
   the OSR-*exit* snapshot, which went live the moment the `deopt_real` refusal
   was retired, and an exit map on the guard would publish the header's bci with
   the guard's frame under it. `Compiler::synthetic_guard_span` is the one new
@@ -150,7 +150,7 @@ a deferral.
   `orig_bci` would translate it as if it were a caller output pc. Making that
   sound means teaching `x64/inlining.rs` to say which space the current pc is
   in, and then giving the callee's bcis a provenance map of their own
-  (`docs/jit/deopt-inline-scopes.md`).
+  (`../../jit/deopt-inline-scopes.md`).
 
 The doc's own step 3 said "and only if it is still measurably in the way". It is
 measurably not.
@@ -167,9 +167,9 @@ measurably not.
   Three runs rather than one because this is the arm where a wrong resume bci
   would show up, and a single green run of a suite that is green anyway says
   very little. The counters are stable to ±1 compile across the three.
-* `probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
-  `probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java` and
-  `bench/HashMapOnly.java` match HotSpot exactly in all three configurations —
+* `../../../probes/LoopXformProbe.java`, `../../../probes/LoopVersionOsrProbe.java`,
+  `../../../probes/IndyDeoptProbe.java`, `../../../bench/StringRegexOnly.java` and
+  `../../../bench/HashMapOnly.java` match HotSpot exactly in all three configurations —
   default, `bytecode-loop-xform`, and `bytecode-loop-xform,deopt-real=0`.
 * `cargo test -p cratonvm-jit`: 1858 + 199 tests, all passing, including the
   artifact-corpus differ that pins the default path byte-for-byte.
@@ -205,7 +205,7 @@ table (`MetricsSummary::loop_xform`, and the `"loop_xform"` object in its JSON).
 | `loop_xform_deopt_frames_diverge` | two copies' frame shapes differed. Reported, not refused — see above. Non-zero is normal |
 
 The bottom five need `CRATONVM_JIT=bytecode-loop-xform` to be anything but zero;
-see `docs/jit/loop-rewriter-wiring.md`. They no longer need `-deopt-real` as
+see `../../jit/loop-rewriter-wiring.md`. They no longer need `-deopt-real` as
 well, which is the whole of what this lane changed.
 
 ## The trap in measuring this

@@ -7531,6 +7531,13 @@ pub fn register_essential_natives_with_shims(
         "(I)C",
         crate::lang_string::native_string_char_at,
     );
+    // LEAF: `native_string_length` -> `string_char_count` is three heap reads —
+    // field 0 (`value`), that array's length, and field 1 (`coder`) — with no
+    // allocation, no safepoint and no throw. See
+    // `NativeMethodRegistry::set_leaf`. Measured at 1405 ns from compiled code
+    // against HotSpot's 0.2 ns (`probes/NativeShapeProbe.java`); `String.length`
+    // is one of the most-called methods in any Java program.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/String",
         "length",
@@ -7544,6 +7551,13 @@ pub fn register_essential_natives_with_shims(
         // (reads the compact `value: byte[]` length / coder).
         crate::lang_string::native_string_length,
     );
+    // NOT the `isEmpty` below: it goes through `ctx.read_string`, which decodes
+    // the whole string into a fresh Rust `String`. That is not a Java-heap
+    // allocation, so it does not break the leaf contract outright — but it is
+    // O(n) work behind a predicate, and marking it leaf would advertise a
+    // cheapness it does not have. Left on the funnel until someone rewrites it
+    // against `string_char_count` and measures.
+    registry.set_leaf(false);
     registry.register("java/lang/String", "isEmpty", "()Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -9744,6 +9758,14 @@ pub fn register_essential_natives_with_shims(
     // --- java.lang.System (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
+    // LEAF: both clock reads are `_ctx`-free — a `SystemTime::now()` /
+    // `Instant::elapsed()` and an integer cast. Nothing to pin, nothing that
+    // can allocate, safepoint or throw. See `NativeMethodRegistry::set_leaf`.
+    // Measured at 604 ns from compiled code against HotSpot's 32 ns
+    // (`probes/NativeShapeProbe.java`), essentially all of it the funnel — and
+    // `System.nanoTime` is what every timeout, scheduler and benchmark in the
+    // JDK calls.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "currentTimeMillis",
@@ -9756,6 +9778,7 @@ pub fn register_essential_natives_with_shims(
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register(
         "java/lang/System",
         "arraycopy",
@@ -15676,19 +15699,37 @@ pub fn register_essential_natives_with_shims(
                     .into())
                 }
             };
-            for i in 0..ctx.array_length(constants) {
-                let candidate = match ctx.get_array_element(constants, i) {
+            // Cross-call GC-safety (2026-08-04): `invoke_virtual` runs
+            // `Enum.name()` — Java, and therefore a possible moving young
+            // collection — with `constants` and `candidate` held as bare
+            // `ObjectRef` locals. After one relocation the array walk reads a
+            // vacated from-space array, matches nothing, and this throws
+            // `No enum constant <NAME>` for a constant that exists. Root the
+            // array once and re-read it (and each element) per iteration; the
+            // MATCHED candidate is also re-read through its own root, because
+            // the `name()` call that identified it may itself have moved it.
+            // Companion fix to `native_class_get_enum_constants`, which had the
+            // same defect one call deeper.
+            let mut scope = NativeHandleScope::new(ctx);
+            let constants_h = scope.root(constants);
+            let constants_cur = scope.get(&constants_h);
+            let len = scope.array_length(constants_cur);
+            for i in 0..len {
+                let constants_cur = scope.get(&constants_h);
+                let candidate = match scope.get_array_element(constants_cur, i) {
                     Value::Object(Some(o)) => o,
                     _ => continue,
                 };
+                let candidate_h = scope.root(candidate);
+                let candidate_cur = scope.get(&candidate_h);
                 let name_val =
-                    ctx.invoke_virtual(candidate, "name", "()Ljava/lang/String;", &[])?;
+                    scope.invoke_virtual(candidate_cur, "name", "()Ljava/lang/String;", &[])?;
                 let name_obj = match name_val {
                     Some(Value::Object(Some(s))) => s,
                     _ => continue,
                 };
-                if ctx.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
-                    return Ok(Some(Value::Object(Some(candidate))));
+                if scope.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
             Err(RuntimeError::IllegalArgumentException {
@@ -22338,12 +22379,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         native_system_set_property,
     );
+    // Re-registration of the SAME body, so the leaf claim has to be restated:
+    // `register` captures the ambient claim into the slot, and a re-register
+    // that does not opt in demotes the triple back to the funnel. That is the
+    // deliberate ordering property of `set_leaf` — see its doc comment.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "nanoTime",
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
     registry.register("java/lang/System", "gc", "()V", |ctx, _args| {
         ctx.force_gc();

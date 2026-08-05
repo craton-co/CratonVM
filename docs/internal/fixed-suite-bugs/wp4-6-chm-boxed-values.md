@@ -2,22 +2,19 @@
 
 ## Status
 
-Resolved. The boxed-value CHM probes now run in the default WP4.6 test suite:
+Resolved. As of 2026-08-04 **every** probe in `wp4_6_chm_basic` runs in the
+default suite — nothing in that file is `#[ignore]`d any more.
 
-- `test_chm_pre_resize_put_get`
-- `test_chm_mutation_cycle`
-
-The resize-heavy CHM probes remain ignored under the separate
-`WP4.6-FOLLOWUP-A` transfer-path issue.
+`WP4.6-FOLLOWUP-A` ("CHM `transfer()` data-loss after resize past 16 buckets")
+closed with it, and it was never a `transfer()` defect:
+`NativeContextImpl::java_strings_equal` answered a hard `false` for two Strings
+whose character storage it could not decode, so a String-keyed
+`ConcurrentHashMap.get` missed keys the map held whether or not a resize had
+run. The Integer-keyed `test_chm_resize_path`, ignored under the same label,
+passed the moment it was un-ignored. See
+[`chm-get-misses-stored-key-in-process-RETIRED-20260804.md`](../chm-get-misses-stored-key-in-process-RETIRED-20260804.md).
 
 ## Repro
-
-```powershell
-cargo test -p cratonvm-vm --test wp4_6_chm_basic -- --ignored --nocapture --test-threads=1
-```
-
-That command now exercises only the still-ignored resize probes. The resolved
-boxed-value probes run with:
 
 ```powershell
 cargo test -p cratonvm-vm --test wp4_6_chm_basic -- --nocapture --test-threads=1
