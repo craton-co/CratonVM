@@ -3595,6 +3595,14 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
 /// this closes the loop for the slower symbolic-reference cache.
 fn resolution_invalidate_adapter(class_id: u32) {
     let cid = crate::classloading::ClassId::new(class_id);
+    // Advance the resolution generation FIRST, so no thread can publish a new
+    // per-thread site-cache entry that snapshots the pre-invalidation epoch
+    // after the authoritative maps below have already been swept. Two of the
+    // four firing sites (`upgrade_synthetic_class`, `recompute_subclass_layouts`)
+    // move a class's field layout while leaving its `ClassId`, its name and the
+    // redefine latch alone — this bump is the only signal a resolved-field
+    // cache gets for them. See `runtime::interpreter::constants`'s `RESOLUTION_EPOCH`.
+    crate::runtime::interpreter::bump_resolution_epoch();
     // Fan out to every live VM: the hook carries no VM identity, and
     // over-invalidating another VM's cache costs a re-resolve, whereas
     // under-invalidating our own is a stale-resolution correctness bug.

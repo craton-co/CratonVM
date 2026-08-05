@@ -1,8 +1,8 @@
 # OSR-02 — exit, recompile, and the livelock
 
 **Status:** not started. **Independent of `osr-01`** if it stays out of the
-publication site. **Owns:** `jit/src/tiered.rs` (the OSR request path),
-`jit/src/deopt.rs` (the OSR exit region).
+publication site. **Owns:** `../../../jit/src/tiered.rs` (the OSR request path),
+`../../../jit/src/deopt.rs` (the OSR exit region).
 
 ## Current state
 
@@ -27,7 +27,7 @@ around it has a known failure mode recorded in this project's history:
    identity, an outstanding-request map that is authoritative about "already
    queued or in flight", and a stale-request drop with a counter. Adding the
    memo there is smaller than adding it anywhere else. See
-   `docs/jit/broker-install-epoch.md` and `docs/jit/compilation-broker.md`.
+   `../../jit/broker-install-epoch.md` and `../../jit/compilation-broker.md`.
 2. **Make the exit state checkable.** For an OSR exit at pc *p*, the
    interpreter must resume at *p* with the locals and stack the compiled frame
    held. Assert it: a test that enters OSR, forces an exit, and compares the
@@ -45,7 +45,7 @@ The bytecode loop rewriter is off by default and arming it **also disables the
 native byte-copy unroller** — they are exact complements. Any OSR measurement
 that compares an armed run against an unarmed one is measuring both changes at
 once. That trap already cost one long triage; see
-`docs/jit/loop-rewriter-wiring.md`.
+`../../jit/loop-rewriter-wiring.md`.
 
 ## What to refuse
 

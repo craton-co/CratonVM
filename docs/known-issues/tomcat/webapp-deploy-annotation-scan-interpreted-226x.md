@@ -138,11 +138,27 @@ So the JAR/zip/inflate path is fine (`probes/JarEntryReadCostProbe.java`: 30.5
 vs 62.7 MiB/s entry reads, raw `Inflater` 938 vs 1254 MiB/s — both under 2x).
 The cost is the per-byte class-file parse.
 
+> **Update 2026-08-04 (later) — three candidate root causes measured and
+> FALSIFIED, and the section below is wrong about the mechanism.** See
+> § What this is NOT — measured, which supersedes both this section and
+> § Root cause. Short version: the cost is **general interpreter throughput**,
+> not any single gate, and no tier-up lever moves it. `--nojit` is now measured
+> *faster* than the default on a quiet host, so compiled code contributes
+> nothing here at all.
+
 ## Where the cost is, decomposed (2026-08-04)
 
 > This section supersedes § Root cause below on the question of *what* is slow.
 > That section's shape — "this code never got compiled" — survives, but it
 > names the wrong code, and the difference decides which fix is worth building.
+>
+> ⚠️ **The per-byte model below does not describe the real parse.** These
+> stages are *synthetic* per-byte loops written by the probe; `ClassParser`
+> itself reads in BULK. Counted with `--dump-native-registry` over the real
+> scan (156 classes): 12,643 `DataInputStream.readUnsignedShort`, 4,768
+> `readInt`, 938 bulk `ByteArrayInputStream.read([BII)` — and ~35k native calls
+> in total, which cannot account for ~400 ms. `readUnsignedByte` does not even
+> reach the top of the list. Do not plan against "~950 ns per byte".
 
 `probes/AnnotationScanSplitProbe.java` runs five stages over the **same
 in-memory class bytes**, each loop inlined into a named static method (never a
@@ -249,12 +265,280 @@ The `CallFloorProbe` contrast is the useful part: **when this VM compiles a
 method it is within a few x of HotSpot.** The 234x is "this code never got
 compiled", not "the compiler emits bad code".
 
-## What this is NOT
+## What this is NOT — measured (2026-08-04, branch `perf/annotation-scan-monitor-wall-20260804`)
+
+Everything in this section was measured on a **quiet host** (load ≈ 6–7; see
+§ Measuring this at all) against the real `AnnotationScanCostProbe`, not a
+microbenchmark. Baseline for all rows: **HotSpot ≈ 8 µs/class, CratonVM
+≈ 1950 µs/class ⇒ ≈ 240x**, which reproduces this doc's 226–234x exactly.
+
+**Not the monitor / `synchronized` cost.** Microbenchmarks are seductive here:
+`SingleByteReadCostProbe` prices an uncontended `synchronized` round trip at
+605.9 ns against HotSpot's 2.6 ns — 233x, temptingly equal to the headline
+ratio. It is a coincidence. In the real scan's profile the only monitor symbol
+that appears at all is `complete_jmx_monitor_enter`, at 1.47%.
+
+**Not the `ACC_SYNCHRONIZED` JIT-admission gate.** `ByteArrayInputStream.read()`
+genuinely never compiles — `jit_bridge.rs` rejected every `ACC_SYNCHRONIZED`
+method on the invocation-counter path, *before* it was ever counted, which is
+why `jit-method-stats` reported it neither compiled nor
+`hot_but_stuck_in_interpreter`. Admitting them (`CRATONVM_JIT=sync-methods`,
+default-off) changes this workload by **nothing**: 2237/2064 → 2140/2096
+µs/class. The gap is real and worth closing on its own merits; it is not this.
+
+**Not the outer loops failing to tier up** — though that gap is real too, and
+is the most interesting negative result here. `ConstantPool.<init>`,
+`ClassParser.readFields` and `readMethods` are invisible to *both* tier-up
+counters: the method counter accumulates globally but they run once per class
+(468 calls, under the 500 threshold), and the OSR trigger reads
+`Frame::backward_count`, which is **per-frame and reset on every invocation**,
+so a ~74-iteration constant-pool loop never approaches the 1000-back-edge
+threshold *within one frame* — permanently, not as a warm-up artifact. The
+stock scan reports `osr=0`: not one OSR body in the entire run.
+`CRATONVM_JIT=loop-work-tierup` (default-off) fixes that — `ConstantPool.<init>`
+compiles, tracked methods 9 → 10 — and buys **2–3%, inside the noise**.
+
+**Not a field-resolution-cache miss either.** `resolve_field_ref_loader_aware`
+does full symbolic work on every access *including a cache hit* — two `String`
+allocations, two extra `class_manager.read()`s and a whole
+`resolve_class_loader_aware` — purely to revalidate the entry it already holds.
+Short-circuiting that for non-loader-sensitive callers
+(`CRATONVM_JIT=field-cache-fastpath`, default-off) measured **nothing**: off
+1894–2047, on 1919–2019 µs/class over four interleaved passes.
+
+> **RETRACTED 2026-08-04 — that lever was INERT and the null result says
+> nothing.** It gated on `should_use_loader_initiated_resolution`, which begins
+> `if loader_aware_resolution() { return true; }` — and that flag is **default
+> ON** (`classloading/src/class_manager.rs:503`, consolidated there precisely so
+> the three copies could not drift). The predicate is therefore unconditionally
+> true and the fast path could never execute. The stated caveat ("I did not
+> confirm the fast path fires") was the tell; it should have been a blocker, not
+> a footnote.
+>
+> The predicate that actually splits the cases is `loader_sensitive`, which
+> additionally requires the referencing class's loader to be `UserDefined`. The
+> replacement (`CRATONVM_JIT=field-site-cache`) uses that one and ships a
+> `CRATONVM_DBG=field-site` counter, so "did the lever fire" is answerable
+> before anything is timed. This is the fifth inert-lever incident in this
+> investigation; a lever now has to prove it fired before it is allowed a
+> timing number.
+
+**So it is not a gate at all — it is interpreter throughput.** The decisive
+measurement: on a quiet host `--nojit` is *faster* than the default
+(1911/1868 vs 1978/1952 µs/class). Compiled code contributes nothing to this
+workload; compilation overhead slightly outweighs it. The `perf` profile is
+correspondingly flat — `execute_frame_from_index` 11.6%, then a long tail at
+1–4% each (`is_object_address` 4.2, `execute_instruction` 3.6, `memcmp` 3.5,
+`resolve_field_ref_loader_aware` 3.3, `invoke_on_class_shared_inner` 3.1,
+`execute_invokevirtual_cached` 2.8, `load_class_concurrent` 2.2,
+`slot_for_exact` 1.6, `complete_jmx_monitor_enter` 1.5) — no hotspot to remove.
+
+### The number that actually sizes this: interpreter vs interpreter
+
+`CallFloorProbe` under `HotSpot -Xint` against `CratonVM --nojit` removes the
+JIT from both sides and prices the interpreters directly (ns/op):
+
+| body | HotSpot `-Xint` | CratonVM `--nojit` | ratio |
+|---|---|---|---|
+| arith (no call) | 17.2 | 176.1 | 10x |
+| + invokestatic leaf | 21.1 | 435.7 | **21x** |
+| + invokevirtual leaf | 17.2 | 666.0 | **39x** |
+| + invokeinterface leaf | 17.0 | 679.7 | **40x** |
+| + `String.length()` | 26.6 | 1105.1 | **42x** |
+
+Read the *increments*, not the absolutes: adding one call costs HotSpot's
+interpreter ~4 ns and CratonVM's **~260 ns (static) to ~490 ns (virtual)** —
+**65–120x**. Pure arithmetic is only 10x. So this VM's interpreter is
+respectable at straight-line bytecode and catastrophic at **invoke**, and the
+BCEL parse is invoke-dense (one object per constant-pool entry, getters
+throughout). That, not any one symbol, is the 226x.
+
+Scale, from `CRATONVM_DBG=hotpath-counts` over the same scan: ~2.0M bytecodes
+executed, ~1.2M instance-field accesses, 201k method-ref resolutions — about
+5,300 bytecodes per class at ~385 ns each.
+
+**What would actually move this** is the interpreted invoke and field paths.
+Fixing them is an interpreter-dispatch project — inline caches, a resolved
+constant pool, per-call-site precomputed flags — not a point fix, and it is the
+only thing that gets 240x anywhere near the ~5x exit criterion.
+
+#### Correction: it is not `try_stackless_invoke` (2026-08-04)
+
+An earlier revision of this section named `try_stackless_invoke`'s ~34 per-call
+string comparisons as the thing to fix. **That was wrong, and the way it was
+wrong is worth keeping.** `CRATONVM_DBG=invokestats` over the scan:
+
+```
+[invokestats] cache_hit=600001 cache_miss=1784 vtable_fast=2672 slow_path=3970
+```
+
+The monomorphic inline cache is **99.7% warm**. `try_stackless_invoke` is the
+cache-*miss* path; it runs on roughly 0.3% of invokes, so its comparison count
+is irrelevant no matter how large. The claim was inferred from reading the
+source rather than from asking how often the function executes — the same
+mistake, in a different costume, as the four falsified root causes above.
+
+The string comparisons per invoke are real, but they are on the **hit** path:
+`intercept_force_registered_native_cached` runs a sequence of
+`(method_name, method_descriptor)` matches on every inline-cache hit that
+dispatches bytecode. That is a per-call-site precomputable question and is
+where the "precomputed flags" half of the project belongs.
+
+#### The clusters, by mechanism
+
+Re-profiled at a 0.35% floor on a quiet host (2039.7 / 1976.2 µs/class):
+
+| cluster | share | mechanism |
+|---|---|---|
+| dispatch loop | ~13.5% | `execute_frame_from_index` 8.92, `execute_instruction` 3.38, `execute` 1.19 |
+| **field resolution** | **~12%** | `resolve_field_ref_loader_aware` 3.51, `load_class_concurrent` 2.59, `resolve_class_loader_aware` 2.02, plus its share of `memcmp` 4.30, `sip::Hasher` 0.48, `_mi_page_malloc_zero` 1.10 / `mi_free` 0.79 |
+| invoke + frame | ~12% | `execute_invokevirtual_cached` 2.90, `pop_and_recycle_frame` 1.62, **`drop_in_place<Option<(Arc.., Arc<str>, Arc<str>, usize)>>` 1.54**, `InvokeCache::get` 1.23, `Frame::new_pooled_cached` 1.05 |
+| native registry | ~4.2% | `slot_for_exact` 2.50, `should_force_registered_native_over_bytecode` 0.75, `slot_index_for_key` 0.53, `intercept_force_registered_native_cached` 0.40 |
+| heap checks | ~6.5% | `is_object_address` 3.78, `record_object_ref_payload_slow` 1.05 |
+
+Two of those have an identified, removable mechanism rather than just a name:
+
+* **Field resolution.** `resolve_field_ref_loader_aware` re-derives the
+  field-*owning class* from its name on **every** access, resolution-cache hit
+  included: two `String` allocations, three `class_manager` read acquisitions
+  and a full `resolve_class_loader_aware`. Only the second half of the answer
+  (locate the field in the owner) is memoized. ~1.2M accesses.
+* **That 1.54% `drop_in_place`.** It is `resolve_method_ref`'s four-value return
+  being dropped. `pop_coerced_invoke_args_virtual` / `_static` call it on the
+  inline-cache **hit** path for two of those four values — the descriptor and
+  the parameter count — paying a `resolution_cache` read lock, a hash probe and
+  three `Arc<str>` clone/drop pairs per invoke to get one string and one
+  integer.
+
+Both are answered by the same thing: a per-thread, epoch-validated resolved
+constant pool (`vm/src/runtime/interpreter/site_cache.rs`), behind
+`CRATONVM_JIT=field-site-cache` and `CRATONVM_JIT=method-site-cache`.
+
+#### What those two levers are worth (2026-08-04)
+
+Measured on an idle Windows box with `probes/SiteCacheCostProbe.java`, four
+interleaved passes with the arm order reversed on even passes. **This is the
+mechanism's price, not the annotation-scan number** — the probe is deliberately
+field-saturated, and the scan's field cluster is ~12% of its profile, so do not
+extrapolate the ratio. The scan number still has to be taken on the Azure host
+against real BCEL; that host was unreachable throughout this session.
+
+Structural check first — both levers demonstrably fire, which is the thing the
+retracted measurement above never established:
+
+```
+off:    field: hit=0         | method: hit=0
+field:  field: hit=12900001  | method: hit=0
+method: field: hit=0         | method: hit=900043
+both:   field: hit=12900001  | method: hit=900043
+```
+
+`--nojit`, ns/op, mean of the last two rounds across four passes:
+
+| benchmark | off | field-site-cache | method-site-cache | HotSpot `-Xint` |
+|---|---|---|---|---|
+| field-heavy | 43,630 | **21,170** (1.9–2.7x per pass) | 49,900 | ~270–440 |
+| mixed | 43,331 | **23,470** | 45,850 | ~425–520 |
+| native-call-heavy | 5,467 | 5,282 | 5,915 | ~400–480 |
+
+* **`field-site-cache` is worth ~1.9x on interpreted field-heavy code**, and the
+  ratio holds in every pass in both orders (1.94, 1.84, 2.69, 1.97). It cuts the
+  interpreter-vs-interpreter gap on this shape from ~100–160x to ~50–79x.
+* **`method-site-cache` measures nothing.** It removes real work — a
+  `resolution_cache` read lock, a hash probe and three `Arc<str>` clone/drop
+  pairs per invoke — but that work is small beside the `safe_native_call` funnel
+  a native invoke pays anyway (~450 ns/call here). The counter proves it fires
+  900k times and it still does not show. Kept, default-OFF, on the same footing
+  as the other measured-nothing levers: the waste is real, the payoff is not.
+
+In **default (JIT-on)** mode neither lever shows a reliable difference on this
+probe (field-heavy: off ~2,570, field ~2,466, both ~2,233 ns/op, inside the
+spread) — the JIT compiles the loop and never touches the interpreter's field
+path. That is consistent rather than contradictory: this workload is only
+interesting because the annotation scan is a case where **the JIT contributes
+nothing** (`--nojit` is *faster* there, measured above), so the scan sits in the
+first regime, not the second.
+
+Correctness: 28/28 regression suite green with the levers off and with both
+levers plus the loader arm on. Two dedicated vectors — `RFieldSiteCache` (291
+checks) and `RMethodSiteCache` (44) — target the silent failure modes
+specifically, since every way these caches can be wrong returns a plausible
+number rather than throwing.
+
+#### The purpose-built probe hid a regression; independent vectors found it
+
+The first version of the cache held **one** epoch pair for the whole table and
+wiped all 1024 slots when either moved. `class_definition_epoch` advances on
+*every class definition*, so during start-up and any class-loading burst it
+moves constantly — and each field access was then paying an `O(SLOTS)` memset.
+
+`SiteCacheCostProbe` never showed this, because it reaches steady state and
+stops defining classes. Six regression vectors that never reach steady state
+(~500 ms runs, boot-dominated) did, and they were **uniformly slower** with the
+lever on:
+
+| vector | off | on (table-wide wipe) | on (per-entry epochs) |
+|---|---|---|---|
+| RCollections | 499 | 629 | 664 vs 666 off |
+| RStrings | 563 | 621 | 675 vs 628 off |
+| RSerial | 572 | 673 | 781 vs 781 off |
+| RExceptions | 526 | 623 | 669 vs 698 off |
+| RReflect | 552 | 592 | 709 vs 675 off |
+| RNumbers | 581 | 679 | 693 vs 713 off |
+
+Holding the epoch pair **per entry** removes the wipe entirely: an epoch change
+costs nothing, stale entries miss one at a time and are replaced in place, and a
+hit is one array index plus four integer compares on a single cache line. After
+that change the six vectors are at parity — the correct outcome for a
+boot-dominated run, where the cache should not help and must not hurt.
+
+Two things worth keeping from this:
+
+* **A probe written alongside a fix will tend to exercise the shape the fix is
+  good at.** The independent check was what caught it, and it is cheap.
+* **A cache's invalidation cost is part of its cost.** An `O(n)` wipe keyed on a
+  counter that moves during class loading is not a cache, it is a memset with a
+  lookup attached.
+
+Re-measured after the redesign the field arm still lands in the same band, but
+that run was taken on a box no longer idle (the `off` column spread 38k–127k
+against 37k–48k on the clean run), so **the 1.9x above is the clean-run figure**
+and the re-measurement should be read only as confirming direction and
+magnitude, not as an independent estimate.
+
+**Consequence for the exit criteria below: they are not reachable by tiering
+work.** ~240x against an interpreter that the JIT cannot help is a
+general-throughput problem. Anyone picking this up should either attack
+interpreter dispatch cost broadly, or re-scope the exit criteria.
+
+Still true from the original triage:
 
 * Not the `seek0`/`ExpandWar` defect — that is fixed and verified separately;
   the `ExpandWar` error no longer appears in these runs.
 * Not JAR/zip/inflate throughput (under 2x, measured above).
 * Not GC and not a hang — the deploys complete, just late.
+
+## Measuring this at all
+
+The Azure build host is shared, and during this investigation its load ran
+between 6 and 178. The **same binary and configuration** measured 2237 and
+14789 µs/class an hour apart, and the HotSpot column swung 13.5 → 99.0 µs/class
+across three interleaved rounds. Any number in this doc taken at load > 10 is
+noise. Check `/proc/loadavg` first; interleave the arms in both directions; and
+prefer CratonVM-vs-CratonVM A/B over the cross-VM ratio.
+
+Two levers here are **partially inert**, which is worse than useless because
+they read as clean negatives:
+
+* `CRATONVM_JIT=threshold=N` moves the *counting-site* threshold but **not**
+  the tiered manager's own — `jit-method-stats` still prints
+  `c1_threshold=500` at `threshold=10`.
+* Crossing the invocation threshold does not by itself nominate anything: the
+  only site that acts on the counter is the dispatch site, and it tests
+  `cnt == threshold || (cnt - threshold) % 64 == 0` against the value **its
+  own** increment returned. `CRATONVM_DBG=loop-work` was added to make this
+  visible — it caught `ConstantPool.<init>` sitting at a count of **1149**,
+  more than twice the threshold, still never nominated.
 
 ## Prior art
 
@@ -295,6 +579,12 @@ pwsh apps/tomcat-suite-runner/run-one.ps1 -Vm craton -Exe <cratonvm.exe> -Class 
 ```
 
 ## Exit criteria
+
+> ⚠️ **Not reachable by tiering work** — see § What this is NOT — measured.
+> Every JIT-admission and tier-up lever tried on 2026-08-04 moved this by ≤3%,
+> and `--nojit` is *faster* than the default, so the remaining distance is
+> interpreter throughput. Closing this doc means either a broad interpreter
+> dispatch improvement or a re-scoped criterion.
 
 `AnnotationScanCostProbe` within ~5x of HotSpot per class, which should bring
 the `examples` redeploy under the ~1 s the `list` assertion needs and the

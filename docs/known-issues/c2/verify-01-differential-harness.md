@@ -1,7 +1,7 @@
 # VERIFY-01 — the harness every lane above needs
 
 **Status:** not started. **Owns:** `apps/*-suite-runner/` drivers and a new
-`scripts/` entry point. **Not a lane** — a prerequisite the other lanes keep
+`../../../scripts` entry point. **Not a lane** — a prerequisite the other lanes keep
 paying for individually.
 
 ## The problem
@@ -16,7 +16,7 @@ suites (Spring, Spring Boot, Tomcat, Hibernate, H2), and today they are:
 * compared against baselines that live in dated `RESULTS-*.md` files rather
   than in a machine-readable form;
 * fixture-dependent in ways that are not checked — the H2 runner failed
-  *every* class once because a `target/` directory had been swept, and the
+  *every* class once because a `../../../target` directory had been swept, and the
   Tomcat runner needs a `CATALINA_BASE` nobody validates before a run.
 
 So "did this change regress anything" costs a person a day, and the answer

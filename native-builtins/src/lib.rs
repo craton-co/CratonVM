@@ -9570,11 +9570,18 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // ForkJoinTask is a Runnable subtype in real JDK; calling
-            // its `exec()` method runs the encapsulated logic and
-            // returns Z (true if completed normally). We discard the
-            // boolean since `execute(...)` is void.
-            let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+            // Run the task through the shared side-table path rather than a
+            // bare `exec()` invoke. The bare invoke never RECORDED the task
+            // as done, so the matching `join()` saw `done == false` and ran
+            // the body a SECOND time — a matrix probe against the host JDK
+            // caught `execute(t); t.join()` executing `compute()` twice
+            // (`ran=2` where HotSpot reports `ran=1`). Silent double
+            // execution is a correctness bug for any non-idempotent task.
+            //
+            // `execute` is void and must not raise the task's exception at
+            // the submitter (it surfaces at the matching `join()`/`get()`),
+            // which is exactly `fjp_compute_for_submit`'s policy.
+            let _ = phases_early::fjp_compute_for_submit(ctx, task)?;
             Ok(None)
         },
     );
