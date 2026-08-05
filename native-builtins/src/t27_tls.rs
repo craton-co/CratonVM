@@ -4508,40 +4508,71 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         let stream_id =
             rustls_server_accept(id).map_err(|e| RuntimeError::IOException { message: e })?;
 
+        // The id space the STREAM natives key on is the offset one:
+        // `s2_tls_read`/`s2_tls_write` route to the rustls tables only for ids
+        // >= `RUSTLS_SOCK_ID_BASE` and otherwise look the id up in the
+        // native-tls registry, where an accepted rustls stream does not exist.
+        // `rustls_session_info` is keyed by the RAW rid, so that one call below
+        // deliberately keeps `stream_id`. Same convention as
+        // `ensure_layered_handshake_started`.
+        let tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
+
         // Build an SSLSocket wrapper. Reuses the existing SSLSocket/
-        // SSLSocketInputStream/SSLSocketOutputStream classes but puts
-        // the rustls stream id into field 2. The stream I/O natives
-        // dispatch on stream-id-table membership (rustls tables first,
-        // then fall back to native-tls).
+        // SSLSocketInputStream/SSLSocketOutputStream classes.
         let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", SSS_SOCK_FIELDS);
         let (proto, cipher, alpn, sni) = rustls_session_info(stream_id)
             .unwrap_or_else(|| ("TLSv1.3".into(), "UNKNOWN".into(), None, None));
+        // PIN across every allocation below. `create_string` and
+        // `alloc_concurrent_synthetic` can each run a moving young collection,
+        // which relocates `sock` — after which the raw `set_field` writes, the
+        // ALPN stash and the returned reference would all address the old
+        // address. `new13_finish_socket` pins for exactly this reason.
+        let sock_pin = ctx.pin_native_root(sock);
         let host_str = ctx.create_string(sni.as_deref().unwrap_or("server"));
+        let sock = ctx.read_native_pin(sock_pin, sock);
         ctx.set_field(sock, SSS_SOCK_HOST, Value::Object(Some(host_str)));
         ctx.set_field(sock, SSS_SOCK_PORT, Value::Int(0));
-        ctx.set_field(sock, SSS_SOCK_TLSID, Value::Int(stream_id));
+        ctx.set_field(sock, SSS_SOCK_TLSID, Value::Int(tls_id));
         ctx.set_field(sock, SSS_SOCK_CLOSED, Value::Int(0));
-        // NOTE: a blocking read/write on this accepted socket appears to be
-        // unreliable independent of this doc's fix (probed while validating
-        // the accept-path change below; H2's own TestNetUtils never reads or
-        // writes on the accepted socket, so it's outside this doc's scope —
-        // left uninvestigated rather than risk a half-understood change to
-        // this shared accept path).
+        // FIX (sslserversocket-accept-stream-id): the raw field writes above
+        // are NOT enough, and on this JDK they do nothing at all.
+        // `javax/net/ssl/SSLSocket` is a real loaded class, so
+        // `alloc_concurrent_synthetic` gives the object the REAL layout, whose
+        // field #2 is reference-typed — the field-layout guard silently drops a
+        // mismatched Int write there. `new13_resolve_tls_id` then reads back
+        // `Object(None)`, falls through to `net_phase_e`'s side table, finds
+        // nothing, and answers -1. Every I/O method on the accepted socket
+        // reads that -1 as "closed": the server half of a plain in-process
+        // `SSLServerSocket` echo failed with `SSLSocketOutputStream.write:
+        // stream is closed` before moving a byte, while the same code passed on
+        // HotSpot.
+        //
+        // The client side already learned this (`new13_finish_socket`'s
+        // netty-client-socket-write-after-close comment) and records the
+        // authoritative id in the side table. The accept path never did, which
+        // is why the "unreliable blocking read/write on the accepted socket"
+        // noted here previously was never reproducible as anything else.
+        crate::net_phase_e::sock_set_for_create(ctx, sock, 0, tls_id);
 
         // 4-field synthetic session: proto, cipher, streamId, attrs (slot 3 —
         // see SSLSESS_ATTRS_SLOT doc comment).
         let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4);
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
+        let sock = ctx.read_native_pin(sock_pin, sock);
         ctx.set_field(session, 0, Value::Object(Some(p)));
         ctx.set_field(session, 1, Value::Object(Some(c)));
-        ctx.set_field(session, 2, Value::Int(stream_id));
+        // Offset id here too: the session accessors subtract
+        // `RUSTLS_SOCK_ID_BASE` before asking `rustls_session_info`, and pass
+        // anything below it to the native-tls lookup instead.
+        ctx.set_field(session, 2, Value::Int(tls_id));
         ctx.set_field(sock, SSS_SOCK_SESSION, Value::Object(Some(session)));
         // Stash ALPN on the socket so `getApplicationProtocol()` can read it.
         // We use a side-table rather than widening SSLSocket's shape.
         if let Some(alpn_str) = alpn {
             stash_sock_alpn(ctx, sock, alpn_str);
         }
+        ctx.unpin_native_roots(sock_pin);
         Ok(Some(Value::Object(Some(sock))))
     });
     // bind(SocketAddress) — STUB-REMOVAL (wave 3). Was `Ok(None)`.
