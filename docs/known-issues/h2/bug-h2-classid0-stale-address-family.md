@@ -507,6 +507,110 @@ witness is on the fixed code.
 of the process. Whatever the gap is, it does not need a long-running heap or an
 accumulated free list to appear.
 
+### The `hasNext()` witness, reproduced WITH the provenance answer (2026-08-05)
+
+The face the old page was named for — and this time it says where the address
+stood in the owning thread's own bookkeeping:
+
+```
+WARN  …vm_exec: NoSuchMethodError method="java/lang/Object.hasNext()Z"
+      caller="org/h2/test/db/TestMultiThread.testConcurrentUpdate()V @pc=252"
+ERROR …gc::guard: receiver points into RECLAIMED memory  obj="0x2004621fa78"
+      location=young from-space FREE BLOCK (reclaimed)  span="0x2004621c7a0+0x3dd0"
+ERROR …gc::guard: …and this is where that address stood in the OWNING thread's own
+      GC bookkeeping.  in_published_snapshot=false  published_roots=38
+      in_blocked_region=false  frames=4
+      top_frame=org/h2/test/db/TestMultiThread.testConcurrentUpdate pc=252
+```
+
+Read the three of them together:
+
+* `location=young from-space FREE BLOCK (reclaimed)` — not "past the frontier",
+  not the inactive semispace. The address is inside a free block of the
+  CURRENT from-space right now, which is the one answer with no false
+  positives: a live object is never there;
+* **`in_published_snapshot=false`** — the snapshot the collector marks this
+  thread from does not contain the address, while the thread's own top frame
+  holds it. `published_roots=38`, so the snapshot exists and is populated; the
+  slot is simply not in it;
+* `in_blocked_region=false`, `frames=4`, and the failing frame is the TOP
+  frame — so this is not the parked-thread deposit path at all. It is a
+  counted, running mutator whose top frame is the one holding the dangling
+  reference.
+
+Together with `ROOT_IN_DEAD_SPANS` and `SWEEP_LIVENESS` both silent (§above),
+that is three independent instruments agreeing: the mark did not drop a root it
+was handed, no heap edge pointed into the doomed span, and the root slice never
+had the address. **The gap is in publishing, not in marking, sweeping, or
+delivery.**
+
+The next number to get is how OLD the snapshot the collector used was:
+`report_root_slice_provenance` now also prints `last_publish_at_collection`
+against `collections_now`, stamped by `note_root_publish` at both publish sites
+(`update_root_snapshot` and `deposit_root_snapshot_inner`). A non-zero
+difference means at least one collection completed after this thread last
+published — i.e. it was marked from a snapshot that could not contain anything
+allocated since. That is the shape both young witnesses have, and it has a
+plausible mechanism: the publish hook fires on object-RETURNING native calls,
+so a stretch of bytecode that allocates and then calls only void natives (or no
+native at all) never republishes.
+
+### The `Iterator` was never the victim — the reported method name is an ARTIFACT
+
+Resolve the pc first, because it is what this whole page was named after.
+
+**The caller pc a dispatch failure reports is the POST-invoke pc**, i.e. the
+return address, not the call site. That is not an inference from the numbers —
+the interpreter advances the frame's pc BEFORE it dispatches, and the terminal
+report reads `thread.frames.last().pc`:
+
+```rust
+// invokeinterface — stackless dispatch with monomorphic inline cache
+0xb9 => {
+    // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
+    thread.frames[frame_idx].pc = saved_pc + 5;
+    let cached_result = execute_invokevirtual_cached(…, saved_pc, …);
+```
+
+Three witnesses, three builds, all consistent with it:
+
+| witness | call site | reported pc | site + length |
+| --- | --- | --- | --- |
+| `TestMultiThread.testConcurrentUpdate` | `invokeinterface ExecutorService.shutdown()V` @247 | **252** | 247 + 5 |
+| `TestMultiThread.testConcurrentInsert` | `invokeinterface ExecutorService.shutdown()V` @192 | **197** | 192 + 5 |
+| `DriverManager.getConnection` | `invokevirtual Properties.put(…)` @16 | **19** | 16 + 3 |
+
+So the two H2 witnesses this family is named for did **not** fail in the
+`for (Future<Void> job : jobs)` loop. `@pc=252` is `aload 4` immediately after
+`executor.shutdown()`; `@pc=197` is `aload_3` immediately after the identical
+call in the sibling method. Both failing call sites are
+`invokeinterface java/util/concurrent/ExecutorService.shutdown()V`, and the
+victim is the **`executor` local** — slot 4 in `testConcurrentUpdate`, slot 3 in
+`testConcurrentInsert` — which is live from its assignment to the end of the
+method, not a loop temp.
+
+**Then the reported method name is wrong.** The call site names
+`shutdown()V`; the report says `java/lang/Object.hasNext()Z` (and
+`java/lang/Object.next()Ljava/lang/Object;` for the sibling). A `ClassId(0)`
+receiver explains the CLASS — `java.lang.Object` is class id 0 — but nothing
+about a zeroed receiver renames `shutdown` to `hasNext`. All three of
+`shutdown()V`, `hasNext()Z` and `next()Ljava/lang/Object;` are
+`invokeinterface` with `count=1`, and `hasNext`/`next` are what the loop
+earlier in the same method dispatches, so an interface call-site cache that
+mixes entries when the receiver class id is 0 produces exactly this. That is a
+second, separate defect and it is not established here — but it is why the
+`java/lang/Object.put(...)` witness in `DriverManager.getConnection` reported
+the RIGHT name: that one is an `invokevirtual`.
+
+Two consequences worth stating plainly:
+
+* **the old page name — and three sessions of reasoning about a synthetic
+  iterator local held only by a parked frame — rests on that artifact.** The
+  actual victim is an ordinary, long-lived local of the running method;
+* the `blocked=false` in the original 2026-08-02 receiver dump was right and
+  should have been believed: the thread is not parked when it trips, and
+  `in_blocked_region=false` in the 2026-08-05 provenance line says so again.
+
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
 Recorded so they are not re-derived; each cost a build-and-soak cycle. These
