@@ -143,7 +143,20 @@ first looked like it had to be, and did not:
 
 `resolve_step1_native` still passes `bytecode_available: false`. That is the
 actual §1.4 hole, and it is why the lists could be inert while the natives kept
-winning. Closing it sends **4,796** shadowing `Bridge` registrations to the
-bytecode under `--jdk-only` at once — far outside this lane, and precisely why
-the fix here is scoped to one class at the registration boundary. It belongs
-with L11 / L12 §11 and needs its own measurement.
+winning.
+
+**Attempted and reverted 2026-08-05, with numbers** —
+[record](../../known-issues/jdk-only/step1-bytecode-available-attempted-and-reverted.md).
+Two of this paragraph's original claims turned out to be wrong: **4,796** is a
+static count of registrations, not of dispatches (the observed change is 10 → 24
+shadow observations on the matrix workload), and the default `--real-jdk` path
+costs nothing because both consumers of the flag are `is_jdk_only()`-gated — the
+392-case matrix stayed byte-identical.
+
+It fails for a different reason than cost: step 1 runs BEFORE method resolution,
+so it has the class name but not the resolved method, and `has_code` derived
+from access flags on the named class is the wrong question when the hierarchy is
+involved. `CharsetDecoder.decodeLoop` is abstract on the named class and
+concrete on its subclasses; `--jdk-only` then dies with `AbstractMethodError:
+... has no Code attribute`. The record proposes two restructurings and states
+the acceptance test that this attempt failed.
