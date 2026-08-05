@@ -51,6 +51,43 @@ The fix reads `value[2i]` / `value[2i+1]`, masks both, combines little-endian,
 and scales the bounds guard by the same stride. Every other `BasicType` keeps
 the one-slot loop, unchanged.
 
+### The first fix was wrong, and every probe passed anyway
+
+The version committed as `304ee5ff5` selected the paired read on
+**`basicType == T_CHAR` alone**. That is not the discriminator. `T_CHAR`
+arrives with two different array types and they are not the same read:
+
+| caller | array | slots per element | `length` counts |
+|---|---|---|---|
+| `StringUTF16.hashCode(byte[])` | `byte[]` | **2** | chars |
+| `Arrays.hashCode(char[])` | `char[]` | **1** | chars |
+
+So the first fix traded one broken shape for another: it corrected every UTF-16
+`String` and silently broke `Arrays.hashCode(char[])`, which had been correct
+all along. The discriminator is the **array**, via `ctx.heap_element_type_of`,
+not the `basicType`.
+
+What caught it was the pre-existing unit test
+`t2_arrays_support_hash_code_char_zero_extends`. What did **not** catch it was
+any of the nine Java probes written for this investigation, all of which passed
+— none of them calls `Arrays.hashCode(char[])`. The probes were built to
+interrogate `String`, so they covered the `String` half of a shared native and
+were blind to the other caller by construction. A probe suite aimed at the
+symptom does not cover the fix's blast radius; the callers of the function you
+edited do.
+
+Both shapes now have a test, kept adjacent with a comment saying why, and both
+were verified by **injecting the exact defect** rather than by assuming the
+assertions were load-bearing:
+
+* injecting `basic_type == HOTSPOT_T_CHAR` (the shipped bug) fails
+  `…_char_zero_extends` and *passes* the two new `byte[]` tests — which is the
+  point: the new tests are blind to it, and the old one is not;
+* injecting `false` (the original pre-fix bug) fails the `byte[]` tests.
+
+Neither injection alone would have proved the pair. The defect never reached
+`dev`.
+
 ## How it was localised, since none of the obvious answers was right
 
 Each step ruled out a whole class of cause by measurement:

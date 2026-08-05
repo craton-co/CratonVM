@@ -78,22 +78,34 @@ implementation, in three separate ways, and no test asked.
 ## Three defects the removal surfaced
 
 Taking a shadow off makes the shadowed code reachable, and two of the three
-things underneath were broken. All three are filed rather than re-masked,
-except the first, where re-masking is the correct answer and the reason is
-recorded at the registration site:
+things underneath were broken. None of the three ended up re-masked — the
+first looked like it had to be, and did not:
 
-* `String.hashCode()` is **wrong for UTF-16 strings** — it hashes the backing
-  BYTES sign-extended, not the code units. The native is kept, stated
-  `Intrinsic`, for correctness rather than speed
-  ([record](../../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md)).
+* `String.hashCode()` was **wrong for UTF-16 strings** — it hashed the backing
+  BYTES sign-extended, not the code units. **Root-caused and FIXED 2026-08-05**
+  ([record](../../internal/string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md)).
+  The defect was never in `String` or `StringUTF16` bytecode: it was the
+  `ArraysSupport.vectorizedHashCode` **native**, which read one array slot per
+  element for every `BasicType`. `StringUTF16.hashCode` calls it with `T_CHAR`
+  over a **`byte[]`** of UTF-16 pairs, so it folded bytes where it owed code
+  units. One shadow was hiding a second shadow. The `hashCode()` native this
+  doc originally proposed to keep is therefore **dropped** — the bytecode is
+  correct now, and keeping the native would have frozen the real bug in place
+  where nothing reached it.
 * `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
   instead of `StringIndexOutOfBoundsException`
-  ([record](../../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md)).
+  ([record](../../known-issues/preconditions-ignores-the-exception-formatter.md)
+  — supersedes the original `string-substring-bounds-…` record, which named the
+  wrong subsystem: the fault is `Preconditions` ignoring its exception-formatter
+  argument, not anything `substring` does).
   Deliberately not re-masked — the native was wrong there too, and re-masking
   would cost the four rows the bytecode fixes, including `substring` splitting
   a surrogate pair into U+FFFD.
 * `+` concatenation loses an unpaired surrogate
   ([record](../../known-issues/string-concat-loses-unpaired-surrogates.md)).
+  Still open, and now located exactly: `execute_string_concat` accumulates into
+  a Rust `String`, which cannot represent an unpaired surrogate. Not a
+  one-liner, and scoped out of this lane deliberately.
 
 ## Residual
 
