@@ -12890,16 +12890,6 @@ const fn invoke_kind_uses_inline_cache(invoke_kind: u8) -> bool {
     matches!(invoke_kind, 0 | 2)
 }
 
-/// DIAGNOSTIC (temporary): `CRATONVM_JIT_NO_INLINE_IC=1` suppresses MIC/PIC slot
-/// allocation so every compiled virtual/interface site falls back to the
-/// resolving helper instead of the emitted inline cascade.
-fn inline_ic_disabled() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_IC").is_some()
-    })
-}
-
 #[cfg(test)]
 fn clear_jit_recursive_cycle_methods_for_test() {
     jit_recursive_cycle_methods().write().clear();
@@ -15137,7 +15127,6 @@ fn try_compile_inner(
                             && helpers.invoke_virtual_mic != 0
                             && num_args >= 1
                             && num_args + 1 <= ir_entry_abi_reg_count()
-                            && !inline_ic_disabled()
                         {
                             let mic = Box::new(JitMICSlot::new());
                             // Seed from the receiver-type profile exactly as the
@@ -17154,7 +17143,7 @@ fn try_compile_inner(
             // policy. Suppressing the slot here made an abstract interface
             // signature that appeared in the active-cycle registry permanently
             // use blind `jit_invoke_dispatch`, including OSR bodies.
-            if invoke_kind_uses_inline_cache(invoke_kind) && !inline_ic_disabled() {
+            if invoke_kind_uses_inline_cache(invoke_kind) {
                 let mic = Box::new(JitMICSlot::new());
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
