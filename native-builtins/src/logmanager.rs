@@ -103,28 +103,63 @@ const STANDARD_LEVEL_NAMES: [&str; 9] = [
 /// checked first.
 const JBOSS_LEVEL_NAMES: [&str; 5] = ["FATAL", "ERROR", "WARN", "DEBUG", "TRACE"];
 
-/// Synthetic slot layout for the singleton `LogManager` instance.  The
-/// real JDK `LogManager` has many more fields but our native-only
-/// implementation only uses:
-///   * slot 0 — `properties` (Properties / HashMap — null-ok).
-///   * slot 1 — `loggerRegistry` (opaque placeholder; the real state
-///              lives in the Rust-side `LoggerRegistry`).
-///   * slot 2 — `rootLogger` (Logger object for "" — populated lazily).
-///   * slot 3 — `ready` (int flag — always 1; honours "initialised" bit).
-const LM_NUM_FIELDS: usize = 4;
-const LM_FIELD_PROPERTIES: usize = 0;
-const LM_FIELD_LOGGER_REGISTRY: usize = 1;
-const LM_FIELD_ROOT_LOGGER: usize = 2;
-const LM_FIELD_READY: usize = 3;
+// Slot layouts for `java.util.logging.LogManager` and `Logger`.
+//
+// These are REAL JDK indices, not a private numbering. In real-JDK mode these
+// objects carry the real class's layout (they are allocated with the real class
+// id by `alloc_concurrent_synthetic`), so every index below addresses whatever
+// the JDK declares there. The previous numbering — a compact 0/1/2/3 for the
+// four fields this implementation cares about — was measured writing a `String`
+// onto `Logger.config`, a `Logger` onto `Logger.name`, and an `Int` onto
+// `LogManager.rootLogger`, a reference field. Found 2026-08-05 by running the
+// L4 shadow-layout census under three real workloads (commons-lang, Jackson,
+// Tomcat) instead of three small probes, which is what the L4 record's standing
+// caveat asked for.
+//
+// Derived from `javap -p --module java.logging` on Temurin 25.0.3:
+//
+//   LogManager: props(0) systemContext(1) userContext(2) rootLogger(3)
+//               readPrimordialConfiguration(4) globalHandlersState(5)
+//               configurationLock(6) closeOnResetLoggers(7) listeners(8)
+//               initializedCalled(9) initializationDone(10) loggerRefQueue(11)
+//
+//   Logger:     config(0) manager(1) name(2) loggerBundle(3) anonymous(4)
+//               catalogRef(5) catalogName(6) catalogLocale(7) parent(8)
+//               kids(9) callerModuleRef(10) isSystemLogger(11)
+//
+// Two of the four values this implementation keeps have NO real field to live
+// in — `loggerRegistry` is a placeholder for Rust-side state, and `ready` is our
+// own initialisation bit; a real `Logger`'s level lives inside `config`, not in
+// a field of its own. Those are anchored PAST the real field count, where they
+// land on padding `define_class_with_options` adds and can corrupt nothing.
+// That is the shape the L4 record calls the target for a kind-3 overlay, and
+// the shadow-layout diff reports such a slot as a harmless `pad` rather than a
+// finding. The models in `ClassManager::synthetic_stub_fields` declare the same
+// widths, so the padding is there in both run modes.
 
-/// Synthetic slot layout for a `Logger` object allocated by us.
-///   * slot 0 — `name` (String).
-///   * slot 1 — `level` (Level object; null = inherit from parent).
-///   * slot 2 — `parent` (Logger object; null for root).
-const LOGGER_NUM_FIELDS: usize = 3;
-pub(crate) const LOGGER_FIELD_NAME: usize = 0;
-pub(crate) const LOGGER_FIELD_LEVEL: usize = 1;
-pub(crate) const LOGGER_FIELD_PARENT: usize = 2;
+/// Real `LogManager` instance-field count on JDK 21–25.
+const LM_REAL_FIELDS: usize = 12;
+const LM_NUM_FIELDS: usize = LM_REAL_FIELDS + 2;
+/// Real: `props`. Same slot as before — and the only one of the four that was
+/// already right, which is why it read as a NAME-only disagreement.
+const LM_FIELD_PROPERTIES: usize = 0;
+const LM_FIELD_ROOT_LOGGER: usize = 3;
+/// VM-internal: a placeholder for the Rust-side `LoggerRegistry`. No real field.
+const LM_FIELD_LOGGER_REGISTRY: usize = LM_REAL_FIELDS;
+/// VM-internal: our own "initialised" bit. No real field — and it used to sit
+/// on `rootLogger`, writing an `Int` where the collector's reference map says a
+/// `Logger` lives.
+const LM_FIELD_READY: usize = LM_REAL_FIELDS + 1;
+
+/// Real `Logger` instance-field count on JDK 21–25.
+const LOGGER_REAL_FIELDS: usize = 12;
+const LOGGER_NUM_FIELDS: usize = LOGGER_REAL_FIELDS + 1;
+pub(crate) const LOGGER_FIELD_NAME: usize = 2;
+pub(crate) const LOGGER_FIELD_PARENT: usize = 8;
+/// VM-internal: a real `Logger` has no `level` field at all — the effective
+/// level lives inside `config` (`Logger$ConfigurationData`). This used to sit
+/// on `manager`.
+pub(crate) const LOGGER_FIELD_LEVEL: usize = LOGGER_REAL_FIELDS;
 
 // ---------------------------------------------------------------------------
 // Process-wide singleton state

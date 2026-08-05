@@ -16891,7 +16891,13 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`. See the
+            // slot table in `logmanager.rs`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -16907,7 +16913,12 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
