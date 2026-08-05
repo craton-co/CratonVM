@@ -21,6 +21,7 @@ pub mod plain_server_socket;
 pub mod registry;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
+pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other
 /// workspace crates that opt in via the `test-mock` feature.

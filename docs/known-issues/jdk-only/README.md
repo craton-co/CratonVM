@@ -34,7 +34,7 @@ below it is the original filing.
 | 10 — `System.exit` bypasses the census | [`jdk-only-system-exit-census-FIXED-20260804.md`](../../internal/jdk-only-system-exit-census-FIXED-20260804.md) |
 | 8 — the real-protected-stub allow-lists | [`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) |
 
-## 2026-08-05 — one record added
+## 2026-08-05 — two records added
 
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
 `native-io` `Bridge` registrations that L5's `register_with_kind` migration
@@ -43,6 +43,15 @@ them. Reclassification questions, not migration ones. The largest is 25 `Bridge`
 registrations on VM-minted `cratonvm/synthetic/Process*` classes — the
 `Function$Identity` shape (a surviving `Bridge` whose receiver class §5 forbids)
 found in a second place.
+
+[`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md)
+— the same question at crate scale, after L5b/L5c repeated the migration for
+`native-awt` and `native-builtins`: 7,748 `Bridge` registrations across those two
+crates that the image does not back. It also records three things the migration
+measured rather than assumed — that the tree's only `bridge` marker outside
+`native-io` names a method a Linux JDK 25 image does not declare, that
+`native-collections` has **zero** rows a migration could ever state, and that
+`ABSENT` on a platform-named class means "not measured here", not "dead".
 
 **Found and fixed while working this list, not filed here before:**
 [`--jdk-only` could not start a thread](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).

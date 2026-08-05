@@ -472,7 +472,7 @@ fn impl_jars_load_class_inner(
                 if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts)
                 {
                     if let Some(loader) = defining_loader {
-                        crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                        crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
                     }
                     return Some(ctx.get_class_mirror(cid));
                 }
@@ -578,7 +578,7 @@ fn load_provider_class_from_loader_jars(
             // same EmbeddedImplClassLoader.
             let loader_id = crate::classloader::get_or_assign_loader_id(ctx, loader);
             if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts) {
-                crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
                 preload_embedded_dependencies(ctx, loader, &class_bytes);
                 return Some(ctx.get_class_mirror(cid));
             }

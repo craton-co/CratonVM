@@ -231,6 +231,104 @@ and the scan demonstrably finds pointers — 0.4-1.0 M of them per sweep, all
 `doomed → doomed`, which is the whole-subgraph-condemned-together case the
 promotion-seed comment in `sweep_old_gen_non_moving` warns about.
 
+### The same scan on the COMPACTING arm, and the trap in it (2026-08-05)
+
+The section above measures the **in-place sweep**. Repeating it against the
+**compactor** — at `--Xmx 512m`, which reaches the compacting regime an order of
+magnitude faster (9 major GCs in 25 minutes against 1 in 90 at `1g`) — gives the
+same verdict, but only after a false positive is removed from the instrument.
+
+Unvalidated, `live_old` fired on **every** compaction: about one hit each,
+always the same shape, byte-identical across three independent processes.
+
+```text
+REFERRER class_id=64 num_slots=18 total_size=320 compact=false
+  slot_of_word=88   enumerator_yielded=2   ENUMERATOR_SEES_VICTIM=false
+CELL 5 raw=[0x0000000200000000, 0x00000200100c4020] decodes_as=Discriminant(0)
+```
+
+Discriminant 0 of `Value` is `Int`. The cell reads `Int(2)` — tag and payload in
+its low half — while the victim's pointer sits in the 16-byte cell's **unused
+upper half**: residue from an `Object` that previously occupied the slot and was
+overwritten by a narrower variant. The mutator can never read it, the GC
+correctly ignores it, and the victim really is dead.
+
+**A raw word scan of this heap lies, and it lies in the direction of
+manufacturing a defect.** `live_old` now asks the containing object's own slot
+enumerator — the one every mark source funnels through — whether it actually
+yields the victim, and counts the rest as `stale_padding`. With that in place,
+over 12 compactions across 3 processes and ~2.4 M dropped blocks, `live_old`,
+`young` and `root` are **0** throughout.
+
+The earlier "`1_298_639` referrer words, every printed one `doomed → doomed`"
+nuisance and this one are the same problem seen twice. The fix for the first was
+to categorise instead of printing; the fix for the second is to decode instead
+of comparing bytes. **Both are needed**, and neither subsumes the other.
+
+`Value`-cell residue is also a *proven* mechanism for stale copies of an address
+existing in the heap long after the field stopped holding one — the cheapest
+known source of "an address that no longer names what its holder thinks it
+names", which is what this page is called. What is still not shown is a path by
+which such a copy is ever *read*.
+
+### The decisive run: `UNCLASSIFIED` is NOT always zero (2026-08-05)
+
+*Where that leaves the residual* below asks for exactly one thing: "the decisive
+run is one that ends in a `cannot be cast` with these lines above it." Here it
+is. `TestMVStoreCacheLoop`, `--Xmx 512m`, `CRATONVM_GC=-moving-young`, JIT on,
+referrer scan armed, run ended in 4 `ClassCastException`s:
+
+```text
+[GC] generational: minor=428 major=5
+[GC] oldgen_compact: dropped_watched_referents=312202 dropped_interior_root=1
+                     downgraded_to_inplace=0
+[GC] decision histogram: moving=270 non_moving=158
+[GC] xt_peer_scan: unclassified_peers=16 cycles_with_unclassified=15
+```
+
+and all four compactions in that same run reported
+`LIVE_REFERRERS=0 young=0 root=0`.
+
+**`UNCLASSIFIED` is 16, over 15 cycles.** The 2026-08-03 campaign observed it
+zero on all five sweeps it measured and concluded the root set was complete;
+that conclusion does not hold for the runs that actually fail. Per
+`xt_root_scan`'s own comment, an unclassified peer is one that did not park in
+the signal handler within the deadline — i.e. **still running JIT code, whose
+frame oops are in no root set**. That is precisely a reference no heap-side scan
+can ever see, and it is consistent with every other measurement on this page:
+nothing in the heap names the block, nothing in the root slice names it, and the
+collector nevertheless had an incomplete root set on 15 cycles of the failing
+run.
+
+This does not prove the specific victim was named by an unclassified peer — that
+needs the per-cycle `xt(...)` line beside the reclamation that drops it. It does
+retire the premise that the root set was complete, which is what possibility (1)
+below was waiting on, and it makes cross-thread root coverage the live suspect
+again rather than a hypothesis "refuted in session 2".
+
+The same run also shows `dropped_interior_root=1`: the compaction dropped a
+block an INTERIOR conservative root pointed into. That run carried
+`CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` (the pin disabled, as a control), so this
+is a direct observation of the defect the interior-root fix removes, firing in a
+run that then produced the family's symptom. It is one contributor, not the
+whole family — `LIVE_REFERRERS=0` says the rest of the dropped set was
+genuinely unreferenced.
+
+### A marking fail-open found while reading (2026-08-05)
+
+`compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`
+when the layout registry cannot produce its oop map. `None` is the *legacy
+object* answer, so every caller — `for_each_ref_slot`, `for_each_old_gen_ref`,
+`forward_ref_slots` — then reads a body of packed 8-byte fields as uniform
+16-byte `Value` cells. The reference slots are never visited, so the marker
+drops **every** edge out of that object and the next reclamation frees its
+referents while it is live.
+
+That is this family's exact shape, and it was indistinguishable from an ordinary
+legacy object. Now counted by `COMPACT_OOP_MAP_MISSING` and printed by
+`VmHeap::print_gc_summary` when non-zero. Expected zero; not yet observed
+non-zero, so this is a closed hole rather than a found cause.
+
 ### Root coverage per sweep (2026-08-03)
 
 The follow-on from the referrer scan: if nothing in the heap or the root slice
@@ -401,7 +499,7 @@ workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
 the 27.
 
 `TimeoutException` is the separate throughput defect tracked on
-`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+`h2-update-path-throughput-20260802.md`, not this one.
 
 #### Eliminated, with measurements
 
@@ -688,7 +786,7 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
-* `bug-h2-testmultithread-concurrent-update-timeout.md` — the class the
+* `h2-update-path-throughput-20260802.md` — the class the
   blocked-frame face was found in, whose own problem is throughput, not this.
 * the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
   same signature; see *Handed over from `TestDiskFull`* above.
