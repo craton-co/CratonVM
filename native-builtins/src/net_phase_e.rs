@@ -16494,13 +16494,64 @@ mod tests {
             other => panic!("expected InetAddress, got {other:?}"),
         };
 
+        // Control, from the real JDK 25 on these exact 16 bytes:
+        //
+        //   getHostAddress = fe80:0:0:0:67b0:99e:5a9b:287e
+        //   toString       = /fe80:0:0:0:67b0:99e:5a9b:287e
+        //
+        // Two separate facts, and this test asserted them as one. The TEXT is
+        // HotSpot's uncompressed eight-group form (not Rust's RFC-5952
+        // `fe80::67b0:99e:5a9b:287e`). The HOSTNAME is ABSENT — note the
+        // leading `/` with nothing before it. `getByAddress(byte[])` is handed
+        // octets and no name, so the mirror must not invent one; see
+        // `alloc_inet_address_unnamed`, whose doc names this exact factory.
+        //
+        // The original assertion demanded `host == ip`, which is the shape the
+        // unnamed-mirror work was undone from: it renders
+        // `fe80:.../fe80:...` instead of `/fe80:...`. It could only ever have
+        // passed against the bug.
         assert_eq!(
             inet_addr_resolve(&ctx, address),
             Some((
-                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+                String::new(),
                 "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
             )),
-            "getByAddress must preserve HotSpot's uncompressed IPv6 text"
+            "getByAddress must preserve HotSpot's uncompressed IPv6 text AND \
+             leave the mirror unnamed"
+        );
+
+        // The user-visible half of the contract, through the real natives
+        // rather than the side table, because that is where the two facts above
+        // are actually combined.
+        let mut registry = NativeMethodRegistry::new();
+        register_re3_inet_address(&mut registry);
+
+        let to_string = registry
+            .find("java/net/InetAddress", "toString", "()Ljava/lang/String;")
+            .expect("InetAddress.toString native is registered");
+        let rendered = match to_string(&mut ctx, &[Value::Object(Some(address))]).unwrap() {
+            Some(Value::Object(Some(s))) => ctx.read_string(s),
+            other => panic!("expected String from toString, got {other:?}"),
+        };
+        assert_eq!(
+            rendered.as_deref(),
+            Some("/fe80:0:0:0:67b0:99e:5a9b:287e"),
+            "HotSpot renders an unnamed InetAddress with a bare leading slash"
+        );
+
+        // `getHostName()` is where the numeric text legitimately stands in for
+        // the missing name — HotSpot reaches the same answer by attempting a
+        // reverse lookup and falling back to `getHostAddress()`. That fallback
+        // lives in `inet_addr_host_name_value`, NOT in the stored pair, which
+        // is the distinction the old assertion collapsed.
+        let host_name = match inet_addr_host_name_value(&mut ctx, address) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            other => panic!("expected String from getHostName, got {other:?}"),
+        };
+        assert_eq!(
+            host_name.as_deref(),
+            Some("fe80:0:0:0:67b0:99e:5a9b:287e"),
+            "an unnamed mirror answers getHostName() with its numeric text"
         );
     }
 
