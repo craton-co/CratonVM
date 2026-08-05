@@ -1932,6 +1932,7 @@ pub(super) fn process_references_after_gc(
             pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
         };
         let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
             &is_marked,
             pointer_map,
         );
@@ -2646,6 +2647,64 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     total_size: usize,
 ) -> Option<ObjectRef> {
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
+}
+
+/// The ARRAY twin of [`tlab_alloc_object_guarded_refill`], for the JIT's
+/// `newarray`/`anewarray` helpers.
+///
+/// Until this existed the JIT had no TLAB path for arrays *at all*. Its object
+/// sites bump inline (`emit_inline_tlab_new`) and miss into the guarded refill
+/// above; its array sites had neither, so every single JIT-compiled array
+/// allocation went to `try_alloc_young_probe` + `try_alloc_array`, which take
+/// the global `young_from` mutex twice — the second time holding it across the
+/// bump, the zeroing AND the header init, so hold time scales with the array's
+/// size. The interpreter's `gc_alloc_array` grew its TLAB arm on 2026-07-25
+/// (`7888b80b6`, +36% aggregate at 4 threads) and the JIT's was left behind;
+/// `AllocScaleProbe` reports the difference as a `long[16]` aggregate scaling
+/// factor stuck near 1.00x while `new Object()` scales.
+///
+/// `refill_needs_young_room = true` for the same reason the object twin passes
+/// it: on this path a refill that forces a collection is worse than spilling to
+/// old gen, because the caller has a cheaper fallback and, unlike the
+/// interpreter, may be holding JIT frames the collector cannot map precisely.
+#[inline(always)]
+pub(crate) fn tlab_alloc_array_guarded_refill(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    element_type: ArrayElementType,
+    length: usize,
+) -> Option<ObjectRef> {
+    use cratonvm_gc::heap::{ObjectKind, HEADER_SIZE};
+    let length_u32 = u32::try_from(length).ok()?;
+    let data_size = cratonvm_gc::heap::array_data_size_checked(length, element_type)?;
+    let total_size = HEADER_SIZE.checked_add(data_size)?;
+    // Anything at or above the TLAB's per-allocation cap goes down the ordinary
+    // path, which owns the young-vs-old-gen (humongous) routing decision.
+    if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
+        return None;
+    }
+    let obj = tlab_alloc_shaped_inner(
+        thread,
+        shared,
+        class_id,
+        TlabShape::Array {
+            element_type,
+            length_u32,
+        },
+        total_size,
+        true,
+    )?;
+    cratonvm_gc::a2dbg::record(
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        ObjectKind::Array as u8,
+        element_type as u8,
+        length_u32,
+        length_u32,
+        total_size,
+    );
+    Some(obj)
 }
 
 /// DBG (CRATONVM_DBG_INVOKESTATS): counts invoke-dispatch path outcomes to
@@ -4974,7 +5033,11 @@ pub(super) fn g1_remark_process_references(
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
     let no_moves = std::collections::HashMap::new();
     let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(is_marked, &no_moves);
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
+            is_marked,
+            &no_moves,
+        );
     let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(

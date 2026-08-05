@@ -56,13 +56,40 @@
 
 use cratonvm_types::ClassId;
 
-/// Number of direct-mapped slots. A power of two so the index is a mask.
+/// Default number of direct-mapped slots. A power of two so the index is a mask.
 ///
-/// BCEL's class parser — the workload this was written for — touches on the
-/// order of a hundred distinct sites in its hot loop, so 1024 slots make
-/// conflict misses vanishingly rare. The table is allocated lazily, so a thread
-/// that never reaches the relevant opcode pays nothing at all.
-const SLOTS: usize = 1024;
+/// 1024 was chosen against BCEL's class parser, which touches on the order of a
+/// hundred distinct sites in its hot loop and hits **99.9%** there
+/// (`hit=1329432 miss=1234` over one annotation scan).
+///
+/// **That number does not generalise.** A Spring Boot unit-test class measured
+/// `hit=184126 miss=166035` — a **53%** hit rate, with nearly every miss
+/// causing a fill, i.e. the table thrashing rather than warming. Broad
+/// application code touches far more distinct field sites than a narrow hot
+/// loop does, so the right size is a workload question, and
+/// [`CRATONVM_JIT=field-site-slots`](field_site_slots) exists to answer it with
+/// hit-rate data instead of a guess. Hit rate is load-independent, which makes
+/// it measurable on a busy shared host where timings are not.
+const DEFAULT_SLOTS: usize = 1024;
+
+/// Slot count for new tables — `CRATONVM_JIT_FIELD_SITE_SLOTS`, rounded UP to a
+/// power of two and clamped to `[64, 65536]`. Read once and cached.
+///
+/// The clamp is not decoration: the index is a mask, so a non-power-of-two would
+/// silently address only part of the table, and an unbounded value would let one
+/// env var allocate arbitrary per-thread memory.
+fn field_site_slots() -> usize {
+    static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let requested = cratonvm_types::flags::runtime_var("CRATONVM_JIT_FIELD_SITE_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SLOTS)
+            .clamp(64, 65536);
+        // Round UP to a power of two so the mask covers every allocated slot.
+        requested.next_power_of_two().min(65536)
+    })
+}
 
 struct Site<T> {
     class_id: ClassId,
@@ -93,20 +120,26 @@ struct Site<T> {
 pub struct SiteCache<T> {
     /// Lazily allocated. `None` in a slot means empty.
     slots: Option<Box<[Option<Site<T>>]>>,
+    /// `slots.len() - 1`, captured when the table is allocated so the hot path
+    /// masks without re-reading the flag. Zero while unallocated.
+    mask: usize,
 }
 
 impl<T> SiteCache<T> {
     pub fn new() -> Self {
-        Self { slots: None }
+        Self {
+            slots: None,
+            mask: 0,
+        }
     }
 
     /// Direct-mapped slot index. Fibonacci-hash the pair and take the HIGH
     /// bits, so that constant-pool indices — which cluster in a narrow range
     /// within any one class — do not alias across classes.
     #[inline]
-    fn slot_of(class_id: ClassId, cp_index: u16) -> usize {
+    fn slot_of(&self, class_id: ClassId, cp_index: u16) -> usize {
         let key = ((class_id.as_u32() as u64) << 16) | cp_index as u64;
-        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize & (SLOTS - 1)
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize & self.mask
     }
 
     /// The two counters a caller must snapshot **before** resolving, and hand
@@ -129,7 +162,7 @@ impl<T> SiteCache<T> {
         if cratonvm_classloading::any_class_redefined() {
             return None;
         }
-        let idx = Self::slot_of(class_id, cp_index);
+        let idx = self.slot_of(class_id, cp_index);
         let site = self.slots.as_ref()?[idx].as_ref()?;
         // BOTH halves of the key, always. A direct-mapped table with a partial
         // tag check answers one site with another site's value, and every
@@ -161,10 +194,16 @@ impl<T> SiteCache<T> {
         if epochs_at_entry != Self::epochs_now() {
             return;
         }
-        let idx = Self::slot_of(class_id, cp_index);
-        let slots = self
-            .slots
-            .get_or_insert_with(|| (0..SLOTS).map(|_| None).collect());
+        if self.slots.is_none() {
+            let n = field_site_slots();
+            self.slots = Some((0..n).map(|_| None).collect());
+            self.mask = n - 1;
+        }
+        let idx = self.slot_of(class_id, cp_index);
+        let slots = match self.slots.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
         slots[idx] = Some(Site {
             class_id,
             cp_index,
@@ -273,7 +312,8 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={}",
+            super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
             COUNTS[FIELD_FILL].load(Ordering::Relaxed),

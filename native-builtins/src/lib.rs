@@ -9890,7 +9890,7 @@ pub fn register_essential_natives_with_shims(
             // reference -- SpEL's `#{systemProperties.foo}` (routed through
             // `MapAccessor.canRead` -> `Properties.containsKey`) then reports the
             // property as absent even though `System.getProperty("foo")` sees it.
-            if let Some(props) = crate::lang_system::system_props_singleton() {
+            if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
             }
             match old {
@@ -9917,7 +9917,7 @@ pub fn register_essential_natives_with_shims(
             let result = ctx.remove_system_property(&key);
             // Mirror the removal into the cached singleton's side-table -- see
             // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
-            if let Some(props) = crate::lang_system::system_props_singleton() {
+            if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
             }
             match result {
@@ -9965,7 +9965,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(props))) => Some(*props),
                 _ => None,
             };
-            if let Some(old) = crate::lang_system::replace_system_props_singleton(new_singleton) {
+            if let Some(old) = crate::lang_system::replace_system_props_singleton(ctx.vm_identity(), new_singleton) {
                 crate::properties_sidetable::unmark_system_props(ctx, old);
             }
             if let Some(props) = new_singleton {
@@ -10048,12 +10048,12 @@ pub fn register_essential_natives_with_shims(
             // `System.getProperties().setProperty(...)`) propagate to the global
             // store — regular `new Properties()` objects must NOT (they'd pollute
             // system properties and cross-contaminate other Properties).
-            let props = match crate::lang_system::system_props_singleton() {
+            let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 Some(cached) => cached,
                 None => {
                     let p = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
                     crate::properties_sidetable::mark_system_props(ctx, p);
-                    crate::lang_system::set_system_props_singleton(p)
+                    crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
                 }
             };
             // Resync the side-table to the current system-property snapshot on
@@ -12773,8 +12773,13 @@ pub fn register_essential_natives_with_shims(
                 ctx.set_field(url, 3, Value::Object(Some(path_str))); // file
                 ctx.set_field(url, 6, Value::Object(Some(path_str))); // path
                 let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
-                ctx.set_field(cs, 0, Value::Object(Some(url)));
-                ctx.set_field(cs, 1, Value::Object(None));
+                // BY NAME. These were raw slots 0 and 1; slot 0 is `location`
+                // on both layouts, but slot 1 is `signers` on a real
+                // `CodeSource` and only `certs` in the fabricated model — the
+                // constructor-order mistake this file already records one
+                // instance of, four lines below, for `ProtectionDomain`.
+                ctx.set_field_by_name(cs, "location", Value::Object(Some(url)));
+                ctx.set_field_by_name(cs, "certs", Value::Object(None));
                 Value::Object(Some(cs))
             } else {
                 Value::Object(None)
@@ -16266,7 +16271,7 @@ pub fn register_essential_natives_with_shims(
         |ctx, _args| {
             let loader =
                 crate::classloader::latest_user_defined_loader_class(ctx).map(|class_id| {
-                    crate::classloader::defining_loader_for(class_id.as_u32())
+                    crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
                         .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx))
                 });
             Ok(Some(Value::Object(loader)))
@@ -24652,7 +24657,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         if element_type == cratonvm_types::ArrayElementType::Reference
             && ctx.loader_id_of_class(class_id) >= 3
         {
-            if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+            if let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32()) {
                 let loader_pin = ctx.pin_native_root(loader);
                 let mirror = crate::lang_class::synthetic_class_mirror(ctx, &array_class_name);
                 let loader = ctx.read_native_pin(loader_pin, loader);
@@ -24709,9 +24714,12 @@ fn object_to_string_dotted_name(
     use rustc_hash::FxHashMap;
     use std::sync::{Arc, OnceLock};
 
-    static CACHE: OnceLock<RwLock<FxHashMap<u32, Arc<str>>>> = OnceLock::new();
+    // Keyed by `(vm_identity, class_id)`: class ids restart at zero in every
+    // VM, and a test binary has several live at once — see the
+    // `ClassNameCache` note in `lang_class`.
+    static CACHE: OnceLock<RwLock<FxHashMap<(usize, u32), Arc<str>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
-    let key = class_id.as_u32();
+    let key = (ctx.vm_identity(), class_id.as_u32());
     if let Some(arc) = cache.read().get(&key).cloned() {
         return arc;
     }
@@ -27419,7 +27427,7 @@ fn native_classloader_find_bootstrap_class(
         Ok(Some(Value::Object(Some(mirror)))) => {
             if ctx
                 .class_id_from_mirror(mirror)
-                .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()))
+                .and_then(|cid| crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()))
                 .is_some()
             {
                 return Ok(Some(Value::Object(None)));
@@ -29421,20 +29429,38 @@ struct RlState {
     fair: bool,
 }
 
-/// Side table: lock identity-hash → [`RlState`].
-fn rl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RlState>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, RlState>>> =
+/// Stable key for a lock object: `(vm_identity, monotonic identity-hash)`.
+///
+/// The VM half is not decoration. Identity hashes are 32-bit and minted per
+/// VM, so two `Vm`s in one test binary — sequential or concurrent — hand out
+/// the same hash for unrelated locks; without the partition a fresh
+/// `ReentrantLock` in VM 2 could be born already held by a thread of VM 1.
+pub(crate) type RlKey = (usize, i32);
+
+/// Side table: [`RlKey`] → [`RlState`].
+fn rl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<RlKey, RlState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<RlKey, RlState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Stable key for a lock object — its monotonic identity-hash code.
-fn rl_key(ctx: &mut dyn NativeContext, lock: ObjectRef) -> i32 {
-    ctx.identity_hash_code(lock)
+/// Stable key for a lock object — see [`RlKey`].
+fn rl_key(ctx: &mut dyn NativeContext, lock: ObjectRef) -> RlKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(lock))
+}
+
+/// Drop every lock-state row belonging to `vm_identity`. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_lock_state(vm_identity: usize) {
+    rl_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(vm, _), _| *vm != vm_identity);
+    crate::util_concurrent_ext::forget_vm_rwl_state(vm_identity);
 }
 
 /// Read the current [`RlState`] for a lock (default = unheld).
-fn rl_get(key: i32) -> RlState {
+fn rl_get(key: RlKey) -> RlState {
     rl_state_table()
         .lock()
         .ok()
@@ -29449,7 +29475,7 @@ fn rl_get(key: i32) -> RlState {
 /// Run `f` with exclusive access to a lock's [`RlState`], creating a
 /// default (unheld) entry on first touch. The whole closure runs under the
 /// side-table mutex, so a read-modify-write of the lock state is atomic.
-fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
+fn rl_with<R>(key: RlKey, f: impl FnOnce(&mut RlState) -> R) -> R {
     let mut t = rl_state_table().lock().unwrap_or_else(|e| e.into_inner());
     let st = t.entry(key).or_insert(RlState {
         owner: RL_UNOWNED,
@@ -30390,7 +30416,7 @@ fn cslm_subrange(
 /// Release a `ReentrantLock` for a thread that is about to `await()` on one
 /// of its conditions. Returns the saved hold count to restore on re-acquire,
 /// or `None` if the caller does not own the lock.
-fn rl_release_for_await(key: i32, tid: i64) -> Option<i32> {
+fn rl_release_for_await(key: RlKey, tid: i64) -> Option<i32> {
     rl_with(key, |st| {
         if st.owner != tid {
             return None;
@@ -30495,7 +30521,7 @@ fn cond_await_millis(
 fn reacquire_lock_after_await(
     ctx: &mut dyn NativeContext,
     mut lock_ref: ObjectRef,
-    lock_key: i32,
+    lock_key: RlKey,
     tid: i64,
     saved_hold: i32,
 ) -> MethodCallResult {
@@ -38402,7 +38428,10 @@ static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// global [`PROXY_CLASS_COUNTER`]). Public-interface proxies of the SAME loader
 /// share one `jdk/proxyN` package, exactly like the JDK's `ProxyBuilder`.
 static PROXY_MODULE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<u32, u32>>> =
+/// Keyed by `(vm_identity, loader_id)`: loader ids are small per-VM integers,
+/// so an unqualified key let VM B's loader 2 inherit VM A's module number and
+/// generate its `$ProxyN` into a package that VM A had already claimed.
+static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<(usize, u32), u32>>> =
     parking_lot::RwLock::new(None);
 
 /// WP2.5 v3 item 6 — classify a thrown exception from
@@ -38998,7 +39027,10 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // --- Collections extras: unmodifiable wrappers ---
     register_collections_extras_natives(registry);
     register_core_stdlib_extras(registry);
-    register_scanner_natives(registry);
+    // `register_scanner_natives` used to be called here. Its twelve
+    // `java/util/Scanner` registrations were overwritten by `native-io`'s two
+    // lines later in the boot sequence, in every configuration; see the note
+    // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases
 }

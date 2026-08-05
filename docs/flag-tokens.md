@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-398 tokens.
+401 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -240,6 +240,8 @@ export inherited from a parent shell.
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
 | `jit-gen` | `CRATONVM_DBG_JIT_GEN` |
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
+| `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
+| `field-site` | `CRATONVM_DBG_FIELD_SITE` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
@@ -324,6 +326,7 @@ export inherited from a parent shell.
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
+| `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
@@ -465,7 +468,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-149 tokens.
+154 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -578,7 +581,12 @@ export inherited from a parent shell.
 | `scalar-replacement` | `CRATONVM_DISABLE_SCALAR_REPLACEMENT` |
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
+| `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
+| `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
+| `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
+| `loop-work-tierup` | `CRATONVM_JIT_LOOP_WORK_TIERUP` |
 | `shadow-nopush` | `CRATONVM_SHADOW_NOPUSH` |
+| `sync-methods` | `CRATONVM_JIT_SYNC_METHODS` |
 | `shadow-noreload` | `CRATONVM_SHADOW_NORELOAD` |
 | `shadow-pin` | `CRATONVM_SHADOW_PIN` |
 | `shadow-raw-reload` | `CRATONVM_SHADOW_RAW_RELOAD` |

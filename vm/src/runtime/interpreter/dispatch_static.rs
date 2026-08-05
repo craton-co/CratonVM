@@ -171,8 +171,11 @@ pub(super) fn execute_invokestatic(
     // gates leaves ordinary ModifiedClassPathClassLoader bytecode bound to the
     // flat application copy.
     let has_user_defining_loader = any_user_loader
-        && cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
-            .is_some();
+        && cratonvm_native_builtins::classloader::defining_loader_for(
+            shared.vm_identity,
+            current_class_id.as_u32(),
+        )
+        .is_some();
     let mut loader_specific_dispatch = false;
     let static_dispatch_class_id = self_class_id.or_else(|| {
         // Keep static method owners in the same initiating-loader namespace

@@ -2524,11 +2524,11 @@ pub(crate) fn register_reflect_array_natives(registry: &mut NativeMethodRegistry
 /// `jdk/proxyN`), assigned in first-encounter order starting at 1. Same loader →
 /// same number, so all of that loader's public-interface proxies land in one
 /// `jdk/proxyN` package — matching HotSpot's per-loader dynamic module.
-fn proxy_module_number(loader_id: u32) -> u32 {
+fn proxy_module_number(vm: usize, loader_id: u32) -> u32 {
     {
         let guard = PROXY_LOADER_MODULES.read();
         if let Some(map) = guard.as_ref() {
-            if let Some(&n) = map.get(&loader_id) {
+            if let Some(&n) = map.get(&(vm, loader_id)) {
                 return n;
             }
         }
@@ -2536,11 +2536,11 @@ fn proxy_module_number(loader_id: u32) -> u32 {
     let mut guard = PROXY_LOADER_MODULES.write();
     let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
     // Re-check under the write lock — another thread may have assigned it.
-    if let Some(&n) = map.get(&loader_id) {
+    if let Some(&n) = map.get(&(vm, loader_id)) {
         return n;
     }
     let n = PROXY_MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    map.insert(loader_id, n);
+    map.insert((vm, loader_id), n);
     n
 }
 
@@ -2550,8 +2550,8 @@ fn proxy_module_number(loader_id: u32) -> u32 {
 /// CURRENT (post-relocation) address, or `0` if no proxy has been created.
 /// Reflection itself no longer goes through this raw form; it reads the
 /// tracked `ObjectRef` directly via `lang_class::proxy_last_interfaces`.
-pub fn proxy_last_interfaces_bits() -> u64 {
-    lang_class::proxy_last_interfaces()
+pub fn proxy_last_interfaces_bits(vm_identity: usize) -> u64 {
+    lang_class::proxy_last_interfaces(vm_identity)
         .map(|arr| arr.as_ptr() as u64)
         .unwrap_or(0)
 }
@@ -2951,7 +2951,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if let Some(cid) = generated_cid {
         if let Some(Value::Object(Some(loader_obj))) = args.first() {
             if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
             }
         }
     }
@@ -2979,7 +2979,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // could relocate/reclaim the array, leaving the shared-mirror
     // `getInterfaces()` reader to dereference a dangling pointer.
     if let Value::Object(Some(arr)) = interfaces {
-        lang_class::set_proxy_last_interfaces(arr);
+        lang_class::set_proxy_last_interfaces(ctx.vm_identity(), arr);
     }
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
@@ -3028,7 +3028,7 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // loaders are recorded; built-in/null loaders keep the fallback.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                    crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+                    crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
                 }
             }
             let mirror = ctx.get_class_mirror(cid);
@@ -3700,7 +3700,10 @@ fn build_proxy_spec_for(
     let gen_class_name = match non_public_pkg {
         Some(pkg) if pkg.is_empty() => format!("$Proxy{n}"),
         Some(pkg) => format!("{pkg}/$Proxy{n}"),
-        None => format!("jdk/proxy{}/$Proxy{n}", proxy_module_number(loader_id)),
+        None => format!(
+            "jdk/proxy{}/$Proxy{n}",
+            proxy_module_number(ctx.vm_identity(), loader_id)
+        ),
     };
 
     // BFS over interface inheritance. Collect public, non-static,
@@ -3854,7 +3857,7 @@ fn native_proxy_instance_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // readers (lang_class synthetic-mode `getInterfaces` fallback), mirroring
     // `native_proxy_new_instance`.
     if let Value::Object(Some(arr)) = interfaces {
-        lang_class::set_proxy_last_interfaces(arr);
+        lang_class::set_proxy_last_interfaces(ctx.vm_identity(), arr);
     }
 
     Ok(None)

@@ -212,7 +212,7 @@ fn populate_sfi(
         );
     }
     let dotted = match cid {
-        Some(c) => crate::lang_class::dotted_class_name(c, &entry.class_name),
+        Some(c) => crate::lang_class::dotted_class_name(ctx.vm_identity(), c, &entry.class_name),
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
     };
 

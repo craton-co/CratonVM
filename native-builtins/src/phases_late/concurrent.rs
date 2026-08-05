@@ -5701,7 +5701,11 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // Thread extras: Thread$State enum, ThreadGroup, UncaughtExceptionHandler
-// Legacy synthetic ThreadGroup = name=0, parent=1, daemon=2, maxPriority=3.
+// ThreadGroup slots = parent=0, name=1, maxPriority=2, daemon=3 -- the REAL
+// JDK 21+ declaration order, which the fabricated model in
+// `synthetic_stub_fields` now also uses. Until 2026-08-05 the model was
+// `name=0, parent=1, daemon=2, maxPriority=3` and the fallback indices below
+// matched it, so both pairs were transposed against every real image.
 // =============================================================================
 
 // Stale-ObjectRef hazard (2026-07-17, see
@@ -5727,6 +5731,27 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
 // read) and re-read through the pin before each subsequent heap touch, so a
 // relocation anywhere in the walk is transparently followed instead of left
 // dangling.
+
+/// Fallback slot indices for a `ThreadGroup` receiver whose class does not
+/// declare the field by name.
+///
+/// **These are the REAL JDK 21+ indices**, and they are the same four the
+/// fabricated model in `ClassManager::synthetic_stub_fields` declares, in the
+/// same order — that is the invariant, and
+/// `tg_fallback_slots_match_the_fabricated_model` asserts it rather than
+/// leaving it to a comment.
+///
+/// Until 2026-08-05 they were the legacy synthetic order (`name=0, parent=1,
+/// daemon=2, maxPriority=3`), which has BOTH pairs transposed against the
+/// image. Nothing caught it for months because [`tg_slot`] resolves by name
+/// first and every real `ThreadGroup` declares all four, so this fallback is
+/// almost never reached — and because a `ThreadGroup` written over a `String`,
+/// and an `int` over an `int`, are both invisible to the overlay hunter's
+/// value-tag test. The L4 shadow-layout diff is what named them.
+pub(crate) const TG_SLOT_PARENT: usize = 0;
+pub(crate) const TG_SLOT_NAME: usize = 1;
+pub(crate) const TG_SLOT_MAX_PRIORITY: usize = 2;
+pub(crate) const TG_SLOT_DAEMON: usize = 3;
 
 pub(crate) fn tg_slot(
     ctx: &mut dyn NativeContext,
@@ -5844,7 +5869,7 @@ pub(crate) fn tg_matches_thread(
             ctx.unpin_native_roots(group_pin);
             break false;
         }
-        current = match tg_get_field(ctx, group, "parent", 1) {
+        current = match tg_get_field(ctx, group, "parent", TG_SLOT_PARENT) {
             Value::Object(parent) => parent,
             _ => None,
         };
@@ -6141,12 +6166,12 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             ctx,
             this,
             "name",
-            0,
+            TG_SLOT_NAME,
             args.get(1).copied().unwrap_or(Value::Object(None)),
         );
-        tg_set_field(ctx, this, "parent", 1, parent);
-        tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
-        tg_set_field(ctx, this, "maxPriority", 3, Value::Int(10));
+        tg_set_field(ctx, this, "parent", TG_SLOT_PARENT, parent);
+        tg_set_field(ctx, this, "daemon", TG_SLOT_DAEMON, Value::Int(0));
+        tg_set_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY, Value::Int(10));
         // The real ctor ends with `parent.add(this)`; ours shadows it, so
         // record the edge in the subgroup registry instead (activeGroupCount /
         // enumerate(ThreadGroup[]) read it back).
@@ -6160,35 +6185,47 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let parent = args.get(1).copied().unwrap_or(Value::Object(None));
-            tg_set_field(ctx, this, "parent", 1, parent);
+            tg_set_field(ctx, this, "parent", TG_SLOT_PARENT, parent);
             tg_set_field(
                 ctx,
                 this,
                 "name",
-                0,
+                TG_SLOT_NAME,
                 args.get(2).copied().unwrap_or(Value::Object(None)),
             );
-            tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
+            tg_set_field(ctx, this, "daemon", TG_SLOT_DAEMON, Value::Int(0));
             let parent_max = match args.get(1) {
-                Some(Value::Object(Some(p))) => tg_get_field(ctx, *p, "maxPriority", 3)
-                    .as_int()
-                    .unwrap_or(10),
+                Some(Value::Object(Some(p))) => {
+                    tg_get_field(ctx, *p, "maxPriority", TG_SLOT_MAX_PRIORITY)
+                        .as_int()
+                        .unwrap_or(10)
+                }
                 _ => 10,
             };
-            tg_set_field(ctx, this, "maxPriority", 3, Value::Int(parent_max));
+            tg_set_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY, Value::Int(parent_max));
             // See the `(String)` ctor: our natives shadow the real `parent.add`.
             tg_register_child(ctx, parent, this);
             Ok(None)
         },
     );
     r.register(tg, "getName", "()Ljava/lang/String;", |ctx, args| {
-        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "name", 0)))
+        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "name", TG_SLOT_NAME)))
     });
     r.register(tg, "getParent", "()Ljava/lang/ThreadGroup;", |ctx, args| {
-        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "parent", 1)))
+        Ok(Some(tg_get_field(
+            ctx,
+            obj_arg(args, 0)?,
+            "parent",
+            TG_SLOT_PARENT,
+        )))
     });
     r.register(tg, "isDaemon", "()Z", |ctx, args| {
-        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "daemon", 2)))
+        Ok(Some(tg_get_field(
+            ctx,
+            obj_arg(args, 0)?,
+            "daemon",
+            TG_SLOT_DAEMON,
+        )))
     });
     r.register(tg, "setDaemon", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6196,14 +6233,14 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             ctx,
             this,
             "daemon",
-            2,
+            TG_SLOT_DAEMON,
             args.get(1).copied().unwrap_or(Value::Int(0)),
         );
         Ok(None)
     });
     r.register(tg, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match tg_get_field(ctx, this, "name", 0) {
+        let name = match tg_get_field(ctx, this, "name", TG_SLOT_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
@@ -6235,7 +6272,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "getMaxPriority", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let max = tg_get_field(ctx, this, "maxPriority", 3)
+        let max = tg_get_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY)
             .as_int()
             .unwrap_or(10);
         Ok(Some(Value::Int(max)))
@@ -6245,7 +6282,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         let prio = args.get(1).and_then(|v| v.as_int()).unwrap_or(10);
         // Clamp to Thread.MIN_PRIORITY..MAX_PRIORITY
         let clamped = prio.max(1).min(10);
-        tg_set_field(ctx, this, "maxPriority", 3, Value::Int(clamped));
+        tg_set_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY, Value::Int(clamped));
         Ok(None)
     });
     r.register(tg, "interrupt", "()V", |ctx, _args| {
@@ -6265,11 +6302,11 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "list", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match tg_get_field(ctx, this, "name", 0) {
+        let name = match tg_get_field(ctx, this, "name", TG_SLOT_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
-        let max_prio = tg_get_field(ctx, this, "maxPriority", 3)
+        let max_prio = tg_get_field(ctx, this, "maxPriority", TG_SLOT_MAX_PRIORITY)
             .as_int()
             .unwrap_or(10);
         // Print the group info and each contained thread
@@ -6368,7 +6405,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             if c == this {
                 return Ok(Some(Value::Int(1)));
             }
-            current = match tg_get_field(ctx, c, "parent", 1) {
+            current = match tg_get_field(ctx, c, "parent", TG_SLOT_PARENT) {
                 Value::Object(Some(p)) => Some(p),
                 _ => None,
             };
@@ -7357,5 +7394,61 @@ pub(crate) mod new15_tests {
         assert_ne!(NEW15_CONT_STATE_NEW, NEW15_CONT_STATE_RUNNING);
         assert_ne!(NEW15_CONT_STATE_RUNNING, NEW15_CONT_STATE_YIELDED);
         assert_ne!(NEW15_CONT_STATE_YIELDED, NEW15_CONT_STATE_DONE);
+    }
+}
+
+#[cfg(test)]
+mod threadgroup_layout_tests {
+    use super::*;
+
+    /// The fallback indices here and the fabricated model in
+    /// `ClassManager::synthetic_stub_fields` are two hand-written copies of the
+    /// same layout, and they were allowed to disagree with each other and with
+    /// the JDK for months. Assert the coupling instead of describing it.
+    ///
+    /// Both must also be the **real** JDK 21+ order, which is why the expected
+    /// names are spelled out here rather than read from the model: a test that
+    /// only checked the two tables against each other would stay green if both
+    /// were transposed together, which is exactly the state this replaces.
+    #[test]
+    fn tg_fallback_slots_match_the_fabricated_model() {
+        let model = cratonvm_classloading::synthetic_stub_field_model("java/lang/ThreadGroup");
+        let instance: Vec<&str> = model
+            .iter()
+            .filter(|f| !f.is_static())
+            .map(|f| &*f.name)
+            .collect();
+        assert_eq!(
+            instance,
+            ["parent", "name", "maxPriority", "daemon"],
+            "the fabricated ThreadGroup model must be the real JDK 21+ \
+             declaration order (javap -p --module java.base java.lang.ThreadGroup)"
+        );
+        assert_eq!(instance[TG_SLOT_PARENT], "parent");
+        assert_eq!(instance[TG_SLOT_NAME], "name");
+        assert_eq!(instance[TG_SLOT_MAX_PRIORITY], "maxPriority");
+        assert_eq!(instance[TG_SLOT_DAEMON], "daemon");
+    }
+
+    /// The model's descriptors have to match too — `maxPriority` is an `int`
+    /// and `daemon` a `boolean`, and swapping *those* is the half that a
+    /// name-only check would miss.
+    #[test]
+    fn the_fabricated_model_descriptors_are_the_real_ones() {
+        let model = cratonvm_classloading::synthetic_stub_field_model("java/lang/ThreadGroup");
+        let descs: Vec<(&str, &str)> = model
+            .iter()
+            .filter(|f| !f.is_static())
+            .map(|f| (&*f.name, &*f.descriptor))
+            .collect();
+        assert_eq!(
+            descs,
+            [
+                ("parent", "Ljava/lang/ThreadGroup;"),
+                ("name", "Ljava/lang/String;"),
+                ("maxPriority", "I"),
+                ("daemon", "Z"),
+            ]
+        );
     }
 }
