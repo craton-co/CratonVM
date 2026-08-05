@@ -143,6 +143,29 @@ by `ClassStore::add` (a new class can be a descendant's previously-missing
 ancestor). The thread-local descriptor tiers carry the epoch, so a transient
 answer is memoized per thread and retires the moment provenance moves.
 
+Two details are load-bearing, and both are the difference between a fix and a
+regression:
+
+* **The epoch is held PER ENTRY, never as one stamp over the table.** A
+  table-wide stamp makes every bump an `O(table)` wipe, and provenance moves on
+  every class definition — that shape is a memset with a lookup attached (see
+  the `site_cache` note that records the same mistake).
+* **Only TRANSIENT answers expire.** A definitive result — resolved against a
+  real, fully-loaded hierarchy whose layout is immutable — is stamped
+  `FIELD_DESCRIPTOR_DURABLE` and never retires. Stamping those with the epoch
+  too is correct and is *also* a performance bug: during any class-loading burst
+  every lookup would miss the thread-local tiers and fall back to the shared
+  `RwLock`, which is the cost the tiers exist to avoid, on the boot-dominated
+  workloads least able to afford it. `a_definitive_descriptor_survives_class_loading`
+  pins it, asserting the epoch actually moved so it cannot pass vacuously.
+
+Checked against six regression vectors **not written for this change**
+(`RCollections RStrings RSerial RExceptions RReflect RNumbers`, boot-dominated,
+`--nojit`, arms interleaved) — the shape the memo cannot help and could only
+hurt: slower on 2 of 6, total −3.4%, i.e. scatter around zero rather than the
+uniform 6-for-6 slowdown that is this pattern's failure signature. A probe
+written alongside a fix only exercises the shape the fix is good at.
+
 Measured with `TlsPostShapeProbe.nativeFloor`, which prices `available()` (one
 field read + one table lookup) against `flush()` (a registered **no-op** native
 on the same receiver, so the difference is the body and nothing else), arms
@@ -155,6 +178,15 @@ interleaved, 3 runs each:
 
 ~70% off the field-read body; the negative value means the field read became
 indistinguishable from the empty native. This is VM-wide, not TLS-specific.
+
+**End to end, testPost's wall clock does not resolve this**, and should not be
+quoted as if it did. Four interleaved runs on the final binaries: base 194.8 s
+and 152.3 s (mean 173.6), fixed 159.8 s and 139.4 s (mean 149.6). The means
+favour the fix by ~14%, but the intervals OVERLAP — base's best beats the fixed
+arm's worst — at n=2 per arm against a test whose spread across this
+investigation was 139–306 s on nominally identical configurations. Directionally
+favourable; not evidence. The phase-level numbers above are the load-bearing
+ones, because they isolate the paths that actually changed.
 
 ## Where the single-byte cost actually goes
 

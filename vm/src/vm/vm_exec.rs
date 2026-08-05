@@ -2856,13 +2856,28 @@ fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
     ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
 }
 
+/// Stamp for a DEFINITIVE thread-local entry: one resolved against a real,
+/// fully-loaded hierarchy, whose layout is immutable. Such an entry must not
+/// expire — it was durable before the epoch existed, and making it perishable
+/// would push every lookup back onto the shared `RwLock` for the duration of
+/// any class-loading burst, which is a net loss on boot-dominated work.
+/// [`class_origin_epoch`] can never return this: it starts at 0 and counts up.
+const FIELD_DESCRIPTOR_DURABLE: u64 = u64::MAX;
+
 /// Record a descriptor result (byte, or 0 = negative) in both thread-local
-/// tiers, stamped with the class-provenance epoch it was resolved under.
+/// tiers.
 ///
-/// `epoch` is what lets a TRANSIENT miss be memoized here: the entry is only
-/// honoured while provenance has not moved, so a stub's promotion to the real
-/// class retires it. Definitive results pass the epoch too — harmless, and it
-/// keeps one code path.
+/// `epoch` is [`FIELD_DESCRIPTOR_DURABLE`] for a definitive result, or the
+/// observed [`class_origin_epoch`] for a TRANSIENT one (stub, or an ancestor
+/// not loaded yet). Stamping the transient case is what lets it be memoized at
+/// all: the entry is honoured only while provenance has not moved, so a stub's
+/// promotion retires it.
+///
+/// The epoch is held PER ENTRY, never as one stamp over the whole table. A
+/// table-wide stamp would turn every bump into an O(table) wipe, and
+/// provenance moves on every class definition — that shape is a memset with a
+/// lookup attached. Per entry, a bump costs nothing: stale entries miss one at
+/// a time and are overwritten in place.
 fn field_descriptor_remember(
     vm_key: usize,
     class_id: u32,
@@ -2905,18 +2920,20 @@ fn resolve_field_descriptor_byte_cached(
     // honoured while this is unchanged, which is what lets a synthetic-stub
     // answer be memoized at all (see the stub note on the slow path).
     let epoch = cratonvm_classloading::class_origin_epoch();
-    if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
+    // An entry is live if it is DURABLE (definitive, immutable layout) or was
+    // stamped under the provenance generation still in force.
+    let live = |stamp: u64| stamp == FIELD_DESCRIPTOR_DURABLE || stamp == epoch;
+    if let Some((cached, stamp)) = FIELD_DESCRIPTOR_LAST.with(|cache| {
         cache
             .get()
-            .filter(|(vm, cid, slot, _, ep)| {
-                *vm == vm_key
-                    && *cid == class_id.as_u32()
-                    && *slot == slot_index
-                    && *ep == epoch
+            .filter(|(vm, cid, slot, _, _)| {
+                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
             })
-            .map(|(_, _, _, byte, _)| byte)
+            .map(|(_, _, _, byte, ep)| (byte, ep))
     }) {
-        return if cached == 0 { None } else { Some(cached) };
+        if live(stamp) {
+            return if cached == 0 { None } else { Some(cached) };
+        }
     }
     // Second tier: the direct-mapped table (see FIELD_DESCRIPTOR_RING's doc).
     let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
@@ -2925,12 +2942,12 @@ fn resolve_field_descriptor_byte_cached(
         (entry.0 == vm_key
             && entry.1 == class_id.as_u32()
             && entry.2 == slot_index
-            && entry.4 == epoch)
-            .then_some(entry.3)
+            && live(entry.4))
+            .then_some((entry.3, entry.4))
     });
-    if let Some(byte) = ring_hit {
+    if let Some((byte, stamp)) = ring_hit {
         FIELD_DESCRIPTOR_LAST
-            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte, epoch))));
+            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte, stamp))));
         return if byte == 0 { None } else { Some(byte) };
     }
     // Fast path: read lock, hash lookup, early return on hit.
@@ -2948,7 +2965,13 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.classes.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b, epoch);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                b,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -3076,11 +3099,23 @@ fn resolve_field_descriptor_byte_cached(
             // never collide with the negative sentinel.
             debug_assert_ne!(b, 0, "descriptor first byte must not be NUL");
             cache_field_descriptor(shared, (class_id, slot_index), b);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b, epoch);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                b,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
         }
         None if cacheable => {
             cache_field_descriptor(shared, (class_id, slot_index), 0u8);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8, epoch);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                0u8,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
         }
         // TRANSIENT miss: the receiver's class — or an ancestor — is a
         // synthetic stub whose descriptors are placeholders, or is not loaded
@@ -25709,6 +25744,49 @@ mod tests {
             Some(b'J'),
             "after promotion the REAL descriptor must win — a memo that \
              outlived the stub would pin the placeholder answer forever"
+        );
+    }
+
+    /// A DEFINITIVE descriptor — resolved against a real, fully-loaded
+    /// hierarchy whose layout is immutable — must keep being served from the
+    /// thread-local tiers across class definitions.
+    ///
+    /// This is the half that is easy to get wrong in the *safe* direction.
+    /// Stamping every entry with the provenance epoch is correct, and it is
+    /// also a performance bug: provenance moves on every class definition, so
+    /// during a class-loading burst every lookup would miss the thread-local
+    /// tiers and fall back to the shared `RwLock` — the exact cost those tiers
+    /// exist to avoid, on precisely the workloads (boot-dominated) least able
+    /// to afford it. Only TRANSIENT answers may expire.
+    #[test]
+    fn a_definitive_descriptor_survives_class_loading() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/Durable", &["J"]);
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "a real class's declared descriptor resolves"
+        );
+
+        // Define unrelated classes — each one bumps the provenance epoch.
+        let before = cratonvm_classloading::class_origin_epoch();
+        for i in 0..3 {
+            add_real_class_with_field_descriptors(
+                &shared,
+                &format!("cratonvm/test/DurableNoise{i}"),
+                &["I"],
+            );
+        }
+        assert!(
+            cratonvm_classloading::class_origin_epoch() > before,
+            "defining classes must move the epoch, or this test proves nothing"
+        );
+
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "a definitive entry must not be retired by unrelated class loading"
         );
     }
 
