@@ -9681,6 +9681,14 @@ pub fn register_essential_natives_with_shims(
     // --- java.lang.System (native methods) ---
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
+    // LEAF: both clock reads are `_ctx`-free — a `SystemTime::now()` /
+    // `Instant::elapsed()` and an integer cast. Nothing to pin, nothing that
+    // can allocate, safepoint or throw. See `NativeMethodRegistry::set_leaf`.
+    // Measured at 604 ns from compiled code against HotSpot's 32 ns
+    // (`probes/NativeShapeProbe.java`), essentially all of it the funnel — and
+    // `System.nanoTime` is what every timeout, scheduler and benchmark in the
+    // JDK calls.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "currentTimeMillis",
@@ -9693,6 +9701,7 @@ pub fn register_essential_natives_with_shims(
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register(
         "java/lang/System",
         "arraycopy",
@@ -22275,12 +22284,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         native_system_set_property,
     );
+    // Re-registration of the SAME body, so the leaf claim has to be restated:
+    // `register` captures the ambient claim into the slot, and a re-register
+    // that does not opt in demotes the triple back to the funnel. That is the
+    // deliberate ordering property of `set_leaf` — see its doc comment.
+    registry.set_leaf(true);
     registry.register(
         "java/lang/System",
         "nanoTime",
         "()J",
         native_system_nano_time,
     );
+    registry.set_leaf(false);
     registry.register("java/lang/System", "exit", "(I)V", native_system_exit);
     registry.register("java/lang/System", "gc", "()V", |ctx, _args| {
         ctx.force_gc();

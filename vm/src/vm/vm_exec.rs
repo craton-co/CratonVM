@@ -1644,6 +1644,133 @@ pub(crate) fn safe_native_call_prevalidated_objects(
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
+/// The funnel with everything a **leaf** native cannot need taken out.
+///
+/// `callback` must have been registered through
+/// [`NativeMethodRegistry::set_leaf`](cratonvm_native_api::NativeMethodRegistry::set_leaf),
+/// whose doc comment states the four-part contract: no Java-heap allocation,
+/// no safepoint or block, no collection, no JNI-pending exception. Callers
+/// establish that by holding a `NativeMethodId` whose slot answers
+/// `is_leaf_id`; they do not get to decide it themselves.
+///
+/// # What this drops, and why each is dead for a leaf
+///
+/// | funnel step | why a leaf does not need it |
+/// |---|---|
+/// | argument pinning into `native_pin_roots` | pins exist so a collection *during* the callback can remap the arguments. A leaf cannot reach a collection, so nothing can move under it. |
+/// | the STW probe + `safepoint_check` | a leaf is a handful of instructions and returns to a mutator that polls safepoints itself; entering one here buys the collector nothing. |
+/// | `native_array_gc_requested` / `young_spill_pressure` relief | both exist for natives that ALLOCATE. A leaf does not. |
+/// | the remap-args-after-GC rebuild | unreachable once the two GC hooks above are gone. |
+/// | `NativeRunning` / restore `record_transition` pair | the state exists so the STW census WAITS for a native holding raw `ObjectRef`s in Rust locals. A leaf holds them for a few instructions and cannot block, so the thread stays exactly what it was — running Java. |
+/// | the JNI pending-exception drain | contract item 4. |
+/// | the pin-watermark truncate + unpin ring | nothing was pinned. |
+/// | `native_diag_pre_call` / `post_call` | these are already behind a mask that is zero on every production run; the leaf path simply does not offer them. A run that needs them can unset the leaf claim. |
+///
+/// # What it keeps
+///
+/// * **The argument forwarding barrier.** Object arguments have just left the
+///   GC-visible operand stack, and a collection may have run between the frame
+///   read and this call — that is the same window the funnel's own
+///   `load_and_forward` covers, and it is two instructions.
+/// * **`catch_unwind`.** A leaf must not panic, but "must not" is a contract,
+///   not a proof, and a panic escaping into JIT-compiled or interpreter frames
+///   is a process-level failure rather than a bad answer. It costs nothing
+///   when nothing unwinds.
+/// * **The return-value forwarding + `native_pending_return` handoff root**,
+///   so an object-returning leaf hands its result over by the same rule every
+///   other native does and the JIT's post-invoke drain sees what it expects.
+///
+/// Measured effect: `probes/NativeShapeProbe.java`, and
+/// `docs/internal/native-call-funnel-is-the-per-call-floor-20260803.md`.
+pub(crate) fn safe_native_call_leaf(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
+    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    let mut heap_forwarded: Vec<Value>;
+    let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+        inline_forwarded[..args.len()].copy_from_slice(args);
+        &mut inline_forwarded[..args.len()]
+    } else {
+        heap_forwarded = args.to_vec();
+        &mut heap_forwarded[..]
+    };
+    for value in forwarded_args.iter_mut() {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.mem.heap.load_and_forward(*obj);
+        }
+    }
+
+    let result = {
+        let mut ctx = NativeContextImpl { shared, thread };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&mut ctx, forwarded_args)
+        }))
+    };
+
+    let mut out: MethodCallResult = match result {
+        Ok(method_result) => method_result,
+        Err(payload) => {
+            // A leaf that panicked has broken its contract. Report it with the
+            // same shape the funnel uses — the callee name plus the Java frame
+            // that called it — rather than letting the payload fall on the
+            // floor, because the whole point of the leaf list is that it is
+            // auditable and a violation must be attributable.
+            thread.native_pending_return = None;
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown native method panic".to_string()
+            };
+            let callee = native_callee_name(callback);
+            let top = thread
+                .frames
+                .last()
+                .map(|f| {
+                    format!(
+                        "{}.{}{}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor()
+                    )
+                })
+                .unwrap_or_default();
+            tracing::error!(
+                "LEAF native {} panicked: {} (invoked from {}). A leaf native must not \
+                 panic — see NativeMethodRegistry::set_leaf; drop its leaf claim.",
+                callee,
+                msg,
+                top,
+            );
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("leaf native method panic: {msg}"),
+            }));
+        }
+    };
+
+    thread.native_pending_return = None;
+    match &mut out {
+        Ok(Some(v)) => {
+            if let Value::Object(Some(o)) = v {
+                *o = shared.mem.heap.load_and_forward(*o);
+            }
+            if let Some(o) = value_as_validated_object_ref(shared, *v) {
+                thread.native_pending_return = Some(o);
+            }
+        }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            thread.native_pending_return = Some(*exc);
+        }
+        _ => {}
+    }
+    out
+}
+
 /// DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector.
 ///
 /// A native that returns with FEWER pins than it entered with truncated its

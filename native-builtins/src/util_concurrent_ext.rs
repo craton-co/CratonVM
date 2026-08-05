@@ -95,9 +95,24 @@ pub(crate) fn register_atomic_integer_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/atomic/AtomicInteger";
     r.register(c, "<init>", "()V", native_atomic_int_init_default);
     r.register(c, "<init>", "(I)V", native_atomic_int_init_value);
+    // LEAF: the plain accessors are one descriptor-typed volatile read or write
+    // of field 0 (`private volatile int value`) — no allocation, no safepoint,
+    // no collection, no JNI exception. See `NativeMethodRegistry::set_leaf`.
+    //
+    // This is item 2 of `docs/internal/aqs-thread-handoff-latency-20260803.md`:
+    // `AtomicInteger.get()` measured **969 ns**, more than an empty bytecode
+    // call, for a body that is `return value;`. Being native it can never be
+    // compiled or inlined, so the whole cost was the funnel around it.
+    //
+    // The CAS / fetch-add members are deliberately NOT here. They go through
+    // `compare_and_swap_field` / `atomic_fetch_add_int`, which take the
+    // monitor table's per-object CAS lock — a lock this thread can be made to
+    // wait on, which is exactly what contract item 2 (no blocking) excludes.
+    r.set_leaf(true);
     r.register(c, "get", "()I", native_atomic_int_get);
     r.register(c, "set", "(I)V", native_atomic_int_set);
     r.register(c, "lazySet", "(I)V", native_atomic_int_set);
+    r.set_leaf(false);
     r.register(c, "getAndSet", "(I)I", native_atomic_int_get_and_set);
     r.register(c, "compareAndSet", "(II)Z", native_atomic_int_cas);
     r.register(c, "weakCompareAndSet", "(II)Z", native_atomic_int_cas);
@@ -127,8 +142,11 @@ pub(crate) fn register_atomic_integer_natives(r: &mut NativeMethodRegistry) {
         native_atomic_int_decrement_and_get,
     );
     r.register(c, "addAndGet", "(I)I", native_atomic_int_add_and_get);
+    // LEAF, same argument as `get`/`set` above: both are plain reads of field 0.
+    r.set_leaf(true);
     r.register(c, "intValue", "()I", native_atomic_int_get);
     r.register(c, "longValue", "()J", native_atomic_int_long_value);
+    r.set_leaf(false);
     r.register(
         c,
         "toString",
@@ -285,9 +303,14 @@ pub(crate) fn register_atomic_long_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "<init>", "()V", native_atomic_long_init_default);
     r.register(c, "<init>", "(J)V", native_atomic_long_init_value);
+    // LEAF, for the same reason as the `AtomicInteger` accessors above: a
+    // descriptor-typed volatile read/write of field 0, and nothing else. The
+    // CAS / fetch-add members stay on the funnel because they take the CAS lock.
+    r.set_leaf(true);
     r.register(c, "get", "()J", native_atomic_long_get);
     r.register(c, "set", "(J)V", native_atomic_long_set);
     r.register(c, "lazySet", "(J)V", native_atomic_long_set);
+    r.set_leaf(false);
     r.register(c, "getAndSet", "(J)J", native_atomic_long_get_and_set);
     r.register(c, "compareAndSet", "(JJ)Z", native_atomic_long_cas);
     r.register(c, "weakCompareAndSet", "(JJ)Z", native_atomic_long_cas);
@@ -317,8 +340,10 @@ pub(crate) fn register_atomic_long_natives(r: &mut NativeMethodRegistry) {
         native_atomic_long_decrement_and_get,
     );
     r.register(c, "addAndGet", "(J)J", native_atomic_long_add_and_get);
+    r.set_leaf(true);
     r.register(c, "intValue", "()I", native_atomic_long_int_value);
     r.register(c, "longValue", "()J", native_atomic_long_get);
+    r.set_leaf(false);
     r.set_category(__prev_cat);
 }
 
