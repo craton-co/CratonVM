@@ -3493,7 +3493,7 @@ pub(crate) fn define_or_get_proxy_class(
             ordered.push(c);
         }
     }
-    let cache_key = (loader_id, ordered.clone());
+    let cache_key = (ctx.vm_identity(), loader_id, ordered.clone());
 
     {
         let guard = PROXY_CLASS_CACHE.read();
@@ -3655,10 +3655,21 @@ pub(crate) fn resolve_serialized_proxy_class(
     // an in-process write→read round-trip (e.g. Spring's
     // `SerializableTypeWrapper`) — always hits here because the write side
     // created the proxy class via `Proxy.newProxyInstance` first.
+    //
+    // "Regardless of the loader namespace" is deliberate; "regardless of the
+    // VM" is not. This scan ignores the key's `loader_id` on purpose, so it
+    // MUST filter on `vm_identity` explicitly — the `ClassId`s on both sides
+    // of the comparison, and the one returned, belong to one class manager.
+    // Left unfiltered it was the widest of the three ways this cache leaked
+    // a foreign proxy class.
+    let vm = ctx.vm_identity();
     {
         let guard = PROXY_CLASS_CACHE.read();
         if let Some(map) = guard.as_ref() {
-            for ((_ns, key), &cid) in map.iter() {
+            for ((row_vm, _ns, key), &cid) in map.iter() {
+                if *row_vm != vm {
+                    continue;
+                }
                 let mut key_set = key.clone();
                 key_set.sort_by_key(|c| c.as_u32());
                 key_set.dedup();

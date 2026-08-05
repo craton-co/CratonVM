@@ -38806,13 +38806,44 @@ fn native_array_new_instance_multi(
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WP2.5-B — generated-proxy-class cache, keyed on
-/// `(loader_id, ordered_iface_class_ids)`. One generated `$ProxyN` class
-/// per (loader, ordered-interface-list) — the JDK `ProxyGenerator` does the
-/// same, keying on interface order so `getInterfaces()` round-trips the
-/// user-requested order.
+/// `(vm_identity, loader_id, ordered_iface_class_ids)`. One generated
+/// `$ProxyN` class per (VM, loader, ordered-interface-list) — the JDK
+/// `ProxyGenerator` does the same minus the VM, keying on interface order so
+/// `getInterfaces()` round-trips the user-requested order.
+///
+/// The `vm_identity` is load-bearing, not hygiene. Every other component of
+/// this entry is a per-VM number: `loader_id` is a small per-VM integer, the
+/// key's `ClassId`s are minted per VM from zero, and **the VALUE is a
+/// `ClassId`** — a handle that means nothing outside the class manager that
+/// issued it. Without the partition, VM B asking for a proxy over its
+/// interface `ClassId(42)` hit VM A's entry and was handed VM A's generated
+/// `$ProxyN` id. `class_name_of_id` then answered `None` for it, which is the
+/// `?` in the `ClassCastException: ? cannot be cast to …` that made the
+/// proxy/annotation corpus tests flip in roughly half of all parallel runs —
+/// in both directions, since the borrowed id sometimes happened to satisfy
+/// the cast and sometimes not.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
-    Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
+    Option<
+        rustc_hash::FxHashMap<
+            (usize, u32, Vec<cratonvm_types::ClassId>),
+            cratonvm_types::ClassId,
+        >,
+    >,
 > = parking_lot::RwLock::new(None);
+
+/// Drop every generated-proxy-class row belonging to `vm_identity`. Called
+/// from `release_vm_native_state`; the rows hold `ClassId`s into a class
+/// manager that is going away.
+pub fn forget_vm_proxy_classes(vm_identity: usize) {
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, _), _| *vm != vm_identity);
+    }
+    let mut modules = PROXY_LOADER_MODULES.write();
+    if let Some(map) = modules.as_mut() {
+        map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
 
 /// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
 /// per-loader counters; a global counter is sufficient here since the
