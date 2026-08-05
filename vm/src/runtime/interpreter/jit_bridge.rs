@@ -1851,6 +1851,33 @@ pub(super) fn try_osr(
         cratonvm_jit::metrics::record_osr_event("osr_exited");
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             dbg_deopt_sink("osr-exit", &rframe, "");
+            // The lane's step 4, and the only place it can be answered: the
+            // artifact records a set of loop-boundary exit-map bcis
+            // (`osr_exit_points`) and until now nothing compared it with where
+            // exits are actually taken. Counted before the identity gate,
+            // because the classification is about THIS artifact's own view of
+            // the bci the frame names; whether the frame is ours to transfer is
+            // the separate question the gate below answers.
+            //
+            // Ungated, for the same reason `osr_entered` / `osr_exited` are: an
+            // exit at a bci this artifact records nothing for otherwise leaves
+            // no trace at all.
+            let exit_site = compiled.classify_osr_exit_site(rframe.bci);
+            cratonvm_jit::metrics::record_osr_event(exit_site.metric());
+            if matches!(exit_site, cratonvm_jit::osr_exit::OsrExitSite::Unrecorded)
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit at bci={} which {}.{}{} records neither an \
+                     exit map nor a deopt point for ({} exit points, {} deopt points)",
+                    rframe.bci,
+                    &*class_name_arc,
+                    &*method_name_arc,
+                    &*descriptor_arc,
+                    compiled.osr_exit_points.len(),
+                    compiled.deopt_points.len(),
+                );
+            }
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
             // could belong to a NESTED compiled callee of the OSR'd code whose
             // sentinel bubbled up here; transferring THAT frame into this live
