@@ -12172,6 +12172,64 @@ pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
     JIT_BAIL_SITE.with(|c| c.take())
 }
 
+/// The one bail site that is a MEASUREMENT rather than a verdict: the
+/// single-pass backend emitted past its code-buffer estimate.
+///
+/// Named as a constant because two places have to agree on it — the backend
+/// records it, and `try_compile` exempts it from the permanent bail-list so the
+/// next attempt can re-run at the measured size. A string literal in both
+/// places would silently stop matching the day either is reworded, and the
+/// symptom (methods quietly never compiling again) is the exact failure this
+/// exemption exists to prevent.
+pub const CODE_BUFFER_TOO_SMALL_SITE: &str = "code-buffer-estimate-too-small";
+
+/// Per-method code-buffer shortfalls measured by a previous compile attempt.
+///
+/// Keyed by the same `"<class>.<method>:<descriptor>"` string the backend
+/// receives as `method_key`. Small and write-once-per-overflow: only methods
+/// that actually overflowed ever appear, which on the workloads measured here
+/// is none at all.
+static CODE_BUFFER_SHORTFALLS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn code_buffer_shortfalls() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>> {
+    CODE_BUFFER_SHORTFALLS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Record that compiling `method_key` wanted `wanted` bytes of code buffer.
+///
+/// Keeps the LARGEST observation: a later attempt can take a shorter path
+/// through the same method (a callee that has since become inlinable, a guard
+/// that de-speculated), and sizing the next buffer from that smaller number
+/// would overflow again.
+pub fn note_code_buffer_shortfall(method_key: &str, wanted: usize) {
+    if method_key.is_empty() || wanted == 0 {
+        return;
+    }
+    let mut map = code_buffer_shortfalls().write();
+    let slot = map.entry(method_key.to_string()).or_insert(0);
+    *slot = (*slot).max(wanted);
+}
+
+/// The measured buffer size to use for `method_key`, if a previous attempt
+/// overflowed.
+///
+/// Doubled, because `wanted` UNDER-reports: it accumulates the bytes `emit`
+/// asked for, and an out-of-bounds `try_patch_*` adds nothing to it — so the
+/// true requirement is at least `wanted` and possibly more. Doubling converges
+/// in one step for every shape seen so far instead of burning a second
+/// `tier_fail_count` retry to discover the same thing again.
+pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
+    if method_key.is_empty() {
+        return None;
+    }
+    code_buffer_shortfalls()
+        .read()
+        .get(method_key)
+        .map(|w| w.saturating_mul(2))
+}
+
 /// Render a taken bail site for a diagnostic line.
 fn format_jit_bail_site(site: Option<(&'static str, u32, u32)>) -> String {
     match site {
@@ -13241,7 +13299,26 @@ pub fn try_compile_with_invokespecial_resolver(
         &admission,
     );
 
-    if result.is_none() && backend_attempted {
+    // Take once and use for all three sinks: the bail-list decision below, the
+    // trace line (only when `CRATONVM_DBG_JITC` is on), and the per-method
+    // store the end-of-run stats table reads (always, so the reason survives
+    // the compile). This used to be taken AFTER the bail-list decision, which
+    // is why that decision could not consult it.
+    let site = if result.is_none() {
+        take_jit_bail_site()
+    } else {
+        None
+    };
+    // A code-buffer overflow is a MEASUREMENT, not a verdict: the backend now
+    // records the size it wanted and the next attempt allocates from that
+    // measurement instead of the heuristic (`code_buffer_hint`). Bail-listing
+    // it would retire the method permanently on the strength of one wrong
+    // estimate — and since the estimate is the only thing that changes between
+    // the two attempts, the retry is exactly the experiment worth running.
+    // Every other backend-attempted `None` is a property of the class file and
+    // stays permanent.
+    let retryable = matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _)));
+    if result.is_none() && backend_attempted && !retryable {
         // The heavy backend path ran and returned None — treat as
         // permanent.  Future try_compile calls for this method
         // short-circuit immediately at the check above.
@@ -13252,10 +13329,6 @@ pub fn try_compile_with_invokespecial_resolver(
         );
     }
     if result.is_none() {
-        // Take once and use for both sinks: the trace line below (only when
-        // `CRATONVM_DBG_JITC` is on) and the per-method store the end-of-run
-        // stats table reads (always, so the reason survives the compile).
-        let site = take_jit_bail_site();
         if let Some(site) = site {
             record_jit_bail_reason(
                 &cached.class_name,
@@ -13660,11 +13733,39 @@ fn precise_virtual_invokes_enabled() -> bool {
     })
 }
 
+/// Thin `bool` wrapper over [`first_unsupported_precise_frame_site`], kept for
+/// the call sites that only need the verdict.
+#[cfg(target_arch = "x86_64")]
 fn precise_exception_frame_sites_supported(
     code: &[u8],
     code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
 ) -> bool {
+    first_unsupported_precise_frame_site(code, code_len, exception_table).is_none()
+}
+
+/// The first `(pc, opcode)` inside a protected range that can throw WITHOUT
+/// publishing a precise exceptional frame, or `None` when every one of them
+/// can.
+///
+/// Returning the site rather than a bare `bool` is what makes the refusal
+/// actionable. `reason=rbc6-handler-reads-unsafe-local` on its own names a
+/// policy, not a cause: the reader cannot tell whether the method was refused
+/// for an `ldc`, a `checkcast`, an array load, or an `invokedynamic`, and those
+/// need different work to admit. With the pc and opcode attached, the
+/// end-of-run stats table says which lowering to teach next — on the Hibernate
+/// concurrency workload five of the hottest still-interpreted methods share
+/// this refusal, and until now nothing said what they shared.
+///
+/// A malformed instruction stream also answers `Some` (at the offending pc,
+/// with the opcode that could not be measured): a walk that cannot find the
+/// next boundary has not proved anything about the rest of the method.
+#[cfg(target_arch = "x86_64")]
+fn first_unsupported_precise_frame_site(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> Option<(usize, u8)> {
     let covered = |pc: usize| {
         exception_table
             .iter()
@@ -13711,15 +13812,15 @@ fn precise_exception_frame_sites_supported(
             && may_throw_without_precise_frame(op)
             && !precise_frame_publishing_opcode(op)
         {
-            return false;
+            return Some((pc, op));
         }
         let len = x64::bytecode_len_at(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
-            return false;
+            return Some((pc, op));
         }
         pc += len;
     }
-    true
+    None
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -13926,6 +14027,30 @@ fn try_compile_inner(
         };
     }
 
+    /// [`jitc_bail`] for a refusal attributable to ONE bytecode, so the stats
+    /// table prints `site(pc=N,op=0xNN)` instead of a bare policy name. A
+    /// refusal that names only the policy tells the reader which gate fired but
+    /// not which lowering has to change to pass it.
+    macro_rules! jitc_bail_at {
+        ($site:expr, $pc:expr, $op:expr) => {
+            return {
+                crate::note_jit_bail_site_at($site, $pc, $op);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] resolver-bail site={}(pc={},op=0x{:02x}) {}.{}{}",
+                        $site,
+                        $pc,
+                        $op,
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor
+                    );
+                }
+                None
+            }
+        };
+    }
+
     /// A bail the compiler will never take back: the offending property is
     /// fixed by the class file, so retrying cannot change the answer. Sets
     /// `backend_attempted`, which is what routes the method onto the permanent
@@ -14067,13 +14192,15 @@ fn try_compile_inner(
         if unsafe_local {
             #[cfg(target_arch = "x86_64")]
             {
-                if !precise_handler_frames_enabled()
-                    || !precise_exception_frame_sites_supported(
-                        code,
-                        code_len,
-                        &cached.exception_table,
-                    )
-                {
+                let blocking_site = if precise_handler_frames_enabled() {
+                    first_unsupported_precise_frame_site(code, code_len, &cached.exception_table)
+                } else {
+                    // The relaxation is switched off wholesale, so no single
+                    // bytecode is at fault; `(0, 0)` renders as a bare site
+                    // name, which is the honest report.
+                    Some((0, 0))
+                };
+                if let Some((pc, op)) = blocking_site {
                     // A handler that reads a later local remains interpreted
                     // unless every throwing site in its protected ranges can
                     // publish that local through the precise exceptional-frame
@@ -14091,7 +14218,12 @@ fn try_compile_inner(
                     // middle of a 600M-call hot chain whose neighbours both
                     // compile. See tomcat/
                     // 30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md.)
-                    jitc_bail!("rbc6-handler-reads-unsafe-local");
+                    //
+                    // The pc/opcode is the actionable half: it names the ONE
+                    // lowering that would have to publish a precise frame for
+                    // this method to compile. See
+                    // `first_unsupported_precise_frame_site`.
+                    jitc_bail_at!("rbc6-handler-reads-unsafe-local", pc, op);
                 }
                 precise_exception_frames = true;
             }
@@ -18222,6 +18354,71 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod code_buffer_retry_tests {
+    use super::{
+        code_buffer_hint, note_code_buffer_shortfall, CODE_BUFFER_TOO_SMALL_SITE,
+    };
+
+    /// A method nobody ever measured has no hint, so the heuristic estimate
+    /// stands and codegen is byte-identical to before this machinery existed.
+    #[test]
+    fn an_unmeasured_method_has_no_hint() {
+        assert_eq!(code_buffer_hint("com/example/Never.touched:()V"), None);
+        // An empty key is what the legacy `compile()` test wrapper passes; it
+        // must not collide with a real method under the empty string.
+        note_code_buffer_shortfall("", 99_999);
+        assert_eq!(code_buffer_hint(""), None);
+    }
+
+    /// The recorded shortfall comes back doubled — `wanted` under-reports,
+    /// because an out-of-bounds `try_patch_*` never adds to it.
+    #[test]
+    fn a_measured_shortfall_comes_back_doubled() {
+        let key = "com/example/Big.method:(I)V";
+        note_code_buffer_shortfall(key, 6238);
+        assert_eq!(code_buffer_hint(key), Some(12_476));
+    }
+
+    /// Two attempts can take different paths through one method, so the
+    /// registry keeps the LARGEST measurement. Sizing the next buffer from a
+    /// later, smaller observation would overflow again — and that second
+    /// overflow would look identical to the first, which is how a "retry" that
+    /// never converges hides.
+    #[test]
+    fn a_smaller_later_measurement_does_not_shrink_the_hint() {
+        let key = "com/example/Bimodal.method:()V";
+        note_code_buffer_shortfall(key, 15_519);
+        note_code_buffer_shortfall(key, 4_000);
+        assert_eq!(code_buffer_hint(key), Some(31_038));
+    }
+
+    /// A zero `wanted` is not a measurement and must not install a hint of 0,
+    /// which `max` would silently ignore but which would make the registry
+    /// claim the method had been measured.
+    #[test]
+    fn a_zero_measurement_is_not_recorded() {
+        let key = "com/example/Zero.method:()V";
+        note_code_buffer_shortfall(key, 0);
+        assert_eq!(code_buffer_hint(key), None);
+    }
+
+    /// The exemption in `try_compile` matches on this constant, and the
+    /// backend records it. If either side were a bare literal, rewording one
+    /// would re-arm the permanent bail-list for overflowing methods — silently,
+    /// since the only symptom is a method that stops being compiled.
+    #[test]
+    fn the_retryable_site_name_is_shared_not_duplicated() {
+        assert_eq!(CODE_BUFFER_TOO_SMALL_SITE, "code-buffer-estimate-too-small");
+        // The predicate `try_compile` actually evaluates, spelled the same way.
+        let site: Option<(&'static str, u32, u32)> = Some((CODE_BUFFER_TOO_SMALL_SITE, 0, 0));
+        assert!(matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _))));
+        // …and a neighbouring backend bail is NOT exempted.
+        let other: Option<(&'static str, u32, u32)> = Some(("branch-target-not-an-instruction-boundary", 0, 0));
+        assert!(!matches!(other, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _))));
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -79,7 +79,28 @@ echo "bin=$BIN"
 echo "jdk=$JDK  xmx=$XMX  runs=$N  timeout=${TIMEOUT}s  extra=${EXTRA[*]:-none}  env=${ENVS[*]:-none}"
 echo "out=$OUT"
 
-hits_stale=0; hits_audit=0; hits_nsme=0; hits_crash=0; hits_pass=0
+# ---------------------------------------------------------------------------
+# Vacuity floor.
+#
+# `testQueryConcurrency` submits its 400 tasks per fork through
+# `ExecutorService.invokeAll` and then DISCARDS the returned Futures. invokeAll
+# captures a task's exception in its Future rather than propagating it, so a run
+# in which every single task threw on its first statement completes in seconds
+# and JUnit reports it GREEN. That is not hypothetical: an `HqlLexer.<clinit>`
+# failure ("Cannot read field \"target\" because \"t\" is null") poisons every
+# subsequent `createQuery`, and the run then reads `ok=1 failed=0` having
+# executed nothing at all. Scoring such a run as a pass is worse than scoring it
+# as a crash — a throughput fix would appear to have worked.
+#
+# `hibernate.show_sql` echoes one `Hibernate: ` line per statement prepared, so
+# the log carries a direct witness of work done. Measured on this fixture at 802
+# statements per fork (identical on HotSpot and CratonVM); require a third of
+# that, which is far below any real run and far above a poisoned one (0).
+FORKS="${FORKS:-50}"
+SQL_PER_FORK=802
+MIN_SQL=$(( FORKS * SQL_PER_FORK / 3 ))
+
+hits_stale=0; hits_audit=0; hits_nsme=0; hits_crash=0; hits_pass=0; hits_vacuous=0
 for ((i = 1; i <= N; i++)); do
   LOG="$OUT/run-$i.log"
   t0=$(date +%s)
@@ -95,18 +116,37 @@ for ((i = 1; i <= N; i++)); do
   s=$(grep -c "Stale pointer detected" "$LOG")
   a=$(grep -c "points into RECLAIMED memory" "$LOG")
   m=$(grep -c "NoSuchMethodError" "$LOG")
+  q=$(grep -c "^Hibernate: " "$LOG")
   r=$(grep -m1 "^@@RESULT " "$LOG")
 
   [ "$s" -gt 0 ] && hits_stale=$((hits_stale + 1))
   [ "$a" -gt 0 ] && hits_audit=$((hits_audit + 1))
   [ "$m" -gt 0 ] && hits_nsme=$((hits_nsme + 1))
+  verdict="${r:-NO-@@RESULT (process died)}"
   if [ -z "$r" ]; then hits_crash=$((hits_crash + 1)); else
-    case "$r" in *"failed=0 aborted=0"*) hits_pass=$((hits_pass + 1));; esac
+    case "$r" in
+      *"failed=0 aborted=0"*)
+        # A green verdict is only a pass if the run actually ran the workload.
+        if [ "$q" -lt "$MIN_SQL" ]; then
+          hits_vacuous=$((hits_vacuous + 1))
+          verdict="VACUOUS (green but only $q < $MIN_SQL statements) -- $r"
+        else
+          hits_pass=$((hits_pass + 1))
+        fi
+        ;;
+    esac
   fi
 
-  printf 'run %-3s rc=%-4s %4ss  stale=%-5s reclaimed-slot=%-5s NSME=%-5s  %s\n' \
-    "$i" "$rc" "$((t1 - t0))" "$s" "$a" "$m" "${r:-NO-@@RESULT (process died)}"
+  printf 'run %-3s rc=%-4s %4ss  stale=%-5s reclaimed-slot=%-5s NSME=%-5s sql=%-6s  %s\n' \
+    "$i" "$rc" "$((t1 - t0))" "$s" "$a" "$m" "$q" "$verdict"
 done
 
 echo "---"
-echo "runs=$N  stale_pointer=$hits_stale  reclaimed_slot_audit=$hits_audit  NSME=$hits_nsme  no_result=$hits_crash  clean_pass=$hits_pass"
+echo "runs=$N  stale_pointer=$hits_stale  reclaimed_slot_audit=$hits_audit  NSME=$hits_nsme  no_result=$hits_crash  clean_pass=$hits_pass  vacuous_green=$hits_vacuous"
+# A vacuous green is a FAILURE of the run, not a curiosity: it means the class
+# reported success without doing its work. Exit non-zero so a caller that only
+# checks the status code cannot mistake it for a clean sweep.
+if [ "$hits_vacuous" -gt 0 ]; then
+  echo "ERROR: $hits_vacuous of $N run(s) reported success without executing the workload." >&2
+  exit 1
+fi
