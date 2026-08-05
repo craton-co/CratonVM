@@ -15057,7 +15057,11 @@ mod tests {
         lo.emit_prologue();
         let after_prologue = lo.buf.pos();
         lo.buf.emit(&[0, 0, 0, 0]);
-        lo.call_exc_patches.push(after_prologue);
+        // `(patch_offset, throw_bci)` — the stub is emitted once per distinct
+        // bci and stamps it. Which bci this exit carries is irrelevant to what
+        // the test measures (that the stub restores what the prologue saved),
+        // so 0.
+        lo.call_exc_patches.push((after_prologue, 0));
         lo.emit_call_exc_stub();
         let code = lo.buf.as_slice().to_vec();
         assert_eq!(
