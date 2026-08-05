@@ -103,6 +103,51 @@ Eliminations, so the next person does not redo them:
   garbage) but the run did not finish inside 900 s either, so it neither
   confirms nor rules that out. This is the most promising next thread.
 
+
+## 2026-08-05 UPDATE: on current `dev` this is no longer a heap failure
+
+Re-run against `dev` of 2026-08-05 (+882 commits), the test **no longer OOMs at
+all** — it runs to completion (`rc=0`, 1677 s) and fails with
+
+```
+java.lang.RuntimeException: java.lang.ArrayIndexOutOfBoundsException
+  at com.sun.tools.javac.api.JavacTaskImpl.invocationHelper
+Caused by: java.lang.ArrayIndexOutOfBoundsException
+  at java.nio.CharBuffer.putBuffer(CharBuffer.java:1143)
+  at java.nio.CharBuffer.put(CharBuffer.java:1050)
+  at com.sun.tools.javac.file.BaseFileManager.decode(BaseFileManager.java:366)
+```
+
+That is a **VM correctness bug, not a footprint one**: a heap `CharBuffer`
+carried `address = -1` instead of `ARRAY_CHAR_BASE_OFFSET` (16), so every
+`CharBuffer.put(CharBuffer)` threw. Fixed separately (`cb_write_hb` in
+`native-builtins/src/phases_late/charset_buffers.rs`); repro in
+`docs/known-issues/repros/charbuffer-address/`. javac's `BaseFileManager.decode`
+grows its CharBuffer and copies the old one in, so every source file it reads
+hit it.
+
+Something in dev's 882 commits — plausibly the 2026-08-04 `defrag-promote`
+change, which the flag table describes as replacing a non-moving young sweep
+that "promoted only" a subset — appears to have relieved the heap pressure this
+page was written about. **The footprint analysis below still describes real
+object widths, but it is no longer the thing failing this test.**
+
+### Compressed oops measured, and it did NOT help
+
+With hole 1's unblock in tree, the same binary was run both ways on the same
+box, same test:
+
+| | result |
+|---|---|
+| `CRATONVM_COMPRESSED_OOPS` unset | completes in 1677 s (fails on the CharBuffer bug) |
+| `CRATONVM_COMPRESSED_OOPS=1` | **does not finish** — killed at the 2700 s ceiling |
+
+So narrowing references is not a demonstrated win for this workload. Part of
+that is self-inflicted: hole 1's unblock refuses the inlined String intrinsics
+under narrow oops, which is a real throughput cost. Do not cite compressed oops
+as the fix for this page without re-measuring after hole 1 has a proper narrow
+arm in `emit_load_string_value_ptr` rather than the blanket refusal.
+
 ## Why CratonVM needs more heap: object width, measured
 
 Per-object *sizes* from `GC.class_histogram` are exact regardless of liveness
