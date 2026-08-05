@@ -1359,6 +1359,16 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
+                    // `AsynchronousFileChannel.write(buf, position)` is a
+                    // POSITIONAL write: it seeks to `position` below and
+                    // overwrites that range, leaving the rest of the file
+                    // intact. Truncating here would discard everything past
+                    // the written range on every call — so state the `false`
+                    // explicitly rather than leaning on the default, which is
+                    // what `clippy::suspicious_open_options` asks for. This is
+                    // a no-op at runtime: `truncate` already defaulted to
+                    // false, so behaviour is unchanged.
+                    .truncate(false)
                     .open(&path)
                 {
                     use std::io::Seek;

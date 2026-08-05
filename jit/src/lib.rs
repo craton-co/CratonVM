@@ -16518,6 +16518,32 @@ fn try_compile_inner(
                         // delete the literals. Do NOT delete the list before
                         // that resolver exists — every entry here is a measured
                         // hot path.
+                        //
+                        // The `String.toLowerCase(Locale)` ladder that used to
+                        // sit beside this one IS gone (2026-08-04). It was the
+                        // third copy of the forced-native `java/lang/String`
+                        // policy — `check_override` forced that name, the warm
+                        // gate refused it, and this bound it: three paths,
+                        // three answers for one method.
+                        //
+                        // This one stays, and the difference is not that it is
+                        // a different class — it is that its triple really IS
+                        // registered `NativeKind::Intrinsic`
+                        // (`register_string_latin1_natives`), so binding it is
+                        // §1.4's reviewed exception rather than a native
+                        // shadowing bytecode. It also accelerates the real
+                        // `String.toLowerCase(Locale)` bytecode instead of
+                        // replacing it, and its input is Latin-1 by
+                        // construction, so it cannot reach the surrogate cases
+                        // that made the `String`-level native diverge.
+                        //
+                        // That premise is a KIND, and this ladder cannot check
+                        // kinds — so it is pinned by
+                        // `the_jit_latin1_lower_ladder_binds_a_reviewed_intrinsic`
+                        // in `vm/tests/wp8_10_9_string_contains_native.rs`.
+                        // Re-tagging the native `Bridge` would silently turn
+                        // this bind into a §1.4 violation that only compiled
+                        // frames can observe.
                         let entry = direct_native_helper(
                             &STRING_LATIN1_LOWER_DIRECT_FN,
                             &class_name,

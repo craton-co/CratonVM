@@ -5,6 +5,65 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-05 — the number is now PINNED, and re-measured
+
+Still open, and still nothing reclassified. What is new is that the number can
+no longer rise unnoticed: wave-2 lane L6 shipped a slack-free ratchet on it
+([`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md)).
+
+```sh
+JAVA_HOME=<JDK25> sh regression-suite/bridge-ratchet.sh
+sh regression-suite/bridge-ratchet.sh --selftest   # hermetic: no VM, no JDK
+```
+
+It lives in `regression-suite/` and not in a unit test because the question needs
+a real JDK image at measurement time. It boots the VM, takes the schema-3 census
+itself (`--explain-jdk-only` — without it the column this record is about is
+null), and scores it against `scripts/baselines/jdk-only-bridge-ratchet.json`,
+keyed `<jdk-feature>/<os>` because the registrars are platform-conditional. A key
+it has no entry for is a **refusal**, not a pass.
+
+**Re-measured on dev `d010d611b4`, JDK 25.0.3, linux — every count in the
+2026-08-04 table below is superseded by this one.** The shape is unchanged; the
+tree moved (L1, L2, L9 and the `String` residuals landed).
+
+**11,916 registrations**, not 11,909: 687 `Intrinsic`, 10,842 `Bridge`, 387
+`SyntheticStub`.
+
+| what the image says about the `Bridge` target | rows | share | (was 08-04) |
+|---|---:|---:|---:|
+| `ACC_NATIVE` — a genuine bridge, §1.5 | 773 | 7% | 760 |
+| concrete bytecode (`has_code`) — a **shadow** | 4,755 | 44% | 4,796 |
+| abstract method — intercepts every implementor | 1,321 | 12% | 1,321 |
+| class present, method **not declared** | 2,497 | 23% | 2,489 |
+| class absent from the image | 1,496 | 14% | 1,478 |
+| **no `ACC_NATIVE` target** | **10,069** | **93%** | 10,084 |
+
+**Two numbers are ratcheted, not one.** `10,069` and — separately — the `4,755`
+shadowing rows, because that is the subgroup that has already produced a defect
+(§7 step 3's decline reaching `UnsatisfiedLinkError` instead of the bytecode; see
+*The first thing it found* below) and because the aggregate alone would let a
+shadow trade places with an abstract-method intercept invisibly. A third
+assertion, `total_rows >= 8_000`, is a **collapse detector, not a measurement**.
+
+**`kind_stated` is no longer false on all rows — and is still false on every
+`Bridge` row.** 9 of the 687 `Intrinsic` rows now state their kind: the
+`java/lang/String` natives L9 migrated to `register_with_kind`. All 10,842
+`Bridge` registrations, including all 10,069 unadjudicated ones, still inherit
+theirs. So the sentence below — "`register_with_kind` exists and has zero
+callers" — is out of date by nine, and step 2's migration is otherwise still
+where it was.
+
+**Where they come from now** (top five registering files, `Bridge` rows with no
+`ACC_NATIVE` target): `native-collections/src/lib.rs` 1,350 ·
+`native-builtins/src/lib.rs` 1,097 · `native-builtins/src/lang_misc.rs` 1,022 ·
+`phases_late/nio_file.rs` 406 · `phases_late/foreign_ffm.rs` 367. Re-derive with
+`python3 scripts/jdk-only-adjudicate.py <census.json>` section 4; section 7 is
+the machine-readable block the ratchet freezes.
+
+**The under-tagging direction is still clean:** zero `SyntheticStub` rows target
+a method the image declares `ACC_NATIVE`.
+
 ## What changed on 2026-08-04 — step 2 exists, and the blocking evidence gap is closed
 
 *What specifically must change* lists three steps. Step 1 (provenance) was
