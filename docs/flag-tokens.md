@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-402 tokens.
+403 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -111,6 +111,7 @@ export inherited from a parent shell.
 | `classpath` | `CRATONVM_DBG_CLASSPATH` |
 | `cleaners` | `CRATONVM_DBG_NO_CLEANERS` |
 | `clinit-fail` | `CRATONVM_DBG_CLINIT_FAIL` |
+| `clinit-order` | `CRATONVM_DBG_CLINIT_ORDER` |
 | `clone` | `CRATONVM_DBG_CLONE` |
 | `coerce` | `CRATONVM_DBG_COERCE` |
 | `compact-inline` | `CRATONVM_DBG_COMPACT_INLINE` |
