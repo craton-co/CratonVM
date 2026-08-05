@@ -492,7 +492,7 @@ impl AmbiguousLocalKinds {
 /// Forward reaching-kind dataflow for the ambiguous locals only.
 ///
 /// See the module-level rationale on [`AmbiguousLocalKinds`] and the fix note
-/// in `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`. Uses the same
+/// in the retired `h2-jitban-longtail1` write-up. Uses the same
 /// successor relation as the precise oop-mask pass so the two agree about
 /// control flow, and seeds every exception-handler entry TOP because a handler
 /// is reachable from any point in its protected range.

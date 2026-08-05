@@ -3,7 +3,7 @@
 
 //! Panama FFI native method registrations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1951,7 +1951,7 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
     let rnl = "jdk/internal/loader/RawNativeLibraries";
 
     // static native boolean load0(RawNativeLibraryImpl impl, String name)
-    r.register(
+    r.register_with_kind(
         rnl,
         "load0",
         "(Ljdk/internal/loader/RawNativeLibraries$RawNativeLibraryImpl;Ljava/lang/String;)Z",
@@ -1975,6 +1975,7 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
                 Err(_) => Ok(Some(Value::Int(0))),
             }
         },
+        NativeKind::Bridge,
     );
 
     // static native void unload0(String name, long handle)
@@ -1998,7 +1999,7 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
     //
     // Real `unload0` returns void and reports nothing, so the `false` an
     // implementation without an unload path returns is intentionally ignored.
-    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |ctx, args| {
+    r.register_with_kind(rnl, "unload0", "(Ljava/lang/String;J)V", |ctx, args| {
         let handle = match args.get(1) {
             Some(Value::Long(n)) => *n,
             Some(Value::Int(n)) => *n as i64,
@@ -2008,10 +2009,10 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
         // handle of 0 ("not loaded") decodes to -1 and is refused.
         let _unloaded = ctx.unload_native_library(handle - 1);
         Ok(None)
-    });
+    }, NativeKind::Bridge);
 
     // static native long findEntry0(long handle, String name)  (in NativeLibrary)
-    r.register(
+    r.register_with_kind(
         "jdk/internal/loader/NativeLibrary",
         "findEntry0",
         "(JLjava/lang/String;)J",
@@ -2035,6 +2036,7 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
             let addr = ctx.find_native_symbol(lib_index, &name).unwrap_or(0);
             Ok(Some(Value::Long(addr as i64)))
         },
+        NativeKind::Bridge,
     );
 }
 

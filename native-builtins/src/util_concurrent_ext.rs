@@ -791,6 +791,12 @@ fn native_lock_support_get_blocker(
     Ok(Some(Value::Object(None)))
 }
 
+/// `#[track_caller]` so the class-origin census's `requested_by` names the
+/// native that wanted the shape, not this one forwarding line — see the
+/// matching note on `NativeContext::ensure_synthetic_class`. This is the
+/// single busiest fabrication funnel in the workspace (~2,000 call sites), so
+/// without it the census cannot name a single one of them.
+#[track_caller]
 pub(crate) fn alloc_concurrent_synthetic(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -845,6 +851,71 @@ pub(crate) fn alloc_concurrent_synthetic(
             let cid = ctx.ensure_synthetic_class(class_name, num_fields);
             ctx.alloc_object(cid, num_fields)
         }
+    }
+}
+
+/// The fallible spelling of [`alloc_concurrent_synthetic`] — same operation,
+/// with the refusal `--jdk-only` requires.
+///
+/// [`alloc_concurrent_synthetic`] reaches `ensure_synthetic_class`, whose
+/// signature has no error channel, so under `--jdk-only` it records a
+/// `CompatibilityClassRequested` violation and fabricates anyway. This one goes
+/// through `try_ensure_synthetic_class`, so the refusal reaches the caller as a
+/// `ClassNotFoundException` naming the class.
+///
+/// Under the default `Compatible` mode the two are byte-for-byte identical.
+///
+/// Every native returning `MethodCallResult` should prefer this spelling;
+/// `ClassIdentityError` converts with `?`.
+#[track_caller]
+pub(crate) fn try_alloc_concurrent_synthetic(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Structurally identical to the infallible spelling above; only the two
+    // `ensure_synthetic_class` arms differ, and only in that they ask the
+    // policy rather than override it.
+    match ctx.ensure_class_initialized(class_name) {
+        Ok(class_id) => {
+            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            let cid = if resolved_name == class_name || class_name == "java/lang/Object" {
+                class_id
+            } else {
+                match ctx.class_id_by_name(class_name) {
+                    Some(id) => id,
+                    None => refused_class(ctx, class_name, num_fields)?,
+                }
+            };
+            let real = ctx.class_num_total_fields(cid);
+            let n = num_fields.max(real);
+            Ok(ctx
+                .try_alloc_object_gc_safe(cid, n)
+                .unwrap_or_else(|| ctx.alloc_object(cid, n)))
+        }
+        Err(_) => {
+            let cid = refused_class(ctx, class_name, num_fields)?;
+            Ok(ctx.alloc_object(cid, num_fields))
+        }
+    }
+}
+
+/// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
+/// Java throwable.
+///
+/// The plain `?` conversion yields `MethodCallFailed::InternalError`, which the
+/// exception model defines as uncatchable and fatal — the wrong shape for a
+/// policy refusal. Contract §5 asks for the specification's
+/// `NoClassDefFoundError`, which is what `refusal_to_java_failure` builds.
+#[track_caller]
+fn refused_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<cratonvm_types::ClassId, MethodCallFailed> {
+    match ctx.try_ensure_synthetic_class(class_name, num_fields) {
+        Ok(id) => Ok(id),
+        Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
     }
 }
 

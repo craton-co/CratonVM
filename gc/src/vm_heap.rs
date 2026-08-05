@@ -2182,6 +2182,15 @@ impl VmHeap {
     /// G1/ZGC return `None`: their liveness is region/registry based and
     /// `is_addr_live` already answers exactly, so there is no free-list view
     /// to consult.
+    /// H2-CID0 — see [`GenerationalHeap::live_holders_of`]. Empty for every
+    /// non-generational backend.
+    pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
+        match self {
+            VmHeap::Generational(h) => h.live_holders_of(addr, cap),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
         match self {
             VmHeap::Generational(h) => h.reclaimed_hole_at(addr),
