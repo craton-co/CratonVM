@@ -228,6 +228,23 @@ wakes), which is what closes out the locals half of the same question.
   the fixture directory every run dies in ~1 s in
   `JdbcConnectionContext.<clinit>` and scores as a crash).
 
+## 5b. What was run to gate this
+
+* `root_snapshot_screen_tests::operand_stack_roots_use_the_same_screen_as_locals`
+  — green on the fix, `1 of 2 survived` on the re-injected pre-fix screen.
+* `cargo test --release -p cratonvm-gc --lib` — 966/966.
+* `cargo test --release -p cratonvm-vm --lib` — 2384 pass, 2 fail:
+  `native::jni::tests::jni_function_table_extended_to_234` and
+  `jni_nio_slots_not_stub`. **Baselined**, not assumed: both fail identically
+  and deterministically in a clean `origin/dev` worktree
+  (`CratonVM-jnibase-20260804`), standalone as well as in the full run. They
+  read a static JNI function table for stub pointers; nothing in this change
+  touches `vm/src/native/jni.rs` or anything that table is built from.
+* `probes/BlockedFrameRootProbe.java` — 0/8200 corrupted and zero detector
+  hits, under JIT and `--nojit`, before and after merging `origin/dev`.
+* `BinTreesClassic` d=16/d=18 — checksums exact, CPU delta as recorded in §3.
+* `SmokeTests` solo, post-merge — unchanged: the 120 s throughput timeout.
+
 ## 6. Repro
 
 ```
