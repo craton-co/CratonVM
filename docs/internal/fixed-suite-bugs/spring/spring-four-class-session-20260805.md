@@ -15,6 +15,16 @@
 | `test.context.aot.AotIntegrationTests` | 4 found / 2 succ / 2 skip | **same** | was FAIL |
 | `beans.factory.aot.BeanRegistrationsAotContributionTests` | 14/14 | **13 of 14** | see residual |
 
+The first three rows are whole-class runs of the final binary against the
+repaired classpath. The BeanRegistrations row is from **per-method** runs
+(`KRunM`): the twelve cheap methods and `applyToWithLargeBeanDefinitions
+CreatesSlices` all pass, and `applyToWithVeryLargeBeanDefinitions
+CreatesSeparateSourceFiles` fails. Three attempts at a single whole-class run
+were killed by the host rather than by the VM — the box was at load average
+85-146 with other sessions' work and the OOM killer active — so the per-method
+figure is what is actually evidenced, and the whole-class number is not
+claimed.
+
 The single residual is
 `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`, filed as
 [`../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md`](../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md).
