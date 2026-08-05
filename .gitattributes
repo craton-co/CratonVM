@@ -19,3 +19,10 @@
 apps/hib-suite-runner/run-hib.sh text eol=lf
 apps/hib-suite-runner/class-overrides.tsv text eol=lf
 apps/hib-suite-runner/known-benign-aborts.tsv text eol=lf
+
+# The strict-corpus baselines are read line-by-line by
+# scripts/jdk-only-strict-probes.sh under bash. A trailing CR ends up inside
+# the comparison key, so every baselined entry reads as absent and every
+# observed one reads as new -- the ratchet would fire on all 28 at once, on
+# Windows only. Same hazard, same fix, as the shell scripts above.
+scripts/baselines/*.txt text eol=lf

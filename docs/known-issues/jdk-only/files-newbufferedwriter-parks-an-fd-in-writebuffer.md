@@ -1,6 +1,8 @@
 # The `java.io` Reader/Writer chain parks VM-internal values on JDK fields
 
-**Status:** OPEN, filed 2026-08-05, widened 2026-08-05 from one class to four. Found by tracing the one *live* access site
+**Status:** the `Files.newBufferedWriter` half is **FIXED 2026-08-05, by
+deletion**. The three synthetic-only siblings remain OPEN — see
+"The other three" below. Found by tracing the one *live* access site
 in the `java/io/BufferedWriter` row of the L4 shadow-layout census
 (`CRATONVM_DBG=overlay,overlay-all,overlay-bt=BufferedWriter`, 402 reads per
 run). **Kind 3** in the taxonomy of
@@ -44,14 +46,48 @@ Both are the same shape as the `VarHandle.vform` finding: it does not fault
 *only* because our natives intercept every operation, and the whole direction of
 `--jdk-only` is to stop intercepting.
 
-## The fix shape
+## What it turned out to be, and what was done
 
-Not a slot renumber — there is nowhere correct in a real `BufferedWriter` to put
-an fd. It wants the **side table keyed by the object** that `LoaderMeta`
-(`native-builtins/src/classloader.rs`) and `vh_meta_put` already use, plus a
-`bw_has_synthetic_layout`-style predicate asked by a field NAME the real class
-declares and the stub does not (`cb`, `nChars` or `maxChars` all work), so the
-discriminator stops depending on the *value* found in a slot the JDK owns.
+The plan above was a side table keyed by the object, plus a name-based
+predicate. Measuring the flagged arm before writing it changed the answer.
+
+**The fd write was already default-OFF.** `open_buffered_writer` was registered
+only under `CRATONVM_SYNTHETIC_BUFFERED_WRITER=1`; since 2026-06-18 the default
+has run the real `BufferedWriter(OutputStreamWriter(Files.newOutputStream(p)))`
+bytecode. So the 402 slot-0 reads per run in the original census were the
+*discriminator*, not the write.
+
+**The flagged arm had no working configuration left.**
+`probes/BufferedWriterDiscriminatorProbe` under
+`CRATONVM_SYNTHETIC_BUFFERED_WRITER=1` produced **zero bytes** for every one of
+its five `Files.newBufferedWriter` writes, against a default arm that is
+byte-identical to HotSpot on all thirteen lines. The overlay trace shows why,
+and it is not the layout: the fd is written once
+(`set_field slot=0 value=Int(3)`) and **every subsequent read of that slot on
+the same object returns `Object(None)`** — destroyed before its first use.
+
+So the path was **deleted**, along with the flag: it was the only writer of this
+overlay in a default build, it had been documented as data-losing for six weeks,
+and relocating a dead path's fd to a side table would have been polish on
+something nobody can run.
+
+**The discriminator's premise was separately false.** `bw_delegate_out` asked
+"does raw slot 0 hold an `Int`?" under a doc comment claiming that slot holds
+"the `lock`/`out` Writer set by the JDK constructor". No JDK lays it out that
+way — `java.io.Writer` declares `writeBuffer` first and `lock` second, so slot 0
+is the `char[]` and `out` is slot 2. It answered correctly anyway for an
+unrelated reason: bytecode `new` writes an explicit `Object(None)` into every
+reference slot, because an all-zero slot decodes as `Int(0)` and **not** as null
+(the R-niche rule in `gc/src/gen_heap.rs`). Any BufferedWriter arriving from an
+allocator that skips those defaults — `alloc_object` without descriptors, which
+is what `alloc_concurrent_synthetic` uses — would have read `Int(0)` and been
+classified as fd-backed **on fd 0**. That read is now
+`#[cfg(feature = "synthetic-jdk")]`-gated, so the default build never asks a
+JDK-owned slot who owns the object.
+
+`java/io/BufferedWriter` slot 0 keeps its `_vm0` model row even so, because
+`native_bw_init` in the `synthetic-jdk` build still parks an fd there. That is
+the same standing-hazard reading the three siblings below carry.
 
 The model itself was corrected on 2026-08-05 — `out` now sits at index 2, where
 the real class declares it — and slot 0 was first left **anonymous** rather than

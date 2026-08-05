@@ -737,24 +737,12 @@ impl Compiler {
         {
             return;
         }
-        let start = self.shadow_fetch_start;
-        let end = self.shadow_fetch_end;
-        let len = end - start;
-        if len >= 2 && (len - 2) <= 127 {
-            // JMP rel8 from (start+2) to end; pad the skipped body with NOPs.
-            let _ = self.buf.try_patch_byte(start, 0xEB);
-            // `len - 2 <= 127` is already established by the `if`; the helper
-            // is here so no rel8 displacement in this crate is written by a
-            // hand-rolled cast (see `ExecutableBuffer::patch_rel8_or_bail`).
-            Self::patch_rel8_or_bail(&mut self.buf, start + 1, (len - 2) as i64);
-            for i in (start + 2)..end {
-                let _ = self.buf.try_patch_byte(i, 0x90);
-            }
-        } else {
-            for i in start..end {
-                let _ = self.buf.try_patch_byte(i, 0x90);
-            }
-        }
+        // Shared with the IR backend's `finish_lazy_thread_fetch`, which erases
+        // the same dead fetch for the same reason. It open-coded only the
+        // NOP-fill half of this for a while, and a 46-NOP entry path cost
+        // `CratonBench fib` ~2x; one helper keeps them from drifting again.
+        self.buf
+            .erase_range_with_jump_over(self.shadow_fetch_start, self.shadow_fetch_end);
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret

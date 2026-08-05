@@ -1653,6 +1653,86 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// Answering `0` immediately for anything that is not a Stream (the old
 /// behaviour) turned that park into a busy-spin that burned a core for the
 /// whole SO_TIMEOUT.
+/// `sun/nio/ch/IOUtil.configureBlocking(FileDescriptor, boolean)`
+///
+/// `NioSocketImpl` flips the OS fd to non-blocking when it enforces a
+/// Java-level SO_TIMEOUT. `net_read0` then returns IOStatus.UNAVAILABLE and
+/// `Net.poll` handles the timed wait. This must alter the real socket; a no-op
+/// makes read0 block until peer close and incorrectly report EOF.
+///
+/// # DEADLOCK (2026-08-05) — the OTHER half of the cycle `net_poll` closed
+///
+/// The listener arm used to run `listener.lock().set_nonblocking(..)` with the
+/// registry read guard still alive, which is the lock order
+///
+/// ```text
+///     registry-read  ->  listener-mutex
+/// ```
+///
+/// while `net_accept` takes the opposite one: it holds `listener_handle.lock()`
+/// across `net_listener_still_registered`, for the whole of a blocking accept.
+/// Two orders is a cycle, and `parking_lot`'s fair `RwLock` is what closes it —
+/// once any writer is queued (`register_handle` from a `socket0`, `remove_fd`
+/// from a close) new readers block, so the accept thread's nested read waits, it
+/// never releases the listener mutex, this thread never gets that mutex, and the
+/// read guard it is still holding never drops. All three park at 0% CPU, which
+/// is the signature of the retired `bounded-socket-operations-hang-about-one-run
+/// -in-five` record. Reachable from any `ServerSocketChannel.configureBlocking`
+/// next to an accept.
+///
+/// The fix is this file's own convention, stated at a dozen other sites as
+/// "clone the Arc under a brief read-lock, drop the map lock, then do the work".
+/// Every handle variant is an `Arc`, so hoisting the clone out costs one
+/// refcount bump and removes the order entirely.
+fn net_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = obj_arg(args, 0)?;
+    let blocking = args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0;
+    let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
+        dbgnet!("configureBlocking: FileDescriptor has no fd id (blocking={blocking})");
+        return Ok(None);
+    };
+    // Record the request regardless of the fd's current registry state. If the
+    // fd is still `Unbound` (pre-`connect0`) this is the ONLY record of it —
+    // see `net_pending_nonblocking`.
+    net_pending_nonblocking().write().insert(fd, !blocking);
+    enum ConfigureTarget {
+        Stream(Arc<TcpStream>),
+        Listener(Arc<Mutex<TcpListener>>),
+        Deferred(&'static str),
+    }
+    let target = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(stream)) => ConfigureTarget::Stream(Arc::clone(stream)),
+            Some(NetSocketHandle::Listener(listener)) => {
+                ConfigureTarget::Listener(Arc::clone(listener))
+            }
+            Some(NetSocketHandle::Unbound) => ConfigureTarget::Deferred("unbound"),
+            Some(NetSocketHandle::Closed) => ConfigureTarget::Deferred("closed"),
+            None => ConfigureTarget::Deferred("MISSING"),
+        }
+    };
+    match target {
+        ConfigureTarget::Stream(stream) => {
+            dbgnet!("configureBlocking fd={fd:#x} kind=stream blocking={blocking}");
+            stream
+                .set_nonblocking(!blocking)
+                .map_err(|error| net_err("configureBlocking", error))?
+        }
+        ConfigureTarget::Listener(listener) => {
+            dbgnet!("configureBlocking fd={fd:#x} kind=listener blocking={blocking}");
+            listener
+                .lock()
+                .set_nonblocking(!blocking)
+                .map_err(|error| net_err("configureBlocking", error))?
+        }
+        ConfigureTarget::Deferred(kind) => {
+            dbgnet!("configureBlocking fd={fd:#x} kind={kind} blocking={blocking} deferred");
+        }
+    }
+    Ok(None)
+}
+
 fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let events = int_arg(args, 1);
@@ -1687,6 +1767,20 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // The guard's scope now ends before any call that can re-enter the
     // registry. Cloning the handle first is cheap: every variant is an `Arc`
     // or a unit.
+    //
+    // FOUND TWICE, INDEPENDENTLY, THE SAME DAY, with the same mechanism and the
+    // same fix. The other diagnosis came from the VM's own watchdog rather than
+    // gdb — `--stack-dump-on-timeout=45` inside `timeout 90`, 6 hangs in 25
+    // runs, all six frame dumps identical (accept thread last in `Net.poll`,
+    // main thread last in `Net.socket0`) — and it carries the A/B this comment
+    // does not: 12 interleaved waves of 10 concurrent probes, **44/120 hangs
+    // before, 0/120 after**. It also establishes that THIS FIX ALONE IS NOT
+    // SUFFICIENT: with only the guard release, the same harness still scored
+    // 10/60. What reaches zero is this plus the EINTR arm in `net_poll_raw`
+    // below, which landed separately on 2026-08-02 for an unrelated symptom.
+    // See the retired `bounded-socket-operations-hang-about-one-run-in-five`
+    // record, which also closes the second half of the cycle in
+    // `net_configure_blocking`.
     let target = {
         let map = net_sockets().read();
         match map.get(&fd) {
@@ -3037,7 +3131,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         r.register(cls, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
         r.register(cls, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     }
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/SocketDispatcher",
         "close0",
         "(I)V",
@@ -3047,6 +3141,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     r.register(
         "sun/nio/ch/SocketDispatcher",
@@ -3187,54 +3282,13 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // offsets; for us it's a no-op since we use name-based field lookup.
     r.register_with_kind(net, "initIDs", "()V", |_c, _a| Ok(None), NativeKind::Bridge);
 
-    // `NioSocketImpl` flips the OS fd to non-blocking when it enforces a
-    // Java-level SO_TIMEOUT. `net_read0` then returns IOStatus.UNAVAILABLE and
-    // `Net.poll` handles the timed wait. This must alter the real stream; a
-    // no-op makes read0 block until peer close and incorrectly report EOF.
+    // See `net_configure_blocking` for the contract and for the lock-order
+    // deadlock its listener arm used to carry.
     r.register_with_kind(
         "sun/nio/ch/IOUtil",
         "configureBlocking",
         "(Ljava/io/FileDescriptor;Z)V",
-        |ctx, args| {
-            let fd_obj = obj_arg(args, 0)?;
-            let blocking = args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0;
-            let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
-                dbgnet!("configureBlocking: FileDescriptor has no fd id (blocking={blocking})");
-                return Ok(None);
-            };
-            // Record the request regardless of the fd's current registry
-            // state. If the fd is still `Unbound` (pre-`connect0`) this is
-            // the ONLY record of it — see `net_pending_nonblocking`.
-            net_pending_nonblocking().write().insert(fd, !blocking);
-            let map = net_sockets().read();
-            match map.get(&fd) {
-                Some(NetSocketHandle::Stream(stream)) => {
-                    dbgnet!("configureBlocking fd={fd:#x} kind=stream blocking={blocking}");
-                    stream
-                        .set_nonblocking(!blocking)
-                        .map_err(|error| net_err("configureBlocking", error))?
-                }
-                Some(NetSocketHandle::Listener(listener)) => {
-                    dbgnet!("configureBlocking fd={fd:#x} kind=listener blocking={blocking}");
-                    listener
-                        .lock()
-                        .set_nonblocking(!blocking)
-                        .map_err(|error| net_err("configureBlocking", error))?
-                }
-                other => {
-                    let kind = match other {
-                        Some(NetSocketHandle::Unbound) => "unbound",
-                        Some(NetSocketHandle::Closed) => "closed",
-                        None => "MISSING",
-                        _ => unreachable!(),
-                    };
-                    dbgnet!(
-                        "configureBlocking fd={fd:#x} kind={kind} blocking={blocking} deferred"
-                    );
-                }
-            }
-            Ok(None)
-        },
+        net_configure_blocking,
         NativeKind::Bridge,
     );
     r.register_with_kind(
@@ -3260,31 +3314,67 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // registries and FileDescriptorTable-owned DatagramSockets, keeping
         // the capability probe and each getter/setter aligned with the actual
         // socket on which Java requested the option.
-        r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
+        r.register_with_kind(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
-        });
+        }, NativeKind::Bridge);
         // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
         // is plain Java returning true — so unlike the keepalive family below these
         // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
         // They used to accept the request and drop it on the floor.
-        r.register(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
+        r.register_with_kind(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
             #[cfg(target_os = "windows")]
             { return Ok(Some(Value::Int(i32::from(win_ext_opt_get(ctx, args, ExtOpt::DontFragment)? != 0)))); }
             #[cfg(not(target_os = "windows"))]
             { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        });
-        r.register(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
             #[cfg(target_os = "windows")]
             { win_ext_opt_set(ctx, args, ExtOpt::DontFragment)?; return Ok(None); }
             #[cfg(not(target_os = "windows"))]
             { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        });
-        r.register(wso, "getTcpKeepAliveProbes0", "(I)I", windows_keepalive_get_probes);
-        r.register(wso, "getTcpKeepAliveTime0", "(I)I", windows_keepalive_get_time);
-        r.register(wso, "getTcpKeepAliveIntvl0", "(I)I", windows_keepalive_get_intvl);
-        r.register(wso, "setTcpKeepAliveProbes0", "(II)V", windows_keepalive_set_probes);
-        r.register(wso, "setTcpKeepAliveTime0", "(II)V", windows_keepalive_set_time);
-        r.register(wso, "setTcpKeepAliveIntvl0", "(II)V", windows_keepalive_set_intvl);
+        }, NativeKind::Bridge);
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveProbes0",
+            "(I)I",
+            windows_keepalive_get_probes,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveTime0",
+            "(I)I",
+            windows_keepalive_get_time,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveIntvl0",
+            "(I)I",
+            windows_keepalive_get_intvl,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveProbes0",
+            "(II)V",
+            windows_keepalive_set_probes,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveTime0",
+            "(II)V",
+            windows_keepalive_set_time,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveIntvl0",
+            "(II)V",
+            windows_keepalive_set_intvl,
+            NativeKind::Bridge,
+        );
     }
 
     // Linux analogue of the `WindowsSocketOptions` block above (HIB-linux
@@ -3564,6 +3654,78 @@ mod tests {
         assert!(
             acquired,
             "a writer could not take the socket registry while a listener poll              was in flight — the poll is holding the read guard across its loop,              and its own nested read will deadlock against the queued writer"
+        );
+    }
+
+    /// `configureBlocking` must not hold the registry read guard while it waits
+    /// for a listener's mutex — the other half of the cycle the poll test above
+    /// closes.
+    ///
+    /// `net_accept` holds `listener_handle.lock()` across
+    /// `net_listener_still_registered`, i.e. listener-mutex -> registry-read,
+    /// for the whole of a blocking accept. `configureBlocking` took the
+    /// opposite order. Two orders is a cycle, and a fair `RwLock` closes it as
+    /// soon as any writer queues.
+    ///
+    /// Unlike its sibling, this one CAN call the handler directly: the guard is
+    /// inside `net_configure_blocking` itself, not inherited from a caller. The
+    /// rest of that test's hard-won shape is kept — assert the path was actually
+    /// exercised (this thread really did wait on the mutex) before trusting the
+    /// writer's result, so "could not reach the path" can never read as a pass —
+    /// and every wait is bounded, so a regression fails in a second instead of
+    /// hanging the suite the way the defect hangs the VM.
+    #[test]
+    fn configure_blocking_does_not_hold_the_registry_lock_waiting_for_a_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let handle = Arc::new(Mutex::new(listener));
+        let fd = register_handle(NetSocketHandle::Listener(Arc::clone(&handle)));
+
+        // Stand in for a blocking `net_accept`: hold the listener mutex for
+        // longer than the writer below is willing to wait.
+        let held = Arc::clone(&handle);
+        let holder = thread::spawn(move || {
+            let guard = held.lock();
+            thread::sleep(Duration::from_millis(1_200));
+            drop(guard);
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        let configurer = thread::spawn(move || {
+            let mut ctx = MockNativeContext::new();
+            let fd_obj = ctx.alloc_object(4);
+            ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+            let t0 = std::time::Instant::now();
+            let r = net_configure_blocking(
+                &mut ctx,
+                &[Value::Object(Some(fd_obj)), Value::Int(0)],
+            );
+            (r.is_ok(), t0.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(300));
+
+        // The assertion: a registry writer gets in while `configureBlocking` is
+        // parked on the listener mutex. Pre-fix it is queued behind the read
+        // guard that call is still holding — the state the deadlock freezes.
+        let acquired = net_sockets()
+            .try_write_for(Duration::from_millis(600))
+            .is_some();
+
+        let (ok, took) = configurer.join().expect("configureBlocking thread");
+        holder.join().expect("mutex holder");
+        remove_fd(fd);
+
+        assert!(
+            ok && took >= Duration::from_millis(400),
+            "configureBlocking did not wait for the listener mutex (ok={ok}, \
+             took={took:?}), so this test could not exercise the registry guard"
+        );
+        assert!(
+            acquired,
+            "a writer could not take the socket registry while configureBlocking \
+             was waiting for a listener mutex — it is holding the read guard \
+             across that wait, which deadlocks against an accept holding the \
+             mutex and reaching for the same read lock"
         );
     }
 

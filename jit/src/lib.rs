@@ -656,6 +656,52 @@ impl ExecutableBuffer {
         }
     }
 
+    /// Erase an already-emitted, straight-line byte range so it costs (almost)
+    /// nothing to execute, without moving any byte that follows it.
+    ///
+    /// Both backends emit the shadow-stack thread fetch unconditionally and
+    /// then discover, after the body is lowered, that the method published
+    /// nothing and the fetch is dead. Neither can *remove* it: every recorded
+    /// offset downstream — branch patches, deopt points, oop-map native PCs —
+    /// is already keyed on the current layout. So the range is overwritten in
+    /// place.
+    ///
+    /// Overwriting it with `0x90` alone is not enough. A one-byte `NOP` is
+    /// still an instruction that has to be fetched, decoded and retired, and
+    /// this range sits on the ENTRY path of the method — a ~46-byte fetch
+    /// becomes 46 NOPs executed on every single invocation. On a small, hot,
+    /// call-heavy method that is the dominant cost: it is what made
+    /// `CratonBench fib` run ~2x slower on the IR tier than the single-pass
+    /// body it displaced. Jumping over the range instead retires two bytes.
+    ///
+    /// The caller must guarantee the range is straight-line and that nothing
+    /// branches INTO its interior — landing on `start + 1` would decode the
+    /// `rel8` displacement as an opcode. Both current callers emit the range
+    /// as one unbroken prologue unit, before any bytecode is lowered.
+    pub fn erase_range_with_jump_over(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let len = end - start;
+        // `JMP rel8` is 2 bytes, so it needs 2 bytes to live in, and the
+        // displacement over the remainder must fit in an `i8`.
+        if len >= 2 && (len - 2) <= 127 && self.try_patch_byte(start, 0xEB).is_ok() {
+            // `len - 2 <= 127` is established above; the helper is here so no
+            // rel8 displacement in this crate is written by a hand-rolled cast
+            // (see `patch_rel8_or_bail`).
+            self.patch_rel8_or_bail(start + 1, (len - 2) as i64);
+            // The skipped bytes are unreachable now, so their encoding is
+            // irrelevant; `0x90` keeps a disassembly dump readable.
+            for off in (start + 2)..end {
+                let _ = self.try_patch_byte(off, 0x90);
+            }
+            return;
+        }
+        for off in start..end {
+            let _ = self.try_patch_byte(off, 0x90);
+        }
+    }
+
     // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
     // have been removed. Every internal codegen site was migrated to the
     // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep
@@ -12378,8 +12424,8 @@ fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
 /// That is worse than a missing feature, because it makes the levers *lie*.
 /// Isolating a miscompile with them is a proof by elimination, and "deny this
 /// package and the crash goes away" only means something if the deny actually
-/// stopped a compile. Measured 2026-08-04 against
-/// `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+/// stopped a compile. Measured 2026-08-04 against the annotation-scan SIGSEGV
+/// (the retired `annotation-scan-arrayread-sigsegv` write-up):
 /// `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` — a prefix matching nothing, so
 /// nothing should compile at all — still left **11 methods compiled** and the
 /// crash still reproduced. Every bisect step read "no effect", which reads as
@@ -21036,6 +21082,76 @@ mod tests {
         assert_eq!(buf.as_slice(), &[0xCC, 0xC3]);
     }
 
+    /// An erased range must be JUMPED over, not merely filled with NOPs.
+    ///
+    /// This is the failure mode that has to be pinned by a byte assertion
+    /// rather than by behaviour: a range of `0x90` is perfectly *correct*, it
+    /// just executes. The IR backend shipped exactly that for the ~46-byte
+    /// shadow-stack thread fetch, and `CratonBench fib` — entered 2.27e9
+    /// times — ran ~2x slower than on the single-pass body. Nothing failed;
+    /// it was only slow. So assert the opcode.
+    #[test]
+    fn erase_range_with_jump_over_emits_a_jump_not_a_nop_sled() {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        // A 46-byte span, the size the IR thread fetch actually occupies,
+        // between a leading and a trailing sentinel.
+        buf.emit_byte(0xCC);
+        let start = buf.pos();
+        buf.emit(&[0xAA; 46]);
+        let end = buf.pos();
+        buf.emit_byte(0xC3);
+
+        buf.erase_range_with_jump_over(start, end);
+
+        let code = buf.as_slice();
+        assert_eq!(code[0], 0xCC, "byte before the range must not move");
+        assert_eq!(code[start], 0xEB, "range must begin with JMP rel8");
+        assert_eq!(
+            code[start + 1],
+            44,
+            "displacement must land exactly on the first byte after the range"
+        );
+        assert!(
+            code[start + 2..end].iter().all(|&b| b == 0x90),
+            "the skipped remainder should be NOP-filled"
+        );
+        assert_eq!(code[end], 0xC3, "byte after the range must not move");
+        assert!(!buf.overflowed(), "a 46-byte erase must not bail the buffer");
+    }
+
+    /// A span too short to hold `JMP rel8`, or too long for its displacement,
+    /// still has to be erased — just without the jump.
+    #[test]
+    fn erase_range_with_jump_over_falls_back_to_nops_when_a_jump_will_not_fit() {
+        // 1 byte: no room for the 2-byte JMP.
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xAA, 0xC3]);
+        buf.erase_range_with_jump_over(0, 1);
+        assert_eq!(buf.as_slice()[0], 0x90);
+        assert_eq!(buf.as_slice()[1], 0xC3, "the range end is exclusive");
+
+        // 130 bytes: `len - 2` exceeds the i8 displacement range.
+        let mut big = ExecutableBuffer::new(256).expect("alloc failed");
+        big.emit(&[0xAA; 130]);
+        big.erase_range_with_jump_over(0, 130);
+        assert!(
+            big.as_slice()[..130].iter().all(|&b| b == 0x90),
+            "an over-long span must fall back to a full NOP fill, never a truncated rel8"
+        );
+        assert!(!big.overflowed(), "the fallback must not bail the compile");
+    }
+
+    /// An empty or inverted range is a no-op, not a panic or a stray patch.
+    #[test]
+    fn erase_range_with_jump_over_ignores_an_empty_range() {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xAA, 0xBB]);
+        buf.erase_range_with_jump_over(1, 1);
+        buf.erase_range_with_jump_over(2, 1);
+        assert_eq!(buf.as_slice(), &[0xAA, 0xBB]);
+        assert!(!buf.overflowed());
+    }
+
     #[test]
     fn test_executable_buffer_emit_checked_success() {
         let mut buf = ExecutableBuffer::new(8).expect("alloc failed");
@@ -26179,8 +26295,8 @@ mod code_cache_lifetime_tests {
     /// The load-bearing case is the last one. `CRATONVM_DBG=jit-bisect-only`
     /// with a prefix matching NOTHING must force EVERY method interpreted —
     /// that is what makes "allow only X, does the crash survive?" a valid
-    /// bisect step. See `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
-    /// the OSR path did not consult this predicate at all, so 21 OSR bodies
+    /// bisect step. See the retired `annotation-scan-arrayread-sigsegv`
+    /// write-up: the OSR path did not consult this predicate at all, so 21 OSR bodies
     /// compiled under exactly that setting and every bisect row read a
     /// meaningless "no effect".
     #[test]

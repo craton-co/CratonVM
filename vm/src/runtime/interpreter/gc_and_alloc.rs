@@ -3622,6 +3622,9 @@ pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &c
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     remap_trace_push(shared, thread, "publish", "");
+    // Stamp when this thread last published, so a stale-address report can say
+    // how many collections completed since. See `note_root_publish`.
+    crate::memory::reclaim_guard::note_root_publish(shared, thread);
     // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
     // native returned without `check_post_block_gc` (unpaired exit), this
     // thread is running with an unconsumed fixup chain / slot-origin set —

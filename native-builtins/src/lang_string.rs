@@ -988,7 +988,16 @@ pub(crate) fn native_string_hash_code(
 
     // For compact strings (byte[] value), inspect the `coder` byte
     // (field 1) to know whether the bytes are LATIN-1 (one byte per char,
-    // unsigned-extended) or UTF-16 (big-endian u16 pairs).
+    // unsigned-extended) or UTF-16 (LITTLE-endian u16 pairs).
+    //
+    // This said "big-endian" while the loop below has always read little-endian.
+    // The identical stale claim on `vectorizedHashCode` is the one that named
+    // the contract that native was not implementing while it hashed bytes for a
+    // day, so these are corrected rather than left as harmless prose. The layout
+    // is little-endian in all four places that touch it: `create_java_string`
+    // writes the low byte at the even index, `decode_string_value` reads it back,
+    // `native_string_index_of_static_helper` decodes the same pairs, and
+    // `StringUTF16.isBigEndian()` answers false.
     let is_utf16 = is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1));
 
     // Strategy: drain the array into a thread-local i32 scratch buffer in
@@ -6160,6 +6169,28 @@ pub(crate) fn native_string_formatted(
 // same little-endian layout as CratonVM's Rust code, keeping every code path
 // consistent. `HI_BYTE_SHIFT == 8` in OpenJDK <=> big-endian; here it is 0.
 //
+// # On JDK 25 this registration never fires, and that is not a defect
+//
+// `--dump-native-registry` against Temurin 25.0.3, checked while closing the
+// `String.hashCode` record because it asked whether `HI_BYTE_SHIFT` /
+// `LO_BYTE_SHIFT` are populated at all:
+//
+//   java/lang/StringUTF16.isBigEndian()Z   loaded: true  declared: FALSE
+//                                          has_code: false  invocations: 0
+//
+// `declared: false` — the method does not exist on JDK 25's `StringUTF16`. Its
+// `<clinit>` reads the byte order from `UNSAFE`, which this VM answers through
+// `jdk/internal/misc/UnsafeConstants.BIG_ENDIAN` (the boot log's
+// "UnsafeConstants populated (5/5)"). The statics are populated and
+// little-endian: `probes/StringUtf16ClassShapeProbe` reads them back as
+// `HI_BYTE_SHIFT=0` / `LO_BYTE_SHIFT=8`, identical to HotSpot.
+//
+// So this stays registered for images that DO declare the method (JDK 17/21),
+// where it must give the same answer `UnsafeConstants` gives, which it does. A
+// census row reading `has_code: false` here means "absent from this image", not
+// "an unimplemented native something is waiting on" — the distinction cost a
+// paragraph of doubt in the record that filed the UTF-16 hash defect.
+//
 // Arity is guaranteed by the verifier (`()Z`); we ignore any extra args
 // defensively and return the constant unconditionally.
 pub(crate) fn native_string_utf16_is_big_endian(
@@ -6684,7 +6715,9 @@ fn native_string_index_of_str_from(
 /// coder format, we recompute the same answer character-wise from the target
 /// alone if `srcCount` and `coder` are sufficient. Concretely we decode the
 /// `[B` array per `coder` (0 = LATIN1 single-byte zero-extended, 1 = UTF16
-/// big-endian u16 pairs) and search for the target's UTF-16 code units.
+/// LITTLE-endian u16 pairs) and search for the target's UTF-16 code units.
+/// (The doc said big-endian; the code below reads `lo` at `2i` and `hi` at
+/// `2i+1`, which is little-endian and is what the rest of the VM writes.)
 fn native_string_index_of_static_helper(
     ctx: &mut dyn NativeContext,
     args: &[Value],

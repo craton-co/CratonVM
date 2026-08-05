@@ -1780,12 +1780,31 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // We back it with the same pool/accounting machinery as the
     // DirectByteBuffer path so a 4 KiB tight-loop allocate/free
     // stays RSS-bounded regardless of which API the JDK picks.
+    // `jdk.internal.misc.Unsafe.allocateMemory0`/`freeMemory0` are ACC_NATIVE on
+    // both the Linux and the Windows JDK 25 image; the un-suffixed pair is the
+    // Java wrapper that calls them (a §1.4 shadow), and `sun.misc.Unsafe`
+    // declares none of the four on either image. Only what the image backs
+    // states its kind.
     for cls in ["jdk/internal/misc/Unsafe", "sun/misc/Unsafe"] {
         r.register(cls, "allocateMemory", "(J)J", unsafe_allocate_memory);
-        r.register(cls, "allocateMemory0", "(J)J", unsafe_allocate_memory);
         r.register(cls, "freeMemory", "(J)V", unsafe_free_memory);
-        r.register(cls, "freeMemory0", "(J)V", unsafe_free_memory);
     }
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "allocateMemory0",
+        "(J)J",
+        unsafe_allocate_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "freeMemory0",
+        "(J)V",
+        unsafe_free_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register("sun/misc/Unsafe", "allocateMemory0", "(J)J", unsafe_allocate_memory);
+    r.register("sun/misc/Unsafe", "freeMemory0", "(J)V", unsafe_free_memory);
 
     // Synthetic helper used by JDK-side Cleaner runnables that
     // capture (addr, size) at allocation time — see module docs.

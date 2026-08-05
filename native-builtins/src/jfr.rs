@@ -594,11 +594,24 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         let next = table.len() as i64 + 1;
         *table.entry(key).or_insert(next)
     }
+    // JDK 25 declares only the `(IJ)J` arity (both images); `(I)J` is the
+    // older spelling and is declared nowhere, so it stays ambient.
     for descriptor in ["(IJ)J", "(I)J"] {
-        registry.register(JVM, "getStackTraceId", descriptor, |ctx, args| {
+        let cb: cratonvm_native_api::NativeCallback = |ctx, args| {
             let skip = args.iter().find_map(|v| v.as_int()).unwrap_or(0);
             Ok(Some(Value::Long(jfr_stack_trace_id(ctx, skip))))
-        });
+        };
+        if descriptor == "(IJ)J" {
+            registry.register_with_kind(
+                JVM,
+                "getStackTraceId",
+                descriptor,
+                cb,
+                cratonvm_native_api::NativeKind::Bridge,
+            );
+        } else {
+            registry.register(JVM, "getStackTraceId", descriptor, cb);
+        }
     }
 
     for (name, descriptor) in [

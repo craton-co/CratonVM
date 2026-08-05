@@ -53,7 +53,7 @@ lane first.
 ## Watch for
 
 Executors are where the **socket/executor hang** shows up
-([bounded socket operations hang about one run in five](../../known-issues/bounded-socket-operations-hang-about-one-run-in-five.md)).
+(the socket-registry lock cycle — the retired `bounded-socket-operations-hang-about-one-run-in-five` record, fixed 2026-08-05).
 That hang is pre-existing and mode-independent; do not attribute it to this
 lane's changes without an A/B against the pre-fix binary and a HotSpot control.
 

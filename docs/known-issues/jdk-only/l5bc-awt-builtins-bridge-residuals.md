@@ -6,6 +6,17 @@ What is open is that 7,748 registrations across the two crates are tagged
 `Bridge` while the JDK 25 image says their target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits every one of them on a claim nobody has checked.
 
+> **PARTLY SUPERSEDED 2026-08-05.** This record's headline finding — that the
+> tree's only `bridge` marker outside `native-io` "is dead on this image" — was
+> half the story. `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` **is**
+> ACC_NATIVE, on the Windows and macOS images; a Linux census simply cannot say
+> so, and one taken against an unpacked Windows JDK does. The marker was right.
+> `java.awt.image.ComponentSampleModel.initIDs()V`, split out of the awt loop
+> here as "not an adjudicated bridge", inherits a **native** `initIDs` from
+> `java.awt.image.SampleModel`. Both state their kind now, and all 21 mixed
+> sites named below have been split. See
+> [`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md).
+
 Sibling record for the crate L5 did first:
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md). The two
 share a method and a conclusion; this one is where the *scale* of the ambient
