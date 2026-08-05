@@ -7657,12 +7657,43 @@ pub fn register_essential_natives_with_shims(
     // — and when it is fixed this registration should be re-measured and
     // probably deleted, because at that point it becomes a pure perf
     // optimisation again and has to argue for itself on those terms.
-    registry.register_with_kind(
+    // NOT `register_with_kind(.., Intrinsic)`, deliberately: this stays a
+    // `Bridge`, so the real-JDK drop takes it and the real bytecode runs.
+    //
+    // It was promoted to `Intrinsic` on 2026-08-05 for CORRECTNESS, because
+    // `String.hashCode()` on a UTF-16 string was wrong — `ArraysSupport.
+    // vectorizedHashCode` read one byte per char under `T_CHAR` instead of
+    // pairing them. That defect is FIXED (`phases_early.rs`), so the
+    // registration has to argue on performance again, which is what it was
+    // originally written for.
+    //
+    // It loses that argument. Measured A-B-B-A interleaved, three rounds,
+    // `probes/StringHashCostProbe`, identical digests (medians, ms):
+    //
+    //           cold-latin1  cold-utf16  warm  map-utf16
+    //   native       89         135        5      110
+    //   bytecode     95         149        2      111
+    //
+    // Slightly faster on the first hash of a distinct string, 2-4x SLOWER on
+    // the cached read, and a wash on the realistic `HashMap<String,_>`
+    // workload. Both sides cache in the same `String.hash` field, so the warm
+    // gap is `safe_native_call` overhead on what should be one field read.
+    //
+    // §1.4's default is the bytecode, and a review that comes back "wash"
+    // does not license shadowing it. (Serial measurement said the native was
+    // slower on cold too; interleaving reversed that, which is why the arms
+    // are interleaved.) Kept registered because synthetic-jdk mode still needs
+    // it -- there the drop does not apply.
+    //
+    // Re-examine with suite numbers when they are available: this is one
+    // microbenchmark on a loaded host, and `String.hashCode` is hot in every
+    // real workload. If it comes back, it comes back with those numbers and a
+    // `register_with_kind` stating the kind.
+    registry.register(
         "java/lang/String",
         "hashCode",
         "()I",
         native_string_hash_code,
-        cratonvm_native_api::NativeKind::Intrinsic,
     );
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
