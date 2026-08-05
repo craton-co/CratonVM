@@ -169,6 +169,28 @@ enum HeapEntry {
 ///   4 modifiers, 5 slot, 6 callerSensitive, 7 override.
 /// Constructor shares the same prefix (no `returnType`/`name`).
 ///
+/// Resolve `field_name` against the PRODUCTION fabricated model for
+/// `class_name` — `ClassManager::synthetic_stub_fields`, the same table that
+/// sizes a bytecode `new` of the stub and that the VM resolves names against
+/// when a class has no real bytes.
+///
+/// Without this the mock answers `None` for every modelled class that has no
+/// hand-written `mock_*_field_slot` helper, so `set_field_by_name` is a
+/// **silent no-op** — and a native that writes a field by name and then again
+/// by raw index gets tested only on the raw half. That is how
+/// `t19_n1_class_get_protection_domain0_with_code_source_returns_pd` came to
+/// depend on a raw `set_field(pd, 0, …)` the real VM never needed: the by-name
+/// write beside it did nothing here and everything there.
+///
+/// Consulted LAST, so every hand-written mapping above still wins.
+fn mock_stub_model_field_slot(class_name: Option<&str>, field_name: &str) -> Option<usize> {
+    let class_name = class_name?;
+    cratonvm_classloading::synthetic_stub_field_model(class_name)
+        .iter()
+        .filter(|f| !f.is_static())
+        .position(|f| &*f.name == field_name)
+}
+
 /// Returns `None` for unknown names — callers treat `None` as "not
 /// present in the mock class layout" and silently skip the write (or
 /// return `Int(0)` for reads).
@@ -1845,6 +1867,7 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
+                .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
         };
         match slot {
             Some(slot) => self.get_field(obj, slot),
@@ -1869,6 +1892,7 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
+                .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
         };
         if let Some(slot) = slot {
             self.set_field(obj, slot, value);
@@ -1901,6 +1925,13 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         {
             return Some(slot);
         }
+        // NOT extended to the fabricated-model fallback that
+        // `get_field_by_name`/`set_field_by_name` use below. Doing so is a
+        // genuine fidelity improvement and it moves five unrelated tests
+        // (`c5_field_get_declaring_class_*`, `c6_method_*`, three
+        // `xnio_worker` cases) because production code takes different
+        // branches once this answers `Some`. That is its own change with its
+        // own investigation, not a rider on a layout fix.
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
     }
 
