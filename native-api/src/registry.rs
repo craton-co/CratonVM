@@ -5667,6 +5667,26 @@ impl NativeMethodRegistry {
                 self.slot_by_key.insert(key, idx);
             }
         }
+        // LEAF: record the callback address if this triple is declared leaf
+        // (`crate::leaf::LEAF_NATIVES`). Done here — at the registration, where
+        // the triple and the callback are both in hand — because that is where
+        // the property belongs: `docs/known-issues/vm/native-call-funnel-is-the-
+        // per-call-floor-20260803.md` asks for the funnel bypass to generalise
+        // as a class whose "predicate wants to live on the registration (a
+        // `NativeKind`-adjacent flag), not in a growing `match` in
+        // `helpers.rs`". Every dispatch route reads it from one place —
+        // `vm_exec::safe_native_call_impl` — so marking a triple changes the
+        // interpreter, the JIT and `invoke_or_native` at once.
+        //
+        // Re-registration re-marks rather than un-marking: `mark` is
+        // idempotent, and a triple whose implementation is replaced by a
+        // NON-leaf one keeps the old address marked (harmless — nothing
+        // dispatches it any more) while the new address is only marked if the
+        // triple is still declared leaf. There is no path here that can mark
+        // an address the table does not name.
+        if crate::leaf::triple_is_leaf(class_name, method_name, descriptor) {
+            crate::leaf::mark(callback as usize);
+        }
         // CAPABILITY: classify the slot once, here, so the dispatch-side gate
         // (`check_dispatch_capability`) is an integer map lookup rather than a
         // per-invocation string match. Populated only when a policy is

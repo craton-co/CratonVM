@@ -1866,6 +1866,154 @@ fn native_diag_post_call(
     }
 }
 
+/// Whether the leaf audit (`CRATONVM_DBG=leafaudit`) is armed. Memoized.
+#[inline]
+fn leaf_audit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LEAFAUDIT").is_some())
+}
+
+/// Count of leaf natives dispatched without the funnel. Reported by
+/// `CRATONVM_INTRINSIC_STATS=1`, for the same "prove it is not inert" reason
+/// as every other counter on this path.
+pub static LEAF_NATIVE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of funnel-free leaf-native dispatches since process start.
+pub fn leaf_native_dispatch_count() -> u64 {
+    LEAF_NATIVE_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count of leaf-predicate violations the audit caught. Non-zero means a
+/// triple in `cratonvm_native_api::leaf::LEAF_NATIVES` is mis-marked.
+pub static LEAF_AUDIT_VIOLATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of leaf-predicate violations observed. Zero unless
+/// `CRATONVM_DBG=leafaudit` armed the audit.
+pub fn leaf_audit_violation_count() -> u64 {
+    LEAF_AUDIT_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Dispatch a native that is declared LEAF
+/// (`cratonvm_native_api::leaf` — cannot allocate, collect, safepoint, block,
+/// throw, or retain a ref past its return), skipping the funnel's bookkeeping.
+///
+/// What is skipped and why it is safe is the module doc on `leaf`; what is
+/// *kept* is the interesting half:
+///
+/// * `catch_unwind` stays. It costs ~2 ns and it is the difference between a
+///   mis-implemented native being reported and it unwinding through the
+///   interpreter. The leaf predicate says a native cannot throw a *Java*
+///   exception; it says nothing about a Rust bug.
+/// * The audit (`CRATONVM_DBG=leafaudit`) stays behind one memoized bool.
+///
+/// A leaf native returns a primitive or void, so there is no object-return
+/// handoff to publish: nothing here writes `native_pending_return`. That is
+/// stricter than the general funnel, which would have run a `Value::Long`
+/// return through `value_as_validated_object_ref` and rooted any timestamp
+/// that happened to alias a heap address. The audit asserts the return shape,
+/// so this is checked rather than assumed.
+#[inline]
+fn safe_native_call_leaf(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    LEAF_NATIVE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if leaf_audit_enabled() {
+        return leaf_audit_dispatch(shared, thread, callback, args);
+    }
+    let out = {
+        let mut ctx = NativeContextImpl { shared, thread };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut ctx, args)))
+    };
+    match out {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown native method panic".to_string());
+            Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("native method panic (leaf): {msg}"),
+            }))
+        }
+    }
+}
+
+/// `CRATONVM_DBG=leafaudit` — check that a native declared LEAF actually is.
+///
+/// A mis-marked leaf is a silent heap-corruption bug: the funnel's pinning and
+/// GC-pressure hooks are skipped for it, so a native that allocates or
+/// collects would run with its arguments unrooted and nothing would say so.
+/// This is the guard that can fail. It runs the native through the FULL
+/// funnel — so the run stays correct while the audit is armed — and then
+/// checks the four claims the predicate makes:
+///
+/// 1. no collection ran (the heap's collection count is unchanged),
+/// 2. no pin was left behind and none was consumed,
+/// 3. nothing was published to `native_pending_return`, and
+/// 4. the native neither threw a Java exception nor returned an object.
+///
+/// A violation names the native and is counted; it does not abort, because
+/// the whole point is to be able to arm this over a real workload.
+#[cold]
+#[inline(never)]
+fn leaf_audit_dispatch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    let collections_before = shared.mem.heap.collection_count();
+    let pins_before = thread.native_pin_roots.len();
+    // The FULL funnel, reached directly rather than through
+    // `safe_native_call_impl` — going back through the dispatcher would take
+    // the leaf branch again and recurse forever.
+    let out = safe_native_call_funnel(shared, thread, callback, args, false, native_diag_mask());
+    let mut complaint: Option<&'static str> = None;
+    if shared.mem.heap.collection_count() != collections_before {
+        complaint = Some("initiated a collection");
+    } else if thread.native_pin_roots.len() != pins_before {
+        complaint = Some("left the pin stack changed");
+    } else if thread.native_pending_return.is_some() {
+        complaint = Some("published a native_pending_return");
+    } else {
+        match &out {
+            Err(MethodCallFailed::ExceptionThrown(_)) => {
+                complaint = Some("threw a Java exception");
+            }
+            Ok(Some(Value::Object(Some(_)))) => complaint = Some("returned an object"),
+            _ => {}
+        }
+    }
+    if let Some(what) = complaint {
+        LEAF_AUDIT_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let callee = native_callee_name(callback);
+        eprintln!(
+            "[leafaudit] VIOLATION {callee} is declared LEAF but {what} — \
+             remove it from cratonvm_native_api::leaf::LEAF_NATIVES"
+        );
+    }
+    out
+}
+
+/// Route a native dispatch: LEAF natives skip the funnel, everything else
+/// takes it.
+///
+/// The check is one relaxed load, a shift and a test for the ~3,100 non-leaf
+/// natives (`leaf::is_leaf_callback`'s bloom word); the exact table is
+/// consulted only behind a set bit.
+///
+/// The leaf branch is gated on an all-clear diagnostic mask deliberately:
+/// with any diagnostic armed a leaf native must still appear in the ring, the
+/// dispatch trace and the straystack, or arming a diagnostic to chase a hang
+/// would make an entire class of natives invisible — the same failure the A3
+/// static/dynamic split guards against for `dispatch_trace`/`native_ring`.
+#[inline]
 fn safe_native_call_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1874,8 +2022,24 @@ fn safe_native_call_impl(
     prevalidated_objects: bool,
 ) -> MethodCallResult {
     // ARCH-2026-08-04 A3 — the funnel's thirteen diagnostic gates, as one word.
-    // Zero on every production run; see the `native_diag` module header.
+    // Zero on every production run; see the `native_diag` module header. Read
+    // ONCE here and handed to the funnel, so routing costs the common path
+    // nothing beyond the bloom test.
     let diag = native_diag_mask();
+    if diag == 0 && cratonvm_native_api::leaf::is_leaf_callback(callback as usize) {
+        return safe_native_call_leaf(shared, thread, callback, args);
+    }
+    safe_native_call_funnel(shared, thread, callback, args, prevalidated_objects, diag)
+}
+
+fn safe_native_call_funnel(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+    prevalidated_objects: bool,
+    diag: u32,
+) -> MethodCallResult {
     let _pin_floor_guard = (diag & native_diag::BLOCKGC != 0).then(|| PinFloorGuard {
         floor: thread.native_pin_roots.len(),
         thread: thread as *const JvmThread,
@@ -23502,6 +23666,314 @@ impl Drop for JniImplicitFrameGuard {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Where the native funnel's fixed per-call cost actually goes.
+///
+/// `docs/known-issues/vm/native-call-funnel-is-the-per-call-floor-20260803.md`
+/// measured the funnel at ~180-330 ns for zero arguments and then said so
+/// itself: *"Nobody has profiled it; this document asserts where the time is,
+/// not which line."* This module is the answer to that. It drives
+/// [`safe_native_call`] with a `Ok(None)` callback against a bare
+/// [`SharedVm`], then times each component of the funnel body **on its own**,
+/// so the breakdown is measured rather than reasoned about.
+///
+/// It is `#[ignore]`d because it is a measurement, not an assertion — a
+/// timing threshold here would be a flake on a shared build host. Run it:
+///
+/// ```text
+/// cargo test --release -p cratonvm-vm --lib funnel -- --ignored --nocapture
+/// ```
+///
+/// Multi-pass by construction: a rung that has not gone flat is not a
+/// measurement (the same lesson the source document records under
+/// "Corrections").
+#[cfg(test)]
+mod native_funnel_profile {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::{JvmThread, ThreadId};
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const PASSES: usize = 4;
+    const ROUNDS: u32 = 400_000;
+
+    fn noop_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(None)
+    }
+
+    /// One row: run `f` `ROUNDS` times per pass, print ns/op for every pass.
+    fn rung(label: &str, mut f: impl FnMut()) {
+        print!("{label:<52}");
+        for _ in 0..PASSES {
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                f();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+            print!("{ns:>10.1}");
+        }
+        println!();
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion — see the module doc"]
+    fn funnel_cost_breakdown() {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "funnel-profile");
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let cb: NativeCallback = noop_native;
+
+        print!("{:<52}", "rung");
+        for i in 1..=PASSES {
+            print!("{i:>10}");
+        }
+        println!("   (ns/op per pass; read the LAST)");
+
+        // --- the whole funnel, by argument shape -------------------------
+        rung("safe_native_call: 0 args", || {
+            black_box(safe_native_call(&shared, &mut thread, cb, &[])).ok();
+        });
+        let one_int = [Value::Int(7)];
+        rung("safe_native_call: 1 int arg", || {
+            black_box(safe_native_call(&shared, &mut thread, cb, &one_int)).ok();
+        });
+        let one_obj = [Value::Object(Some(obj))];
+        rung("safe_native_call: 1 object arg", || {
+            black_box(safe_native_call(&shared, &mut thread, cb, &one_obj)).ok();
+        });
+        let one_long = [Value::Long(0x1234_5678)];
+        rung("safe_native_call: 1 long arg", || {
+            black_box(safe_native_call(&shared, &mut thread, cb, &one_long)).ok();
+        });
+        let four = [
+            Value::Object(Some(obj)),
+            Value::Long(0x1234_5678),
+            Value::Int(1),
+            Value::Int(2),
+        ];
+        rung("safe_native_call: 4 args (obj,long,int,int)", || {
+            black_box(safe_native_call(&shared, &mut thread, cb, &four)).ok();
+        });
+        rung("safe_native_call_prevalidated: 1 object arg", || {
+            black_box(safe_native_call_prevalidated_objects(
+                &shared,
+                &mut thread,
+                cb,
+                &one_obj,
+            ))
+            .ok();
+        });
+
+        println!();
+
+        // --- the callback itself, with nothing around it -----------------
+        rung("BARE callback (no funnel at all)", || {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            black_box(noop_native(&mut ctx, &[])).ok();
+        });
+
+        // --- funnel components, one at a time ----------------------------
+        rung("component: native_diag_mask()", || {
+            black_box(native_diag_mask());
+        });
+        rung("component: catch_unwind around the callback", || {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            black_box(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| noop_native(&mut ctx, &[])))
+                    .map_err(|_| ()),
+            )
+            .ok();
+        });
+        rung("component: 2x thread_state::record_transition", || {
+            let prior = thread_state::current_state();
+            thread_state::record_transition(ThreadExecState::NativeRunning, "funnel-profile");
+            thread_state::record_transition(prior, "funnel-profile");
+        });
+        rung("component:   ... current_state() alone", || {
+            black_box(thread_state::current_state());
+        });
+        rung("component: native_oom enter + restore", || {
+            let depth = crate::runtime::native_oom::enter_native_call();
+            crate::runtime::native_oom::restore(depth);
+        });
+        rung("component: pin push + truncate (1 object)", || {
+            let base = thread.native_pin_roots.len();
+            pin_value_for_native_call(&shared, &mut thread.native_pin_roots, &one_obj[0]);
+            thread.native_pin_roots.truncate(base);
+        });
+        rung("component: value_as_validated_object_ref(Long)", || {
+            black_box(value_as_validated_object_ref(&shared, one_long[0]));
+        });
+        rung("component: heap.load_and_forward(obj)", || {
+            black_box(shared.mem.heap.load_and_forward(obj));
+        });
+        rung("component: stw_requested load", || {
+            black_box(
+                shared
+                    .mem
+                    .gc_barrier
+                    .stw_requested
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+        });
+        rung("component: young_spill_pressure()", || {
+            black_box(shared.mem.heap.young_spill_pressure());
+        });
+        rung("component: disable_jit() + native_array_gc swap", || {
+            black_box(
+                crate::runtime::env_cache::disable_jit()
+                    && shared
+                        .mem
+                        .native_array_gc_requested
+                        .swap(false, std::sync::atomic::Ordering::Relaxed),
+            );
+        });
+        rung("component: take_jni_pending_exception()", || {
+            black_box(crate::native::jni::take_jni_pending_exception());
+        });
+        rung("component: the two INLINE_NATIVE_ARGS scratch arrays", || {
+            const N: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
+            let mut forwarded = [Value::Object(None); N];
+            let mut roots = [None::<usize>; N];
+            black_box(&mut forwarded);
+            black_box(&mut roots);
+        });
+    }
+}
+
+/// The LEAF class: routing, and an audit that is shown to FAIL.
+///
+/// A guard that cannot fail reads exactly like one that works, so the audit
+/// is driven here with a callback that deliberately violates the predicate
+/// and the violation is asserted, not assumed. Without that injection
+/// `leaf_audit_violation_count() == 0` on a clean run proves nothing.
+#[cfg(test)]
+mod leaf_native_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::{JvmThread, ThreadId};
+    use std::sync::Arc;
+
+    fn shared() -> Arc<SharedVm> {
+        Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    /// A well-behaved leaf: no ctx contact, primitive return.
+    fn leafy(_ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Long(7)))
+    }
+
+    /// A native that LIES about being a leaf: it allocates and hands the
+    /// object back, which is two violations at once (object return, and a
+    /// published `native_pending_return`).
+    fn liar(ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Object(Some(ctx.alloc_object(ClassId::new(0), 0)))))
+    }
+
+    #[test]
+    fn an_unmarked_callback_is_not_routed_to_the_leaf_path() {
+        let before = leaf_native_dispatch_count();
+        let shared = shared();
+        let mut thread = JvmThread::new(ThreadId(0), "leaf-route");
+        let cb: NativeCallback = leafy;
+        assert_eq!(
+            safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
+            Some(Value::Long(7))
+        );
+        assert_eq!(
+            leaf_native_dispatch_count(),
+            before,
+            "a callback that was never marked leaf must take the full funnel"
+        );
+    }
+
+    #[test]
+    fn a_marked_callback_takes_the_funnel_free_path() {
+        let cb: NativeCallback = leafy;
+        cratonvm_native_api::leaf::mark(cb as usize);
+        let before = leaf_native_dispatch_count();
+        let shared = shared();
+        let mut thread = JvmThread::new(ThreadId(0), "leaf-route-marked");
+        assert_eq!(
+            safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
+            Some(Value::Long(7)),
+            "the leaf path must deliver the native's own result unchanged"
+        );
+        assert!(
+            leaf_native_dispatch_count() > before,
+            "a marked callback must be routed past the funnel — an inert \
+             bypass and a working one are indistinguishable by timing alone"
+        );
+        assert_eq!(
+            thread.native_pin_roots.len(),
+            0,
+            "the leaf path pins nothing and must leave the pin stack alone"
+        );
+    }
+
+    /// The audit is driven directly (rather than through the env flag, which
+    /// is memoized process-wide and would leak into every other test in this
+    /// binary) and handed a native that breaks the predicate.
+    #[test]
+    fn the_audit_catches_a_native_that_is_not_really_a_leaf() {
+        let shared = shared();
+        let mut thread = JvmThread::new(ThreadId(0), "leaf-audit-injection");
+
+        let clean_before = leaf_audit_violation_count();
+        let cb: NativeCallback = leafy;
+        let _ = leaf_audit_dispatch(&shared, &mut thread, cb, &[]);
+        assert_eq!(
+            leaf_audit_violation_count(),
+            clean_before,
+            "an honest leaf must not be reported"
+        );
+
+        let before = leaf_audit_violation_count();
+        let liar_cb: NativeCallback = liar;
+        let _ = leaf_audit_dispatch(&shared, &mut thread, liar_cb, &[]);
+        assert!(
+            leaf_audit_violation_count() > before,
+            "the audit must FAIL on a native that allocates and returns an \
+             object while claiming to be a leaf — if it cannot fail here it \
+             is not evidence of anything on a real workload"
+        );
+    }
+
+    /// Every triple in the table is registered by a real registrar, so the
+    /// mechanism is wired end-to-end rather than merely present.
+    ///
+    /// This is the check that catches the mechanism going inert: a rename in
+    /// `native-builtins` (or a descriptor typo in the table) leaves
+    /// `LEAF_NATIVES` naming a triple nothing registers, `mark` is never
+    /// called for it, and the bypass silently stops existing.
+    #[test]
+    fn every_declared_leaf_triple_is_actually_registered() {
+        let shared = shared();
+        let registry = &shared.natives.native_methods;
+        for (class, method, descriptor) in cratonvm_native_api::leaf::LEAF_NATIVES {
+            assert!(
+                registry.find(class, method, descriptor).is_some(),
+                "{class}.{method}{descriptor} is declared LEAF but nothing \
+                 registers it — the bypass for it is inert"
+            );
+        }
+        assert!(
+            cratonvm_native_api::leaf::marked_count() >= cratonvm_native_api::leaf::LEAF_NATIVES.len(),
+            "booting a VM must have marked every declared leaf callback"
+        );
+    }
+}
 
 #[cfg(test)]
 mod native_diag_tests {

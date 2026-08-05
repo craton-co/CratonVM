@@ -15,6 +15,9 @@ pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
 pub mod intrinsic;
+/// The LEAF native class — which registered natives may be dispatched without
+/// the `safe_native_call` funnel, and why.
+pub mod leaf;
 pub mod native_id;
 pub mod native_ring;
 pub mod plain_server_socket;

@@ -4148,6 +4148,28 @@ fn run() -> Result<()> {
             "[cratonvm] interpreter intrinsic dispatches: {}",
             cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
         );
+        // The compiled-code counterpart. The interpreter counter alone cannot
+        // answer the question the native-funnel work actually asks: with the
+        // JIT on, hot code never reaches the interpreter's inline cache, so an
+        // interpreter-side bypass reads as "landed" while being inert for
+        // every compiled call — which is exactly what happened to the
+        // `Thread.currentThread` fix. See `jit::helpers::JIT_FUNNEL_BYPASS_HITS`
+        // and docs/known-issues/vm/native-call-funnel-is-the-per-call-floor.
+        let (sp_sites, ir_sites) = cratonvm_jit::thread_current_thread_bound_sites();
+        eprintln!(
+            "[cratonvm] compiled-code native-funnel bypasses: {} \
+             (Thread.currentThread sites bound: single-pass {sp_sites}, IR {ir_sites})",
+            cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
+        );
+        // LEAF natives (`cratonvm_native_api::leaf`). The violation count is
+        // always printed, not only when non-zero: a silent `0` from an
+        // un-armed audit and a genuine clean audit look identical otherwise,
+        // and that is the distinction the whole mechanism rests on.
+        eprintln!(
+            "[cratonvm] leaf-native funnel-free dispatches: {} (audit violations: {})",
+            cratonvm_vm::vm::leaf_native_dispatch_count(),
+            cratonvm_vm::vm::leaf_audit_violation_count(),
+        );
     }
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
