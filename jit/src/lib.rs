@@ -13200,42 +13200,26 @@ pub fn try_compile_with_invokespecial_resolver(
         Err(_) => return None,
     };
 
-    // Keep the final compiler admission gate aligned with the VM static
-    // skip-list. The tiered background worker bypasses VM-side eligibility and
-    // otherwise continued compiling MutableBigInteger after it was quarantined.
-    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
-    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
-    // package-level interpreted control completes the entire class. Background
-    // compilation can bypass VM eligibility checks, so fail closed here too.
-    // The `org/glassfish/jaxb/` final-admission mirror of the VM skip-list
-    // guard was removed 2026-07-27. It is the SECOND of the two gates that
-    // enforced that ban, and deleting `jaxb_mapping_residual_skip_prefix` from
-    // `vm/src/jit/skip_list.rs` alone does not lift it: `try_compile` returns
-    // `None` here before any JAXB method can be compiled, so a "ban removed"
-    // run that does not also pass `CRATONVM_JIT_ALLOW_PACKAGES` measures an
-    // uncompiled package: `CRATONVM_DBG_JIT_ENTRY=1` over 900 iterations of
-    // the `JaxbQNameProbe` reproducer counts 0 `org/glassfish/jaxb/…` JIT
-    // entries with either gate present and 12923 with both gone. The
-    // corruption the ban existed for (a self-cast `QName cannot be cast to
-    // QName`, later an `UnmarshalException: unexpected element (uri:"",
-    // local:"widget")` at iteration 81) was never JAXB's: it was the
-    // `java/lang/String` compact-layout field intrinsic reading a primitive
-    // field four bytes high, fixed by `82b78bca5`. Bisected with that probe —
-    // dev `95e4d9929` fails at iteration 81, `82b78bca5` and later are clean.
-    // See the retired `jaxb-jit-ban-removed-20260727` write-up.
-
-    // Keep the final admission gate aligned with the VM-side Xerces parser
-    // guard. Background compilation bypasses the VM skip-list, and JITting
-    // this package corrupts SchemaGrammar's SymbolHash during Hazelcast XML
-    // schema validation.
-    // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
-    // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
-    // package-level interpreted control completes the entire class. Background
-    // compilation can bypass VM eligibility checks, so fail closed here too.
-    // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
-    // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
-    // can reach this crate after the VM-side enqueue path has logged work; keep
-    // the exact proven corruptor interpreted unless explicitly lifted.
+    // NO PACKAGE IS BANNED HERE ANY MORE. What used to sit at this point was a
+    // set of hand-written "keep the final admission gate aligned with the VM
+    // static skip-list" mirrors — `java/math/BigInteger`,
+    // `com/sun/org/apache/xerces/internal/`, `org/hsqldb/` (twice),
+    // `org/yaml/snakeyaml/emitter/Emitter.emit`, and earlier
+    // `org/glassfish/jaxb/`. `d1979bec5` (2026-08-01) deleted every one of them
+    // together with `vm/src/jit/skip_list.rs`, the file they mirrored, because
+    // each ban's underlying defect had been fixed elsewhere.
+    //
+    // Their prose outlived them here by four days, and it did real damage:
+    // `docs/known-issues/springboot/flywayautoconfigurationtests-silent-hang-…`
+    // (2026-08-05) reasoned from the surviving `org/hsqldb/` paragraph that the
+    // Flyway HSQLDB path "is running interpreted" in a run where it had been
+    // JIT-eligible for four days, and looked for the stall in the wrong place.
+    // The real defect was `383e7f5cf`. See
+    // `docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
+    //
+    // If a package ever needs to be force-interpreted again, do it through the
+    // bisect levers below (which `compile_gate::admit` applies at all three
+    // compile doors), not by reintroducing a gate only this door enforces.
     // DBG (RandomizedContext WeakHashMap JIT investigation, 2026-07-02):
     // `CRATONVM_JIT_DENY` — comma-separated substrings matched against
     // `Class.method`; a matching method is force-interpreted (never

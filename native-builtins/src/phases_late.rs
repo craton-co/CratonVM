@@ -374,18 +374,39 @@ pub(crate) fn unsafe_wp1_2_natives(registry: &mut NativeMethodRegistry) {
 
 
 /// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
-/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object that
-/// `Files.newBufferedWriter` allocates. The synthetic object stores its file
-/// descriptor as an `Int` in slot 0; a real BufferedWriter's slot 0 holds an
-/// object reference (the `lock`/`out` Writer set by the JDK constructor).
+/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object the
+/// `synthetic-jdk` build's `native_bw_init` produces.
 ///
 /// Returns `Some(out)` — the wrapped `Writer` — for a real BufferedWriter, so
-/// the `BufferedWriter` natives can forward the I/O to real bytecode instead
-/// of misreading slot 0 as an fd and dropping the write. Returns `None` for
-/// the synthetic fd-backed object, leaving the slot-0 fd fast-path in place.
+/// the `BufferedWriter` natives forward the I/O to real bytecode. Returns
+/// `None` for a fd-backed object, leaving the slot-0 fd fast-path in place.
+///
+/// # Why the slot-0 test is `#[cfg]`-gated
+///
+/// The test is "does raw slot 0 hold an `Int`?", and it used to run in every
+/// build. Its old doc claimed a real BufferedWriter's slot 0 holds "the
+/// `lock`/`out` Writer set by the JDK constructor" — which is true of no JDK:
+/// `java.io.Writer` declares `writeBuffer` first and `lock` second, so slot 0
+/// is the `char[]` and `out` is slot 2. The question being asked was never the
+/// question the comment described.
+///
+/// It answered correctly anyway, for an unrelated reason: bytecode `new` writes
+/// an explicit `Object(None)` into every reference slot, because an all-zero
+/// slot decodes as `Int(0)` and NOT as null (the R-niche rule in
+/// `gc/src/gen_heap.rs`). A BufferedWriter arriving from an allocator that
+/// skips those defaults — `alloc_object` without descriptors, which is what
+/// `alloc_concurrent_synthetic` uses — would have read `Int(0)` and been
+/// classified as fd-backed **on fd 0**.
+///
+/// In the default build nothing writes an fd into a `java/io/BufferedWriter`
+/// any more (`Files.newBufferedWriter`'s fd path was deleted on 2026-08-05, see
+/// `phases_late/nio_file.rs`), so the read is gated to the `synthetic-jdk`
+/// build, where slot 0 belongs to the fabricated model and the question is the
+/// right one to ask.
 fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    #[cfg(feature = "synthetic-jdk")]
     if let Value::Int(_) = ctx.get_field(this, 0) {
-        return None; // synthetic fd-backed BufferedWriter (Files.newBufferedWriter)
+        return None; // fd-backed BufferedWriter (native_bw_init)
     }
     match ctx.get_field_by_name(this, "out") {
         Value::Object(Some(o)) => Some(o),
@@ -1656,29 +1677,36 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(map))))
     });
 
-    // redirectInput/Output/Error — store redirect target and return this
-    r.register(
-        pb,
-        "redirectInput",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 3, args[1]); // store redirect file in field 3
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(
-        pb,
-        "redirectOutput",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
-    r.register(
-        pb,
-        "redirectError",
-        "(Ljava/io/File;)Ljava/lang/ProcessBuilder;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
+    // redirectInput/Output/Error(File) are DELIBERATELY NOT REGISTERED.
+    //
+    // Each real overload is a one-liner that delegates to the `Redirect`
+    // overload — `redirectOutput(File f) { return redirectOutput(Redirect.to(f)); }`
+    // — and the `Redirect` spellings already work end to end: this file's
+    // `start()` shim does not run in real-JDK mode (verified with
+    // `CRATONVM_DBG_PB=1`: no `[PB-START-ENTRY]`), so the real
+    // `ProcessBuilder.start()` bytecode builds `redirects[]` and
+    // `native-io`'s `ProcessImpl`/`forkAndExec` natives honour it. A probe
+    // measured `Redirect.appendTo(file)` and `Redirect.INHERIT` byte-identical
+    // to HotSpot on the same run where the three File overloads below failed.
+    //
+    // What the three registrations did instead, all three wrong:
+    //
+    //   * `redirectOutput(File)` and `redirectError(File)` returned the
+    //     receiver and DROPPED the file. `pb.redirectOutput(f)` then
+    //     `pb.redirectOutput()` answered `PIPE`, and the child's output went
+    //     nowhere — silently, with no exception and no empty file to notice.
+    //   * `redirectInput(File)` stored the File into raw slot 3. On a real
+    //     `java/lang/ProcessBuilder` slot 3 is `redirectErrorStream`, a
+    //     BOOLEAN, so this was a reference-into-primitive overlay write — the
+    //     defect class wave 2's census hunts — and the redirect itself still
+    //     never happened, so `new ProcessBuilder("cat").redirectInput(f)`
+    //     left the child reading a pipe nobody would ever write to and the
+    //     parent's `readAllBytes()` blocked forever. That hang, not the
+    //     dropped output, is what a suite sees.
+    //
+    // Registering a native for a method whose real body is a delegation is a
+    // net loss twice over: it can only reimplement what the delegate already
+    // does, and it hides the delegate when it gets it wrong.
 
     // Redirect enum constants
     r.register(

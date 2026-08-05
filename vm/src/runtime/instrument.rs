@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, PoisonError, RwLock};
 
-use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::narrow_oop::ref_element_size;
 use cratonvm_types::{
     error::{MethodCallFailed, MethodCallResult, VmError},
@@ -1553,7 +1553,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/instrument/ClassFileTransformer;)Z",
         native_remove_transformer,
     );
-    r.register(
+    r.register_with_kind(
         impl_class,
         "redefineClasses0",
         "(J[Ljava/lang/instrument/ClassDefinition;)V",
@@ -1567,6 +1567,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let defs = args.get(2).cloned().unwrap_or(Value::Object(None));
             native_redefine_classes0(ctx, &[receiver, defs])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1574,7 +1575,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/instrument/ClassDefinition;)V",
         native_redefine_classes0,
     );
-    r.register(
+    r.register_with_kind(
         impl_class,
         "retransformClasses0",
         "(J[Ljava/lang/Class;)V",
@@ -1583,6 +1584,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let classes = args.get(2).cloned().unwrap_or(Value::Object(None));
             native_retransform_classes0(ctx, &[receiver, classes])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1597,7 +1599,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         native_get_all_loaded_classes0,
     );
     // JDK 25 (J)[Ljava/lang/Class; variant — first arg is `long jvmtienv`.
-    r.register(
+    r.register_with_kind(
         impl_class,
         "getAllLoadedClasses0",
         "(J)[Ljava/lang/Class;",
@@ -1605,6 +1607,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let receiver = args.first().cloned().unwrap_or(Value::Object(None));
             native_get_all_loaded_classes0(ctx, &[receiver])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1612,7 +1615,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
         native_get_initiated_classes0,
     );
-    r.register(
+    r.register_with_kind(
         impl_class,
         "getInitiatedClasses0",
         "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;",
@@ -1621,6 +1624,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let loader = args.get(2).cloned().unwrap_or(Value::Object(None));
             native_get_initiated_classes0(ctx, &[receiver, loader])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1628,7 +1632,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Z",
         native_is_modifiable_class0,
     );
-    r.register(
+    r.register_with_kind(
         impl_class,
         "isModifiableClass0",
         "(JLjava/lang/Class;)Z",
@@ -1637,6 +1641,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let cls = args.get(2).cloned().unwrap_or(Value::Object(None));
             native_is_modifiable_class0(ctx, &[receiver, cls])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1644,7 +1649,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)J",
         native_get_object_size0,
     );
-    r.register(
+    r.register_with_kind(
         impl_class,
         "getObjectSize0",
         "(JLjava/lang/Object;)J",
@@ -1653,6 +1658,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             let obj = args.get(2).cloned().unwrap_or(Value::Object(None));
             native_get_object_size0(ctx, &[receiver, obj])
         }) as NativeCallback,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1680,11 +1686,12 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // String jar, boolean isBootstrap). Drives both the bootstrap- and
     // system-classloader append forms (Mockito inline mock maker injects its
     // MockMethodDispatcher into the bootstrap loader via this path).
-    r.register(
+    r.register_with_kind(
         impl_class,
         "appendToClassLoaderSearch0",
         "(JLjava/lang/String;Z)V",
         native_append_to_classloader_search0,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1722,7 +1729,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // handler is kept (rather than reverted to a no-op) so that the recording
     // is already correct on the day the capability becomes real — see the
     // "TO MAKE THIS `true` AGAIN" note on `native_is_prefix_supported0`.
-    r.register(
+    r.register_with_kind(
         impl_class,
         "setNativeMethodPrefixes",
         "(J[Ljava/lang/String;Z)V",
@@ -1754,6 +1761,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             });
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // setHasRetransformableTransformers(long, boolean) — JVMTI capability flag toggle.
     //
@@ -1775,11 +1783,12 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // `redefine_immune_reflection_native` allow-list — cede a redefined class's
     // methods to the woven bytecode), and the load hook IS the chain walk.
     // Recording the flag would create state nothing reads.
-    r.register(
+    r.register_with_kind(
         impl_class,
         "setHasRetransformableTransformers",
         "(JZ)V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,
@@ -1790,11 +1799,12 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // JDK 25 InstrumentationImpl natives take `long jvmtienv` (descriptor (J)Z).
     // Register both the (J)Z variant (the JDK 25 actual signature) and the
     // legacy ()Z variant (backstop in case some workloads see the older arity).
-    r.register(
+    r.register_with_kind(
         impl_class,
         "isRetransformClassesSupported0",
         "(J)Z",
         native_is_retransform_supported0,
+        NativeKind::Bridge,
     );
     r.register(
         impl_class,

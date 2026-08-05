@@ -16,6 +16,12 @@ There was never a separate lane doc for L5b/L5c — L5 named them and set the
 rule. This is the record of what executing that rule on the other crates
 actually produced, and it differs from L5 in four ways worth keeping.
 
+> **Follow-up, same day:** section 1 below is half right. `hasDisplays0` IS
+> ACC_NATIVE — on the Windows/macOS image — and a census taken against an
+> unpacked Windows JDK proves it, so the marker was correct and the row states
+> its kind now. The 21 mixed sites of section 2 have since been split. See
+> `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+
 ## 1. The one adjudicated `bridge` verdict outside `native-io` did not survive
 
 L5's Rules say to start from the `JDK-ONLY-CLASSIFY` markers, because "those

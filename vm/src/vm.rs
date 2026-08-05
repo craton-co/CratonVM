@@ -67775,17 +67775,39 @@ mod tests {
         );
     }
 
+    /// Set a `java.lang.reflect.Field` mirror's JDK-layout field BY NAME.
+    ///
+    /// The two tests below used to hand-number these slots from the fabricated
+    /// model (`0=override, 1=clazz, 2=slot, 3=name, ...`), and one of them
+    /// derived an extra-slot index arithmetically from a 7-field stub. The
+    /// model moved on 2026-08-05 — `java.lang.reflect.AccessibleObject` declares
+    /// TWO fields, not one — and frozen indices are exactly what such a change
+    /// silently rots. Production never numbered these: `create_field_object`
+    /// and `read_field_meta` both go through `set_field_by_name` /
+    /// `get_field_by_name`, so the tests do too.
+    fn m11_set_field_mirror_by_name(
+        shared: &Arc<SharedVm>,
+        field: cratonvm_types::ObjectRef,
+        class_id: ClassId,
+        name: &str,
+        value: Value,
+    ) {
+        let idx = {
+            let cm = shared.classes.class_manager.read();
+            crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, name, &cm.class_store)
+                .unwrap_or_else(|| panic!("java/lang/reflect/Field declares no `{name}`"))
+        };
+        shared.mem.heap.set_field(field, idx, value);
+    }
+
     #[test]
     fn m11_field_access_control_public_allowed() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Real JDK java.lang.reflect.Field layout (see
-        // classloading/class_manager::synthetic_stub_fields):
-        //   0=override, 1=clazz, 2=slot, 3=name, 4=type,
-        //   5=modifiers, 6=trustedFinal.
-        // Native code resolves these by name via get_field_by_name, so we
-        // must load the Field class so the class manager knows its layout.
+        // The JDK-layout fields go in BY NAME (see `m11_set_field_mirror_by_name`),
+        // which is what the natives under test do — so this test does not have
+        // to know, or track, where the fabricated model puts them.
         let field_class_id = shared
             .load_class_concurrent("java/lang/reflect/Field")
             .unwrap();
@@ -67802,18 +67824,16 @@ mod tests {
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
         // Populate real JDK-named fields.
-        shared
-            .mem
-            .heap
-            .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.mem.heap.set_field(field, 2, Value::Int(0)); // slot
         let fname = create_java_string(&shared, "value");
-        shared
-            .mem
-            .heap
-            .set_field(field, 3, Value::Object(Some(fname))); // name
-        shared.mem.heap.set_field(field, 5, Value::Int(0x0009)); // modifiers = PUBLIC | STATIC
-        shared.mem.heap.set_field(field, 6, Value::Int(0)); // trustedFinal
+        for (name, value) in [
+            ("clazz", Value::Object(Some(class_mirror))),
+            ("slot", Value::Int(0)),
+            ("name", Value::Object(Some(fname))),
+            ("modifiers", Value::Int(0x0009)), // PUBLIC | STATIC
+            ("trustedFinal", Value::Int(0)),
+        ] {
+            m11_set_field_mirror_by_name(&shared, field, field_class_id, name, value);
+        }
 
         // Public field access should succeed
         let result = call_native(
@@ -67832,12 +67852,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Real JDK Field layout + CratonVM extra slots:
-        //   0=override, 1=clazz, 2=slot, 3=name, 4=type,
-        //   5=modifiers, 6=trustedFinal, then extras [desc, rj_slot, accessible].
-        // field_extra_base floors at 7 slots when class_num_total_fields(Field)
-        // returns the 7-field synthetic stub, so the accessible extra lives at
-        // absolute index 7+2 = 9.
+        // JDK-layout fields go in BY NAME. CratonVM's own extra slots have no
+        // JDK field to be named after, so they are anchored past the layout at
+        // `max(FIELD_NUM_FIELDS_LEGACY_FLOOR, class_num_total_fields) + k` —
+        // computed here the way `lang_class.rs` computes it rather than
+        // hard-coded (this test used to spell it "7+2 = 9", which stopped being
+        // true the moment the Field model gained `accessCheckCache`).
         let field_class_id = shared
             .load_class_concurrent("java/lang/reflect/Field")
             .unwrap();
@@ -67853,35 +67873,41 @@ mod tests {
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
 
-        // Field 1: private+static, accessible=true → should succeed.
-        let field = shared.mem.heap.alloc_object(field_class_id, 12);
-        shared
-            .mem
-            .heap
-            .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.mem.heap.set_field(field, 2, Value::Int(0)); // slot
-        let fname = create_java_string(&shared, "secret");
-        shared
-            .mem
-            .heap
-            .set_field(field, 3, Value::Object(Some(fname))); // name
-        shared.mem.heap.set_field(field, 5, Value::Int(0x000A)); // modifiers: PRIVATE | STATIC
-        shared.mem.heap.set_field(field, 9, Value::Int(1)); // extra: accessible=true
+        // Mirrors `FIELD_NUM_FIELDS_LEGACY_FLOOR` / `FIELD_EXTRA_OFFSET_ACCESSIBLE`
+        // in `native-builtins/src/lang_class.rs`.
+        let jdk_width = {
+            let cm = shared.classes.class_manager.read();
+            cm.class_store
+                .get(field_class_id)
+                .map_or(0, |c| c.num_total_fields)
+        };
+        let accessible_slot = core::cmp::max(7, jdk_width) + 2;
 
+        // Field 1: private+static, accessible=true → should succeed.
         // Field 2: private+static, accessible=false → should be rejected.
-        let field2 = shared.mem.heap.alloc_object(field_class_id, 12);
-        shared
-            .mem
-            .heap
-            .set_field(field2, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.mem.heap.set_field(field2, 2, Value::Int(0)); // slot
-        let fname2 = create_java_string(&shared, "secret2");
-        shared
-            .mem
-            .heap
-            .set_field(field2, 3, Value::Object(Some(fname2))); // name
-        shared.mem.heap.set_field(field2, 5, Value::Int(0x000A)); // modifiers
-        shared.mem.heap.set_field(field2, 9, Value::Int(0)); // extra: accessible=false
+        let mut mirrors = Vec::new();
+        for (field_name, accessible) in [("secret", 1), ("secret2", 0)] {
+            let f = shared
+                .mem
+                .heap
+                .alloc_object(field_class_id, accessible_slot + 1);
+            let fname = create_java_string(&shared, field_name);
+            for (name, value) in [
+                ("clazz", Value::Object(Some(class_mirror))),
+                ("slot", Value::Int(0)),
+                ("name", Value::Object(Some(fname))),
+                ("modifiers", Value::Int(0x000A)), // PRIVATE | STATIC
+            ] {
+                m11_set_field_mirror_by_name(&shared, f, field_class_id, name, value);
+            }
+            shared
+                .mem
+                .heap
+                .set_field(f, accessible_slot, Value::Int(accessible));
+            mirrors.push(f);
+        }
+        let field = mirrors[0];
+        let field2 = mirrors[1];
 
         let rejected = call_native(
             &shared,

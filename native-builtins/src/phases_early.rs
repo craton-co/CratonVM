@@ -21554,7 +21554,6 @@ pub(crate) fn register_t2_3_completion_natives(r: &mut NativeMethodRegistry) {
     register_arraylist_element_data(r);
     register_arrays_parallel_sort(r);
     register_spliterator_primitive_natives(r);
-    register_scanner_find_within_horizon(r);
     r.set_category(__prev_cat);
 }
 
@@ -22333,151 +22332,19 @@ fn spl_prim_for_each_remaining(
     Ok(None)
 }
 
-// ---------------------------------------------------------------------------
-// T2.3.12 — Scanner.findWithinHorizon(Pattern, long)
-// ---------------------------------------------------------------------------
+// `Scanner.findWithinHorizon` used to be implemented here, over the model's
+// slots 0 and 1, and registered by `register_t2_3_completion_natives` — which
+// has no call site, so it was live in no configuration. Measured rather than
+// assumed: `--dump-native-registry` shows no `findWithinHorizon` row among the
+// 35 live `java/util/Scanner` entries, and the call reached real JDK bytecode
+// that reads `buf`/`matcher`/`source` and threw `NullPointerException` in both
+// modes (`probes/L3ScannerSearchProbe` on the pre-fix binary).
 //
-// `findWithinHorizon` scans forward from the current Scanner position,
-// optionally limited to the first `horizon` characters, for the next
-// match of the given pattern. On success it advances the position past
-// the match and returns the matched substring; on failure it returns
-// null and leaves the position unchanged.
-//
-// A horizon of 0 means "entire remaining input" (per OpenJDK javadoc).
-// Negative horizons throw IllegalArgumentException.
-//
-// JDK-ONLY-LAYOUT: this used to read the synthetic Scanner model's slots 0 and
-// 1 directly. On a REAL `java.util.Scanner` those are `buf`
-// (a `java.nio.CharBuffer`) and `position` — so slot 0 read back whatever
-// `native_scanner_init_*` had left in `buf`, and only worked because that
-// native was writing a `String` into the same wrong field. The scanner state
-// now lives with the rest of the `Scanner` natives in `native-io`, which
-// resolves `position` on the receiver's own class and keeps the input text in
-// an identity-keyed side table (`buf` has no `String` to hold). See the
-// JDK-ONLY-LAYOUT block above `SCAN_FIELD_INPUT` there.
-
-fn register_scanner_find_within_horizon(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
-    r.register(
-        "java/util/Scanner",
-        "findWithinHorizon",
-        "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
-        native_scanner_find_within_horizon_pattern_int,
-    );
-    r.register(
-        "java/util/Scanner",
-        "findWithinHorizon",
-        "(Ljava/lang/String;I)Ljava/lang/String;",
-        native_scanner_find_within_horizon_string_int,
-    );
-    r.set_category(__prev_cat);
-}
-
-fn scanner_find_within_horizon_impl(
-    ctx: &mut dyn NativeContext,
-    this: cratonvm_types::ObjectRef,
-    regex: crate::JavaRegex,
-    horizon: i32,
-) -> MethodCallResult {
-    if horizon < 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("horizon < 0: {horizon}"),
-            }
-            .into(),
-        );
-    }
-    let source = match cratonvm_native_io::scanner_source(ctx, this) {
-        Some(s) => s,
-        // Never opened through our constructors, or closed. The real
-        // `findWithinHorizon` calls `ensureOpen()`, but this native has always
-        // answered null for an unreadable scanner; keep that rather than
-        // introduce a throw on a path nothing has measured.
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let pos = cratonvm_native_io::scanner_position(ctx, this);
-    if pos >= source.len() {
-        return Ok(Some(Value::Object(None)));
-    }
-    // Clamp the search window to horizon bytes when non-zero. We use
-    // byte offsets throughout since the underlying string is UTF-8
-    // and our regex crate operates on byte slices; clamping to a char
-    // boundary avoids splitting a multi-byte sequence.
-    let window_end = if horizon == 0 {
-        source.len()
-    } else {
-        let mut end = pos + horizon as usize;
-        if end > source.len() {
-            end = source.len();
-        }
-        // Back up to the nearest char boundary so we never slice
-        // through the middle of a multi-byte UTF-8 sequence.
-        while end > pos && !source.is_char_boundary(end) {
-            end -= 1;
-        }
-        end
-    };
-    let hay = &source[pos..window_end];
-    match regex.find(hay) {
-        Some(m) => {
-            let new_pos = pos + m.end;
-            cratonvm_native_io::scanner_set_position(ctx, this, new_pos)?;
-            Ok(Some(Value::Object(Some(ctx.create_string(&m.text)))))
-        }
-        None => Ok(Some(Value::Object(None))),
-    }
-}
-
-fn native_scanner_find_within_horizon_pattern_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let pattern = match args.get(1) {
-        Some(Value::Object(Some(p))) => *p,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("pattern".to_string()),
-            }
-            .into());
-        }
-    };
-    let horizon = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let regex = crate::read_pattern_regex(ctx, pattern)?;
-    scanner_find_within_horizon_impl(ctx, this, regex, horizon)
-}
-
-fn native_scanner_find_within_horizon_string_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let pattern_str = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("pattern".to_string()),
-            }
-            .into());
-        }
-    };
-    let horizon = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let regex = crate::compile_java_regex(&pattern_str, 0).map_err(|e| {
-        cratonvm_types::error::MethodCallFailed::from(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("{e:?}"),
-            },
-        )
-    })?;
-    scanner_find_within_horizon_impl(ctx, this, regex, horizon)
-}
+// It now lives in `native-io/src/lib.rs`, beside `findInLine` and `skip`: they
+// share the Scanner state accessors and the same regex engine, and
+// `register_scanner_natives` there is registered in every configuration. Moved
+// rather than wired up in place — a second implementation over a second model
+// is what made this lane's own brief describe `Scanner` as three fields wide.
 
 // ===========================================================================
 // T2.3 unit tests — Random / StringTokenizer / ArraysSupport natives
@@ -23329,102 +23196,6 @@ mod t2_tests {
         let mut ctx = mock_ctx();
         let r = native_spl_int_try_split(&mut ctx, &[]).unwrap();
         assert_eq!(r, Some(Value::Object(None)));
-    }
-
-    // -----------------------------------------------------------------------
-    // T2.3.12: Scanner.findWithinHorizon(String, I)
-    //
-    // We exercise the String-overload path so we don't need a real compiled
-    // Pattern object in the test harness. The Pattern-overload path reuses
-    // the same inner helper and is verified in integration tests.
-    // -----------------------------------------------------------------------
-
-    fn make_scanner(ctx: &mut dyn NativeContext, text: &str) -> cratonvm_types::ObjectRef {
-        // Five slots, matching the model in `native-io` and the fabricated
-        // `java/util/Scanner` in `class_manager.rs`. The state goes in through
-        // `native-io`'s own setter, which is where `findWithinHorizon` now
-        // reads it from.
-        let sc = crate::alloc_concurrent_synthetic(ctx, "java/util/Scanner", 5);
-        cratonvm_native_io::scanner_set_source(ctx, sc, text);
-        sc
-    }
-
-    #[test]
-    fn t2_scanner_find_within_horizon_finds_first_match_advances_pos() {
-        let mut ctx = mock_ctx();
-        let sc = make_scanner(&mut ctx, "prefix abc123 suffix");
-        let pat = ctx.create_string(r"\d+");
-        let r = native_scanner_find_within_horizon_string_int(
-            &mut ctx,
-            &[
-                Value::Object(Some(sc)),
-                Value::Object(Some(pat)),
-                Value::Int(0),
-            ],
-        )
-        .unwrap();
-        let text = match r {
-            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        assert_eq!(text, "123");
-        // Position should now be just past the digits (pos of "123" end).
-        // Read it back through the same accessor the native writes through.
-        assert_eq!(
-            cratonvm_native_io::scanner_position(&mut ctx, sc),
-            "prefix abc123".len()
-        );
-    }
-
-    #[test]
-    fn t2_scanner_find_within_horizon_no_match_returns_null() {
-        let mut ctx = mock_ctx();
-        let sc = make_scanner(&mut ctx, "only letters here");
-        let pat = ctx.create_string(r"\d+");
-        let r = native_scanner_find_within_horizon_string_int(
-            &mut ctx,
-            &[
-                Value::Object(Some(sc)),
-                Value::Object(Some(pat)),
-                Value::Int(0),
-            ],
-        )
-        .unwrap();
-        assert_eq!(r, Some(Value::Object(None)));
-    }
-
-    #[test]
-    fn t2_scanner_find_within_horizon_respects_horizon() {
-        let mut ctx = mock_ctx();
-        let sc = make_scanner(&mut ctx, "aaaa12345");
-        let pat = ctx.create_string(r"\d+");
-        // Horizon = 4 means we look only at "aaaa" — no digits in that window.
-        let r = native_scanner_find_within_horizon_string_int(
-            &mut ctx,
-            &[
-                Value::Object(Some(sc)),
-                Value::Object(Some(pat)),
-                Value::Int(4),
-            ],
-        )
-        .unwrap();
-        assert_eq!(r, Some(Value::Object(None)));
-    }
-
-    #[test]
-    fn t2_scanner_find_within_horizon_negative_horizon_errors() {
-        let mut ctx = mock_ctx();
-        let sc = make_scanner(&mut ctx, "abc");
-        let pat = ctx.create_string(r"\d+");
-        let r = native_scanner_find_within_horizon_string_int(
-            &mut ctx,
-            &[
-                Value::Object(Some(sc)),
-                Value::Object(Some(pat)),
-                Value::Int(-1),
-            ],
-        );
-        assert!(r.is_err());
     }
 
     // -----------------------------------------------------------------------
