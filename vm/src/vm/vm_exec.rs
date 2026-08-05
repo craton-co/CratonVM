@@ -3481,7 +3481,20 @@ fn cold_log_overlay_access(
 /// a per-thread set would print one line per thread for the same site, which is
 /// noise, not information. Only ever populated under `CRATONVM_DBG_OVERLAY`, so
 /// a default run and every unit test leave it empty.
+///
+/// This is diagnostic de-duplication state, not `--jdk-only` feature state (the
+/// contract's "no process globals" clause is about the latter), and it is the
+/// same shape as the `static N: AtomicU32` print caps the two neighbouring
+/// diagnostics in this file already use.
 fn first_model_slot_report(class_id: ClassId, index: usize, is_read: bool) -> bool {
+    // `CRATONVM_DBG=overlay-nodedup` turns the cap off, for when you want
+    // per-site COUNTS rather than per-site presence.
+    static NODEDUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NODEDUP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_NODEDUP").is_some()
+    }) {
+        return true;
+    }
     static SEEN: std::sync::OnceLock<
         parking_lot::Mutex<rustc_hash::FxHashSet<(u32, u32, bool)>>,
     > = std::sync::OnceLock::new();

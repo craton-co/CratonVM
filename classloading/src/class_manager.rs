@@ -6348,7 +6348,12 @@ impl ClassManager {
     /// over real references, which this instrument cannot falsify (see the
     /// module docs).
     fn report_shadow_layout(&self, id: ClassId) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_none() {
+        // Latched once: this runs on every class definition, and the default
+        // path must not pay an env lookup per class.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some()
+        }) {
             return;
         }
         let Some(diff) = self.shadow_layout_diff(id) else {
