@@ -1,9 +1,9 @@
 # COV-03 — `getfield` learned about references; `putfield` twenty lines below it did not
 
 **Status:** not started. **Independent of every other lane.**
-**Owns:** the `0xb4` and `0xb5` arms of `IrBuilder::build` in `jit/src/ir.rs`
+**Owns:** the `0xb4` and `0xb5` arms of `IrBuilder::build` in `../../../jit/src/ir.rs`
 (`ir.rs:4995` and `ir.rs:5074` today), and their lowering in
-`jit/src/ir_lower.rs`. Not `ir_compatible`.
+`../../../jit/src/ir_lower.rs`. Not `ir_compatible`.
 
 > **Re-measure before quoting the survey's 43 — this lane is now much larger
 > than that.** `cov-01`, `cov-02` and `cov-04` all closed 2026-08-03, and
@@ -85,7 +85,7 @@ been burned by once — see the `optimize=false` guard's comment about
 * `CRATONVM_DBG=ir-compiles` on `ConditionalOnPropertyTests`: the
   `refused at ir.rs:5085` count falls, `optimizing backend produced a body`
   rises. Both numbers, not one.
-* `jit/tests/ir_vs_singlepass.rs`: a method that stores a reference field,
+* `../../../jit/tests/ir_vs_singlepass.rs`: a method that stores a reference field,
   reads it back, and returns it — same answer from both backends.
 * **A generational/moving test.** A reference stored into an old object,
   pointing at a young one, surviving a young collection. If the barrier is

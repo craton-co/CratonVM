@@ -10,11 +10,11 @@ anything in the measurement below is still current.
 **Found 2026-08-04. Landed 2026-08-03.**
 **Owns:** whatever lowers `baload`/`bastore` in `IrBuilder::build`, and the
 decision of whether an IR body may replace a C1 body without evidence.
-Not `regression-suite/perf/`.
+Not `../../../regression-suite/perf`.
 
 ## The measurement
 
-`bench/CratonBench.java` phase `sieve`, isolated fresh process, pinned cpu 13,
+`../../../bench/CratonBench.java` phase `sieve`, isolated fresh process, pinned cpu 13,
 `-Xmx8g`, arms interleaved with the order flipped on alternate pairs, 5 pairs.
 Both builds are from the same tree and differ only by `cov-02`:
 
@@ -48,7 +48,7 @@ Both builds **admit** the method. Only the newer one **lowers** it — before,
 single-pass backend. `cov-02` added the arm, the refusal went away, and the
 body the optimizing tier now emits is 6.4x slower than the one it displaced.
 
-Per-phase C2 reach, from the same runs (`regression-suite/perf/c2-reach.sh`):
+Per-phase C2 reach, from the same runs (`../../../regression-suite/perf/c2-reach.sh`):
 
 | build | requests | admitted | bodies |
 |---|---:|---:|---:|
@@ -81,7 +81,7 @@ This is that separate measurement, and for this method the answer is no.
 Two reasons, both now closed:
 
 1. **The perf gate could not run.** Its own `export LC_ALL=C` made `javac`
-   default to US-ASCII and it died compiling `bench/CratonBench.java` before
+   default to US-ASCII and it died compiling `../../../bench/CratonBench.java` before
    measuring anything (fixed 2026-08-03, `MEAS-02`). A gate that cannot start
    catches nothing.
 2. **Nothing recorded which phases reach the optimizing tier**, so the one
