@@ -3856,7 +3856,12 @@ pub fn try_jit_compile_callee(
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         if callee_probe_dbg() {
-            callee_probe_note("BAIL-LISTED", class_name, method_name, descriptor);
+            // Carry the recorded refusal site into the tally key: "bail-listed"
+            // alone says only that some earlier compile said no, and the
+            // whole point of the tally is to name what has to be fixed.
+            let why = cratonvm_jit::jit_bail_reason_for(class_name, method_name, descriptor)
+                .unwrap_or_else(|| "reason-not-recorded".to_string());
+            callee_probe_note(&format!("BAIL-LISTED[{why}]"), class_name, method_name, descriptor);
         }
         return None;
     }
@@ -3924,6 +3929,7 @@ pub fn try_jit_compile_callee(
                     ids
                 );
             }
+            callee_probe_tally("CACHE-MISS", class_name, method_name);
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -3932,6 +3938,7 @@ pub fn try_jit_compile_callee(
     if slot.load(Ordering::Relaxed) == fp {
         let n = CALLEE_NEG_HITS.fetch_add(1, Ordering::Relaxed);
         if n & CALLEE_NEG_REPROBE_MASK != 0 {
+            callee_probe_tally("NEG-CACHE", class_name, method_name);
             return None;
         }
         // Periodic re-probe: fall through and re-run the full pipeline.
@@ -3975,6 +3982,52 @@ fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor:
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 25 {
         eprintln!("[callee-probe] {why} {class_name}.{method_name}{descriptor}");
+    }
+    callee_probe_tally(why, class_name, method_name);
+}
+
+/// Per-`(reason, callee)` tally behind the same flag as [`callee_probe_note`].
+///
+/// The first-25 sample above is spent entirely on class loading before the
+/// workload's own code runs, so it cannot answer the question the counter
+/// `pub_probe_none` raises — *which* callees are refused, and for which of the
+/// four reasons. Bounded to [`CALLEE_PROBE_TALLY_CAP`] distinct keys so a
+/// pathological run cannot grow it without limit.
+fn callee_probe_tally(why: &str, class_name: &str, method_name: &str) {
+    if !callee_probe_dbg() {
+        return;
+    }
+    const CALLEE_PROBE_TALLY_CAP: usize = 4096;
+    let tally = CALLEE_PROBE_TALLY
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = tally.lock();
+    let key = format!("{why} {class_name}.{method_name}");
+    if guard.len() >= CALLEE_PROBE_TALLY_CAP && !guard.contains_key(&key) {
+        return;
+    }
+    *guard.entry(key).or_insert(0) += 1;
+}
+
+#[allow(clippy::type_complexity)]
+static CALLEE_PROBE_TALLY: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// Dump the [`callee_probe_tally`] histogram, hottest first. Called from the
+/// `mic-prof` dump so one run answers both "how often does the inline cache
+/// fail to hold an entry" and "for which callees, and why".
+pub(crate) fn dump_callee_probe_tally() {
+    if !callee_probe_dbg() {
+        return;
+    }
+    let Some(tally) = CALLEE_PROBE_TALLY.get() else {
+        return;
+    };
+    let mut rows: Vec<(String, u64)> = tally.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("[callee-probe] tally ({} distinct keys)", rows.len());
+    for (key, count) in rows.iter().take(30) {
+        eprintln!("[callee-probe]   {count:>10} {key}");
     }
 }
 
@@ -4137,9 +4190,29 @@ pub(super) fn try_jit_compile_callee_slow(
     let code_attr = method.code()?;
     // `cm` is intentionally passed through: do not recursively read-lock the
     // class manager while this guard and its borrowed method are alive.
+    //
+    // The class id here MUST be `declaring_id`, not `callee_class_id`. The scan
+    // resolves the constant-pool indices embedded in `code_attr.code`, and
+    // those indices only mean anything in the constant pool of the class that
+    // DECLARES the method. `callee_class_id` is the RECEIVER's class, which for
+    // any inherited method is a different class with a completely unrelated
+    // pool: the same index there is a Utf8, a Fieldref, or out of range, so the
+    // scan's `_ => return true` arm fired and the method was permanently
+    // `mark_jit_bail_listed`ed for a constant it never referenced.
+    //
+    // The cost of that landed on exactly the code least able to absorb it —
+    // framework hierarchies whose hot methods are inherited accessors. On
+    // `InPredicateTest`'s 100k-element criteria IN-list, every hot SQM
+    // accessor (`SqmTextValuedSimplePath.getReferencedPathSource`,
+    // `BasicSqmPathSource.getExpressible`, ...) was bail-listed this way, so
+    // `jit_invoke_virtual_mic` reported `hit_entry=0 / pub_probe_none=2228315`
+    // — the inline cache NEVER held an entry, and 2.2M dispatches from compiled
+    // code each took the entryless helper path instead of a direct call. That
+    // made JIT-on ~2x SLOWER than `--nojit` on that test, which is what
+    // docs/known-issues/hibernate/hib-inpredicate-*.md has been tracking.
     if jit_method_calls_forced_class_generic_metadata(
         &cm,
-        callee_class_id,
+        declaring_id,
         &code_attr.code,
         code_attr.code.len(),
     ) {

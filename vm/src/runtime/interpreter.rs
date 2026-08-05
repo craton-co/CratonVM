@@ -4330,9 +4330,22 @@ fn execute_frame_from_index(
         // chain before the watchdog aborts the process. The load is
         // `Ordering::Relaxed` — a single predicted branch per bytecode in
         // the common case (flag always false).
-        if !stack_dump_emitted && shared.stack_dump_pending() {
+        //
+        // Under `--stack-sample-ms` the same hook is driven as a periodic
+        // SAMPLER: the per-`execute()` latch is bypassed and the request is
+        // consumed here, so the sampler thread's next re-arm produces the
+        // next sample. That distinction is the whole point — with the latch
+        // in place this hook fires once per nested interpreter entry, and the
+        // resulting "profile" ranks methods by call count rather than by time
+        // (a cheap method entered 100k times outranks the one that actually
+        // burned the wall clock).
+        if (!stack_dump_emitted || shared.stack_sample_mode()) && shared.stack_dump_pending() {
             shared.dump_current_thread_frames(thread);
-            stack_dump_emitted = true;
+            if shared.stack_sample_mode() {
+                shared.clear_stack_dump_request();
+            } else {
+                stack_dump_emitted = true;
+            }
             // Don't park or sleep here — the watchdog aborts the process
             // after a short grace period, and if it doesn't (e.g. crashed
             // mid-way) we'd rather keep running than hang forever. The
@@ -7351,7 +7364,7 @@ mod lambda;
 pub use lambda::*;
 mod native_override;
 pub use native_override::*;
-mod jit_bridge;
+pub(crate) mod jit_bridge;
 pub use jit_bridge::*;
 
 // ---------------------------------------------------------------------------
