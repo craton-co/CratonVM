@@ -249,6 +249,12 @@ pub mod mic_prof {
             cratonvm_jit::unowned_ic_entry_refusals(),
             cratonvm_jit::unowned_ic_entry_publishes(),
         );
+        // `pub_probe_none` says the inline cache never learned an entry; the
+        // tally says WHICH callees were refused and under which of the four
+        // reasons. Together they are a diagnosis; separately they are the
+        // "hit_entry=0 forever" observation that has been made before and left
+        // unexplained. No-op unless `CRATONVM_DBG=callee-probe` is also set.
+        crate::runtime::interpreter::jit_bridge::dump_callee_probe_tally();
     }
 }
 

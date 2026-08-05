@@ -609,6 +609,18 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
+    /// If set, sample every interpreter thread's Java frame chain to stderr
+    /// every `MILLIS` and keep running (no abort). Unlike
+    /// `--stack-dump-on-timeout`, which emits one dump per nested interpreter
+    /// entry and therefore ranks methods by CALL COUNT, this is a
+    /// time-weighted profile: aggregate the leaf frame of each emitted
+    /// `T19.H1 stack dump` record to see where wall-clock actually goes.
+    /// Diagnostic-only. JIT-compiled frames never reach the dispatch loop and
+    /// so are not sampled — pair it with `--nojit`, or read the result as
+    /// "of the interpreted time, ...".
+    #[arg(long = "stack-sample-ms", value_name = "MILLIS")]
+    stack_sample_ms: Option<u64>,
+
     // -----------------------------------------------------------------------
     // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
     //
@@ -1051,6 +1063,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--add-modules",
     "--Xlog",
     "--stack-dump-on-timeout",
+    "--stack-sample-ms",
     "--gpu-device",
     "--gpu-min-work",
 ];
@@ -3659,6 +3672,30 @@ fn run() -> Result<()> {
         cratonvm_native_api::native_ring::enable(true);
         vm.shared.natives.native_methods.flush_native_ring_names();
         cratonvm_vm::dispatch_trace::enable();
+    }
+
+    // `--stack-sample-ms`: periodic, time-weighted Java-frame profiler. Arms
+    // sampling mode (which makes the interpreter CONSUME each dump request
+    // instead of latching it once per nested `execute()`), then re-arms the
+    // request every interval. Never aborts the process, so it composes with a
+    // normal run; the run just gets slower in proportion to the sample rate.
+    if let Some(ms) = args.stack_sample_ms.filter(|ms| *ms > 0) {
+        vm.shared.enable_stack_sampling();
+        let shared_for_sampler = std::sync::Arc::clone(&vm.shared);
+        let sampler_completed = std::sync::Arc::clone(&watchdog_completed);
+        std::thread::Builder::new()
+            .name("cratonvm-stack-sampler".into())
+            .spawn(move || {
+                eprintln!("=== stack sampler: armed at {ms}ms intervals ===");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if sampler_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    shared_for_sampler.request_stack_sample();
+                }
+            })
+            .ok();
     }
 
     if let Some(secs) = effective_watchdog {

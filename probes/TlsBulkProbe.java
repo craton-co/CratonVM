@@ -47,6 +47,21 @@ import javax.net.ssl.TrustManagerFactory;
  * <pre>
  *   TlsBulkProbe -keystore &lt;localhost-rsa.jks&gt; -threads 8 -sizeMiB 16
  * </pre>
+ *
+ * <p><strong>Does not currently run on CratonVM.</strong> The server half — a
+ * plain in-process {@code SSLServerSocket} — fails there before any bytes are
+ * measured: the accepted socket's output stream reports
+ * {@code SSLSocketOutputStream.write: stream is closed} and the client then
+ * times out (Windows {@code os error 10060}). Reproduced at 2 threads x 1 MiB,
+ * i.e. nothing to do with bulk volume. It works on HotSpot.
+ *
+ * <p>That lane is NOT the one {@code TestSsl.testPost} uses — testPost's server
+ * is a Tomcat NIO connector driving a rustls-backed {@code SSLEngine}, not an
+ * {@code SSLServerSocket} — so this was set aside rather than chased during the
+ * testPost investigation (see
+ * {@code docs/internal/fixed-suite-bugs/tomcat/testssl-testpost-connection-dies-under-concurrent-bulk-tls-FIXED.md}).
+ * Use {@code TlsPostShapeProbe} for the testPost shape. This file is kept
+ * because the server-side failure above is itself worth a page.
  */
 public final class TlsBulkProbe {
 

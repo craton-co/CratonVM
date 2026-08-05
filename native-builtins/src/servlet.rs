@@ -2391,6 +2391,19 @@ struct TlsReadahead {
     pos: usize,
 }
 
+// MEASURED AND REVERTED (testssl-testpost bulk TLS, 2026-08-04): sharding this
+// table 64 ways by stream id, on the theory that 8 threads popping ~16.7 million
+// single bytes each were convoying on one process-global mutex. They are not.
+// A/B on the same probe (`TlsPostShapeProbe.nativeFloor`, which prices
+// `available()` — this table's lookup plus one field read — against a no-op
+// native on the same receiver):
+//
+//   global mutex   1 thread 167.5 ns   8 threads 1165.5 ns
+//   64 shards      1 thread 180.7 ns   8 threads 1111.7 ns
+//
+// 4.6% at 8 threads is inside the run-to-run noise, so the lock was never the
+// contended resource and the shards bought nothing. The real cost behind that
+// number is the per-call field read — see `resolve_field_descriptor_byte_cached`.
 fn tls_readahead() -> &'static parking_lot::Mutex<HashMap<i32, TlsReadahead>> {
     static T: OnceLock<parking_lot::Mutex<HashMap<i32, TlsReadahead>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))

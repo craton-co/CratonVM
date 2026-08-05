@@ -56,9 +56,10 @@ pub mod verify_insn;
 pub mod vtype;
 
 pub use class::{
-    find_field_recursive, find_method_recursive, invokespecial_selection_start, ArrayInfo, Class,
-    ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, RecordComponentInfo,
-    RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
+    class_origin_epoch, find_field_recursive, find_method_recursive, invokespecial_selection_start,
+    ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
+    RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE,
+    RECORD_OBJ_TO_STRING,
 };
 // JDK-only mode (contract §5): every `Class` carries a `ClassOrigin`, and the
 // `--dump-class-origins` census is a `Vec<ClassOriginEntry>`. Both are named at
