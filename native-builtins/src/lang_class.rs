@@ -10936,6 +10936,13 @@ fn cached_annotation_proxy_resolving(
     queried_class_id: ClassId,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> Option<ObjectRef> {
+    // Cache FIRST. `resolve_annotation_type_near` can call `loadClass` on a
+    // user-defined loader, and `getAnnotation(X)` is hot enough that paying
+    // that on every hit would be a real cost — the point of this cache is that
+    // a repeat lookup touches nothing.
+    if let Some(cached) = peek_annotation_proxy_cache(queried_class_id, &ann.type_descriptor) {
+        return Some(cached);
+    }
     let ann_class_id = resolve_annotation_type_near(ctx, ann, Some(queried_class_id))?;
     Some(cached_annotation_proxy(
         ctx,
@@ -10943,6 +10950,14 @@ fn cached_annotation_proxy_resolving(
         ann,
         ann_class_id,
     ))
+}
+
+fn peek_annotation_proxy_cache(holder_class_id: ClassId, key: &str) -> Option<ObjectRef> {
+    annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(holder_class_id.as_u32(), key.to_string()))
+        .copied()
 }
 
 /// Build-or-fetch the cached annotation proxy for a class annotation. Keep the
@@ -12937,34 +12952,11 @@ fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     ctx.class_id_of_object(sample)
 }
 
-/// Whether an annotation's declared type can be loaded. The JDK's
-/// `sun.reflect.annotation.AnnotationParser` OMITS any annotation whose type
-/// class is not resolvable (e.g. a compile-only annotation like
-/// `org.apiguardian.api.API`, whose jar isn't on the runtime classpath) вЂ” it
-/// does NOT surface a broken/null annotation. CratonVM must do the same;
-/// otherwise `getDeclaredAnnotations()` returns a proxy with a null type mirror
-/// (`annotationType()`/`getClass()` в†’ null), which breaks every annotation
-/// walker (e.g. JUnit's `AnnotationUtils.findRepeatableAnnotations` NPEs on
-/// `annotationType().equals(...)` during test discovery в†’ 0 tests found).
-fn annotation_type_loadable(
-    ctx: &mut dyn NativeContext,
-    ann: &cratonvm_native_api::AnnotationData,
-) -> bool {
-    annotation_type_loadable_near(ctx, ann, None)
-}
-
-/// Is this annotation's TYPE resolvable, as seen from `declaring_class_id`?
+/// Resolve one annotation's declared TYPE, as seen from `declaring_class_id`.
 ///
-/// A thin `is_some()` over [`resolve_annotation_type_class_id`] — see
-/// [`resolvable_annotations`] for why the two must be the SAME lookup.
-fn annotation_type_loadable_near(
-    ctx: &mut dyn NativeContext,
-    ann: &cratonvm_native_api::AnnotationData,
-    declaring_class_id: Option<ClassId>,
-) -> bool {
-    resolve_annotation_type_near(ctx, ann, declaring_class_id).is_some()
-}
-
+/// Was `annotation_type_loadable_near`, a `bool`. Returning the `ClassId` is
+/// the point: the answer is now handed to the builder instead of being
+/// recomputed there — see [`resolvable_annotations`].
 fn resolve_annotation_type_near(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
@@ -13883,6 +13875,11 @@ pub(crate) fn native_method_get_annotation(
     }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
+            // Cache first — see `cached_annotation_proxy_resolving`.
+            let key = method_annotation_proxy_key(&method_name, &method_desc, &ann.type_descriptor);
+            if let Some(cached) = peek_annotation_proxy_cache(class_id, &key) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             if let Some(ann_cid) = resolve_annotation_type_near(ctx, ann, Some(class_id)) {
                 let proxy = cached_method_annotation_proxy(
                     ctx,
