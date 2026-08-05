@@ -4859,6 +4859,102 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(None)))
 }
 
+/// The window `findWithinHorizon` is allowed to search: `horizon` CODE POINTS
+/// from `pos`, or the whole remainder when `horizon == 0`.
+///
+/// The horizon is counted in characters, not bytes — the javadoc says the
+/// scanner "will never search more than horizon code points beyond its current
+/// position". The implementation this replaces (in `phases_early.rs`, never
+/// registered) added the horizon to a byte offset and then walked back to a
+/// char boundary, which is the same number only for ASCII.
+fn scanner_horizon_window(input: &str, pos: usize, horizon: i32) -> &str {
+    let remaining = &input[pos..];
+    if horizon == 0 {
+        return remaining;
+    }
+    match remaining.char_indices().nth(horizon as usize) {
+        Some((byte_end, _)) => &remaining[..byte_end],
+        // Fewer than `horizon` characters left: the window is the remainder.
+        None => remaining,
+    }
+}
+
+/// `Scanner.findWithinHorizon(String|Pattern, int)`.
+///
+/// Shared by both overloads. Returns the matched text and the new position, or
+/// `None` for no match — in which case the position must not move.
+fn scanner_find_within_horizon(
+    input: &str,
+    pos: usize,
+    pattern: &str,
+    horizon: i32,
+) -> Option<(String, usize)> {
+    if pos >= input.len() {
+        return None;
+    }
+    let hay = scanner_horizon_window(input, pos, horizon);
+    let re = regex::Regex::new(pattern).ok()?;
+    let m = re.find(hay)?;
+    Some((m.as_str().to_string(), pos + m.end()))
+}
+
+fn scanner_find_within_horizon_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    pattern_str: String,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let horizon = match args.get(2) {
+        Some(Value::Int(h)) => *h,
+        _ => 0,
+    };
+    if horizon < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("horizon < 0: {horizon}"),
+        }
+        .into());
+    }
+    let input = scan_input(ctx, this)?;
+    let pos = scan_pos(ctx, this);
+    match scanner_find_within_horizon(&input, pos, &pattern_str, horizon) {
+        Some((matched, new_pos)) => {
+            scan_set_pos(ctx, this, new_pos)?;
+            let s = ctx.create_string(&matched);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_scanner_find_within_horizon_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
+}
+
+fn native_scanner_find_within_horizon_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `Pattern`'s first instance field is `pattern:String` on both layouts.
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(p))) => match ctx.get_field(*p, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        },
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
+}
+
 fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -6454,6 +6550,44 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "skip",
         "(Ljava/util/regex/Pattern;)Ljava/util/Scanner;",
         native_scanner_skip,
+    );
+    // `findWithinHorizon` had an implementation in
+    // `native-builtins/src/phases_early.rs` that NOTHING registered: its only
+    // registrar, `register_t2_3_completion_natives`, has no call site, and
+    // `--dump-native-registry` showed no such row among the 35 live
+    // `java/util/Scanner` entries. So the call reached real JDK bytecode, which
+    // reads `buf`, `matcher` and `source` — none of which these natives
+    // populate — and threw `NullPointerException` in both modes, measured by
+    // `probes/L3ScannerSearchProbe`. It lives here now, beside `findInLine` and
+    // `skip`, which share its state accessors and its regex engine.
+    //
+    // Registered as INTRINSIC, with the kind STATED rather than inherited.
+    // `java.util.Scanner` declares no ACC_NATIVE method, so a `Bridge` tag —
+    // which contract §1.5 defines by an ACC_NATIVE target — would be wrong,
+    // and the L6 ratchet says so in as many words: two new Bridge rows
+    // shadowing concrete bytecode is a regression it refuses, and raising the
+    // baseline is explicitly not the fix. Intrinsic is what these are: a Rust
+    // fast path replicating a method that HAS real bytecode and has to match
+    // it, which is the category the implementation in `phases_early.rs` used
+    // before it moved here.
+    //
+    // The other 35 registrations in this function are still `Bridge` by
+    // inheritance and still wrong for the same reason — see the
+    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
+    // GOOD direction and belongs with whoever re-freezes it.
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/lang/String;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_string,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_pattern,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
 
     // Interface dispatch: Iterator
@@ -19204,6 +19338,57 @@ mod io_tests {
     #[test]
     fn scanner_consume_token_empty() {
         assert!(scanner_consume_token("", 0, r"\s+").is_none());
+    }
+
+    // T2.3.12 - `findWithinHorizon`, ported from `phases_early.rs` when the
+    // implementation moved here. These exercise the pure helper rather than the
+    // native, so they need no mock heap; the horizon boundary and the
+    // no-match-does-not-move-the-position rule are what they are for.
+
+    #[test]
+    fn scanner_fwh_finds_first_match_and_reports_the_new_position() {
+        let (text, pos) =
+            scanner_find_within_horizon("prefix abc123 suffix", 0, r"\d+", 0).unwrap();
+        assert_eq!(text, "123");
+        assert_eq!(pos, "prefix abc123".len());
+    }
+
+    #[test]
+    fn scanner_fwh_no_match_is_none() {
+        assert!(scanner_find_within_horizon("only letters here", 0, r"\d+", 0).is_none());
+    }
+
+    #[test]
+    fn scanner_fwh_respects_the_horizon() {
+        // Horizon 4 sees only "aaaa" - no digits in that window.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 4).is_none());
+        // One more character and the digits are reachable.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 5).is_some());
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_counts_characters_not_bytes() {
+        // Four 2-byte characters then a digit: a horizon of 4 must NOT reach
+        // the digit, and a horizon of 5 must. Counting bytes would let a
+        // horizon of 4 see nothing and a horizon of 8 see the digit - which is
+        // what the implementation this replaced did.
+        let s = "\u{e9}\u{e9}\u{e9}\u{e9}7";
+        assert!(scanner_find_within_horizon(s, 0, r"\d", 4).is_none());
+        assert_eq!(scanner_find_within_horizon(s, 0, r"\d", 5).unwrap().0, "7");
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_past_the_end_is_the_remainder() {
+        assert_eq!(scanner_horizon_window("abc", 0, 99), "abc");
+        assert_eq!(scanner_horizon_window("abc", 1, 0), "bc");
+    }
+
+    #[test]
+    fn scanner_fwh_searches_from_the_given_position() {
+        // The first match is behind `pos`; only the one after it counts.
+        let (text, pos) = scanner_find_within_horizon("11 22", 3, r"\d+", 0).unwrap();
+        assert_eq!(text, "22");
+        assert_eq!(pos, 5);
     }
 
     #[test]

@@ -1225,6 +1225,38 @@ pub(crate) fn create_string_or_oom(
     )))
 }
 
+/// [`create_string_or_oom`] for UTF-16 code units.
+///
+/// Identical escalation ladder — the only difference is that the source is a
+/// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
+/// allocated `String`. String concatenation builds its result this way; see
+/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+pub(crate) fn create_string_from_units_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    units: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_from_units as try_new_string;
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", units.len()),
+        },
+    )))
+}
+
 pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
@@ -3635,6 +3667,31 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                     thread.thread_id.0,
                 );
             }
+        }
+    }
+    // H2-CID0: once per collection per thread, ask whether any LIVE frame slot
+    // now points into memory the collector reclaimed. The blocked-region
+    // deposit/wake pair covers a PARKED thread; this covers a RUNNING one, and
+    // it bounds the loss window to "since the previous safepoint" — which no
+    // reader-side reporter can do, because by the time a `checkcast` or an
+    // `invoke` trips over the address, any number of collections have passed.
+    //
+    // One relaxed load per publish on the common path; the frame walk runs only
+    // when the collection counter actually moved. Unconditional, and that is
+    // the point: this family has been chased across four sessions on runs that
+    // were never armed.
+    {
+        thread_local! {
+            static AUDIT_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.mem.heap.collection_count();
+        let prev = AUDIT_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            crate::memory::reclaim_guard::audit_thread_frames(
+                shared,
+                thread,
+                "running frame slot (safepoint)",
+            );
         }
     }
     // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per

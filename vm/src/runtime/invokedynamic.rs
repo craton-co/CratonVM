@@ -30,7 +30,8 @@ use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{
-    create_java_string, create_java_string_uninterned, read_java_string, NativeContextImpl,
+    create_java_string, create_java_string_uninterned, read_java_string, read_java_string_units,
+    NativeContextImpl,
     SharedVm,
 };
 
@@ -103,15 +104,27 @@ const GROOVY_DTT: &str = "org/codehaus/groovy/runtime/typehandling/DefaultTypeTr
 
 /// Data extracted from the constant pool under a read lock, owned so we can
 /// drop the lock before proceeding with string creation (which needs a write lock).
+/// `StringConcatFactory` recipe tags, as UTF-16 code units.
+///
+/// The recipe is walked unit-by-unit rather than `char`-by-`char` so a lone
+/// surrogate in a folded literal survives; these are the two markers it looks
+/// for. Values per `java.lang.invoke.StringConcatFactory`.
+const TAG_ARG_UNIT: u16 = 0x0001;
+const TAG_CONST_UNIT: u16 = 0x0002;
+
 struct IndyInfo {
     bsm_class: String,
     bsm_method: String,
     target_name: String,
     target_descriptor: String,
-    /// The recipe string (first bootstrap argument, if StringConcatFactory).
-    recipe: String,
-    /// Additional constant strings from bootstrap arguments (for \u0002 placeholders).
-    constant_args: Vec<String>,
+    /// The recipe (first bootstrap argument, if StringConcatFactory) as UTF-16
+    /// code units. Units rather than `String` because a recipe may embed a lone
+    /// surrogate from a folded string literal, which a Rust `str` cannot hold --
+    /// see `resolve_concat_constant_units`.
+    recipe: Vec<u16>,
+    /// Additional constants from bootstrap arguments (TAG_CONST placeholders),
+    /// as UTF-16 code units, for the same reason as `recipe`.
+    constant_args: Vec<Vec<u16>>,
     /// Raw CP indices for bootstrap arguments (needed for LambdaMetafactory).
     bootstrap_arg_indices: Vec<u16>,
 }
@@ -119,8 +132,8 @@ struct IndyInfo {
 /// Immutable metadata owned for the lifetime of generated code which directly
 /// invokes a `StringConcatFactory` call site.
 pub struct JitStringConcatSite {
-    recipe: Arc<str>,
-    constant_args: Vec<Arc<str>>,
+    recipe: Arc<[u16]>,
+    constant_args: Vec<Arc<[u16]>>,
     target_descriptor: Arc<str>,
 }
 
@@ -146,22 +159,22 @@ pub fn make_jit_string_concat_site_from_parts(
         return None;
     }
     let (recipe, constant_args) = if handle.member_name.as_ref() == MAKE_CONCAT_WITH_CONSTANTS {
-        let recipe = bsm
+        let recipe: Vec<u16> = bsm
             .bootstrap_arguments
             .first()
-            .and_then(|idx| resolve_string_constant(pool, *idx))?;
-        let constants = bsm
+            .and_then(|idx| resolve_concat_constant_units(pool, *idx))?;
+        let constants: Vec<Arc<[u16]>> = bsm
             .bootstrap_arguments
             .iter()
             .skip(1)
-            .map(|idx| Arc::from(resolve_concat_constant(pool, *idx).unwrap_or_default()))
+            .map(|idx| {
+                Arc::from(resolve_concat_constant_units(pool, *idx).unwrap_or_default().as_slice())
+            })
             .collect();
-        (Arc::from(recipe), constants)
+        (Arc::from(recipe.as_slice()), constants)
     } else if handle.member_name.as_ref() == MAKE_CONCAT {
-        let recipe: String = std::iter::repeat('\u{0001}')
-            .take(parse_descriptor_args(descriptor).len())
-            .collect();
-        (Arc::from(recipe), Vec::new())
+        let recipe: Vec<u16> = vec![TAG_ARG_UNIT; parse_descriptor_args(descriptor).len()];
+        (Arc::from(recipe.as_slice()), Vec::new())
     } else {
         return None;
     };
@@ -330,10 +343,10 @@ pub fn execute_invokedynamic(
         let bsm_method = bsm_handle.member_name.to_string();
 
         // 5. Extract recipe and constant args (if StringConcatFactory)
-        let recipe = if let Some(&arg_index) = bsm.bootstrap_arguments.first() {
-            resolve_string_constant(&class.constant_pool, arg_index).unwrap_or_default()
+        let recipe: Vec<u16> = if let Some(&arg_index) = bsm.bootstrap_arguments.first() {
+            resolve_concat_constant_units(&class.constant_pool, arg_index).unwrap_or_default()
         } else {
-            String::new()
+            Vec::new()
         };
 
         // The `\u0002` (TAG_CONST) entries in the recipe consume these trailing
@@ -345,11 +358,13 @@ pub fn execute_invokedynamic(
         // constant, silently dropping it. `resolve_concat_constant` converts each
         // loadable-constant kind to its HotSpot-identical text (reusing
         // `format_float`/`format_double` so e.g. `1.0f` → "1.0", not "1").
-        let constant_args: Vec<String> = bsm
+        let constant_args: Vec<Vec<u16>> = bsm
             .bootstrap_arguments
             .iter()
             .skip(1) // skip recipe
-            .map(|&idx| resolve_concat_constant(&class.constant_pool, idx).unwrap_or_default())
+            .map(|&idx| {
+                resolve_concat_constant_units(&class.constant_pool, idx).unwrap_or_default()
+            })
             .collect();
 
         let bootstrap_arg_indices = bsm.bootstrap_arguments.clone();
@@ -380,11 +395,11 @@ pub fn execute_invokedynamic(
     if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT_WITH_CONSTANTS {
         // Cache the StringConcat call site
         let site = ResolvedCallSite::StringConcat {
-            recipe: Arc::from(info.recipe.clone()),
+            recipe: Arc::from(info.recipe.as_slice()),
             constant_args: info
                 .constant_args
                 .iter()
-                .map(|s| Arc::from(s.as_str()))
+                .map(|u| Arc::from(u.as_slice()))
                 .collect(),
             target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
@@ -407,12 +422,10 @@ pub fn execute_invokedynamic(
         // Synthesize a recipe of all \u{0001} placeholders so the existing concat
         // logic works unchanged.
         let arg_types = parse_descriptor_args(&info.target_descriptor);
-        let synthetic_recipe: String = std::iter::repeat('\u{0001}')
-            .take(arg_types.len())
-            .collect();
+        let synthetic_recipe: Vec<u16> = vec![TAG_ARG_UNIT; arg_types.len()];
 
         let site = ResolvedCallSite::StringConcat {
-            recipe: Arc::from(synthetic_recipe.as_str()),
+            recipe: Arc::from(synthetic_recipe.as_slice()),
             constant_args: vec![],
             target_descriptor: Arc::from(info.target_descriptor.as_str()),
         };
@@ -426,7 +439,7 @@ pub fn execute_invokedynamic(
         // TAG_CONST (U+0002) placeholders and the constant list is empty. The
         // whole-`IndyInfo` clone (`patched_info`) this branch used to build was
         // only ever read for the three values passed below.
-        const NO_CONSTANTS: &[&str] = &[];
+        const NO_CONSTANTS: &[Arc<[u16]>] = &[];
         execute_string_concat(
             shared,
             thread,
@@ -1575,11 +1588,11 @@ pub fn resolve_method_handle_full(
 /// Generic over `S: AsRef<str>` so the cached path can pass its
 /// `&[Arc<str>]` and the bootstrap path its `&[String]` with no conversion at
 /// all.
-fn execute_string_concat<S: AsRef<str>>(
+fn execute_string_concat<S: AsRef<[u16]>>(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
-    recipe: &str,
+    recipe: &[u16],
     constant_args: &[S],
     target_descriptor: &str,
 ) -> Result<(), MethodCallFailed> {
@@ -1653,13 +1666,27 @@ fn execute_string_concat<S: AsRef<str>>(
         }
     }
 
-    // Walk the recipe and build the result string
-    let mut result = String::new();
+    // Walk the recipe and build the result, accumulating UTF-16 code UNITS
+    // rather than a Rust `String`.
+    //
+    // A Rust `String`/`str` is UTF-8 by construction and therefore cannot hold
+    // an unpaired surrogate (U+D800..U+DFFF is not a Unicode scalar value). A
+    // `String` accumulator here silently rewrote every one of them to U+FFFD,
+    // so `"x" + lone + "y"` produced `x�y` while
+    // `new String(new char[]{'x', lone, 'y'})` — which never touches Rust text
+    // — came back correct. Concatenation is on the JLS's lossless path: `+`
+    // copies code units, it does not validate them.
+    //
+    // Units also remove a transcode from the hot path rather than adding one:
+    // a `String` argument used to be decoded UTF-16 -> UTF-8 on the way in and
+    // re-encoded UTF-8 -> UTF-16 by `create_string_or_oom` on the way out.
+    // See `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+    let mut result: Vec<u16> = Vec::new();
     let mut arg_idx = 0;
     let mut const_idx = 0;
 
-    for ch in recipe.chars() {
-        if ch == '\u{0001}' {
+    for &tag in recipe {
+        if tag == TAG_ARG_UNIT {
             // Argument placeholder
             if arg_idx < arg_values.len() {
                 let arg_type = arg_types.get(arg_idx).copied().unwrap_or('L');
@@ -1679,18 +1706,38 @@ fn execute_string_concat<S: AsRef<str>>(
                     )),
                     None => arg_values[arg_idx],
                 };
-                let s = value_to_string(shared, Some(thread), &arg_val, arg_type);
-                result.push_str(&s);
+                // A `String` argument is copied unit-for-unit. `value_to_string`
+                // would route it through `read_java_string`, whose
+                // `String::from_utf16_lossy` is exactly where the surrogate
+                // died. Every other shape (primitives, and objects reached via
+                // `toString()`) is produced as Rust text and cannot carry an
+                // unpaired surrogate in the first place, so encoding those to
+                // units here loses nothing.
+                let units = match arg_val {
+                    Value::Object(Some(obj)) => {
+                        read_java_string_units(&shared.mem.heap, obj)
+                    }
+                    _ => None,
+                };
+                match units {
+                    Some(u) => result.extend_from_slice(&u),
+                    None => {
+                        let s = value_to_string(shared, Some(thread), &arg_val, arg_type);
+                        result.extend(s.encode_utf16());
+                    }
+                }
                 arg_idx += 1;
             }
-        } else if ch == '\u{0002}' {
+        } else if tag == TAG_CONST_UNIT {
             // Constant placeholder (from bootstrap_arguments[1..])
-            if let Some(s) = constant_args.get(const_idx) {
-                result.push_str(s.as_ref());
+            if let Some(u) = constant_args.get(const_idx) {
+                result.extend_from_slice(u.as_ref());
             }
             const_idx += 1;
         } else {
-            result.push(ch);
+            // Literal recipe text. Already units, so a lone surrogate folded
+            // into the recipe by javac is copied through untouched.
+            result.push(tag);
         }
     }
 
@@ -1705,7 +1752,8 @@ fn execute_string_concat<S: AsRef<str>>(
     // wrongly reports identity with an equal literal.
     // `"a" + b` on a full heap must raise a catchable OutOfMemoryError, not
     // abort the VM -- see `interpreter::create_string_or_oom`.
-    let str_ref = crate::runtime::interpreter::create_string_or_oom(shared, thread, &result)?;
+    let str_ref =
+        crate::runtime::interpreter::create_string_from_units_or_oom(shared, thread, &result)?;
     thread.frames[frame_idx]
         .stack
         .push(Value::Object(Some(str_ref)))?;
@@ -1757,6 +1805,33 @@ pub(crate) fn resolve_string_constant(cp: &ConstantPool, index: u16) -> Option<S
 /// Returning `None` (→ empty string at the call site, preserving the prior
 /// fail-soft behaviour) only for kinds that cannot legally appear as a recipe
 /// constant.
+/// [`resolve_concat_constant`] in UTF-16 code **units**.
+///
+/// A `CONSTANT_Utf8` entry may contain lone surrogates -- Java's modified UTF-8
+/// encodes them individually and javac emits them for any string literal
+/// holding one (ANTLR's `_serializedATN` is the standard example). The parser
+/// keeps the exact units for such entries in a side table, because the
+/// `Arc<str>` form cannot represent them; `get_utf8_wide` is `Some` only for
+/// those entries and `None` for the overwhelmingly common lossless case.
+///
+/// Both the recipe and the `TAG_CONST` slots go through here, so a lone
+/// surrogate written as a *literal* survives concatenation exactly as one
+/// arriving as a runtime argument does. Before this, only the argument path was
+/// lossless and `"x\uD801y" + n` still produced U+FFFD.
+fn resolve_concat_constant_units(cp: &ConstantPool, index: u16) -> Option<Vec<u16>> {
+    let wide = match cp.get(index) {
+        Some(ConstantPoolEntry::StringReference { string_index }) => cp.get_utf8_wide(*string_index),
+        Some(ConstantPoolEntry::Utf8(_)) => cp.get_utf8_wide(index),
+        _ => None,
+    };
+    if let Some(units) = wide {
+        return Some(units.to_vec());
+    }
+    // Every other loadable-constant kind (int/long/float/double/Class) is
+    // produced as ASCII text by `String.valueOf`, so the UTF-8 form is lossless.
+    resolve_concat_constant(cp, index).map(|s| s.encode_utf16().collect())
+}
+
 fn resolve_concat_constant(cp: &ConstantPool, index: u16) -> Option<String> {
     match cp.get(index)? {
         ConstantPoolEntry::StringReference { string_index } => {
@@ -2965,9 +3040,14 @@ mod tests {
     use crate::classloading::resolution::ResolutionCache;
 
     fn concat_site(recipe: &str, constants: &[&str], descriptor: &str) -> ResolvedCallSite {
+        // Recipes and constants are UTF-16 code units on the cached site; the
+        // `&str` parameters here are test-authoring convenience only.
         ResolvedCallSite::StringConcat {
-            recipe: Arc::from(recipe),
-            constant_args: constants.iter().map(|s| Arc::from(*s)).collect(),
+            recipe: Arc::from(recipe.encode_utf16().collect::<Vec<u16>>().as_slice()),
+            constant_args: constants
+                .iter()
+                .map(|s| Arc::from(s.encode_utf16().collect::<Vec<u16>>().as_slice()))
+                .collect(),
             target_descriptor: Arc::from(descriptor),
         }
     }
@@ -3065,24 +3145,27 @@ mod tests {
 
     #[test]
     fn cached_string_concat_site_exposes_borrowable_recipe_and_constants() {
-        // `execute_string_concat` now borrows `&str` / `&[S: AsRef<str>]`
+        // `execute_string_concat` borrows `&[u16]` / `&[S: AsRef<[u16]>]`
         // straight out of the cached site instead of rebuilding an `IndyInfo`
         // with `recipe.to_string()`, `target_descriptor.to_string()` and a
         // freshly allocated `Vec<String>` of every constant on *every* `"a" + b`
         // evaluation. This test pins the borrow shape: destructuring the cached
-        // site must yield data usable without conversion, and `Arc<str>` must
-        // satisfy the `AsRef<str>` bound.
-        fn takes_borrowed<S: AsRef<str>>(
-            recipe: &str,
+        // site must yield data usable without conversion, and `Arc<[u16]>` must
+        // satisfy the `AsRef<[u16]>` bound.
+        //
+        // Units rather than `str` since 2026-08-05: a recipe can carry a lone
+        // surrogate from a folded literal, which a Rust `str` turns into U+FFFD.
+        fn takes_borrowed<S: AsRef<[u16]>>(
+            recipe: &[u16],
             constants: &[S],
             descriptor: &str,
         ) -> String {
-            let mut out = String::from(recipe);
+            let mut out: Vec<u16> = recipe.to_vec();
             for c in constants {
-                out.push_str(c.as_ref());
+                out.extend_from_slice(c.as_ref());
             }
-            out.push_str(descriptor);
-            out
+            out.extend(descriptor.encode_utf16());
+            String::from_utf16_lossy(&out)
         }
 
         let site = concat_site("a\u{0002}b", &["X", "Y"], "(I)Ljava/lang/String;");
@@ -3098,11 +3181,12 @@ mod tests {
             takes_borrowed(recipe, constant_args.as_slice(), target_descriptor),
             "a\u{0002}bXY(I)Ljava/lang/String;"
         );
-        // The bootstrap path passes `&[String]`; both must compile against the
-        // same bound.
-        let owned: Vec<String> = vec!["X".to_string(), "Y".to_string()];
+        // The bootstrap path passes owned `Vec<u16>`; both must compile against
+        // the same bound.
+        let owned: Vec<Vec<u16>> = vec![vec![b'X' as u16], vec![b'Y' as u16]];
+        let recipe_units: Vec<u16> = "a\u{0002}b".encode_utf16().collect();
         assert_eq!(
-            takes_borrowed("a\u{0002}b", owned.as_slice(), "(I)Ljava/lang/String;"),
+            takes_borrowed(&recipe_units, owned.as_slice(), "(I)Ljava/lang/String;"),
             "a\u{0002}bXY(I)Ljava/lang/String;"
         );
     }
@@ -3120,9 +3204,9 @@ mod tests {
             "(ILjava/lang/String;J)Ljava/lang/String;",
         ] {
             let n = parse_descriptor_args(desc).len();
-            let recipe: String = std::iter::repeat('\u{0001}').take(n).collect();
-            assert_eq!(recipe.chars().filter(|c| *c == '\u{0001}').count(), n);
-            assert!(!recipe.contains('\u{0002}'));
+            let recipe: Vec<u16> = vec![TAG_ARG_UNIT; n];
+            assert_eq!(recipe.iter().filter(|&&u| u == TAG_ARG_UNIT).count(), n);
+            assert!(!recipe.contains(&TAG_CONST_UNIT));
         }
     }
 

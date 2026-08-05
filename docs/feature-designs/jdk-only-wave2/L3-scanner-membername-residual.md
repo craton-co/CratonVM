@@ -251,27 +251,9 @@ still byte-identical to HotSpot 25 in both modes on the merged binary, and
 `cargo test --release` for `cratonvm-native-builtins` (3267) and
 `cratonvm-native-io` (380) is fully green.
 
-It cannot check `Scanner` any further than that, and the reason is the
-follow-up L4 names for itself: **a model slot that is anonymous asserts
-nothing.** `class_manager.rs` still declares
-`"java/util/Scanner" => instance_fields(5)`, five `_fN` slots typed
-`Ljava/lang/Object;`. Naming them is now a mechanical change, because this lane
-established what each one is:
-
-| model slot | name to declare | descriptor |
-|---:|---|---|
-| 0 | `buf` | `Ljava/nio/CharBuffer;` (the input text no longer lives here) |
-| 1 | `position` | `I` |
-| 2 | `delimPattern` | `Ljava/util/regex/Pattern;` |
-| 3 | `radix` | `I` |
-| 4 | `closed` | `Z` |
-
-That is `class_manager.rs`, which L7 owns, and it has a real behavioural
-consequence worth its own A/B rather than a drive-by: today every fabricated
-slot is `Ljava/lang/Object;`, so on a fabricated `Scanner` an `Int` position or
-radix is coerced to null on the way in and reads back as the default. Declaring
-`I` and `Z` fixes that, and would also let `scan_slot`'s by-name resolution
-succeed on the fabricated layout instead of falling through to the model index.
+It could not check `Scanner` any further than that, for the reason L4 names for
+itself: **a model slot that is anonymous asserts nothing.** That follow-up is
+now taken, and taking it changed the answer — see below.
 
 Filed rather than fixed:
 
@@ -283,11 +265,16 @@ Filed rather than fixed:
   `toString()` deliberately still works on a closed scanner, as it does on the
   JDK. **This changes `Compatible` mode**, from *silently wrong* to *matching
   HotSpot*, the same way L2's `try_set_jdk_map_field` fix did.
-* **`register_t2_3_completion_natives` is never called**, so
-  `Scanner.findWithinHorizon` is registered in no configuration and falls
-  through to real bytecode that cannot work against our state. Its natives are
-  rewired onto the shared accessors rather than left reading `buf` and
-  `position` raw, but nothing runs them. A registration gap, not a layout one.
+* ~~**`register_t2_3_completion_natives` is never called**~~ — **FIXED,
+  2026-08-05; see *The two follow-ups* below.**
+* **`Scanner.match()` is unimplemented on every path.** Our natives never
+  populate the real `matcher` / `matchValid` state, so `match()` throws
+  `IllegalStateException` after `next()`, `nextInt()` and `findInLine()` alike,
+  where HotSpot 25 returns `ab`, `7` and `42`. Measured, not inferred. Closing
+  it means running a real `Matcher` on every token path — a redesign of these
+  natives, not a fix to one of them — and fabricating a `MatchResult` instead
+  is the defect family this whole record is about. `probes/L3ScannerSearchProbe`
+  deliberately does not call `match()`, and says why.
 (A fourth, filed and then fixed once measured: **`useDelimiter(String)` and
 `delimiter()` fabricated an uncompiled `java.util.regex.Pattern`** — two field
 pokes, no `compile()`. The two slots they wrote are the real class's first two,
@@ -305,3 +292,103 @@ then measuring it is the order this record recommends: the first draft of the
 note called it "correct for our readers and wrong for real JDK code", which was
 a guess that happened to be right — the reproduction is what made it a
 finding.)
+
+---
+
+# The two follow-ups, 2026-08-05
+
+Both were taken after this record was first written. Both changed shape once
+measured, which is the only reason they are worth writing up.
+
+## `findWithinHorizon` — registered, not deleted
+
+The record said the natives were dead and called it "a registration gap, not a
+layout one". Two readings of that were open: wire them up, or delete them and
+let real bytecode run — the direction the whole feature is going.
+`probes/L3ScannerSearchProbe` decided it against Temurin 25.0.3:
+
+```
+fwh.s.found=123          HotSpot     fwh.s.found=java.lang.NullPointerException   CratonVM
+fwh.b.short=null                     fwh.b.short=java.lang.NullPointerException
+fwh.b.negative=IllegalArgumentException
+```
+
+Real bytecode does not cope: it reads `buf`, `matcher` and `source`, none of
+which our natives populate, and NPEs in both modes. `findInLine` and `skip` —
+the registered siblings in the same probe — matched HotSpot exactly, which is
+what makes the three `fwh` lines a finding rather than a broken probe.
+
+So they are registered, and the implementation moved from `phases_early.rs` to
+`native-io` beside `findInLine` and `skip`: same state accessors, same regex
+engine, and `register_scanner_natives` is live in every configuration. Moving
+it rather than wiring it up in place is the same judgement as deleting the dead
+Scanner bundle — a second implementation over a second model is what made this
+lane's own brief describe `Scanner` as three fields wide.
+
+One real defect came out of the move: the horizon is **code points**, and the
+old implementation added it to a byte offset before walking back to a char
+boundary. Identical for ASCII, wrong otherwise; there is now a test that fails
+on the old arithmetic.
+
+**The L6 ratchet caught it, and was right.** Two new `Bridge` rows shadowing
+concrete bytecode is a regression it refuses — `bridge_shadows_bytecode` 4755
+→ 4757, `bridge_without_acc_native` 10069 → 10071 on Linux — and its message
+says the fix is to state the kind, not to raise the baseline. It is right:
+`java.util.Scanner` declares no ACC_NATIVE method, contract §1.5 defines a
+Bridge by an ACC_NATIVE target, and these two are a Rust fast path replicating
+real bytecode, which is Intrinsic — the category the implementation carried
+before it moved. Registered with `register_with_kind`, the Linux ratchet passes
+on the **unchanged** baseline: 10069 and 4755 exactly. No re-freeze was needed,
+and the first draft of this change would have re-frozen it for no reason.
+
+## Naming the model — two slots, not five
+
+The mechanical form of L4's follow-up was wrong, and measuring it is what
+showed that. Naming all five slots in OUR order took the census from **one**
+anonymous-model artifact to **three** index-wise disagreements:
+
+```
+[OVERLAY-LAYOUT] java/util/Scanner — model has 5 slot(s), 3 disagree with the loaded image
+[OVERLAY] suspect native set_field [model-slot]: … slot=3
+          model=radix:I real=delimPattern:Ljava/util/regex/Pattern; verdict=TYPE
+```
+
+None of those three is a defect. The shadow diff compares model slot *i*
+against image slot *i*, and from slot 2 on the two orders diverge: the image
+has `matcher`, `delimPattern`, `hasNextPattern` where the model means
+delimiter, radix, closed, and does not reach `closed` and `radix` until slots
+14 and 15. The natives resolve those three **by name** and never touch the
+model index on a real layout, so the model claiming to correspond there is a
+false statement that generates false rows.
+
+Only `buf` and `position` line up, so only those are named. The rest stay
+anonymous, which is the honest thing for a model that does not claim to match —
+and the census now reports
+
+```
+[OVERLAY-LAYOUT] java/util/Scanner — model has 5 slot(s), 0 disagree with the loaded image
+```
+
+with no suspect rows at all, on Windows and on Azure Linux.
+
+Naming `position` is not cosmetic. Every `_fN` is `Ljava/lang/Object;`, so on a
+FABRICATED `Scanner` the `Int` position was coerced to null on the way in and
+`scan_pos` read back 0 forever — `next()` would return the first token and
+never advance. Declaring it `I` keeps the value. Same defect and same fix as
+the `StringReader` position documented in `native-io/src/lib.rs`.
+
+**The general lesson for the rest of item 2's work list**, since 73 of 156
+modelled classes have disagreeing slots: *name a model slot only where the
+model's index is meant to be the image's index.* For a class whose natives have
+been migrated to by-name resolution, most slots no longer make that claim, and
+naming them re-introduces exactly the wrong-field assertion the migration
+removed.
+
+## Verification
+
+Three probes — `L3ScannerLayoutProbe`, `L3MemberNameProbe`,
+`L3ScannerSearchProbe` — byte-identical to HotSpot 25 in `--real-jdk` and
+`--jdk-only`, on Windows and on Azure Linux. Census: zero suspect rows for
+`Scanner` and `MemberName`, `0 disagree` on the layout line. Bridge ratchet:
+PASS on the unchanged linux baseline. `cargo test`: `cratonvm-classloading`
+759, `cratonvm-native-io` 386, `cratonvm-native-builtins` 3270, all green.
