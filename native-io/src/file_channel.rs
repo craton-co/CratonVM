@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -951,53 +951,60 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- modern JDK 25 dispatch surface ---
-    for cls in [
-        "sun/nio/ch/FileDispatcherImpl",
-        "sun/nio/ch/WindowsFileDispatcherImpl",
-        "sun/nio/ch/UnixFileDispatcherImpl",
-    ] {
-        // map0 has two shapes across JDK history.
-        r.register(
-            cls,
-            "map0",
-            "(Ljava/io/FileDescriptor;IJJZ)J",
-            native_fc_map0,
-        );
-        r.register(
-            cls,
-            "map0",
-            "(Ljava/io/FileDescriptor;IJJ)J",
-            native_fc_map0,
-        );
-        r.register(cls, "unmap0", "(JJ)I", native_fc_unmap0);
-        r.register(
-            cls,
-            "transferTo0",
-            "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J",
-            native_fc_transfer_to0,
-        );
-        r.register(
-            cls,
-            "transferTo0",
-            "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J",
-            native_fc_transfer_to0,
-        );
-        r.register(
-            cls,
-            "maxDirectTransferSize0",
-            "()I",
-            native_fc_max_direct_transfer_size0,
-        );
-        // force0 — fsync. Canonical real implementation lives here
-        // (was a silent no-op stub in `nio_native.rs`, which lost
-        // data on crash for callers of `FileChannel.force`).
-        r.register(
-            cls,
-            "force0",
-            "(Ljava/io/FileDescriptor;Z)I",
-            native_fc_force0,
-        );
-    }
+    //
+    // Registered under all three platform spellings; `backed` names the ones a
+    // JDK 25 image declares ACC_NATIVE, measured on linux-x64 AND windows-x64
+    // 25.0.4+7 (2026-08-05). `WindowsFileDispatcherImpl` is on neither image —
+    // the Windows JDK names its class `FileDispatcherImpl` — so it is never
+    // backed, and the second `map0`/`transferTo0` shapes are older JDKs' and
+    // are backed nowhere either.
+    use crate::nio_native::{register_fd_native, FD_LEAF, FD_UNIX};
+    register_fd_native(
+        r,
+        "map0",
+        "(Ljava/io/FileDescriptor;IJJZ)J",
+        native_fc_map0,
+        &[FD_LEAF, FD_UNIX],
+    );
+    register_fd_native(
+        r,
+        "map0",
+        "(Ljava/io/FileDescriptor;IJJ)J",
+        native_fc_map0,
+        &[],
+    );
+    register_fd_native(r, "unmap0", "(JJ)I", native_fc_unmap0, &[FD_LEAF, FD_UNIX]);
+    register_fd_native(
+        r,
+        "transferTo0",
+        "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J",
+        native_fc_transfer_to0,
+        &[FD_LEAF],
+    );
+    register_fd_native(
+        r,
+        "transferTo0",
+        "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J",
+        native_fc_transfer_to0,
+        &[],
+    );
+    register_fd_native(
+        r,
+        "maxDirectTransferSize0",
+        "()I",
+        native_fc_max_direct_transfer_size0,
+        &[FD_LEAF],
+    );
+    // force0 — fsync. Canonical real implementation lives here (was a silent
+    // no-op stub in `nio_native.rs`, which lost data on crash for callers of
+    // `FileChannel.force`).
+    register_fd_native(
+        r,
+        "force0",
+        "(Ljava/io/FileDescriptor;Z)I",
+        native_fc_force0,
+        &[FD_LEAF, FD_UNIX],
+    );
 
     // --- legacy FileChannelImpl surface (older JDKs / fallback). The
     // signatures here use raw int fds rather than FileDescriptor. ---
@@ -1044,11 +1051,12 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     // A missing native here is an UnsatisfiedLinkError on the FIRST file-backed
     // DB open (H2 `SingleFileStore.lockFileChannel` -> `FileChannelImpl.tryLock`
     // -> `FileKey.create`), so it blocks every persistent H2 database.
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/FileKey",
         "init",
         "(Ljava/io/FileDescriptor;[I)V",
         native_filekey_init,
+        NativeKind::Bridge,
     );
     // Real Unix OpenJDK's `FileKey` (confirmed via javap against an actual
     // JDK 25 install) does NOT use the Windows-shaped int[3] convention
@@ -1059,11 +1067,12 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     // matching native for the ACTUAL descriptor the class file declares ->
     // `UnsatisfiedLinkError` on the first `FileChannel.lock()`/`tryLock()` in
     // real-JDK mode on Linux (e.g. Tomcat's `OcspBaseTest` responder lock).
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/FileKey",
         "init",
         "(Ljava/io/FileDescriptor;[J)V",
         native_filekey_init_longs,
+        NativeKind::Bridge,
     );
     // KEEP: `FileKey.initIDs()` only caches the jfieldIDs for `st_dev`/`st_ino`
     // (`dwVolumeSerialNumber`/`nFileIndex*` on Windows) that `init` writes.
