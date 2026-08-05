@@ -119,17 +119,7 @@ fn test_vm() -> Vm {
 ///
 /// The trailing comment on each is the observed failure, from
 /// `Vm::describe_result`.
-const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[
-    // `Proxy.isProxyClass` on a generated proxy — returns 0.
-    ("cratonvm/ReflectionComplete", "testProxyIsProxyClass"),
-    ("cratonvm/TckReflect", "proxy_isProxyClass"),
-    // An annotation proxy is not castable to the annotation interface, and a
-    // `Proxy` instance is not castable to the interface it implements.
-    // ClassCastException: "? cannot be cast to cratonvm.TckReflect$…".
-    ("cratonvm/TckReflect", "ann_inheritedValue"),
-    ("cratonvm/TckReflect", "ann_methodValue"),
-    ("cratonvm/TckReflect", "proxy_objectMethods"),
-];
+const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[];
 
 /// `(class, method)` pairs that PASS when their test is the only one in the
 /// process and FAIL in a full run — order dependence, not a missing feature.
@@ -147,28 +137,7 @@ const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[
 /// legitimately flips some of them. Both outcomes are absorbed. That is a
 /// deliberately weaker gate, and the reason to keep the list short and to
 /// empty it rather than grow it.
-const KNOWN_ORDER_DEPENDENT: &[(&str, &str)] = &[
-    // NullPointerException: "Field.get: null receiver for instance field".
-    (
-        "cratonvm/ReflectionComplete",
-        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
-    ),
-    // `getGenericType` / `getGenericSuperclass` stop surfacing
-    // `ParameterizedType` / `WildcardType` — all return 0.
-    ("cratonvm/GenericReflectionTest", "testParameterizedField"),
-    ("cratonvm/GenericReflectionTest", "testParameterizedSuperclass"),
-    ("cratonvm/GenericReflectionTest", "testTwoArgParameterizedField"),
-    ("cratonvm/GenericReflectionTest", "testWildcardExtendsNumber"),
-    // `System.gc()` stops being decisive enough for the finalizer observation.
-    ("cratonvm/FinalizerTest", "testNoFinalizeOnLive"),
-    ("cratonvm/TckUtil", "testArraysAsList"),
-    // Serialization round-trips lose every field: the deserialized object's
-    // fields read back null. NullPointerException on the first field access.
-    ("cratonvm/SerializeBasic", "testSimpleRoundTrip"),
-    ("cratonvm/SerializeBasic", "testNestedObject"),
-    ("cratonvm/SerializeBasic", "testTransientField"),
-    ("cratonvm/SerializeBasic", "testNonSerializableThrows"),
-];
+const KNOWN_ORDER_DEPENDENT: &[(&str, &str)] = &[];
 
 fn listed(list: &[(&str, &str)], class: &str, method: &str) -> bool {
     list.iter().any(|&(c, m)| c == class && m == method)
