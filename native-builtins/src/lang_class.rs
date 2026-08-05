@@ -6252,18 +6252,151 @@ fn method_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// count, accessible flag) in extra slots appended *after* the JDK
 /// layout. All native readers go via `get_field_by_name` for JDK fields
 /// and via the extra-slot helpers for our metadata.
+/// The `java/lang/reflect/Method` mirror layout: everything
+/// [`create_method_object`] needs that depends on the *Method class* rather
+/// than on the individual method being mirrored.
+///
+/// Resolving this per mirror was the dominant cost of
+/// `Class.getDeclaredMethods()`. Each mirror re-ran
+/// `ensure_class_initialized` (a name-keyed class lookup),
+/// `class_num_total_fields`, `method_class_has_named_layout`, and then wrote
+/// 13 fields **by name** — a name→slot resolution apiece. On
+/// `org.jooq.impl.DefaultDSLContext` (1003 declared methods) one call therefore
+/// did ~13,000 name-based field resolutions, and measured **3401 µs/call
+/// against HotSpot's 46.9 µs — 73x**. That is not descriptor work: 1000
+/// no-argument `void` methods cost the same 91x, and adding four reference
+/// parameters plus a reference return adds only 23%.
+///
+/// It matters because Spring's `AnnotationsScanner.getBaseTypeMethods` calls
+/// `getDeclaredMethods()` once per type per hierarchy walk. `JooqAutoConfigurationTests`
+/// spends 93.5% of its samples under `EventListenerMethodProcessor`, whose
+/// `MethodIntrospector.selectMethods` does exactly that — 457 ms on HotSpot,
+/// 151,695 ms here.
+///
+/// Scoped to ONE native call on purpose. A cross-call cache of these slots
+/// would need all three of `site_cache.rs`'s validity conditions (class
+/// definition epoch, resolution epoch, redefine latch) because
+/// `upgrade_synthetic_class` / `recompute_subclass_layouts` move a field layout
+/// in place while keeping the `ClassId` — and `java/lang/reflect/Method` is
+/// exactly the class Mockito's inline mock maker redefines. Hoisting within a
+/// call needs none of that and already turns 1003 resolutions into 1.
+#[derive(Clone, Copy)]
+pub(crate) struct MethodMirrorLayout {
+    class_id: ClassId,
+    /// JDK-layout width, before the CratonVM extra slots.
+    base: usize,
+    num_fields: usize,
+    has_named_layout: bool,
+    /// Slot index per JDK field name, `None` when this build's
+    /// `resolve_field_index_by_class_id` cannot answer (notably the test mock,
+    /// where it is unwired) — those fall back to the by-name write.
+    slots: [Option<usize>; METHOD_MIRROR_FIELD_COUNT],
+}
+
+/// JDK `Method` fields written by [`create_method_object`], in a fixed order so
+/// [`MethodMirrorLayout::slots`] can be indexed by the constants below.
+const METHOD_MIRROR_FIELDS: [&str; 12] = [
+    "clazz",
+    "name",
+    "returnType",
+    "parameterTypes",
+    "exceptionTypes",
+    "modifiers",
+    "slot",
+    "callerSensitive",
+    "annotations",
+    "parameterAnnotations",
+    "annotationDefault",
+    "signature",
+];
+const METHOD_MIRROR_FIELD_COUNT: usize = 12;
+const MMF_CLAZZ: usize = 0;
+const MMF_NAME: usize = 1;
+const MMF_RETURN_TYPE: usize = 2;
+const MMF_PARAMETER_TYPES: usize = 3;
+const MMF_EXCEPTION_TYPES: usize = 4;
+const MMF_MODIFIERS: usize = 5;
+const MMF_SLOT: usize = 6;
+const MMF_CALLER_SENSITIVE: usize = 7;
+const MMF_ANNOTATIONS: usize = 8;
+const MMF_PARAMETER_ANNOTATIONS: usize = 9;
+const MMF_ANNOTATION_DEFAULT: usize = 10;
+const MMF_SIGNATURE: usize = 11;
+
+/// Resolve [`MethodMirrorLayout`] once. Call this outside any per-method loop.
+pub(crate) fn resolve_method_mirror_layout(ctx: &mut dyn NativeContext) -> MethodMirrorLayout {
+    let class_id = ctx
+        .ensure_class_initialized("java/lang/reflect/Method")
+        .unwrap_or(ClassId::new(0));
+    let jdk_layout_fields = ctx.class_num_total_fields(class_id);
+    let base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, jdk_layout_fields);
+    let has_named_layout = method_class_has_named_layout(ctx, class_id);
+    let mut slots = [None; METHOD_MIRROR_FIELD_COUNT];
+    for (i, field) in METHOD_MIRROR_FIELDS.iter().enumerate() {
+        slots[i] = ctx.resolve_field_index_by_class_id(class_id, field);
+    }
+    MethodMirrorLayout {
+        class_id,
+        base,
+        num_fields: base + METHOD_EXTRA_SLOTS,
+        has_named_layout,
+        slots,
+    }
+}
+
+/// Write one JDK `Method` field, by slot when it resolved and by name when it
+/// did not.
+///
+/// The by-name arm is not dead code: `resolve_field_index_by_class_id` is
+/// unwired in the test mock, and keeping the fallback means this change cannot
+/// alter what any caller observes — a resolved slot writes the same field
+/// `set_field_by_name` would have, and an unresolved one takes the identical
+/// old path, including its silent skip for a class with no named field table.
+#[inline]
+fn set_method_field(
+    ctx: &mut dyn NativeContext,
+    layout: &MethodMirrorLayout,
+    obj: cratonvm_types::ObjectRef,
+    field: usize,
+    value: Value,
+) {
+    match layout.slots[field] {
+        Some(index) => ctx.set_field(obj, index, value),
+        None => ctx.set_field_by_name(obj, METHOD_MIRROR_FIELDS[field], value),
+    }
+}
+
+#[inline]
+fn get_method_field(
+    ctx: &mut dyn NativeContext,
+    layout: &MethodMirrorLayout,
+    obj: cratonvm_types::ObjectRef,
+    field: usize,
+) -> Value {
+    match layout.slots[field] {
+        Some(index) => ctx.get_field(obj, index),
+        None => ctx.get_field_by_name(obj, METHOD_MIRROR_FIELDS[field]),
+    }
+}
+
 pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
 ) -> cratonvm_types::ObjectRef {
-    let class_id = ctx
-        .ensure_class_initialized("java/lang/reflect/Method")
-        .unwrap_or(ClassId::new(0));
+    let layout = resolve_method_mirror_layout(ctx);
+    create_method_object_with_layout(ctx, meta, &layout)
+}
+
+pub(crate) fn create_method_object_with_layout(
+    ctx: &mut dyn NativeContext,
+    meta: &MethodMetadata,
+    layout: &MethodMirrorLayout,
+) -> cratonvm_types::ObjectRef {
+    let class_id = layout.class_id;
 
     // Allocate JDK-layout width + our extra metadata slots.
-    let jdk_layout_fields = ctx.class_num_total_fields(class_id);
-    let base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, jdk_layout_fields);
-    let num_fields = base + METHOD_EXTRA_SLOTS;
+    let base = layout.base;
+    let num_fields = layout.num_fields;
     let obj = ctx.alloc_object(class_id, num_fields);
     // GC-safety: every reflective mirror/array/string built below can trigger
     // classloading (and therefore GC) via `get_class_mirror` /
@@ -6345,20 +6478,44 @@ pub(crate) fn create_method_object(
     let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
-    ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
-    ctx.set_field_by_name(obj, "name", Value::Object(Some(name_str)));
-    ctx.set_field_by_name(obj, "returnType", Value::Object(Some(ret_mirror)));
-    ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
+    set_method_field(ctx, layout, obj, MMF_CLAZZ, Value::Object(Some(class_mirror)));
+    set_method_field(ctx, layout, obj, MMF_NAME, Value::Object(Some(name_str)));
+    set_method_field(
+        ctx,
+        layout,
+        obj,
+        MMF_RETURN_TYPE,
+        Value::Object(Some(ret_mirror)),
+    );
+    set_method_field(
+        ctx,
+        layout,
+        obj,
+        MMF_PARAMETER_TYPES,
+        Value::Object(Some(param_arr)),
+    );
     // G2 + WP2.1: exceptionTypes is a non-null Class[] populated from the
     // `Exceptions` class-file attribute (or empty if no throws clause).
     // `Method.getExceptionTypes()` does `exceptionTypes.clone()` вЂ” if this
     // were null, ByteBuddy / Mockito / Spring AOP clinit paths would NPE.
-    ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
-    ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
+    set_method_field(
+        ctx,
+        layout,
+        obj,
+        MMF_EXCEPTION_TYPES,
+        Value::Object(Some(exception_arr)),
+    );
+    set_method_field(
+        ctx,
+        layout,
+        obj,
+        MMF_MODIFIERS,
+        Value::Int(meta.access_flags as i32),
+    );
     // JDK's `slot` is an opaque vmindex we don't populate; default 0.
-    ctx.set_field_by_name(obj, "slot", Value::Int(0));
+    set_method_field(ctx, layout, obj, MMF_SLOT, Value::Int(0));
     // `callerSensitive` is a byte cache; 0 means "not yet computed".
-    ctx.set_field_by_name(obj, "callerSensitive", Value::Int(0));
+    set_method_field(ctx, layout, obj, MMF_CALLER_SENSITIVE, Value::Int(0));
     // Annotation raw-byte fields (`annotations`, `parameterAnnotations`,
     // `annotationDefault`) вЂ” all `byte[]` on JDK 25. These MUST be `null`
     // when no annotation bytes are present, NOT empty arrays.
@@ -6385,9 +6542,15 @@ pub(crate) fn create_method_object(
     // `AnnotationParser` does not read `arr.length`, and the JDK getters for
     // all three fields (`Executable.sharedGetParameterAnnotations`,
     // `Method.getDefaultValue`) explicitly null-check before parsing.
-    ctx.set_field_by_name(obj, "annotations", Value::Object(None));
-    ctx.set_field_by_name(obj, "parameterAnnotations", Value::Object(None));
-    ctx.set_field_by_name(obj, "annotationDefault", Value::Object(None));
+    set_method_field(ctx, layout, obj, MMF_ANNOTATIONS, Value::Object(None));
+    set_method_field(
+        ctx,
+        layout,
+        obj,
+        MMF_PARAMETER_ANNOTATIONS,
+        Value::Object(None),
+    );
+    set_method_field(ctx, layout, obj, MMF_ANNOTATION_DEFAULT, Value::Object(None));
 
     // Synthetic-JDK mode can load `java/lang/reflect/Method` without any real
     // field table. Production `set_field_by_name` silently skips those writes,
@@ -6401,12 +6564,12 @@ pub(crate) fn create_method_object(
     // write turned into `clazz` being overwritten with the RETURN TYPE (slot 2)
     // — Byte Buddy then reported `public abstract int int.value() does not
     // represent interface …Argument`. See `method_class_has_named_layout`.
-    let has_named_layout = method_class_has_named_layout(ctx, class_id);
+    let has_named_layout = layout.has_named_layout;
     let named_method_layout_landed = matches!(
-        ctx.get_field_by_name(obj, "name"),
+        get_method_field(ctx, layout, obj, MMF_NAME),
         Value::Object(Some(actual)) if actual == name_str
     ) && matches!(
-        ctx.get_field_by_name(obj, "clazz"),
+        get_method_field(ctx, layout, obj, MMF_CLAZZ),
         Value::Object(Some(actual)) if actual == class_mirror
     );
     if has_named_layout && !named_method_layout_landed && crate::nbflags().iae_trace_ok {
@@ -6477,7 +6640,7 @@ pub(crate) fn create_method_object(
         // `method_signature`/`create_string` above can also allocate/classload —
         // re-read `obj` before writing into it.
         let obj = ctx.read_native_pin(obj_pin, obj);
-        ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
+        set_method_field(ctx, layout, obj, MMF_SIGNATURE, Value::Object(Some(sig_obj)));
     }
 
     // --- CratonVM extra metadata (append after JDK layout) ---
@@ -8546,8 +8709,11 @@ pub(crate) fn native_class_get_declared_methods(
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
+        // Resolve the Method mirror layout ONCE for the whole array instead of
+        // once per mirror — see `MethodMirrorLayout` for the measurement.
+        let layout = resolve_method_mirror_layout(ctx);
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
-            create_method_object(ctx, visible[i])
+            create_method_object_with_layout(ctx, visible[i], &layout)
         });
         Ok(Some(Value::Object(Some(arr))))
     })();
@@ -10023,8 +10189,10 @@ fn collect_public_methods(
     // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
     // same fix, same residual-gap doc reference.
     let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
+    // One layout resolution for the whole array (see `MethodMirrorLayout`).
+    let layout = resolve_method_mirror_layout(ctx);
     build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
-        create_method_object(ctx, &metas[i])
+        create_method_object_with_layout(ctx, &metas[i], &layout)
     })
 }
 
