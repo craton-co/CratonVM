@@ -129,7 +129,7 @@ is what the fix buys.
 The residual 2/8 is a **different, pre-existing, mode-independent** defect —
 the `dev` binary hangs at the same rate under `--real-jdk`, which no
 `JdkOnly`-gated change can cause. Filed separately as
-[bounded socket operations hang about one run in five](../known-issues/bounded-socket-operations-hang-about-one-run-in-five.md),
+[bounded socket operations hang about one run in five](fixed-suite-bugs/net/bounded-socket-operations-hang-FIXED-20260805.md) (fixed 2026-08-05),
 with a HotSpot control (12/12 clean at the same host load) that is what
 distinguishes it from contention.
 

@@ -204,13 +204,23 @@ fn rel8_displacement_patches_all_go_through_the_range_checked_helper() {
         offenders.extend(bad.into_iter().map(|(line, text)| format!("{name}:{line}: {text}")));
     }
     // A source scan that matches nothing passes exactly as happily as one that
-    // matches everything. These files do contain such calls; if the walker
-    // stops finding them, the needle or the file list has rotted and this test
-    // is about to approve anything.
+    // matches everything. If the walker stops finding calls, the needle or the
+    // file list has rotted and this test is about to approve anything.
+    //
+    // The floor was 5 — the exact census at the time — and dropped to 1 when
+    // the erase-a-dead-range idiom moved onto `ExecutableBuffer` as
+    // `erase_range_with_jump_over` (it had been open-coded in `frames.rs` and,
+    // missing its JMP half, in `ir_lower.rs`). That is the direction this test
+    // wants, so the floor follows the census down rather than the conversion
+    // being reverted to satisfy it. What actually proves the walker still
+    // works is `the_rel8_scan_sees_a_call_split_across_lines`, which runs it
+    // against injected offenders in three formattings; this assert only
+    // catches the file list going stale.
     assert!(
-        scanned >= 5,
-        "found only {scanned} try_patch_byte call(s) across the emitter sources — the scan \
-         is broken, and it was about to pass without checking anything"
+        scanned >= 1,
+        "found no try_patch_byte call at all across the emitter sources — the scan \
+         is broken, or the file list is stale, and it was about to pass without \
+         checking anything"
     );
     assert!(
         offenders.is_empty(),

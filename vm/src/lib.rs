@@ -115,11 +115,38 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 // failure because the failure path never hits our hooks** — it
 // terminates earlier through libtest's own `process::exit(101)`.
 //
-// The panic-count tracking remains in place so a future regression
-// — e.g. a panic that escapes libtest's `catch_unwind` — surfaces
-// as a non-zero exit through the `if panics > EXPECTED` branch,
-// which keeps the safety net honest without false positives on the
-// `#[should_panic]` quota.
+// That last claim is not just a reading of libtest: measured
+// 2026-08-05, a run with one genuinely failing test exited **101
+// with no shim message at all**, proving `atexit` never ran. A run
+// with every test passing printed the shim's own line and exited
+// through `on_exit`.
+//
+// ## The panic tripwire, and why `atexit` no longer consults it
+//
+// `exit_code()` answers "was a failure in flight when teardown hit
+// us" by comparing a global panic count against a compile-time
+// budget. The `atexit` path used to consult it too, and that was a
+// pure liability: `atexit` only runs when `main` RETURNED, which per
+// the paragraph above already means every test passed. Consulting a
+// heuristic to second-guess a certainty can only produce false reds
+// — and did. The budget was 32 while a clean run panicked 33 times,
+// so `cargo test -p cratonvm-vm --lib` reported
+// `test result: ok. 2410 passed; 0 failed` and then exited 1, on
+// every run, silently. `on_exit` now exits 0 unconditionally.
+//
+// The tripwire survives only on the SEH path, where libtest never
+// got to decide anything. Be aware of what it is worth there: of the
+// 28 `#[should_panic]` attributes only ~25 actually fire (the rest
+// sit in `#[ignore]`d or unreached tests), while ambient panics have
+// grown from the 4 originally recorded to 9. A single failing test
+// adds one panic to a count that already drifts by several, so the
+// signal does not really separate "a failure was pending" from "the
+// ambient set moved again". It is kept because a crash-path
+// heuristic that is sometimes right beats none, and because the
+// alternative — reporting every teardown crash as failure — is a
+// policy change this fix does not need to make. If the 0xC0000005
+// stays gone, delete the tripwire and the SEH main-thread arm with
+// it.
 //
 // ## Regression coverage
 //
@@ -160,13 +187,27 @@ pub mod harness_exit_shim {
     ///     - vm/src/runtime/lock_order.rs   (15) // +7: top-of-hierarchy wiring
     ///     - vm/src/runtime/value_stack.rs  (6)
     ///     - vm/src/vm/vm_init.rs           (2)
-    ///   - 4 ambient-panic slots observed on clean Windows runs
-    ///     (e.g. exception-path helpers that panic + `catch_unwind`
-    ///     immediately). If a future refactor removes an ambient
-    ///     panic this constant will over-count by one; the only
-    ///     consequence is the tripwire becomes slightly more
-    ///     generous, never less.
-    pub const EXPECTED_PANIC_COUNT: usize = 32;
+    ///   - 9 ambient-panic slots, ENUMERATED from a clean
+    ///     `--no-capture` run on 2026-08-05 rather than estimated:
+    ///     `vm/src/vm/vm_exec.rs`, `vm/src/threading/thread_registry.rs`
+    ///     ("intentional panic for K1 test"),
+    ///     `vm/src/threading/event_loop.rs`, `vm/src/runtime/jvmti.rs`
+    ///     (3), `vm/src/native/jni.rs`,
+    ///     `vm/src/jit/conservative_roots.rs`, and
+    ///     `native-api/src/native_id.rs`. Each panics and is caught
+    ///     immediately, so each still bumps the hook's counter.
+    ///
+    /// The previous value of 32 assumed 4 ambient slots. It was wrong
+    /// in BOTH directions at once and nothing noticed, because the
+    /// drift guard below counts only the `#[should_panic]` half:
+    /// ambient panics had grown 4 -> 9, while 3 of the 28
+    /// `#[should_panic]` attributes never fire (their tests are
+    /// `#[ignore]`d or unreached), so a clean run lands at 33 against
+    /// a budget of 32 -- a permanent, silent exit-1.
+    ///
+    /// Only the SEH crash path reads this now; see the module header
+    /// for why `atexit` must not, and for how weak the signal is.
+    pub const EXPECTED_PANIC_COUNT: usize = 37;
 
     /// Only the true `#[should_panic]` attributes that the
     /// source-drift regression test counts. Kept separate from
@@ -216,16 +257,48 @@ pub mod harness_exit_shim {
     pub fn exit_code() -> u32 {
         let observed = PANIC_COUNT.load(Ordering::SeqCst);
         if observed > EXPECTED_PANIC_COUNT {
+            report(&format!(
+                "panic tripwire: observed {observed} panics, expected at most \
+                 {EXPECTED_PANIC_COUNT} ({SHOULD_PANIC_ATTR_COUNT} #[should_panic] + \
+                 {} ambient). Reporting failure (1).",
+                EXPECTED_PANIC_COUNT - SHOULD_PANIC_ATTR_COUNT,
+            ));
             1
         } else {
             0
         }
     }
 
+    /// One line to stderr, bypassing `eprintln!`.
+    ///
+    /// Every path that calls this is a path that terminates the process with
+    /// `ExitProcess`, so the message has to reach the real handle: libtest
+    /// redirects the print macros per test thread, and anything written
+    /// through them dies with the process instead of reaching cargo. A silent
+    /// `ExitProcess(1)` is what made this shim's own tripwire look like an
+    /// unexplained teardown crash for a whole afternoon.
+    fn report(msg: &str) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = err.write_all(b"\n[harness-exit-shim] ");
+        let _ = err.write_all(msg.as_bytes());
+        let _ = err.write_all(b"\n");
+        let _ = err.flush();
+    }
+
     extern "C" fn on_exit() {
         // atexit path: runs when `main` returns cleanly. Bypasses the
         // subsequent CRT static-destructor pass.
-        unsafe { ExitProcess(exit_code()) }
+        //
+        // Unconditionally 0, and NOT `exit_code()`. Reaching here means
+        // libtest's `main` returned; libtest terminates a failing run
+        // through `process::exit(ERROR_EXIT_CODE)`, which on Windows is
+        // `ExitProcess` and does not run `atexit` handlers. So arriving
+        // here is already proof that every test passed, and consulting
+        // the panic heuristic could only ever overturn that proof with a
+        // guess. It did: budget 32, clean run 33, permanent silent
+        // exit-1 behind a `test result: ok` line.
+        unsafe { ExitProcess(0) }
     }
 
     /// Windows unhandled-exception filter. Fires when the harness
@@ -452,11 +525,23 @@ mod harness_exit_shim_tests {
     }
 
     // Deliberately-failing test that only runs when the extra
-    // `--cfg test_harness_exit_code` flag is passed. Its purpose is
-    // to drive the panic counter past `EXPECTED_PANIC_COUNT` so
-    // `ExitProcess(1)` fires — the invoker then asserts the resulting
-    // cargo-test exit code is 1. Kept in the main run's skip-list so
-    // the default gate stays green.
+    // `--cfg test_harness_exit_code` flag is passed:
+    //
+    //   cargo test -p cratonvm-vm --lib --config \
+    //     'build.rustflags=["--cfg","test_harness_exit_code"]'
+    //
+    // The invariant it proves is the one the whole shim rests on: a
+    // genuine test failure must reach cargo as a failure, NOT be
+    // rewritten by our hooks. **Expect exit code 101** — libtest's own
+    // `ERROR_EXIT_CODE`, reached through `process::exit` before either
+    // hook can fire.
+    //
+    // It used to assert exit 1, on the theory that a failure arrives
+    // via `atexit` with the panic counter over budget. It does not:
+    // `atexit` never runs on the failing path, which is exactly why
+    // `on_exit` can return 0 unconditionally. Asserting 1 here would
+    // have made this guard pass only while the bug it was meant to
+    // catch was present.
     //
     // The outer `#[allow(unexpected_cfgs)]` on the module silences
     // the lint for this opt-in cfg that cargo doesn't learn about
@@ -464,6 +549,6 @@ mod harness_exit_shim_tests {
     #[cfg(test_harness_exit_code)]
     #[test]
     fn harness_exit_code_regression() {
-        panic!("T17.E.2 deliberate failure — drives the atexit exit-1 path");
+        panic!("T17.E.2 deliberate failure — the run must exit 101, not 0");
     }
 }
