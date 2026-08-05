@@ -403,6 +403,77 @@ captured while that sweep ran: `root_coverage=complete` / `INCOMPLETE` /
 `any_thread_in_jit()` hint, so zero passes means the scan never looked, which is
 the opposite conclusion from zero unclassified peers.
 
+### The take-over contributes nothing here (2026-08-05)
+
+With the summary made unconditional, every arm reports the same thing:
+
+```text
+[GC] xt_peer_scan: unclassified_peers=0 cycles_with_unclassified=0
+     taken_over=0 xt_roots=0 helper_windows=253 resignals=16
+     classified_after_retry=0 enabled=true
+```
+
+**`taken_over=0` and `xt_roots=0` on every run measured.** The cross-thread
+take-over pass froze no peer and contributed no root; all cross-thread coverage
+in this workload comes from the helper-window pass (200-570 windows per run),
+which handles peers blocked in native code with JIT frames below. That is
+consistent with the dose-response above — a deadline on a pass that never
+classifies anybody cannot change the outcome — and it retires the take-over
+deadline as a factor here.
+
+It also confirms what the retry does: `resignals=16` with `unclassified=0`,
+against **16** unclassified peers on the pre-retry twin run. Those sixteen were
+converted to definite `STATE_NOT_JIT` answers. (The `classified_after_retry`
+counter read 0 while doing so — it only incremented in the `STATE_PARKED` arm —
+and has been corrected to count every definitive answer that needed a
+re-signal.)
+
+### The unregistered-JIT-frame memo is unsound across a re-descend (2026-08-05)
+
+Found by reading, then given both a fix and a direct measurement.
+
+`scan_active_jit_frames` detects a JIT frame that is live WITHOUT having pushed
+an entry guard — the A5 case — by looking for a JIT return address in the band
+above the registered chain. On a hit it conservatively marks that band and flags
+the cycle non-moving. Miss it and that frame's oops are never marked, so the
+non-moving sweep frees them while it is live: this family's exact face.
+
+The detection is memoized by `UNREG_JIT_VERIFIED_LO`, justified as:
+
+> nothing above our current stack pointer can change while we are nested below it
+
+That statement is true, and it does not support the memo, because **the memo
+outlives the nesting**. `verified_lo` only ever moves deeper. A thread that
+returns above it, enters an already-compiled method — which pushes no guard and
+adds no code range — and descends again will short-circuit the detection over a
+band that was rewritten in between, for the rest of its life. The memo's only
+staleness guard is `jit_code_range_count()`, which changes when a method
+COMPILES, not when one is ENTERED. The sibling cache in the same file
+(`JIT_SCAN_CACHE`) keys on `JIT_BOUNDARY_GEN` for the analogous reason; this one
+never did.
+
+It applies to peers as well as to the collecting thread: the same memo gates the
+per-native-call `update_root_snapshot`, so a parked peer's *published* snapshot
+inherits the stale verdict.
+
+**Fix.** Track the shallowest stack pointer observed since verification. Rising
+to `hiwater` pops every frame below it and leaves everything at or above it
+untouched, so the still-clean floor is `max(verified_lo, hiwater)` and the band
+between is rescanned. A thread that only descends — the perpetually-deepening
+recursion the incremental path was written for — sees `hiwater == verified_lo`
+and behaves exactly as before; a regression test asserts that, and another
+asserts the returning-thread sequence the old rule got wrong (it also pins the
+old rule's wrong answer, so the fix cannot be silently reverted).
+`CRATONVM_JIT_UNREG_MEMO_HIWATER=0` restores the old rule for A/B.
+
+**Measurement.** `CRATONVM_DBG_UNREG_MEMO_AUDIT=1` runs the detection scan even
+when the memo says clean and counts the disagreement, reported unconditionally
+as `[GC] unreg_memo: shortcircuits=N SUPPRESSED=M`. It marks nothing and changes
+no collector decision, so unlike most instruments on this page it cannot perturb
+what it measures. `SUPPRESSED > 0` means the memo hid a real unregistered JIT
+frame. The denominator is printed beside it for the reason this page has now
+learned twice: a zero with no denominator is not a measurement.
+
 ### A marking fail-open found while reading (2026-08-05)
 
 `compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`
