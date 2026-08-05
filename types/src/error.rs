@@ -868,8 +868,17 @@ pub enum RuntimeError {
     #[error("ArrayStoreException: {message}")]
     ArrayStoreException { message: String },
 
+    /// `message` carries HotSpot's exact text ("Index 3 out of bounds for
+    /// length 2", "Range [0, 5) out of bounds for length 2"). It was absent
+    /// until 2026-08-05, which is why every SIOOBE this VM threw had a null
+    /// message -- 13 rows of `StringPolicyMatrixProbe` differed from HotSpot on
+    /// nothing but that. Build it with the `sioobe_*` constructors below rather
+    /// than by hand, so the wording stays in one place.
     #[error("StringIndexOutOfBoundsException: index {index}")]
-    StringIndexOutOfBoundsException { index: i32 },
+    StringIndexOutOfBoundsException {
+        index: i32,
+        message: Option<String>,
+    },
 
     #[error("ClassNotFoundException: {class_name}")]
     ClassNotFoundException { class_name: String },
@@ -1033,6 +1042,53 @@ fn format_optional_message(message: &Option<String>) -> String {
 }
 
 impl RuntimeError {
+    /// `StringIndexOutOfBoundsException` with HotSpot's `checkIndex` wording.
+    ///
+    /// The three `sioobe_*` constructors reproduce `jdk.internal.util
+    /// .Preconditions`'s three message shapes verbatim. Reproduced rather than
+    /// invented: the JDK builds these in `Preconditions.outOfBounds*` and real
+    /// code greps them, so the wording is behaviour, not decoration. Keep them
+    /// here so the format strings cannot drift between the dozen call sites.
+    pub fn sioobe_index(index: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index,
+            message: Some(format!("Index {index} out of bounds for length {length}")),
+        }
+    }
+
+    /// HotSpot's `checkFromToIndex` wording: a half-open `[from, to)` range.
+    pub fn sioobe_range(from: i32, to: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: if from < 0 { from } else { to },
+            message: Some(format!(
+                "Range [{from}, {to}) out of bounds for length {length}"
+            )),
+        }
+    }
+
+    /// HotSpot's `checkFromIndexSize` wording: `[from, from + size)`. Note the
+    /// message prints the ADDITION unevaluated, which is not the same string as
+    /// `sioobe_range(from, from + size, length)` -- and `from + size` can
+    /// overflow, which is exactly why the JDK does not evaluate it.
+    pub fn sioobe_range_size(from: i32, size: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: if from < 0 { from } else { size },
+            message: Some(format!(
+                "Range [{from}, {from} + {size}) out of bounds for length {length}"
+            )),
+        }
+    }
+
+    /// A SIOOBE whose call site does not know the length, so it cannot build
+    /// HotSpot's text. Prefer one of the three above; this exists so the
+    /// remaining sites say so explicitly rather than silently passing `None`.
+    pub fn sioobe_no_length(index: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index,
+            message: None,
+        }
+    }
+
     /// The Java throwable this error materialises as: `(internal class name,
     /// detail message)`, or `None` when it has no Java counterpart
     /// ([`RuntimeError::NotImplemented`], which must stay an internal error).
@@ -1099,9 +1155,10 @@ impl RuntimeError {
                 "java/lang/IllegalMonitorStateException",
                 Some(message.as_str()),
             ),
-            RuntimeError::StringIndexOutOfBoundsException { index: _ } => {
-                ("java/lang/StringIndexOutOfBoundsException", None)
-            }
+            RuntimeError::StringIndexOutOfBoundsException { message, .. } => (
+                "java/lang/StringIndexOutOfBoundsException",
+                message.as_deref(),
+            ),
             RuntimeError::NumberFormatException { message } => {
                 ("java/lang/NumberFormatException", Some(message.as_str()))
             }
@@ -1458,7 +1515,7 @@ mod tests {
 
     #[test]
     fn runtime_error_string_index_out_of_bounds() {
-        let err = RuntimeError::StringIndexOutOfBoundsException { index: 99 };
+        let err = RuntimeError::sioobe_no_length(99);
         assert_eq!(
             format!("{err}"),
             "StringIndexOutOfBoundsException: index 99"

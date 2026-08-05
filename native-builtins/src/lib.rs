@@ -14602,7 +14602,13 @@ pub fn register_essential_natives_with_shims(
 
     // Win32-side filesystem init — noop in our VM (path canonicalization
     // and FS flags are built in Rust, not JNI).
-    registry.register("java/io/WinNTFileSystem", "initIDs", "()V", native_noop);
+    registry.register_with_kind(
+        "java/io/WinNTFileSystem",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     registry.register_with_kind(
         "java/io/UnixFileSystem",
         "initIDs",
@@ -14872,7 +14878,7 @@ pub fn register_essential_natives_with_shims(
     );
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessEnvironment",
         "environmentBlock",
         "()Ljava/lang/String;",
@@ -14887,6 +14893,7 @@ pub fn register_essential_natives_with_shims(
             block.push('\0');
             Ok(Some(Value::Object(Some(ctx.create_string(&block)))))
         },
+        NativeKind::Bridge,
     );
     // Executable/Method/Constructor accessors with the same synthetic layout.
     registry.register(
@@ -20323,7 +20330,7 @@ pub fn register_essential_natives_with_shims(
     // path instead of failing during resolver initialization.
     // `notifyAddrChange0()` drives the optional network-change listener —
     // see its own registration below for why it must NOT answer 0.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "init0",
         "()V",
@@ -20342,8 +20349,9 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "loadDNSconfig0",
         "()V",
@@ -20362,6 +20370,7 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // `notifyAddrChange0()` is NOT a passive query — it is a BLOCKING wait,
     // and `ResolverConfigurationImpl$AddressChangeListener.run()` is
@@ -20375,11 +20384,12 @@ pub fn register_essential_natives_with_shims(
     // notification mechanism" answer: the listener returns and the thread
     // exits. CratonVM's resolver configuration is read once at init0 and
     // never reloaded, so there is nothing for a listener to observe anyway.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "notifyAddrChange0",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(-1))),
+        NativeKind::Bridge,
     );
 
     // JNDI DNS uses PortConfig to select a UDP source port. These are native
@@ -38806,13 +38816,44 @@ fn native_array_new_instance_multi(
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WP2.5-B — generated-proxy-class cache, keyed on
-/// `(loader_id, ordered_iface_class_ids)`. One generated `$ProxyN` class
-/// per (loader, ordered-interface-list) — the JDK `ProxyGenerator` does the
-/// same, keying on interface order so `getInterfaces()` round-trips the
-/// user-requested order.
+/// `(vm_identity, loader_id, ordered_iface_class_ids)`. One generated
+/// `$ProxyN` class per (VM, loader, ordered-interface-list) — the JDK
+/// `ProxyGenerator` does the same minus the VM, keying on interface order so
+/// `getInterfaces()` round-trips the user-requested order.
+///
+/// The `vm_identity` is load-bearing, not hygiene. Every other component of
+/// this entry is a per-VM number: `loader_id` is a small per-VM integer, the
+/// key's `ClassId`s are minted per VM from zero, and **the VALUE is a
+/// `ClassId`** — a handle that means nothing outside the class manager that
+/// issued it. Without the partition, VM B asking for a proxy over its
+/// interface `ClassId(42)` hit VM A's entry and was handed VM A's generated
+/// `$ProxyN` id. `class_name_of_id` then answered `None` for it, which is the
+/// `?` in the `ClassCastException: ? cannot be cast to …` that made the
+/// proxy/annotation corpus tests flip in roughly half of all parallel runs —
+/// in both directions, since the borrowed id sometimes happened to satisfy
+/// the cast and sometimes not.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
-    Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
+    Option<
+        rustc_hash::FxHashMap<
+            (usize, u32, Vec<cratonvm_types::ClassId>),
+            cratonvm_types::ClassId,
+        >,
+    >,
 > = parking_lot::RwLock::new(None);
+
+/// Drop every generated-proxy-class row belonging to `vm_identity`. Called
+/// from `release_vm_native_state`; the rows hold `ClassId`s into a class
+/// manager that is going away.
+pub fn forget_vm_proxy_classes(vm_identity: usize) {
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, _), _| *vm != vm_identity);
+    }
+    let mut modules = PROXY_LOADER_MODULES.write();
+    if let Some(map) = modules.as_mut() {
+        map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
 
 /// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
 /// per-loader counters; a global counter is sufficient here since the

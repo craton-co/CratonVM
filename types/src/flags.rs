@@ -1647,9 +1647,6 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_AQS`
     pub synthetic_aqs: bool,
 
-    /// `CRATONVM_SYNTHETIC_BUFFERED_WRITER` — [`parse::exactly_one`].
-    pub synthetic_buffered_writer: bool,
-
     /// `CRATONVM_SYNTHETIC_DSA`
     pub synthetic_dsa: bool,
 
@@ -1847,7 +1844,6 @@ impl NativeFlags {
             synthetic_agroal: present(src, "CRATONVM_SYNTHETIC_AGROAL"),
             synthetic_annotations: present(src, "CRATONVM_SYNTHETIC_ANNOTATIONS"),
             synthetic_aqs: present(src, "CRATONVM_SYNTHETIC_AQS"),
-            synthetic_buffered_writer: exactly_one(src, "CRATONVM_SYNTHETIC_BUFFERED_WRITER"),
             synthetic_dsa: present(src, "CRATONVM_SYNTHETIC_DSA"),
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
