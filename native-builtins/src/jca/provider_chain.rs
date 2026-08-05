@@ -3156,16 +3156,38 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
+    /// The seed chain is PER-PLATFORM: `SunMSCAPI` wraps the Windows CryptoAPI
+    /// and ships only in the Windows JDK, so HotSpot 25 answers thirteen
+    /// providers there and twelve everywhere else. This test asserted a flat
+    /// thirteen and so encoded a Windows capture as universal — measured
+    /// against `java -version 25.0.3` on Linux, which lists exactly the twelve
+    /// below.
     #[test]
-    fn seed_chain_has_thirteen_jdk25_providers() {
+    fn seed_chain_matches_the_platform_jdk25_provider_list() {
         let chain = snapshot();
-        assert_eq!(chain.len(), 13);
         let names: Vec<&str> = chain.iter().map(|(n, _, _)| n.as_str()).collect();
-        // Spot-check: SUN must be first, SunPKCS11 last, SunJCE in the middle.
-        assert_eq!(names[0], "SUN");
-        assert_eq!(names[12], "SunPKCS11");
-        assert!(names.contains(&"SunJCE"));
-        assert!(names.contains(&"SunEC"));
+        let mut expected = vec![
+            "SUN",
+            "SunRsaSign",
+            "SunEC",
+            "SunJSSE",
+            "SunJCE",
+            "SunJGSS",
+            "SunSASL",
+            "XMLDSig",
+            "SunPCSC",
+            "JdkLDAP",
+            "JdkSASL",
+        ];
+        if cfg!(target_os = "windows") {
+            expected.push("SunMSCAPI");
+        }
+        expected.push("SunPKCS11");
+        // The whole ordered list, not a length plus three spot-checks: order is
+        // what provider selection walks, so a chain that is the right length
+        // with two entries swapped resolves algorithms to the wrong provider
+        // and still passes a spot-check.
+        assert_eq!(names, expected);
     }
 
     // -----------------------------------------------------------------
