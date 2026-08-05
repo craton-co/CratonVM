@@ -27,13 +27,49 @@ This is what makes it easy to misattribute: the same probe corpus looks corrupt
 or clean depending only on how its constants were built, and a `hashCode` or
 `substring` differential over the corrupt one points at the wrong subsystem.
 
-## Where to look
+## Where it is
 
-`StringConcatFactory` / the `invokedynamic` string-concat bridge, and the
-`indy` concat helper the JIT binds (`INDY_STRING_CONCAT_FN`). The narrowing
-question is whether the concat path goes through `read_string` /
-`create_string` (UTF-8, lossy) rather than assembling the two backing arrays as
-code units.
+Located 2026-08-05, no longer a "where to look".
+
+`vm/src/runtime/invokedynamic.rs::execute_string_concat` accumulates into a
+**Rust `String`**:
+
+```rust
+let s = value_to_string(shared, Some(thread), &arg_val, arg_type);
+result.push_str(&s);
+...
+let str_ref = crate::runtime::interpreter::create_string_or_oom(shared, thread, &result)?;
+```
+
+A Rust `String` is UTF-8 by construction, so it cannot hold an unpaired
+surrogate: the loss happens on the way *in* (`value_to_string` decoding the
+argument) and is sealed on the way *out* (`create_string_or_oom` re-encoding
+it). Every `"a" + b` site in the VM goes through this function, which is why the
+symptom is universal for concatenation and absent for `new String(char[])`.
+
+## The fix, and the reason it is not a one-liner
+
+Accumulating `Vec<u16>` code units instead of a `String` is the correct shape —
+the VM already stores compact strings as little-endian UTF-16 pairs and has
+unit-level constructors (`init_string_from_units`). The care needed is that
+this is a hot path: every string concatenation in every workload runs it, and
+`push_str` on a `String` is not the same cost as pushing units.
+
+Two options, in preference order:
+
+1. **Units throughout.** Change the accumulator to `Vec<u16>` and give
+   `value_to_string` a unit-returning sibling for the `String` case (the
+   non-`String` cases go through `toString()` and are already lossless as
+   UTF-8). Measure against the concat-heavy probes before landing.
+2. **Lossless fast path with a units fallback.** Keep the `String`
+   accumulator, but detect an argument that is not losslessly representable
+   and redo that concat through the unit path. Cheaper to land, but it adds a
+   check to the hot path and leaves two code paths that can drift — the shape
+   this feature has been burned by repeatedly.
+
+Do not land either without the concat-heavy timings; the equivalent change on
+the `java/lang/String` natives turned out to make its workload FASTER, which is
+not something to assume in either direction.
 
 The general shape — a native that reads a `String` through `read_string` and
 writes it back through `create_string` cannot carry an unpaired surrogate — was
