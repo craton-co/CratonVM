@@ -157,6 +157,30 @@ public final class ReaderWriterLayoutProbe {
             out("skip.nextChar", isr.read());
         }
 
+        // ---- 6. `getEncoding()` reports the JDK's HISTORICAL charset name,
+        // not the canonical one — `StreamDecoder.encodingName()` asks
+        // `HistoricallyNamedCharset`, which most of java.base implements. The
+        // single divergence in this probe's first run: CratonVM said "UTF-8"
+        // where HotSpot says "UTF8".
+        String[] charsets = {
+            "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE", "US-ASCII", "ISO-8859-1",
+            "ISO-8859-15", "windows-1252", "KOI8-R", "IBM850", "Shift_JIS",
+            "EUC-JP", "GB2312", "GBK", "Big5",
+        };
+        for (String cn : charsets) {
+            try {
+                java.nio.charset.Charset cs = java.nio.charset.Charset.forName(cn);
+                try (InputStreamReader r =
+                                new InputStreamReader(new java.io.ByteArrayInputStream(new byte[0]), cs);
+                        OutputStreamWriter w =
+                                new OutputStreamWriter(new java.io.ByteArrayOutputStream(), cs)) {
+                    out("enc." + cn, cs.name() + "|" + r.getEncoding() + "|" + w.getEncoding());
+                }
+            } catch (Exception e) {
+                out("enc." + cn, e.getClass().getName());
+            }
+        }
+
         System.out.println("RWLAYOUT-COMPLETE");
     }
 }
