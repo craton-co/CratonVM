@@ -8328,6 +8328,27 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
+    // one of these intrinsics reaches `emit_load_string_value_ptr`
+    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
+    // `String.value` reference field. That emitter is NOT gated on
+    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
+    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
+    // the adjacent coder/hash field and dereferences the result - a
+    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
+    // indexOf / hashCode / equals / compareTo.
+    //
+    // Refusing the intrinsic here is the unblock that module's header
+    // prescribes: it costs throughput (the calls fall back to native
+    // dispatch) and costs nothing when the gate is off, which is the default.
+    // The real fix is a narrow arm in that emitter, mirroring
+    // `emit_narrow_ref_aload_regs`. This does NOT make `-XX:+UseCompressedOops`
+    // sound on its own - hole 2 (the conservative 8-byte-word rescan in
+    // `gen_heap`'s `mark_young_to_old_refs` / `rewrite_stretch_conservatively`)
+    // is still open, and `enable_for_live_heap` still warns.
+    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+        return None;
+    }
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {

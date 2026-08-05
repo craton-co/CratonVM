@@ -103,6 +103,68 @@ Eliminations, so the next person does not redo them:
   garbage) but the run did not finish inside 900 s either, so it neither
   confirms nor rules that out. This is the most promising next thread.
 
+## Why CratonVM needs more heap: object width, measured
+
+Per-object *sizes* from `GC.class_histogram` are exact regardless of liveness
+(each entry's bytes/instances is that class's real instance size), so unlike
+the totals they can be compared directly. Confirmed against the `[layout]`
+diagnostic (`CRATONVM_DBG_LAYOUT=1`), which prints each class's compact body:
+
+| class | CratonVM | HotSpot (compressed oops) |
+|---|--:|--:|
+| `java/lang/String` | 56 (32 hdr + 24 body) | 24 |
+| `java/util/HashMap$Node` | 64 (32 + 32) | 32 |
+| `com/sun/tools/javac/util/List` | 48 | 24 |
+| `java/util/HashMap` | **320** | ~48 |
+| `java/util/LinkedHashMap` | **400** | ~48 |
+| `java/util/ArrayList` | **112** | ~24 |
+
+Two separate effects:
+
+1. **A broad ~2-2.5x** on everything, from a 32-byte `ObjectHeader`
+   (`types/src/heap_types.rs`, vs HotSpot's 12) and 8-byte reference fields
+   (vs 4 narrow). This is the dominant term, because it applies to the millions
+   of small nodes javac allocates. Note the nodes themselves are *fine* —
+   `HashMap$Node` gets the compact layout (`body=32 refs=3 fields=4`).
+
+2. **A ~7x on a few container classes.** `HashMap`, `LinkedHashMap` and
+   `ConcurrentHashMap` print `LEGACY, no compact layout` and fall back to the
+   uniform 16-byte tagged-`Value` cell (320 = 32 + 18x16). This is
+   **deliberate**, not a bug: `build_compact_layout`
+   (`classloading/src/class.rs`) refuses any class with a *padded* slot — a slot
+   with no field descriptor — because native code stores mixed types into those
+   raw slots (`map_alloc_node` writes `Int(hash)` into one and refs into
+   others), and guessing they are references makes the GC scan a primitive as a
+   pointer and corrupt the heap. The legacy cell self-describes via its tag.
+   `IdentityHashMap` (`body=40`) and `WeakHashMap` (`body=64`) have no padded
+   slots and are compact, which is the control.
+
+Effect 2 is bounded (one object per map). **Effect 1 is the lever**, and the
+fix already exists behind a gate.
+
+## The lever: compressed oops, gated off by two named holes
+
+`gc/src/compressed_oops.rs` narrows reference instance fields and reference
+array elements from 8 bytes to 4 under `-XX:+UseCompressedOops` /
+`CRATONVM_COMPRESSED_OOPS=1`, **off by default**. Its header is explicit that
+the gate is off for correctness, not throughput, and names both holes:
+
+1. `emit_load_string_value_ptr` (`jit/src/x64.rs`) emits an unconditional
+   64-bit load of `String.value` and is not gated on
+   `narrow_oops_block_inline_fields` the way the getfield/putfield arms are, so
+   under narrow oops every inlined `charAt`/`length`/`hashCode`/... is a
+   deterministic wild-pointer SIGSEGV.
+2. `mark_young_to_old_refs` and `rewrite_stretch_conservatively`
+   (`gc/src/gen_heap.rs`) rescan unparseable heap stretches in aligned 8-byte
+   words; a pair of adjacent narrow oops never matches, so marks are missed
+   (premature reclamation) and refs to moved objects are left dangling.
+
+Hole 1 has a one-line unblock the header itself prescribes — refuse
+`try_resolve_string_intrinsic` under `narrow_oops_enabled()`, trading the
+intrinsic's throughput for correctness. **That unblock is now in tree** (it is
+inert while the gate is off). Hole 2 is untouched, so the gate must stay off;
+`enable_for_live_heap` still prints its unsoundness warning.
+
 ## What the profile says
 
 `perf record -F 199 -g` against the pre-fix binary during this test put
