@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-08-05 CPU benchmark table re-measured in a quiet window; Sieve at parity
+
+All seven CratonBench rows re-taken in one interleaved series on `dev`
+@ `ded183df8` against JDK 25.0.3, in a window opened only once the load fell
+below 2.5 **and** nothing else was pinned to the measuring core. CratonVM's
+run-to-run spread is under 1% on five of the seven rows.
+
+| | ratio | was 2026-07 |
+|---|---|---|
+| Arithmetic | 1.95x | 2.44x |
+| Fibonacci(44) | 5.89x | 2.79x |
+| **Sieve** | **0.99x** | 2.28x |
+| **Matrix** | **0.99x** | 2.93x |
+| HashMap | 2.07x | 1.75x |
+| String/Regex | 5.37x | 7.7x |
+| Binary Trees | 9.46x | 8.34x |
+
+Two rows are now at parity with HotSpot C2. Sieve's 6.50x of 2026-08-04 was a
+live regression and is fixed; see the entry below.
+
+**Sieve's HotSpot arm is bimodal** — ~2,369 ms or ~2,739 ms with nothing
+between, so a 9-sample median reports whichever mode won, and two consecutive
+series on an unchanged binary read 2,386 ms and 2,734 ms. That row's figure is
+the median of 18 pooled samples; the cleanest single series would have claimed
+0.87x, i.e. CratonVM 14% faster than HotSpot, which the data does not support.
+CratonVM's own samples on that phase are unimodal.
+
 ### 2026-08-04 The optimizing tier stops taking methods the single-pass backend does better
 
 `cov-02` taught `IrBuilder::build` to lower `bastore`. The side effect was that
