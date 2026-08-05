@@ -5,7 +5,7 @@
 | **Status** | OPEN — measured, pinned, not fixed. Each is a gap in CratonVM's own ~5,200-stub class library, not an interpreter defect. |
 | **Area** | `native-builtins` / `native-collections` (the `synthetic-jdk` class library), surfaced by `vm/tests/interpreter_tests.rs` |
 | **Pinned in** | `KNOWN_SYNTHETIC_JDK_GAPS`, `vm/tests/interpreter_tests.rs` |
-| **Discovered** | 2026-08-02, when the extended interpreter corpus was made runnable (see the retired `extended-interpreter-corpus-is-a-synthetic-jdk-corpus-20260802` write-up for how it had been dark, and for the 198 failures that turned out not to be gaps at all). |
+| **Discovered** | 2026-08-02, when the extended interpreter corpus was made runnable (see the retired `extended-interpreter-corpus-is-a-synthetic-jdk-corpus-FIXED-20260805` write-up for how it had been dark, and for the 198 failures that turned out not to be gaps at all). |
 
 ## Scope, and what "measured" means here
 

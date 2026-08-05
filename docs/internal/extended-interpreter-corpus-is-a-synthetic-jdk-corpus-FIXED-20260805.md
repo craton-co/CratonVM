@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | ✅ RESOLVED 2026-08-02. Root-caused, fixed, and re-baselined. Retired from `docs/known-issues/`. |
+| **Status** | ✅ RESOLVED 2026-08-05. Root-caused, fixed, and re-baselined. Retired from `docs/known-issues/`. |
 | **Area** | `vm/tests/interpreter_tests.rs` (the `CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1` corpus) |
 | **Original symptom** | Opting in yielded `710 passed; 214 failed` serially, and `STATUS_ACCESS_VIOLATION` / SIGSEGV in the default parallel run. |
-| **Now** | `924 passed; 0 failed` serially *and* in a full-parallel run, with 16 measured synthetic-library gaps pinned in `KNOWN_SYNTHETIC_JDK_GAPS`. |
+| **Now** | `924 passed; 0 failed` serially, and no crash in a full-parallel run, with 16 measured synthetic-library gaps pinned in `KNOWN_SYNTHETIC_JDK_GAPS`. |
 
 ## What the original triage got wrong
 
