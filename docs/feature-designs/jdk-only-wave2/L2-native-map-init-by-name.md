@@ -125,7 +125,7 @@ JDK 25:
 doc predicted. Probe transcripts identical pre/post but for an ephemeral TCP
 port and a timing line. `test_classes` corpus identical in `Compatible` mode
 with timestamps normalised, all 10 members. 101 `--lib` tests
-(94 + 7 new) green in both feature configurations, and all 8 integration
+(94 + 7 new) green in both feature configurations, and all 12 integration
 targets — including `gc_relocation_harness`, which had not compiled since
 `gc_overlay_roots_for_collection` grew a parameter.
 
@@ -183,7 +183,7 @@ recorded in the evidence file. One divergence it did fix, in a second commit:
 **Both hosts, independently, against the same Temurin 25.0.3+9 image.**
 
 * Windows 11: release binaries from `d81e220b3` (pre) and this branch (post);
-  101 `--lib` tests and all 8 integration targets green, 107 with
+  101 `--lib` tests and all 12 integration targets green, 107 with
   `--features synthetic-jdk`.
 * Azure Linux (`/data/data/wt-l2mapinit-20260804`, `wt-l2base-20260804`):
   release binaries from `2572ea9af` (pre — the dev tip this branch merges) and
