@@ -1264,14 +1264,34 @@ mod tests {
         worker.join().expect("census worker must not panic");
 
         let after = thread_state_census();
+        // Cumulative and monotonic: our worker contributed one and peers can
+        // only add more, so `>` is race-free.
         assert!(
             after.terminated_total > before.terminated_total,
             "terminating must bump the cumulative terminated count"
         );
+        // This one is NOT. The live registry is process-global and this counts
+        // every thread in the binary, not just ours: a peer test's worker
+        // sitting in `Terminated` for the instant before its cell is reaped
+        // made it read `left: 1, right: 0` in 1 of 24 full-suite runs.
+        //
+        // Retry for a quiet moment instead. Our own worker has been `join`ed
+        // by now, so if OURS were the cell that failed to leave, the count
+        // could never return to 0 and this still fails — which is exactly the
+        // property under test.
+        const ATTEMPTS: usize = 256;
+        let mut observed = after.get(ThreadExecState::Terminated);
+        for _ in 0..ATTEMPTS {
+            if observed == 0 {
+                break;
+            }
+            std::thread::yield_now();
+            observed = thread_state_census().get(ThreadExecState::Terminated);
+        }
         assert_eq!(
-            after.get(ThreadExecState::Terminated),
-            0,
-            "terminated cells leave the live registry"
+            observed, 0,
+            "terminated cells leave the live registry — still populated after \
+             {ATTEMPTS} attempts"
         );
     }
 
