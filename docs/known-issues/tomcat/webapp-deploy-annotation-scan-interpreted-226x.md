@@ -479,6 +479,22 @@ The hit rate that makes the scan number possible does **not** generalise:
 > never reused. `fill ≈ miss` is equally consistent with cold misses — every
 > first touch fills — so it never distinguished the two, and I named the
 > mechanism before checking capacity.
+>
+> **Confirmed independently on the Windows box**, different hardware and
+> different workloads (`--nojit`, hit rate at 1024 → 65536 slots):
+>
+> | workload | 1024 | 65536 | hits |
+> |---|---|---|---|
+> | `SiteCacheCostProbe` | 99% | 99% | 32.2M |
+> | `RSerial` | 89% | 90% | 24.4k |
+> | `RCollections` | 81% | 81% | 244 |
+> | `RStrings` | 71% | 71% | 686 |
+> | `RReflect` | 55% | 55% | 128 |
+>
+> Flat everywhere; only `RSerial` moves, by one point. (The last three rows have
+> too little volume to say anything about those workloads individually — the
+> conclusion rests on the high-volume rows here and on Azure.) **1024 is
+> sufficient; a bigger table buys nothing on any workload measured.**
 
 What the numbers actually say is the ordinary thing a cache says: **it pays
 where there is REUSE and is neutral where there is not.** The annotation scan
