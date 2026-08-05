@@ -6,6 +6,9 @@ behaves today exactly as it did before L5. What is open is that each one is
 tagged `Bridge` while the JDK 25 image says its target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits it on a claim nobody has checked.
 
+Sibling record for the crates L5b/L5c did next:
+[`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md).
+
 ## What L5 did, and why this file exists
 
 Lane L5 of the wave-2 plan
