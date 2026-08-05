@@ -272,6 +272,47 @@ fn test_compiled_callee_handler_resume_keeps_the_loop_iterator() {
     assert_eq!(precise_handler_mismatches("loopMismatches"), 0);
 }
 
+#[test]
+fn test_an_instanceof_in_a_protected_range_no_longer_refuses_the_method() {
+    if !precise_handler_frame_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `instanceof` (0xc1) sat inside `may_throw_without_precise_frame`'s
+    // `0xbb..=0xc1` range, so ANY protected range containing one refused the
+    // whole method — even though the x64 lowering of `instanceof` cannot throw
+    // (`jit_instanceof` returns 0 or 1 on every path and never stashes a
+    // pending exception, and the codegen emits no post-call exception check
+    // because there is nothing to check).
+    //
+    // The refusal is what this test is really about, so assert it directly.
+    // `mismatches == 0` ALONE would be a false pass: the interpreter gets this
+    // shape right, so a method that never compiles scores a clean zero. That is
+    // not hypothetical here — `loopStep`'s first draft had an `instanceof` in
+    // its range and read 0 mismatches in both arms of its own A/B for exactly
+    // this reason, which is recorded in the fixture's own comment.
+    assert_eq!(precise_handler_mismatches("instanceofMismatches"), 0);
+
+    const CLASS: &str = "cratonvm/JitPreciseHandlerFrame";
+    const METHOD: &str = "instanceofStep";
+    const DESC: &str = "(IZ)I";
+
+    // No refusal was recorded for it at all. Pre-fix this reads
+    // `Some("rbc6-handler-reads-unsafe-local(pc=..,op=0xc1)")` — the pc/opcode
+    // suffix is what made the cause visible in the first place.
+    let reason = cratonvm_jit::jit_bail_reason_for(CLASS, METHOD, DESC);
+    assert!(
+        !reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("rbc6-handler-reads-unsafe-local")),
+        "instanceofStep was still refused by the RBC.6 gate: {reason:?}"
+    );
+    assert!(
+        !cratonvm_jit::is_jit_bail_listed(CLASS, METHOD, DESC),
+        "instanceofStep was permanently bail-listed; it compiles now"
+    );
+}
+
 fn osr_loop_progress_class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/JitOsrLoopProgress.class")).exists()

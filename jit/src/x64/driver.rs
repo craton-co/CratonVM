@@ -694,6 +694,14 @@ pub fn compile_with_param_slots(
         .saturating_add(8192)
         .saturating_add(invoke_info.len().saturating_mul(1024))
         .saturating_add(inline_extra);
+    // A previous attempt at this method that emitted past its estimate left the
+    // size it actually wanted behind; prefer the measurement to the heuristic.
+    // See `crate::note_code_buffer_shortfall` — without this, the estimate has
+    // exactly one chance per method and getting it wrong is permanent.
+    let estimated_size = match crate::code_buffer_hint(method_key) {
+        Some(measured) => estimated_size.max(measured),
+        None => estimated_size,
+    };
     let mut buf = ExecutableBuffer::new(estimated_size.max(4096))?;
     buf.set_tag("x64-single-pass");
 
@@ -1801,9 +1809,22 @@ pub fn compile_with_param_slots(
             code_len = code_len,
             capacity = compiler.buf.capacity(),
             wanted = compiler.buf.wanted(),
-            "JIT compile bailed: code buffer estimate too small; method stays interpreted"
+            "JIT compile bailed: code buffer estimate too small; retrying at the measured size"
         );
-        crate::note_jit_bail_site("code-buffer-estimate-too-small");
+        // Remember the shortfall so the NEXT attempt at this method sizes its
+        // buffer from a measurement instead of the heuristic.
+        //
+        // This backend cannot retry in place — it consumes six one-shot
+        // thread-local staging requests before the buffer is allocated, and
+        // re-entering it here would find them gone. So the retry is deferred to
+        // the next compile request, which arrives with those requests freshly
+        // staged. What made that impossible before is that the caller treats
+        // ANY backend-attempted `None` as permanent (`mark_jit_bail_listed`),
+        // so the first overflow retired the method for the life of the process
+        // — the estimate got exactly one chance and a method that needed more
+        // was never compiled again. `try_compile` now exempts this one site.
+        crate::note_code_buffer_shortfall(method_key, compiler.buf.wanted());
+        crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
         return None;
     }
 

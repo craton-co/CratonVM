@@ -7,6 +7,7 @@ Usage:
     cratonvm --real-jdk --java-home <JDK> --explain-jdk-only \\
         --dump-native-registry census.json -cp probes JdkOnlyCensusLoadProbe
     python3 scripts/jdk-only-adjudicate.py census.json
+    python3 scripts/jdk-only-adjudicate.py census.json --json block.json
 
 `--explain-jdk-only` is not optional: without it `image_adjudication` is
 false, every `image_declaring_method` is null, and this script refuses
@@ -24,12 +25,37 @@ The questions, in the order the record asks them:
   3. How many natives of ANY kind shadow concrete bytecode (`has_code`)?
   4. Which source file each unadjudicated group comes from, so the
      reclassification wave can be cut into subsystem-sized batches.
+
+Section 7 is the same answer to question 2, as a **machine-readable block**,
+and `--json FILE` writes it on its own.  It is not computed here: it comes from
+`scripts/jdk-only-bridge-ratchet.py`, which is the L6 gate.  Two independent
+implementations of "how many Bridge rows are unadjudicated" would drift, and
+the one that drifted would be the one nobody was running.
 """
+import importlib.util
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 
-path = sys.argv[1]
+_GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jdk-only-bridge-ratchet.py")
+_spec = importlib.util.spec_from_file_location("jdk_only_bridge_ratchet", _GATE)
+ratchet = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ratchet)
+
+argv = sys.argv[1:]
+json_out = None
+if "--json" in argv:
+    i = argv.index("--json")
+    try:
+        json_out = argv[i + 1]
+    except IndexError:
+        sys.exit("--json needs a path ('-' for stdout)")
+    del argv[i:i + 2]
+if not argv:
+    sys.exit(__doc__)
+path = argv[0]
+
 with open(path, encoding="utf-8") as fh:
     doc = json.load(fh)
 
@@ -109,3 +135,25 @@ for r in mis[:25]:
           f"{r.get('registered_by')}")
 if len(mis) > 25:
     print(f"    ... and {len(mis) - 25} more")
+
+# --- 7. the machine-readable block ----------------------------------------
+# Section 2's `bridge` row again, in the shape the L6 ratchet freezes.  The
+# five buckets are disjoint and sum to the Bridge total, which section 2's
+# columns deliberately do NOT (its `code` column counts every has_code row of
+# that kind, whether or not the method is also declared elsewhere in the
+# table).  Read this one when you want an identity that adds up.
+block = ratchet.adjudicate(doc)
+print("\n=== 7. machine-readable adjudication block "
+      "(scripts/jdk-only-bridge-ratchet.py) ===")
+print(ratchet.render_block(block))
+print("\n  gate it against the committed baseline with:")
+print("    sh regression-suite/bridge-ratchet.sh")
+
+if json_out:
+    text = json.dumps(block, indent=2, sort_keys=True) + "\n"
+    if json_out == "-":
+        sys.stdout.write(text)
+    else:
+        with open(json_out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"\n  block written to {json_out}")

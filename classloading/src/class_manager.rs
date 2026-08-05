@@ -5853,6 +5853,11 @@ impl ClassManager {
         let class_name_for_hook = Arc::clone(&class.name);
         let class_id_for_hook = id.as_u32();
         self.class_store.add(class);
+        // L4 gap 2/1 — the shadow-layout census. This class was defined from
+        // real bytes; if CratonVM also carries a hand-numbered slot model for
+        // its name, the two layouts are now both known and can be diffed once,
+        // here, instead of guessed at per access.
+        self.report_shadow_layout(id);
 
         // T10.5 — Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
@@ -6312,6 +6317,53 @@ impl ClassManager {
     /// Get a mutable reference to a loaded class by its id.
     pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
         self.class_store.get_mut(id)
+    }
+
+    /// Diff CratonVM's fabricated slot model for this class against the layout
+    /// the loaded image actually declares.
+    ///
+    /// `None` when there is nothing to say: the class has no model in
+    /// [`synthetic_stub_field_model`], or it *is* a fabricated stub (diffing a
+    /// model against itself answers nothing).
+    ///
+    /// This is the overlay detector's answer to the two gaps a per-access type
+    /// check cannot reach — a read of a wrong-field slot, and a same-kind write
+    /// into one. Both are invisible in the value's type tag and both are visible
+    /// here. See [`crate::shadow_layout`].
+    #[must_use]
+    pub fn shadow_layout_diff(&self, id: ClassId) -> Option<crate::shadow_layout::ShadowLayoutDiff> {
+        let name = self.class_store.get(id).map(|c| Arc::clone(&c.name))?;
+        let model = synthetic_stub_fields(&name);
+        crate::shadow_layout::diff_against_model(&self.class_store, id, &model)
+    }
+
+    /// Emit the one-per-class shadow-layout census line for a class that has
+    /// just been defined from real bytes, under `CRATONVM_DBG=overlay`.
+    ///
+    /// Deliberately per class and not per access: the interesting output is the
+    /// slot map, it never changes for a given image, and printing it once keeps
+    /// it readable next to the access-site lines. `overlay-all` widens it from
+    /// "only classes that actually disagree" to every class carrying a model, so
+    /// the `Agrees` rows can be audited too — most of them are anonymous slots
+    /// over real references, which this instrument cannot falsify (see the
+    /// module docs).
+    fn report_shadow_layout(&self, id: ClassId) {
+        // Latched once: this runs on every class definition, and the default
+        // path must not pay an env lookup per class.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some()
+        }) {
+            return;
+        }
+        let Some(diff) = self.shadow_layout_diff(id) else {
+            return;
+        };
+        let all = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_ALL").is_some();
+        if diff.disagreement_count() == 0 && !all {
+            return;
+        }
+        eprint!("{}", diff.render());
     }
 
     /// Re-parent a loaded class.
@@ -9482,6 +9534,12 @@ impl ClassManager {
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(id, bytes);
 
+        // L4 — the other path by which a modelled class acquires a real layout:
+        // a stub that was already minted is replaced in place by the real bytes.
+        // The ClassId is deliberately reused, so every native holding a
+        // positional index for the old model now addresses the new one.
+        self.report_shadow_layout(id);
+
         Ok(())
     }
 
@@ -10446,6 +10504,19 @@ pub fn synthetic_stub_instance_field_count(name: &str) -> usize {
         .count()
 }
 
+/// CratonVM's fabricated slot **model** for `name` — the same table that sizes
+/// a bytecode `new` of the stub and that pads a real class up to the count
+/// native code was written against.
+///
+/// Exposed so the overlay detector can diff the model against the real layout
+/// (`crate::shadow_layout`). Reading it is the only way to say what a
+/// hand-numbered positional access *meant*; the value's type tag alone cannot,
+/// which is the blind spot L4 closes.
+#[must_use]
+pub fn synthetic_stub_field_model(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
+    synthetic_stub_fields(name)
+}
+
 fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
     use cratonvm_reader::field::ClassFileField;
 
@@ -11077,16 +11148,51 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/text/NumberFormat" => instance_fields(4),
         // MessageFormat = 1 field (pattern=0)
         "java/text/MessageFormat" => instance_fields(1),
-        // Thread = 8 fields. Keep the first five synthetic slots stable
-        // (name=0, priority=1, tid=2, target/runnable=3, virtualFlag=4), and
-        // append the real Thread fields JBoss Threads reflects during its
-        // Unsafe bootstrap.
+        // Thread = 8 fields, and **every NAMED slot sits at its real JDK
+        // index**. The anonymous ones carry CratonVM's fabricated conventions
+        // (name=0, priority=1, tid=2, target/runnable=3, virtualFlag=5) and
+        // must stay anonymous — an `_fN` asserts nothing, which is exactly
+        // right for a slot whose meaning differs between the two layouts.
+        //
+        // Real JDK 21–25 `java.lang.Thread`, instance fields in declaration
+        // order: `eetop`(J), `tid`(J), `name`, `interrupted`(Z),
+        // `contextClassLoader`, `holder`, `threadLocals`,
+        // `inheritableThreadLocals`, … (19 in all).
+        //
+        // Until 2026-08-05 this arm was `instance_fields(5)` followed by
+        // `contextClassLoader`, i.e. it declared that name at index **5**,
+        // which is `holder` on every real image; `threadLocals` and
+        // `inheritableThreadLocals` at 6 and 7 were right by accident. No
+        // accessor was writing the wrong field — they all resolve on the
+        // receiver's own class — but it is a live landmine for anything that
+        // resolves against the CLASS NAME while the receiver carries the other
+        // layout, and this tree already carries a scar from one such instance:
+        // see the defensive type check in
+        // `native_thread_get_context_class_loader`, whose comment records a
+        // mis-slotted read observed as a `String` during Mockito plugin
+        // discovery.
+        //
+        // Slot 5 is deliberately NOT named `holder`.
+        // `populate_real_thread_holder` detects the fabricated layout with
+        // `get_field_by_name(this, "holder").is_none()` and falls back to its
+        // own slot conventions, so declaring `holder` here would silently turn
+        // that fallback off. It is the fabricated-only virtual-thread flag
+        // instead — `SYNTHETIC_THREAD_VIRTUAL_SLOT` in
+        // `native-builtins/src/jdk25_concurrency.rs` moved off index 4 in the
+        // same change so it stops sharing a slot with `contextClassLoader`.
         "java/lang/Thread" => {
-            let mut fields = instance_fields(5);
+            let mut fields = instance_fields(4);
             fields.push(ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("contextClassLoader"),
                 descriptor: cratonvm_types::intern_arc("Ljava/lang/ClassLoader;"),
+                attributes: vec![],
+            });
+            // Slot 5 — anonymous on purpose (see above).
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("_f5"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             });
             fields.push(ClassFileField {
@@ -11141,13 +11247,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
+        // DECLARATION ORDER IS THE REAL JDK'S, and must stay that way.
+        //
+        // It was `name, parent, daemon, maxPriority` until 2026-08-05 — BOTH
+        // pairs transposed against the image, which declares
+        // `parent, name, maxPriority, daemon` (JDK 21 through 25, `javap -p
+        // --module java.base java.lang.ThreadGroup`). Every field here has a
+        // real counterpart at a different index, so the model was wrong in the
+        // one way no value-tag census can see: a `ThreadGroup` reference over a
+        // `String` reference and an `int` over an `int` both type-check. The
+        // L4 shadow-layout diff reported all four
+        // (`docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`).
+        //
+        // The natives in `native-builtins/src/phases_late/concurrent.rs`
+        // resolve these by NAME first and only fall back to a hard-coded index,
+        // so on a real image they were already correct — the transposition bit
+        // wherever a raw index was used instead, and it kept the census
+        // reporting four rows that were not defects. The fallback constants
+        // there are the real order now too; the two tables must move together.
         "java/lang/ThreadGroup" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("parent"),
@@ -11156,14 +11274,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("daemon"),
-                descriptor: cratonvm_types::intern_arc("Z"),
+                name: cratonvm_types::intern_arc("name"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("maxPriority"),
                 descriptor: cratonvm_types::intern_arc("I"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("daemon"),
+                descriptor: cratonvm_types::intern_arc("Z"),
                 attributes: vec![],
             },
         ],
