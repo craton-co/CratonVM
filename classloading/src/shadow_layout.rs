@@ -610,3 +610,62 @@ mod tests {
         assert!(!is_anonymous_model_field("f0"));
     }
 }
+
+#[cfg(test)]
+mod production_model_order_tests {
+    use super::*;
+    use crate::class_manager::synthetic_stub_field_model;
+
+    fn instance_names(class: &str) -> Vec<String> {
+        synthetic_stub_field_model(class)
+            .iter()
+            .filter(|f| !f.is_static())
+            .map(|f| f.name.to_string())
+            .collect()
+    }
+
+    /// The real JDK 21–25 declaration order for each class whose model was
+    /// rotated. Spelled out so a JDK upgrade falsifies it, and asserted as a
+    /// PREFIX so a model may stop short of the real field list but must never
+    /// name a field at an index the image uses for something else.
+    ///
+    /// Anonymous `_fN` entries are the model declining to make a claim, which
+    /// is the correct thing for a slot whose meaning differs between the
+    /// fabricated and real layouts.
+    #[test]
+    fn rotated_models_now_name_fields_at_their_real_indices() {
+        let cases: &[(&str, &[&str])] = &[
+            // AbstractMap contributes keySet, values ahead of k/v.
+            (
+                "java/util/Collections$SingletonMap",
+                &["_f0", "_f1", "k", "v"],
+            ),
+            // java.io.Reader contributes lock, skipBuffer ahead of `in`.
+            ("java/io/BufferedReader", &["_f0", "_f1", "in"]),
+            // java.io.Writer contributes writeBuffer, lock ahead of `out`.
+            ("java/io/BufferedWriter", &["_f0", "_f1", "out"]),
+            // Declaration order, NOT the CodeSource(URL, Certificate[]) ctor.
+            ("java/security/CodeSource", &["location", "signers", "certs"]),
+            // Fixed earlier the same day; pinned here so the whole family is
+            // covered by one test rather than three.
+            (
+                "java/security/ProtectionDomain",
+                &["codesource", "classloader", "principals", "permissions"],
+            ),
+            (
+                "java/lang/ThreadGroup",
+                &["parent", "name", "maxPriority", "daemon"],
+            ),
+        ];
+        for (class, want) in cases {
+            let got = instance_names(class);
+            assert_eq!(
+                got.iter().map(String::as_str).collect::<Vec<_>>(),
+                *want,
+                "{class}'s fabricated model must match the real JDK declaration \
+                 order (javap -p --module java.base {})",
+                class.replace('/', ".")
+            );
+        }
+    }
+}

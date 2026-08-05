@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress};
@@ -999,81 +999,91 @@ fn crc32_update_byte_buffer_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // Inflater
     let il = "java/util/zip/Inflater";
-    r.register(il, "initIDs", "()V", infl_init_ids);
-    r.register(il, "init", "(Z)J", infl_init);
-    r.register(il, "setDictionary", "(J[BII)V", infl_set_dictionary);
-    r.register(
+    r.register_with_kind(il, "initIDs", "()V", infl_init_ids, NativeKind::Bridge);
+    r.register_with_kind(il, "init", "(Z)J", infl_init, NativeKind::Bridge);
+    r.register_with_kind(il, "setDictionary", "(J[BII)V", infl_set_dictionary, NativeKind::Bridge);
+    r.register_with_kind(
         il,
         "setDictionaryBuffer",
         "(JJI)V",
         infl_set_dictionary_buffer,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         il,
         "inflateBytesBytes",
         "(J[BII[BII)J",
         infl_inflate_bytes_bytes,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         il,
         "inflateBytesBuffer",
         "(J[BIIJI)J",
         infl_inflate_bytes_buffer,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         il,
         "inflateBufferBytes",
         "(JJI[BII)J",
         infl_inflate_buffer_bytes,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         il,
         "inflateBufferBuffer",
         "(JJIJI)J",
         infl_inflate_buffer_buffer,
+        NativeKind::Bridge,
     );
-    r.register(il, "getAdler", "(J)I", infl_get_adler);
-    r.register(il, "reset", "(J)V", infl_reset);
-    r.register(il, "end", "(J)V", infl_end);
+    r.register_with_kind(il, "getAdler", "(J)I", infl_get_adler, NativeKind::Bridge);
+    r.register_with_kind(il, "reset", "(J)V", infl_reset, NativeKind::Bridge);
+    r.register_with_kind(il, "end", "(J)V", infl_end, NativeKind::Bridge);
 
     // Deflater
     let dl = "java/util/zip/Deflater";
     r.register(dl, "initIDs", "()V", defl_init_ids);
-    r.register(dl, "init", "(IIZ)J", defl_init);
-    r.register(dl, "setDictionary", "(J[BII)V", defl_set_dictionary);
-    r.register(
+    r.register_with_kind(dl, "init", "(IIZ)J", defl_init, NativeKind::Bridge);
+    r.register_with_kind(dl, "setDictionary", "(J[BII)V", defl_set_dictionary, NativeKind::Bridge);
+    r.register_with_kind(
         dl,
         "setDictionaryBuffer",
         "(JJI)V",
         defl_set_dictionary_buffer,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         dl,
         "deflateBytesBytes",
         "(J[BII[BIIII)J",
         defl_deflate_bytes_bytes,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         dl,
         "deflateBytesBuffer",
         "(J[BIIJIII)J",
         defl_deflate_bytes_buffer,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         dl,
         "deflateBufferBytes",
         "(JJI[BIIII)J",
         defl_deflate_buffer_bytes,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         dl,
         "deflateBufferBuffer",
         "(JJIJIII)J",
         defl_deflate_buffer_buffer,
+        NativeKind::Bridge,
     );
-    r.register(dl, "getAdler", "(J)I", defl_get_adler);
-    r.register(dl, "reset", "(J)V", defl_reset);
-    r.register(dl, "end", "(J)V", defl_end);
+    r.register_with_kind(dl, "getAdler", "(J)I", defl_get_adler, NativeKind::Bridge);
+    r.register_with_kind(dl, "reset", "(J)V", defl_reset, NativeKind::Bridge);
+    r.register_with_kind(dl, "end", "(J)V", defl_end, NativeKind::Bridge);
 
     // Note: java.util.zip.ZipFile and ZipFile$Source have NO native methods in
     // JDK 25 — the central-directory parser is pure Java backed by
@@ -1085,18 +1095,19 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // private natives that the actual JDK class file delegates to. Mindustry
     // and any app reading JARs trips `updateBytes0` during entry verification.
     let crc = "java/util/zip/CRC32";
-    r.register(crc, "update", "(II)I", crc32_update);
+    r.register_with_kind(crc, "update", "(II)I", crc32_update, NativeKind::Bridge);
     // `updateBytes` is concrete real-JDK bytecode that only checks its range
     // then delegates to updateBytes0. Force its registered implementation in
     // real-JDK mode so archive writers never compile a second, incompatible
     // CRC-state transition around the native boundary.
     r.register(crc, "updateBytes", "(I[BII)I", crc32_update_bytes_0);
-    r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
-    r.register(
+    r.register_with_kind(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0, NativeKind::Bridge);
+    r.register_with_kind(
         crc,
         "updateByteBuffer0",
         "(IJII)I",
         crc32_update_byte_buffer_0,
+        NativeKind::Bridge,
     );
 }
 

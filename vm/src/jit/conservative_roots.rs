@@ -106,7 +106,28 @@ pub(crate) struct JitFrameChainEntry {
     /// the compiled method's oop map at the current native PC to
     /// enumerate oops directly from frame slots.
     pub precise: Option<PreciseFrameInfo>,
+    /// How many *interpreter* frames this thread had when the entry was
+    /// pushed — i.e. where this compiled frame sits in the Java call stack.
+    ///
+    /// A compiled method executes without pushing a `runtime::frame::Frame`,
+    /// so `Thread.getStackTrace()` (and every throwable's trace) used to skip
+    /// it entirely: once H2's query chain warmed up, an ALIAS function saw a
+    /// 6-frame stack where the interpreter showed 21, and
+    /// `org.h2.test.db.TestIndex.testFunctionIndex` — whose whole assertion is
+    /// that an `org.h2.command.query.Select` frame is visible from inside the
+    /// function — failed. `capture_full_trace` interleaves the chain back in
+    /// using this number.
+    ///
+    /// [`u32::MAX`] means "inherit the enclosing entry's": a JIT→JIT dispatch
+    /// (`try_call_compiled_entry_reentrant`) is called *from* compiled code and
+    /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
+    /// since the entry it nests inside, so the enclosing depth is exact.
+    pub interp_depth: u32,
 }
+
+/// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
+/// the entry this one nests inside.
+pub(crate) const INTERP_DEPTH_INHERIT: u32 = u32::MAX;
 
 /// NEW-12: metadata needed to walk a JIT frame with precise oop maps.
 ///
@@ -614,6 +635,7 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
     push_entry_full(JitFrameChainEntry {
         entry_sp: sp,
         precise: None,
+        interp_depth: INTERP_DEPTH_INHERIT,
     })
 }
 
@@ -625,6 +647,15 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
     note_jit_boundary();
     let depth = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
+        // Resolve the "same place in the Java stack as my caller" sentinel
+        // while the chain is in hand. An empty chain means the entry is the
+        // outermost compiled frame reached from a site that could not name its
+        // interpreter depth; 0 places it below every interpreter frame, which
+        // is the only safe guess and never reorders the frames that DO know.
+        let mut entry = entry;
+        if entry.interp_depth == INTERP_DEPTH_INHERIT {
+            entry.interp_depth = v.last().map_or(0, |e| e.interp_depth);
+        }
         // Finalize the outgoing top entry's `exact_rbp` from the cache before it
         // becomes non-top (each entry's `exact_rbp` is read by the relocation
         // walk). The incoming entry starts unrecorded → reset the cache to 0.
@@ -896,6 +927,18 @@ impl JitEntryGuard {
     /// valid for any in-flight GC walker.
     #[inline(always)]
     pub fn enter_with_compiled(cm: &cratonvm_jit::CompiledMethod) -> Self {
+        Self::enter_with_compiled_at(cm, None)
+    }
+
+    /// [`Self::enter_with_compiled`] plus the interpreter depth this compiled
+    /// frame sits at, so Java-level stack walks can place it (see
+    /// [`JitFrameChainEntry::interp_depth`]). `None` inherits the enclosing
+    /// entry's depth, which is what a JIT→JIT dispatch wants.
+    #[inline(always)]
+    pub fn enter_with_compiled_at(
+        cm: &cratonvm_jit::CompiledMethod,
+        interp_depth: Option<usize>,
+    ) -> Self {
         // Retain frame metadata even when this method has no oop-map entries.
         // The prologue still records its RBP whenever precise maps are enabled,
         // and the conservative fallback can then scan this compiled frame's
@@ -904,6 +947,10 @@ impl JitEntryGuard {
         let sp = current_stack_pointer();
         let entry = JitFrameChainEntry {
             entry_sp: sp,
+            interp_depth: match interp_depth {
+                Some(d) => u32::try_from(d).unwrap_or(u32::MAX - 1),
+                None => INTERP_DEPTH_INHERIT,
+            },
             precise: Some(PreciseFrameInfo {
                 compiled_method: cm as *const cratonvm_jit::CompiledMethod,
                 frame_base: sp,
@@ -2409,6 +2456,41 @@ pub fn current_thread_jit_depth() -> usize {
     JIT_ENTRY_CHAIN.with(|c| c.borrow().len())
 }
 
+/// The active compiled frames of the CURRENT thread, outermost first, as
+/// `(interpreter depth at entry, "class/Name.method:descriptor", owner class)`.
+///
+/// This is what makes a JIT-compiled method visible to `Thread.getStackTrace()`
+/// and to every throwable's trace: compiled code pushes no interpreter frame,
+/// so without it the Java-visible stack silently loses every method the JIT has
+/// taken over. See [`JitFrameChainEntry::interp_depth`] for the H2 case that
+/// found it.
+///
+/// Entries with no label are skipped rather than reported as an unnamed frame:
+/// the only artifacts with an empty `method_label` are the legacy/test compile
+/// wrapper's, and inventing a frame for one would be worse than omitting it.
+pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
+    JIT_ENTRY_CHAIN.with(|c| {
+        c.borrow()
+            .iter()
+            .filter_map(|e| {
+                let info = e.precise.as_ref()?;
+                // SAFETY: exactly the contract documented on
+                // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
+                // owning `Arc` for as long as the body is registered, and the
+                // chain entry is popped the moment the call returns or unwinds,
+                // so there is no stale-pointer window. This read happens on the
+                // owning thread, from a Java-level stack capture, i.e. strictly
+                // inside that window.
+                let cm = unsafe { &*info.compiled_method };
+                if cm.method_label.is_empty() {
+                    return None;
+                }
+                Some((e.interp_depth, cm.method_label.clone(), cm.owner_class_id))
+            })
+            .collect()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Cross-thread JIT-root gap detector (multi-thread-in-JIT-under-STW)
 // ---------------------------------------------------------------------------
@@ -3845,6 +3927,10 @@ mod tests {
         let entry_sp = current_stack_pointer() + 4096;
         push_entry_full(JitFrameChainEntry {
             entry_sp,
+            // No interpreter stack in this unit test; `INTERP_DEPTH_INHERIT`
+            // is what a site that cannot name its depth pushes, and with an
+            // empty chain it resolves to 0.
+            interp_depth: INTERP_DEPTH_INHERIT,
             precise: Some(PreciseFrameInfo {
                 compiled_method: &cm as *const cratonvm_jit::CompiledMethod,
                 frame_base: entry_sp,

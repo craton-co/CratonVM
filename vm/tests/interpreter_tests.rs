@@ -43,20 +43,170 @@ fn extended_interpreter_tests_enabled() -> bool {
 }
 
 fn require_extended_interpreter_tests(test_name: &str) -> bool {
-    if extended_interpreter_tests_enabled() {
-        true
-    } else {
+    if !extended_interpreter_tests_enabled() {
         eprintln!(
             "Skipping {test_name}: set CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 to run extended interpreter corpus tests"
         );
-        false
+        return false;
     }
+    assert!(
+        cratonvm_vm::config::SYNTHETIC_JDK_COMPILED_IN,
+        "the extended interpreter corpus was opted into, but this test binary was \
+         built WITHOUT the `synthetic-jdk` Cargo feature.\n\
+         \n\
+         `test_vm()` builds a `VmConfig::default()`, whose JDK mode is \
+         `EMBEDDED_DEFAULT_JDK_MODE` = synthetic. In a default-feature build that \
+         registers none of the ~5,200 synthetic stubs AND suppresses boot-classpath \
+         discovery, so the corpus measures a VM with no class library at all — \
+         `config::require_synthetic_jdk` rejects exactly this state for the CLI. \
+         Run it and 214 of the 924 tests fail; with the feature, 40 do. Failing here \
+         rather than reporting that number is the whole point.\n\
+         \n\
+         Re-run as:\n  \
+         CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 cargo test --release \\\n    \
+         -p cratonvm-vm --features synthetic-jdk --test interpreter_tests"
+    );
+    // The second gate must NOT stay a silent skip once the corpus has been
+    // asked for. `vm/build.rs` compiles every fixture in one `javac`
+    // invocation per pass, so a single unbuildable source leaves the whole
+    // staging directory empty — which is what happened, undetected, until
+    // `f715d1367`: opting in still printed a green `924 passed` that had run
+    // none of the corpus. An explicit request for the corpus that cannot be
+    // served is a failure, not a pass.
+    assert!(
+        class_files_available(),
+        "the extended interpreter corpus was opted into, but no compiled fixtures \
+         were staged: {}/cratonvm/SimpleReturn.class does not exist.\n\
+         \n\
+         `vm/build.rs` needs a `javac` (from `$JAVA_HOME/bin` if set, else PATH) \
+         and compiles all fixtures of a pass in ONE invocation, so one broken \
+         source stages nothing at all. Re-run the build and read the \
+         `cargo:warning=javac failed …` lines it prints.",
+        test_resources_dir()
+    );
+    true
 }
 
 /// Create a VM configured for testing (classpath pointing to test resources).
 fn test_vm() -> Vm {
     let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
     Vm::new(config)
+}
+
+/// `(class, method)` pairs that do not yet produce the JDK-correct answer
+/// under CratonVM's synthetic class library — the pinned baseline of this
+/// corpus.
+///
+/// Every entry is **measured twice**, and both measurements are what makes it
+/// belong here rather than in [`KNOWN_ORDER_DEPENDENT`]:
+///
+/// 1. Re-run under a real **JDK 25** (`probes/CorpusOracle`) — HotSpot
+///    produces the value the test expects, so the expectation is right and
+///    CratonVM is what is missing. Fixture expectations HotSpot *disagreed*
+///    with were corrected in the fixtures instead and are not listed anywhere
+///    (`ReflectionComplete.testFieldGetPrivate`,
+///    `PropertiesComplete.testPropertiesLoadSpaces`,
+///    `ScopedValueComplete.testThreadVisibility`).
+/// 2. Re-run **alone** in a fresh process (`--exact <test>`) — still fails, so
+///    it is a real gap and not an artefact of the ~900 VMs that precede it in
+///    a full run. Eleven entries that failed this second check moved to
+///    [`KNOWN_ORDER_DEPENDENT`]; do the same before adding anything here.
+///
+/// The list is a two-way gate, which is the whole point of pinning it:
+/// a mismatch that is NOT listed fails the run, and a listed pair that starts
+/// PASSING also fails the run, telling you to delete the entry. A corpus whose
+/// known gaps close silently is how this one went dark for as long as it did.
+///
+/// The trailing comment on each is the observed failure, from
+/// `Vm::describe_result`.
+const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[
+    // `Proxy.isProxyClass` on a generated proxy — returns 0.
+    ("cratonvm/ReflectionComplete", "testProxyIsProxyClass"),
+    ("cratonvm/TckReflect", "proxy_isProxyClass"),
+    // An annotation proxy is not castable to the annotation interface, and a
+    // `Proxy` instance is not castable to the interface it implements.
+    // ClassCastException: "? cannot be cast to cratonvm.TckReflect$…".
+    ("cratonvm/TckReflect", "ann_inheritedValue"),
+    ("cratonvm/TckReflect", "ann_methodValue"),
+    ("cratonvm/TckReflect", "proxy_objectMethods"),
+];
+
+/// `(class, method)` pairs that PASS when their test is the only one in the
+/// process and FAIL in a full run — order dependence, not a missing feature.
+///
+/// Measured the same way as the list above, by running each one alone
+/// (`--exact <test>`). All eleven passed; all eleven fail once the ~900 other
+/// corpus tests have each stood up and dropped their own `Vm` first. That is a
+/// VM-lifecycle defect — the same family as the process-global native caches
+/// that made the parallel run SIGSEGV — and it is tracked as one, in
+/// `docs/known-issues/corpus-is-order-dependent-20260805.md`, NOT as a
+/// class-library gap.
+///
+/// Unlike [`KNOWN_SYNTHETIC_JDK_GAPS`], an entry here that PASSES is not an
+/// error: whether it does depends on what ran before it, so a parallel run
+/// legitimately flips some of them. Both outcomes are absorbed. That is a
+/// deliberately weaker gate, and the reason to keep the list short and to
+/// empty it rather than grow it.
+const KNOWN_ORDER_DEPENDENT: &[(&str, &str)] = &[
+    // NullPointerException: "Field.get: null receiver for instance field".
+    (
+        "cratonvm/ReflectionComplete",
+        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
+    ),
+    // `getGenericType` / `getGenericSuperclass` stop surfacing
+    // `ParameterizedType` / `WildcardType` — all return 0.
+    ("cratonvm/GenericReflectionTest", "testParameterizedField"),
+    ("cratonvm/GenericReflectionTest", "testParameterizedSuperclass"),
+    ("cratonvm/GenericReflectionTest", "testTwoArgParameterizedField"),
+    ("cratonvm/GenericReflectionTest", "testWildcardExtendsNumber"),
+    // `System.gc()` stops being decisive enough for the finalizer observation.
+    ("cratonvm/FinalizerTest", "testNoFinalizeOnLive"),
+    ("cratonvm/TckUtil", "testArraysAsList"),
+    // Serialization round-trips lose every field: the deserialized object's
+    // fields read back null. NullPointerException on the first field access.
+    ("cratonvm/SerializeBasic", "testSimpleRoundTrip"),
+    ("cratonvm/SerializeBasic", "testNestedObject"),
+    ("cratonvm/SerializeBasic", "testTransientField"),
+    ("cratonvm/SerializeBasic", "testNonSerializableThrows"),
+];
+
+fn listed(list: &[(&str, &str)], class: &str, method: &str) -> bool {
+    list.iter().any(|&(c, m)| c == class && m == method)
+}
+
+/// Decide what a corpus result means, given the two pinned lists.
+///
+/// `matched` is whether the call produced the expected value; `expected` is a
+/// human label for it. A mismatch is reported through
+/// [`Vm::describe_result`] rather than `{result:?}` — `MethodCallResult`'s own
+/// `Debug` prints a thrown exception as
+/// `Err(ExceptionThrown(ObjectRef { ptr: 0x… }))`, an address with no class,
+/// no message and no stack, which is why 175 of this corpus's 214 failures
+/// were indistinguishable from one another and had to be re-run one at a time
+/// through a hand-written Java probe to be grouped at all.
+fn corpus_check(
+    vm: &Vm,
+    class: &str,
+    method: &str,
+    expected: &str,
+    matched: bool,
+    result: &cratonvm_vm::error::MethodCallResult,
+) {
+    if listed(KNOWN_ORDER_DEPENDENT, class, method) {
+        // Either outcome is expected — see the list's doc comment.
+        return;
+    }
+    match (matched, listed(KNOWN_SYNTHETIC_JDK_GAPS, class, method)) {
+        (true, false) => {}
+        (false, true) => {}
+        (false, false) => panic!(
+            "{class}::{method} — expected {expected}, {}",
+            vm.describe_result(result)
+        ),
+        (true, true) => panic!(
+            "{class}::{method} now produces the expected {expected}, but it is still              listed in KNOWN_SYNTHETIC_JDK_GAPS. Delete that entry: the list is the              pinned synthetic-JDK baseline, and a gap that closes silently leaves the              next regression with nothing to fail against."
+        ),
+    }
 }
 
 /// Skip guard — returns early if .class files are not available.
@@ -78,10 +228,14 @@ fn test_simple_return() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SimpleReturn", "test", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SimpleReturn",
+        "test",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -89,10 +243,14 @@ fn test_arithmetic_add() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/Arithmetic", "test", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/Arithmetic",
+        "test",
+        "Int(30)",
+        matches!(result, Ok(Some(Value::Int(30)))),
+        &result,
+    );
 }
 
 #[test]
@@ -100,10 +258,14 @@ fn test_arithmetic_mul() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/Arithmetic", "testMul", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/Arithmetic",
+        "testMul",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -111,10 +273,14 @@ fn test_arithmetic_div() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/Arithmetic", "testDiv", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(25))) => {}
-        other => panic!("Expected Ok(Some(Int(25))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/Arithmetic",
+        "testDiv",
+        "Int(25)",
+        matches!(result, Ok(Some(Value::Int(25)))),
+        &result,
+    );
 }
 
 #[test]
@@ -122,10 +288,14 @@ fn test_arithmetic_neg() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/Arithmetic", "testNeg", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(-42))) => {}
-        other => panic!("Expected Ok(Some(Int(-42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/Arithmetic",
+        "testNeg",
+        "Int(-42)",
+        matches!(result, Ok(Some(Value::Int(-42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -133,10 +303,14 @@ fn test_control_flow_if_else() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ControlFlow", "testIfElse", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ControlFlow",
+        "testIfElse",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -144,10 +318,14 @@ fn test_control_flow_loop() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ControlFlow", "testLoop", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(45))) => {}
-        other => panic!("Expected Ok(Some(Int(45))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ControlFlow",
+        "testLoop",
+        "Int(45)",
+        matches!(result, Ok(Some(Value::Int(45)))),
+        &result,
+    );
 }
 
 #[test]
@@ -155,26 +333,29 @@ fn test_control_flow_while() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ControlFlow", "testWhile", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1024))) => {}
-        other => panic!("Expected Ok(Some(Int(1024))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ControlFlow",
+        "testWhile",
+        "Int(1024)",
+        matches!(result, Ok(Some(Value::Int(1024)))),
+        &result,
+    );
 }
 
 #[test]
 fn test_control_flow_switch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ControlFlow", "testSwitch", "(I)I", &[Value::Int(2)]);
+    corpus_check(
+        &vm,
         "cratonvm/ControlFlow",
         "testSwitch",
-        "(I)I",
-        &[Value::Int(2)],
+        "Int(20)",
+        matches!(result, Ok(Some(Value::Int(20)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(20))) => {}
-        other => panic!("Expected Ok(Some(Int(20))), got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +435,14 @@ fn test_pattern_switch_exact_match() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testExactMatch", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testExactMatch",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -268,10 +453,14 @@ fn test_pattern_switch_widening() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testWidening", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(107))) => {}
-        other => panic!("Expected Ok(Some(Int(107))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testWidening",
+        "Int(107)",
+        matches!(result, Ok(Some(Value::Int(107)))),
+        &result,
+    );
 }
 
 #[test]
@@ -282,10 +471,14 @@ fn test_pattern_switch_narrowing() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testNarrowing", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(15))) => {}
-        other => panic!("Expected Ok(Some(Int(15))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testNarrowing",
+        "Int(15)",
+        matches!(result, Ok(Some(Value::Int(15)))),
+        &result,
+    );
 }
 
 #[test]
@@ -296,10 +489,14 @@ fn test_pattern_switch_out_of_range() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testOutOfRange", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(314))) => {}
-        other => panic!("Expected Ok(Some(Int(314))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testOutOfRange",
+        "Int(314)",
+        matches!(result, Ok(Some(Value::Int(314)))),
+        &result,
+    );
 }
 
 #[test]
@@ -310,10 +507,14 @@ fn test_pattern_switch_null() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testNull", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(99))) => {}
-        other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testNull",
+        "Int(99)",
+        matches!(result, Ok(Some(Value::Int(99)))),
+        &result,
+    );
 }
 
 // -- 83.2: Record Patterns --
@@ -326,10 +527,14 @@ fn test_record_pattern_simple() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(7))) => {}
-        other => panic!("Expected Ok(Some(Int(7))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordPatterns",
+        "testSimpleRecord",
+        "Int(7)",
+        matches!(result, Ok(Some(Value::Int(7)))),
+        &result,
+    );
 }
 
 #[test]
@@ -340,10 +545,14 @@ fn test_record_pattern_nested() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testNestedRecord", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordPatterns",
+        "testNestedRecord",
+        "Int(10)",
+        matches!(result, Ok(Some(Value::Int(10)))),
+        &result,
+    );
 }
 
 #[test]
@@ -354,10 +563,14 @@ fn test_record_pattern_with_guard() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordPatterns",
+        "testRecordWithGuard",
+        "Int(2)",
+        matches!(result, Ok(Some(Value::Int(2)))),
+        &result,
+    );
 }
 
 #[test]
@@ -368,10 +581,14 @@ fn test_record_pattern_null() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordNull", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(77))) => {}
-        other => panic!("Expected Ok(Some(Int(77))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordPatterns",
+        "testRecordNull",
+        "Int(77)",
+        matches!(result, Ok(Some(Value::Int(77)))),
+        &result,
+    );
 }
 
 #[test]
@@ -382,10 +599,14 @@ fn test_record_pattern_in_box() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordInBox", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordPatterns",
+        "testRecordInBox",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 // -- 83.3: Guard Expressions --
@@ -398,10 +619,14 @@ fn test_guard_true() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardTrue", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(43))) => {}
-        other => panic!("Expected Ok(Some(Int(43))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testGuardTrue",
+        "Int(43)",
+        matches!(result, Ok(Some(Value::Int(43)))),
+        &result,
+    );
 }
 
 #[test]
@@ -412,10 +637,14 @@ fn test_guard_false() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardFalse", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(103))) => {}
-        other => panic!("Expected Ok(Some(Int(103))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testGuardFalse",
+        "Int(103)",
+        matches!(result, Ok(Some(Value::Int(103)))),
+        &result,
+    );
 }
 
 #[test]
@@ -426,10 +655,14 @@ fn test_guard_side_effect() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(56))) => {}
-        other => panic!("Expected Ok(Some(Int(56))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/PatternSwitch",
+        "testGuardSideEffect",
+        "Int(56)",
+        matches!(result, Ok(Some(Value::Int(56)))),
+        &result,
+    );
 }
 
 // -- 83.4: Sealed Class Exhaustiveness --
@@ -442,10 +675,14 @@ fn test_sealed_exhaustive_circle() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustive", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(5))) => {}
-        other => panic!("Expected Ok(Some(Int(5))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SealedSwitch",
+        "testExhaustive",
+        "Int(5)",
+        matches!(result, Ok(Some(Value::Int(5)))),
+        &result,
+    );
 }
 
 #[test]
@@ -456,10 +693,14 @@ fn test_sealed_exhaustive_rect() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(12))) => {}
-        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SealedSwitch",
+        "testExhaustiveRect",
+        "Int(12)",
+        matches!(result, Ok(Some(Value::Int(12)))),
+        &result,
+    );
 }
 
 #[test]
@@ -470,10 +711,14 @@ fn test_sealed_with_default() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedSwitch", "testWithDefault", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(12))) => {}
-        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SealedSwitch",
+        "testWithDefault",
+        "Int(12)",
+        matches!(result, Ok(Some(Value::Int(12)))),
+        &result,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -490,10 +735,14 @@ fn test_record_canonical_ctor() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordRuntime",
+        "testCanonicalCtor",
+        "Int(30)",
+        matches!(result, Ok(Some(Value::Int(30)))),
+        &result,
+    );
 }
 
 #[test]
@@ -503,16 +752,15 @@ fn test_record_accessor_generation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/RecordRuntime",
         "testAccessorGeneration",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 // -- 84.2: Record equals/hashCode/toString --
@@ -525,10 +773,14 @@ fn test_record_equals_true() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordRuntime",
+        "testEqualsTrue",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -539,10 +791,14 @@ fn test_record_equals_false() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordRuntime",
+        "testEqualsFalse",
+        "Int(0)",
+        matches!(result, Ok(Some(Value::Int(0)))),
+        &result,
+    );
 }
 
 #[test]
@@ -553,10 +809,14 @@ fn test_record_equals_null() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsNull", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordRuntime",
+        "testEqualsNull",
+        "Int(0)",
+        matches!(result, Ok(Some(Value::Int(0)))),
+        &result,
+    );
 }
 
 #[test]
@@ -566,16 +826,15 @@ fn test_record_hashcode_consistent() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/RecordRuntime",
         "testHashCodeConsistent",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -585,16 +844,15 @@ fn test_record_hashcode_different() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/RecordRuntime",
         "testHashCodeDifferent",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -605,10 +863,14 @@ fn test_record_tostring() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/RecordRuntime", "testToString", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/RecordRuntime",
+        "testToString",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // -- 84.3: Sealed Class Verification --
@@ -620,16 +882,15 @@ fn test_sealed_permitted_loads() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/SealedVerify",
         "testPermittedSubclassLoads",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -640,10 +901,14 @@ fn test_sealed_multiple_permitted() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(3))) => {}
-        other => panic!("Expected Ok(Some(Int(3))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SealedVerify",
+        "testMultiplePermitted",
+        "Int(3)",
+        matches!(result, Ok(Some(Value::Int(3)))),
+        &result,
+    );
 }
 
 #[test]
@@ -654,10 +919,14 @@ fn test_sealed_verify_with_default() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SealedVerify",
+        "testSealedWithDefault",
+        "Int(10)",
+        matches!(result, Ok(Some(Value::Int(10)))),
+        &result,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -674,10 +943,14 @@ fn test_reflect_method_static() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testStaticMethod", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectMethod",
+        "testStaticMethod",
+        "Int(30)",
+        matches!(result, Ok(Some(Value::Int(30)))),
+        &result,
+    );
 }
 
 #[test]
@@ -688,10 +961,14 @@ fn test_reflect_method_instance() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectMethod",
+        "testInstanceMethod",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -702,10 +979,14 @@ fn test_reflect_method_string_return() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectMethod", "testStringReturn", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectMethod",
+        "testStringReturn",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -715,16 +996,15 @@ fn test_reflect_method_private_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectMethod",
         "testPrivateSetAccessible",
-        "()I",
-        &[],
+        "Int(777)",
+        matches!(result, Ok(Some(Value::Int(777)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(777))) => {}
-        other => panic!("Expected Ok(Some(Int(777))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -734,16 +1014,15 @@ fn test_reflect_method_exception_wrapping() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectMethod",
         "testExceptionWrapping",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // -- 88.2: Field Get/Set on User Classes --
@@ -756,10 +1035,14 @@ fn test_reflect_field_get_int() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testGetIntField", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectField",
+        "testGetIntField",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -770,10 +1053,14 @@ fn test_reflect_field_get_string() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testGetStringField", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectField",
+        "testGetStringField",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -784,10 +1071,14 @@ fn test_reflect_field_static() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testStaticField", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(300))) => {}
-        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectField",
+        "testStaticField",
+        "Int(300)",
+        matches!(result, Ok(Some(Value::Int(300)))),
+        &result,
+    );
 }
 
 #[test]
@@ -798,10 +1089,14 @@ fn test_reflect_field_set_int() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectField", "testSetIntField", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(123))) => {}
-        other => panic!("Expected Ok(Some(Int(123))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectField",
+        "testSetIntField",
+        "Int(123)",
+        matches!(result, Ok(Some(Value::Int(123)))),
+        &result,
+    );
 }
 
 // -- 88.3: Constructor.newInstance --
@@ -813,16 +1108,15 @@ fn test_reflect_constructor_noarg() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectConstructor",
         "testNoArgConstructor",
-        "()I",
-        &[],
+        "Int(10)",
+        matches!(result, Ok(Some(Value::Int(10)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -832,16 +1126,15 @@ fn test_reflect_constructor_param() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectConstructor",
         "testParamConstructor",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -851,16 +1144,15 @@ fn test_reflect_constructor_exception() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectConstructor",
         "testExceptionInConstructor",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // -- 88.4: Annotation Runtime Retention --
@@ -872,16 +1164,15 @@ fn test_reflect_annotation_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectAnnotation",
         "testClassAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -891,16 +1182,15 @@ fn test_reflect_annotation_method() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectAnnotation",
         "testMethodAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -911,10 +1201,14 @@ fn test_reflect_annotation_absent() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectAnnotation",
+        "testNoAnnotation",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -924,16 +1218,15 @@ fn test_reflect_annotation_is_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectAnnotation",
         "testIsAnnotationPresent",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -949,10 +1242,14 @@ fn test_serialize_simple_round_trip() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SerializeBasic",
+        "testSimpleRoundTrip",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 // 91.1: Nested object serialization
@@ -964,10 +1261,14 @@ fn test_serialize_nested_object() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testNestedObject", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SerializeBasic",
+        "testNestedObject",
+        "Int(30)",
+        matches!(result, Ok(Some(Value::Int(30)))),
+        &result,
+    );
 }
 
 // 91.1: Transient field is skipped during serialization
@@ -979,10 +1280,14 @@ fn test_serialize_transient_field() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/SerializeBasic", "testTransientField", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/SerializeBasic",
+        "testTransientField",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // 91.1: Non-serializable class throws exception
@@ -993,16 +1298,15 @@ fn test_serialize_non_serializable_throws() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/SerializeBasic",
         "testNonSerializableThrows",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // 91.3: Thread.getContextClassLoader returns non-null
@@ -1013,16 +1317,15 @@ fn test_context_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testContextClassLoader",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // 91.3: Parent delegation chain
@@ -1033,16 +1336,15 @@ fn test_parent_delegation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testParentDelegation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // 91.3: Set/get context class loader round-trip
@@ -1053,16 +1355,15 @@ fn test_set_context_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testSetContextClassLoader",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // 91.3: Class.getClassLoader for user classes
@@ -1073,16 +1374,15 @@ fn test_class_get_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testClassGetClassLoader",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,16 +1397,15 @@ fn test_bootstrap_class_loader_is_null() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testBootstrapClassLoaderIsNull",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -1116,16 +1415,15 @@ fn test_string_bootstrap_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testStringBootstrapLoader",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: Loader name correctness
@@ -1137,10 +1435,14 @@ fn test_loader_name() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ClassLoaderTest",
+        "testLoaderName",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1150,16 +1452,15 @@ fn test_platform_loader_name() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testPlatformLoaderName",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: System class loader has correct parent chain (app → platform → null)
@@ -1170,16 +1471,15 @@ fn test_system_class_loader_chain() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testSystemClassLoaderChain",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: loadClass delegation to parent works for bootstrap classes
@@ -1190,16 +1490,15 @@ fn test_load_class_delegation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testLoadClassDelegation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: loadClass works for user-defined classes
@@ -1210,16 +1509,15 @@ fn test_load_class_for_user_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testLoadClassForUserClass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: getClassLoader() returns same object each call (singleton identity)
@@ -1230,16 +1528,15 @@ fn test_class_loader_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testClassLoaderIdentity",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: getSystemClassLoader() returns same instance each call
@@ -1250,16 +1547,15 @@ fn test_system_class_loader_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testSystemClassLoaderIdentity",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 3: Loader isolation — bootstrap classes vs app classes have different loaders
@@ -1270,16 +1566,15 @@ fn test_loader_isolation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testLoaderIsolation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Regression (SC-custom-classloader-ignored): a custom loader that overrides
@@ -1295,16 +1590,15 @@ fn test_custom_loader_override_invoked() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testCustomLoaderOverrideInvoked", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testCustomLoaderOverrideInvoked",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Regression (SC-custom-classloader-ignored): Class.forName(name, false, loader)
@@ -1316,16 +1610,15 @@ fn test_for_name_honors_custom_loader_override() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testForNameHonorsCustomLoaderOverride", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ClassLoaderTest",
         "testForNameHonorsCustomLoaderOverride",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,16 +1633,15 @@ fn test_method_handle_static() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testStaticMethodHandle",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 4: Virtual method invocation via MethodHandle
@@ -1360,16 +1652,15 @@ fn test_method_handle_virtual() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testVirtualMethodHandle",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 4: Constructor invocation via MethodHandle
@@ -1380,16 +1671,15 @@ fn test_method_handle_constructor() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testConstructorMethodHandle",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 4: MethodHandle.bindTo bound receiver
@@ -1401,10 +1691,14 @@ fn test_method_handle_bind_to() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testBindTo", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/MethodHandleTest",
+        "testBindTo",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // Session 4: Lookup.in(targetClass)
@@ -1416,10 +1710,14 @@ fn test_lookup_in() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testLookupIn", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/MethodHandleTest",
+        "testLookupIn",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // Session 4: VarHandle.get() and VarHandle.set() for instance fields
@@ -1430,16 +1728,15 @@ fn test_var_handle_get_set() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testVarHandleGetSet",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Session 4: VarHandle.compareAndSet()
@@ -1451,10 +1748,14 @@ fn test_var_handle_cas() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/MethodHandleTest",
+        "testVarHandleCAS",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // Session 4: MethodHandle.type() returns valid MethodType
@@ -1465,16 +1766,15 @@ fn test_method_handle_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testMethodHandleType",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP1.6 acceptance: MethodHandle.invokeExact strict-arity round-trip.
@@ -1489,16 +1789,15 @@ fn test_method_handle_invoke_exact_round_trip() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testInvokeExactRoundTrip", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testInvokeExactRoundTrip",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP1.6 acceptance: VarHandle.getAcquire / setRelease round-trip on a
@@ -1513,16 +1812,15 @@ fn test_var_handle_acquire_release() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleAcquireRelease", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/MethodHandleTest",
         "testVarHandleAcquireRelease",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,10 +1935,14 @@ fn test_tck_class_file_magic() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckClassFile",
+        "testMagicNumber",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1651,10 +1953,14 @@ fn test_tck_class_file_version() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testClassVersion", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckClassFile",
+        "testClassVersion",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1665,10 +1971,14 @@ fn test_tck_class_file_constant_pool() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testConstantPool", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckClassFile",
+        "testConstantPool",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1679,10 +1989,14 @@ fn test_tck_class_file_field_access() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testFieldAccess", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckClassFile",
+        "testFieldAccess",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1693,10 +2007,14 @@ fn test_tck_class_file_method_access() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckClassFile", "testMethodAccess", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckClassFile",
+        "testMethodAccess",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // 97.2: TCK Chapter 5 — Loading, Linking, Initialization
@@ -1708,10 +2026,14 @@ fn test_tck_loading_class_loading() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testClassLoading", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckLoading",
+        "testClassLoading",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1722,10 +2044,14 @@ fn test_tck_loading_static_init() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testStaticInit", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckLoading",
+        "testStaticInit",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1736,10 +2062,14 @@ fn test_tck_loading_interface_init() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testInterfaceInit", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckLoading",
+        "testInterfaceInit",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1750,10 +2080,14 @@ fn test_tck_loading_array_creation() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testArrayCreation", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckLoading",
+        "testArrayCreation",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1764,10 +2098,14 @@ fn test_tck_loading_inheritance() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckLoading", "testInheritance", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckLoading",
+        "testInheritance",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // 97.2: TCK Chapter 6 — Instruction Set
@@ -1779,10 +2117,14 @@ fn test_tck_instructions_int_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testIntArithmetic", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testIntArithmetic",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1793,10 +2135,14 @@ fn test_tck_instructions_long_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testLongArithmetic", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testLongArithmetic",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1806,16 +2152,15 @@ fn test_tck_instructions_float_arithmetic() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/TckInstructions",
         "testFloatArithmetic",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -1826,10 +2171,14 @@ fn test_tck_instructions_comparisons() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testComparisons", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testComparisons",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1840,10 +2189,14 @@ fn test_tck_instructions_tableswitch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testTableswitch", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testTableswitch",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1854,10 +2207,14 @@ fn test_tck_instructions_lookupswitch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testLookupswitch", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testLookupswitch",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1868,10 +2225,14 @@ fn test_tck_instructions_field_ops() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testFieldOps", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testFieldOps",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1882,10 +2243,14 @@ fn test_tck_instructions_array_ops() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testArrayOps", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testArrayOps",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1896,10 +2261,14 @@ fn test_tck_instructions_invoke_virtual() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testInvokeVirtual",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1910,10 +2279,14 @@ fn test_tck_instructions_invoke_static() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeStatic", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testInvokeStatic",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1923,16 +2296,15 @@ fn test_tck_instructions_exception_handling() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/TckInstructions", "testExceptionHandling", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/TckInstructions",
         "testExceptionHandling",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -1943,10 +2315,14 @@ fn test_tck_instructions_checkcast() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testCheckcast", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testCheckcast",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -1957,10 +2333,14 @@ fn test_tck_instructions_instanceof() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/TckInstructions", "testInstanceof", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/TckInstructions",
+        "testInstanceof",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 // =========================================================================
@@ -1974,16 +2354,15 @@ fn test_s17_method_invoke_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodInvokePrivateViaReflection",
-        "()I",
-        &[],
+        "Int(49)",
+        matches!(result, Ok(Some(Value::Int(49)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(49))) => {}
-        other => panic!("Expected Ok(Some(Int(49))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -1993,16 +2372,15 @@ fn test_s17_method_invoke_instance() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodInvokeInstance",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2012,16 +2390,15 @@ fn test_s17_method_invoke_type_coercion() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodInvokeTypeCoercion",
-        "()I",
-        &[],
+        "Int(36)",
+        matches!(result, Ok(Some(Value::Int(36)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(36))) => {}
-        other => panic!("Expected Ok(Some(Int(36))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2031,16 +2408,15 @@ fn test_s17_field_get_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldGetPrivate",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2052,16 +2428,15 @@ fn test_s17_field_get_own_private_final_reference_without_set_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2071,16 +2446,15 @@ fn test_s17_field_set_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldSetPrivate",
-        "()I",
-        &[],
+        "Int(999)",
+        matches!(result, Ok(Some(Value::Int(999)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(999))) => {}
-        other => panic!("Expected Ok(Some(Int(999))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2090,16 +2464,15 @@ fn test_s17_field_static_get_set() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldStaticGetSet",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2109,16 +2482,15 @@ fn test_s17_constructor_noarg() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testConstructorNoArg",
-        "()I",
-        &[],
+        "Int(0)",
+        matches!(result, Ok(Some(Value::Int(0)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2128,16 +2500,15 @@ fn test_s17_constructor_with_args() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testConstructorWithArgs",
-        "()I",
-        &[],
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2147,16 +2518,15 @@ fn test_s17_constructor_set_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testConstructorSetAccessible",
-        "()I",
-        &[],
+        "Int(300)",
+        matches!(result, Ok(Some(Value::Int(300)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(300))) => {}
-        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2167,10 +2537,14 @@ fn test_s17_proxy_basic() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectionComplete",
+        "testProxyBasic",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 #[test]
@@ -2180,16 +2554,15 @@ fn test_s17_proxy_is_proxy_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testProxyIsProxyClass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2199,16 +2572,15 @@ fn test_s17_proxy_get_handler() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testProxyGetHandler",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2218,16 +2590,15 @@ fn test_s17_get_declared_methods() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testGetDeclaredMethods",
-        "()I",
-        &[],
+        "Int(0)",
+        matches!(result, Ok(Some(Value::Int(0)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2237,16 +2608,15 @@ fn test_s17_get_declared_fields() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testGetDeclaredFields",
-        "()I",
-        &[],
+        "Int(2)",
+        matches!(result, Ok(Some(Value::Int(2)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2256,16 +2626,15 @@ fn test_s17_get_declared_constructors() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testGetDeclaredConstructors",
-        "()I",
-        &[],
+        "Int(2)",
+        matches!(result, Ok(Some(Value::Int(2)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2275,16 +2644,15 @@ fn test_s17_get_declared_method_by_name() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testGetDeclaredMethodByName",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2294,16 +2662,15 @@ fn test_s17_method_modifiers() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodModifiers",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2313,16 +2680,15 @@ fn test_s17_field_modifiers() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldModifiers",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2332,16 +2698,15 @@ fn test_s17_method_return_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodReturnType",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2351,16 +2716,15 @@ fn test_s17_method_parameter_types() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodParameterTypes",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2370,16 +2734,15 @@ fn test_s17_method_parameter_count() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodParameterCount",
-        "()I",
-        &[],
+        "Int(2)",
+        matches!(result, Ok(Some(Value::Int(2)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2390,10 +2753,14 @@ fn test_s17_field_type() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldType", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ReflectionComplete",
+        "testFieldType",
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
+    );
 }
 
 #[test]
@@ -2403,16 +2770,15 @@ fn test_s17_field_declaring_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testFieldDeclaringClass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2422,16 +2788,15 @@ fn test_s17_method_declaring_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/ReflectionComplete",
         "testMethodDeclaringClass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ============================================================
@@ -2445,16 +2810,15 @@ fn test_s18_custom_annotation_values() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testCustomAnnotationValues",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2464,16 +2828,15 @@ fn test_s18_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testInheritedAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2483,16 +2846,15 @@ fn test_s18_non_inherited_not_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testNonInheritedNotPresent",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2502,16 +2864,15 @@ fn test_s18_get_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testGetInheritedAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2521,16 +2882,15 @@ fn test_s18_declared_annotations_no_inherited() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testDeclaredAnnotationsNoInherited",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2540,16 +2900,15 @@ fn test_s18_overriding_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testOverridingInheritedAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2559,16 +2918,15 @@ fn test_s18_method_annotation_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testMethodAnnotationPresent",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2578,16 +2936,15 @@ fn test_s18_method_annotation_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationIdentity", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testMethodAnnotationIdentity",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2597,16 +2954,15 @@ fn test_s18_method_no_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testMethodNoAnnotation",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2616,16 +2972,15 @@ fn test_s18_parameter_annotation_count() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testParameterAnnotationCount",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2635,16 +2990,15 @@ fn test_s18_parameter_annotation_empty() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/AnnotationTest",
         "testParameterAnnotationEmpty",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // ============================================================
@@ -2658,16 +3012,15 @@ fn test_s19_class_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testClassTypeParams",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2677,16 +3030,15 @@ fn test_s19_multiple_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testMultipleTypeParams",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2696,16 +3048,15 @@ fn test_s19_bounded_type_param() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testBoundedTypeParam",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2715,16 +3066,15 @@ fn test_s19_generic_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testGenericSuperclass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2734,16 +3084,15 @@ fn test_s19_non_generic_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testNonGenericSuperclass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2753,16 +3102,15 @@ fn test_s19_method_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testMethodTypeParams",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2772,16 +3120,15 @@ fn test_s19_method_generic_return_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testMethodGenericReturnType",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2791,16 +3138,15 @@ fn test_s19_method_generic_param_types() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testMethodGenericParamTypes",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2810,16 +3156,15 @@ fn test_s19_field_generic_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testFieldGenericType",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 #[test]
@@ -2829,16 +3174,15 @@ fn test_s19_no_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testNoTypeParams",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP2.8 acceptance: getGenericSuperclass on a class extending
@@ -2853,16 +3197,15 @@ fn test_s19_parameterized_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testParameterizedSuperclass", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testParameterizedSuperclass",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP2.8 acceptance: Field.getGenericType for a List<String> field
@@ -2874,16 +3217,15 @@ fn test_s19_parameterized_field() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testParameterizedField", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testParameterizedField",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP2.8 acceptance: two-argument ParameterizedType (Map<String, Integer>)
@@ -2895,16 +3237,15 @@ fn test_s19_two_arg_parameterized_field() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testTwoArgParameterizedField", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testTwoArgParameterizedField",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // WP2.8 acceptance: wildcard with upper bound (`? extends Number`)
@@ -2916,16 +3257,15 @@ fn test_s19_wildcard_extends_number() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testWildcardExtendsNumber", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testWildcardExtendsNumber",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // Spring GenericTypeResolver regression: same-named type variables declared by
@@ -2937,16 +3277,15 @@ fn test_s19_same_named_interface_type_variables() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testSameNamedInterfaceTypeVariables", "()I", &[]);
+    corpus_check(
+        &vm,
         "cratonvm/GenericReflectionTest",
         "testSameNamedInterfaceTypeVariables",
-        "()I",
-        &[],
+        "Int(1)",
+        matches!(result, Ok(Some(Value::Int(1)))),
+        &result,
     );
-    match result {
-        Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-    }
 }
 
 // =========================================================================
@@ -2963,10 +3302,14 @@ macro_rules! s20_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/StreamComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/StreamComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3029,10 +3372,14 @@ macro_rules! s21_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/StringFormatComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/StringFormatComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3102,10 +3449,14 @@ macro_rules! s22_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PropertiesComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/PropertiesComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3181,10 +3532,14 @@ macro_rules! s23_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/MemoryModelTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/MemoryModelTest",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }
@@ -3197,10 +3552,14 @@ fn test_s23_thread_basic() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/ThreadBasicTest",
+        "testThreadBasic",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 s23_test!(test_s23_volatile_visibility, "testVolatileVisibility");
@@ -3234,10 +3593,14 @@ macro_rules! s23b_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JmmComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/JmmComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3311,10 +3674,14 @@ macro_rules! s24_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InterruptComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/InterruptComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3436,10 +3803,14 @@ macro_rules! s25_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/VirtualThreadTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/VirtualThreadTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3497,10 +3868,14 @@ macro_rules! s27_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FinalizerTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/FinalizerTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3527,10 +3902,14 @@ macro_rules! s32_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/EscapeAnalysisTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/EscapeAnalysisTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3561,10 +3940,14 @@ macro_rules! s31_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InlineComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/InlineComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3617,10 +4000,14 @@ macro_rules! s33_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/InlineCacheTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/InlineCacheTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3653,10 +4040,14 @@ macro_rules! s35_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/OsrComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/OsrComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3734,10 +4125,14 @@ macro_rules! s37_test_int {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/FPCompletenessTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3752,10 +4147,14 @@ macro_rules! s37_test_long {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()J", &[]);
-            match result {
-                Ok(Some(Value::Long(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Long({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/FPCompletenessTest",
+                $method,
+                &format!("Long({})", $expected),
+                matches!(result, Ok(Some(Value::Long(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3818,10 +4217,14 @@ macro_rules! s39_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JdwpComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/JdwpComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3882,10 +4285,14 @@ macro_rules! s44_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JniComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/JniComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -3959,10 +4366,14 @@ macro_rules! s46_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckLang", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/TckLang",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -4118,10 +4529,14 @@ macro_rules! s50_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckReflect", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/TckReflect",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -4302,10 +4717,14 @@ macro_rules! s38_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PgoTest", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/PgoTest",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -4348,10 +4767,14 @@ fn test_s45_hello_world_check() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/HelloWorld",
+        "check",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 }
 
 /// Test ManifestInfo parsing including Class-Path attribute.
@@ -4470,10 +4893,14 @@ fn test_s45_run_class_from_jar() {
         .with_classpath(vec![jar_path.to_string_lossy().into_owned()]);
     let mut vm = cratonvm_vm::vm::Vm::new(config);
     let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
-    match result {
-        Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
-    }
+    corpus_check(
+        &vm,
+        "cratonvm/HelloWorld",
+        "check",
+        "Int(42)",
+        matches!(result, Ok(Some(Value::Int(42)))),
+        &result,
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4527,10 +4954,14 @@ macro_rules! s47_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckUtil", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/TckUtil",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }
@@ -4611,10 +5042,14 @@ macro_rules! s49_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/JucComplete",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
     ($name:ident, $method:expr, $expected:expr) => {
@@ -4626,10 +5061,14 @@ macro_rules! s49_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/JucComplete",
+                $method,
+                &format!("Int({})", $expected),
+                matches!(result, Ok(Some(Value::Int(v))) if v == $expected),
+                &result,
+            );
         }
     };
 }
@@ -4846,10 +5285,14 @@ macro_rules! s51_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/ScopedValueComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/ScopedValueComplete",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }
@@ -4936,10 +5379,14 @@ macro_rules! s48_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckIo", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/TckIo",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }
@@ -5028,13 +5475,14 @@ macro_rules! new14_jdbc_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/TckJdbc", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!(
-                    "TckJdbc::{} — expected Ok(Some(Int(1))), got: {other:?}",
-                    $method
-                ),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/TckJdbc",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }
@@ -5085,10 +5533,14 @@ macro_rules! s53_test {
             require_class_files!();
             let mut vm = test_vm();
             let result = vm.invoke("cratonvm/PatternComplete", $method, "()I", &[]);
-            match result {
-                Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
-            }
+            corpus_check(
+                &vm,
+                "cratonvm/PatternComplete",
+                $method,
+                "Int(1)",
+                matches!(result, Ok(Some(Value::Int(1)))),
+                &result,
+            );
         }
     };
 }

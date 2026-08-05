@@ -748,7 +748,7 @@ pub(crate) fn native_method_get_default_value(
     // the `processors()` default through identity-sensitive Class equality;
     // resolving this default globally made the two otherwise identical
     // `SimpleReflectiveProcessor.class` mirrors come from different forks.
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
+    let container_loader = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32());
     Ok(Some(crate::lang_class::annotation_element_to_java_typed(
         ctx,
         &default,

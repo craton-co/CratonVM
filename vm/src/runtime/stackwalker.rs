@@ -357,10 +357,104 @@ pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEn
 /// innermost to outermost), matching the order produced by
 /// `JvmThread.frames.iter()`.
 pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<StackTraceEntry> {
-    frames
-        .iter()
-        .map(|f| entry_from_frame(class_store, f))
-        .collect()
+    let jit = crate::jit::conservative_roots::active_compiled_frames();
+    if jit.is_empty() {
+        return frames
+            .iter()
+            .map(|f| entry_from_frame(class_store, f))
+            .collect();
+    }
+    interleave_compiled_frames(class_store, frames, &jit)
+}
+
+/// Splice the CURRENT thread's active compiled frames into its interpreter
+/// frames, outermost first.
+///
+/// A JIT-compiled method runs without pushing a [`Frame`], so on its own
+/// `frames` is the Java stack *minus everything the JIT has taken over* — which
+/// grows as a workload warms up, until a stack that was 21 frames deep reports
+/// 6. `jit` carries, per active compiled frame, the interpreter depth it was
+/// entered at ([`crate::jit::conservative_roots::active_compiled_frames`]), and
+/// that is exactly the insertion point: an entry recorded at depth `d` was
+/// pushed when `frames[..d]` already existed and `frames[d]` did not, so it
+/// belongs immediately before `frames[d]`. Entries sharing a depth are nested
+/// (compiled code dispatching to compiled code) and keep their push order,
+/// which is already outermost-first.
+///
+/// Compiled entries carry no bytecode index, so their line number is
+/// [`LINE_NUMBER_UNKNOWN`] — `StackTraceElement` renders that as
+/// `(Unknown Source)`. A frame with an unknown line is strictly better than an
+/// absent frame: `Thread.getStackTrace()` consumers ask *which methods are on
+/// the stack* far more often than they ask which line.
+fn interleave_compiled_frames(
+    class_store: &ClassStore,
+    frames: &[Frame],
+    jit: &[(u32, String, u32)],
+) -> Vec<StackTraceEntry> {
+    let mut out = Vec::with_capacity(frames.len() + jit.len());
+    let mut next = 0usize;
+    for (i, f) in frames.iter().enumerate() {
+        while next < jit.len() && (jit[next].0 as usize) <= i {
+            if let Some(e) = compiled_frame_entry(class_store, &jit[next]) {
+                out.push(e);
+            }
+            next += 1;
+        }
+        out.push(entry_from_frame(class_store, f));
+    }
+    for slot in &jit[next..] {
+        if let Some(e) = compiled_frame_entry(class_store, slot) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// One compiled frame as a [`StackTraceEntry`], from the artifact's
+/// `"class/Name.method:descriptor"` label and its owning class id.
+///
+/// Returns `None` for a label this cannot parse rather than emitting a frame
+/// with a mangled name — the only labels in production come from
+/// `x64::compile_with_param_slots`' `method_key` (and the matching stamp on the
+/// optimizing tier), which are always of that shape.
+fn compiled_frame_entry(
+    class_store: &ClassStore,
+    (_, label, owner_class_id): &(u32, String, u32),
+) -> Option<StackTraceEntry> {
+    let (owner_and_method, method_descriptor) = label.rsplit_once(':')?;
+    let (class_name, method_name) = owner_and_method.rsplit_once('.')?;
+    if class_name.is_empty() || method_name.is_empty() {
+        return None;
+    }
+    let class_id = ClassId::new(*owner_class_id);
+    let class = class_store.get(class_id);
+    // Prefer the class's own recorded name: the label is built from the same
+    // string, but a class the store knows is the authority, and it also gives
+    // the source file the label cannot carry.
+    let (class_name, source_file, method_index) = match class {
+        Some(c) => (
+            std::sync::Arc::from(&*c.name),
+            c.source_file.as_deref().map(std::sync::Arc::from),
+            find_method_index_memoized(
+                c,
+                class_id,
+                &std::sync::Arc::<str>::from(method_name),
+                &std::sync::Arc::<str>::from(method_descriptor),
+            ),
+        ),
+        None => (std::sync::Arc::from(class_name), None, None),
+    };
+    Some(StackTraceEntry {
+        class_name,
+        method_name: std::sync::Arc::from(method_name),
+        source_file,
+        // No bytecode index is recorded for a compiled frame, so there is no
+        // line to resolve. Never guess one: a wrong line is worse than none.
+        line_number: LINE_NUMBER_UNKNOWN,
+        byte_code_index: -1,
+        class_id: Some(class_id),
+        method_index,
+    })
 }
 
 /// Like [`capture_full_trace`] but WITHOUT resolving source-line numbers — so it

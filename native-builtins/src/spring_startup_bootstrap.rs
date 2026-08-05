@@ -1394,7 +1394,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 if let Some((declaring, name, descriptor)) =
                     crate::lang_class::method_class_name_desc(ctx, incoming)
                 {
-                    if crate::classloader::defining_loader_for(declaring.as_u32()).is_none() {
+                    if crate::classloader::defining_loader_for(ctx.vm_identity(), declaring.as_u32()).is_none() {
                         if let Some(class_name) = ctx.class_name_of_id(declaring) {
                             if let Some(child_declaring) = resolve_class_id_via_tccl(ctx, &class_name)
                             {
@@ -1483,7 +1483,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             };
             if let Some(c) = cls {
                 if let Some(cid) = ctx.class_id_from_mirror(c) {
-                    if crate::classloader::defining_loader_for(cid.as_u32()).is_none() {
+                    if crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()).is_none() {
                         if let Some(name) = ctx.class_name_of_id(cid) {
                             if let Some(better_cid) = resolve_class_id_via_tccl(ctx, &name) {
                                 if better_cid != cid {

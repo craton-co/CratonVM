@@ -46,7 +46,7 @@
 //! WP1.2 delta. Duplicate registration would panic or silently
 //! overwrite, either of which is a bug.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1031,19 +1031,27 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
         native_unsafe_reallocate_memory_consolidated,
     );
     registry.register(u, "freeMemory", "(J)V", native_unsafe_free_memory);
-    registry.register(
+    registry.register_with_kind(
         u2,
         "allocateMemory0",
         "(J)J",
         native_unsafe_allocate_memory_consolidated,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "reallocateMemory0",
         "(JJ)J",
         native_unsafe_reallocate_memory_consolidated,
+        NativeKind::Bridge,
     );
-    registry.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory);
+    registry.register_with_kind(
+        u2,
+        "freeMemory0",
+        "(J)V",
+        native_unsafe_free_memory,
+        NativeKind::Bridge,
+    );
     // Some JDK builds expose the unsuffixed forms on jdk.internal.misc.Unsafe.
     registry.register(
         u2,
@@ -1073,11 +1081,12 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
         "(Ljava/lang/Object;JJB)V",
         native_unsafe_set_memory_consolidated,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "setMemory0",
         "(Ljava/lang/Object;JJB)V",
         native_unsafe_set_memory_consolidated,
+        NativeKind::Bridge,
     );
     registry.register(
         u,
@@ -1091,11 +1100,12 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
         "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
         native_unsafe_copy_memory_consolidated,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "copyMemory0",
         "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
         native_unsafe_copy_memory_consolidated,
+        NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }
@@ -1942,7 +1952,13 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     // (NativeMethodRegistry::register overwrites prior entries with
     // the same key, so this becomes the live impl.)
     registry.register(u, "freeMemory", "(J)V", native_unsafe_free_memory);
-    registry.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory);
+    registry.register_with_kind(
+        u2,
+        "freeMemory0",
+        "(J)V",
+        native_unsafe_free_memory,
+        NativeKind::Bridge,
+    );
 
     // SECURITY FIX (V5): consolidate allocate/reallocate/free/setMemory/
     // copyMemory AND the raw get/put natives onto the SINGLE arena store.
@@ -1959,19 +1975,21 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
         native_unsafe_define_class,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "defineClass0",
         "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
         native_unsafe_define_class,
+        NativeKind::Bridge,
     );
 
     // 7. getLoadAverage0.
-    registry.register(
+    registry.register_with_kind(
         u2,
         "getLoadAverage0",
         "([DI)I",
         native_unsafe_get_load_average,
+        NativeKind::Bridge,
     );
     registry.register(
         u,
@@ -1993,11 +2011,12 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
         native_unsafe_static_field_base,
     );
-    registry.register(
+    registry.register_with_kind(
         u2,
         "staticFieldBase0",
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
         native_unsafe_static_field_base,
+        NativeKind::Bridge,
     );
 
     // 9. Acquire/Release fences.
