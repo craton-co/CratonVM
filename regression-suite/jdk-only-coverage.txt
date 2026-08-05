@@ -133,6 +133,16 @@ Covered OUTSIDE this corpus, by the strict-corpus probe gate
 scripts/jdk-only-strict-probes.sh runs probes/JdkOnly*Probe on three arms —
 real HotSpot, `--real-jdk`, `--jdk-only` — against one image and one set of
 class files, and diffs the two CratonVM transcripts against the HotSpot one.
+
+It is BLOCKING in CI, as a ratchet: the known divergences are committed to
+scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.txt and the gate fails
+when that set grows. A divergence that disappears prints "re-freeze" and
+passes, so a fix is never blocked by the gate that measured it. It refuses
+(exit 2) rather than passing when no baseline exists for the current key, and
+an arm that does not complete fails regardless of the baseline. Re-freeze with:
+
+  bash scripts/jdk-only-strict-probes.sh --update-baseline --note "why"
+
 It is a different instrument from this suite and answers a different question:
 this suite asserts invariants a vector states about itself, the gate asserts
 that CratonVM's whole transcript is what HotSpot printed. A wrong VALUE that
