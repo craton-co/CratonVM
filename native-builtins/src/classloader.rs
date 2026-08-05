@@ -146,6 +146,13 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    // L1: the per-loader bookkeeping is keyed by heap address, so carrying it
+    // into a fresh VM would hand a brand-new loader an old one's loader type
+    // and namespace id the moment an address is reused.
+    loader_meta_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
     cratonvm_types::loader_pin::clear_loader_pins();
     // Companion: drop the GC marker's mirror_pin registry for the new VM too
@@ -323,6 +330,29 @@ pub fn gc_reconcile_defining_loaders(
         }
         true
     });
+    drop(ns);
+
+    // L1: identical treatment for the VM-internal loader bookkeeping table.
+    // It holds `loader_type` / `classes_loaded` / `parallel_capable` /
+    // `loader_id`, keyed by the loader object, for exactly the reason the
+    // namespace store above is object-keyed: an identity-hash key recurs once
+    // a collection reuses the address, and a brand-new loader would inherit a
+    // dead one's namespace id. Prune the dead, remap the moved.
+    loader_meta_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain_mut(|(obj_ref, _)| {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if !is_marked(old_addr) {
+                return false;
+            }
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+            true
+        });
+
     dead_class_ids.sort_unstable();
     dead_class_ids.dedup();
     dead_class_ids
@@ -770,6 +800,243 @@ const CL_DEFAULT_DOMAIN: usize = 5;
 const CL_LOADER_ID: usize = 6;
 const CL_FIELD_COUNT: usize = 7;
 
+// ---------------------------------------------------------------------------
+// L1 — VM-internal loader bookkeeping lives beside the object, not in it
+// ---------------------------------------------------------------------------
+//
+// Four of the seven synthetic slots above hold values the real JDK has no
+// field for at all: `CL_LOADER_TYPE`, `CL_CLASSES_LOADED`,
+// `CL_IS_PARALLEL_CAPABLE` and `CL_LOADER_ID` are CratonVM bookkeeping. On a
+// real JDK image the loader object has the REAL layout — `parent`(0)
+// `name`(1) `unnamedModule`(2) `nameAndId`(3) `parallelLockMap`(4)
+// `package2certs`(5) `classes`(6) — so all four of our `Value::Int` writes
+// land on reference fields. `Heap::set_field_as` coerces the `Int` to
+// `Object(None)`, and the JDK's own field is destroyed. Measured 2026-08-04
+// with `CRATONVM_DBG=overlay,overlay-all`: eight rows, four slots on each of
+// `ClassLoaders$AppClassLoader` and `$PlatformClassLoader`, the writer named
+// by `overlay-bt` as `alloc_classloader`.
+//
+// This is the third kind of layout defect and neither earlier fix applies:
+// `VarHandle` (kind 1) had synthetic slots to keep on the synthetic layout,
+// `Properties` (kind 2) had a real field we were indexing against the wrong
+// class. Here `resolve_field_index_by_class_id` returns `None` because there
+// IS no real field — so the value has to leave the object.
+//
+// Shape copied from `lang_invoke::vh_meta_put`/`vh_meta_get`, with two
+// deliberate departures, both forced by facts about loaders specifically:
+//
+//  * **Keyed by the loader OBJECT, not by `identity_hash_code`.** Identity
+//    hashes are address-derived and recur once a collection reuses the
+//    region, so a fresh loader can inherit a dead one's entry — including its
+//    namespace id, which is exactly the bug that made
+//    `loader_namespace_id_store` move off identity hashes (see its doc
+//    comment). Object keys are pruned and remapped by
+//    [`gc_reconcile_defining_loaders`], alongside that store.
+//  * **NOT a GC root.** `vh_meta_put` calls `register_var_handle_root`
+//    because a VarHandle held only by a `static final` field has no other
+//    root. A loader does not have that problem: the app/platform singletons
+//    are already rooted by [`gc_scan_loader_singleton_roots`], and rooting
+//    user loaders here would pin every one of them forever and defeat
+//    loader unloading (`CRATONVM_LOADER_UNLOAD`, HIB-CV-24 Manifestation B).
+//
+//  * **Every member is an `Option`.** The design sketch had bare
+//    `i32`/`bool`/`u32`, but each of the nine converted read sites has its
+//    OWN default for a missing value (`LOADER_APP` in `cl_load_class`,
+//    `LOADER_CUSTOM` in `cl_get_name`, `1` in
+//    `cl_is_registered_as_parallel_capable`, "unassigned" for the id). A
+//    single struct-wide default would silently change all of them; `Option`
+//    keeps each caller's own fallback where it already is.
+
+/// CratonVM's per-loader bookkeeping, held beside the loader object.
+///
+/// `None` means "this VM has never recorded that value for this loader",
+/// which is NOT the same as any particular default — see the module comment
+/// above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoaderMeta {
+    /// `LOADER_BOOTSTRAP` / `LOADER_PLATFORM` / `LOADER_APP` / `LOADER_CUSTOM`.
+    loader_type: Option<i32>,
+    /// Count of classes defined through this loader's `defineClass` natives.
+    classes_loaded: Option<i32>,
+    /// `registerAsParallelCapable()` bookkeeping.
+    parallel_capable: Option<bool>,
+    /// CratonVM class-namespace id (`0` = the shared application namespace).
+    loader_id: Option<u32>,
+}
+
+impl LoaderMeta {
+    /// What the three `ClassLoader` constructor natives record: a custom
+    /// loader that has defined nothing yet and is parallel-capable, with a
+    /// namespace id only for the `(String, ClassLoader)` form (the other two
+    /// leave the id unassigned until `loader_namespace_id` needs one).
+    fn custom_initialiser(loader_id: Option<u32>) -> Self {
+        LoaderMeta {
+            loader_type: Some(LOADER_CUSTOM),
+            classes_loaded: Some(0),
+            parallel_capable: Some(true),
+            loader_id,
+        }
+    }
+}
+
+/// Loader-object → [`LoaderMeta`]. A `Vec` rather than a map for the same
+/// reason `loader_namespace_id_store` is one: entries are keyed by a raw heap
+/// address that the GC rewrites, and `retain_mut` over a `Vec` remaps in
+/// place where a hash map would have to be rebuilt. Loader counts are in the
+/// tens even for a servlet container.
+fn loader_meta_store() -> &'static Mutex<Vec<(ObjectRef, LoaderMeta)>> {
+    static INSTANCE: OnceLock<Mutex<Vec<(ObjectRef, LoaderMeta)>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Record (or replace) `loader`'s bookkeeping.
+pub(crate) fn loader_meta_put(loader: ObjectRef, meta: LoaderMeta) {
+    let mut t = loader_meta_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match t.iter_mut().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        Some((_, slot)) => *slot = meta,
+        None => t.push((loader, meta)),
+    }
+}
+
+/// Read `loader`'s recorded bookkeeping, if this VM has any.
+pub(crate) fn loader_meta_get(loader: ObjectRef) -> Option<LoaderMeta> {
+    loader_meta_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(l, _)| l.as_ptr() == loader.as_ptr())
+        .map(|&(_, m)| m)
+}
+
+/// Read-modify-write, creating an all-`None` entry if the loader has none.
+fn loader_meta_upsert(loader: ObjectRef, f: impl FnOnce(&mut LoaderMeta)) {
+    let mut t = loader_meta_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match t.iter_mut().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        Some((_, slot)) => f(slot),
+        None => {
+            let mut meta = LoaderMeta::default();
+            f(&mut meta);
+            t.push((loader, meta));
+        }
+    }
+}
+
+/// An instance field the REAL `java.lang.ClassLoader` declares and no
+/// CratonVM stand-in can: `ensure_synthetic_class` fabricates a class with an
+/// EMPTY field list (`fabricate_class`, `fields: vec![]`), so a fabricated
+/// loader stub declares no named fields at all.
+///
+/// Three names, not one, so a rename in a future JDK degrades one witness at a
+/// time instead of flipping the whole predicate. All three are private JDK
+/// internals of `java.lang.ClassLoader` and have been since JDK 9.
+const REAL_CLASSLOADER_WITNESS_FIELDS: [&str; 3] =
+    ["parallelLockMap", "package2certs", "nameAndId"];
+
+/// JDK-ONLY-LAYOUT: does this loader object actually have OUR seven-slot
+/// synthetic layout, or the real JDK `ClassLoader` layout?
+///
+/// **Ask by NAME, never by field count.** `object_num_fields(x) >= N` returns
+/// the requested count on both layouts, so it cannot tell them apart; that
+/// version of this predicate shipped completely inert on 2026-08-04 and an A/B
+/// against the pre-fix binary counted the identical overlay writes with and
+/// without it (see the wave-2 README's failure modes).
+///
+/// `resolve_field_index_by_class_id` walks the class hierarchy, which is what
+/// makes this work for `ClassLoaders$AppClassLoader` — the witness fields are
+/// declared three superclasses up on `java.lang.ClassLoader`, so a
+/// `declared_fields` test on the receiver's own class would answer "synthetic"
+/// for every built-in loader and be inert exactly where the eight measured
+/// rows are.
+fn cl_has_synthetic_layout(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(loader);
+    !REAL_CLASSLOADER_WITNESS_FIELDS
+        .iter()
+        .any(|name| ctx.resolve_field_index_by_class_id(cid, name).is_some())
+}
+
+// ---------------------------------------------------------------------------
+// The four accessors every converted read site goes through.
+//
+// Order is the one `vh_field_desc` uses: side table first, raw slot second.
+// The raw-slot fallback is gated on [`cl_has_synthetic_layout`] so that a
+// loader allocated outside our path still works in synthetic-JDK mode, while
+// on a real JDK layout no `CL_*` value is ever read out of an object slot —
+// reading `parallelLockMap` back as an `Int` is the same confusion the write
+// side just stopped committing.
+// ---------------------------------------------------------------------------
+
+/// `CL_LOADER_TYPE`. `None` = unknown; each caller keeps its own default.
+fn loader_type_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Option<i32> {
+    if let Some(t) = loader_meta_get(loader).and_then(|m| m.loader_type) {
+        return Some(t);
+    }
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_TYPE) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `CL_CLASSES_LOADED`.
+fn loader_classes_loaded_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Option<i32> {
+    if let Some(n) = loader_meta_get(loader).and_then(|m| m.classes_loaded) {
+        return Some(n);
+    }
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Int(v) = ctx.get_field(loader, CL_CLASSES_LOADED) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `CL_IS_PARALLEL_CAPABLE`.
+pub(crate) fn loader_parallel_capable_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Option<i32> {
+    if let Some(p) = loader_meta_get(loader).and_then(|m| m.parallel_capable) {
+        return Some(i32::from(p));
+    }
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Int(v) = ctx.get_field(loader, CL_IS_PARALLEL_CAPABLE) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `CL_LOADER_ID`. `None` for "no namespace id assigned"; `0` is never a
+/// user-loader id (it is the shared application namespace), so the callers'
+/// pre-existing `v > 0` tests are preserved by returning `None` for it.
+pub(crate) fn loader_id_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Option<u32> {
+    if let Some(id) = loader_meta_get(loader).and_then(|m| m.loader_id) {
+        if id > 0 {
+            return Some(id);
+        }
+        return None;
+    }
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
+            if v > 0 {
+                return Some(v as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Write side: record in the table always, and mirror into the raw slot only
+/// on our own layout.
+fn loader_set_classes_loaded(ctx: &mut dyn NativeContext, loader: ObjectRef, n: i32) {
+    loader_meta_upsert(loader, |m| m.classes_loaded = Some(n));
+    if cl_has_synthetic_layout(ctx, loader) {
+        ctx.set_field(loader, CL_CLASSES_LOADED, Value::Int(n));
+    }
+}
+
 // URLClassLoader synthetic field indices (6 fields)
 const UCL_LOADER_TYPE: usize = 0;
 const UCL_PARENT_REF: usize = 1;
@@ -901,11 +1168,23 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     };
     let mut obj = alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT);
     let obj_pin = ctx.pin_native_root(obj);
-    ctx.set_field(obj, CL_LOADER_TYPE, Value::Int(loader_type));
+    // L1: the four VM-internal slots go into the object ONLY on our own
+    // layout. On a real JDK image `class_name` resolves to the real
+    // `ClassLoaders$AppClassLoader` / `$PlatformClassLoader`, whose slots
+    // 0/3/4/6 are `parent` / `nameAndId` / `parallelLockMap` / `classes` —
+    // references, all four. These were the eight measured overlay rows.
+    // The values themselves are not lost: `loader_meta_put` below records
+    // them, and every reader consults that table first.
+    let synthetic_layout = cl_has_synthetic_layout(ctx, obj);
+    if synthetic_layout {
+        ctx.set_field(obj, CL_LOADER_TYPE, Value::Int(loader_type));
+    }
     ctx.set_field(obj, CL_PARENT_REF, Value::Object(None));
     ctx.set_field(obj, CL_NAME_REF, Value::Object(None));
-    ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    if synthetic_layout {
+        ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
+        ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    }
     let pd = alloc_default_protection_domain(ctx);
     let pd_pin = ctx.pin_native_root(pd);
     obj = ctx.read_native_pin(obj_pin, obj);
@@ -921,7 +1200,9 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         0 // built-in loaders don't use this field
     };
     obj = ctx.read_native_pin(obj_pin, obj);
-    ctx.set_field(obj, CL_LOADER_ID, Value::Int(lid));
+    if synthetic_layout {
+        ctx.set_field(obj, CL_LOADER_ID, Value::Int(lid));
+    }
     // Built-in loaders (platform & app) extend `jdk.internal.loader.BuiltinClassLoader`,
     // whose constructor (`BuiltinClassLoader(String, BuiltinClassLoader, URLClassPath)`)
     // initializes the inherited `nameToModule` and `moduleToReader` Map fields to
@@ -979,6 +1260,19 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     let lock = ctx.read_native_pin(lock_pin, lock);
     ctx.set_field_by_name(obj, "assertionLock", Value::Object(Some(lock)));
     let obj = ctx.read_native_pin(obj_pin, obj);
+    // L1: record the four VM-internal values beside the object. Done LAST, on
+    // the post-allocation address: every step above can collect (the
+    // ProtectionDomain, three ConcurrentHashMaps and the assertion lock are
+    // all allocations), and the table is keyed by address.
+    loader_meta_put(
+        obj,
+        LoaderMeta {
+            loader_type: Some(loader_type),
+            classes_loaded: Some(0),
+            parallel_capable: Some(true),
+            loader_id: Some(lid as u32),
+        },
+    );
     ctx.unpin_native_roots(obj_pin);
     obj
 }
@@ -999,11 +1293,15 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
 /// only as long as nothing ever reads `classes` back (e.g. `addClass`,
 /// reflection over loader-owned classes), but a real type-confusion bug
 /// regardless of whether anything currently exercises it. `loader_namespace_id`
-/// already keys real-JDK-mode ids by the loader's stable identity hash in a
-/// side table instead of touching the field, so delegating to it fixes the
-/// corruption for free while preserving identical id-assignment semantics
-/// (same `allocate_loader_id()` counter, same "0 = application/built-in
-/// loader" convention `loader_id_for`'s null-loader callers already rely on).
+/// already keys real-JDK-mode ids in an object-keyed side table instead of
+/// touching the field, so delegating to it fixes the corruption for free
+/// while preserving identical id-assignment semantics (same
+/// `allocate_loader_id()` counter, same "0 = application/built-in loader"
+/// convention `loader_id_for`'s null-loader callers already rely on).
+///
+/// L1 finished the job on the WRITE side too: the `ClassLoader` constructor
+/// natives now record the id in [`LoaderMeta`] and only mirror it into slot 6
+/// when [`cl_has_synthetic_layout`] says the object has our layout.
 pub(crate) fn get_or_assign_loader_id(ctx: &mut dyn NativeContext, cl: ObjectRef) -> u32 {
     loader_namespace_id(ctx, cl)
 }
@@ -1070,13 +1368,21 @@ fn lk_modes_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 
 fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    // L1: record before allocating anything — `this` is the live receiver at
+    // this point, and the table is keyed by address.
+    loader_meta_put(this, LoaderMeta::custom_initialiser(None));
+    let synthetic_layout = cl_has_synthetic_layout(ctx, this);
+    if synthetic_layout {
+        ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    }
     // parent defaults to system class loader
     let sys = alloc_classloader(ctx, LOADER_APP);
     ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys)));
     ctx.set_field(this, CL_NAME_REF, Value::Object(None));
-    ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    if synthetic_layout {
+        ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
+        ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    }
     // WP2.3: build a non-null defaultDomain so JDK preDefineClass's
     // `pd.getCodeSource()` chain doesn't NPE on the no-PD defineClass path.
     let pd = alloc_default_protection_domain(ctx);
@@ -1093,11 +1399,18 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    // L1: see `cl_init_default`.
+    loader_meta_put(this, LoaderMeta::custom_initialiser(None));
+    let synthetic_layout = cl_has_synthetic_layout(ctx, this);
+    if synthetic_layout {
+        ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    }
     ctx.set_field(this, CL_PARENT_REF, parent);
     ctx.set_field(this, CL_NAME_REF, Value::Object(None));
-    ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    if synthetic_layout {
+        ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
+        ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    }
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
@@ -1112,11 +1425,23 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = obj_arg(args, 0)?;
     let name = args.get(1).copied().unwrap_or(Value::Object(None));
     let parent = args.get(2).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    // Assign the unique namespace id up front: `this` is the live receiver
+    // here, before the ProtectionDomain / CHM allocations below can collect
+    // and move it, and the L1 table is keyed by address. The id comes from a
+    // counter, so pulling it forward changes nothing about its value's
+    // meaning.
+    let lid = ctx.allocate_loader_id();
+    loader_meta_put(this, LoaderMeta::custom_initialiser(Some(lid)));
+    let synthetic_layout = cl_has_synthetic_layout(ctx, this);
+    if synthetic_layout {
+        ctx.set_field(this, CL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
+    }
     ctx.set_field(this, CL_PARENT_REF, parent);
     ctx.set_field(this, CL_NAME_REF, name);
-    ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    if synthetic_layout {
+        ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
+        ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
+    }
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
@@ -1124,9 +1449,9 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let packages_map =
         alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
-    // Assign unique loader ID for namespace isolation
-    let lid = ctx.allocate_loader_id();
-    ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));
+    if synthetic_layout {
+        ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));
+    }
     Ok(None)
 }
 
@@ -1541,9 +1866,17 @@ pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRe
 /// Loader-object → CratonVM loader-namespace-id side table for real-JDK mode.
 ///
 /// In synthetic-JDK mode a user loader's namespace id lives in the synthetic
-/// `CL_LOADER_ID` field slot (populated by `ClassLoader.<init>`/`defineClass`).
-/// In real-JDK mode that slot is a genuine `java.lang.ClassLoader` field and
-/// cannot be repurposed, so the id is keyed on the loader OBJECT instead.
+/// `CL_LOADER_ID` field slot (populated by `ClassLoader.<init>`/`defineClass`,
+/// and mirrored into [`LoaderMeta::loader_id`] since L1). In real-JDK mode
+/// that slot is a genuine `java.lang.ClassLoader` field and cannot be
+/// repurposed, so the id is keyed on the loader OBJECT instead.
+///
+/// Distinct from the L1 [`loader_meta_store`], which it sits directly beside:
+/// this table holds ids `loader_namespace_id_at` allocated *lazily*, on first
+/// request, for loaders whose constructor never ran through one of our
+/// natives. `LoaderMeta` holds what the constructor natives themselves
+/// recorded. Both are object-keyed and both are pruned/remapped by the same
+/// [`gc_reconcile_defining_loaders`] pass, for the same reason.
 ///
 /// # GC contract — both halves are load-bearing
 ///
@@ -1581,9 +1914,14 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
 /// id from `class_manager`'s per-class `loader_id`, e.g. as returned by
 /// `NativeContext::loader_id_of_class`), find the live `ClassLoader` object
 /// that owns it. `None` for built-in namespaces (0/1/2) or a namespace this
-/// process never allocated via the object-keyed store (e.g. one only ever
-/// set through the synthetic-JDK `CL_LOADER_ID` field slot, which this store
-/// doesn't track).
+/// process never allocated via the object-keyed store.
+///
+/// Since L1 an id assigned by a `ClassLoader` constructor native (rather than
+/// by `loader_namespace_id_at`'s own allocation) IS tracked here too:
+/// `remember_namespace_object` mirrors it in on first lookup. The doc used to
+/// name that gap — "one only ever set through the synthetic-JDK
+/// `CL_LOADER_ID` field slot, which this store doesn't track" — and it is now
+/// closed in both modes.
 ///
 /// Exists because several call sites need to *actively drive* a specific
 /// loader's own `loadClass()` (JVMS §5.4.3 initiating-loader semantics) once
@@ -1610,11 +1948,13 @@ pub(crate) fn loader_object_for_namespace_id(ns_id: u32) -> Option<ObjectRef> {
 
 /// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
 /// one on first request. Built-in loaders map to `0` (the Application / global
-/// namespace — they ARE the global store). User-defined loaders use their
-/// synthetic `CL_LOADER_ID` slot when present (synthetic-JDK mode) and otherwise
-/// an identity-hash-keyed id (real-JDK mode). Used by `defineClass` to give a
-/// user loader its own namespace so an override-first redefinition of an
-/// already-loaded class does not collide with the original definer.
+/// namespace — they ARE the global store). A user-defined loader uses the id
+/// its constructor native recorded ([`LoaderMeta::loader_id`], mirrored into
+/// the synthetic `CL_LOADER_ID` slot in synthetic-JDK mode) when it has one,
+/// and otherwise gets one allocated here and keyed on the loader object. Used
+/// by `defineClass` to give a user loader its own namespace so an
+/// override-first redefinition of an already-loaded class does not collide
+/// with the original definer.
 pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
     loader_namespace_id_at(ctx, loader, 0)
 }
@@ -1626,14 +1966,26 @@ fn loader_namespace_id_at(ctx: &mut dyn NativeContext, loader: ObjectRef, depth:
     if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return 0;
     }
-    if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
-        if v > 0 {
-            // Synthetic-JDK mode keeps the id in a field slot, so this path
-            // never reaches the allocation below — the parent link has to be
-            // recorded here too or the chain is invisible in that mode.
-            record_parent_link(ctx, loader, v as u32, depth);
-            return v as u32;
-        }
+    if let Some(v) = loader_id_of(ctx, loader) {
+        // A loader whose id came from a `ClassLoader` constructor native has
+        // it in the L1 side table (and, in synthetic-JDK mode, in the field
+        // slot as well), so this path never reaches the allocation below —
+        // the parent link has to be recorded here too or the chain is
+        // invisible for those loaders.
+        //
+        // Mirror it into the object-keyed store as well, or
+        // `loader_object_for_namespace_id` cannot answer for this loader and
+        // the "drive that loader's own loadClass" call sites lose their
+        // receiver. Before L1 real-JDK mode got this for free: the
+        // constructor's slot-6 write was coerced away, so the code below ran
+        // and pushed the entry. Now that the id survives, push it here —
+        // which also closes the same hole synthetic-JDK mode has always had
+        // (`loader_object_for_namespace_id`'s doc used to name it).
+        // Insert BEFORE `record_parent_link`, which recurses into this
+        // function against a non-reentrant `Mutex`.
+        remember_namespace_object(loader, v);
+        record_parent_link(ctx, loader, v, depth);
+        return v;
     }
     // Resolve the parent's namespace BEFORE taking the store lock: doing it
     // afterwards re-enters this function (the parent may not have an id yet)
@@ -1652,6 +2004,24 @@ fn loader_namespace_id_at(ctx: &mut dyn NativeContext, loader: ObjectRef, depth:
     drop(map);
     cratonvm_classloading::register_user_loader_parent(id, parent_ns);
     id
+}
+
+/// Record `loader → id` in the object-keyed namespace store if it is not
+/// already there, so [`loader_object_for_namespace_id`] can invert an id that
+/// was assigned by a `ClassLoader` constructor native rather than by
+/// [`loader_namespace_id_at`]'s own allocation. Takes the lock briefly and
+/// recurses into nothing.
+fn remember_namespace_object(loader: ObjectRef, id: u32) {
+    if id < 3 {
+        return;
+    }
+    let mut map = loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map.iter().any(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        return;
+    }
+    map.push((loader, id));
 }
 
 /// Namespace id of `loader`'s delegation parent, allocating one for the parent
@@ -1698,10 +2068,8 @@ pub(crate) fn peek_loader_namespace_id(
     if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return None;
     }
-    if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
-        if v > 0 {
-            return Some(v as u32);
-        }
+    if let Some(v) = loader_id_of(ctx, loader) {
+        return Some(v);
     }
     loader_namespace_id_store()
         .lock()
@@ -2243,10 +2611,7 @@ fn cl_load_class_base_delegation_rooted(
         && !builtin_loader_reachable(ctx, this);
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
-    let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
-        Value::Int(v) => v,
-        _ => LOADER_APP,
-    };
+    let loader_type = loader_type_of(ctx, this).unwrap_or(LOADER_APP);
 
     // A user-defined loader must always return a class it has already
     // defined before delegating to its parent. In real-JDK mode the
@@ -2272,10 +2637,7 @@ fn cl_load_class_base_delegation_rooted(
 
     // For synthetic-mode custom loaders, check own namespace first.
     if loader_type == LOADER_CUSTOM {
-        let loader_id = match ctx.get_field(this, CL_LOADER_ID) {
-            Value::Int(v) if v > 0 => Some(v as u32),
-            _ => None,
-        };
+        let loader_id = loader_id_of(ctx, this);
         if let Some(lid) = loader_id {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, lid) {
                 if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
@@ -2322,14 +2684,8 @@ fn cl_load_class_base_delegation_rooted(
     // 2. Delegate to parent loader first (recursive parent-first delegation)
     if let Some(parent) = parent {
         // Recursively delegate to parent by calling its loadClass
-        let parent_type = match ctx.get_field(parent, CL_LOADER_TYPE) {
-            Value::Int(v) => v,
-            _ => LOADER_APP,
-        };
-        let parent_lid = match ctx.get_field(parent, CL_LOADER_ID) {
-            Value::Int(v) if v > 0 => Some(v as u32),
-            _ => None,
-        };
+        let parent_type = loader_type_of(ctx, parent).unwrap_or(LOADER_APP);
+        let parent_lid = loader_id_of(ctx, parent);
         // Check parent's namespace for custom loaders. Apply loader-isolation:
         // a sibling custom loader's class (e.g. a generated proxy that leaked
         // into the app-loader namespace but whose registered defining loader is
@@ -2895,11 +3251,8 @@ pub(crate) fn cl_define_class_basic(
             // redefining an eligible class under itself) would report the wrong
             // loader and classloader-isolation patterns silently break.
             crate::classloader::register_defining_loader(cid.as_u32(), this);
-            let count = match ctx.get_field(this, CL_CLASSES_LOADED) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
-            ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(count + 1));
+            let count = loader_classes_loaded_of(ctx, this).unwrap_or(0);
+            loader_set_classes_loaded(ctx, this, count + 1);
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
@@ -3224,7 +3577,7 @@ fn read_byte_buffer_slice(
 }
 
 /// Bind the loader-id used to register the new class. We look up the
-/// loader's `CL_LOADER_ID` slot if present (lazily allocating a fresh
+/// loader's recorded namespace id if it has one (lazily allocating a fresh
 /// id), otherwise fall through to id 0 (= application loader). A null
 /// loader is treated as the bootstrap class loader, which the backend
 /// also models as id 0 in this VM.
@@ -3973,10 +4326,7 @@ fn cl_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         Ok(Some(name_val))
     } else {
         // Return loader type as name if no explicit name set
-        let lt = match ctx.get_field(this, CL_LOADER_TYPE) {
-            Value::Int(v) => v,
-            _ => LOADER_CUSTOM,
-        };
+        let lt = loader_type_of(ctx, this).unwrap_or(LOADER_CUSTOM);
         let name_str = match lt {
             LOADER_BOOTSTRAP => "bootstrap",
             LOADER_PLATFORM => "platform",
@@ -5456,24 +5806,26 @@ fn cl_register_as_parallel_capable(
 /// unconditional `true`. A loader that had just successfully registered was
 /// then told it had not — the register/query pair contradicted itself.
 ///
-/// The four `ClassLoader` initialisers now seed `CL_IS_PARALLEL_CAPABLE = 1`,
+/// The four `ClassLoader` initialisers now seed `parallel_capable = true`,
 /// which is the truthful answer for this VM: every synthetic loader IS
 /// parallel-capable, because class definition serialises on the VM's own
 /// global class-registry lock rather than on the loader object, so no loader
-/// can deadlock another by loading concurrently. The state stays in the field
+/// can deadlock another by loading concurrently. The state stays per-loader
 /// (not a constant) so a future per-loader model can flip it back to 0.
+///
+/// L1 moved that state out of slot 4 and into [`LoaderMeta`]: on a real JDK
+/// image slot 4 is `java.lang.ClassLoader.parallelLockMap`, so the seed write
+/// was destroying a JDK field and the read was answering its fallback by
+/// accident. `phases_late`'s shadowed twin reads through the same accessor.
 fn cl_is_registered_as_parallel_capable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let val = match ctx.get_field(this, CL_IS_PARALLEL_CAPABLE) {
-        Value::Int(v) => v,
-        // Loader allocated without the synthetic 7-field layout (too short to
-        // carry the slot): fall back to the same `true` the registration call
-        // reports, rather than contradicting it.
-        _ => 1,
-    };
+    // Loader this VM never recorded, or one on the real JDK layout (where
+    // slot 4 is `parallelLockMap`, not our flag): fall back to the same `true`
+    // the registration call reports, rather than contradicting it.
+    let val = loader_parallel_capable_of(ctx, this).unwrap_or(1);
     Ok(Some(Value::Int(val)))
 }
 
@@ -9685,6 +10037,372 @@ mod classloader_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(_, id)| *id != DEAD_NS && *id != MOVED_NS);
+    }
+
+    // -----------------------------------------------------------------
+    // L1 — the four VM-internal loader fields live beside the object
+    // -----------------------------------------------------------------
+
+    /// Declare `names` as instance fields of `cid`, so
+    /// `resolve_field_index_by_class_id` finds them — the mock's resolver
+    /// consults `declared_fields`.
+    fn declare_instance_fields(ctx: &MockNativeContext, cid: cratonvm_types::ClassId, names: &[&str]) {
+        let fields = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| cratonvm_native_api::FieldMetadata {
+                name: (*n).to_string(),
+                descriptor: "Ljava/lang/Object;".to_string(),
+                access_flags: 0,
+                slot_index: i,
+                declaring_class_id: cid,
+                is_static: false,
+            })
+            .collect();
+        ctx.set_declared_fields(cid, fields);
+    }
+
+    /// Build a `ClassLoader` subclass and an instance of it. `real_layout`
+    /// declares the JDK's own private fields, which is what tells the two
+    /// layouts apart.
+    fn make_loader(
+        ctx: &mut MockNativeContext,
+        class_name: &str,
+        real_layout: bool,
+    ) -> ObjectRef {
+        let class_loader = ctx
+            .ensure_class_initialized("java/lang/ClassLoader")
+            .expect("ClassLoader class");
+        let cid = ctx
+            .ensure_class_initialized(class_name)
+            .expect("loader class");
+        ctx.set_superclass(cid, class_loader);
+        if real_layout {
+            declare_instance_fields(
+                ctx,
+                cid,
+                &[
+                    "parent",
+                    "name",
+                    "unnamedModule",
+                    "nameAndId",
+                    "parallelLockMap",
+                    "package2certs",
+                    "classes",
+                ],
+            );
+        }
+        new_object_ref(ctx, class_name)
+    }
+
+    /// The predicate must be FALSIFIABLE. `object_num_fields(x) >= N` was the
+    /// first version of it and shipped completely inert — it answers the same
+    /// on both layouts. Inject the real JDK's own field names and watch the
+    /// answer flip; that is the whole difference the fix rests on.
+    #[test]
+    fn cl_layout_predicate_is_decided_by_a_real_jdk_field_name() {
+        let mut ctx = MockNativeContext::new();
+        let ours = make_loader(&mut ctx, "example/L1SyntheticLoader", false);
+        let theirs = make_loader(&mut ctx, "example/L1RealLayoutLoader", true);
+
+        assert!(
+            cl_has_synthetic_layout(&ctx, ours),
+            "a fabricated stub declares no fields at all — that IS our layout"
+        );
+        assert!(
+            !cl_has_synthetic_layout(&ctx, theirs),
+            "a class declaring java.lang.ClassLoader's own private fields is \
+             the REAL layout; if this passes, the predicate cannot fail and \
+             the whole fix is inert"
+        );
+    }
+
+    /// Every witness name on its own has to be enough — the point of carrying
+    /// three is that a rename in a future JDK degrades one at a time instead
+    /// of flipping the predicate wholesale.
+    #[test]
+    fn cl_layout_predicate_fires_on_any_single_witness_field() {
+        for (i, witness) in REAL_CLASSLOADER_WITNESS_FIELDS.iter().enumerate() {
+            let mut ctx = MockNativeContext::new();
+            let class_loader = ctx
+                .ensure_class_initialized("java/lang/ClassLoader")
+                .expect("ClassLoader class");
+            let name = format!("example/L1Witness{i}");
+            let cid = ctx.ensure_class_initialized(&name).expect("loader class");
+            ctx.set_superclass(cid, class_loader);
+            declare_instance_fields(&ctx, cid, &[witness]);
+            let loader = new_object_ref(&mut ctx, &name);
+            assert!(
+                !cl_has_synthetic_layout(&ctx, loader),
+                "`{witness}` alone must identify the real JDK layout"
+            );
+        }
+    }
+
+    /// On the real layout the four `CL_*` slots are `parent` / `nameAndId` /
+    /// `parallelLockMap` / `classes` — references, all four. Writing an `Int`
+    /// there is coerced to `Object(None)` and destroys the JDK's field. The
+    /// eight measured census rows were exactly these writes on
+    /// `ClassLoaders$AppClassLoader` and `$PlatformClassLoader`.
+    #[test]
+    fn cl_init_leaves_the_four_vm_internal_slots_untouched_on_a_real_layout() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1RealCtorLoader", true);
+
+        // A recognisable reference in every one of the four slots. If the
+        // native writes an `Int` over it, the slot stops being this object.
+        let sentinel = new_object_ref(&mut ctx, "java/lang/Object");
+        for slot in [
+            CL_LOADER_TYPE,
+            CL_CLASSES_LOADED,
+            CL_IS_PARALLEL_CAPABLE,
+            CL_LOADER_ID,
+        ] {
+            ctx.set_field(loader, slot, Value::Object(Some(sentinel)));
+        }
+
+        let name = ctx.create_string("l1");
+        cl_init_name_parent(
+            &mut ctx,
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        )
+        .expect("ClassLoader(String, ClassLoader) native");
+
+        for slot in [
+            CL_LOADER_TYPE,
+            CL_CLASSES_LOADED,
+            CL_IS_PARALLEL_CAPABLE,
+            CL_LOADER_ID,
+        ] {
+            assert_eq!(
+                ctx.get_field(loader, slot),
+                Value::Object(Some(sentinel)),
+                "slot {slot} is a JDK reference field on the real layout and \
+                 must not be overwritten with VM bookkeeping"
+            );
+        }
+
+        // ... and the values are not lost: they moved next to the object.
+        let meta = loader_meta_get(loader).expect("constructor must record the meta");
+        assert_eq!(meta.loader_type, Some(LOADER_CUSTOM));
+        assert_eq!(meta.classes_loaded, Some(0));
+        assert_eq!(meta.parallel_capable, Some(true));
+        assert!(
+            meta.loader_id.is_some_and(|id| id > 0),
+            "the (String, ClassLoader) form assigns a namespace id"
+        );
+        assert_eq!(loader_type_of(&ctx, loader), Some(LOADER_CUSTOM));
+        assert_eq!(loader_id_of(&ctx, loader), meta.loader_id);
+        assert_eq!(loader_parallel_capable_of(&ctx, loader), Some(1));
+
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Synthetic-JDK mode is unchanged: the slots are still written, so a
+    /// reader that has not been converted (or a loader whose meta entry was
+    /// dropped) still finds the values where they have always been.
+    #[test]
+    fn cl_init_still_writes_the_slots_on_our_own_layout() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1SyntheticCtorLoader", false);
+
+        let name = ctx.create_string("l1");
+        cl_init_name_parent(
+            &mut ctx,
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        )
+        .expect("ClassLoader(String, ClassLoader) native");
+
+        assert_eq!(
+            ctx.get_field(loader, CL_LOADER_TYPE),
+            Value::Int(LOADER_CUSTOM)
+        );
+        assert_eq!(ctx.get_field(loader, CL_CLASSES_LOADED), Value::Int(0));
+        assert_eq!(ctx.get_field(loader, CL_IS_PARALLEL_CAPABLE), Value::Int(1));
+        let slot_id = match ctx.get_field(loader, CL_LOADER_ID) {
+            Value::Int(v) => v,
+            other => panic!("expected a namespace id in slot 6, got {other:?}"),
+        };
+        assert!(slot_id > 0);
+        assert_eq!(loader_id_of(&ctx, loader), Some(slot_id as u32));
+
+        // The raw-slot fallback is what keeps a loader allocated outside our
+        // path working. Drop the table entry and the slots must still answer.
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert_eq!(loader_type_of(&ctx, loader), Some(LOADER_CUSTOM));
+        assert_eq!(loader_classes_loaded_of(&ctx, loader), Some(0));
+        assert_eq!(loader_parallel_capable_of(&ctx, loader), Some(1));
+        assert_eq!(loader_id_of(&ctx, loader), Some(slot_id as u32));
+    }
+
+    /// The fallback must NOT fire on the real layout: slot 4 there is
+    /// `parallelLockMap`, and reading it back as this VM's parallel-capable
+    /// flag is the same type confusion the write side just stopped
+    /// committing. "No `CL_*` value is read from an object slot on a
+    /// real-JDK run" is half of L1's done-when.
+    #[test]
+    fn readers_do_not_fall_back_to_raw_slots_on_a_real_layout() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1NoFallbackLoader", true);
+
+        // Plant values that WOULD be read if the fallback were ungated.
+        ctx.set_field(loader, CL_LOADER_TYPE, Value::Int(LOADER_PLATFORM));
+        ctx.set_field(loader, CL_CLASSES_LOADED, Value::Int(77));
+        ctx.set_field(loader, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
+        ctx.set_field(loader, CL_LOADER_ID, Value::Int(4242));
+
+        assert_eq!(loader_type_of(&ctx, loader), None);
+        assert_eq!(loader_classes_loaded_of(&ctx, loader), None);
+        assert_eq!(loader_parallel_capable_of(&ctx, loader), None);
+        assert_eq!(loader_id_of(&ctx, loader), None);
+
+        // `isRegisteredAsParallelCapable` therefore answers the same `true`
+        // `registerAsParallelCapable` reports, rather than the `0` that
+        // happened to be sitting in `parallelLockMap`'s slot.
+        let answer = cl_is_registered_as_parallel_capable(&mut ctx, &[Value::Object(Some(loader))])
+            .expect("native")
+            .expect("return value");
+        assert_eq!(answer, Value::Int(1));
+    }
+
+    /// The side table is authoritative, ahead of the slot — the ordering
+    /// `vh_field_desc` uses.
+    #[test]
+    fn the_side_table_outranks_the_raw_slot() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1PrecedenceLoader", false);
+        ctx.set_field(loader, CL_LOADER_TYPE, Value::Int(LOADER_APP));
+        loader_meta_put(
+            loader,
+            LoaderMeta {
+                loader_type: Some(LOADER_CUSTOM),
+                ..LoaderMeta::default()
+            },
+        );
+
+        assert_eq!(loader_type_of(&ctx, loader), Some(LOADER_CUSTOM));
+        // A member the table does NOT carry still falls through to the slot.
+        ctx.set_field(loader, CL_CLASSES_LOADED, Value::Int(5));
+        assert_eq!(loader_classes_loaded_of(&ctx, loader), Some(5));
+
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Same GC contract as `loader_namespace_id_store`, and for the same
+    /// reason: the table is keyed by a raw heap address. Prune the dead so a
+    /// recycled address cannot make a brand-new loader inherit a dead one's
+    /// namespace id; remap the moved so a relocated loader keeps its own.
+    /// Deleting either half of the `retain_mut` fails here.
+    #[test]
+    fn loader_meta_store_is_pruned_and_remapped_by_gc_reconcile() {
+        let mut ctx = MockNativeContext::new();
+        let dead = make_loader(&mut ctx, "example/L1GcDeadLoader", false);
+        let moved_from = make_loader(&mut ctx, "example/L1GcMovedLoader", false);
+        let moved_to = new_object_ref(&mut ctx, "example/L1GcMovedLoader");
+
+        const DEAD_NS: u32 = 90_101;
+        const MOVED_NS: u32 = 90_102;
+        loader_meta_put(
+            dead,
+            LoaderMeta {
+                loader_id: Some(DEAD_NS),
+                ..LoaderMeta::default()
+            },
+        );
+        loader_meta_put(
+            moved_from,
+            LoaderMeta {
+                loader_id: Some(MOVED_NS),
+                ..LoaderMeta::default()
+            },
+        );
+        assert_eq!(loader_id_of(&ctx, dead), Some(DEAD_NS));
+
+        let dead_addr = dead.as_ptr() as usize;
+        let from_addr = moved_from.as_ptr() as usize;
+        let to_addr = moved_to.as_ptr() as usize;
+        // Process-global store in a multi-threaded test binary: report every
+        // address this test does not own as ALIVE, so nothing another test
+        // registered can be pruned by this call.
+        let is_marked = move |addr: usize| addr != dead_addr;
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(from_addr, to_addr);
+
+        gc_reconcile_defining_loaders(&is_marked, &pointer_map);
+
+        assert!(
+            loader_meta_get(dead).is_none(),
+            "a loader collected this cycle must not keep its bookkeeping entry"
+        );
+        assert_eq!(
+            loader_meta_get(moved_to).and_then(|m| m.loader_id),
+            Some(MOVED_NS),
+            "a relocated loader must keep its bookkeeping at its new address"
+        );
+        assert!(
+            loader_meta_get(moved_from).is_none(),
+            "the pre-collection address must no longer resolve"
+        );
+
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, m)| m.loader_id != Some(DEAD_NS) && m.loader_id != Some(MOVED_NS));
+    }
+
+    /// `loader_object_for_namespace_id` has to be able to invert an id that a
+    /// constructor native assigned. Before L1 real-JDK mode got that for free
+    /// (the slot write was coerced away, so `loader_namespace_id_at` allocated
+    /// a fresh id and stored the object); now the constructor's id survives,
+    /// so it has to be mirrored in explicitly.
+    #[test]
+    fn a_constructor_assigned_namespace_id_is_invertible() {
+        let mut ctx = MockNativeContext::new();
+        let loader = make_loader(&mut ctx, "example/L1InvertibleLoader", true);
+        let name = ctx.create_string("l1");
+        cl_init_name_parent(
+            &mut ctx,
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(name)),
+                Value::Object(None),
+            ],
+        )
+        .expect("ClassLoader(String, ClassLoader) native");
+
+        let ns = loader_namespace_id(&mut ctx, loader);
+        assert!(ns > 0, "a user-defined loader gets its own namespace");
+        assert_eq!(
+            loader_object_for_namespace_id(ns).map(|o| o.as_ptr()),
+            Some(loader.as_ptr()),
+            "the id must resolve back to the loader that owns it"
+        );
+
+        loader_namespace_id_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, id)| *id != ns);
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[test]

@@ -621,6 +621,9 @@ pub(crate) struct MockNativeContext {
     /// to simulate a class with a specific declared field list for
     /// `ObjectStreamClass` / reflection-driven code.
     pub(crate) declared_fields_override: UnsafeCell<HashMap<u32, Vec<FieldMetadata>>>,
+    /// Next id handed out by `allocate_loader_id`. Starts at
+    /// `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` like the real VM's counter.
+    pub(crate) next_loader_id: u32,
     /// Per-class overrides for `inner_classes` (the `InnerClasses` attribute
     /// entries, as `(inner_class_name, outer_class_name, inner_name,
     /// access_flags)`). Empty vec by default (mock has no class metadata);
@@ -798,6 +801,7 @@ impl MockNativeContext {
             blocking_begin_count: 0,
             blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
+            next_loader_id: cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED,
             inner_classes_override: UnsafeCell::new(HashMap::new()),
             declared_methods_override: UnsafeCell::new(HashMap::new()),
             superclass_override: UnsafeCell::new(HashMap::new()),
@@ -1619,7 +1623,18 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
     }
 
     fn allocate_loader_id(&mut self) -> u32 {
-        0
+        // The real implementation (`vm_exec::allocate_loader_id`) hands out a
+        // monotonic counter starting at
+        // `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` — 0/1/2 are reserved for
+        // Bootstrap/Extension/Application and are never a user-loader id.
+        // This used to return a constant `0`, which is the ONE value every
+        // caller in `classloader.rs` reads as "no namespace assigned", so any
+        // test exercising an id-assigning path silently measured the
+        // unassigned case. Mirror the real counter instead; it is per-mock,
+        // so tests stay independent of each other.
+        let id = self.next_loader_id;
+        self.next_loader_id += 1;
+        id
     }
 
     fn method_parameter_annotations(
@@ -1848,6 +1863,21 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         class_id: ClassId,
         field_name: &str,
     ) -> Option<usize> {
+        // Fields a test declared via `set_declared_fields` resolve here too.
+        // The real implementation (`resolve_field_index_in_hierarchy`) walks
+        // the class hierarchy over exactly this metadata. Without it a
+        // predicate of the form "does this class declare <a field only the
+        // REAL JDK class has>" is unfalsifiable under the mock — it could
+        // only ever answer `None`, and a test of it would pass vacuously.
+        // `classloader::cl_has_synthetic_layout` is such a predicate.
+        if let Some(slot) = self
+            .declared_fields(class_id)
+            .iter()
+            .find(|f| !f.is_static && f.name == field_name)
+            .map(|f| f.slot_index)
+        {
+            return Some(slot);
+        }
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
     }
 
