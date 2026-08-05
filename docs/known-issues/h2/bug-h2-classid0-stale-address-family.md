@@ -499,7 +499,7 @@ workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
 the 27.
 
 `TimeoutException` is the separate throughput defect tracked on
-`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+`h2-update-path-throughput-20260802.md`, not this one.
 
 #### Eliminated, with measurements
 
@@ -786,7 +786,7 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
-* `bug-h2-testmultithread-concurrent-update-timeout.md` — the class the
+* `h2-update-path-throughput-20260802.md` — the class the
   blocked-frame face was found in, whose own problem is throughput, not this.
 * the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
   same signature; see *Handed over from `TestDiskFull`* above.
