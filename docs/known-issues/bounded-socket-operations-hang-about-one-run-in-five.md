@@ -106,6 +106,35 @@ under "AUDIT 2026-05-17" ("clone the per-listener `Arc<Mutex<_>>`, drop the map
 lock, then perform the blocking accept"). `net_poll` was the one path that
 missed it.
 
+## The A/B, and the first one that proved nothing
+
+**Result: pre-fix 13/60 hung, post-fix 0/60.**
+
+The first attempt was 30 sequential runs per arm on a quiet host and returned
+**0/30 on both arms — including the pre-fix binary**. That is not a passing
+A/B, it is a failed reproduction, and reporting it as a fix would have been the
+"aggregate that is not a before/after" this feature keeps producing. The race
+needs `Net.socket0` to land inside a window the accept thread opens twice per
+50 ms slice; at load 14 it is never hit, and the original evidence was taken at
+load 60–160.
+
+So the second attempt generates its own contention — 10 concurrent copies of
+the probe per wave, six waves — and **alternates the arms within each wave**.
+Running one arm to completion and then the other is how the first attempt ended
+up comparing two different machines.
+
+| wave | pre-fix cumulative | post-fix cumulative |
+|---|---|---|
+| 1 | 3/10 | 0/10 |
+| 2 | 5/20 | 0/20 |
+| 3 | 5/30 | 0/30 |
+| 4 | 5/40 | 0/40 |
+| 5 | 7/50 | 0/50 |
+| 6 | **13/60** | **0/60** |
+
+Same host, same minute, same load, same class files. The pre-fix arm hung in
+every single wave and the post-fix arm never did.
+
 ## What it is not
 
 Every one of these was measured, and all four still stand:

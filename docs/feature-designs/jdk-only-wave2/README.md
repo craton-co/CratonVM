@@ -33,14 +33,14 @@ can work on what, simultaneously, without colliding.**
 | [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
 | [L6](L6-unadjudicated-bridge-ratchet.md) | Ratchet the 10,084 unadjudicated `Bridge` rows | `native-builtins/tests/`, `scripts/` | — | S |
 | [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
-| [L8](L8-strict-corpus-green.md) | Criterion 6: strict corpus green | `probes/`, `regression-suite/` | — | L |
+| [L8](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L3–L8 can all start today, in parallel, by different people.** (L1 and L2
-are done; L9 is closed.)
+**L3–L7 can all start today, in parallel, by different people.** (L1, L2 and
+L8 are done; L9 is closed.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -136,7 +136,11 @@ above looks paranoid.
 4. `Compatible` mode byte-for-byte unchanged.
 5. No process globals for this feature's state.
 6. **Strict corpus green.** The unmeasured half until 2026-08-04, and where the
-   defects turned out to be — see L8.
+   defects turned out to be. **Not green**, and now measured on every CI run by
+   `scripts/jdk-only-strict-probes.sh` — see
+   [L8 retired](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md).
+   Four open records stand between here and green, all four **compatibility**
+   defects that `--jdk-only` did not introduce.
 
 ## State as of 2026-08-05
 
@@ -183,3 +187,35 @@ comment. Item 7 is still blocked on L10.
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
 so `kind_stated` is no longer `false` on all 11,909 rows.
+
+**Update, 2026-08-05 — L8 is retired, and criterion 6 is now measured on every
+build.** One new probe over the five surfaces nothing covered (ProcessBuilder,
+security providers, virtual threads, agents/attach, JNI) found four divergences
+on its first run, and two of those were binding failures hiding three more
+underneath. Seven defects: five fixed, four filed (one of the five fixed is the
+lane's own open residual). **Zero were introduced by `--jdk-only`** — every one
+was already wrong in Compatible mode and had simply never been executed, which
+is the fourth independent confirmation of this wave's central pattern.
+
+Two of the fixes are worth naming here because their blast radius is not
+`--jdk-only`-shaped at all: **no JNI native on a nested class could bind**
+(`jni_encode` never escaped `$`), and **`RegisterNatives` always returned
+`JNI_ERR`** (it decoded `JClass` as an object handle while `FindClass` returns
+a `ClassId`). Between them, the `FindClass` + `RegisterNatives` idiom every
+`JNI_OnLoad` is built on had never worked.
+
+Two corrections to this document's own numbers, both from the same census
+instrument pointed at a suite for the first time:
+
+* the three standing probes reach **674** slots, not 401, and the registry is
+  **11,526** now that the `String` natives are gone;
+* "take the censuses from the suites, not the probes" is wrong as stated.
+  Three H2 classes reach 729 slots and the probes reach 674, but **305 are
+  suite-only and 250 are probe-only** — neither is a superset. L5/L6/L7 should
+  read the union.
+
+Item 2's floor warning gains a fifth instance: `ProcessBuilder.redirectInput`
+wrote a `File` into raw slot 3, which on a real `java/lang/ProcessBuilder` is
+the `redirectErrorStream` **boolean**. A reference-into-primitive write, exactly
+what the hunter is meant to catch, found instead by a probe diffing behaviour
+against HotSpot.
