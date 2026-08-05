@@ -501,6 +501,28 @@ pub struct EnclosingMethodInfo {
     pub method_descriptor: String,
 }
 
+/// Counts in-place changes to any class's provenance — see [`class_origin_epoch`].
+static CLASS_ORIGIN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times any class's [`ClassOrigin`] has been rewritten in place.
+///
+/// Consumers that memoize something derived from a class's provenance —
+/// specifically whether it is a synthetic stub — can hold their entry against
+/// this value and drop it when the number moves. That is what makes such a
+/// memo safe: a stub's field descriptors are placeholders that must not be
+/// trusted, but a stub can be *promoted* to the real class at any time
+/// ([`ClassManager::upgrade_synthetic_class`]), and a cached "this is a stub"
+/// answer would then be wrong forever.
+///
+/// Only IN-PLACE changes need to bump this. A brand-new class gets a fresh
+/// `ClassId`, so no entry keyed by that id can exist to go stale.
+/// [`Class::set_origin`] is the documented single writer of the provenance
+/// pair, which is why the bump lives there.
+#[inline]
+pub fn class_origin_epoch() -> u64 {
+    CLASS_ORIGIN_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Class {
     // ----- Provenance ------------------------------------------------------
 
@@ -520,6 +542,12 @@ impl Class {
     pub fn set_origin(&mut self, origin: ClassOrigin) {
         self.is_synthetic_stub = origin.is_compatibility_stub();
         self.origin = origin;
+        // Invalidate every memo derived from provenance — see
+        // [`class_origin_epoch`]. Unconditional rather than gated on the
+        // stub bit actually changing: this runs once per class definition or
+        // upgrade, never on a hot path, and a bump that was not strictly
+        // required only costs a re-resolve.
+        CLASS_ORIGIN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ----- Interned accessors ---------------------------------------------
@@ -1163,6 +1191,13 @@ impl ClassStore {
         let superclass = class.superclass;
         self.classes.push(Some(class));
         self.live_count += 1;
+        // A new class can be the ANCESTOR a descendant's descriptor lookup was
+        // previously unable to resolve, so it retires provenance-derived memos
+        // for the same reason an in-place origin change does — see
+        // [`class_origin_epoch`]. Not every `add` needs this (most classes are
+        // nobody's missing ancestor), but the alternative is reasoning about
+        // which ones do, and a class definition is not a hot path.
+        CLASS_ORIGIN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Ids are monotonic, so appending keeps each child list sorted.
         if let Some(sid) = superclass {
             self.subclasses.entry(sid.as_u32()).or_default().push(id.as_u32());

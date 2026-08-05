@@ -2810,8 +2810,12 @@ thread_local! {
     /// millions of consecutive writes to the same `(class, slot)`; once the
     /// shared cache has a definitive result, repeating its RwLock + hash probe
     /// adds no correctness value. The VM identity prevents cross-VM reuse.
+    ///
+    /// Entries carry the [`class_origin_epoch`] they were resolved under, so
+    /// a TRANSIENT miss can live here too — see
+    /// [`resolve_field_descriptor_byte_cached`]'s stub note.
     static FIELD_DESCRIPTOR_LAST:
-        std::cell::Cell<Option<(usize, u32, usize, u8)>> =
+        std::cell::Cell<Option<(usize, u32, usize, u8, u64)>> =
         const { std::cell::Cell::new(None) };
 
     /// PERF (perf/halfgap-20260717): the single-entry cache above thrashes
@@ -2840,8 +2844,8 @@ thread_local! {
     /// so a collision can only cost a re-walk, never return another field's
     /// descriptor.
     static FIELD_DESCRIPTOR_RING:
-        std::cell::RefCell<[(usize, u32, usize, u8); 64]> =
-        const { std::cell::RefCell::new([(0, 0, 0, 0); 64]) };
+        std::cell::RefCell<[(usize, u32, usize, u8, u64); 64]> =
+        const { std::cell::RefCell::new([(0, 0, 0, 0, 0); 64]) };
 }
 
 /// Bucket for [`FIELD_DESCRIPTOR_RING`]. Slot indices are small and dense, so
@@ -2852,14 +2856,25 @@ fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
     ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
 }
 
-/// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
-/// in both thread-local tiers.
-fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, byte: u8) {
-    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
+/// Record a descriptor result (byte, or 0 = negative) in both thread-local
+/// tiers, stamped with the class-provenance epoch it was resolved under.
+///
+/// `epoch` is what lets a TRANSIENT miss be memoized here: the entry is only
+/// honoured while provenance has not moved, so a stub's promotion to the real
+/// class retires it. Definitive results pass the epoch too — harmless, and it
+/// keeps one code path.
+fn field_descriptor_remember(
+    vm_key: usize,
+    class_id: u32,
+    slot_index: usize,
+    byte: u8,
+    epoch: u64,
+) {
+    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte, epoch))));
     FIELD_DESCRIPTOR_RING.with(|cell| {
         let mut ring = cell.borrow_mut();
         let idx = field_descriptor_bucket(class_id, slot_index);
-        ring[idx] = (vm_key, class_id, slot_index, byte);
+        ring[idx] = (vm_key, class_id, slot_index, byte, epoch);
     });
 }
 
@@ -2886,13 +2901,20 @@ fn resolve_field_descriptor_byte_cached(
     // especially by unit tests. Use the process-unique lifetime identity so
     // thread-local descriptor entries can never bleed into a later VM.
     let vm_key = shared.vm_identity;
+    // Provenance generation. Entries in the two thread-local tiers are only
+    // honoured while this is unchanged, which is what lets a synthetic-stub
+    // answer be memoized at all (see the stub note on the slow path).
+    let epoch = cratonvm_classloading::class_origin_epoch();
     if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
         cache
             .get()
-            .filter(|(vm, cid, slot, _)| {
-                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
+            .filter(|(vm, cid, slot, _, ep)| {
+                *vm == vm_key
+                    && *cid == class_id.as_u32()
+                    && *slot == slot_index
+                    && *ep == epoch
             })
-            .map(|(_, _, _, byte)| byte)
+            .map(|(_, _, _, byte, _)| byte)
     }) {
         return if cached == 0 { None } else { Some(cached) };
     }
@@ -2900,12 +2922,15 @@ fn resolve_field_descriptor_byte_cached(
     let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
         let ring = cell.borrow();
         let entry = ring[field_descriptor_bucket(class_id.as_u32(), slot_index)];
-        (entry.0 == vm_key && entry.1 == class_id.as_u32() && entry.2 == slot_index)
+        (entry.0 == vm_key
+            && entry.1 == class_id.as_u32()
+            && entry.2 == slot_index
+            && entry.4 == epoch)
             .then_some(entry.3)
     });
     if let Some(byte) = ring_hit {
         FIELD_DESCRIPTOR_LAST
-            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte))));
+            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte, epoch))));
         return if byte == 0 { None } else { Some(byte) };
     }
     // Fast path: read lock, hash lookup, early return on hit.
@@ -2923,7 +2948,7 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.classes.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b, epoch);
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -3039,10 +3064,7 @@ fn resolve_field_descriptor_byte_cached(
     // miss (`cacheable`) caches the `0u8` sentinel so the next lookup short-
     // circuits in the fast path instead of re-walking the hierarchy вЂ” this is
     // the common case for any real field/slot with no descriptor mapping, which
-    // previously re-walked under the read lock on every single access. A
-    // TRANSIENT miss (`!cacheable`: class/ancestor not loaded, or a synthetic
-    // stub that may be promoted) is NOT cached, so it re-walks and picks up the
-    // real descriptor once the class is loaded/promoted.
+    // previously re-walked under the read lock on every single access.
     //
     // Correctness under class redefinition: JEP 109 / JVMTI redefinition
     // performs an in-place method-body swap and MUST preserve field layout, so
@@ -3054,13 +3076,32 @@ fn resolve_field_descriptor_byte_cached(
             // never collide with the negative sentinel.
             debug_assert_ne!(b, 0, "descriptor first byte must not be NUL");
             cache_field_descriptor(shared, (class_id, slot_index), b);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b, epoch);
         }
         None if cacheable => {
             cache_field_descriptor(shared, (class_id, slot_index), 0u8);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8);
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8, epoch);
         }
-        None => {}
+        // TRANSIENT miss: the receiver's class — or an ancestor — is a
+        // synthetic stub whose descriptors are placeholders, or is not loaded
+        // yet. The answer may change (a stub can be promoted to the real class,
+        // an ancestor can load), so it must NOT go into the SHARED cache, which
+        // has no invalidation.
+        //
+        // PERF (testssl-testpost bulk TLS): it may, however, be memoized in the
+        // THREAD-LOCAL tiers, because those are epoch-stamped and
+        // `Class::set_origin` bumps the epoch on exactly the events that could
+        // change the answer. Without this, every `NativeContext::get_field` on a
+        // synthetic receiver re-took the process-global `class_manager` read
+        // lock to re-derive an answer that never changes in practice — and
+        // CratonVM's own stream/socket stand-ins (`SSLSocketInputStream` and
+        // friends) are all synthetic. `TestSsl.testPost` reads 16 MiB one byte
+        // at a time on each of 8 threads, so that lock was acquired ~134 million
+        // times in one test; measured against a no-op native on the same
+        // receiver, the field read cost 167 ns/call at 1 thread and 1166 ns/call
+        // at 8 — the superlinear part being the shared-cacheline RMW of the read
+        // acquire, not any real work.
+        None => field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8, epoch),
     }
     desc_byte
 }
@@ -25352,6 +25393,90 @@ mod tests {
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)
+    }
+
+    /// A synthetic stub's descriptor answer may be memoized — but ONLY for as
+    /// long as it is still a stub. Promotion to the real class must retire the
+    /// memo, or the promoted class would keep serving the stub's answer (raw,
+    /// descriptor-unaware reads) forever.
+    ///
+    /// This is the invariant that makes the thread-local memoization of a
+    /// TRANSIENT miss safe, so it is the invariant worth pinning. It is
+    /// exercised by INJECTING the promotion: resolve once against the stub,
+    /// then flip the origin the way `upgrade_synthetic_class` does and resolve
+    /// again. Without the epoch in the thread-local key, the second resolve
+    /// returns the stale `None` and this test fails.
+    #[test]
+    fn promoting_a_stub_retires_its_memoized_descriptor() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/StubPromote", &["J"]);
+
+        // Make it a stub after the fact, exactly as a fabricated stand-in would
+        // be, and confirm the resolver refuses to trust its descriptors.
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::compatibility_stub(
+                "test stub",
+            ));
+        }
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            None,
+            "a synthetic stub's placeholder descriptors must not be trusted"
+        );
+        // Repeat: this is the call the memo now serves without the global lock.
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            None,
+            "the stub answer is stable while the class is still a stub"
+        );
+
+        // INJECT the promotion the memo has to survive.
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::default());
+        }
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "after promotion the REAL descriptor must win — a memo that \
+             outlived the stub would pin the placeholder answer forever"
+        );
+    }
+
+    /// The epoch only has to move when provenance is rewritten in place; a
+    /// bump on every call would make the memo above useless, and no bump at all
+    /// would make it unsafe.
+    #[test]
+    fn class_origin_epoch_moves_only_on_a_provenance_write() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/EpochStill", &["I"]);
+        // Sampled AFTER the class is added: defining a class bumps the epoch
+        // too (a new class can be someone's previously-missing ancestor).
+        let before = cratonvm_classloading::class_origin_epoch();
+        // Resolving does not touch provenance.
+        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        assert_eq!(
+            cratonvm_classloading::class_origin_epoch(),
+            before,
+            "reads must not bump the epoch, or every memo is invalidated \
+             immediately and the lock is back on the hot path"
+        );
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::compatibility_stub("x"));
+        }
+        assert!(
+            cratonvm_classloading::class_origin_epoch() > before,
+            "set_origin is the documented single writer of provenance, so it \
+             must be the thing that retires provenance-derived memos"
+        );
     }
 
     #[test]

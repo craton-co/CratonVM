@@ -401,7 +401,16 @@ fn sock_set<F: FnOnce(&mut SockSide)>(ctx: &dyn NativeContext, this: ObjectRef, 
 /// restriction via `SSLSocket.setEnabledCipherSuites` — that only takes
 /// effect through the real Java call chain.
 pub(crate) fn sock_stream_id_for_upcall(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    sock_get(ctx, this).stream_id
+    // Read the one `i32` under the lock instead of `sock_get`'s whole-struct
+    // clone. `SockSide` owns a `String` and a `Vec`, so the clone was two heap
+    // allocations per call to answer a question about a single integer — and
+    // this is the per-call fallback under `SSLSocketInputStream.read()I`, whose
+    // callers read megabytes one byte at a time.
+    sock_side_table()
+        .lock()
+        .get(&native_obj_key(ctx, this))
+        .map(|s| s.stream_id)
+        .unwrap_or(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,13 +1687,19 @@ fn java_byte_array_to_vec(
             "byte[] out of range: off={off} len={ln} array={len_usize}"
         )));
     }
-    let mut out = Vec::with_capacity(ln);
-    for i in 0..ln {
-        let v = ctx.get_array_element(arr, off + i);
-        out.push(match v {
-            Value::Int(n) => (n as i8) as u8,
-            _ => 0,
-        });
+    // PERF: one bulk copy instead of one virtual `get_array_element` (plus a
+    // `Value` box) per byte. This is the marshalling step under every
+    // `Socket.getOutputStream().write(byte[], int, int)`, so its per-byte cost
+    // is paid by every bulk socket write in the VM. The range is already
+    // bounds-checked above, so the intrinsic copies exactly `ln` bytes; a short
+    // return means `arr` is not a byte[] and the old loop's zero-fill would have
+    // put bytes on the wire the caller never supplied.
+    let mut out = vec![0u8; ln];
+    let copied = ctx.read_byte_array_into(arr, off, &mut out);
+    if copied != ln {
+        return Err(iae(format!(
+            "byte[] slice not readable: off={off} len={ln} copied={copied}"
+        )));
     }
     Ok(out)
 }
