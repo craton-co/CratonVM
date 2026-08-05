@@ -1541,6 +1541,22 @@ pub(super) fn try_osr(
         }
     };
 
+    // osr-02 frame comparator: record the ENTRY frame — the state compiled code
+    // is about to start from. Here, because the entry has validated and nothing
+    // has run yet.
+    //
+    // Without this record the comparator cannot see a replay at all: compiled
+    // iterations produce no back-edge arrivals, so "entered at frame 5, ran to
+    // 12, resumed at 5" and "entered at 5 and advanced nothing" are the same
+    // sequence of arrival indices, both strictly increasing. A hand-written
+    // fixture modelling the historical defect passed without it. Paired with
+    // the next exit record this makes the advance a MEASURED quantity —
+    // `index(X) - index(E)` over the un-compiled run's own trajectory, not
+    // anything the JIT claims.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_entry(&thread.frames[frame_idx], entry_pc);
+    }
+
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
     // Capture this `*mut JvmThread` so the OSR trampoline can cache it and the
@@ -2510,6 +2526,17 @@ pub(super) fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: C
     elidable
 }
 
+/// `CRATONVM_JIT=sync-methods` — admit `ACC_SYNCHRONIZED` methods to the
+/// invocation-counter compile path, where the interpreter's call wrapper owns
+/// the implicit monitor. Read once and cached; this sits on the hot
+/// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
+fn jit_sync_methods_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
+    })
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -2557,10 +2584,31 @@ pub(super) fn try_jit_upgrade_with_gate(
     if gate.generation > 0 {
         return None;
     }
-    // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
-    // Do not let a cached interpreter target become a compiled monitor-less
-    // body through the invocation-counter upgrade path.
-    if cached.is_synchronized {
+    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
+    // the *caller* supplies it. Both interpreter entry points into compiled code
+    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
+    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
+    // class mirror's) monitor for the whole native activation and releases it on
+    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
+    // through those two, so admitting a synchronized method here is contained.
+    //
+    // The three entries that would NOT be wrapped each refuse a synchronized
+    // callee independently, and must keep doing so:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
+    //     `named_method_is_synchronized` gate;
+    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
+    //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
+    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
+    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
+    // deploy interpreted — the method was rejected here *before* it was ever
+    // counted, which is why `jit-method-stats` reported it neither compiled nor
+    // `hot_but_stuck_in_interpreter`. See
+    // docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
+    if cached.is_synchronized && !jit_sync_methods_enabled() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the

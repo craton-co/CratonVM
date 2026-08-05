@@ -3887,11 +3887,11 @@ impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
-    /// See `update_root_snapshot` (`vm/src/runtime/interpreter.rs`) for why the
-    /// operand-stack-sourced roots are filtered against `heap.is_object_address`:
-    /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
-    /// roots without heap validation (its file is restricted from edits), and
-    /// the resulting bogus addresses crash the GC at the next mark/move.
+    /// Operand-stack-sourced roots are filtered against `heap.is_heap_addr`
+    /// (alignment + arena containment) — the SAME screen `scan_local_objects`
+    /// applies to locals, and deliberately not the strict `is_object_address`
+    /// header probe. See `scan_frame_roots` in
+    /// `runtime/interpreter/gc_and_alloc.rs` for the full rationale.
     pub(crate) fn deposit_root_snapshot(&mut self) {
         // A thread that is about to PARK cannot consult its per-thread JIT memo
         // caches, but this deposit publishes them as GC roots — so any entry
@@ -3999,7 +3999,11 @@ impl<'a> NativeContextImpl<'a> {
                 let added = snapshot.split_off(before);
                 for o in added {
                     let addr = o.as_ptr() as usize;
-                    if self.shared.mem.heap.is_object_address(addr).is_some() {
+                    // `is_heap_addr`, not `is_object_address` — see
+                    // `scan_frame_roots`. This deposit is the collector's ONLY
+                    // view of the thread once it blocks, so a root dropped here
+                    // is an object reclaimed under a live frame slot.
+                    if self.shared.mem.heap.is_heap_addr(addr).is_some() {
                         snapshot.push(o);
                     }
                 }
@@ -4045,6 +4049,11 @@ impl<'a> NativeContextImpl<'a> {
             let mut origins = self.thread.gc_block_state.slot_origins.lock();
             origins.clear();
             for (fi, fr) in self.thread.frames.iter().enumerate() {
+                // Recorded per slot, not applied as a filter: every slot is
+                // still tracked and written back, but the fold's invariant
+                // check needs to know which of them the collector was actually
+                // obliged to keep. See `SlotOrigin::live`.
+                let live_mask = fr.live_locals_mask_here();
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
@@ -4052,6 +4061,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: li as u32,
                             is_stack: false,
+                            live: li >= 64 || live_mask & (1u64 << li) != 0,
                             orig: a,
                             cur: a,
                         });
@@ -4064,6 +4074,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: si as u32,
                             is_stack: true,
+                            live: true,
                             orig: a,
                             cur: a,
                         });
@@ -4217,6 +4228,74 @@ impl<'a> NativeContextImpl<'a> {
             });
         }
 
+        // DIAGNOSTIC (CRATONVM_DBG_BLOCKGC) — the deposit-side precondition of
+        // the blocked-frame stale-receiver family, checked WITHOUT needing the
+        // rare collection to land in the window.
+        //
+        // This snapshot is the ONLY view a cross-thread collector has of this
+        // thread while it is blocked. So a frame slot that decodes as
+        // `Value::Object(Some(_))`, is LIVE at this frame's pc, and is not in
+        // the snapshot, is an object the collector will not know to keep — and
+        // the owner will read it again on wake. `slot_origins` (recorded just
+        // above) cannot rescue it either: that tracker advances `cur` through
+        // each cycle's pointer map, and an object nothing rooted is never IN a
+        // pointer map.
+        //
+        // What can differ: this walk decodes a slot with `to_value()`, while
+        // the two publishing scans additionally consult the parallel kind
+        // marks (`Frame::local_kinds`, `ValueStack::kinds`) and skip a slot
+        // marked `long`/`double`, so the moving collector cannot relocate a
+        // pointer-shaped primitive. A slot whose kind mark and whose value tag
+        // DISAGREE therefore falls between the two, and is published by
+        // neither. Non-zero output here names that slot.
+        if blockgc_dbg() && raise_blocked_flag {
+            let published: rustc_hash::FxHashSet<usize> =
+                snapshot.iter().map(|r| r.as_ptr() as usize).collect();
+            let heap = &self.shared.mem.heap;
+            let mut gaps = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                let live_mask = fr.live_locals_mask_here();
+                let mut report = |what: &str, idx: usize, a: usize| {
+                    if published.contains(&a) || heap.is_heap_addr(a).is_none() {
+                        return;
+                    }
+                    gaps += 1;
+                    if gaps <= 8 {
+                        eprintln!(
+                            "[blockgc] UNPUBLISHED-LIVE-SLOT tid={} frame#{fi} {}.{} pc={} \
+                             {what}[{idx}] 0x{a:x} — a live object frame slot the blocking \
+                             deposit did not publish as a root",
+                            self.thread.thread_id.0,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.pc,
+                        );
+                    }
+                };
+                for li in 0..fr.locals_len() {
+                    if li < 64 && live_mask & (1u64 << li) == 0 {
+                        continue;
+                    }
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        report("local", li, o.as_ptr() as usize);
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        report("stack", si, o.as_ptr() as usize);
+                    }
+                }
+            }
+            if gaps > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} frames={} snapshot={} UNPUBLISHED-LIVE-SLOTS={}",
+                    self.thread.thread_id.0,
+                    self.thread.frames.len(),
+                    snapshot.len(),
+                    gaps,
+                );
+            }
+        }
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
         // thread can read where THIS thread is parked (cross-thread
@@ -5453,97 +5532,215 @@ fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
         .is_some_and(|class| class.name.as_ref() == "java/lang/String")
 }
 
-/// Return the raw Java String hash directly from compact storage.
+/// How a `java.lang.String` instance stores its characters.
+///
+/// The first two match the JDK's own `String.LATIN1` / `String.UTF16` coder
+/// constants and describe a `byte[]` payload. [`STRING_STORAGE_CHARS`] is the
+/// pre-JDK-9 `char[]` payload, which CratonVM's own fabricated
+/// `java/lang/String` still uses — see [`java_string_storage`].
+const STRING_STORAGE_LATIN1: u8 = 0;
+const STRING_STORAGE_UTF16: u8 = 1;
+const STRING_STORAGE_CHARS: u8 = 2;
+
+/// The element type of `object`, or `None` when `object` is not an array at
+/// all. `VmHeap::array_element_type` reads a header word that is only
+/// meaningful on an array, so every layout probe below goes through here.
+fn array_element_type_of(shared: &SharedVm, object: ObjectRef) -> Option<ArrayElementType> {
+    if shared.mem.heap.kind_of(object) != ObjectKind::Array {
+        return None;
+    }
+    shared.mem.heap.array_element_type(object)
+}
+
+/// Locate a String's character array and how that array is encoded.
+///
+/// Returning `None` means *"this object's characters could not be located"* —
+/// never *"the string is empty"* and never anything about a comparison. Every
+/// caller must treat `None` as "fall back to running `String.hashCode()` /
+/// `String.equals()`".
+///
+/// # Why this is not just slots 0 and 1
+///
+/// The JDK-9+ compact layout (`value:[B` at slot 0, `coder:B` at slot 1) is
+/// probed first and answered without touching class metadata: it is the layout
+/// of every String in a real-JDK run and these readers sit under the hottest
+/// comparison in the map natives.
+///
+/// But it is not the only layout this VM runs. CratonVM's fabricated
+/// `java/lang/String` (booted whenever no real JDK image is in play — every
+/// in-process `VmConfig::new()` test) declares `value` + `hash` and has **no
+/// `coder` field at all**, so its slot 1 holds the *cached hash*. Reading that
+/// as a coder is what made `compact_java_strings_equal` answer "not equal" for
+/// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
+/// every String key the same map had just stored
+/// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+/// So when the positional probe does not describe a String, resolve `value`
+/// and `coder` by NAME off the receiver's own class before giving up.
+fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let heap = &shared.mem.heap;
+    if let Value::Object(Some(value)) = heap.get_field(object, 0) {
+        // `array_element_type` / `array_length` read header words that only
+        // mean anything on an array, so the kind check comes first — same
+        // order, and for the same reason, as `read_java_string`'s.
+        match array_element_type_of(shared, value) {
+            Some(ArrayElementType::Char) => return Some((value, STRING_STORAGE_CHARS)),
+            Some(ArrayElementType::Byte) => match heap.get_field(object, 1) {
+                Value::Int(0) => return Some((value, STRING_STORAGE_LATIN1)),
+                Value::Int(1) => return Some((value, STRING_STORAGE_UTF16)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    java_string_storage_by_name(shared, object)
+}
+
+/// Metadata-driven half of [`java_string_storage`], for any `java/lang/String`
+/// whose layout is not the JDK-9+ positional one. A missing `coder` field means
+/// a `byte[]` payload is LATIN1 — the same default `NativeContextImpl
+/// ::read_string` applies when it takes this route.
+fn java_string_storage_by_name(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let class_id = shared.mem.heap.class_id_of(object);
+    let (value_index, coder_index) = {
+        let cm = shared.classes.class_manager.read();
+        (
+            resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?,
+            resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store),
+        )
+    };
+    let Value::Object(Some(value)) = shared.mem.heap.get_field(object, value_index) else {
+        return None;
+    };
+    match array_element_type_of(shared, value) {
+        Some(ArrayElementType::Char) => Some((value, STRING_STORAGE_CHARS)),
+        Some(ArrayElementType::Byte) => {
+            match coder_index.map(|index| shared.mem.heap.get_field(object, index)) {
+                None | Some(Value::Int(0)) => Some((value, STRING_STORAGE_LATIN1)),
+                Some(Value::Int(1)) => Some((value, STRING_STORAGE_UTF16)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Number of UTF-16 code units in a character array of `element_count`
+/// elements under `storage`. `None` for a UTF16 `byte[]` of odd length, which
+/// is not a decodable String payload.
+fn string_unit_count(element_count: usize, storage: u8) -> Option<usize> {
+    match storage {
+        STRING_STORAGE_LATIN1 => Some(element_count),
+        STRING_STORAGE_UTF16 => (element_count % 2 == 0).then(|| element_count / 2),
+        _ => Some(element_count),
+    }
+}
+
+/// Read one UTF-16 code unit out of a String's character array.
+///
+/// # Safety
+/// `data` must point at `storage`'s payload and `index` must be less than the
+/// [`string_unit_count`] computed for that same payload.
+unsafe fn string_unit_at(data: *const u8, storage: u8, index: usize) -> u16 {
+    if storage == STRING_STORAGE_LATIN1 {
+        return unsafe { *data.add(index) } as u16;
+    }
+    // Both the UTF16 `byte[]` payload and a `char[]` payload are pairs of
+    // little-endian bytes (`StringUTF16.isBigEndian() == false`, and `char[]`
+    // elements are stored as native-endian `u16` on the little-endian targets
+    // this VM builds for).
+    unsafe {
+        u16::from_le_bytes([*data.add(index * 2), *data.add(index * 2 + 1)])
+    }
+}
+
+/// Return the raw Java String hash directly from the receiver's character
+/// storage, without materialising a host `String`.
+///
+/// `None` means the storage could not be read, not that the hash is 0.
 fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32> {
     if !is_real_java_string(shared, object) {
         return None;
     }
-    let (Value::Object(Some(bytes)), Value::Int(coder)) = (
-        shared.mem.heap.get_field(object, 0),
-        shared.mem.heap.get_field(object, 1),
-    ) else {
-        return None;
-    };
-    if !matches!(coder, 0 | 1)
-        || shared.mem.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
-    {
-        return None;
-    }
-    let ptr = shared.mem.heap.array_data_ptr(bytes)?;
-    let raw = unsafe {
-        std::slice::from_raw_parts(ptr as *const u8, shared.mem.heap.array_length(bytes))
-    };
+    let (value, storage) = java_string_storage(shared, object)?;
+    let data = shared.mem.heap.array_data_ptr(value)?;
+    let units = string_unit_count(shared.mem.heap.array_length(value), storage)?;
     let mut hash = 0i32;
-    if coder == 0 {
-        for &byte in raw {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
-        }
-    } else {
-        if raw.len() & 1 != 0 {
-            return None;
-        }
-        for unit in raw.chunks_exact(2) {
-            hash = hash
-                .wrapping_mul(31)
-                .wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
-        }
+    for index in 0..units {
+        // SAFETY: `data` is `value`'s payload and `index < units`, the unit
+        // count computed for that payload.
+        let unit = unsafe { string_unit_at(data, storage, index) };
+        hash = hash.wrapping_mul(31).wrapping_add(unit as i32);
     }
     Some(hash)
 }
 
-/// Compare final compact `java.lang.String` instances without creating a
-/// host `String`. Cache entries originate only from confirmed String keys; the
-/// class-id equality guard therefore also rejects unrelated objects that happen
-/// to expose a similar field layout.
-fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectRef) -> bool {
+/// Compare two `java.lang.String` instances without creating a host `String`.
+///
+/// `Some(_)` is an ANSWER; `None` means "this comparison was not made" — the
+/// caller must fall back to dispatching `String.equals`. Returning `false` for
+/// a String whose storage this function does not understand is what made
+/// `ConcurrentHashMap.get` miss keys the map held (see [`java_string_storage`]
+/// and the known-issue file it names): a "not equal" verdict is only ever
+/// correct once BOTH operands have actually been read.
+fn compact_java_strings_equal(
+    shared: &SharedVm,
+    left: ObjectRef,
+    right: ObjectRef,
+) -> Option<bool> {
     if left == right {
-        return true;
+        return Some(true);
     }
     if shared.mem.heap.class_id_of(left) != shared.mem.heap.class_id_of(right) {
-        return false;
+        return Some(false);
     }
-    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) = (
-        shared.mem.heap.get_field(left, 0),
-        shared.mem.heap.get_field(left, 1),
+    let (left_value, left_storage) = java_string_storage(shared, left)?;
+    let (right_value, right_storage) = java_string_storage(shared, right)?;
+    let (Some(left_data), Some(right_data)) = (
+        shared.mem.heap.array_data_ptr(left_value),
+        shared.mem.heap.array_data_ptr(right_value),
     ) else {
-        return false;
+        return None;
     };
-    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) = (
-        shared.mem.heap.get_field(right, 0),
-        shared.mem.heap.get_field(right, 1),
-    ) else {
-        return false;
-    };
-    if !matches!(left_coder, 0 | 1)
-        || !matches!(right_coder, 0 | 1)
-        || shared.mem.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
-        || shared.mem.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
-    {
-        return false;
+    let left_elements = shared.mem.heap.array_length(left_value);
+    let right_elements = shared.mem.heap.array_length(right_value);
+    if left_storage == right_storage {
+        // Same representation: one raw payload compare, no decoding at all.
+        //
+        // Bytes per ELEMENT, not per code unit: `array_length` already counts
+        // elements, and a UTF16 String's value array is a `byte[]` whose length
+        // is the byte count. Only a `char[]` has 2-byte elements. (Deriving the
+        // span from the unit count instead would read twice the payload of
+        // every UTF16 String.)
+        let element_bytes = if left_storage == STRING_STORAGE_CHARS {
+            2
+        } else {
+            1
+        };
+        let left_raw =
+            unsafe { std::slice::from_raw_parts(left_data, left_elements * element_bytes) };
+        let right_raw =
+            unsafe { std::slice::from_raw_parts(right_data, right_elements * element_bytes) };
+        return Some(left_raw == right_raw);
     }
-    let (Some(left_ptr), Some(right_ptr)) = (
-        shared.mem.heap.array_data_ptr(left_bytes),
-        shared.mem.heap.array_data_ptr(right_bytes),
-    ) else {
-        return false;
-    };
-    let left_len = shared.mem.heap.array_length(left_bytes);
-    let right_len = shared.mem.heap.array_length(right_bytes);
-    let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
-    let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
-    if left_coder == right_coder {
-        return left_raw == right_raw;
+    let left_units = string_unit_count(left_elements, left_storage)?;
+    let right_units = string_unit_count(right_elements, right_storage)?;
+    if left_units != right_units {
+        return Some(false);
     }
-    let (latin, utf16) = if left_coder == 0 {
-        (left_raw, right_raw)
-    } else {
-        (right_raw, left_raw)
-    };
-    utf16.len() == latin.len().saturating_mul(2)
-        && latin
-            .iter()
-            .zip(utf16.chunks_exact(2))
-            .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
+    for index in 0..left_units {
+        // SAFETY: each pointer is its own value array's payload and `index` is
+        // below that array's unit count.
+        let (l, r) = unsafe {
+            (
+                string_unit_at(left_data, left_storage, index),
+                string_unit_at(right_data, right_storage, index),
+            )
+        };
+        if l != r {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 impl<'a> NativeContextImpl<'a> {
@@ -9927,7 +10124,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if !is_real_java_string(self.shared, a) || !is_real_java_string(self.shared, b) {
             return None;
         }
-        Some(compact_java_strings_equal(self.shared, a, b))
+        compact_java_strings_equal(self.shared, a, b)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -23815,6 +24012,74 @@ mod tests {
             Value::Object(Some(o)) => o.as_ptr() as usize,
             other => panic!("expected an object slot, got {other:?}"),
         }
+    }
+
+    /// Two distinct `java.lang.String` objects with the same characters must
+    /// compare EQUAL through the native-context fast path, whatever layout
+    /// this VM's `java/lang/String` happens to use.
+    ///
+    /// `VmConfig::default()` boots the fabricated `java/lang/String`, which is
+    /// `char[]`-backed and has no `coder` field. The positional reader used to
+    /// read its slot 1 (the cached hash) as a coder, reject the value, and
+    /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
+    /// String-keyed CHM missed every key it held
+    /// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    #[test]
+    fn equal_strings_compare_equal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
+        assert_ne!(a.as_ptr(), b.as_ptr(), "the probe needs two distinct objects");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        // "k0" == 'k' * 31 + '0' == 3365, the value String.hashCode() returns.
+        assert_eq!(compact_java_string_hash(&shared, a), Some(3365));
+        assert_eq!(
+            compact_java_string_hash(&shared, a),
+            compact_java_string_hash(&shared, b)
+        );
+    }
+
+    /// Non-Latin1 content, which is the UTF16 `byte[]` payload on a real-JDK
+    /// String and a `char[]` payload here. Both are 2 bytes per code unit but
+    /// only one of them is 2 bytes per *array element*, and the same-storage
+    /// compare spans `array_length` elements — so getting that conversion
+    /// backwards reads past the end of every UTF16 String.
+    #[test]
+    fn non_latin1_strings_round_trip_through_the_compact_readers() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let c = crate::vm::create_java_string_uninterned(&shared, "kπ1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        assert_eq!(compact_java_strings_equal(&shared, a, c), Some(false));
+        let expected = "kπ0"
+            .encode_utf16()
+            .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+        assert_eq!(compact_java_string_hash(&shared, a), Some(expected));
+    }
+
+    /// Different characters still compare unequal — the fix must not make
+    /// every comparison "unknown".
+    #[test]
+    fn different_strings_compare_unequal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(false));
+    }
+
+    /// A String whose character storage cannot be located answers `None`
+    /// ("not compared"), never `Some(false)`. This is the whole contract: a
+    /// caller reading `false` stops looking, and that is how a present key
+    /// becomes an absent one.
+    #[test]
+    fn unreadable_string_storage_is_unknown_not_unequal() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
+        shared.mem.heap.set_field(b, 0, Value::Object(None));
+        assert_eq!(compact_java_strings_equal(&shared, a, b), None);
+        assert_eq!(compact_java_string_hash(&shared, b), None);
     }
 
     /// A virtual thread parked across a MOVING collection must resume with

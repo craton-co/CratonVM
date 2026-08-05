@@ -3,7 +3,7 @@
 
 //! Phase 50-54 native method registrations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
@@ -8245,6 +8245,24 @@ pub(crate) struct FjpEntry {
     /// `isCompletedNormally()` is false).
     pub(crate) cancelled: bool,
     pub(crate) result: Value,
+    /// The `Throwable` this task completed exceptionally with, or
+    /// `Value::Object(None)` for a task that has not completed abnormally.
+    ///
+    /// Every task this bridge runs executes INLINE on the submitting thread,
+    /// so a `Callable.call()` / `compute()` that throws surfaces here as an
+    /// `Err(MethodCallFailed::ExceptionThrown)` from `invoke_virtual` — with
+    /// nowhere to put it, the eager-inline natives used to discard it and
+    /// report a null result, so `Future.get()` handed back null instead of
+    /// throwing and `isCompletedNormally()` claimed success for a task that
+    /// had blown up. Weld's `AbstractExecutorServices.checkForExceptions`
+    /// (which calls `Future.get()` on every `invokeAll` result and rethrows
+    /// the `ExecutionException`'s cause) is the reason this has to be
+    /// modelled rather than approximated: without it a failed CDI bean
+    /// deployment reports success and the container boots half-built.
+    ///
+    /// Rooted and remapped by `gc_scan_forkjoin_roots` /
+    /// `gc_update_forkjoin_refs` exactly like `result`.
+    pub(crate) thrown: Value,
 }
 
 impl FjpEntry {
@@ -8253,6 +8271,7 @@ impl FjpEntry {
             done: false,
             cancelled: false,
             result: Value::Object(None),
+            thrown: Value::Object(None),
         }
     }
 }
@@ -8284,6 +8303,11 @@ pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
         if !e.cancelled {
             e.done = true;
             e.result = result;
+            // A normal completion clears any recorded throwable: this is the
+            // only path that says "the task produced a value", and the two
+            // states are mutually exclusive in the real `ForkJoinTask` status
+            // word too.
+            e.thrown = Value::Object(None);
         }
     }
     // Best-effort reap: if the table has grown beyond 4096 entries, drop
@@ -8299,6 +8323,33 @@ pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
         for k in drained {
             m.remove(&k);
         }
+    }
+}
+
+/// Complete the task ABNORMALLY with `thrown`.
+///
+/// Mirrors the real `ForkJoinTask.trySetThrown`: the task becomes DONE, has no
+/// result, and every later `join()`/`get()`/`invoke()` replays the throwable
+/// instead of handing back a value. A task that was already cancelled keeps
+/// its cancellation (the real status word is likewise write-once).
+pub(crate) fn fjp_state_set_thrown(o: ObjectRef, thrown: ObjectRef) {
+    let mut m = fjp_state().lock();
+    let e = m.entry(fjp_key(o)).or_insert_with(FjpEntry::new);
+    if !e.cancelled {
+        e.done = true;
+        e.result = Value::Object(None);
+        e.thrown = Value::Object(Some(thrown));
+    }
+}
+
+/// The `Throwable` a task completed abnormally with, if any.
+pub(crate) fn fjp_state_thrown(o: ObjectRef) -> Option<ObjectRef> {
+    match fjp_state().lock().get(&fjp_key(o)) {
+        Some(FjpEntry {
+            thrown: Value::Object(Some(t)),
+            ..
+        }) => Some(*t),
+        _ => None,
     }
 }
 
@@ -8403,6 +8454,13 @@ pub fn gc_scan_forkjoin_roots(out: &mut Vec<ObjectRef>) {
         if let Value::Object(Some(obj)) = entry.result {
             out.push(obj);
         }
+        // The recorded throwable is reachable ONLY from this table until a
+        // later `get()`/`join()` replays it — without this push a young GC
+        // reclaims the exception object and the replay hands back a dangling
+        // reference.
+        if let Value::Object(Some(obj)) = entry.thrown {
+            out.push(obj);
+        }
     }
 }
 
@@ -8419,6 +8477,7 @@ pub fn gc_update_forkjoin_refs(pointer_map: &std::collections::HashMap<usize, us
     for (key, mut entry) in m.drain() {
         let new_key = pointer_map.get(&key).copied().unwrap_or(key);
         fjp_remap_value_ref(&mut entry.result, pointer_map);
+        fjp_remap_value_ref(&mut entry.thrown, pointer_map);
         remapped.insert(new_key, entry);
     }
     *m = remapped;
@@ -8445,6 +8504,13 @@ enum FjtEntry {
     ComputeObject,
     ComputeVoid,
     Exec,
+    /// No `compute()`/`exec()` at all — the shape is unrecognised. Kept as its
+    /// own variant so the historical "try both `compute()` overloads, then
+    /// give up with null" guess stays confined to the case it was written for.
+    /// The three real variants above propagate a throwing body instead (see
+    /// `fjp_compute_and_complete`); replaying that blind retry for them ran a
+    /// throwing `compute()` a SECOND time.
+    Unknown,
 }
 
 /// Pick the entry point from the receiver's RUNTIME class rather than inferring
@@ -8464,7 +8530,7 @@ fn fjt_entry_point(ctx: &mut dyn NativeContext, task: ObjectRef) -> FjtEntry {
         FjtEntry::Exec
     } else {
         // Unknown shape -- keep the historical behaviour.
-        FjtEntry::ComputeObject
+        FjtEntry::Unknown
     }
 }
 
@@ -8506,52 +8572,493 @@ impl Drop for FjpActiveGuard {
     }
 }
 
-fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (ObjectRef, Value) {
+/// Run `task`'s body inline and COMPLETE it in the `fjp_state` side table.
+///
+/// Returns the (possibly relocated) task plus the outcome. A task body that
+/// throws is recorded as an abnormal completion via [`fjp_state_set_thrown`]
+/// and the exception is propagated to the caller — it used to be discarded,
+/// which made `join()` hand back null and `isCompletedNormally()` report
+/// success for a task that had blown up.
+///
+/// The completion happens while `task_pin` is still held and before any
+/// further allocation, so no GC can move the throwable between catching it
+/// and rooting it in the table.
+fn fjp_compute_and_complete(
+    ctx: &mut dyn NativeContext,
+    task: ObjectRef,
+) -> (ObjectRef, Result<Value, MethodCallFailed>) {
     let _active = FjpActiveGuard::enter();
     let task_pin = ctx.pin_native_root(task);
     let mut live_task = task;
-    let result = match fjt_entry_point(ctx, live_task) {
-        FjtEntry::ComputeObject => {
-            match ctx.invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[]) {
-                Ok(Some(val)) => val,
-                _ => {
-                    live_task = ctx.read_native_pin(task_pin, live_task);
-                    let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
-                    Value::Object(None)
-                }
-            }
-        }
-        FjtEntry::ComputeVoid => {
-            let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
-            Value::Object(None)
-        }
+    let outcome = match fjt_entry_point(ctx, live_task) {
+        FjtEntry::ComputeObject => ctx
+            .invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[])
+            .map(|v| v.unwrap_or(Value::Object(None))),
+        FjtEntry::ComputeVoid => ctx
+            .invoke_virtual(live_task, "compute", "()V", &[])
+            .map(|_| Value::Object(None)),
         FjtEntry::Exec => {
             // `exec()` runs the task and leaves any value in the task's own
             // raw-result slot; `ForkJoinTask<Void>` subclasses answer null.
-            let _ = ctx.invoke_virtual(live_task, "exec", "()Z", &[]);
-            live_task = ctx.read_native_pin(task_pin, live_task);
-            match ctx.invoke_virtual(live_task, "getRawResult", "()Ljava/lang/Object;", &[]) {
-                Ok(Some(val)) => val,
-                _ => Value::Object(None),
+            match ctx.invoke_virtual(live_task, "exec", "()Z", &[]) {
+                Ok(_) => {
+                    live_task = ctx.read_native_pin(task_pin, live_task);
+                    ctx.invoke_virtual(live_task, "getRawResult", "()Ljava/lang/Object;", &[])
+                        .map(|v| v.unwrap_or(Value::Object(None)))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        FjtEntry::Unknown => {
+            // Historical guess for a task class with no recognised entry
+            // point: try both `compute()` shapes and settle for null. Kept
+            // byte-for-byte because "which method carries the work" is
+            // genuinely unknown here, so a propagated NoSuchMethodError
+            // would be noise rather than the task's own failure.
+            match ctx.invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(val)) => Ok(val),
+                _ => {
+                    live_task = ctx.read_native_pin(task_pin, live_task);
+                    let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
+                    Ok(Value::Object(None))
+                }
             }
         }
     };
     live_task = ctx.read_native_pin(task_pin, live_task);
+    let outcome = fjp_complete_from_outcome(live_task, outcome);
     ctx.unpin_native_roots(task_pin);
-    (live_task, result)
+    (live_task, outcome)
 }
 
-fn fjp_compute_void(ctx: &mut dyn NativeContext, task: ObjectRef) -> ObjectRef {
+/// Complete `task` inline for a SUBMIT-shaped entry point.
+///
+/// `submit`/`execute` hand the task back and let a failure surface at the
+/// matching `join()`/`get()` — the real JDK does not raise the task's
+/// exception at the submitter. So a throwing body is RECORDED (via
+/// `fjp_compute_and_complete`) but not re-raised here. An internal VM error
+/// still propagates.
+pub(crate) fn fjp_compute_for_submit(
+    ctx: &mut dyn NativeContext,
+    task: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let (live_task, outcome) = fjp_compute_and_complete(ctx, task);
+    match outcome {
+        Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(live_task),
+        Err(internal) => Err(internal),
+    }
+}
+
+/// Record a computed outcome against `task` and hand it back.
+///
+/// `Err(InternalError)` is a VM-level failure rather than something the task
+/// "completed with", so it is passed through without touching the table.
+fn fjp_complete_from_outcome(
+    task: ObjectRef,
+    outcome: Result<Value, MethodCallFailed>,
+) -> Result<Value, MethodCallFailed> {
+    match outcome {
+        Ok(value) => {
+            fjp_state_set_done(task, value);
+            Ok(value)
+        }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            fjp_state_set_thrown(task, exc);
+            Err(MethodCallFailed::ExceptionThrown(exc))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn fjp_compute_void(
+    ctx: &mut dyn NativeContext,
+    task: ObjectRef,
+) -> (ObjectRef, Result<(), MethodCallFailed>) {
     let _active = FjpActiveGuard::enter();
     let task_pin = ctx.pin_native_root(task);
-    if fjt_entry_point(ctx, task) == FjtEntry::Exec {
-        let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+    let outcome = if fjt_entry_point(ctx, task) == FjtEntry::Exec {
+        ctx.invoke_virtual(task, "exec", "()Z", &[]).map(|_| ())
     } else {
-        let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
-    }
+        ctx.invoke_virtual(task, "compute", "()V", &[]).map(|_| ())
+    };
     let live_task = ctx.read_native_pin(task_pin, task);
+    let outcome = fjp_complete_from_outcome(live_task, outcome.map(|()| Value::Object(None)));
     ctx.unpin_native_roots(task_pin);
-    live_task
+    (live_task, outcome.map(|_| ()))
+}
+
+// ---------------------------------------------------------------------------
+// Bulk submission — invokeAll / invokeAny
+// ---------------------------------------------------------------------------
+//
+// `ForkJoinPool.commonPool()` is a VM Bridge shortcut: it hands back an object
+// that never ran the real pool constructor, so its `queues`/`runState`/`mode`
+// fields are unset. Every pool method therefore has to be either implemented
+// here or kept off the real-JDK path — anything that falls through to real
+// bytecode reaches `poolSubmit()`/`submissionQueue()` against that
+// under-initialized instance and throws `RejectedExecutionException`.
+//
+// `invokeAll(Collection)` was the overload Weld's `ConcurrentBeanDeployer` →
+// `AbstractExecutorServices.invokeAllAndCheckForExceptions` calls, and it was
+// never covered: that is what failed the entire `org.hibernate.orm.test.cdi.*`
+// cluster. `invokeAny` was uncovered too and was WORSE than a crash — real
+// bytecode ran the callables and then returned null, a silent wrong answer.
+
+/// Wrap `cause` in a `java.util.concurrent.ExecutionException` — the exception
+/// `Future.get()` is specified to raise for a task that completed abnormally.
+///
+/// The wrapper is load-bearing, not cosmetic: Weld's
+/// `AbstractExecutorServices.checkForExceptions` catches `ExecutionException`
+/// specifically and rethrows its `getCause()`. Handing back the bare cause
+/// would sail straight through that catch.
+fn fjp_execution_exception(ctx: &mut dyn NativeContext, cause: ObjectRef) -> MethodCallFailed {
+    let cause_pin = ctx.pin_native_root(cause);
+    let live_cause = ctx.read_native_pin(cause_pin, cause);
+    let built = ctx.new_object_initialized(
+        "java/util/concurrent/ExecutionException",
+        "(Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(live_cause))],
+    );
+    let live_cause = ctx.read_native_pin(cause_pin, live_cause);
+    ctx.unpin_native_roots(cause_pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        // Constructor unavailable: the raw cause still REPORTS the failure,
+        // which beats reporting success with a null result.
+        _ => MethodCallFailed::ExceptionThrown(live_cause),
+    }
+}
+
+/// What `join()` / `invoke()` should observe for a task.
+///
+/// `ForkJoinTask.join()` rethrows the task's own throwable unchecked; the
+/// `ExecutionException` wrapping is `get()`'s contract, not `join()`'s.
+fn fjp_state_get_for_join(o: ObjectRef) -> Result<(bool, Value), MethodCallFailed> {
+    match fjp_state_thrown(o) {
+        Some(thrown) => Err(MethodCallFailed::ExceptionThrown(thrown)),
+        None => fjp_state_get_checked(o),
+    }
+}
+
+/// What `Future.get()` should observe for a task.
+fn fjp_state_get_for_future(
+    ctx: &mut dyn NativeContext,
+    o: ObjectRef,
+) -> Result<(bool, Value), MethodCallFailed> {
+    match fjp_state_thrown(o) {
+        Some(thrown) => Err(fjp_execution_exception(ctx, thrown)),
+        None => fjp_state_get_checked(o),
+    }
+}
+
+/// Shared body of every `join()` / `invoke()` registration.
+///
+/// Computes the task if it has not run yet, and replays an abnormal
+/// completion as the task's OWN throwable — `ForkJoinTask.join()` rethrows
+/// unchecked rather than wrapping.
+fn fjp_join_body(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let (done, cached) = fjp_state_get_for_join(this)?;
+    if done {
+        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
+        return Ok(Some(cached));
+    }
+    let (this, outcome) = fjp_compute_and_complete(ctx, this);
+    tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), ok = outcome.is_ok(), "fjt.join computed");
+    Ok(Some(outcome?))
+}
+
+/// Shared body of every `Future.get()` registration.
+///
+/// Same as [`fjp_join_body`] except an abnormal completion is reported as
+/// `ExecutionException(cause)` — `get()`'s contract, and the type Weld's
+/// `checkForExceptions` catches.
+fn fjp_future_get_body(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let (done, cached) = fjp_state_get_for_future(ctx, this)?;
+    if done {
+        return Ok(Some(cached));
+    }
+    let (_this, outcome) = fjp_compute_and_complete(ctx, this);
+    match outcome {
+        Ok(value) => Ok(Some(value)),
+        Err(MethodCallFailed::ExceptionThrown(cause)) => Err(fjp_execution_exception(ctx, cause)),
+        Err(internal) => Err(internal),
+    }
+}
+
+/// Shared body of `RecursiveAction`'s `join()` / `invoke()` — void result.
+fn fjp_join_void_body(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let (done, _) = fjp_state_get_for_join(this)?;
+    if !done {
+        let (_this, outcome) = fjp_compute_void(ctx, this);
+        outcome?;
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+/// Run one `Callable.call()` inline and complete a fresh task key with the
+/// outcome. The task object is the `Future` handed back to the caller.
+///
+/// A throwing callable is recorded as that task's abnormal completion and is
+/// NOT propagated: `invokeAll` must run every callable and report failures
+/// through the individual futures. Only an internal VM error aborts.
+fn fjp_run_callable_as_task(
+    ctx: &mut dyn NativeContext,
+    callable: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Pin the callable BEFORE allocating: `alloc_concurrent_synthetic` can
+    // trigger a collection that relocates it.
+    let callable_pin = ctx.pin_native_root(callable);
+    let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+    let task_pin = ctx.pin_native_root(task);
+    let live_callable = ctx.read_native_pin(callable_pin, callable);
+    let outcome = {
+        let _active = FjpActiveGuard::enter();
+        ctx.invoke_virtual(live_callable, "call", "()Ljava/lang/Object;", &[])
+            .map(|v| v.unwrap_or(Value::Object(None)))
+    };
+    let live_task = ctx.read_native_pin(task_pin, task);
+    let recorded = fjp_complete_from_outcome(live_task, outcome);
+    ctx.unpin_native_roots(callable_pin);
+    match recorded {
+        Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(live_task),
+        Err(internal) => Err(internal),
+    }
+}
+
+/// A batch of `Collection` elements that stays GC-rooted while it is processed.
+///
+/// The elements MUST remain pinned for the whole of `invokeAll`/`invokeAny`:
+/// running one callable allocates freely, so any element ref handed out as a
+/// bare address would be stale by the next iteration. Callers re-read each
+/// element through its own handle via [`FjpBatch::element`] and release the
+/// whole batch once — with [`FjpBatch::release`].
+struct FjpBatch {
+    /// Pin-stack watermark to truncate back to; releases every handle below.
+    base: usize,
+    handles: Vec<(usize, ObjectRef)>,
+}
+
+impl FjpBatch {
+    fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// The current address of element `i`, re-read through its pin.
+    fn element(&self, ctx: &dyn NativeContext, i: usize) -> ObjectRef {
+        let (handle, obj) = self.handles[i];
+        ctx.read_native_pin(handle, obj)
+    }
+
+    fn release(self, ctx: &mut dyn NativeContext) {
+        ctx.unpin_native_roots(self.base);
+    }
+}
+
+/// `submit(Runnable)` / `submit(Runnable, T)` counterpart of
+/// [`fjp_run_callable_as_task`]: run the runnable inline and complete a fresh
+/// task key with `fixed_result` (null for the no-result overload).
+fn fjp_run_runnable_as_task(
+    ctx: &mut dyn NativeContext,
+    runnable: ObjectRef,
+    fixed_result: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let runnable_pin = ctx.pin_native_root(runnable);
+    let result_pin = pinned_object_value(ctx, fixed_result);
+    let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+    let task_pin = ctx.pin_native_root(task);
+    let live_runnable = ctx.read_native_pin(runnable_pin, runnable);
+    let outcome = {
+        let _active = FjpActiveGuard::enter();
+        ctx.invoke_virtual(live_runnable, "run", "()V", &[])
+    };
+    let live_task = ctx.read_native_pin(task_pin, task);
+    let result = read_pinned_object_value(ctx, result_pin, fixed_result);
+    let recorded = fjp_complete_from_outcome(live_task, outcome.map(|_| result));
+    ctx.unpin_native_roots(runnable_pin);
+    match recorded {
+        Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(live_task),
+        Err(internal) => Err(internal),
+    }
+}
+
+/// Drain a `Collection` receiver into a pinned [`FjpBatch`].
+///
+/// Iterates through the real `Iterator` bytecode rather than assuming a
+/// concrete container: Weld passes an `ArrayList`, but `invokeAll` accepts any
+/// `Collection` and a `Set`/unmodifiable view has to work identically.
+fn fjp_collect_elements(
+    ctx: &mut dyn NativeContext,
+    collection: ObjectRef,
+) -> Result<FjpBatch, MethodCallFailed> {
+    let coll_pin = ctx.pin_native_root(collection);
+    let live_coll = ctx.read_native_pin(coll_pin, collection);
+    let iter = match ctx.invoke_virtual(live_coll, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        Ok(_) => {
+            ctx.unpin_native_roots(coll_pin);
+            return Ok(FjpBatch {
+                base: coll_pin,
+                handles: Vec::new(),
+            });
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(coll_pin);
+            return Err(e);
+        }
+    };
+    let iter_pin = ctx.pin_native_root(iter);
+    let mut live_iter = iter;
+    // Every element collected so far must stay rooted across the next
+    // `hasNext`/`next` (both can allocate), so each one is pinned as it is
+    // seen and the whole batch is re-read through its own handle at the end.
+    // The handle is carried explicitly rather than derived from `iter_pin`
+    // arithmetic: the pin stack being densely indexed is an implementation
+    // detail of `pin_native_root`, not a contract this code should rely on.
+    let mut out: Vec<(usize, ObjectRef)> = Vec::new();
+    loop {
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) if v != 0 => {}
+            Ok(_) => break,
+            Err(e) => {
+                ctx.unpin_native_roots(coll_pin);
+                return Err(e);
+            }
+        }
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(element)))) => {
+                let handle = ctx.pin_native_root(element);
+                out.push((handle, element));
+            }
+            // `invokeAll`/`invokeAny` are specified to throw NPE when the
+            // collection or any element is null (confirmed against the host
+            // JDK). Skipping the element instead would hand back a list
+            // SHORTER than the caller submitted — a silent wrong answer of
+            // exactly the kind this bridge exists to stop producing.
+            Ok(_) => {
+                ctx.unpin_native_roots(coll_pin);
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("null task in the submitted collection".to_string()),
+                }
+                .into());
+            }
+            Err(e) => {
+                ctx.unpin_native_roots(coll_pin);
+                return Err(e);
+            }
+        }
+    }
+    // Deliberately NOT unpinned here — the caller runs user code between
+    // elements, and the batch has to survive it.
+    Ok(FjpBatch {
+        base: coll_pin,
+        handles: out,
+    })
+}
+
+/// `ForkJoinPool.invokeAll(Collection)` (and the timed / uninterruptible
+/// variants, which differ only in a timeout this inline model never needs).
+///
+/// Runs every callable inline in submission order and returns a real
+/// `java.util.ArrayList` of completed task objects. Matches the JDK contract:
+/// the call returns only once EVERY task has completed, and a task that threw
+/// is reported through its own future rather than aborting the batch.
+fn fjp_invoke_all(ctx: &mut dyn NativeContext, tasks: ObjectRef) -> MethodCallResult {
+    let batch = fjp_collect_elements(ctx, tasks)?;
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        Ok(_) => {
+            batch.release(ctx);
+            return Ok(Some(Value::Object(None)));
+        }
+        Err(e) => {
+            batch.release(ctx);
+            return Err(e);
+        }
+    };
+    let list_pin = ctx.pin_native_root(list);
+    let mut live_list = list;
+    for i in 0..batch.len() {
+        let callable = batch.element(ctx, i);
+        let task = match fjp_run_callable_as_task(ctx, callable) {
+            Ok(t) => t,
+            Err(e) => {
+                batch.release(ctx);
+                return Err(e);
+            }
+        };
+        let task_pin = ctx.pin_native_root(task);
+        live_list = ctx.read_native_pin(list_pin, live_list);
+        let live_task = ctx.read_native_pin(task_pin, task);
+        let added = ctx.invoke_virtual(
+            live_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(live_task))],
+        );
+        // The list roots the task from here on, so the task pin can go.
+        ctx.unpin_native_roots(task_pin);
+        if let Err(e) = added {
+            batch.release(ctx);
+            return Err(e);
+        }
+    }
+    live_list = ctx.read_native_pin(list_pin, live_list);
+    batch.release(ctx);
+    Ok(Some(Value::Object(Some(live_list))))
+}
+
+/// `ForkJoinPool.invokeAny(Collection)` (and its timed variant).
+///
+/// Returns the result of the first callable that completes normally. Per the
+/// `ExecutorService` contract an empty collection raises
+/// `IllegalArgumentException`, and a collection in which EVERY callable throws
+/// raises `ExecutionException` wrapping the last failure — the previous
+/// fall-through to real bytecode returned null in both cases, which reads as a
+/// successful "the task produced null" to every caller.
+fn fjp_invoke_any(ctx: &mut dyn NativeContext, tasks: ObjectRef) -> MethodCallResult {
+    let batch = fjp_collect_elements(ctx, tasks)?;
+    if batch.len() == 0 {
+        batch.release(ctx);
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "invokeAny: empty task collection".to_string(),
+        }
+        .into());
+    }
+    // The last failure is kept pinned so it survives the remaining callables'
+    // allocations and is still valid when it becomes the ExecutionException's
+    // cause below.
+    let mut last_failure: Option<(usize, ObjectRef)> = None;
+    for i in 0..batch.len() {
+        let callable = batch.element(ctx, i);
+        let task = match fjp_run_callable_as_task(ctx, callable) {
+            Ok(t) => t,
+            Err(e) => {
+                batch.release(ctx);
+                return Err(e);
+            }
+        };
+        match fjp_state_thrown(task) {
+            None => {
+                let (_, result) = fjp_state_get(task);
+                batch.release(ctx);
+                return Ok(Some(result));
+            }
+            Some(thrown) => {
+                let handle = ctx.pin_native_root(thrown);
+                last_failure = Some((handle, thrown));
+            }
+        }
+    }
+    let failure = last_failure.map(|(handle, obj)| ctx.read_native_pin(handle, obj));
+    let result = match failure {
+        Some(cause) => Err(fjp_execution_exception(ctx, cause)),
+        // Unreachable: the collection was non-empty, so some callable ran.
+        None => Ok(Some(Value::Object(None))),
+    };
+    batch.release(ctx);
+    result
 }
 
 /// Reset the side-table (used by tests; production never calls this).
@@ -8689,9 +9196,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             if done {
                 return Ok(Some(cached));
             }
-            let (task, result) = fjp_compute_object_result(ctx, task);
-            fjp_state_set_done(task, result);
-            Ok(Some(result))
+            // `ForkJoinPool.invoke(task)` DOES rethrow the task's exception —
+            // unlike submit/execute, it is a "run it and give me the answer"
+            // call with nowhere else to report a failure.
+            let (_task, outcome) = fjp_compute_and_complete(ctx, task);
+            Ok(Some(outcome?))
         },
     );
     // submit(ForkJoinTask) — eagerly compute inline
@@ -8703,9 +9212,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             let mut task = obj_arg(args, 1)?;
             let (done, _) = fjp_state_get(task);
             if !done {
-                let (live_task, result) = fjp_compute_object_result(ctx, task);
-                task = live_task;
-                fjp_state_set_done(task, result);
+                task = fjp_compute_for_submit(ctx, task)?;
             }
             Ok(Some(Value::Object(Some(task))))
         },
@@ -8780,33 +9287,15 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(fjt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(fjt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(fjt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_future_get_body(ctx, this)
     });
     r.register(fjt, "isDone", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -8820,9 +9309,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "isCompletedNormally", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        // A cancelled task IS done but did NOT complete normally.
+        // A cancelled task, and a task whose body threw, are both DONE but
+        // did NOT complete normally.
         let (done, cancelled) = fjp_state_flags(this);
-        Ok(Some(Value::Int(i32::from(done && !cancelled))))
+        let threw = fjp_state_thrown(this).is_some();
+        Ok(Some(Value::Int(i32::from(done && !cancelled && !threw))))
     });
     r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -8858,23 +9349,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(rt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(rt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_future_get_body(ctx, this)
     });
     r.register(rt, "getRawResult", "()Ljava/lang/Object;", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -8893,13 +9372,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(rt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(rt, "isDone", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -8941,21 +9414,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(ra, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get_checked(this)?;
-        if !done {
-            let this = fjp_compute_void(ctx, this);
-            fjp_state_set_done(this, Value::Object(None));
-        }
-        Ok(Some(Value::Object(None)))
+        fjp_join_void_body(ctx, this)
     });
     r.register(ra, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get_checked(this)?;
-        if !done {
-            let this = fjp_compute_void(ctx, this);
-            fjp_state_set_done(this, Value::Object(None));
-        }
-        Ok(Some(Value::Object(None)))
+        fjp_join_void_body(ctx, this)
     });
     r.register(ra, "isDone", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -9004,10 +9467,10 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), cached = ?cached, "pool.invoke done");
                 return Ok(Some(cached));
             }
-            let (task, result) = fjp_compute_object_result(ctx, task);
-            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), result = ?result, "pool.invoke result");
-            fjp_state_set_done(task, result);
-            Ok(Some(result))
+            // `ForkJoinPool.invoke(task)` DOES rethrow the task's exception.
+            let (task, outcome) = fjp_compute_and_complete(ctx, task);
+            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), ok = outcome.is_ok(), "pool.invoke result");
+            Ok(Some(outcome?))
         },
     );
 
@@ -9029,9 +9492,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 };
                 let (done, _) = fjp_state_get(task);
                 if !done {
-                    let (live_task, result) = fjp_compute_object_result(ctx, task);
-                    task = live_task;
-                    fjp_state_set_done(task, result);
+                    task = fjp_compute_for_submit(ctx, task)?;
                 }
                 Ok(Some(Value::Object(Some(task))))
             },
@@ -9057,16 +9518,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
-            let task_pin = ctx.pin_native_root(task);
-            let _callable_pin = ctx.pin_native_root(callable);
-            let result = match ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[]) {
-                Ok(Some(val)) => val,
-                _ => Value::Object(None),
-            };
-            let task = ctx.read_native_pin(task_pin, task);
-            ctx.unpin_native_roots(task_pin);
-            fjp_state_set_done(task, result);
+            // Shares `fjp_run_callable_as_task` with `invokeAll` so both have
+            // one exception model. The old inline version discarded a
+            // throwing `call()` (`_ => Value::Object(None)`) and marked the
+            // task done with a null result, so `Future.get()` reported
+            // success for a callable that had blown up.
+            let task = fjp_run_callable_as_task(ctx, callable)?;
             Ok(Some(Value::Object(Some(task))))
         },
     );
@@ -9079,13 +9536,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
-            let task_pin = ctx.pin_native_root(task);
-            let _runnable_pin = ctx.pin_native_root(runnable);
-            let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-            let task = ctx.read_native_pin(task_pin, task);
-            ctx.unpin_native_roots(task_pin);
-            fjp_state_set_done(task, Value::Object(None));
+            let task = fjp_run_runnable_as_task(ctx, runnable, Value::Object(None))?;
             Ok(Some(Value::Object(Some(task))))
         },
     );
@@ -9099,18 +9550,112 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 _ => return Ok(args.get(2).copied()),
             };
             let fixed_result = args.get(2).copied().unwrap_or(Value::Object(None));
-            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
-            let task_pin = ctx.pin_native_root(task);
-            let _runnable_pin = ctx.pin_native_root(runnable);
-            let result_pin = pinned_object_value(ctx, fixed_result);
-            let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-            let task = ctx.read_native_pin(task_pin, task);
-            let result = read_pinned_object_value(ctx, result_pin, fixed_result);
-            ctx.unpin_native_roots(task_pin);
-            fjp_state_set_done(task, result);
+            let task = fjp_run_runnable_as_task(ctx, runnable, fixed_result)?;
             Ok(Some(Value::Object(Some(task))))
         },
     );
+    // ForkJoinPool.invokeAll(Collection) / invokeAll(Collection, long, TimeUnit)
+    // / invokeAllUninterruptibly(Collection).
+    //
+    // `invokeAll(Collection)` is the overload Weld's `ConcurrentBeanDeployer`
+    // -> `AbstractExecutorServices.invokeAllAndCheckForExceptions` calls, and
+    // it was never on the allow-list — so it fell through to real JDK bytecode
+    // against the under-initialized `commonPool()` bridge object and threw
+    // `RejectedExecutionException` at `submissionQueue()`, failing the entire
+    // `org.hibernate.orm.test.cdi.*` / `jpa.cdi.*` cluster plus
+    // `filter.FilterParameterTests`. Same eager-inline model as
+    // `submit(Callable)`: run each callable synchronously, collect the
+    // completed tasks as the returned `List<Future<T>>`.
+    //
+    // The timed and uninterruptible variants share the implementation: every
+    // task has already completed by the time this returns, so a timeout can
+    // never elapse and there is no interruptible wait to differ over.
+    for invoke_all_desc in [
+        "(Ljava/util/Collection;)Ljava/util/List;",
+        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/util/List;",
+    ] {
+        r.register(
+            "java/util/concurrent/ForkJoinPool",
+            "invokeAll",
+            invoke_all_desc,
+            |ctx, args| {
+                let tasks = obj_arg(args, 1)?;
+                fjp_invoke_all(ctx, tasks)
+            },
+        );
+    }
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "invokeAllUninterruptibly",
+        "(Ljava/util/Collection;)Ljava/util/List;",
+        |ctx, args| {
+            let tasks = obj_arg(args, 1)?;
+            fjp_invoke_all(ctx, tasks)
+        },
+    );
+
+    // ForkJoinPool.invokeAny(Collection) / invokeAny(Collection, long, TimeUnit).
+    //
+    // Uncovered for the same reason as invokeAll, but it failed WORSE: real
+    // bytecode ran the callables and then returned null instead of throwing,
+    // so callers saw a silent wrong answer rather than an error. (The
+    // `invokeAll` doc flagged invokeAny as "not checked"; a matrix probe
+    // diffed against the host JDK is what caught it.)
+    for invoke_any_desc in [
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+    ] {
+        r.register(
+            "java/util/concurrent/ForkJoinPool",
+            "invokeAny",
+            invoke_any_desc,
+            |ctx, args| {
+                let tasks = obj_arg(args, 1)?;
+                fjp_invoke_any(ctx, tasks)
+            },
+        );
+    }
+
+    // ForkJoinPool.lazySubmit(ForkJoinTask) — same uncovered-overload story;
+    // it threw RejectedExecutionException. The JDK's lazySubmit differs from
+    // submit only in NOT signalling a worker to pick the task up, which is
+    // meaningless for a pool that runs everything inline.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "lazySubmit",
+        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+        |ctx, args| {
+            let mut task = obj_arg(args, 1)?;
+            let (done, _) = fjp_state_get(task);
+            if !done {
+                task = fjp_compute_for_submit(ctx, task)?;
+            }
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
+
+    // ForkJoinTask.getException() — reads the same recorded throwable that
+    // `join()`/`get()` replay, so the three cannot disagree about whether a
+    // task failed.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register(
+            task_class,
+            "getException",
+            "()Ljava/lang/Throwable;",
+            |_ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(match fjp_state_thrown(this) {
+                    Some(t) => Value::Object(Some(t)),
+                    None => Value::Object(None),
+                }))
+            },
+        );
+    }
+
     // `awaitQuiescence` must observe the FutureTask roots created by the
     // real-worker `execute(Runnable)` bridge. The old constant true could say
     // the pool was idle while a worker was blocked inside user code.
@@ -9173,35 +9718,15 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(fjt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "fjt.join recompute");
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(fjt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(fjt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_future_get_body(ctx, this)
     });
     // get(long, TimeUnit) — `final` in the real JDK (declaring class is always
     // ForkJoinTask, even for RecursiveTask/RecursiveAction receivers), needed
@@ -9214,13 +9739,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let (done, cached) = fjp_state_get_checked(this)?;
-            if done {
-                return Ok(Some(cached));
-            }
-            let (this, result) = fjp_compute_object_result(ctx, this);
-            fjp_state_set_done(this, result);
-            Ok(Some(result))
+            fjp_future_get_body(ctx, this)
         },
     );
     r.register(fjt, "isDone", "()Z", |_ctx, args| {
@@ -9230,9 +9749,11 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "isCompletedNormally", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        // A cancelled task IS done but did NOT complete normally.
+        // A cancelled task, and a task whose body threw, are both DONE but
+        // did NOT complete normally.
         let (done, cancelled) = fjp_state_flags(this);
-        Ok(Some(Value::Int(i32::from(done && !cancelled))))
+        let threw = fjp_state_thrown(this).is_some();
+        Ok(Some(Value::Int(i32::from(done && !cancelled && !threw))))
     });
     r.register(fjt, "isCancelled", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -9279,35 +9800,15 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(rt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "rt.join cached");
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "rt.join compute");
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(rt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_join_body(ctx, this)
     });
     r.register(rt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get_checked(this)?;
-        if done {
-            return Ok(Some(cached));
-        }
-        let (this, result) = fjp_compute_object_result(ctx, this);
-        fjp_state_set_done(this, result);
-        Ok(Some(result))
+        fjp_future_get_body(ctx, this)
     });
     r.register(rt, "getRawResult", "()Ljava/lang/Object;", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -9353,21 +9854,11 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(ra, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get_checked(this)?;
-        if !done {
-            let this = fjp_compute_void(ctx, this);
-            fjp_state_set_done(this, Value::Object(None));
-        }
-        Ok(Some(Value::Object(None)))
+        fjp_join_void_body(ctx, this)
     });
     r.register(ra, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get_checked(this)?;
-        if !done {
-            let this = fjp_compute_void(ctx, this);
-            fjp_state_set_done(this, Value::Object(None));
-        }
-        Ok(Some(Value::Object(None)))
+        fjp_join_void_body(ctx, this)
     });
     r.register(ra, "isDone", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -11603,15 +12094,63 @@ fn p52_hex_val(b: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // java.net.InetSocketAddress — holder-shaped synthetic
 // ---------------------------------------------------------------------------
+/// `InetSocketAddress`'s `checkPort` — the JDK rejects a port outside
+/// `[0, 65535]` with `IllegalArgumentException` from EVERY constructor
+/// (`InetSocketAddressHolder` runs it before storing anything). Ours accepted
+/// any `int` silently, so `new InetSocketAddress(-1)` produced a socket address
+/// with a negative port instead of failing where the caller could see it — and
+/// a bind through it then failed much later with an unrelated OS error.
+fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    if !(0..=0xFFFF).contains(&port) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("port out of range:{port}"),
+        }
+        .into());
+    }
+    Ok(port)
+}
+
 fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) {
-    let holder =
-        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
-    ctx.set_field(holder, 0, host);
-    ctx.set_field(holder, 1, addr);
-    ctx.set_field(holder, 2, Value::Int(port));
-    ctx.set_field(this, 0, Value::Object(Some(holder)));
-    ctx.set_field(this, 1, Value::Int(port));
-    ctx.set_field(this, 2, addr);
+    // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
+    // (and on a cold VM also loads + initialises the holder class), so `this`,
+    // `host` and `addr` can all relocate across it. Writing them back through
+    // the pre-call locals stored a VACATED from-space reference into the
+    // holder's `addr` slot, which read back as **null** while `isUnresolved()`
+    // still answered false — the exact pair that let `ServerSocket.bind` walk
+    // past its own unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`
+    // (`addr.isLinkLocalAddress()`).
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let host_h = match host {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let addr_h = match addr {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let holder = alloc_concurrent_synthetic(
+        &mut *scope,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
+    let holder_h = scope.root(holder);
+    let host_cur = match &host_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => host,
+    };
+    let addr_cur = match &addr_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => addr,
+    };
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field(holder_cur, 0, host_cur);
+    scope.set_field(holder_cur, 1, addr_cur);
+    scope.set_field(holder_cur, 2, Value::Int(port));
+    let this_cur = scope.get(&this_h);
+    scope.set_field(this_cur, 0, Value::Object(Some(holder_cur)));
+    scope.set_field(this_cur, 1, Value::Int(port));
+    scope.set_field(this_cur, 2, addr_cur);
 }
 
 fn p52_isa_host_from_addr(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Value {
@@ -11656,27 +12195,74 @@ fn p52_isa_host_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
             }
         }
         Value::Object(None) => {}
-        other => return other,
+        // A PRIMITIVE in slot 0. This native is registered as
+        // `()Ljava/lang/String;`, so returning it hands bytecode about to
+        // `areturn`/`checkcast` a String an `Int` — unsound, and the same
+        // descriptor hazard `lang_misc::enum_constant_name` documents. A
+        // zeroed or out-of-range slot decodes as `Value::Int(0)`, so this arm
+        // is reachable on any receiver this family did not construct.
+        _ => {}
     }
     Value::Object(Some(ctx.create_string("0.0.0.0")))
 }
 
 fn p52_isa_port_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    // Same bound as `p52_isa_addr_value`: a real-layout `InetSocketAddress` has
+    // ONE field, so the legacy slot-1 fallback is an out-of-range read there.
+    // Reading it back as the port produced a plausible-looking small integer
+    // from whatever the zeroed slot decodes to.
+    let legacy_port = |ctx: &mut dyn NativeContext| {
+        if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                v @ Value::Int(_) | v @ Value::Long(_) => v,
+                _ => Value::Int(0),
+            }
+        } else {
+            Value::Int(0)
+        }
+    };
     match ctx.get_field(this, 0) {
         Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => {
             match ctx.get_field(holder, 2) {
                 v @ Value::Int(_) | v @ Value::Long(_) => v,
-                _ => ctx.get_field(this, 1),
+                _ => legacy_port(ctx),
             }
         }
-        _ => ctx.get_field(this, 1),
+        _ => legacy_port(ctx),
     }
 }
 
+/// The `addr` an `InetSocketAddress` carries, or `Object(None)`.
+///
+/// The legacy-layout fallback (slot 2) must never manufacture a NON-null answer
+/// out of a slot that cannot hold an address. A real-layout `InetSocketAddress`
+/// declares exactly ONE instance field (`holder`), so slot 2 is out of range,
+/// and an out-of-range/zeroed read decodes as `Value::Int(0)` — which is not
+/// `Object(None)`, so `isUnresolved()` answered **false** while `getAddress()`
+/// answered **null**. `ServerSocket.bind` tests exactly that pair:
+///
+/// ```java
+/// if (epoint.isUnresolved()) throw new SocketException("Unresolved address");
+/// impl.bind(epoint.getAddress(), epoint.getPort());
+/// ```
+///
+/// so the disagreement is what let a null address past the guard and two frames
+/// on into `sun.nio.ch.Net.bind`'s `addr.isLinkLocalAddress()`. Any non-reference
+/// result now reads as unresolved, which is both truthful and a far better
+/// diagnostic (`SocketException` at the guard, not an NPE inside the JDK).
 fn p52_isa_addr_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match ctx.get_field(this, 0) {
-        Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => ctx.get_field(holder, 1),
-        _ => ctx.get_field(this, 2),
+        Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => {
+            match ctx.get_field(holder, 1) {
+                v @ Value::Object(_) => v,
+                _ => Value::Object(None),
+            }
+        }
+        _ if ctx.object_num_fields(this) > 2 => match ctx.get_field(this, 2) {
+            v @ Value::Object(_) => v,
+            _ => Value::Object(None),
+        },
+        _ => Value::Object(None),
     }
 }
 
@@ -11686,21 +12272,42 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     let isa = "java/net/InetSocketAddress";
     r.register(isa, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let port = args[1].as_int().unwrap_or(0);
+        let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
         // `new InetSocketAddress(port)` delegates to the `(InetAddress, int)`
         // constructor with a null address. The JDK substitutes the resolved
         // wildcard address rather than creating an unresolved socket address.
         // Keeping this null made `getAddress()` return null and caused
         // RecordableServerHttpRequestTests.getRemoteAddress() to NPE.
-        let addr = crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0");
-        let host = p52_isa_host_from_addr(ctx, addr);
-        p52_isa_set(ctx, this, host, Value::Object(Some(addr)), port);
+        //
+        // Cross-call GC-safety: `alloc_inet_address_external` and
+        // `p52_isa_host_from_addr` both allocate — on a cold VM the first also
+        // initialises the whole `java.net.InetAddress` hierarchy — so `this`
+        // and `addr` are rooted across them. Without this the FIRST
+        // `new InetSocketAddress(0)` of a GC-stressed run answered
+        // `getAddress() == null`, which is how `new ServerSocket(0)` reached
+        // `Net.bind` with a null address.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let addr =
+            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0");
+        let addr_h = scope.root(addr);
+        let addr_cur = scope.get(&addr_h);
+        let host = p52_isa_host_from_addr(&mut *scope, addr_cur);
+        let this_cur = scope.get(&this_h);
+        let addr_cur = scope.get(&addr_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            host,
+            Value::Object(Some(addr_cur)),
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
-        let port = args[2].as_int().unwrap_or(0);
+        let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
         // Real JDK resolves the hostname via `InetAddress.getByName(host)`
         // here, falling back to an unresolved address only on
         // UnknownHostException. Leaving `addr` unconditionally null made
@@ -11712,15 +12319,29 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         // string), which in turn NPE'd `RemoteCIDRValve.isAllowed` on any
         // Tomcat context configured with that valve (e.g. the examples
         // webapp's `META-INF/context.xml`).
-        let host_str = ctx.read_string(host).unwrap_or_default();
-        let addr = crate::net_phase_e::resolve_host_external(&host_str)
-            .map(|ip| {
-                Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
-                    ctx, &host_str, &ip,
-                )))
-            })
-            .unwrap_or(Value::Object(None));
-        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
+        // Cross-call GC-safety: `alloc_inet_address_external` allocates, so
+        // `this` and the host String are rooted across it.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let host_h = scope.root(host);
+        let host_str = scope.read_string(host).unwrap_or_default();
+        let addr = match crate::net_phase_e::resolve_host_external(&host_str) {
+            Some(ip) => Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+                &mut *scope,
+                &host_str,
+                &ip,
+            ))),
+            None => Value::Object(None),
+        };
+        let this_cur = scope.get(&this_h);
+        let host_cur = scope.get(&host_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            Value::Object(Some(host_cur)),
+            addr,
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -11729,13 +12350,38 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         // substitutes InetAddress.anyLocalAddress(). Tomcat's NioEndpoint
         // relies on that for an unspecified bind address; rejecting it here
         // leaves the connector FAILED before it can allocate an ephemeral port.
+        //
+        // The port is validated BEFORE the wildcard is materialised: the JDK
+        // runs `checkPort` inside the holder constructor, so an out-of-range
+        // port throws `IllegalArgumentException` and no address is resolved.
+        let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
+        // Cross-call GC-safety: the wildcard branch allocates (and initialises
+        // the InetAddress hierarchy on a cold VM), so `this` is rooted across
+        // it. This constructor is the one `ServerSocket(int, int, InetAddress)`
+        // uses with a null `bindAddr`, and it is where `new ServerSocket(0)`
+        // acquired the null address that NPE'd `sun.nio.ch.Net.bind`.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
         let addr = match args.get(1) {
             Some(Value::Object(Some(addr))) => *addr,
-            _ => crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0"),
+            _ => crate::net_phase_e::alloc_inet_address_external(
+                &mut *scope,
+                "0.0.0.0",
+                "0.0.0.0",
+            ),
         };
-        let port = args[2].as_int().unwrap_or(0);
-        let host_val = p52_isa_host_from_addr(ctx, addr);
-        p52_isa_set(ctx, this, host_val, Value::Object(Some(addr)), port);
+        let addr_h = scope.root(addr);
+        let addr_cur = scope.get(&addr_h);
+        let host_val = p52_isa_host_from_addr(&mut *scope, addr_cur);
+        let this_cur = scope.get(&this_h);
+        let addr_cur = scope.get(&addr_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            host_val,
+            Value::Object(Some(addr_cur)),
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -11744,16 +12390,22 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         "(Ljava/lang/String;I)Ljava/net/InetSocketAddress;",
         |ctx, args| {
             let host = obj_arg(args, 0)?;
-            let port = args[1].as_int().unwrap_or(0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
+            let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
+            // Cross-call GC-safety: the allocation below can move `host`.
+            let mut scope = NativeHandleScope::new(ctx);
+            let host_h = scope.root(host);
+            let obj = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 3);
+            let obj_h = scope.root(obj);
+            let obj_cur = scope.get(&obj_h);
+            let host_cur = scope.get(&host_h);
             p52_isa_set(
-                ctx,
-                obj,
-                Value::Object(Some(host)),
+                &mut *scope,
+                obj_cur,
+                Value::Object(Some(host_cur)),
                 Value::Object(None),
                 port,
             );
-            Ok(Some(Value::Object(Some(obj))))
+            Ok(Some(Value::Object(Some(scope.get(&obj_h)))))
         },
     );
     r.register(isa, "getHostName", "()Ljava/lang/String;", |ctx, args| {
@@ -11794,7 +12446,30 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             "0.0.0.0".to_string()
         };
         let port = p52_isa_port_value(ctx, this).as_int().unwrap_or(0);
-        let s = ctx.create_string(&format!("{host_str}:{port}"));
+        // HotSpot renders `InetSocketAddressHolder.toString()`:
+        //   unresolved → `hostname + "/<unresolved>"`
+        //   resolved   → `addr.toString()`, i.e. `hostName + "/" + ip`, with an
+        //                Inet6Address's numeric part bracketed
+        // and then appends `":" + port`. We used to emit a bare `host:port`,
+        // which loses the `/`-separated address entirely and — worse — makes an
+        // UNRESOLVED address print exactly like a resolved one, so a log line
+        // could not distinguish `createUnresolved("h", 80)` from a real
+        // endpoint. Reference: `probes/ServerSocketNullInetAddressProbe.java`,
+        // diffed against HotSpot 25.0.3+9.
+        let rendered = match p52_isa_addr_value(ctx, this) {
+            Value::Object(Some(addr)) => {
+                let (h, ip) = crate::net_phase_e::inet_addr_resolve_external(ctx, addr)
+                    .unwrap_or_else(|| (host_str.clone(), host_str.clone()));
+                let ip_part = if ip.contains(':') {
+                    format!("[{ip}]")
+                } else {
+                    ip
+                };
+                format!("{h}/{ip_part}")
+            }
+            _ => format!("{host_str}/<unresolved>"),
+        };
+        let s = ctx.create_string(&format!("{rendered}:{port}"));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(isa, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {

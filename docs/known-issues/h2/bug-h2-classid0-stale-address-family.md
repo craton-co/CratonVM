@@ -771,3 +771,49 @@ young→young half is vacuous whenever selective promotion moved every survivor
 out (measured: `young_survivors_scanned=0` on every BinTrees cycle). Both gaps
 are now closed, and the assertion prints a per-sweep line even when it finds
 nothing, so a clean campaign is positive evidence rather than silence.
+
+## The blocked-thread face, and the in-cycle check for it (2026-08-04)
+
+A Hibernate witness of this family (`sql.exec.SmokeTests#testQueryConcurrency`,
+one occurrence) was filed as a separate page and has been retired into
+`../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`.
+Two things from it belong here, because they apply to any future occurrence:
+
+**`reclaimed_hole_at`'s verdict already names the collector — read it before
+attributing anything.** `location=young TO-space (the inactive semispace)` is the MOVING
+collector's face — the arena a Cheney cycle evacuates, swaps out and zeroes —
+and it is NOT the non-moving sweep's `young from-space FREE BLOCK (reclaimed)`.
+An address there is a *pre-copy* address that something failed to remap or
+failed to evacuate. Cross-check it against `young_freed_lookup`, which is
+unconditional: a non-moving-sweep victim is always in that ring, and this face
+never is. The Hibernate page was attributed to the DoHead Layer-1
+register-invisible-root mechanism on the strength of the `ClassId(0)` header
+alone, and both of those checks refute it.
+
+**The invariant is now checked where it breaks, for blocked threads.**
+`ThreadRegistry::fold_pointer_map_into_blocked` asserts, unconditionally and at
+the end of every moving cycle, that no `slot_origins` entry — the exact
+`(frame, slot)` tracker for a thread inside a blocked region — points into the
+semispace that cycle just evacuated. A hit names tid / frame / slot and carries
+`was_a_scanned_root`, which forks the fix: `false` = the blocking deposit never
+published the slot (root COVERAGE gap), `true` = the collector was handed it and
+did not evacuate it (EVACUATION gap). Under `CRATONVM_DBG_BLOCKGC` the deposit
+side additionally reports `UNPUBLISHED-LIVE-SLOT` — a live object frame slot the
+snapshot omitted — which is the same question asked with no GC race required.
+
+So for a blocked-thread occurrence, the verdict now arrives from the collection
+that caused it rather than from whichever bytecode dereferenced it later. If a
+fresh `ClassId(0)` report has neither line above it, the holder was not in a
+blocked region and the gap is elsewhere.
+
+One root-coverage defect on that path was fixed at the same time, and it is not
+specific to blocked threads: all FOUR copies of the frame root scan
+(`collect_roots`, `update_root_snapshot`/`scan_frame_roots`, the blocking
+deposit, and the frozen-in-JIT peer scan) re-screened their operand-stack roots
+with the strict `is_object_address` header probe. That probe drops young /
+mid-init objects and the `is_heap_addr`-validated JNI long-as-jobject roots,
+re-introducing two already-fixed regressions on the operand-stack half only,
+while the locals half of the same loop used the loose screen. All four now use
+`is_heap_addr`; see
+`root_snapshot_screen_tests::operand_stack_roots_use_the_same_screen_as_locals`,
+which fails on the pre-fix screen with `1 of 2 survived`.

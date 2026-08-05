@@ -2177,6 +2177,26 @@ impl VmHeap {
         }
     }
 
+    /// Generational: `[base, base + capacity)` of the INACTIVE young
+    /// semispace — the arena a moving cycle has just evacuated and zeroed.
+    ///
+    /// This is [`reclaimed_hole_at`](Self::reclaimed_hole_at)'s
+    /// inactive-semispace arm hoisted into a plain range, so a caller that
+    /// must test many addresses at once (the blocked-thread root audit in
+    /// `ThreadRegistry::fold_pointer_map_into_blocked`) pays one arena lock
+    /// instead of three per address. No live object is ever in here: a live
+    /// young object is in the active semispace or in old gen.
+    ///
+    /// G1/ZGC have no semispace pair, hence `None`.
+    pub fn young_inactive_semispace_range(&self) -> Option<(usize, usize)> {
+        match self {
+            VmHeap::Generational(h) => Some(h.young_inactive_semispace_range()),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Generational: is `addr` inside EITHER young semispace? Used by
     /// reference processing to detect stale PRE-GC Reference addresses
     /// (young + absent from the pointer map ⇒ did not survive the GC).

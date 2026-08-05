@@ -269,10 +269,11 @@ mis-classified every `invokedynamic` trap as a loop boundary.
 
 ## What is left after this lane
 
-* **The differential is a Java-level oracle, not a frame comparator.** It sees
-  the resumed frame through the program's behaviour, not by diffing interpreter
-  slots against a recorded uncompiled run. A divergence in a local the rest of
-  the loop never reads would not be seen.
+* ~~**The differential is a Java-level oracle, not a frame comparator.**~~
+  **CLOSED 2026-08-04.** `CRATONVM_DBG_OSR_FRAME_TRACE` +
+  `regression-suite/perf/osr-frame-differential.sh` diff the resumed frame
+  against the un-compiled run's, slot for slot. The item is now closed in the
+  brief's own words rather than in substance.
 * **`osr_exit_off_loop_boundary` has not been observed non-zero.** The row
   exists because the `invokedynamic` trap can produce one; nothing in this lane
   drove one.

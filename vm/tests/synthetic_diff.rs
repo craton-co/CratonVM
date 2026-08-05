@@ -589,6 +589,60 @@ fn real_fjp_path() {
         run.stdout.contains("r:sum=123"),
         "second FJP task returned wrong value (expected 123)"
     );
+
+    // --- bulk submission (the hibernate CDI-cluster regression) ---------
+    //
+    // `invokeAll(Collection)` was missing from the real-FJP bridge
+    // allow-list, so it fell through to real JDK bytecode against the
+    // under-initialized `commonPool()` object and threw
+    // RejectedExecutionException at submissionQueue(). Every assertion below
+    // is PAIRED — size AND sum AND "the callables actually ran" AND "the
+    // futures report done" — because a bridge that silently dropped the work
+    // would pass a bare "it returned a list of the right length".
+    assert!(
+        run.stdout.contains("r:invokeAllSize=4"),
+        "invokeAll returned the wrong number of futures.\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:invokeAllSum=10"),
+        "invokeAll futures carried the wrong results (expected 1+2+3+4)"
+    );
+    assert!(
+        run.stdout.contains("r:invokeAllRan=4"),
+        "invokeAll did not actually RUN every callable — a list of futures \
+         with no work done behind them is the failure this guards"
+    );
+    assert!(
+        run.stdout.contains("r:invokeAllDone=true"),
+        "invokeAll returned before every task completed"
+    );
+    assert!(
+        run.stdout.contains("r:ifaceInvokeAllSize=4"),
+        "invokeAll failed through an ExecutorService-typed receiver — the \
+         invokeinterface shape Weld's ConcurrentBeanDeployer actually uses"
+    );
+    // Weld's `AbstractExecutorServices.checkForExceptions` calls
+    // `Future.get()` on each result and rethrows the ExecutionException's
+    // cause; a swallowed failure would silently report a half-built
+    // container as a successful CDI deployment.
+    assert!(
+        run.stdout.contains("r:invokeAllFailure=IllegalStateException"),
+        "a throwing callable did not surface as ExecutionException(cause) \
+         from Future.get().\nstdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.stdout.contains("r:invokeAllOkSibling=7"),
+        "one failing callable disturbed its sibling's result — invokeAll must \
+         complete the whole batch and report failures per-future"
+    );
+    assert!(
+        run.stdout.contains("r:invokeAnyInRange=true"),
+        "invokeAny returned a value outside the submitted set (it returned \
+         null before the fix — a silent wrong answer, not an exception)"
+    );
 }
 
 /// Smoke test: socket layer routes to real JDK bytecode under
