@@ -1225,6 +1225,38 @@ pub(crate) fn create_string_or_oom(
     )))
 }
 
+/// [`create_string_or_oom`] for UTF-16 code units.
+///
+/// Identical escalation ladder — the only difference is that the source is a
+/// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
+/// allocated `String`. String concatenation builds its result this way; see
+/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+pub(crate) fn create_string_from_units_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    units: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_from_units as try_new_string;
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", units.len()),
+        },
+    )))
+}
+
 pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation

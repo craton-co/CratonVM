@@ -21330,16 +21330,83 @@ fn native_arrays_support_vectorized_hash_code(
         return Ok(Some(Value::Int(initial_value)));
     }
     let arr_len = ctx.array_length(arr);
-    // Guard against out-of-range (from_index + length) — the JDK
-    // contract says the caller is responsible, but we refuse to read
-    // past the end defensively.
-    let end = (from_index as usize).saturating_add(length as usize);
-    if end > arr_len {
+
+    // T_CHAR over a byte[] is the one case whose ELEMENT is not one array slot.
+    //
+    // `StringUTF16.hashCode(byte[] value)` calls
+    // `vectorizedHashCode(value, 0, value.length >> 1, 0, T_CHAR)`: the array
+    // is a `byte[]`, `length` counts CHARS, and each char is a PAIR of bytes.
+    // Every other BasicType here has one element per slot.
+    //
+    // This loop used to read one slot per iteration for T_CHAR as well, so a
+    // 3-char string hashed bytes 0..3 instead of pairing 0/1, 2/3, 4/5 — and
+    // `(elem as u16)` on a signed byte sign-extended each one. Measured:
+    // `"ΣΟΣ".hashCode()` returned 62956255 where the JLS (and
+    // HotSpot) say 924359, while `charAt`, `length` and `equals` on the same
+    // object were all correct. `StringUTF16.getChar` and `StringUTF16.length`
+    // were correct too when invoked directly — which is what localised the
+    // fault here rather than in the class.
+    //
+    // Latin-1 was unaffected and that is why this survived: `StringLatin1`
+    // reaches this function through `hashCodeOfUnsigned` with T_BOOLEAN, one
+    // byte per element, masked — correct as written. Only a `String`
+    // containing a code unit > 0xFF takes the T_CHAR path at all.
+    //
+    // Little-endian, to match `native_string_utf16_is_big_endian` returning
+    // false and every Rust accessor in `lang_string.rs`. The comment below
+    // said "big-endian u16 pairs", which was the OpenJDK-on-a-BE-host
+    // description and never this VM's layout.
+    // T_CHAR arrives with TWO different array types and they are NOT the same
+    // read. The discriminator is the array, not the `basicType`:
+    //
+    //   * `Arrays.hashCode(char[] a)` -> `vectorizedHashCode(a, 0, a.length, 1,
+    //     T_CHAR)`. A `char[]`: one slot per element, zero-extended.
+    //   * `StringUTF16.hashCode(byte[] v)` -> `vectorizedHashCode(v, 0,
+    //     v.length >> 1, 0, T_CHAR)`. A `byte[]` of UTF-16 pairs: TWO slots per
+    //     element, and `length` counts chars.
+    //
+    // Keying on `basic_type` alone gets one of them wrong whichever way it is
+    // written. `t2_arrays_support_hash_code_char_zero_extends` covers the
+    // `char[]` side and caught exactly that.
+    let char_pairs = basic_type == HOTSPOT_T_CHAR
+        && matches!(
+            ctx.heap_element_type_of(arr),
+            cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+        );
+    let (start_slot, end_slot) = if char_pairs {
+        let start = (from_index as usize).saturating_mul(2);
+        (start, start.saturating_add((length as usize).saturating_mul(2)))
+    } else {
+        let start = from_index as usize;
+        (start, start.saturating_add(length as usize))
+    };
+    // Guard against out-of-range — the JDK contract says the caller is
+    // responsible, but we refuse to read past the end defensively.
+    if end_slot > arr_len {
         return Ok(Some(Value::Int(initial_value)));
     }
 
     let mut acc = initial_value;
-    for i in (from_index as usize)..end {
+    if char_pairs {
+        let mut slot = start_slot;
+        while slot < end_slot {
+            let lo = match ctx.get_array_element(arr, slot) {
+                Value::Int(v) => (v as u8) as u16,
+                Value::Long(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let hi = match ctx.get_array_element(arr, slot + 1) {
+                Value::Int(v) => (v as u8) as u16,
+                Value::Long(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let unit = ((hi << 8) | lo) as i32;
+            acc = acc.wrapping_mul(31).wrapping_add(unit);
+            slot += 2;
+        }
+        return Ok(Some(Value::Int(acc)));
+    }
+    for i in start_slot..end_slot {
         let elem = match ctx.get_array_element(arr, i) {
             Value::Int(v) => v,
             Value::Long(v) => v as i32,
@@ -21357,7 +21424,7 @@ fn native_arrays_support_vectorized_hash_code(
         //   T_BOOLEAN → unsignedHashCode(byte[]) → `(a[i] & 0xff)`
         //   T_BYTE    → hashCode(byte[])         → sign-extend `byte`
         //   T_SHORT   → hashCode(short[])        → sign-extend `short`
-        //   T_CHAR    → utf16hashCode(byte[])    → big-endian u16 pairs
+        //   T_CHAR    → utf16hashCode(byte[])    → u16 PAIRS, handled above
         //   T_INT     → hashCode(int[])          → raw 32-bit
         let contribution = match basic_type {
             HOTSPOT_T_BOOLEAN => elem & 0xff,
@@ -22785,6 +22852,91 @@ mod t2_tests {
             ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(0xFFFE)));
+    }
+
+    /// `T_CHAR` over a **byte[]** is the `StringUTF16.hashCode` shape: two
+    /// slots per element, little-endian, and `length` counting CHARS.
+    ///
+    /// This is the case that was wrong until 2026-08-05 -- the loop read one
+    /// slot per iteration for every `BasicType`, so a 3-char string hashed
+    /// bytes 0,1,2 and `(elem as u16)` sign-extended each signed byte.
+    /// `"\u03A3\u039F\u03A3".hashCode()` returned 62956255 where the JLS and
+    /// HotSpot say 924359.
+    ///
+    /// Note what the sibling `t2_arrays_support_hash_code_char_zero_extends`
+    /// pins: `T_CHAR` over a **char[]** (`Arrays.hashCode(char[])`) is ONE
+    /// slot per element. The two shapes share a `basicType` and differ only in
+    /// the array, which is why the first attempt at this fix keyed on
+    /// `basicType` alone and broke the other one. Keep both tests adjacent.
+    #[test]
+    fn t2_arrays_support_hash_code_char_over_byte_array_pairs_little_endian() {
+        let mut ctx = mock_ctx();
+        // "\u03A3\u039F\u03A3" as CratonVM stores it: low byte first.
+        let arr = make_byte_array(&mut ctx, &[0xA3, 0x03, 0x9F, 0x03, 0xA3, 0x03]);
+        let r = native_arrays_support_vectorized_hash_code(
+            &mut ctx,
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(3), // CHAR count, not byte count
+                Value::Int(0),
+                Value::Int(HOTSPOT_T_CHAR),
+            ],
+        );
+        assert_eq!(
+            r.unwrap(),
+            Some(Value::Int(924359)),
+            "T_CHAR over a byte[] must pair the bytes little-endian. 62956255 is the \
+             pre-2026-08-05 answer: one slot per iteration, each signed byte sign-extended \
+             to a char. 161735 would be pairing without masking; 41407139 would be \
+             big-endian pairing."
+        );
+    }
+
+    /// The byte[] path honours `fromIndex` in CHARS, and refuses to read past
+    /// the end when `fromIndex + 2*length` would.
+    ///
+    /// The bounds guard has to scale with the same stride as the reader. It did
+    /// not in the first version of this fix -- it compared `fromIndex + length`
+    /// against the array length, which for the byte[] shape is half the bytes
+    /// actually touched, so an over-long `length` read off the end instead of
+    /// returning the initial value.
+    #[test]
+    fn t2_arrays_support_hash_code_char_over_byte_array_bounds_use_the_pair_stride() {
+        let mut ctx = mock_ctx();
+        let arr = make_byte_array(&mut ctx, &[0xA3, 0x03, 0x9F, 0x03, 0xA3, 0x03]);
+
+        // fromIndex is a CHAR index: start at char 1 -> bytes 2..6 -> 2 chars.
+        let from_one = native_arrays_support_vectorized_hash_code(
+            &mut ctx,
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(0),
+                Value::Int(HOTSPOT_T_CHAR),
+            ],
+        );
+        // 31 * 0x039F + 0x03A3 = 29727 + ... computed as the JLS fold.
+        let expected = 31i32.wrapping_mul(0x039F).wrapping_add(0x03A3);
+        assert_eq!(from_one.unwrap(), Some(Value::Int(expected)));
+
+        // 4 chars over a 6-byte array needs 8 bytes: refuse, return initial.
+        let too_long = native_arrays_support_vectorized_hash_code(
+            &mut ctx,
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(4),
+                Value::Int(7),
+                Value::Int(HOTSPOT_T_CHAR),
+            ],
+        );
+        assert_eq!(
+            too_long.unwrap(),
+            Some(Value::Int(7)),
+            "the bounds guard must scale by the pair stride, not the char count"
+        );
     }
 
     #[test]
