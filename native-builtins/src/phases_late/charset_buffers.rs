@@ -745,6 +745,28 @@ pub(crate) fn cb_write_hb(
     ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len_chars));
     ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len_chars));
     ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+    // `java.nio.Buffer.address` (long), and it MUST be written last, by name:
+    // the indexed CB_FIELD_* writes above can alias the real `address` slot,
+    // and CB_FIELD_MARK's -1 is exactly what used to land in it.
+    //
+    // A real `HeapCharBuffer` sets `address` to
+    // `ARRAY_CHAR_BASE_OFFSET + (offset << 1)` (= 16 + 0). Left at -1, the
+    // inherited bulk-put bytecode `CharBuffer.put(CharBuffer)` ->
+    // `putBuffer` -> `ScopedMemoryAccess.copyMemory` computes a source
+    // offset of `address(-1) + (pos << 1)`, which is below
+    // `arrayBaseOffset` (16), so `unsafe_array_read_bytes`'s
+    // `byte_off.checked_sub(ABASE)` underflows and the copy reports
+    // ArrayIndexOutOfBoundsException.
+    //
+    // This is the identical defect, and the identical fix, that
+    // `charset.rs`'s ByteBuffer allocator already carries with the same
+    // warning about aliasing. Found 2026-08-05: it is what fails
+    // `BeanRegistrationsAotContributionTests
+    // #applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` on
+    // current dev - javac's `BaseFileManager.decode` grows its CharBuffer and
+    // copies the old one in, so EVERY source file it reads hits this.
+    // 16 == `Unsafe.arrayBaseOffset(char[])` here.
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
 }
 
 /// Read the backing char[] from a CharBuffer, honouring both the
