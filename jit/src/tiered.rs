@@ -1130,6 +1130,15 @@ pub fn dump_method_stats_to_stderr() {
         // workload its OSR shows up here as `osr_entered` collapsing while
         // `osr_refused_entry` rises, and nowhere else. Read `osr_exited`
         // against `osr_entered`, never alone.
+        //
+        // The four `osr_exit_*` rows partition the exits that arrived carrying
+        // a reconstructed frame, and two of them — `osr_exit_map_missing` and
+        // `osr_exit_bci_unrecorded` — are cross-checks between metadata one
+        // function writes, not classifications, so they MUST read zero.
+        // `regression-suite/perf/osr-exit-differential.sh` parses this line and
+        // fails its run on either of those, or on a forced-exit arm that took
+        // no entry — without which that whole harness would be a test of the
+        // interpreter.
         eprintln!(
             "[cratonvm] OSR lifecycle: {}",
             crate::metrics::osr_counts()
