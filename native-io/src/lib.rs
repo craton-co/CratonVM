@@ -4573,6 +4573,47 @@ fn native_scanner_has_next_boolean(
 
 // --- Scanner configuration ---
 
+/// Build the `java.util.regex.Pattern` that `delimiter()` hands back.
+///
+/// Both delimiter sites used to fabricate one — `alloc_object(Pattern, 2)` with
+/// the source poked into slot 0 and `0` into slot 1. Those two writes land on
+/// the right fields (`pattern:String`, `flags:int` are the real class's first
+/// two, per javap), so nothing in the overlay census ever objected, and our own
+/// readers only want slot 0. **It is still not a usable `Pattern`.** Real
+/// `Pattern.matcher()` does compile lazily when `compiled` is false, so it gets
+/// as far as running — and then throws, because the rest of the object
+/// (`capturingGroupCount`, `localCount`, `root`, …) is the zeroed state a real
+/// `compile()` would have filled in. Measured against the host JDK:
+/// `sc.useDelimiter(","); sc.delimiter().matcher("x,y").find()` answers `true`
+/// on HotSpot 25 and threw `ArrayIndexOutOfBoundsException` inside
+/// `Matcher.search` here.
+///
+/// So ask the JDK for one. The fabricated object survives only as the fallback
+/// for a runtime where `Pattern.compile` cannot be invoked (a synthetic image
+/// whose `Pattern` is itself a stub), which is the only place it was ever
+/// adequate.
+fn scan_make_pattern(ctx: &mut dyn NativeContext, source: ObjectRef) -> ObjectRef {
+    let source_pin = ctx.pin_native_root(source);
+    let compiled = ctx.invoke(
+        "java/util/regex/Pattern",
+        "compile",
+        "(Ljava/lang/String;)Ljava/util/regex/Pattern;",
+        &[Value::Object(Some(source))],
+    );
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.unpin_native_roots(source_pin);
+    if let Ok(Some(Value::Object(Some(pat)))) = compiled {
+        return pat;
+    }
+    let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
+        Ok(cid) => ctx.alloc_object(cid, 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
+    };
+    ctx.set_field(pat, 0, Value::Object(Some(source)));
+    ctx.set_field(pat, 1, Value::Int(0));
+    pat
+}
+
 fn native_scanner_use_delimiter_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4585,13 +4626,11 @@ fn native_scanner_use_delimiter_string(
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    // Create a Pattern synthetic: 2 fields (source=0, flags=1)
-    let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
-        Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
-    };
-    ctx.set_field(pat, 0, Value::Object(Some(pattern_str)));
-    ctx.set_field(pat, 1, Value::Int(0));
+    // GC-safety: `scan_make_pattern` invokes Java, which can relocate `this`.
+    let this_pin = ctx.pin_native_root(this);
+    let pat = scan_make_pattern(ctx, pattern_str);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     scan_set_delim(ctx, this, Value::Object(Some(pat)));
     Ok(Some(Value::Object(Some(this))))
 }
@@ -4639,14 +4678,9 @@ fn native_scanner_delimiter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if let Value::Object(Some(_)) = delim {
         Ok(Some(delim))
     } else {
-        // Return default pattern
+        // No delimiter set: hand back the default, compiled the same way.
         let src = ctx.create_string(SCAN_DEFAULT_DELIM);
-        let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
-            Ok(cid) => ctx.alloc_object(cid, 2),
-            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
-        };
-        ctx.set_field(pat, 0, Value::Object(Some(src)));
-        ctx.set_field(pat, 1, Value::Int(0));
+        let pat = scan_make_pattern(ctx, src);
         Ok(Some(Value::Object(Some(pat))))
     }
 }
