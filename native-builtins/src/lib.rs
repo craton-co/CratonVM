@@ -6496,13 +6496,47 @@ fn populate_real_thread_holder(
         Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
         None => target,
     };
+    // A new thread's priority is NOT a constant. The JDK's
+    // `Thread(ThreadGroup g, ...)` takes the CREATING thread's priority and
+    // then caps it at the group's ceiling:
+    //
+    //     int priority = parent.getPriority();
+    //     if (priority > g.getMaxPriority()) priority = g.getMaxPriority();
+    //
+    // This site hard-coded `NORM_PRIORITY`, so a thread created in a group
+    // lowered to 3 still reported 5 — `probes/ThreadGroupPriorityProbe`
+    // measures 5 where Temurin 25.0.3 gives 3. That defeats the point of
+    // lowering a pool's group, which is to cap the threads it will hold.
+    // `setPriority` already clamped against the group correctly; only
+    // construction skipped the step.
+    let creator_priority = {
+        let creator = ctx.current_thread_object();
+        match ctx.get_field_by_name(creator, "holder") {
+            Value::Object(Some(h)) => ctx
+                .get_field_by_name(h, "priority")
+                .as_int()
+                .filter(|p| (1..=10).contains(p))
+                .unwrap_or(5),
+            // JDK 17 shape (no FieldHolder), or a mirror still under
+            // construction: NORM_PRIORITY is the JDK's own default.
+            _ => 5,
+        }
+    };
+    let group_ceiling = match group {
+        Value::Object(Some(g)) => ctx
+            .get_field_by_name(g, "maxPriority")
+            .as_int()
+            .filter(|p| (1..=10).contains(p))
+            .unwrap_or(10),
+        _ => 10,
+    };
     let args = [
         Value::Object(Some(holder)),
         group,
         target,
         Value::Long(0), // stackSize
-        Value::Int(5),  // priority = NORM_PRIORITY
-        Value::Int(0),  // daemon = false
+        Value::Int(creator_priority.min(group_ceiling)),
+        Value::Int(0), // daemon = false
     ];
     let ctor_ok = ctx
         .invoke(
