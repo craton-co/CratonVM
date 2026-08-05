@@ -127,7 +127,7 @@ names `ofVirtual`, `startVirtualThread` or `isVirtual`.
 
 ## The residual this lane opened, closed
 
-[Bounded socket operations hang about one run in five](../known-issues/bounded-socket-operations-hang-about-one-run-in-five.md)
+[Bounded socket operations hang about one run in five](fixed-suite-bugs/net/bounded-socket-operations-hang-FIXED-20260805.md) (fixed 2026-08-05)
 named five candidate call sites and asked for a thread dump as the cheapest
 next step. It was right. Twenty-five runs with `--stack-dump-on-timeout=45`
 inside `timeout 90` hung **6 times** — the recorded rate — and every hung run
