@@ -113,6 +113,28 @@ RUST_MIN_STACK=8388608 cargo test --all -- --test-threads=4
 
 Tests that require `javac` skip gracefully when no JDK is on the `PATH`.
 
+### Demanding that those skips did not happen
+
+Most of `vm/tests` drives a real `cratonvm` binary, and a few also need a real
+JDK. When a prerequisite is missing, those tests print a note and return — and
+cargo then reports `test ... ok`, which is **indistinguishable from a real
+pass**. A whole suite can report green having asserted nothing. This is not
+hypothetical: a build cut off mid-link once left two JIT tests reporting
+`ok ... finished in 0.00s` with zero coverage, and the duration was the only
+tell.
+
+Set `CRATONVM_REQUIRE_E2E=1` to turn every such skip into a failure naming what
+was missing:
+
+```bash
+cargo build --release -p cratonvm-cli
+CRATONVM_REQUIRE_E2E=1 cargo test -p cratonvm-vm
+```
+
+Leave it unset for ordinary development — default behaviour is unchanged, so a
+contributor with no JDK and no build is never blocked. `0` and the empty string
+also read as unset. See [`vm/tests/common/mod.rs`](vm/tests/common/mod.rs).
+
 ## Linting and formatting
 
 These are the same checks CI is configured to run

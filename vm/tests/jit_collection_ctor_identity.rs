@@ -75,7 +75,15 @@ fn classpath_dir() -> PathBuf {
 
 /// Resolve the `cratonvm` CLI binary (`CRATONVM_BIN`, then release, then
 /// debug) — same resolution order as the sibling subprocess tests.
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
