@@ -205,6 +205,22 @@ and which needs its own measurement. Recorded here rather than attempted.
 On the original Hibernate classpath (`DiscoveryProbe` on `OffsetDateTimeTest`,
 `CRATONVM_BG_COMPILE=0`): **0/5 clean before, 5/5 clean after**.
 
+Suite state, `apps/hib-suite-runner`, `passed.txt[0..60)`, real JDK, JIT on:
+
+| arm | result | wall |
+|---|---|---|
+| default | **60/60 PASS** | 3m35s |
+| `CRATONVM_BG_COMPILE=0` | **60/60 PASS** | 3m50s |
+
+The second row is the point of the fix: the opt-out could not previously
+complete a single class on this classpath. The ~7 % wall difference between the
+arms is the inline-tier-up path doing its own codegen on the mutator and is not
+attributable to this change (which only *removes* compiles).
+
+`cargo test -p cratonvm-vm --lib` — 2401 passed, the same 2 pre-existing
+`native::jni` `/OPT:ICF` failures as on unmodified `dev`, documented in
+`../../native-call-funnel-per-call-floor-item2-20260805.md`.
+
 `vm/tests/clinit_first_call_compile_order.rs` pins both flag arms — the default
 arm too, so a future change that moves the first-call door under the background
 pipeline cannot reintroduce this silently. **Verified RED on the pre-fix
