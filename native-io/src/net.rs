@@ -1847,7 +1847,33 @@ fn net_poll_raw(raw: NetRawHandle, events: i32, timeout: i32) -> std::io::Result
     // the borrowed socket's file descriptor alive for the call.
     let count = unsafe { poll(&mut pfd, 1, timeout) };
     if count < 0 {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        // AUDIT 2026-08-02: report EINTR as "not ready", exactly as
+        // OpenJDK's `Net.poll` does — `unix/native/libnio/ch/Net.c` returns
+        // 0 revents on EINTR rather than throwing. `poll(2)` is NEVER
+        // auto-restarted by `SA_RESTART`, so any signal delivered to a
+        // thread parked here comes straight back as EINTR — and CratonVM
+        // sends one on purpose: `jit::xt_root_scan` SIGUSR2s every thread
+        // to take it over for a cross-thread JIT root scan. Without this
+        // arm `net_err` has no `Interrupted` case, so the park surfaced as
+        // `SocketException: poll: Interrupted system call` — a random
+        // mid-request connection abort whenever a GC landed on a socket
+        // wait. Measured 2026-08-02: 14 of 160
+        // `RequestMappingMessageConversionIntegrationTests` failed exactly
+        // that way, and 0 with this arm. This is the same audit that fixed
+        // `read0`/`write0` above on 2026-07-26 and missed the poll
+        // primitive they park on.
+        //
+        // Reporting "not ready" rather than retrying the poll in place is
+        // what keeps the caller's deadline honest: `NioSocketImpl`'s
+        // `timedRead`/`timedAccept` recompute the remaining timeout from
+        // `System.nanoTime()` on every pass, and `net_poll_listener` below
+        // loops on `Ok(false)`. Re-polling here with the same `timeout`
+        // would restart the whole wait on each signal instead.
+        if error.kind() == std::io::ErrorKind::Interrupted || error.raw_os_error() == Some(4) {
+            return Ok(false);
+        }
+        Err(error)
     } else {
         Ok(count > 0)
     }

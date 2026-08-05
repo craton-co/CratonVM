@@ -730,6 +730,31 @@ impl OldGen {
         objects: &mut Vec<(*mut u8, usize)>,
     ) {
         let mut offset = start_offset;
+        // PERF 2026-08-02: `dirty_ranges` is sorted ascending, non-overlapping
+        // and coalesced (see `gen_heap::scan_dirty_cards`, which sorts the card
+        // indices and merges adjacent cards before calling here), and `offset`
+        // only ever increases across this loop. So the range that could contain
+        // `offset` can be tracked with a monotone cursor. This used to be a
+        // `dirty_ranges.iter().any(..)` per object, making the dirty-card scan
+        // O(old-gen objects x dirty ranges) — quadratic in the size of the old
+        // generation once a workload promotes a lot and dirties a lot.
+        //
+        // Measured 2026-08-02, `perf record -F 199` against
+        // `BeanRegistrationsAotContributionTests
+        // #applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` (10001
+        // generated bean definitions, so a large old gen and a large dirty set):
+        // `scan_region_filtered` was **73.7% of ALL CPU samples** before this
+        // change and does not appear in the profile at all after it.
+        //
+        // Scope the claim honestly: removing that 73.7% does NOT make that test
+        // pass — it still exhausts the heap in javac (see
+        // `docs/known-issues/spring/beanregistrations-verylarge-heap-footprint
+        // -20260805.md`), it just gets there sooner. And on the 1001-definition
+        // sibling, whose old gen is small enough that the quadratic never bites,
+        // an alternating 2-binary A/B is within noise (221 s vs 229 s). The
+        // justification for this change is the algorithm and the profile, not a
+        // wall-clock win on any particular test.
+        let mut range_idx = dirty_ranges.partition_point(|&(_, end)| end <= offset);
         while offset < end_offset {
             let ptr = (base + offset) as *mut u8;
             // SAFETY: `offset` is a valid object boundary within an
@@ -757,7 +782,18 @@ impl OldGen {
                 break;
             }
             // Collect only if the object's start lands in a dirty card.
-            if dirty_ranges.iter().any(|&(s, e)| offset >= s && offset < e) {
+            // Advance the cursor past every range that ends at or before this
+            // object; what remains is the only range that can contain it.
+            while range_idx < dirty_ranges.len() && dirty_ranges[range_idx].1 <= offset {
+                range_idx += 1;
+            }
+            let Some(&(range_start, _)) = dirty_ranges.get(range_idx) else {
+                // Past the last dirty range: no later object in this region can
+                // qualify, and the caller derives its own cursor from the free
+                // list rather than from how far this walk got.
+                return;
+            };
+            if offset >= range_start {
                 objects.push((ptr, total_size));
             }
             offset += total_size;
@@ -1346,6 +1382,121 @@ impl std::fmt::Debug for OldGen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lay out `count` fixed-size objects back to back in a fresh old gen
+    /// and return their `(ptr, offset)` pairs. Headers must be real: the
+    /// walker derives every object boundary by striding header-to-header.
+    fn old_gen_with_objects(count: usize, slots: u32) -> (OldGen, Vec<usize>) {
+        let mut og = OldGen::new(64 * 1024);
+        let base = og.base_ptr() as usize;
+        let mut offsets = Vec::new();
+        for i in 0..count {
+            let body = SLOT_SIZE * slots as usize;
+            let ptr = og.alloc(HEADER_SIZE + body, 8).unwrap();
+            // SAFETY: `ptr` is a fresh, correctly sized old-gen allocation.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        cratonvm_types::ClassId::new(1),
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        i as i32,
+                        0,
+                        slots,
+                    ),
+                );
+            }
+            offsets.push(ptr as usize - base);
+        }
+        (og, offsets)
+    }
+
+    /// The reference semantics this walk had before it was given a monotone
+    /// cursor: an object is collected iff its start offset lies in ANY dirty
+    /// range. Kept here as the oracle the fast path is compared against.
+    fn expected_in_ranges(offsets: &[usize], ranges: &[(usize, usize)]) -> Vec<usize> {
+        offsets
+            .iter()
+            .copied()
+            .filter(|off| ranges.iter().any(|&(s, e)| *off >= s && *off < e))
+            .collect()
+    }
+
+    fn collected_offsets(og: &OldGen, ranges: &[(usize, usize)]) -> Vec<usize> {
+        let base = og.base_ptr() as usize;
+        og.walk_objects_in_card_ranges(ranges)
+            .into_iter()
+            .map(|(ptr, _)| ptr as usize - base)
+            .collect()
+    }
+
+    #[test]
+    fn card_range_walk_collects_exactly_the_objects_starting_in_a_dirty_range() {
+        let (og, offsets) = old_gen_with_objects(8, 2);
+        // One range covering objects 2..4 only.
+        let ranges = vec![(offsets[2], offsets[4])];
+        assert_eq!(
+            collected_offsets(&og, &ranges),
+            expected_in_ranges(&offsets, &ranges)
+        );
+        assert_eq!(collected_offsets(&og, &ranges), vec![offsets[2], offsets[3]]);
+    }
+
+    #[test]
+    fn card_range_walk_handles_several_disjoint_ranges() {
+        let (og, offsets) = old_gen_with_objects(10, 3);
+        // Sorted, non-overlapping, with gaps — what the card table produces.
+        let ranges = vec![
+            (offsets[1], offsets[2]),
+            (offsets[4], offsets[6]),
+            (offsets[9], offsets[9] + 8),
+        ];
+        assert_eq!(
+            collected_offsets(&og, &ranges),
+            expected_in_ranges(&offsets, &ranges)
+        );
+    }
+
+    #[test]
+    fn card_range_walk_is_empty_when_no_object_starts_in_a_range() {
+        let (og, offsets) = old_gen_with_objects(6, 2);
+        // A range strictly inside object 3's body, so no object *starts* in it.
+        let ranges = vec![(offsets[3] + 8, offsets[3] + 16)];
+        assert!(collected_offsets(&og, &ranges).is_empty());
+        assert!(expected_in_ranges(&offsets, &ranges).is_empty());
+    }
+
+    #[test]
+    fn card_range_walk_matches_the_any_predicate_for_every_prefix_and_suffix() {
+        // The monotone cursor added 2026-08-02 replaced a per-object
+        // `ranges.iter().any(..)`, and returns early once the cursor passes
+        // the last range. Sweep a family of range sets — including ones that
+        // end before the last object, which is what exercises that early
+        // return — and require the two to agree exactly.
+        let (og, offsets) = old_gen_with_objects(12, 2);
+        for lo in 0..offsets.len() {
+            for hi in (lo + 1)..=offsets.len() {
+                let end = if hi == offsets.len() {
+                    offsets[hi - 1] + 8
+                } else {
+                    offsets[hi]
+                };
+                let ranges = vec![(offsets[lo], end)];
+                assert_eq!(
+                    collected_offsets(&og, &ranges),
+                    expected_in_ranges(&offsets, &ranges),
+                    "disagreement for objects {lo}..{hi}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_range_walk_with_no_ranges_collects_nothing() {
+        let (og, _offsets) = old_gen_with_objects(4, 2);
+        assert!(collected_offsets(&og, &[]).is_empty());
+    }
 
     #[test]
     fn new_old_gen() {
