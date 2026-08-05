@@ -4280,11 +4280,23 @@ fn run() -> Result<()> {
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =
                 cratonvm_vm::jit::xt_root_scan::XT_CYCLES_WITH_UNCLASSIFIED.load(O::Relaxed);
-            if peers > 0 {
-                eprintln!(
-                    "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles}"
-                );
-            }
+            // H2-CID0 (2026-08-05): UNCONDITIONAL. This used to print only when
+            // `peers > 0`, which made "every peer answered" indistinguishable
+            // from "the take-over never ran" — and a run that FAILED printed
+            // nothing, which reads as the reassuring one and was the other.
+            // `taken_over` is what separates them.
+            let taken = cratonvm_vm::jit::xt_root_scan::XT_THREADS_TAKEN_OVER.load(O::Relaxed);
+            let roots = cratonvm_vm::jit::xt_root_scan::XT_ROOTS_FOUND.load(O::Relaxed);
+            let hw = cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_SCANNED.load(O::Relaxed);
+            let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
+            let saved =
+                cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            eprintln!(
+                "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 resignals={resig} classified_after_retry={saved} enabled={}",
+                cratonvm_vm::jit::xt_root_scan::enabled(),
+            );
         }
     }
 

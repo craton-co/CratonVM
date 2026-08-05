@@ -705,6 +705,9 @@ struct YoungFreedRec {
     size: AtomicU64,
     cycle: AtomicU64,
     seq: AtomicU64,
+    /// H2-CID0 (2026-08-05) — packed cross-thread root coverage of the sweep
+    /// that published this span. See [`pack_xt_coverage`].
+    xt: AtomicU64,
 }
 
 impl YoungFreedRec {
@@ -714,8 +717,36 @@ impl YoungFreedRec {
             size: AtomicU64::new(0),
             cycle: AtomicU64::new(0),
             seq: AtomicU64::new(0),
+            xt: AtomicU64::new(0),
         }
     }
+}
+
+/// Marks a packed coverage word as actually written.
+///
+/// Zero is a legitimate reading (`passes=0` = the takeover never ran, which
+/// `gc_quiescence::XT_PASSES_LAST_CYCLE` warns is the OPPOSITE conclusion from
+/// "ran and found nothing"), so absence needs its own encoding.
+const XT_CAPTURED: u64 = 1 << 48;
+
+/// Pack `(passes, taken_over, unclassified)` into one word, saturating each at
+/// 16 bits — the counts are per-cycle peer tallies, so anything near the cap is
+/// already far past "a few threads".
+#[inline]
+fn pack_xt_coverage(passes: u64, taken: u64, unclassified: u64) -> u64 {
+    XT_CAPTURED
+        | (passes.min(0xFFFF) << 32)
+        | (taken.min(0xFFFF) << 16)
+        | unclassified.min(0xFFFF)
+}
+
+/// `(passes, taken_over, unclassified)`, or `None` if nothing was captured.
+#[inline]
+fn unpack_xt_coverage(w: u64) -> Option<(u64, u64, u64)> {
+    if w & XT_CAPTURED == 0 {
+        return None;
+    }
+    Some(((w >> 32) & 0xFFFF, (w >> 16) & 0xFFFF, w & 0xFFFF))
 }
 
 static YOUNG_FREED_RING: [YoungFreedRec; YOUNG_FREED_RING_LEN] =
@@ -732,15 +763,31 @@ pub fn record_young_span_freed(base: usize, size: usize, cycle: u64) {
     r.size.store(size as u64, Ordering::Relaxed);
     r.cycle.store(cycle, Ordering::Relaxed);
     r.seq.store(seq, Ordering::Relaxed);
+    // H2-CID0: the coverage of THIS sweep, captured here because this call
+    // happens inside it — after the take-over pass published its outcome and
+    // before `reset_xt_cycle` clears it for the next one. Read back by the
+    // reclaim guard for the exact span it reports, so a stale receiver can say
+    // whether the sweep that freed it had seen every running peer's JIT frames.
+    let (passes, taken, unclassified, _roots, _hw, _hw_roots) =
+        crate::gc_quiescence::xt_cycle_coverage();
+    r.xt.store(
+        pack_xt_coverage(passes, taken, unclassified),
+        Ordering::Relaxed,
+    );
     // Publish `base` LAST, as in the old-gen ring.
     r.base.store(base as u64, Ordering::Release);
 }
 
 /// Did the young sweep reclaim a span covering `addr`? Returns
-/// `(base, size, cycle, seq)` for the most recent covering record.
-pub fn young_freed_lookup(addr: usize) -> Option<(usize, usize, u64, u64)> {
+/// `(base, size, cycle, seq, xt_coverage)` for the most recent covering record,
+/// where `xt_coverage` is `(passes, taken_over, unclassified)` for the sweep
+/// that published the span — `None` when nothing was captured.
+#[allow(clippy::type_complexity)]
+pub fn young_freed_lookup(
+    addr: usize,
+) -> Option<(usize, usize, u64, u64, Option<(u64, u64, u64)>)> {
     let a = addr as u64;
-    let mut best: Option<(usize, usize, u64, u64)> = None;
+    let mut best: Option<(usize, usize, u64, u64, Option<(u64, u64, u64)>)> = None;
     for r in YOUNG_FREED_RING.iter() {
         let base = r.base.load(Ordering::Acquire);
         if base == 0 {
@@ -751,12 +798,13 @@ pub fn young_freed_lookup(addr: usize) -> Option<(usize, usize, u64, u64)> {
             continue;
         }
         let seq = r.seq.load(Ordering::Relaxed);
-        if best.is_none_or(|(_, _, _, b)| seq > b) {
+        if best.is_none_or(|(_, _, _, b, _)| seq > b) {
             best = Some((
                 base as usize,
                 size as usize,
                 r.cycle.load(Ordering::Relaxed),
                 seq,
+                unpack_xt_coverage(r.xt.load(Ordering::Relaxed)),
             ));
         }
     }
@@ -15575,6 +15623,40 @@ impl GarbageCollector for GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H2-CID0 (2026-08-05) — "nobody looked" must not read as "nothing found".
+    ///
+    /// `gc_quiescence::XT_PASSES_LAST_CYCLE` documents the trap: the take-over
+    /// is gated on an `any_thread_in_jit()` hint, so a cycle can legitimately
+    /// run ZERO passes — and then `unclassified = 0` means "never looked", the
+    /// opposite conclusion from "looked and every peer answered". The guard
+    /// reports a stale receiver's freeing sweep through this encoding, so the
+    /// three readings have to survive the round trip distinctly.
+    #[test]
+    fn packed_sweep_coverage_separates_never_looked_from_complete() {
+        // Looked, everyone answered.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(2, 3, 0)),
+            Some((2, 3, 0)),
+        );
+        // Looked, someone did not — the defect's signature.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(2, 1, 4)),
+            Some((2, 1, 4)),
+        );
+        // Never looked: distinguishable from both of the above.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(0, 0, 0)),
+            Some((0, 0, 0)),
+        );
+        // Nothing captured at all is a FOURTH reading, and the only one that
+        // may be absent — an all-zero word must not decode as a real sample.
+        assert_eq!(unpack_xt_coverage(0), None);
+        // Saturation must not alias a large count onto a small one, or onto
+        // the captured bit.
+        let (p, t, u) = unpack_xt_coverage(pack_xt_coverage(1 << 20, 1 << 20, 1 << 20)).unwrap();
+        assert_eq!((p, t, u), (0xFFFF, 0xFFFF, 0xFFFF));
+    }
 
     /// No-op monitor cleanup for tests in the gc crate.
     struct NoOpMonitors;
