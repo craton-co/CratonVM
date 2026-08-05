@@ -106,34 +106,47 @@ under "AUDIT 2026-05-17" ("clone the per-listener `Arc<Mutex<_>>`, drop the map
 lock, then perform the blocking accept"). `net_poll` was the one path that
 missed it.
 
-## The A/B, and the first one that proved nothing
+## The A/B — and it took three attempts to get an honest one
 
-**Result: pre-fix 13/60 hung, post-fix 0/60.**
+**Final result: pre-fix 44/120 hung, fixed 0/120.** It took two wrong
+measurements to get there, and both are worth keeping.
 
-The first attempt was 30 sequential runs per arm on a quiet host and returned
-**0/30 on both arms — including the pre-fix binary**. That is not a passing
-A/B, it is a failed reproduction, and reporting it as a fix would have been the
-"aggregate that is not a before/after" this feature keeps producing. The race
-needs `Net.socket0` to land inside a window the accept thread opens twice per
-50 ms slice; at load 14 it is never hit, and the original evidence was taken at
-load 60–160.
+**Attempt 1 proved nothing.** Thirty sequential runs per arm on a quiet host:
+**0/30 on both arms, including the pre-fix binary**. That is a failed
+reproduction, not a passing test. The race needs `Net.socket0` to land inside a
+window the accept thread opens twice per 50 ms slice; at load 14 it is never
+hit, and the original evidence was taken at load 60–160.
 
-So the second attempt generates its own contention — 10 concurrent copies of
-the probe per wave, six waves — and **alternates the arms within each wave**.
-Running one arm to completion and then the other is how the first attempt ended
-up comparing two different machines.
+**Attempt 2 generated its own contention** — 10 concurrent probes per wave,
+arms alternating *within* each wave so neither gets a quieter machine — and
+scored 13/60 against 0/60. That reads like a clean fix.
 
-| wave | pre-fix cumulative | post-fix cumulative |
+**Attempt 3 refuted it.** Re-running the same two binaries later scored
+**27/60 pre-fix and 10/60 "post-fix"**. The fixed arm hung too. So the
+`net_poll` guard release is necessary and **not sufficient**: there is a second
+path into the same wedge, and one clean 60-run sample had merely missed it.
+
+What closes it is the *pair*. `origin/dev` landed an independent change on
+2026-08-02 for an unrelated symptom — `net_poll_raw` must report EINTR as
+"not ready" rather than throwing, because CratonVM's own cross-thread JIT root
+scan `SIGUSR2`s every thread and `poll(2)` is never `SA_RESTART`-restarted.
+With **both** changes present:
+
+| wave | pre-fix cumulative | merged cumulative |
 |---|---|---|
 | 1 | 3/10 | 0/10 |
-| 2 | 5/20 | 0/20 |
-| 3 | 5/30 | 0/30 |
-| 4 | 5/40 | 0/40 |
-| 5 | 7/50 | 0/50 |
-| 6 | **13/60** | **0/60** |
+| 4 | 11/40 | 0/40 |
+| 8 | 27/80 | 0/80 |
+| 12 | **44/120** | **0/120** |
 
-Same host, same minute, same load, same class files. The pre-fix arm hung in
-every single wave and the post-fix arm never did.
+Twelve waves, 120 runs per arm, same host, arms interleaved. The pre-fix arm
+hung in every wave; the merged arm never once.
+
+**The lesson is not about sockets.** Two fixes for two different symptoms, from
+two branches, neither sufficient alone — and the branch that landed second
+would have reported a clean A/B for the wrong reason if it had only sampled 60
+runs. Measure the merged state, and treat a single clean sample of a
+probabilistic failure as unproven.
 
 ## What it is not
 

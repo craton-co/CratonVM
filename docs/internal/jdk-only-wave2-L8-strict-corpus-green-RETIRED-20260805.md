@@ -142,13 +142,25 @@ writer-preferring `RwLock` every slice. A concurrent `Net.socket0` queues
 between the two reads and nothing moves. One flag turned "the run stops after
 the `nio` line" into two named frames in under a minute.
 
-**A/B: pre-fix 13/60 hung, post-fix 0/60** — and the first A/B proved nothing.
+**A/B: pre-fix 44/120 hung, merged 0/120** — after two wrong measurements.
 Thirty sequential runs per arm on a quiet host gave 0/30 on *both*, pre-fix
-included: a failed reproduction, not a passing test. The race needs contention,
-so the second attempt generated 10 concurrent probes per wave and alternated
-the arms **within** each wave, because running one arm to completion and then
-the other compares two different machines. The pre-fix arm hung in all six
-waves; the post-fix arm never did.
+included: a failed reproduction, not a passing test. Ten concurrent probes per
+wave with the arms alternating **within** each wave then gave 13/60 vs 0/60,
+which reads like a clean fix. Re-running the same two binaries later gave
+**27/60 vs 10/60** — the "fixed" arm hung too.
+
+So the guard release is necessary and **not sufficient**. What closes it is the
+pair: `origin/dev` had landed an independent `net_poll_raw` change on
+2026-08-02, for an unrelated symptom (EINTR must report not-ready, because
+CratonVM's own cross-thread JIT root scan `SIGUSR2`s every thread and `poll(2)`
+is never `SA_RESTART`-restarted). With both present, twelve waves scored
+44/120 against 0/120.
+
+That is the transferable lesson from this lane, and it is not about sockets:
+**two fixes from two branches, neither sufficient alone**, and the second one
+in would have claimed a clean A/B for the wrong reason had it stopped at 60
+runs. Measure the merged state, and treat one clean sample of a probabilistic
+failure as unproven.
 
 ## Two bugs in the instruments
 
