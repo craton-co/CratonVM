@@ -350,8 +350,52 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
     / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
     0/1. Each is its own change with its own A/B, and the list is this lane's
-    output. **`ThreadGroup` and `java/lang/Thread` are FIXED (2026-08-05); the
-    rest are open.**
+    output. **`ThreadGroup`, `java/lang/Thread` and
+    `java/security/ProtectionDomain` are FIXED (2026-08-05); the rest are
+    open.**
+
+    ### The third worked example — `ProtectionDomain`, and what the mock hid
+
+    The model was in the JDK **constructor's argument order**,
+    `(CodeSource, PermissionCollection, ClassLoader, Principal[])`, while the
+    class declares `codesource, classloader, principals, permissions`. Three of
+    the four sat at the wrong index, all four are references, and the arm said
+    so in as many words: *"Matches the constructor signature … that real JDK
+    bytecode targets."* The signature was right and irrelevant. **A constructor
+    signature is not a field layout** — worth its own line, because it is a
+    plausible-looking way to derive a model and it produced a rotation rather
+    than a swap.
+
+    No live defect, again: `populate_protection_domain_fields` wrote slots 0..3
+    and then the same four by name, with a comment noting the by-name pass was
+    "authoritative — runs last". It was, so the raw pass was dead weight on a
+    real layout and redundant on a fabricated one. The probe reads all four
+    fields correctly on the pre-fix binary. Fixed by putting the model in
+    declaration order and deleting the raw pass, which also deletes an ordering
+    dependency nothing could see from the call site.
+
+    **The finding worth carrying forward is in the test infrastructure.**
+    Removing the raw pass turned an existing test red, and the reason was that
+    `MockNativeContext::set_field_by_name` silently resolved `None` for any
+    class with a fabricated model but no hand-written `mock_*_field_slot`
+    helper. So under the mock, **the by-name half of every dual write in
+    `native-builtins` did nothing** — every such native was tested on its raw
+    half only, the half that is wrong precisely when the model and the image
+    disagree. The same test also expected a `String` at `CodeSource` slot 0, a
+    value the VM has not produced for as long as the by-name write beside it
+    has existed. Both were artefacts of the blind spot.
+
+    The mock's read and write paths now fall back to the production
+    `synthetic_stub_field_model`; the third entry point,
+    `resolve_field_index_by_class_id`, is deliberately left alone because
+    wiring it moves five unrelated tests. See
+    [mock-native-context-by-name-writes-were-silent.md](mock-native-context-by-name-writes-were-silent.md).
+
+    **`java/security/CodeSource` is still open** and is the same shape: its
+    model is `(location, certs)` — constructor order again — where the class
+    declares `location, signers, certs, …`, so `certs` sits on `signers`. It
+    has about a dozen raw `get_field(cs, 0)` / `get_field(cs, 1)` readers to
+    audit, which is why it is its own change and not a rider on this one.
 
     ### The second worked example — `java/lang/Thread`, which had NO live defect
 
