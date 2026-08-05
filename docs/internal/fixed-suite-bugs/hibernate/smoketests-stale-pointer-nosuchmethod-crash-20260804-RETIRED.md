@@ -79,16 +79,19 @@ published. `testQueryConcurrency` parks the JUnit main thread in
 workers churn young — which is why this test, and not another, is where it
 showed.
 
-## 2. Reproduction: 30 runs, both binaries, neither reproduces
+## 2. Reproduction: 41 runs, both binaries, neither reproduces
 
 The page said "not yet confirmed deterministic — a single occurrence from one
 run" and asked for 3-5 interleaved re-runs. Done, and then some.
 
 | binary | runs | corruption | `@@RESULT` |
 |---|---:|---:|---|
-| dev tip (`41349f661`) | 24 | **0** | 120 s timeout, `ok=16 failed=1` |
+| dev tip `41349f661` and this branch's builds on it | 35 | **0** | 120 s timeout, `ok=16 failed=1` under load |
 | the witness build itself (`a43a74ded`, `CratonVM-hib-local-0712-v3`) | 6 | **0** | same |
 | HotSpot JDK 25 control | 1 | — | `ok=17` in 15.3 s |
+
+(Logs under `apps/hib-suite-runner/runs/`: `base-smoke1` 1, `base-par` 8,
+`dbg-par` 12, `det-par` 12, `ab/dev-*` 6, `ab/wit-*` 6, `fix-solo` 1.)
 
 `--Xmx 1500m`, real JDK, JIT on, the page's own command, 3-6 VMs concurrently
 (the original run's load shape), arms interleaved in the same window. Counting
