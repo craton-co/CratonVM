@@ -1359,6 +1359,16 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
+                    // `AsynchronousFileChannel.write(buf, position)` is a
+                    // POSITIONAL write: it seeks to `position` below and
+                    // overwrites that range, leaving the rest of the file
+                    // intact. Truncating here would discard everything past
+                    // the written range on every call — so state the `false`
+                    // explicitly rather than leaning on the default, which is
+                    // what `clippy::suspicious_open_options` asks for. This is
+                    // a no-op at runtime: `truncate` already defaulted to
+                    // false, so behaviour is unchanged.
+                    .truncate(false)
                     .open(&path)
                 {
                     use std::io::Seek;
@@ -1600,7 +1610,7 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             // the peer reads or the connection resets) instead of the
             // caller's own timeout ever firing — a separate, out-of-scope-
             // for-this-fix architectural gap. Filed as a residual; see
-            // docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md.
+            // fixed-suite-bugs/stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
@@ -3026,7 +3036,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 (src_str.as_str(), 0)
             };
             let src_addr =
-                crate::net_phase_e::alloc_inet_address_external(ctx, src_ip_str, src_ip_str);
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, src_ip_str);
             ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
             ctx.set_field(pkt, 4, Value::Int(src_port));
             Ok(None)
@@ -3145,7 +3155,7 @@ fn dc_box_option(ctx: &mut dyn NativeContext, name: &str, raw: i32) -> MethodCal
 fn p72_alloc_inet_socket_address(ctx: &mut dyn NativeContext, ip: &str, port: i32) -> ObjectRef {
     let host0 = ctx.create_string(ip);
     let host_pin = ctx.pin_native_root(host0);
-    let addr0 = crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip);
+    let addr0 = crate::net_phase_e::alloc_inet_address_unnamed(ctx, ip);
     let addr_pin = ctx.pin_native_root(addr0);
     let holder0 =
         alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
@@ -4548,7 +4558,7 @@ pub(crate) fn p72_inet_from_socket_address(
 
     let ip = host.trim_matches(&['[', ']'][..]);
     Ok(Some(Value::Object(Some(
-        crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip),
+        crate::net_phase_e::alloc_inet_address_unnamed(ctx, ip),
     ))))
 }
 
@@ -4915,7 +4925,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             };
             match local_ip {
                 Some(ip) => Ok(Some(Value::Object(Some(
-                    crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip),
+                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip),
                 )))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -4965,7 +4975,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                         3,
                     );
                     let host = ctx.create_string(&ip);
-                    let addr = crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip);
+                    let addr = crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip);
                     ctx.set_field(holder, 0, Value::Object(Some(host)));
                     ctx.set_field(holder, 1, Value::Object(Some(addr)));
                     ctx.set_field(holder, 2, Value::Int(port));
@@ -5159,7 +5169,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             match p72_socket_stream_addr(ctx, this, true) {
                 Some((ip, _)) => Ok(Some(Value::Object(Some(
-                    crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip),
+                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip),
                 )))),
                 None => Ok(Some(Value::Object(None))),
             }

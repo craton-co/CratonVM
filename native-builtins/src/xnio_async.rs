@@ -1302,7 +1302,7 @@ fn option_value_as_bool(ctx: &dyn NativeContext, value: &OptionValue) -> Option<
 /// int (e.g. a `60000`ms timeout option) becomes a bogus "object reference"
 /// that segfaults the next time anything dereferences it (confirmed root
 /// cause of the `ElytronRemoteOutboundConnectionTestCase` SIGSEGV, see
-/// `docs/known-issues/wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`).
+/// `fixed-suite-bugs/wildfly/wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`).
 fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
@@ -2206,7 +2206,7 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
     //     (`getDeclaredField("type")`) would fail (the original WFLYSRV0055).
     // Real Options instances have working `cast`/`parseValue`/`getName` and a
     // real `type` field; their slot layout (declClass/name/type) still matches
-    // the OptionMap/Builder slot reads. See docs/internal/wildfly-suite-bugs/
+    // the OptionMap/Builder slot reads. See wildfly-suite-bugs/
     // bug-08 + bug-09.
     let _ = native_options_clinit;
     // Accessors for each well-known field. Registered as top-level fn

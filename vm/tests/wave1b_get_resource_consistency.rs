@@ -7,7 +7,7 @@
 //! lookup MUST return the first of those URLs (not null, not a
 //! different URL form).
 //!
-//! Roadmap reference: `docs/roadmap-any-java-app.md` Wave 1 Task B.
+//! Roadmap reference: `history/roadmap-any-java-app.md` Wave 1 Task B.
 //!
 //! Why this is a real-JDK-mode pin (not a `vm.invoke` Rust unit test):
 //!   * The bug shape is "the cl_get_resource native override is never
@@ -35,7 +35,15 @@ use std::process::Command;
 
 const RESOURCE_NAME: &str = "META-INF/services/wave1b.foo.svc";
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CRATONVM_BIN") {
         let pb = PathBuf::from(p);
         if pb.exists() {

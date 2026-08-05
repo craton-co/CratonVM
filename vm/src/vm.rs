@@ -32196,6 +32196,57 @@ mod tests {
         }
     }
 
+    /// The script subtag survives `forLanguageTag` in synthetic-JDK mode too.
+    ///
+    /// This mode never reaches the real `sun.util.locale` BCP-47 parser the
+    /// native prefers (there is no such class here), so it exercises the Rust
+    /// fallback split and the `locale_data` side table's script slot — the
+    /// parts that a real-JDK run alone would leave completely untested.
+    /// `zh-hant-CN` used to come back as bare `zh_CN`
+    /// (`TestAcceptLanguage.bug56848`).
+    #[test]
+    fn locale_for_language_tag_keeps_script() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let tag = create_java_string(&shared, "zh-hant-CN");
+        let loc = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Locale",
+            "forLanguageTag",
+            "(Ljava/lang/String;)Ljava/util/Locale;",
+            &[Value::Object(Some(tag))],
+        )
+        .unwrap()
+        .unwrap();
+        let Value::Object(Some(l)) = loc else {
+            panic!("expected object");
+        };
+        let read = |thread: &mut JvmThread, method: &str| -> String {
+            let v = call_native(
+                &shared,
+                thread,
+                "java/util/Locale",
+                method,
+                "()Ljava/lang/String;",
+                &[Value::Object(Some(l))],
+            )
+            .unwrap()
+            .unwrap();
+            match v {
+                Value::Object(Some(s)) => read_java_string(&shared.mem.heap, s).unwrap(),
+                _ => panic!("expected string from {method}"),
+            }
+        };
+        assert_eq!(read(&mut thread, "getLanguage"), "zh");
+        // Title-cased, and NOT mistaken for the region.
+        assert_eq!(read(&mut thread, "getScript"), "Hant");
+        assert_eq!(read(&mut thread, "getCountry"), "CN");
+        assert_eq!(read(&mut thread, "getVariant"), "");
+        assert_eq!(read(&mut thread, "toString"), "zh_CN_#Hant");
+        assert_eq!(read(&mut thread, "toLanguageTag"), "zh-Hant-CN");
+    }
+
     // =========================================================================
     // Phase 32: java.nio.file — Path, Paths, Files
     // =========================================================================

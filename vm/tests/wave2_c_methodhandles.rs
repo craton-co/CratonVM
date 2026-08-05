@@ -12,7 +12,7 @@
 //! framework (Log4j 2 LMC), `StringConcatFactory.makeConcatWithConstants`,
 //! `LambdaMetafactory.metafactory`, JSON libraries, and the JVM's own
 //! bootstrap-method invocation path rely on. Coverage gaps here break wide
-//! swaths of modern Java (per `docs/roadmap-any-java-app.md` item RC.8).
+//! swaths of modern Java (per `history/roadmap-any-java-app.md` item RC.8).
 //!
 //! Required output (HotSpot reference, all 8 lines):
 //!   findStatic.prim=7
@@ -43,7 +43,15 @@ fn probe_dir() -> PathBuf {
     worktree_root().join("apps").join("methodhandles_probe")
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {

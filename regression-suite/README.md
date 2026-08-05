@@ -187,6 +187,89 @@ baseline file is per-host). For a new bench host, generate
 `perf/cratonbench-baseline-<host>.tsv` with `--calibrate` and pass it via
 `--baseline`.
 
+**What the gate is evidence about.** Every run records the optimizing tier's
+per-phase reach — `ir_requests` / `ir_admitted` / `ir_bodies` in
+`samples.tsv`, one `ir_reach_<phase>` line in `manifest.tsv`, and a summary
+line on the console. Across all seven phases the optimizing (C2/IR) tier
+produces **three** bodies, so the gate measures the **single-pass** backend, and
+a CratonBench delta is not evidence about C2 in either direction — including
+"the C2 change did no harm". Note `compiles_c2` is a *different* column and is
+not a substitute: it counts compiles whose requested tier was C2, including
+every one the optimizing pipeline declined and handed back to the single-pass
+backend.
+
+Anchoring a workload whose reach has not been measured, and quoting a
+CratonBench delta as a C2 result, are the two things `docs/known-issues/c2/`
+says to refuse. `perf/c2-reach.sh` measures any workload's reach in one run;
+`bench/CratonBenchC2.java` is a characterised candidate that does reach the
+tier, deliberately **not** a gate phase and with no baseline.
+
 > Note (2026-07-24): the bintrees anchor deliberately FAILS on current `dev` —
 > an open ~4x bt18 regression (post-`cf3a44e2a`) is being bisected. That is
 > the gate doing its job; do not re-anchor the baseline to absorb it.
+
+## Bridge ratchet (unadjudicated `Bridge` natives) — gate
+
+`bridge-ratchet.sh` is the second non-Java gate hosted here, and the only one
+that measures the *native registry* rather than execution. Contract §1.5
+defines a `NativeKind::Bridge` as what an `ACC_NATIVE` method binds to;
+**10,084 of the 10,844 `Bridge` registrations have no `ACC_NATIVE` target**,
+every one of them inherited its kind from an ambient `set_category`, and until
+this gate nothing stopped that number rising. See
+[`docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`](../docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md).
+
+```bash
+JAVA_HOME=/path/to/jdk25 sh regression-suite/bridge-ratchet.sh
+sh regression-suite/bridge-ratchet.sh --selftest    # hermetic: no VM, no JDK
+```
+
+It boots the VM against a real JDK image, takes the schema-3 census
+(`--explain-jdk-only --dump-native-registry`, whose `image_declaring_method`
+column is what makes "adjudicated?" a machine-readable fact), and scores it
+against [`scripts/baselines/jdk-only-bridge-ratchet.json`](../scripts/baselines/jdk-only-bridge-ratchet.json).
+
+**Why it lives here and not in `native-builtins/tests/`** — beside
+`stub_ratchet.rs`, which it is modelled on: the question needs a real JDK image
+at measurement time and `cargo test` has none. The alternative, committing a
+census artefact and asserting over it in a unit test, was rejected: an
+11,909-row snapshot keyed to one JDK build rots, and a rotting baseline is
+worse than none.
+
+It asserts three things, with `SLACK = 0`:
+
+1. `bridge.without_acc_native <= baseline` — the ratchet.
+2. `bridge.shadows_bytecode <= baseline` — the same ratchet on the subgroup
+   that has already produced a defect. A `Bridge` shadowing concrete bytecode
+   reaches §7 step 3's decline, which used to fall through to
+   `UnsatisfiedLinkError` instead of to the bytecode; that is how `--jdk-only`
+   came to be unable to start a thread.
+3. `total_rows >= 8_000` — a **collapse detector, not a measurement**, exactly
+   as in `stub_ratchet.rs`'s `essential_registry_is_populated`. Do not cite it
+   as a fact about the registry's size.
+
+**The baseline is keyed by `<jdk-feature>/<os>`,** and a census with no
+matching entry is a refusal (exit 2), never a pass. `image_declaring_method`
+describes one runtime image, and the registrars are platform-conditional — a
+Linux baseline scoring a Windows census is the "silently combines two different
+worlds" defect [`scripts/jdk-only-census.sh`](../scripts/jdk-only-census.sh)'s
+header exists to not repeat.
+
+**Exit codes:** `0` pass · `1` the gate fired · `2` refused to adjudicate (never
+a pass) · `3` a prerequisite is missing.
+
+**The guard is shown to fail on every run.** `--selftest` runs first,
+hermetically, and injects an unadjudicated `Bridge` into a synthetic census
+that the gate must reject — plus an *adjudicated* one it must accept, so the
+gate is not simply always-red. A guard never shown to fail is decoration; three
+shipped inert in this feature. The one-off injection into the real registrar
+that the lane doc asks for is recorded in
+[`docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+
+**Re-freezing.** A count that goes *down* passes and prints an instruction; it
+is never absorbed automatically, because a slack-free ratchet left at the old
+number silently re-admits exactly that many new unadjudicated rows.
+
+```bash
+JAVA_HOME=/path/to/jdk25 sh regression-suite/bridge-ratchet.sh \
+    --update-baseline --note "L5: native-io migrated to register_with_kind"
+```

@@ -123,6 +123,21 @@ const CF_BUCKET_MAP_NAME: u16 = 1 << 8;
 /// stale bit is unreachable: `receiver_facts` is only ever asked about the
 /// runtime class of an object that exists.
 const CF_HAS_NAME: u16 = 1 << 9;
+/// `IdentityHashMap` ancestry (exact class or a user subclass).
+///
+/// `IdentityHashMap.get`/`put` are registered straight onto the generic
+/// bucket-map natives (`native_map_get_pub`/`native_map_put_pub` — see
+/// `register_identity_hashmap_natives`), which by default compute the bucket
+/// hash and collision equality via the key's *virtual* `hashCode()`/`equals()`
+/// — content semantics. That happens to coincide with reference semantics for
+/// a key class like `java.lang.Class` that doesn't override either method,
+/// which is why this went unnoticed, but it is not what `IdentityHashMap`'s
+/// contract requires, and every `hashCode()`/`equals()` dispatch it triggers
+/// is a moving-GC window a pure identity computation would not need at all.
+/// `map_hash_key`/`map_keys_equal` consult this flag to skip virtual dispatch
+/// entirely for an identity-map receiver — see `map_hash_key_identity`
+/// and `map_keys_equal_identity`.
+const CF_IDENTITY_MAP: u16 = 1 << 10;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,6 +271,23 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // class necessarily has a name, so the common case skips the call.
     if exact.is_some() || ctx.class_name_of_id(cid).is_some() {
         flags |= CF_HAS_NAME;
+    }
+    // `IdentityHashMap` is not a `WellKnownClass` variant (it participates in
+    // no other family decision here), so a direct name walk is simpler than
+    // adding a 16th variant for this one flag. Paid once per `ClassId`, then
+    // cached forever by `receiver_facts` like every other bit above.
+    {
+        let mut cur = cid;
+        for _ in 0..FACTS_WALK_LIMIT {
+            if ctx.class_name_of_id(cur).as_deref() == Some("java/util/IdentityHashMap") {
+                flags |= CF_IDENTITY_MAP;
+                break;
+            }
+            match ctx.superclass_of(cur) {
+                Some(parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
     }
     ClassFacts(flags)
 }
@@ -969,6 +1001,137 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 #[inline]
 fn pack_obj_key(hash: u32, generation: u32) -> usize {
     (((hash as u64) << 32) | (generation as u64)) as usize
+}
+
+/// Does the object-key registry record `actual_class_id` for `key`'s slot?
+///
+/// The owner index (`overlay_owner_keys`) is keyed by ADDRESS and therefore
+/// cannot tell a live collection from an unrelated object that recycled its
+/// block. The registry slot behind the packed key does carry the registering
+/// collection's `class_id`, which is GC-invariant, so comparing it against the
+/// class actually at the address is a sound identity check — the same one
+/// `widened_obj_key` uses for recycled identity hashes.
+///
+/// Unknown key (no such slot) answers `true`: absence of evidence is not
+/// evidence of a mismatch, and dropping a root on it would be the unsafe
+/// direction. Over-retaining one cycle is the safe one.
+/// OFF BY DEFAULT — measured harmful. Opt in with `CRATONVM_OWNER_CLASS_FILTER=1`.
+///
+/// The defect this guards against is real and unit-proven (see
+/// `marker_owner_lookup_survives_address_recycling_by_a_non_collection`): the
+/// marker's owner→overlay lookup has no identity check, so an ordinary object
+/// that recycles a dead collection's block inherits its references. But
+/// ENFORCING the check costs more than it saves on the workload that motivated
+/// it.
+///
+/// One-binary A/B on `DefaultCatalogAndSchemaTest`, arms alternating, only this
+/// variable differing (`probes/owner-filter-flag-ab-20260801.sh`):
+///
+/// | arm | rc  | stale receivers |
+/// |-----|-----|-----------------|
+/// | off | 139 | 0               |
+/// | on  | 139 | 3641            |
+/// | off | 127 | 0               |
+/// | on  | 139 | 973             |
+///
+/// Dropping a key discards a LIVE collection's roots whenever the recorded and
+/// actual class disagree for any reason OTHER than recycling, and on this
+/// workload they disagree often enough to reclaim thousands of live objects.
+/// Exempting the zeroed-header case (`class_id == 0`, an already-freed owner)
+/// cut it from 5784/637 to 3641/973 but did not close it — so the remaining
+/// mismatches are not just corrupted owners.
+///
+/// It stays a runtime switch, not a second binary, because that is what made
+/// the effect attributable at all: a two-binary comparison had shown only
+/// `found=132` vs `110` and looked like a clean win.
+///
+/// Before re-enabling this, find a discriminator that cannot fire on a live
+/// collection — the recorded class is not one.
+fn owner_class_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_OWNER_CLASS_FILTER").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_OWNER_FILTER=1`: report every key this check DROPS.
+///
+/// A drop is only correct when the address was genuinely recycled. If the
+/// registry's recorded class can disagree with the marker's header class for
+/// any OTHER reason, this filter discards a LIVE collection's roots — the one
+/// direction that turns a diagnostic improvement into a use-after-free. The
+/// counter distinguishes "rare, and each one an aliased address" from
+/// "systematic", which is the difference between a fix and a regression.
+fn owner_filter_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OWNER_FILTER").is_some())
+}
+
+static OWNER_FILTER_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total keys dropped by the owner identity check this process.
+pub fn owner_class_filter_drop_count() -> u64 {
+    OWNER_FILTER_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn owner_key_class_matches(key: usize, actual_class_id: u32, owner_addr: usize) -> bool {
+    let hash = (key >> 32) as u32;
+    let generation = key as u32;
+    let recorded = {
+        let shard = obj_key_shard_for(hash)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match shard.get(&hash) {
+            None => None,
+            Some(slots) => slots
+                .iter()
+                .find(|s| s.generation == generation)
+                .map(|s| (s.class_id, s.last_ptr)),
+        }
+    };
+    match recorded {
+        // Unknown key: absence of evidence is not evidence of a mismatch, and
+        // dropping a root here would be the unsafe direction. Over-retaining
+        // one cycle is the safe one.
+        None => true,
+        Some((recorded_class, last_ptr)) => {
+            if recorded_class == actual_class_id {
+                return true;
+            }
+            // A ZEROED header is not evidence of recycling. It is evidence of
+            // corruption somewhere ELSE, and dropping on it makes that
+            // corruption strictly worse.
+            //
+            // `class_id == 0` is both the all-zero header of an already-freed
+            // block and the legitimate `ClassId(0)` ad-hoc container shape, so
+            // it cannot discriminate. Measured on `DefaultCatalogAndSchemaTest`
+            // with `CRATONVM_DBG_OWNER_FILTER=1`: the drops were dominated by
+            // `recorded_class=64 actual_class=0 same_addr=true` — the owner's
+            // own block had already been freed underneath a live collection.
+            // Dropping its overlay refs there removes the last thing keeping
+            // that collection's CONTENTS marked, turning ONE premature free
+            // into a cascade: 637 and 5784 stale receivers on the two runs that
+            // crashed, against 117 with no filter at all.
+            //
+            // Retaining on an unreadable owner costs one cycle of
+            // over-retention — the same safe direction as the unknown-key arm.
+            if actual_class_id == 0 || recorded_class == 0 {
+                return true;
+            }
+            let n = OWNER_FILTER_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if owner_filter_dbg() && n < 32 {
+                eprintln!(
+                    "[owner-filter] DROP key=0x{key:x} owner=0x{owner_addr:x} \
+                     recorded_class={recorded_class} actual_class={actual_class_id} \
+                     slot_last_ptr=0x{last_ptr:x} same_addr={}",
+                    last_ptr == owner_addr,
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Authoritative lazy store for fresh, exact-class HashMaps with primitive
@@ -1871,7 +2034,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
     // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
     // (same fix pattern as register_blocking_queue_natives above) —
-    // docs/gaps/gap-phaser-real-bytecode-state.md.
+    // gaps/gap-phaser-real-bytecode-state.md.
     #[cfg(feature = "synthetic-jdk")]
     register_phaser_natives(registry);
     register_priority_blocking_queue_natives(registry);
@@ -1885,7 +2048,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // synthetic-jdk only so the self-contained real STPE bytecode runs in
     // real-JDK mode (same fix pattern as register_blocking_queue_natives /
     // register_phaser_natives above). See
-    // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+    // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
     #[cfg(feature = "synthetic-jdk")]
     register_executors_scheduled_natives(registry);
     register_concurrent_completeness_natives(registry);
@@ -3210,7 +3373,7 @@ fn al_ensure_capacity(
     // `stream()`. Every caller of this function hits the exact same hazard on
     // `this` after the call returns (`al_set_size` etc.), so this is `add`/
     // `add(int,Object)`/`addAll`'s shared, hottest allocation site. See
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let old_buf_pin = data.map(|d| ctx.pin_native_root(d)).unwrap_or(usize::MAX);
     let new_buf = alloc_ref_array(ctx, new_cap);
@@ -5208,7 +5371,7 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // live via CRATONVM_DBG_STALE_OBJREF during WildFly
         // parallel-extension-add (same "Family 1" pattern as
         // native_hashmap_get_exact's `map_keys_equal` fix -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
         let d_pin = ctx.pin_native_root(d);
         for i in 0..size {
             let d_cur = ctx.read_native_pin(d_pin, d);
@@ -5439,8 +5602,13 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         if hashtable_layout {
             return None;
         }
-        let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
-        if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
+        // JDK-ONLY-LAYOUT (L2): the `table` field of the class the receiver
+        // ACTUALLY is, not of `java/util/HashMap`. Resolving against a fixed
+        // class name reads `HashMap`'s index off an unrelated layout — on a
+        // `Properties` that is `Hashtable.threshold`, an `int`, so this
+        // fallback probed a field that can never hold a bucket array.
+        let slot = receiver_table_slot(ctx, this)?;
+        if slot == MAP_FIELD_BUCKETS {
             return None;
         }
         match ctx.get_field(this, slot) {
@@ -5600,10 +5768,139 @@ fn try_set_jdk_map_field(
     field_name: &str,
     value: Value,
 ) {
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", field_name) {
+    // JDK-ONLY-LAYOUT: resolve the name on the RECEIVER's class, not on a
+    // hard-coded `java/util/HashMap`.
+    //
+    // This was `resolve_field_index("java/util/HashMap", field_name)` and then
+    // wrote that index into `this` — whatever class `this` actually was. For a
+    // receiver that is not a `HashMap`, the index names a *different field*,
+    // and the `slot < object_num_fields` bound below does not help: it stops an
+    // out-of-range write, not a wrong-field one. That is the shape of guard
+    // that looks protective and is not.
+    //
+    // Measured 2026-08-04 with `CRATONVM_DBG=overlay,overlay-all` on
+    // `new Properties()`: `Float(0.75)` — a `loadFactor` — landed on
+    // `Properties` slot 7, which the real class declares as a **reference**,
+    // and `Int(0)` / `Int(12)` landed on slots 5 and 6, likewise references. On
+    // a real `java.util.Properties` those slots are `defaults` / `map`, so each
+    // write both destroyed a live reference and stored the value nowhere useful.
+    //
+    // `resolve_field_index_by_class_id` walks the receiver's own hierarchy, so
+    // `loadFactor` on a `Properties` resolves through `Hashtable` to its true
+    // absolute slot; its doc comment already recommends it over the name-based
+    // form in exactly this situation, because the caller holds the object. When
+    // the receiver's class does not declare the field the lookup returns `None`
+    // and nothing is written — the correct outcome, and strictly better than
+    // writing whatever field happens to sit at a `HashMap` index.
+    let class_id = ctx.class_id_of_object(this);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, field_name) {
         if slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, value);
         }
+    }
+}
+
+/// The receiver's OWN bucket-array field (`table`), resolved by NAME against
+/// the class the receiver actually is, and bounded by its allocated slot count.
+///
+/// JDK-ONLY-LAYOUT (L2): every caller of this used to ask
+/// `resolve_field_index("java/util/HashMap", "table")` — a fixed class name —
+/// and then write that index into whatever `this` happened to be. On a
+/// `java.util.Properties` (which is deliberately excluded from
+/// `CF_HASHTABLE_LAYOUT`, because JDK 25 backs it with a side
+/// `ConcurrentHashMap`) `HashMap.table` is index 2, and index 2 on a real
+/// `Properties` is the inherited `Hashtable.threshold` — an `int`. That is the
+/// surviving `Properties` slot-2 row of the overlay census (`Object` written
+/// over an `I`): the bucket array both destroyed a live field and was stored
+/// where nothing reads it. The receiver's own `table` (inherited from
+/// `Hashtable`) is index 0, which slot 0 already holds.
+///
+/// `None` is the answer for a receiver that has no real `table` field at all —
+/// CratonVM's own fabricated map layouts (`cratonvm/util/MapViewBacking`, the
+/// bare `ClassId(0)` CHM segments, a synthetic-mode `HashMap` stub whose fields
+/// are `_f0.._fN`). That is the layout predicate this file needs, and it asks
+/// for a field NAME the real class declares rather than counting slots: a
+/// count test cannot separate the two layouts, because the allocators size
+/// every synthetic map to at least `MAP_NUM_FIELDS` and a real one to at least
+/// its real field count. (`object_num_fields(x) >= N` was exactly the inert
+/// `VarHandle` guard that nearly shipped on 2026-08-04.)
+///
+/// Caveat, shared with the `try_set_jdk_map_field` conversion that landed the
+/// same day: a subclass that declares its own field literally called `table`
+/// shadows the inherited one, and this resolves to the subclass's. That is the
+/// receiver's own answer to "where is your `table`", which is the best a name
+/// lookup can do; it is still strictly better than answering with a fixed
+/// class's index, which is right for exactly one receiver class.
+fn receiver_table_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let class_id = ctx.class_id_of_object(this);
+    ctx.resolve_field_index_by_class_id(class_id, "table")
+        .filter(|&slot| slot < ctx.object_num_fields(this))
+}
+
+/// Publish a freshly built bucket table on `map`, honouring both storage
+/// conventions this crate maintains:
+///
+/// * absolute slot 0 (`MAP_FIELD_BUCKETS`) always gets the array — it is what
+///   every other native map operation reads, and the native surface is the
+///   authoritative implementation for the `HashMap` family;
+/// * the receiver's REAL `table` field gets the same array when it is a
+///   different slot, so JDK bytecode that reads `getfield map.table` directly
+///   (`HashMap.resize`, `KeySpliterator`, `writeObject`) sees a live array
+///   rather than a stale value or an `Int`;
+/// * the legacy `Int(capacity)` at absolute slot 2 (`MAP_FIELD_CAPACITY`) is
+///   written ONLY when the receiver actually has our fabricated layout. On a
+///   real layout slot 2 is a declared field — `table` on `HashMap`,
+///   `threshold` on `Hashtable`/`Properties` — and the raw write either
+///   clobbers the bucket array with `Int(16)` (`arraylength` on an int, and
+///   the `HashMap` slot-2 census row) or destroys an unrelated field.
+///   `map_state` derives the capacity from the bucket array's length and only
+///   falls back to slot 2 when there is no array, so dropping the write costs
+///   nothing.
+///
+/// Neither `set_field` variant is a GC point (`gen_heap::write_barrier` never
+/// allocates from the Java heap), so callers may pass references they have
+/// already re-read through their pins.
+fn publish_map_table(ctx: &mut dyn NativeContext, map: ObjectRef, buckets: ObjectRef, cap: i32) {
+    publish_map_table_inner(ctx, map, buckets, cap, false);
+}
+
+/// [`publish_map_table`] with a release-style store of the bucket array, for
+/// `map_resize`'s publication of a rehashed table to lock-free CHM readers.
+fn publish_map_table_volatile(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+) {
+    publish_map_table_inner(ctx, map, buckets, cap, true);
+}
+
+fn publish_map_table_inner(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+    volatile: bool,
+) {
+    let table_slot = receiver_table_slot(ctx, map);
+    if volatile {
+        ctx.set_field_volatile(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    } else {
+        ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    }
+    match table_slot {
+        Some(slot) if slot != MAP_FIELD_BUCKETS => {
+            if volatile {
+                ctx.set_field_volatile(map, slot, Value::Object(Some(buckets)));
+            } else {
+                ctx.set_field(map, slot, Value::Object(Some(buckets)));
+            }
+        }
+        Some(_) => {}
+        // Fabricated layout: slot 2 means `capacity` and nothing else. The
+        // write stays unguarded, as it has always been — `set_field` is
+        // contractually bounds-checked (M4a) and drops an out-of-range index.
+        None => ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap)),
     }
 }
 
@@ -5719,6 +6016,26 @@ fn enum_set_contains_member(
         }
         _ => None,
     }
+}
+
+/// Pure reference-identity hash, matching `IdentityHashMap`'s documented
+/// contract (`System.identityHashCode`), with the same bit-spread every other
+/// bucket hash in this file applies. Unlike `map_hash_key`, this never
+/// dispatches into Java (`ctx.identity_hash_code` reads the object header),
+/// so it cannot trigger a moving GC — an identity-map lookup/insert needs no
+/// pin around this call.
+#[inline]
+fn map_hash_key_identity(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+    let h = ctx.identity_hash_code(key);
+    h ^ ((h as u32) >> 16) as i32
+}
+
+/// Pure reference-identity equality, matching `IdentityHashMap`'s documented
+/// contract (`==`, not `Object.equals`). Never dispatches into Java, so —
+/// unlike `map_keys_equal` — it cannot trigger a moving GC either.
+#[inline]
+fn map_keys_equal_identity(a: ObjectRef, b: ObjectRef) -> bool {
+    std::ptr::eq(a.as_ptr(), b.as_ptr())
 }
 
 /// Compute hash for a key.
@@ -6012,11 +6329,59 @@ fn map_alloc_node(
     let value = read_pinned_elem(ctx, value_pin, value);
     let next = next.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
     ctx.unpin_native_roots(key_pin);
+    // A node's value slot is `V value` -> `Ljava/lang/Object;` on the real
+    // `java/util/HashMap$Node` the line above binds to, so the
+    // descriptor-aware `set_field` path coerces a primitive there to NULL
+    // (`coerce_field_value_by_descriptor`, the `b'L'` arm).
+    //
+    // Every caller of this function is a view/snapshot set builder that passes
+    // a raw `Value::Int(1)` PRESENT marker, so every one of those markers was
+    // reaching the heap as null — ~1000 destructive writes in a program that
+    // does nothing but iterate an entrySet. Nothing read them back (the
+    // view branches of `native_hs_contains`/`native_hs_remove` resolve
+    // membership against the SOURCE map's `containsKey`/`get`), so it was
+    // invisible; it also drowned `CRATONVM_DBG=overlay` in benign noise, which
+    // is how it went unnoticed.
+    //
+    // Use the node's own key as the marker. It is a reference, it is never
+    // null here (every caller passes a freshly allocated entry), it costs no
+    // allocation and no Java dispatch — and "the entry is present" is exactly
+    // what a set's value slot means. A caller with a genuine value is
+    // unaffected.
+    let value = match value {
+        Value::Object(_) => value,
+        _ => Value::Object(Some(key)),
+    };
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(node, NODE_FIELD_NEXT, Value::Object(next));
     node
+}
+
+/// The value a `Set` stores in its backing map to mean "this element is
+/// present".
+///
+/// It has to survive the round trip as NON-NULL, because `native_hs_add` /
+/// `native_hs_remove` report membership from whether the previous value was
+/// null — that is the whole encoding. A raw `Value::Int(1)` does not survive on
+/// a node bound to a real JDK class: the value slot is `V value` ->
+/// `Ljava/lang/Object;`, and `coerce_field_value_by_descriptor`'s `b'L'` arm
+/// turns a primitive there into null, so `remove(x)` deletes the element and
+/// still answers `false`. That is the defect `7bf427af1` fixed on the
+/// LinkedHashMap side after it broke Jersey's `Resource.Builder`.
+///
+/// The element is its own marker: a reference, no allocation, no Java
+/// dispatch, and exactly what a real `HashSet.PRESENT` stands in for.
+///
+/// A NULL element has no reference to use and keeps the legacy `Int(1)`, so
+/// membership for that one element must not be read from the value —
+/// `native_hs_add`/`native_hs_remove` settle it with `containsKey` instead.
+fn present_marker(elem: Value) -> Value {
+    match elem {
+        Value::Object(Some(_)) => elem,
+        _ => Value::Int(1),
+    }
 }
 
 /// S111r26: Layout-aware node key reader.
@@ -6490,28 +6855,30 @@ fn map_resize_inner(
     // fallback) complete before this volatile store. The non-CHM
     // (single-threaded HashMap) callers see identical semantics — a
     // volatile store is at least as strong as a plain store.
-    ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    set_map_size(ctx, this, size);
-    // Mirror the bucket array to the JDK-resolved `table` slot when present
+    // Mirror the bucket array to the receiver's own `table` slot when present
     // (and different from slot 0). This is critical for AnnotationAttributes
     // and other JDK-constructed maps where slot 0 may not be the `table`
     // field — without this mirror, subsequent reads via `map_state` (which
     // reads slot 0) would see the new buckets, but any JDK-bytecode path
     // that reads `table` directly would see null. Also keeps the two
     // storage locations in sync.
+    //
+    // JDK-ONLY-LAYOUT (L2): `publish_map_table_volatile` resolves `table` on
+    // the RECEIVER's class. This used to resolve it on `java/util/HashMap` and
+    // write index 2 into whatever `this` was — on a `Properties` (excluded
+    // from `CF_HASHTABLE_LAYOUT`, so it reaches this arm) index 2 is
+    // `Hashtable.threshold`, an `int`, and every rehash overwrote it with the
+    // bucket array. Same census row as `native_map_init`'s.
     if !uses_native_hashtable_layout(ctx, this) {
-        let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-        if let Some(slot) = table_slot {
-            if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
-                ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+        publish_map_table_volatile(ctx, this, new_buckets, new_cap);
+        set_map_size(ctx, this, size);
+    } else {
+        ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+        set_map_size(ctx, this, size);
+        if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
             }
-        }
-        if table_slot != Some(MAP_FIELD_CAPACITY) {
-            ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
-        }
-    } else if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
-        if slot < ctx.object_num_fields(this) {
-            ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
         }
     }
     ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
@@ -6937,6 +7304,10 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiFunction;)V",
         native_map_replace_all,
     );
+    // `Map`'s three conditional mutators. `HashMap` overrides all of them with
+    // bucket-walking bodies, so without these the JDK bytecode runs over our
+    // natively-allocated nodes — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(r, c);
     r.set_category(__prev_cat);
 }
 
@@ -7003,7 +7374,7 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // dropping that entry silently empties a live `HashMap<Integer,?>`: `get`
     // returns null, `size()` returns 0, `keySet()` iterates nothing, and no
     // exception is raised anywhere. That is the
-    // `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
+    // `fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
     // failure: Hibernate's `ParameterMetadataImpl.queryParametersByPosition` is
     // exactly this shape (fresh exact-class `HashMap`, boxed-Integer keys, long
     // lived), and losing it reports `No parameter labelled '?1' in query with
@@ -7050,9 +7421,6 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    let this = ctx.read_native_pin(this_pin, this);
-    set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
     // `MAP_FIELD_CAPACITY` (absolute slot 2) is dangerous when the JDK class
@@ -7064,23 +7432,20 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // capacity Int write if it would clobber `table`. `map_state` already
     // prefers the bucket array's length over `MAP_FIELD_CAPACITY`, so dropping
     // the Int write is safe.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot < ctx.object_num_fields(this) {
-            let this = ctx.read_native_pin(this_pin, this);
-            let buckets = ctx.read_native_pin(buckets_pin, buckets);
-            ctx.set_field(this, slot, Value::Object(Some(buckets)));
-        }
-    }
+    //
+    // JDK-ONLY-LAYOUT (L2): `publish_map_table` resolves `table` on the
+    // RECEIVER's class rather than on a hard-coded `java/util/HashMap`. This is
+    // the legacy branch the census pinned the surviving `Properties` slot-2 row
+    // on: a `Properties` reaches here (it is deliberately excluded from
+    // `CF_HASHTABLE_LAYOUT` because JDK 25 backs it with a side
+    // `ConcurrentHashMap`), `HashMap.table` is index 2, and index 2 on a
+    // `Properties` is the inherited `Hashtable.threshold` — an `int`. Its own
+    // `table` is index 0, which slot 0 already holds, so the mirror correctly
+    // collapses to a single write.
+    publish_map_table(ctx, this, buckets, MAP_DEFAULT_CAPACITY as i32);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(
-            this,
-            MAP_FIELD_CAPACITY,
-            Value::Int(MAP_DEFAULT_CAPACITY as i32),
-        );
-    }
+    set_map_size(ctx, this, 0);
 
     // Best-effort JDK-named field population for bytecode readers. `size`
     // was already mirrored by `set_map_size`; the rest are best-effort.
@@ -7148,26 +7513,14 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    let this = ctx.read_native_pin(this_pin, this);
-    set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
-    // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
-    // (or null), never an Int. Skip the legacy Int-capacity write when it
-    // would land on the same slot as JDK `table`.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot < ctx.object_num_fields(this) {
-            let this = ctx.read_native_pin(this_pin, this);
-            let buckets = ctx.read_native_pin(buckets_pin, buckets);
-            ctx.set_field(this, slot, Value::Object(Some(buckets)));
-        }
-    }
+    // into the receiver's own `table` slot so `HashMap.resize()` bytecode sees
+    // an array (or null), never an Int; write the legacy Int capacity only on
+    // our fabricated layout (JDK-ONLY-LAYOUT, L2).
+    publish_map_table(ctx, this, buckets, cap as i32);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
-    }
+    set_map_size(ctx, this, 0);
 
     // Best-effort JDK-named field population for bytecode readers.
     // `size` is mirrored by `set_map_size`.
@@ -7406,6 +7759,18 @@ fn is_native_bucket_map(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
 #[inline]
 fn is_lhm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     receiver_facts(ctx, this).has(CF_LHM)
+}
+
+/// True when `this`'s runtime class is `java/util/IdentityHashMap` or a
+/// subclass. `native_hashmap_get_exact`/`native_map_put_evict_pinned` consult
+/// this to compute the bucket hash/equality via reference identity
+/// (`ctx.identity_hash_code` + pointer equality) instead of the receiver
+/// key's virtual `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+///
+/// PERF: memoized per `ClassId` — see `CF_IDENTITY_MAP`.
+#[inline]
+fn is_identity_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    receiver_facts(ctx, this).has(CF_IDENTITY_MAP)
 }
 
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7726,12 +8091,25 @@ fn native_map_put_evict_pinned(
     key_pin: usize,
     value_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: use reference-identity hash/equality
+    // (`CF_IDENTITY_MAP`) instead of virtual `hashCode()`/`equals()` — see
+    // `map_hash_key_identity`. `this` is fresh here (just pinned by the
+    // caller, no GC-triggering call has run yet), so this read is safe.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+
     // Handle null key: hash=0, bucket=0, key field stores null
     // hashCode() can collect before this helper reaches its first field access;
     // refresh the caller's already-pinned key before dispatching it.
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
@@ -7852,7 +8230,13 @@ fn native_map_put_evict_pinned(
             // stored key: `key.equals(k)`, not `k.equals(key)`. The direction
             // is observable for asymmetric equality implementations and was
             // load-bearing for ANTLR DFA-state canonicalization.
-            let eq = map_keys_equal(ctx, key_for_eq, node_key)?;
+            //
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_for_eq, node_key)
+            } else {
+                map_keys_equal(ctx, key_for_eq, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -7903,7 +8287,7 @@ fn native_map_put_evict_pinned(
     // stays valid for this whole function's lifetime, so re-read through
     // it here -- before it is used to seed the new `this_pin` below -- to
     // guarantee `this` is current regardless of how many GCs the walk
-    // triggered. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // triggered. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     this = ctx.read_native_pin(put_pin_base, this);
 
     // Key not found — append at the TAIL of the chain. This matches HotSpot
@@ -7936,7 +8320,36 @@ fn native_map_put_evict_pinned(
     let value = read_pinned_elem(ctx, value_pin, value);
     let key_pin = pin_value(ctx, key_val);
     let value_pin = pin_value(ctx, value);
-    // Create node — for null keys, store Value::Object(None) in key field
+    // Create node — for null keys, store Value::Object(None) in key field.
+    //
+    // LOAD-BEARING: `ClassId::new(0)` here is not laziness. It resolves to a
+    // `cratonvm/synthetic/AnonymousObject$4` (see `VmExec::alloc_object`),
+    // which declares no fields and therefore carries NO field descriptors — so
+    // `set_field` takes the raw path and stores every `Value` variant as
+    // written. Bind this to the real `java/util/HashMap$Node` (as
+    // `map_alloc_node` does) and the descriptor-aware path turns on: a
+    // primitive written to the value slot, declared `Ljava/lang/Object;`, is
+    // coerced to NULL.
+    //
+    // That is not hypothetical. It is exactly what happened on the
+    // LinkedHashMap side when its node was switched to the real
+    // `java/util/LinkedHashMap$Entry` (`7bf427af1`, and Defect 3 of
+    // `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`):
+    // the Set PRESENT marker went to null and broke Jersey's
+    // `Resource.Builder.onBuildMethod`.
+    //
+    // The marker is no longer the obstacle — every one now goes through
+    // `present_marker` and is a reference. But that was MEASURED to be
+    // necessary and NOT sufficient: building this line as
+    // `alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS)` on top
+    // of the marker fix still fails `probes/LinkedHashMapNodeProbe.java` and
+    // `SetSurface`, including `Map$Entry.getKey()` coming back null and
+    // `keySet().remove` leaving the map unshrunk. Whatever else this node's
+    // real descriptors change has not been chased down.
+    //
+    // So: switching this class is its own validated project, not a tidy-up.
+    // `LinkedHashMapNodeProbe`'s set-membership and map-view sections are the
+    // guard — they go loudly red (9 failures) the moment this line changes.
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     // Keep the node and both object values rooted through population and
     // refresh every reference immediately before its store. The later
@@ -8059,13 +8472,20 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Value::Object(Some(key)) = key_val {
-        if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+    // `IdentityHashMap` receiver: the string/int fast paths below key by
+    // content (all equal-content Strings collapse to one entry, ignoring
+    // `==`), which is wrong for an identity map. Skip straight to the
+    // general path, which honours `CF_IDENTITY_MAP` below.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+    if !identity_mode {
+        if let Value::Object(Some(key)) = key_val {
+            if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+                return result;
+            }
+        }
+        if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
             return result;
         }
-    }
-    if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
-        return result;
     }
     let this = materialize_hm_int_fast(ctx, this)?;
 
@@ -8083,12 +8503,19 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // same plain-HashMap bucket code) via
     // native_chm_compute_if_present -> native_map_compute_if_present ->
     // native_map_get -> native_hashmap_get_exact. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8165,7 +8592,12 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -8376,8 +8808,19 @@ fn native_map_remove_pinned(
     remove_pin_base: usize,
     key_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`. `this` is fresh here
+    // (just re-read from its pin by the caller).
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let (hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -8415,6 +8858,7 @@ fn native_map_remove_pinned(
         search_hash: i32,
         key_pin: usize,
         key_fallback: Value,
+        identity_mode: bool,
     ) -> Result<bool, MethodCallFailed> {
         // The node and requested key can both be relocated while this native
         // call is running on a Tomcat worker. Reload the node *before* reading
@@ -8434,6 +8878,11 @@ fn native_map_remove_pinned(
         let Value::Object(Some(k)) = read_pinned_elem(ctx, key_pin, key_fallback) else {
             return Ok(false);
         };
+        // `IdentityHashMap` receiver: reference identity, not `equals()` — and
+        // no Java dispatch means no GC risk, so skip the pin dance below.
+        if identity_mode {
+            return Ok(map_keys_equal_identity(k, nk));
+        }
         // The freshly loaded node key has no caller-owned pin. Retain it
         // together with the already-rooted requested key for every
         // fast-wrapper probe and the eventual Java equals dispatch.
@@ -8453,11 +8902,11 @@ fn native_map_remove_pinned(
         // leaves the plain Rust-local `head`/`buckets` dangling -- observed
         // as `get_field`/`set_field` OOB drops on a genuine, unrelated,
         // freshly-allocated `java/lang/Object` now sitting at the stale
-        // address (docs/known-issues/tomcat-08-07/
-        // dohead-post-fix-sporadic-residuals.md's header-count residual).
+        // address (fixed-suite-bugs/tomcat/
+        // dohead-post-fix-sporadic-residuals-FIXED.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
         let head_matches =
-            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val)?;
+            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -8514,7 +8963,7 @@ fn native_map_remove_pinned(
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
             let curr_matches =
-                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val)?;
+                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val, identity_mode)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
@@ -8537,6 +8986,242 @@ fn native_map_remove_pinned(
     }
 
     Ok(Some(Value::Object(None)))
+}
+
+// ---------------------------------------------------------------------------
+// `Map`'s three conditional mutators: remove(k,v) / replace(k,v) / replace(k,o,n)
+// ---------------------------------------------------------------------------
+//
+// `native_map_init`'s header states the premise this whole layer rests on:
+// "every observable Map method is registered as a native, so JDK bytecode for
+// `HashMap.<method>` does not run". These three were the exception. They are
+// `java.util.Map` *default* methods that `HashMap` and `Hashtable` override
+// with implementations that walk the bucket array directly, so every call ran
+// REAL JDK bytecode over a table whose nodes this native layer allocates —
+// while `ConcurrentHashMap` had all three registered (see the
+// "ConcurrentHashMap-specific methods" block in `register_chm_natives`; they
+// are not CHM-specific at all).
+//
+// On a `LinkedHashMap` that bytecode path is
+// `HashMap.remove(k,v)` -> `HashMap.removeNode` -> `LinkedHashMap.afterNodeRemoval`,
+// whose first statement is `(LinkedHashMap.Entry<K,V>) e`. Our nodes were
+// `java/util/LinkedHashMap$Node` (see `lhm_alloc_node`, which now mints the
+// real `LinkedHashMap$Entry`), so it threw
+// `ClassCastException: java.util.LinkedHashMap$Node cannot be cast to
+// java.util.LinkedHashMap$Entry`. Kafka's
+// `MetadataLoader.removeAndClosePublisher` calls exactly
+// `publishers.remove(name, publisher)` on a `LinkedHashMap` field, which failed
+// embedded-broker shutdown ("Failed to shut down embedded Kafka cluster") in
+// Spring Boot's `KafkaAutoConfigurationIntegrationTests`.
+//
+// The cast is only the loudest symptom. Even where no cast is involved (a plain
+// `HashMap`), the JDK bytecode mutates the real bucket array and `size` field
+// behind the native bookkeeping — `map_state`'s size, the LHM overlay's
+// `size`/`head`/`tail`, the integer fast-path overlay — desyncing the map.
+//
+// Each is implemented exactly as `java.util.Map`'s default: in terms of
+// `get` / `containsKey` / `put` / `remove`, which are registered and which do
+// the receiver routing (LinkedHashMap / TreeMap / ConcurrentHashMap /
+// Hashtable) themselves.
+
+/// `Hashtable` (and `Properties`) reject a null value in all three of these
+/// methods (`Objects.requireNonNull(value)` is the first statement of each);
+/// `HashMap`/`LinkedHashMap` accept null values throughout. One helper so the
+/// three natives below stay a faithful mirror of whichever override the
+/// receiver actually has.
+fn map_kv_reject_null_for_hashtable(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    value: &Value,
+    method: &str,
+) -> Result<(), MethodCallFailed> {
+    if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!("Hashtable.{method}: null value")),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `Map.remove(Object key, Object value)` — remove only if currently mapped to
+/// `value`. Mirrors the JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, value) || (cur == null && !containsKey(key))) return false;
+/// remove(key);
+/// return true;
+/// ```
+fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
+    // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
+    // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
+    // GC — so every receiver/key/value local is re-read from its pin after each
+    // call, the same discipline `native_chm_remove_kv` follows.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let expected_pin = pin_value(ctx, expected);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let expected = read_pinned_elem(ctx, expected_pin, expected);
+        if !values_equal_deep(ctx, &current, &expected)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        // `get` cannot distinguish "absent" from "mapped to null"; only the
+        // null case needs the extra probe.
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V value)` — replace only if the key is currently mapped,
+/// returning the previous value (or `null` when absent). Mirrors the JDK
+/// default: `if (get(key) != null || containsKey(key)) cur = put(key, value);`
+fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        let old = native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?
+            .unwrap_or(Value::Object(None));
+        Ok(Some(old))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V oldValue, V newValue)` — compare-and-set. Mirrors the
+/// JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, oldValue) || (cur == null && !containsKey(key))) return false;
+/// put(key, newValue);
+/// return true;
+/// ```
+fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let old_pin = pin_value(ctx, old_val);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let old_val = read_pinned_elem(ctx, old_pin, old_val);
+        if !values_equal_deep(ctx, &current, &old_val)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// Register `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)` on one
+/// map class. Called for every map family whose JDK class overrides them with
+/// a bucket-walking body (`HashMap`, `LinkedHashMap`, `Hashtable`);
+/// `ConcurrentHashMap` has its own segment-locked versions and `TreeMap` does
+/// not override them at all (its inherited `Map` defaults call the registered
+/// `get`/`containsKey`/`put`/`remove` natives, which is already correct).
+fn register_map_conditional_mutators(r: &mut NativeMethodRegistry, c: &str) {
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_remove_kv,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_replace,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_replace_kv,
+    );
 }
 
 fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8589,6 +9274,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
     // which can trigger a moving GC. Pin `this` and the search key up front
     // and re-read them (plus the bucket-chain `node`) after every such call.
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     this = materialize_hm_int_fast(ctx, this)?;
@@ -8597,7 +9285,14 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     let key_for_hash = key_val;
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8665,7 +9360,11 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -9503,9 +10202,8 @@ fn alloc_view_backing(
     let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
         alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS)
     });
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing, buckets, cap as i32);
     set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
     ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
     backing
@@ -9794,7 +10492,7 @@ fn make_view_set_of(
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, sentinel]) {
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, present_marker(elem)]) {
             ctx.unpin_native_roots(first_pin);
             return Err(e);
         }
@@ -9876,30 +10574,23 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
     let backing = ctx.read_native_pin(roots_base, backing);
     let source = ctx.read_native_pin(source_pin, source);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    // Synthetic slot-0 bucket store (what map_state / iterator / remove read).
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    // Mirror the bucket array into the real `java/util/HashMap` `table` slot so
-    // JDK `keySet()/entrySet().spliterator()` bytecode (which reads `getfield
-    // map.table` directly) sees the live array instead of a stale value — and
-    // only write the synthetic `Int(capacity)` when `table` is NOT that same
-    // slot, otherwise it clobbers the bucket array and `arraylength` panics with
+    // Synthetic slot-0 bucket store (what map_state / iterator / remove read),
+    // plus a mirror into the backing's own `table` slot so JDK
+    // `keySet()/entrySet().spliterator()` bytecode (which reads `getfield
+    // map.table` directly) sees the live array instead of a stale value. The
+    // synthetic `Int(capacity)` is written only on our fabricated layout,
+    // otherwise it clobbers the bucket array and `arraylength` panics with
     // `expected object reference, got int(16)`. This mirrors the dual-storage
-    // `map_resize` already maintains (see its `table_slot` mirror).
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(t) = table_slot {
-        if t != MAP_FIELD_BUCKETS && t < ctx.object_num_fields(backing) {
-            ctx.set_field(backing, t, Value::Object(Some(buckets)));
-        }
-    }
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap));
-    }
+    // `map_resize` already maintains.
+    //
+    // JDK-ONLY-LAYOUT (L2): a view backing is EITHER a real `java/util/HashMap`
+    // (the branch above, ≥16 slots) or the fabricated
+    // `cratonvm/util/MapViewBacking`, and `publish_map_table` tells them apart
+    // by asking each receiver for its own `table` field — the fixed
+    // `java/util/HashMap` lookup answered `2` for both.
+    publish_map_table(ctx, backing, buckets, cap);
     // Reset modCount so the JDK spliterator's CME check stays consistent.
-    if let Some(mc) = ctx.resolve_field_index("java/util/HashMap", "modCount") {
-        if mc < ctx.object_num_fields(backing) {
-            ctx.set_field(backing, mc, Value::Int(0));
-        }
-    }
+    try_set_jdk_map_field(ctx, backing, "modCount", Value::Int(0));
     set_map_size(ctx, backing, 0);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
@@ -9963,7 +10654,7 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
         for (k, key_pin) in keys.into_iter().zip(key_pins) {
             let backing = ctx.read_native_pin(roots_base, backing);
             let k = read_pinned_elem(ctx, key_pin, k);
-            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, sentinel]);
+            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, present_marker(k)]);
         }
     }
     ctx.unpin_native_roots(roots_base);
@@ -10506,9 +11197,8 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
     let backing_map_pin = ctx.pin_native_root(backing_map);
     let buckets = alloc_ref_array(ctx, cap);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing_map, buckets, cap as i32);
     set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
@@ -10520,7 +11210,7 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]);
+        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]);
     }
     let set = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(set_pin);
@@ -11012,11 +11702,30 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
-    // put(key, sentinel) — returns null if key was new
-    let sentinel = Value::Int(1);
-    let put_args = [Value::Object(Some(backing)), elem, sentinel];
+    // put(element, PRESENT) — the previous value being null is how this
+    // reports "the element was not already in the set". See `present_marker`
+    // for why the marker must be a reference.
+    //
+    // A NULL element has no reference to mark itself with, so its membership
+    // cannot be read out of the value slot at all. Settle that one case with
+    // `containsKey`, which distinguishes "absent" from "present" without
+    // consulting the value.
+    let elem_is_null = matches!(elem, Value::Object(None));
+    let had_null = if elem_is_null {
+        matches!(
+            native_map_contains_key(ctx, &[Value::Object(Some(backing)), elem])?,
+            Some(Value::Int(1))
+        )
+    } else {
+        false
+    };
+    let put_args = [Value::Object(Some(backing)), elem, present_marker(elem)];
     let old = native_map_put(ctx, &put_args)?;
-    let was_new = matches!(old, Some(Value::Object(None)));
+    let was_new = if elem_is_null {
+        !had_null
+    } else {
+        matches!(old, Some(Value::Object(None)))
+    };
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
 }
 
@@ -11179,12 +11888,29 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let elem_pin = pin_value(ctx, elem);
     let backing = ctx.read_native_pin(backing_pin, backing);
     let elem = read_pinned_elem(ctx, elem_pin, elem);
+    // A null element carries no PRESENT marker of its own (see
+    // `present_marker`), so the removed value cannot say whether it was there.
+    // Ask `containsKey` first — it does not consult the value. `containsKey`
+    // dispatches Java and can move things, so re-read through the pins after.
+    let had_null = if matches!(elem, Value::Object(None)) {
+        match native_map_contains_key(ctx, &[Value::Object(Some(backing)), elem]) {
+            Ok(v) => Some(matches!(v, Some(Value::Int(1)))),
+            Err(e) => {
+                ctx.unpin_native_roots(backing_pin);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     let remove_args = [Value::Object(Some(backing)), elem];
     let old = native_map_remove(ctx, &remove_args);
     ctx.unpin_native_roots(backing_pin);
     let old = old?;
     Ok(Some(Value::Int(
-        if !matches!(old, Some(Value::Object(None))) {
+        if had_null.unwrap_or(!matches!(old, Some(Value::Object(None)))) {
             1
         } else {
             0
@@ -14904,9 +15630,8 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     let buckets_pin = ctx.pin_native_root(buckets);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing_map, buckets, cap as i32);
     set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
@@ -14915,7 +15640,7 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]) {
+        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -14949,9 +15674,8 @@ fn make_map_of(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodC
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     let map = ctx.read_native_pin(map_pin, map);
-    ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, map, buckets, cap as i32);
     set_map_size(ctx, map, 0);
-    ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
     for (i, (key, value)) in pairs.iter().enumerate() {
         let map = ctx.read_native_pin(map_pin, map);
@@ -15486,7 +16210,7 @@ fn stream_make_lazy_derived(
     // exactly the "cursor" Iterator bug (`next()` returns `this`; real
     // per-element consumption happens inside the mapper/filter/etc that was
     // about to be appended to the chain) documented in
-    // docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     // The actual drive now happens inline, one element at a time through the
     // FULL chain, the first time a terminal genuinely needs concrete
     // elements (`stream_pull_internal` / `stream_pull_synthetic_downstream`).
@@ -15810,7 +16534,7 @@ fn stream_pull_internal(
         // through `chain`, one `tryAdvance` at a time -- NOT via
         // `stream_source_elems` (which would fully drain the raw source with
         // a dumb append-only collector BEFORE any op in `chain` ever runs).
-        // See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+        // See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
         if let Some(spl) = stream_lazy_spliterator(ctx, stream) {
             let mut emit_stopped = false;
             {
@@ -16138,7 +16862,7 @@ where
 // state change during that disconnected raw drain, so it never returns
 // `false`, and the drain runs until `drain_spliterator_to_array`'s
 // 1,000,000-iteration safety cap. See
-// docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+// fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
 //
 // `drain_spliterator_inline` below fixes this by driving `tryAdvance` itself
 // and running EACH element through the chain from inside the reentrant
@@ -16702,7 +17426,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // `cratonvm/internal/StreamChainCollector` consumer used by
     // `drain_spliterator_inline` to drive a lazy spliterator's elements
     // straight through their downstream op-chain, one `tryAdvance` at a
-    // time. See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // time. See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     r.register(
         STREAM_CHAIN_COLLECTOR_CLASS,
         "accept",
@@ -17589,7 +18313,7 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // resync and can move `this` again via its own allocations. Confirmed
     // live via CRATONVM_DBG_STALE_OBJREF under concurrent stream map/flatMap
     // stress at -Xmx32m; see
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let this = ctx.read_native_pin(this_pin, this);
     let this = resync_values_view(ctx, this);
@@ -17713,7 +18437,7 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// incorrectly-forwarded native root slipped through a moving-GC window — the
 /// exact failure shape suspected (never confirmed) behind the intermittent
 /// `ConfigurationTest::testDatabaseProperties` `ClassCastException`, see
-/// docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md
+/// fixed-suite-bugs/keycloak/keycloak-quarkus-runtime-config-resolution-mismatches.md
 /// ("Residual" section). That race stopped reproducing before this canary could
 /// be validated against it; kept as a near-zero-overhead tripwire (one class-id
 /// comparison per element; no allocation/formatting unless it actually fires,
@@ -18348,7 +19072,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // `spl`/`consumer` and re-read it before that final use. Confirmed
             // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
             // ServiceLoader stream draining -- see
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let this_pin = ctx.pin_native_root(this);
             let spl_pin = ctx.pin_native_root(spl);
             const SAFETY_CAP: usize = 1_000_000;
@@ -19549,7 +20273,7 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // not consulted yet. Validation does happen, but one call later and only
     // partially: the SAM natives (`native_collfn_supplier_get` and friends)
     // check `collector_tag_of` and degrade to an empty list/map rather than
-    // failing. See `docs/known-issues/c2/collections-interception.md`, Residual 1.
+    // failing. See `docs/feature-designs/collections-interception.md`, Residual 1.
     // Left as-is deliberately: there is no way for a native to decline a call
     // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
     // options are to throw — which would break any legitimate default-method
@@ -25570,7 +26294,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     for (i, val) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, present_marker(val)]) {
             ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
@@ -25594,13 +26318,8 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             let this_pin = ctx.pin_native_root(this);
             let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+            publish_map_table(ctx, this, buckets, MAP_DEFAULT_CAPACITY as i32);
             set_map_size(ctx, this, 0);
-            ctx.set_field(
-                this,
-                MAP_FIELD_CAPACITY,
-                Value::Int(MAP_DEFAULT_CAPACITY as i32),
-            );
             ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
@@ -25627,9 +26346,14 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let cap = MAP_DEFAULT_CAPACITY;
     let buckets = alloc_ref_array(ctx, cap);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    // JDK-ONLY-LAYOUT (L2): `new HashMap<>(map)` gets the same treatment as the
+    // no-arg constructor. Writing `Int(cap)` at absolute slot 2 landed on the
+    // real `table` field of every real-layout receiver — the `HashMap` slot-2
+    // `Int` over `[` census row — leaving JDK bytecode an int where it expects
+    // the bucket array, while `native_map_init` right next door already stored
+    // the array there.
+    publish_map_table(ctx, this, buckets, cap as i32);
     set_map_size(ctx, this, 0);
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
     // Copy entries from source, dispatching on its concrete backend
     // (LinkedHashMap overlay, TreeMap tree, HashMap/CHM buckets, or — via the
@@ -25699,13 +26423,13 @@ fn hashmap_table_size_for_u64(cap: u64) -> i32 {
 /// `HashMap.putMapEntries` does. The value is advisory — `readObject` recomputes
 /// threshold from `loadFactor` — so an approximation round-trips correctly.
 fn hashmap_serialized_capacity(ctx: &dyn NativeContext, this: ObjectRef, size: i32) -> i32 {
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "table") {
-        if slot < ctx.object_num_fields(this) {
-            if let Value::Object(Some(tab)) = ctx.get_field(this, slot) {
-                let len = ctx.array_length(tab);
-                if len > 0 {
-                    return len as i32;
-                }
+    // JDK-ONLY-LAYOUT (L2): the receiver's own `table`, not `HashMap`'s index
+    // read off an unrelated layout.
+    if let Some(slot) = receiver_table_slot(ctx, this) {
+        if let Value::Object(Some(tab)) = ctx.get_field(this, slot) {
+            let len = ctx.array_length(tab);
+            if len > 0 {
+                return len as i32;
             }
         }
     }
@@ -25959,7 +26683,7 @@ pub fn comparator_compare(
                     // (the second element, computed AFTER that hazard) must
                     // be re-read — `a`/`b` are raw `ObjectRef`-carrying
                     // `Value`s just like `comparator`. See
-                    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
                     let comparator_pin = ctx.pin_native_root(comparator);
                     let b_pin = pin_value(ctx, b);
                     let ia = comparing_key_as_i64(
@@ -26079,7 +26803,7 @@ pub fn comparator_compare(
             // (the key extractor) and trigger a moving GC; `key_fn` AND
             // `b` (the second element, used AFTER that hazard) are both
             // raw `ObjectRef`-carrying `Value`s that must be re-read. See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let key_fn_pin = ctx.pin_native_root(key_fn);
             let b_pin = pin_value(ctx, b);
             let ka = ctx
@@ -26093,8 +26817,8 @@ pub fn comparator_compare(
             let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
             let b = read_pinned_elem(ctx, b_pin, b);
             // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
-            // docs/known-issues/wildfly-remoting-classcastexception-
-            // parallel-extension-add.md): `ka` -- the FIRST extracted key --
+            // fixed-suite-bugs/wildfly/
+            // wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md): `ka` -- the FIRST extracted key --
             // was read raw here and reused below at `natural_compare(ctx,
             // &ka, &kb)`, but the very next line's `invoke_virtual` (computing
             // `kb`) is exactly as GC-capable as the first one that produced
@@ -26150,7 +26874,7 @@ pub fn comparator_compare(
             // fix (class_id 1295/1299 traces via `Comparator.lambda$
             // thenComparing$...` and `ResourceAttributesXMLContentReader
             // .<init>`). See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let comparator_pin = ctx.pin_native_root(comparator);
             let a_pin = pin_value(ctx, a);
             let b_pin = pin_value(ctx, b);
@@ -26233,7 +26957,7 @@ fn compare_with_key_function(
     // `apply` call can run arbitrary interpreted bytecode and trigger a
     // moving GC; `key_fn` AND `b` (used after that hazard) both need
     // re-reading. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let key_fn_pin = ctx.pin_native_root(key_fn);
     let b_pin = pin_value(ctx, b);
     let ka = ctx
@@ -26735,7 +27459,7 @@ fn native_comparator_then_comparing_double(
 // size, len, emptyValue) — writing through the legacy indices above then
 // silently lands on the wrong real fields (wrong type too: `elts` is a
 // String[], not an ArrayList). See
-// docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md.
+// fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md.
 // `sj_real_layout` resolves the real class's actual field indices by name
 // when present; every entry point below branches on it. This is
 // intentionally still a full from-scratch Rust reimplementation of
@@ -29368,8 +30092,8 @@ fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ===========================================================================
 // LinkedHashMap = 5-field synthetic:
 //   0: buckets (Object[]), 1: size (Int), 2: capacity (Int), 3: head (Node), 4: tail (Node)
-// LinkedHashMap$Node = 6-field synthetic:
-//   0: key, 1: value, 2: hash, 3: next (bucket chain), 4: before, 5: after (insertion order)
+// LinkedHashMap$Entry = the REAL 6-field JDK node (see `LHM_NODE_*` below):
+//   0: hash, 1: key, 2: value, 3: next (bucket chain), 4: before, 5: after (insertion order)
 
 const LHM_FIELD_BUCKETS: usize = 0;
 const LHM_FIELD_SIZE: usize = 1;
@@ -29579,13 +30303,16 @@ fn lhm_ptr_cache() -> &'static Mutex<StdHashMap<usize, usize>> {
     C.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-// Real JDK LinkedHashMap$Node layout (extends HashMap$Node{hash,key,value,next}
+// Real JDK LinkedHashMap$Entry layout (extends HashMap$Node{hash,key,value,next}
 // and adds before,after): hash@0, key@1, value@2, next@3, before@4, after@5.
+// Verified with `javap -p --module java.base java.util.LinkedHashMap$Entry` on
+// the JDK 25 the suites run, and `compute_field_layout` lays superclass fields
+// out first, in declaration order — so these indices are the real ones.
 // Using the real slot order (not the historical synthetic key@0/value@1/hash@2)
 // is required so inherited real-JDK `HashMap.writeObject`→`internalWriteEntries`
 // (Java serialization; NOT force-native) reads the right slots — the old order
 // serialized `{k=v}` as `{v=null}`, desyncing peers. Nodes bind to the real
-// LinkedHashMap$Node class, and slot 0 = hash:I now holds an Int, so the
+// LinkedHashMap$Entry class, and slot 0 = hash:I now holds an Int, so the
 // descriptor-aware field writes/reads coincide with each slot's declared type.
 const LHM_NODE_HASH: usize = 0;
 const LHM_NODE_KEY: usize = 1;
@@ -29624,7 +30351,16 @@ fn lhm_alloc_node(ctx: &mut dyn NativeContext, key: Value, value: Value, hash: i
     // Pin+re-read them across the allocation.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Node", LHM_NODE_NUM_FIELDS);
+    // The real JDK's nested node type, NOT the `java/util/LinkedHashMap$Node`
+    // this used to mint. That name does not exist in the JDK, so every piece of
+    // real-JDK bytecode that reached one of our nodes either threw
+    // (`afterNodeRemoval`'s `(LinkedHashMap.Entry) e`, the
+    // `kafka-embedded-kraft-...-FIXED` defect 1) or found no method at all
+    // (`getKey()`/`getValue()`/`setValue()` are declared on the real
+    // `HashMap$Node` and inherited, so on the fake class they were a
+    // `NoSuchMethodError`). The slot layout below was already the real one, so
+    // this is a change of class IDENTITY only — see `LHM_NODE_*`.
+    let node = alloc_synthetic(ctx, "java/util/LinkedHashMap$Entry", LHM_NODE_NUM_FIELDS);
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -29935,6 +30671,11 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
         native_lhm_compute_if_absent,
     );
+    // `LinkedHashMap` inherits `HashMap`'s bucket-walking overrides of the
+    // three conditional mutators, and `HashMap.removeNode` calls
+    // `LinkedHashMap.afterNodeRemoval`, which casts the node to
+    // `LinkedHashMap$Entry` — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(registry, c);
     registry.set_category(__prev_cat);
 }
 
@@ -30025,7 +30766,7 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // that follows, unpinned otherwise. Confirmed live via
     // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add (same
     // "Family 1" pattern as native_hashmap_get_exact's fix -- see
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
     let this_pin = ctx.pin_native_root(this);
     // Cap the eager bucket-table allocation to what the heap can hold (see
     // `alloc_bucket_table`); `cap` is rebound to the actual table length so
@@ -30242,6 +30983,33 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // A LinkedHashMap value is a REFERENCE: the node's value slot is
+    // `V value` -> `Ljava/lang/Object;` on the real `java/util/HashMap$Node`
+    // that `LinkedHashMap$Entry` extends. Now that `lhm_alloc_node` binds to
+    // that real class, the descriptor-aware `set_field` path coerces a
+    // primitive `Value` in that slot to NULL.
+    //
+    // Our own set layer writes a raw `Value::Int(1)` PRESENT sentinel there
+    // (`native_hs_add`), and `native_hs_add` / `native_hs_remove` decide "was
+    // it already in the set" purely from whether the previous value was null.
+    // Coerced to null, `LinkedHashSet.remove(x)` DELETED the element and still
+    // reported `false` — which broke Jersey's
+    // `Resource.Builder.onBuildMethod`, whose
+    // `checkState(methodBuilders.remove(builder))` then threw
+    // `IllegalStateException` and failed every test that starts the Jersey
+    // filter. `CopyOnWriteArraySet` shares the same backing and broke with it.
+    //
+    // Box it on the way in. A real Java caller can never arrive here with a
+    // primitive — `Map.put`'s descriptor is `(Object,Object)Object`, so the
+    // interpreter has already boxed — so this only ever fires for our own
+    // internal sentinels, and `Integer.valueOf(1)` hands back the JDK's cached
+    // instance rather than allocating. Boxing here, before the pins below, is
+    // deliberate: `box_primitive_result` dispatches `valueOf`, which can GC.
+    let value = match value {
+        Value::Object(_) => value,
+        primitive => box_primitive_result(ctx, primitive),
+    };
+
     // GC-SAFETY: `this` is a bare Rust local read from `args`, not itself a
     // GC root -- only a `pin_native_root`/`read_native_pin` handle survives a
     // moving GC. `map_hash_key` (key.hashCode()), `lhm_resize` (allocates a
@@ -30367,38 +31135,38 @@ fn native_lhm_put_evict(
     }
     if evict && invoke_remove_eldest {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
-            // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
-            // with no real `getKey()`/`getValue()`; an override that inspects
-            // the eldest (e.g. Hibernate's `LRU.removeEldestEntry` calls
-            // `eldest.getKey()`) would hit a NoSuchMethodError. Wrap the head's
-            // key/value in a real `SimpleImmutableEntry` (which has working
-            // `getKey`/`getValue` natives) for the hook call.
+            // Hand the override the REAL head node, exactly as HotSpot's
+            // `LinkedHashMap.afterNodeInsertion` does
+            // (`removeEldestEntry(first)` where `first = head`).
+            //
+            // This used to wrap the head's key/value in a fresh
+            // `AbstractMap$SimpleImmutableEntry`, because the node was a fake
+            // `java/util/LinkedHashMap$Node` whose class declares no methods —
+            // so an override that inspects the eldest (Hibernate's
+            // `LRU.removeEldestEntry` calls `eldest.getKey()`) hit a
+            // `NoSuchMethodError`. `lhm_alloc_node` now mints the real
+            // `java/util/LinkedHashMap$Entry`, which inherits the real
+            // `HashMap$Node.getKey/getValue/setValue/equals/hashCode/toString`
+            // bodies and reads them off the very slots we write, so the copy is
+            // no longer needed — and the copy was itself a deviation: it was
+            // immutable (`setValue` threw `UnsupportedOperationException` where
+            // HotSpot mutates the map) and never `==` the live entry.
+            let head_pin = ctx.pin_native_root(head);
+            // Family-1 fix (cce0079): the key is re-used for the reentrant
+            // remove below, across the hook's virtual dispatch (GC-capable) —
+            // pin it so the remove receives the current address, not a pre-GC
+            // one. Read it BEFORE the dispatch: an override that removes the
+            // eldest reentrantly may leave the node unlinked by the time we
+            // get back.
             let key = ctx.get_field(head, LHM_NODE_KEY);
-            let val = ctx.get_field(head, LHM_NODE_VALUE);
-            // Family-1 fix (cce0079): `key` is re-used for the reentrant
-            // remove below, across BOTH the entry alloc and the hook's
-            // virtual dispatch (each GC-capable) — pin it so the remove
-            // receives the current address, not a pre-GC one.
             let eldest_key_pin = pin_value(ctx, key);
-            let eldest = match ctx.new_object_initialized(
-                "java/util/AbstractMap$SimpleImmutableEntry",
-                "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                &[key, val],
-            )? {
-                Some(Value::Object(Some(e))) => e,
-                _ => {
-                    ctx.unpin_native_roots(this_pin);
-                    return Ok(Some(Value::Object(None)));
-                }
-            };
-            // `new_object_initialized` above allocates and can trigger a
-            // moving GC; refresh `this` before the virtual dispatch below.
             let this = ctx.read_native_pin(this_pin, this);
+            let head = ctx.read_native_pin(head_pin, head);
             let verdict = ctx.invoke_virtual(
                 this,
                 "removeEldestEntry",
                 "(Ljava/util/Map$Entry;)Z",
-                &[Value::Object(Some(eldest))],
+                &[Value::Object(Some(head))],
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
                 // `invoke_virtual` above runs arbitrary Java and can trigger
@@ -34922,12 +35690,38 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
 /// it only after the collection object itself has been found reachable through
 /// ordinary Java roots/fields. The returned copy deliberately releases every
 /// side-table lock before the collector recursively marks the values.
-pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
+/// `owner_class_id` is the class id of the object CURRENTLY at `owner_addr`.
+/// The owner index is keyed by address, and an address is recycled the moment
+/// its previous tenant is reclaimed — so without this check the marker is
+/// handed the DEAD collection's references on behalf of whatever unrelated
+/// object now sits there. `widened_obj_key` already applies exactly this
+/// discriminator on the mutator side (its case 2b re-keys and clears a
+/// different-class recycle), but that only runs when the recycled address is
+/// used as a COLLECTION again; an ordinary object landing there is never
+/// observed, so the stale entry survives indefinitely. `None` skips the check.
+pub fn gc_overlay_roots_for_collection(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+) -> Vec<ObjectRef> {
     let keys = {
         let index = overlay_owner_keys()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         index.get(&owner_addr).cloned().unwrap_or_default()
+    };
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    // Drop any key whose registry slot records a DIFFERENT class than the
+    // object now at this address. A class id is GC-invariant (it travels with
+    // the header), so a mismatch means the registering collection is gone and
+    // this entry belongs to a previous tenant.
+    let keys: Vec<usize> = match owner_class_id {
+        Some(actual) if owner_class_filter_enabled() => keys
+            .into_iter()
+            .filter(|key| owner_key_class_matches(*key, actual, owner_addr))
+            .collect(),
+        _ => keys,
     };
     if keys.is_empty() {
         return Vec::new();
@@ -35037,7 +35831,13 @@ pub fn gc_overlay_roots_for_matching_owners(
     };
     let mut roots = Vec::new();
     for owner in owners {
-        roots.extend(gc_overlay_roots_for_collection(owner));
+        // `None`: this seed is address-based by construction — the predicate
+        // selects owners by generation/range, and no class id is available for
+        // them. It is already a deliberate over-approximation ("retain the
+        // edges of every current owner"), so skipping the recycled-owner check
+        // here only over-retains, which is this path's existing contract. The
+        // precise per-owner rule runs in the BFS, which does pass a class id.
+        roots.extend(gc_overlay_roots_for_collection(owner, None));
     }
     roots
 }
@@ -35532,7 +36332,7 @@ fn tree_compare(
 /// must be re-read after every comparator invocation, not just once at
 /// entry — hence pinning both here and returning their current values
 /// alongside the search result, so callers never reuse a pre-search copy.
-/// See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+/// See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
 fn tm_binary_search(
     ctx: &mut dyn NativeContext,
     owner: ObjectRef,
@@ -35569,7 +36369,7 @@ fn tm_binary_search(
     // array on a miss). This — plus the sibling `a`/`b` reuse inside
     // `comparator_compare`'s own dispatch arms — was the actual root cause
     // of the residual panics that survived the owner/data/comparator-only
-    // fix. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fix. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let mut key = *key;
     let key_pin = pin_value(ctx, key);
     let mut low: usize = 0;
@@ -36958,7 +37758,7 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
 /// `ClassCastException: class java.lang.Object cannot be cast to class
 /// java.lang.Comparable` (the stale key decoded as whatever now occupies the
 /// address); see the sibling
-/// `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
 /// for the same defect in `PriorityBlockingQueue`.
 ///
 /// Pin the whole snapshot once, then read each element back through its pin
@@ -38549,7 +39349,7 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: `tree_compare`/`native_ts_add` can
         // run a user Comparator/lambda and trigger a moving GC. See
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
         let data_pin = ctx.pin_native_root(data);
         let result_pin = ctx.pin_native_root(result);
         let mut data = data;
@@ -38897,7 +39697,7 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // local reused across every iteration, and `elems` (collected up front)
     // sat entirely unpinned in a Rust `Vec` across the whole loop — pin both
     // before the loop starts and refresh on every iteration. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let (_, elem_pins) = pin_value_slice(ctx, &elems);
     let mut changed = false;
@@ -39908,9 +40708,10 @@ fn chm_init_segments(
         let seg_pin = ctx.pin_native_root(seg);
         let buckets = alloc_ref_array(ctx, cap_per_segment);
         let seg = ctx.read_native_pin(seg_pin, seg);
-        ctx.set_field(seg, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // Segments are bare `ClassId(0)` three-slot objects — the fabricated
+        // layout — so this keeps writing `Int(capacity)` at slot 2.
+        publish_map_table(ctx, seg, buckets, cap_per_segment as i32);
         set_map_size(ctx, seg, 0);
-        ctx.set_field(seg, MAP_FIELD_CAPACITY, Value::Int(cap_per_segment as i32));
         let segments = ctx.read_native_pin(segments_pin, segments);
         let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
         ctx.unpin_native_roots(seg_pin);
@@ -42201,13 +43002,8 @@ fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let buckets = rooted_across(ctx, &mut [&mut set, &mut backing], |ctx| {
         alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY)
     });
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing, buckets, MAP_DEFAULT_CAPACITY as i32);
     set_map_size(ctx, backing, 0);
-    ctx.set_field(
-        backing,
-        MAP_FIELD_CAPACITY,
-        Value::Int(MAP_DEFAULT_CAPACITY as i32),
-    );
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     Ok(Some(Value::Object(Some(set))))
 }
@@ -42433,6 +43229,51 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
 
 const PROPS_FIELD_DEFAULTS: usize = 3;
 
+/// Where this `Properties` receiver's `defaults` chain link actually lives.
+///
+/// JDK-ONLY-LAYOUT (L2, step 3): `PROPS_FIELD_DEFAULTS` (3) is a slot of the
+/// fabricated four-field `Properties` model. On a real
+/// `java.util.Properties` the inherited `Hashtable` fields occupy 0..=7 and
+/// absolute slot 3 is `float loadFactor`, so `native_props_init`'s
+/// `Object(None)` landed on a primitive — and the overlay hunter did NOT
+/// report it, because its predicate only flagged `Object(Some(_))` over a
+/// primitive descriptor. It was invisible in the census for that reason, not
+/// absent from the defect. **Closed 2026-08-05 as L4 gap 3**:
+/// `overlay_access_is_cross_type` now flags `Object(_)`, so a write of this
+/// exact shape appears in the census, and the shadow-layout diff reports the
+/// slot as a `TYPE` disagreement whether or not anything writes it.
+///
+/// Reading the same slot back was the other half: `getProperty`'s fallback
+/// walk read slot 3, got a `Float`, and stopped — so on a real layout a
+/// `Properties(defaults)` chain never resolved a single inherited key, even
+/// though `native_props_init_defaults` had already learned to mirror the
+/// reference into the real `defaults` field by name.
+///
+/// The real field is resolved on the RECEIVER's class (a `Properties`
+/// subclass — `java.security.Provider`, Ant's `PropertySet` — inherits it),
+/// and only a receiver that does not declare `defaults` at all, i.e. the
+/// fabricated stub, falls back to the raw model slot.
+fn props_defaults_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let class_id = ctx.class_id_of_object(this);
+    if let Some(idx) = ctx.resolve_field_index_by_class_id(class_id, "defaults") {
+        if idx < ctx.object_num_fields(this) {
+            return idx;
+        }
+    }
+    PROPS_FIELD_DEFAULTS
+}
+
+/// Read the `defaults` link of a `Properties`-shaped receiver.
+fn props_get_defaults(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    ctx.get_field(this, props_defaults_slot(ctx, this))
+}
+
+/// Write the `defaults` link of a `Properties`-shaped receiver.
+fn props_set_defaults(ctx: &mut dyn NativeContext, this: ObjectRef, value: Value) {
+    let slot = props_defaults_slot(ctx, this);
+    ctx.set_field(this, slot, value);
+}
+
 // JDK-ONLY-CLASSIFY: unknown — needs census. HIGHEST-RISK GROUP IN THIS CRATE.
 // All 43 registrations target `java.util.Properties` methods that have concrete
 // bytecode in JDK 25 and none that is ACC_NATIVE, which reads as "stub" on the
@@ -42645,6 +43486,13 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.register(ht, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
     registry.register(ht, "toString", "()Ljava/lang/String;", native_map_to_string);
     registry.register(ht, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+    // `Hashtable` (and `Properties`, which overrides them again) declare their
+    // own bucket-walking `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)`.
+    // Same gap, same fix — see `register_map_conditional_mutators`. The null
+    // rejection those overrides open with is honoured by
+    // `map_kv_reject_null_for_hashtable`.
+    register_map_conditional_mutators(registry, ht);
+    register_map_conditional_mutators(registry, p);
     // Note: `keys()` / `elements()` are registered by
     // `cratonvm-native-builtins::deprecated_io_util::register_*_natives`,
     // which runs AFTER us in `vm_init`'s real-JDK arm. The force-native
@@ -42665,7 +43513,7 @@ fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(None),
     };
     native_map_init(ctx, &[Value::Object(Some(this))])?;
-    ctx.set_field(this, PROPS_FIELD_DEFAULTS, Value::Object(None));
+    props_set_defaults(ctx, this, Value::Object(None));
     Ok(None)
 }
 
@@ -42675,20 +43523,19 @@ fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(None),
     };
     native_map_init(ctx, &[Value::Object(Some(this))])?;
-    ctx.set_field(this, PROPS_FIELD_DEFAULTS, args[1]);
-    // Also store the defaults reference in the REAL `defaults` field, resolved
-    // by name. On a real-layout `java.util.Properties` the inherited Hashtable
-    // fields push `defaults` to a different slot than this native model's
-    // `PROPS_FIELD_DEFAULTS` (3) — which there lands on `loadFactor` (a float),
-    // so the reference is misplaced. The side-table `getProperty` reads the
-    // by-name `defaults` slot to walk the fallback chain (TC0622 follow-up);
-    // without this write it always sees null. Writing both keeps the native
-    // model (slot 3) and the real layout consistent.
-    if let Some(idx) = ctx.resolve_field_index("java/util/Properties", "defaults") {
-        if idx != PROPS_FIELD_DEFAULTS {
-            ctx.set_field(this, idx, args[1]);
-        }
-    }
+    // Store the defaults reference in the REAL `defaults` field, resolved by
+    // name on the receiver's class. On a real-layout `java.util.Properties` the
+    // inherited Hashtable fields push `defaults` well past this native model's
+    // `PROPS_FIELD_DEFAULTS` (3) — which there lands on `loadFactor`, a float —
+    // so the raw slot both misplaces the reference and destroys a live field.
+    // The side-table `getProperty` reads the by-name `defaults` slot to walk
+    // the fallback chain (TC0622 follow-up).
+    //
+    // JDK-ONLY-LAYOUT (L2, step 3): this used to write BOTH slots, so a real
+    // receiver still took the destructive write; `props_set_defaults` writes
+    // the one slot that is right for this receiver, and every reader now
+    // resolves the same way.
+    props_set_defaults(ctx, this, args[1]);
     Ok(None)
 }
 
@@ -42703,13 +43550,13 @@ fn native_props_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(result);
     }
     // Fall through to defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
         if let Some(Value::Object(Some(_))) = def_result {
             return Ok(def_result);
         }
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
     }
     Ok(Some(Value::Object(None)))
 }
@@ -42728,13 +43575,13 @@ fn native_props_get_property_default(
         return Ok(result);
     }
     // Fall through to defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
         if let Some(Value::Object(Some(_))) = def_result {
             return Ok(def_result);
         }
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
     }
     // Return the default value arg
     Ok(Some(args[2]))
@@ -43220,7 +44067,7 @@ fn native_props_string_property_names(
     let result = native_map_key_set(ctx, &[Value::Object(Some(this))])?;
 
     // Also add keys from defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let defs_pin = ctx.pin_native_root(defs);
         let def_keys = props_collect_keys(ctx, defs);
@@ -43253,7 +44100,7 @@ fn native_props_string_property_names(
             }
         }
         let defs = ctx.read_native_pin(defs_pin, defs);
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
         ctx.unpin_native_roots(defs_pin);
     }
     Ok(result)
@@ -44230,7 +45077,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     // shared loop above so each yielded `Map.Entry` is wrapped in
     // `UnmodifiableMapEntry` (setValue() must throw, not silently mutate the
     // backing map through the "locked" view — see
-    // docs/known-issues/tomcat-08-07/parametermap-immutability-not-locked.md).
+    // fixed-suite-bugs/tomcat/parametermap-immutability-not-locked-FIXED.md).
     {
         let c = UNMOD_ENTRY_SET_CLASS;
         r.register(
@@ -51268,6 +52115,86 @@ mod tests {
 
     // Fix item 1: a recycled identity hash on a different class must not inherit
     // a dead object's slot — `pack_obj_key`/`ObjKeyEntry` carry a class marker.
+    /// Defect 5: the MARKER's owner→overlay edge is unvalidated where the
+    /// MUTATOR's is validated.
+    ///
+    /// `widened_obj_key` guards address recycling with a GC-invariant
+    /// `class_id` comparison (its case 2b re-keys and clears the dead
+    /// collection's overlay when a different class lands on a recycled
+    /// identity hash). But that runs only when the recycled address is used as
+    /// an overlay-backed COLLECTION again. When an ordinary object lands there
+    /// instead, nothing ever clears the entry, and
+    /// `gc_overlay_roots_for_collection` — a bare address lookup with no
+    /// identity check at all — hands the old-gen marker the DEAD collection's
+    /// references on behalf of the unrelated live object now at that address.
+    ///
+    /// Observed in the wild as eight
+    /// `old-gen mark: rejecting external-overlay(BFS owner) candidate … not a
+    /// plausible object base` warnings whose first words decode to ASCII string
+    /// payload (`0x766f206b63617473` = "stack ov"), a raw heap pointer, and an
+    /// interior address — i.e. the marker being handed non-headers for a live,
+    /// already-marked owner.
+    #[test]
+    fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
+        use super::{
+            obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry,
+        };
+        // Tests the PREDICATE directly, not `gc_overlay_roots_for_collection`,
+        // so it documents the defect regardless of whether enforcement is
+        // enabled — which it is NOT by default; see
+        // `owner_class_filter_enabled` for the measurements that disabled it.
+
+        // A never-dereferenced, 8-aligned fake address for the dead collection.
+        const DEAD_HASH: u32 = 0x5EED_BEEF;
+        const LINKED_LIST_CLASS: u32 = 4242;
+        const UNRELATED_CLASS: u32 = 7777;
+        let recycled_addr = 0x5EED_0000usize;
+        let dead_key = pack_obj_key(DEAD_HASH, 0);
+
+        // The registry slot `widened_obj_key` would have created for a live
+        // LinkedList at `recycled_addr`.
+        obj_key_shard_for(DEAD_HASH)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(DEAD_HASH)
+            .or_default()
+            .push(ObjKeyEntry {
+                last_ptr: recycled_addr,
+                generation: 0,
+                class_id: LINKED_LIST_CLASS,
+                vm: 0,
+            });
+
+        // While the collection is alive its own class matches, so its roots
+        // are kept. (A predicate that answered `false` here would drop a live
+        // collection's references — the failure mode that keeps enforcement
+        // switched off by default.)
+        assert!(
+            owner_key_class_matches(dead_key, LINKED_LIST_CLASS, recycled_addr),
+            "a LIVE collection's own overlay keys must be kept"
+        );
+
+        // It dies, and its block is REALLOCATED to an ordinary object of a
+        // different class that never touches an overlay — so `widened_obj_key`
+        // (and therefore case 2b's cleanup) never runs and nothing in the
+        // system observes the handover. The recorded class still names the
+        // dead collection, so the mismatch is detectable.
+        assert!(
+            !owner_key_class_matches(dead_key, UNRELATED_CLASS, recycled_addr),
+            "a recycled address must not inherit the DEAD collection's overlay              keys: the marker has no identity check of its own, while
+             `widened_obj_key` applies exactly this one"
+        );
+
+        // A ZEROED owner header is ambiguous — an already-freed block and the
+        // legitimate `ClassId(0)` container share it — so it must NOT license a
+        // drop. Enforcing there cascades one premature free into every element
+        // the collection holds.
+        assert!(
+            owner_key_class_matches(dead_key, 0, recycled_addr),
+            "class_id 0 is not evidence of recycling and must retain"
+        );
+    }
+
     #[test]
     fn pack_obj_key_roundtrip() {
         use super::pack_obj_key;
@@ -52776,6 +53703,13 @@ mod tests {
             /// class hierarchy to `classify_class`. Empty by default, which
             /// reproduces the previous always-`None` `superclass_of` stub.
             superclasses: HashMap<ClassId, ClassId>,
+            /// Modelled `(class, field name) -> absolute slot`, so a `MockCtx`
+            /// can present a REAL field layout to the by-name resolvers.
+            /// Empty by default, which reproduces the previous always-`None`
+            /// `resolve_field_index_by_class_id` stub — a class nothing has
+            /// declared a field for is exactly a fabricated stub, whose slots
+            /// are `_f0.._fN`.
+            field_indices: HashMap<(ClassId, String), usize>,
             /// Distinct per `Shared`, so two `MockCtx`s in one process are two
             /// different "VMs".
             ///
@@ -52802,6 +53736,7 @@ mod tests {
                     object_classes: HashMap::new(),
                     class_names: HashMap::new(),
                     superclasses: HashMap::new(),
+                    field_indices: HashMap::new(),
                     vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
@@ -52881,6 +53816,29 @@ mod tests {
                     .unwrap()
                     .superclasses
                     .insert(child, parent);
+            }
+
+            /// Declare that `class_id` (or a subclass of it) has instance field
+            /// `name` at absolute slot `index`, so
+            /// `resolve_field_index_by_class_id` answers like a real layout.
+            /// A class with no declared field of that name is a fabricated
+            /// stub as far as the resolver is concerned.
+            pub(super) fn define_field(&self, class_id: ClassId, name: &str, index: usize) {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .field_indices
+                    .insert((class_id, name.to_string()), index);
+            }
+
+            /// Allocate an object of `class_id` with `num_fields` slots.
+            pub(super) fn alloc_object_of(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                let obj = s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); num_fields],
+                });
+                s.object_classes.insert(obj.as_ptr() as usize, class_id);
+                obj
             }
 
             /// Model `ClassStore::remove`: the class becomes invisible to
@@ -53071,11 +54029,26 @@ mod tests {
             // cratonvm-native-collections --lib` on `dev`. This mock has no
             // notion of class field layout, so `None` (matching the trait's
             // documented "field not found" case) is the correct stub.
+            /// Resolve against the layout the test declared with
+            /// `define_field`, walking `define_superclass` edges the way the
+            /// real `resolve_field_index_in_hierarchy` walks a class's
+            /// ancestry. A class nothing declared a field for still answers
+            /// `None` — that is the fabricated-stub case — so every
+            /// pre-existing test's expectations are unchanged.
             fn resolve_field_index_by_class_id(
                 &self,
-                _class_id: ClassId,
-                _field_name: &str,
+                class_id: ClassId,
+                field_name: &str,
             ) -> Option<usize> {
+                let s = self.shared.lock().unwrap();
+                let mut cur = Some(class_id);
+                for _ in 0..64 {
+                    let c = cur?;
+                    if let Some(idx) = s.field_indices.get(&(c, field_name.to_string())) {
+                        return Some(*idx);
+                    }
+                    cur = s.superclasses.get(&c).copied();
+                }
                 None
             }
             fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
@@ -54165,6 +55138,212 @@ mod tests {
                 ))
             });
             assert!(res.is_err(), "comparator error must propagate");
+        }
+
+        // ---------------------------------------------------------------
+        // JDK-ONLY-LAYOUT (L2) — `publish_map_table` / `props_defaults_slot`
+        //
+        // The defect these cover is silent by construction: a raw index
+        // resolves, type-checks and lands on a DIFFERENT field. So each test
+        // states the real layout, does the write, and then asserts on the
+        // field that must NOT have moved — the assertion that fails when the
+        // resolution regresses to a fixed class name.
+        // ---------------------------------------------------------------
+
+        const HASHMAP_CID: ClassId = ClassId::new(41);
+        const HASHTABLE_CID: ClassId = ClassId::new(42);
+        const PROPERTIES_CID: ClassId = ClassId::new(43);
+        const STUB_CID: ClassId = ClassId::new(44);
+
+        /// Real `java/util/HashMap`: `AbstractMap` contributes `keySet`(0) and
+        /// `values`(1), so `table` is absolute slot 2 — the same index the
+        /// fabricated layout calls `capacity`.
+        fn define_real_hashmap(ctx: &MockCtx) {
+            ctx.define_class(HASHMAP_CID, "java/util/HashMap");
+            ctx.define_field(HASHMAP_CID, "table", 2);
+            ctx.define_field(HASHMAP_CID, "size", 4);
+            ctx.define_field(HASHMAP_CID, "modCount", 5);
+        }
+
+        /// Real `java/util/Properties extends Hashtable`: `Hashtable` declares
+        /// `table`(0), `count`(1), `threshold`(2), `loadFactor`(3), and
+        /// `Properties` adds `defaults`(8). Absolute slot 2 — where the fixed
+        /// `java/util/HashMap` lookup put the bucket array — is an `int`.
+        fn define_real_properties(ctx: &MockCtx) {
+            ctx.define_class(HASHTABLE_CID, "java/util/Hashtable");
+            ctx.define_field(HASHTABLE_CID, "table", 0);
+            ctx.define_field(HASHTABLE_CID, "count", 1);
+            ctx.define_field(HASHTABLE_CID, "threshold", 2);
+            ctx.define_field(HASHTABLE_CID, "loadFactor", 3);
+            ctx.define_class(PROPERTIES_CID, "java/util/Properties");
+            ctx.define_superclass(PROPERTIES_CID, HASHTABLE_CID);
+            ctx.define_field(PROPERTIES_CID, "defaults", 8);
+        }
+
+        /// A real `HashMap` receiver keeps today's behaviour exactly: the
+        /// bucket array at slot 0 AND at the real `table` slot, and no legacy
+        /// `Int(capacity)` — writing one there is what put an `Int` in the
+        /// `table` field (`arraylength` on an int) and produced the
+        /// `HashMap` slot-2 census row.
+        #[test]
+        fn publish_map_table_mirrors_into_the_real_table_slot() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let buckets = ctx.new_ref_array(ClassId::new(0), 16);
+
+            publish_map_table(&mut ctx, map, buckets, 16);
+
+            assert!(
+                matches!(ctx.get_field(map, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "slot 0 is what every native map op reads"
+            );
+            assert!(
+                matches!(ctx.get_field(map, 2), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "the real `table` slot must hold the array, never an Int"
+            );
+        }
+
+        /// The receiver the whole lane is about. `Properties` is excluded from
+        /// `CF_HASHTABLE_LAYOUT`, so it reaches the legacy branch; its own
+        /// `table` is slot 0, and slot 2 is `threshold`, an `int` that must
+        /// survive untouched.
+        #[test]
+        fn publish_map_table_leaves_a_properties_int_field_alone() {
+            let mut ctx = MockCtx::new(1);
+            // A real VM has `java/util/HashMap` loaded too — that is the whole
+            // point: the old lookup found ITS `table` (index 2) and wrote it
+            // into a `Properties`. Without this the fixture cannot express the
+            // defect and the test passes vacuously.
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.set_field(props, 2, Value::Int(12)); // threshold
+            let buckets = ctx.new_ref_array(ClassId::new(0), 16);
+
+            publish_map_table(&mut ctx, props, buckets, 16);
+
+            assert!(
+                matches!(ctx.get_field(props, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "`Hashtable.table` IS slot 0, so one write covers both roles"
+            );
+            assert_eq!(
+                ctx.get_field(props, 2),
+                Value::Int(12),
+                "slot 2 is `Hashtable.threshold` on this receiver — the bucket \
+                 array must not land there (the surviving census row)"
+            );
+        }
+
+        /// A fabricated receiver — nothing declares a field called `table` —
+        /// keeps the legacy `(buckets, size, capacity)` model, including the
+        /// `Int` at slot 2. The predicate is the field NAME, never the slot
+        /// count: this stub has MORE slots than the real `HashMap` above.
+        #[test]
+        fn publish_map_table_keeps_the_capacity_int_on_the_fabricated_layout() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+            let backing = ctx.alloc_object_of(STUB_CID, 16);
+            let buckets = ctx.new_ref_array(ClassId::new(0), 32);
+
+            publish_map_table(&mut ctx, backing, buckets, 32);
+
+            assert!(
+                matches!(ctx.get_field(backing, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "slot 0 always holds the array"
+            );
+            assert_eq!(
+                ctx.get_field(backing, MAP_FIELD_CAPACITY),
+                Value::Int(32),
+                "slot 2 means `capacity` on our own layout"
+            );
+        }
+
+        /// `native_props_init`'s `Object(None)` used to land on `loadFactor`,
+        /// and the overlay hunter cannot see it (`Object(None)` over a
+        /// primitive is not reported). Resolve `defaults` on the receiver.
+        #[test]
+        fn props_defaults_resolves_the_real_field_and_spares_load_factor() {
+            let mut ctx = MockCtx::new(1);
+            define_real_properties(&ctx);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.set_field(props, 3, Value::Float(0.75)); // loadFactor
+            let parent = ctx.alloc_object_of(PROPERTIES_CID, 10);
+
+            props_set_defaults(&mut ctx, props, Value::Object(Some(parent)));
+
+            assert_eq!(
+                ctx.get_field(props, 3),
+                Value::Float(0.75),
+                "slot 3 is `loadFactor` on a real Properties"
+            );
+            assert!(
+                matches!(ctx.get_field(props, 8), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "the reference belongs in the real `defaults` field"
+            );
+            assert!(
+                matches!(props_get_defaults(&ctx, props), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "and the getProperty fallback walk must read it back — reading \
+                 raw slot 3 got a Float and stopped the chain dead"
+            );
+        }
+
+        /// A fabricated `Properties` stub has no `defaults` field to resolve,
+        /// so the four-field model's slot 3 stays in force.
+        #[test]
+        fn props_defaults_falls_back_to_the_model_slot_on_a_stub() {
+            let mut ctx = MockCtx::new(1);
+            ctx.define_class(STUB_CID, "java/util/Properties");
+            let props = ctx.alloc_object_of(STUB_CID, 4);
+            let parent = ctx.alloc_object_of(STUB_CID, 4);
+
+            props_set_defaults(&mut ctx, props, Value::Object(Some(parent)));
+
+            assert!(
+                matches!(ctx.get_field(props, PROPS_FIELD_DEFAULTS), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "synthetic layout keeps slot 3"
+            );
+            assert!(
+                matches!(props_get_defaults(&ctx, props), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "and reads back from the same slot"
+            );
+        }
+
+        /// `map_state`'s bucket fallback used to probe `HashMap`'s `table`
+        /// index on any receiver. On a `Properties` that index is an `int`
+        /// field; the receiver's own `table` is slot 0.
+        #[test]
+        fn receiver_table_slot_answers_per_receiver_not_per_hashmap() {
+            let ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+            let stub = ctx.alloc_object_of(STUB_CID, 16);
+
+            assert_eq!(receiver_table_slot(&ctx, map), Some(2));
+            assert_eq!(receiver_table_slot(&ctx, props), Some(0));
+            assert_eq!(
+                receiver_table_slot(&ctx, stub),
+                None,
+                "no `table` field means our own layout — asked by NAME, and \
+                 note this stub is WIDER than the real HashMap, so a field \
+                 count could not have told them apart"
+            );
+        }
+
+        /// The bound matters: a real class can declare `table` at an index the
+        /// receiver was allocated too small for (a backing map sized to
+        /// `MAP_NUM_FIELDS`), and a write there would be dropped or land out
+        /// of range.
+        #[test]
+        fn receiver_table_slot_is_bounded_by_the_allocated_slots() {
+            let ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            let undersized = ctx.alloc_object_of(HASHMAP_CID, 2);
+            assert_eq!(receiver_table_slot(&ctx, undersized), None);
         }
     }
 

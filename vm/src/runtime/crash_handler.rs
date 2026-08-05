@@ -107,7 +107,7 @@ pub fn savebase_watch_caught() -> bool {
 //   * **JDK mode.** CratonVM ships two complete, materially different Java
 //     class libraries (~5,200 Rust stubs vs ~300 natives over real JDK
 //     bytecode). They have different semantics and different bugs. Until
-//     `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` the mode was
+//     `arch-2026-07-26/jdk-mode-determinism.md` the mode was
 //     host-detected and printed nowhere; the launcher now prints it, but the
 //     hardware-fault path below does NOT go through the launcher's panic hook,
 //     so without this snapshot a SIGSEGV/access-violation report still carries
@@ -117,7 +117,7 @@ pub fn savebase_watch_caught() -> bool {
 //     prove a complete rewritable root map. A heap-corruption report that does
 //     not say whether the last cycles compacted is nearly undiagnosable, and
 //     the degrade was invisible for a long time (see
-//     `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+//     `arch-2026-07-26/moving-young-precise-roots.md`).
 //   * **JIT state.** Whether the faulting thread was inside compiled code,
 //     and whether an unregistered JIT frame was on the stack, separates a
 //     codegen bug from an interpreter/GC bug on the first read.
@@ -336,7 +336,7 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
 /// thread crashing in the middle of a hot bytecode loop it is the last known
 /// good position. The report says so rather than implying it is live.
 ///
-/// CR-VXC-1 (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §5.1): the
+/// CR-VXC-1 (`arch-2026-07-26/vm-exec-closeout.md` §5.1): the
 /// body below reads one process-wide `OnceLock` published from `Vm::new`, so a
 /// fault on a spawned worker or on a virtual-thread carrier used to render the
 /// *primordial* thread's frames — never the faulting thread's. The two crash
@@ -2101,7 +2101,7 @@ fn install_signal_handlers() {
             let n = hex_into_buf(&mut rbuf, cratonvm_jit::code_frees_total() as u64);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
-            if let Some((base, len, active)) =
+            if let Some((base, len, active, flags)) =
                 cratonvm_jit::recent_code_free_covering(fault_pc as usize)
             {
                 async_signal_safe::write_all(
@@ -2120,6 +2120,30 @@ fn install_signal_handlers() {
                 let n = hex_into_buf(&mut rbuf, active as u64);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                // The count above is NOT self-interpreting, and reading it as
+                // if it were has already cost one investigation a session: it
+                // is sampled at the `munmap`, not at the instant the release
+                // was decided, and it is recorded for every executable buffer
+                // including compile attempts that nothing ever pointed into.
+                // These three arms are what make it readable.
+                let published = flags & cratonvm_jit::CODE_FREE_PUBLISHED != 0;
+                let authorised = flags & cratonvm_jit::CODE_FREE_AUTHORISED != 0;
+                if !published {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    NEVER PUBLISHED: a discarded compile attempt. No cache entry, baked call or trampoline could name it, so the count above is not evidence of anything.\n",
+                    );
+                } else if authorised {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    published, released BY THE RETIREMENT QUEUE with a quiescence proof. A non-zero count above only means some OTHER thread entered compiled code between the proof and the unmap.\n",
+                    );
+                } else {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    *** published body released OUTSIDE the retirement queue. This IS a use-after-free of executable memory. Re-run with CRATONVM_DBG_JIT_CODE_FREE=1 to name the release site. ***\n",
+                    );
+                }
             } else {
                 async_signal_safe::write_all(
                     async_signal_safe::STDERR_FD,

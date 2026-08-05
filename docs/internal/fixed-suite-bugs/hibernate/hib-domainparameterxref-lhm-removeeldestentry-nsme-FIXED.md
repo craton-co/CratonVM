@@ -5,7 +5,7 @@
 | **Status** | ✅ FIXED 2026-07-08 — `native_lhm_put` now treats a slot-0/`java.lang.Object` class-id read from a receiver that already reached the `LinkedHashMap` native as untrusted and skips the impossible virtual `Object.removeEldestEntry` call. |
 | **Area** | VM — JIT/GC precise-root-tracking ("Layer 1"), surfacing here via the native `LinkedHashMap` shim's `removeEldestEntry` guard (`../../../../native-collections/src/lib.rs`) |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z` |
-| **Severity** | formerly blocked `org.hibernate.orm.test.jpa.criteria.InPredicateTest`; fixed Azure probe now passes under default JIT (`ok=1`, 55.971s). |
+| **Severity** | formerly blocked `org.hibernate.orm.test.jpa.criteria.InPredicateTest`; fixed Azure probe now passes under default JIT (`ok=1`, 55.971s). This NSME fix is unaffected and still verified not to reproduce, but note `InPredicateTest` itself is not fully green — the *separate* dispatch-heavy JIT timeout this doc's own text discusses below reopened 2026-08-04, see the status note in the paragraph after this table. |
 | **Discovered** | 2026-07-06. Root cause traced same day. |
 
 ## 2026-07-08 fix — slot-0/Object reads no longer dispatch `Object.removeEldestEntry`
@@ -51,9 +51,17 @@ NoSuchMethodError lines: none
 Superseded by the 2026-07-08 fix above; retained for historical context.
 
 
-`InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — it now times
-out earlier in the same test method instead (`TimeoutException` @ 120s), see
-[hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md).
+`InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — for a while
+it timed out earlier in the same test method instead (`TimeoutException` @ 120s),
+see
+[hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md](../../hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md).
+**That timeout was fixed 2026-08-04** — a JIT callee-admission gate was reading
+an inherited method's bytecode against the subclass's constant pool — and the
+class now passes end to end under default JIT (`ok=1 failed=0`, 65-88 s, 2/2).
+So the masking described below no longer applies: the run does reach
+`session.createQuery(cr)` and `DomainParameterXref`'s constructor, and completes
+without this NSME. That is direct evidence for this doc's fix, not the
+"unreached, therefore unknown" state the next paragraph describes.
 Stack-dump sampling of a clean, uncontended repro shows the test consistently
 timing out inside `SqmCriteriaNodeBuilder.in()` (criteria-predicate
 construction), which runs **before** `session.createQuery(cr)` — the call that
@@ -67,6 +75,10 @@ than "fixed." **Do not retire this doc to `internal/` on the basis of
 question that would need a repro that actually reaches `DomainParameterXref`
 (e.g. a synthetic direct repro, or re-checking once the dispatch-heavy JIT
 slowdown blocking `.in()` is addressed).
+
+*(2026-08-04: that re-check has now happened — see the paragraph above. The
+`.in()` slowdown is fixed, the test reaches `DomainParameterXref` and passes, so
+the "unreached, therefore unknown" caveat in this paragraph is discharged.)*
 
 ## Symptom
 

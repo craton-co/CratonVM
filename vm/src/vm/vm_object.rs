@@ -1025,16 +1025,27 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // `set_field_as` with the DECLARED descriptor, so the stored tag depends on
     // that coercion — it is not obviously a stable Int.
     //
-    // Evidence that would settle it (do not guess):
+    // Evidence that would settle it (do not guess) — RUN 2026-08-04, results
+    // inline. The verdict stays `unknown` but is **no longer ranked HIGH**: the
+    // two checks that would have shown live harm both came back clean.
     //   1. Under `--real-jdk`, run a program that reaches
     //      `Class.getConstructor(...)` / `Class.getDeclaredConstructor(...)`
     //      twice on the same class (so the second call takes the
     //      `cachedConstructor != null` fast path) and check whether the
     //      `getfield cachedConstructor` succeeds, returns null, or raises.
-    //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the
-    //      overlay-corruption hunter in `vm_exec.rs` (`overlay_write_is_destructive`)
-    //      exists precisely to report a primitive written to a reference slot,
-    //      and this write should appear in its output if the hazard is live.
+    //      **CLEAN.** Three rounds of `getDeclaredConstructor()` on a nested
+    //      class, interleaved with `String.class.getConstructor(String.class)`,
+    //      all returned the right `Constructor` against a real JDK 21 image.
+    //      Nothing raised, and no `expected object reference, got int(N)`.
+    //   2. Run the same with `CRATONVM_DBG_OVERLAY` enabled — the overlay
+    //      hunter in `vm_exec.rs` (`overlay_access_is_cross_type`) exists
+    //      precisely to report a primitive written to a reference slot, and
+    //      this write should appear in its output if the hazard is live.
+    //      **CLEAN.** The hunter reported nothing on that run. Note the hunter
+    //      was widened on 2026-08-05 (L4): it now also instruments READS and
+    //      fires on any slot where CratonVM's fabricated model and the loaded
+    //      image disagree, so this check is worth re-running — the 2026-08-04
+    //      silence was over a strictly narrower detector.
     //   3. Confirm which readers still depend on slot 0: the reverse map
     //      (`class_mirrors_reverse` / `class_id_from_mirror`) is the primary
     //      path, and `mirror_class_id` in `native-builtins/src/lang_class.rs`
@@ -1042,6 +1053,16 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      misses. If the census shows zero fallback hits under a real JDK, the
     //      correct wave-2 fix is to DELETE the slot-0 write (and the slot-1
     //      name read in `mirror_class_name`) rather than relocate it.
+    //      **INSTRUMENTED, not yet answered.** `mirror_class_id` now reports
+    //      its first fallback hit under the same `CRATONVM_DBG_OVERLAY` flag,
+    //      so this is one broad real-JDK run away from decidable. Do not delete
+    //      the overlay on the strength of a small probe: silence over a
+    //      ten-class workload is not silence over Spring Boot.
+    //
+    // What 1 and 2 do and do not establish: they rule out the overlay being
+    // *destructive* on a real image, which was the ranked-HIGH worry. They say
+    // nothing about whether it is still *needed* — that is check 3, and it is
+    // the question whose answer removes code rather than reassuring about it.
     shared
         .mem
         .heap
@@ -1215,6 +1236,14 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // mirror additionally has no legitimate `cachedConstructor` reader, so if
     // the evidence says the overlay is destructive, this site can move to the
     // `primitive_mirrors` side table with no JDK-visible consequence.
+    //
+    // 2026-08-04: the evidence gathered for the sibling site (see its checks 1
+    // and 2, both clean) says the overlay is NOT destructive on a real image,
+    // so the "move it to the side table" branch above is not forced. This site
+    // is nonetheless the easier of the two to retire if check 3 ever comes back
+    // zero, precisely because a primitive mirror has no legitimate reader:
+    // `Int(-1)` is a sentinel nothing but this VM asks for, so relocating it
+    // needs no census of its own — only the sibling's.
     shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.
@@ -1283,8 +1312,14 @@ fn statics_index_counters_on() -> bool {
 }
 
 /// Is the lock-free statics read path switched off? (`CRATONVM_NO_STATICS_INDEX=1`)
+///
+/// `pub` (re-exported as `crate::vm::statics_index_disabled`, like the
+/// hit/miss counters beside it) because the JIT's compile-time static-slot
+/// resolver honours the same switch: with the index off, compiled code must not
+/// bake a direct load either, or the switch would silently stop being an A/B of
+/// the lock-free path once methods tier up.
 #[inline]
-fn statics_index_disabled() -> bool {
+pub fn statics_index_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STATICS_INDEX").is_some()
@@ -1336,15 +1371,33 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
         // Reading class_manager while holding statics write is fine because
         // class_manager read is non-exclusive, and no code path holds
         // class_manager write while trying to acquire statics.
-        let num_fields = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.fields.len())
-            .unwrap_or(0);
+        //
+        // Type each slot from its static field's DESCRIPTOR. `StaticsBlock::new`
+        // fills with `Value::Int(0)`, and a `J`/`D` static left at `Int(0)` is
+        // read correctly by the interpreter (which widens) but as garbage by
+        // JIT-compiled code, which takes the load width from the descriptor and
+        // reads 8 bytes over a 4-byte payload. That is the loader/zip cluster's
+        // defect arriving through a second door: `prepare_class` seeds typed
+        // defaults, but this path runs when a static is written BEFORE its class
+        // is prepared, and it used to undo that.
+        let (static_descriptors, num_fields) = {
+            let cm = shared.classes.class_manager.read();
+            match cm.get_class(class_id) {
+                Some(c) => (
+                    c.fields
+                        .iter()
+                        .filter(|f| f.is_static())
+                        .map(|f| f.descriptor.to_string())
+                        .collect::<Vec<_>>(),
+                    c.fields.len(),
+                ),
+                None => (Vec::new(), 0),
+            }
+        };
         republish = true;
-        crate::vm::realms::class_realm::StaticsBlock::new(num_fields)
+        crate::vm::realms::class_realm::StaticsBlock::from_values(
+            super::vm_util::typed_default_static_slots(&static_descriptors, num_fields),
+        )
     });
     if field_index >= fields.len() {
         // Growth relocates the block (the old one stays mapped for any
@@ -1672,8 +1725,13 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
     let mut missing = Vec::new();
 
     let cm = shared.classes.class_manager.read();
-    // Iterate over all loaded classes in the ClassStore
-    for class_id_u32 in 0..cm.class_store.len() as u32 {
+    // Iterate over all loaded classes in the ClassStore.
+    //
+    // `slot_count()`, not `len()`: `len()` is the LIVE class count, so after
+    // any class unload the tombstone makes it smaller than the id upper bound
+    // and this census silently stopped short of the highest-id classes — the
+    // most recently loaded ones. `get` already skips tombstones below.
+    for class_id_u32 in 0..cm.class_store.slot_count() as u32 {
         let class_id = ClassId::new(class_id_u32);
         let class = match cm.class_store.get(class_id) {
             Some(c) => c,

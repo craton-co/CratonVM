@@ -16,7 +16,7 @@ being misread as an unguarded foreign frame) and all three are fixed. The same
 lane now runs 25 real Cheney cycles with zero fallbacks and the HotSpot
 checksum, at parity on wall time with both opt-out configurations. Full account
 and evidence:
-`docs/internal/default-moving-young-enabled-20260730.md`.
+`default-moving-young-enabled-20260730.md`.
 
 The one obligation still open by design is the **cross-thread coverage
 handshake**: a cycle is treated as unproven whenever a peer thread is in
@@ -83,7 +83,7 @@ Acceptance on the uniquely named release binary:
   accounting markers and zero failures/aborts/container failures.
 
 Detailed evidence and baseline exclusions are recorded in
-`docs/internal/default-moving-young-enabled-20260730.md`.
+`default-moving-young-enabled-20260730.md`.
 
 The 2026-07-01 "FINISHED" validation table later in this document remains
 historical and incomplete: it declared the feature correct without reporting

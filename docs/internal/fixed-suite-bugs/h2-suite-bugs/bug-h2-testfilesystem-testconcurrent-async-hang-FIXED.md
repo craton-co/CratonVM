@@ -2,7 +2,7 @@
 > names are fixed. What is left is a single performance wall —
 > `testConcurrent` on `nioMemLZF:1:`, >18 minutes against HotSpot's 862ms —
 > carried forward with its one concrete lead as "Residual 4" in
-> [`docs/known-issues/h2/h2-jitban-residuals-20260726.md`](../../../known-issues/h2/h2-jitban-residuals-20260726.md).
+> [`docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`](../../../known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md).
 > Note the filename is a misnomer: `async:` is the LEAST affected of the
 > sixteen filesystems this class exercises. Do not cite this doc as current
 > behaviour.

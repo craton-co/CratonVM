@@ -16,8 +16,8 @@
 //! delegate to the same `crate::lang_*` / `crate::util_*` native functions
 //! the registry would have invoked.
 //!
-//! See `docs/feature_roadmap_interpreter_intrinsic_table.md` and
-//! `docs/internal/intrinsic_table_contract.md`.
+//! See `gaps/feature_roadmap_interpreter_intrinsic_table.md` and
+//! `intrinsic_table_contract.md`.
 
 pub mod integer;
 pub mod long;
@@ -90,6 +90,10 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
         ("java/lang/Long", "longValue", "()J") => LongLongValue,
         ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => LongParseLong,
 
+        // java/lang/Thread — static, empty body, pure CPU hint
+        ("java/lang/Thread", "onSpinWait", "()V") => ThreadOnSpinWait,
+        ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => ThreadCurrentThread,
+
         // java/lang/Math — static, pure arithmetic
         ("java/lang/Math", "abs", "(I)I") => MathAbsInt,
         ("java/lang/Math", "abs", "(J)J") => MathAbsLong,
@@ -157,6 +161,8 @@ pub fn is_static(kind: InterpIntrinsic) -> bool {
     matches!(
         kind,
         SystemArraycopy
+            | ThreadOnSpinWait
+            | ThreadCurrentThread
             | IntegerValueOf
             | IntegerParseInt
             | LongValueOf
@@ -192,6 +198,23 @@ pub fn dispatch(
         StringIsEmpty => string::intrinsic_string_is_empty(ctx, args),
         // System
         SystemArraycopy => system::intrinsic_system_arraycopy(ctx, args),
+        // Thread
+        ThreadOnSpinWait => {
+            // Same body as the registry native: a CPU pause hint, nothing
+            // observable. The interpreter's invokestatic fast path answers
+            // this without reaching here at all; this arm covers any caller
+            // that still routes through the generic dispatch.
+            std::hint::spin_loop();
+            Ok(None)
+        }
+        ThreadCurrentThread => {
+            // Same answer as the registry native. The interpreter's
+            // invokestatic fast path serves this without reaching here once
+            // the thread's mirror exists; this arm covers the first call (which
+            // must run `current_thread_object`'s allocating slow path) and any
+            // caller still on the generic route.
+            Ok(Some(Value::Object(Some(ctx.current_thread_object()))))
+        }
         // StringBuilder
         StringBuilderAppendString => stringbuilder::intrinsic_sb_append_string(ctx, args),
         StringBuilderAppendInt => stringbuilder::intrinsic_sb_append_int(ctx, args),
@@ -251,6 +274,8 @@ pub fn callback_for(kind: InterpIntrinsic) -> cratonvm_native_api::NativeCallbac
         StringCharAt => tramp!(StringCharAt),
         StringIsEmpty => tramp!(StringIsEmpty),
         SystemArraycopy => tramp!(SystemArraycopy),
+        ThreadOnSpinWait => tramp!(ThreadOnSpinWait),
+        ThreadCurrentThread => tramp!(ThreadCurrentThread),
         StringBuilderAppendString => tramp!(StringBuilderAppendString),
         StringBuilderAppendInt => tramp!(StringBuilderAppendInt),
         StringBuilderAppendChar => tramp!(StringBuilderAppendChar),

@@ -28,7 +28,7 @@
 //!     IOException.
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -849,160 +849,132 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 
 // JDK-ONLY-CLASSIFY: bridge — `sun.nio.ch.FileDispatcherImpl` / `IOUtil` /
 // `NativeThread` are the file-descriptor syscall layer: `read0`, `write0`,
-// `pread0`, `size0`, `truncate0`, `force0`, `close0` are ACC_NATIVE in JDK 25
-// and take raw memory pointers, which is why the call site warns that leaving
-// them unregistered segfaults. Only 5 triples resolved statically here because
-// the class name is a loop/`let` variable at most sites, so the count is a
-// floor, not a total. This function deliberately registers the same natives
-// under all three platform class names, so expect `overwrote` noise in the
-// census; that is intentional robustness, not a duplicate-registration defect.
+// `pread0`, `size0`, `truncate0` and friends are ACC_NATIVE in JDK 25 and take
+// raw memory pointers, which is why the call site warns that leaving them
+// unregistered segfaults. The earlier version of this marker said only 5
+// triples resolved statically "because the class name is a loop variable at
+// most sites"; the schema-3 census resolves every row, and says 22 of this
+// function's 75 registrations are ACC_NATIVE on a JDK 25 Unix image. Those 22
+// state their kind at their own call sites (L5, 2026-08-05); the block below is
+// split so that statement is true per row rather than per function.
+//
+// The other 53 keep the ambient category. Registering the same natives under
+// all three platform class names is deliberate robustness, but only one of the
+// three is ever the ACC_NATIVE declarer on a given image, so the other two are
+// not adjudicated by a census taken on this one. Per-row table and the
+// descriptor mismatches it turned up:
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
 /// Register `sun/nio/ch/*` natives for real-JDK boot. Idempotent: the
 /// registry's `register` replaces a previous entry at the same key,
 /// so it's safe to call after other NIO-related registrars.
 pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
+    use cratonvm_native_api::NativeKind;
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.set_category(NativeKind::Bridge);
     // --- FileDispatcherImpl (Unix class name; Windows uses
     // WindowsFileDispatcherImpl but the static natives are on the
     // parent class or in a companion). Register on all three names
     // for robustness — the registry lookup uses (class, name, desc). ---
-    for cls in [
-        "sun/nio/ch/FileDispatcherImpl",
-        "sun/nio/ch/WindowsFileDispatcherImpl",
-        "sun/nio/ch/UnixFileDispatcherImpl",
-    ] {
-        r.register(
-            cls,
-            "read0",
-            "(Ljava/io/FileDescriptor;JI)I",
-            native_fd_read0,
-        );
-        r.register(
-            cls,
-            "pread0",
-            "(Ljava/io/FileDescriptor;JIJ)I",
-            native_fd_pread0,
-        );
-        r.register(
-            cls,
-            "readv0",
-            "(Ljava/io/FileDescriptor;JI)J",
-            native_fd_readv0,
-        );
-        r.register(
-            cls,
-            "write0",
-            "(Ljava/io/FileDescriptor;JIZ)I",
-            native_fd_write0,
-        );
-        r.register(
-            cls,
-            "write0",
-            "(Ljava/io/FileDescriptor;JI)I",
-            native_fd_write0,
-        );
-        r.register(
-            cls,
-            "pwrite0",
-            "(Ljava/io/FileDescriptor;JIJ)I",
-            native_fd_pwrite0,
-        );
-        r.register(
-            cls,
-            "writev0",
-            "(Ljava/io/FileDescriptor;JIZ)J",
-            native_fd_writev0,
-        );
-        r.register(
-            cls,
-            "writev0",
-            "(Ljava/io/FileDescriptor;JI)J",
-            native_fd_writev0,
-        );
-        r.register(cls, "size0", "(Ljava/io/FileDescriptor;)J", native_fd_size0);
-        r.register(
-            cls,
-            "seek0",
-            "(Ljava/io/FileDescriptor;J)J",
-            native_fd_seek0,
-        );
+    // Which of the three names actually declares these natives is decided by
+    // the image, not by this file, and the census (JDK 25, Linux, 2026-08-05)
+    // says: `UnixFileDispatcherImpl` declares 14 of them ACC_NATIVE;
+    // `FileDispatcherImpl` (`extends UnixFileDispatcherImpl` on this image)
+    // declares only `init0` itself and inherits the rest;
+    // `WindowsFileDispatcherImpl` is absent from a Unix image altogether. So
+    // the 14 are stated `Bridge` on the class that declares them, and the same
+    // 14 are still registered under the other two names — those rows are
+    // robustness aliases, not adjudicated bridges, and stay ambient.
+    const FD_ACC_NATIVE: &[(&str, &str, NativeCallback)] = &[
+        ("read0", "(Ljava/io/FileDescriptor;JI)I", native_fd_read0),
+        ("pread0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pread0),
+        ("readv0", "(Ljava/io/FileDescriptor;JI)J", native_fd_readv0),
+        ("write0", "(Ljava/io/FileDescriptor;JI)I", native_fd_write0),
+        ("pwrite0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pwrite0),
+        ("writev0", "(Ljava/io/FileDescriptor;JI)J", native_fd_writev0),
+        ("size0", "(Ljava/io/FileDescriptor;)J", native_fd_size0),
+        ("seek0", "(Ljava/io/FileDescriptor;J)J", native_fd_seek0),
         // `force0` is registered by `file_channel.rs::register_file_channel_real`
         // (real fsync via `std::fs::File::sync_all` / `sync_data`).
-        r.register(
-            cls,
-            "truncate0",
-            "(Ljava/io/FileDescriptor;J)I",
-            native_fd_truncate0,
-        );
-        r.register(
-            cls,
-            "available0",
-            "(Ljava/io/FileDescriptor;)I",
-            native_fd_available0,
-        );
-        r.register(
-            cls,
-            "isOther0",
-            "(Ljava/io/FileDescriptor;)Z",
-            native_fd_isother0,
-        );
-        r.register(
-            cls,
-            "close0",
-            "(Ljava/io/FileDescriptor;)V",
-            native_fd_close0,
-        );
-        r.register(
-            cls,
-            "preClose0",
-            "(Ljava/io/FileDescriptor;)V",
-            native_fd_preclose0,
-        );
-        r.register(
-            cls,
-            "lock0",
-            "(Ljava/io/FileDescriptor;ZJJZ)I",
-            native_fd_lock0,
-        );
-        r.register(
-            cls,
-            "release0",
-            "(Ljava/io/FileDescriptor;JJ)V",
-            native_fd_release0,
-        );
-        r.register(cls, "duplicateHandle", "(J)J", native_fd_duplicate_handle);
-        r.register(
-            cls,
-            "setDirect0",
-            "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
-            native_fd_setdirect0,
-        );
-        // Real JDK 25 declares `FileDispatcherImpl.init0()` (confirmed via
-        // javap), not `init()` -- that name doesn't exist on this class at
-        // all. The `init()` entry below was a name mismatch that left
-        // `init0` unregistered, so any bytecode path that loads
-        // `FileDispatcherImpl` (e.g. `ManagementFactory.getPlatformMBeanServer()`
-        // on Linux) hit `UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.init0()V`.
-        r.register(cls, "init0", "()V", native_nt_init);
-        // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0
-        // are registered by `file_channel.rs::register_file_channel_real`
-        // (real memmap2 / sendfile / fsync implementations). They were
-        // previously stubbed here and the duplicate registration was
-        // fragile — order-of-registration decided which won. Only
-        // `allocationGranularity0` (a pure constant) is owned here.
-        r.register(
-            cls,
+        ("truncate0", "(Ljava/io/FileDescriptor;J)I", native_fd_truncate0),
+        ("available0", "(Ljava/io/FileDescriptor;)I", native_fd_available0),
+        ("isOther0", "(Ljava/io/FileDescriptor;)Z", native_fd_isother0),
+        ("lock0", "(Ljava/io/FileDescriptor;ZJJZ)I", native_fd_lock0),
+        ("release0", "(Ljava/io/FileDescriptor;JJ)V", native_fd_release0),
+        // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0 are
+        // registered by `file_channel.rs::register_file_channel_real` (real
+        // memmap2 / sendfile / fsync implementations). They were previously
+        // stubbed here and the duplicate registration was fragile — order of
+        // registration decided which won. Only `allocationGranularity0` (a
+        // pure constant) is owned here.
+        (
             "allocationGranularity0",
             "()J",
             native_fc_allocation_granularity0,
-        );
+        ),
+    ];
+    // Registered for the same robustness reason, but resolving to no
+    // ACC_NATIVE method on ANY of the three names on this image: the two
+    // boolean-suffixed descriptors are older JDK spellings, `close0` and
+    // `preClose0` are declared on `sun.nio.ch.UnixDispatcher` (net.rs registers
+    // those and states them there), `duplicateHandle` is Windows-only, and
+    // JDK 25's `setDirect0` takes `(Ljava/io/FileDescriptor;)I` — this
+    // `CharBuffer` descriptor matches nothing. Left ambient on purpose.
+    const FD_UNADJUDICATED: &[(&str, &str, NativeCallback)] = &[
+        ("write0", "(Ljava/io/FileDescriptor;JIZ)I", native_fd_write0),
+        ("writev0", "(Ljava/io/FileDescriptor;JIZ)J", native_fd_writev0),
+        ("close0", "(Ljava/io/FileDescriptor;)V", native_fd_close0),
+        ("preClose0", "(Ljava/io/FileDescriptor;)V", native_fd_preclose0),
+        ("duplicateHandle", "(J)J", native_fd_duplicate_handle),
+        (
+            "setDirect0",
+            "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
+            native_fd_setdirect0,
+        ),
+    ];
+    const FD_DECLARER: &str = "sun/nio/ch/UnixFileDispatcherImpl";
+    const FD_ALIASES: [&str; 2] = [
+        "sun/nio/ch/FileDispatcherImpl",
+        "sun/nio/ch/WindowsFileDispatcherImpl",
+    ];
+
+    for (name, desc, cb) in FD_ACC_NATIVE {
+        r.register_with_kind(FD_DECLARER, name, desc, *cb, NativeKind::Bridge);
+    }
+    for cls in FD_ALIASES {
+        for (name, desc, cb) in FD_ACC_NATIVE {
+            r.register(cls, name, desc, *cb);
+        }
+    }
+    for cls in [FD_DECLARER, FD_ALIASES[0], FD_ALIASES[1]] {
+        for (name, desc, cb) in FD_UNADJUDICATED {
+            r.register(cls, name, desc, *cb);
+        }
+    }
+    // Real JDK 25 declares `FileDispatcherImpl.init0()` (confirmed via javap),
+    // not `init()` -- that name doesn't exist on this class at all. The
+    // `init()` entry this replaced was a name mismatch that left `init0`
+    // unregistered, so any bytecode path that loads `FileDispatcherImpl` (e.g.
+    // `ManagementFactory.getPlatformMBeanServer()` on Linux) hit
+    // `UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.init0()V`. This is
+    // the one native the leaf class declares itself; the other two names
+    // inherit or lack it, so only the leaf states its kind.
+    r.register_with_kind(
+        "sun/nio/ch/FileDispatcherImpl",
+        "init0",
+        "()V",
+        native_nt_init,
+        NativeKind::Bridge,
+    );
+    for cls in [FD_DECLARER, FD_ALIASES[1]] {
+        r.register(cls, "init0", "()V", native_nt_init);
     }
 
-    r.register(
+    r.register_with_kind(
         "java/io/FileCleanable",
         "cleanupClose0",
         "(IJ)V",
         native_file_cleanable_cleanup_close0,
+        NativeKind::Bridge,
     );
 
     // --- FileChannelImpl (legacy names for older JDKs that carried the
@@ -1035,16 +1007,16 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // --- NativeThread ---
     let nt = "sun/nio/ch/NativeThread";
     r.register(nt, "current", "()J", native_nt_current);
-    r.register(nt, "current0", "()J", native_nt_current);
+    r.register_with_kind(nt, "current0", "()J", native_nt_current, NativeKind::Bridge);
     r.register(nt, "signal", "(J)V", native_nt_signal);
-    r.register(nt, "init", "()V", native_nt_init);
+    r.register_with_kind(nt, "init", "()V", native_nt_init, NativeKind::Bridge);
 
     // --- IOUtil ---
     let iou = "sun/nio/ch/IOUtil";
-    r.register(iou, "iovMax", "()I", native_iou_iov_max);
-    r.register(iou, "writevMax", "()J", native_iou_write_max_size);
-    r.register(iou, "fdLimit", "()I", native_iou_fd_limit);
-    r.register(iou, "initIDs", "()V", native_iou_init_ids);
+    r.register_with_kind(iou, "iovMax", "()I", native_iou_iov_max, NativeKind::Bridge);
+    r.register_with_kind(iou, "writevMax", "()J", native_iou_write_max_size, NativeKind::Bridge);
+    r.register_with_kind(iou, "fdLimit", "()I", native_iou_fd_limit, NativeKind::Bridge);
+    r.register_with_kind(iou, "initIDs", "()V", native_iou_init_ids, NativeKind::Bridge);
     r.set_category(__prev_cat);
 }
 
@@ -1546,7 +1518,7 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     // DatagramChannel (SYNTHETIC, synthetic-jdk only).
     //
     // FLAGGED SyntheticStub: the `t16_dc_*` family fabricates datagram/connect
-    // state (per `S1` in docs/reviews/fable-2026-06-10/native-io.md). Per the
+    // state (per `S1` in reviews/fable-2026-06-10/native-io.md). Per the
     // no-synthetic-stubs policy these overrides are compiled in only under
     // `synthetic-jdk` and tagged `NativeKind::SyntheticStub`. In the default
     // build they are absent, so the real JDK `DatagramChannel`/`sun.nio.ch`

@@ -3,6 +3,18 @@
 **Status:** OPEN (2026-07-23; re-diagnosed 2026-07-28). Not closable by
 incremental tuning — see "What closure actually requires".
 
+**2026-08-04 note:** this same test method produced a one-shot fatal
+stale-receiver crash in a single run, unrelated to the throughput gap this doc
+tracks. That page is now retired — see
+[`../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md):
+its DoHead Layer-1 attribution is refuted by its own log, the blocked-thread
+root path it actually names is now checked in the cycle that would break it,
+and the generic stale-address family it belongs to lives on
+[`../h2/bug-h2-classid0-stale-address-family.md`](../h2/bug-h2-classid0-stale-address-family.md).
+Do not conflate the two when triaging future `SmokeTests` failures: THIS doc is
+the throughput failure (120 s timeout under load), and it is what all 30 of that
+page's re-runs actually hit, on dev tip and on the crashing build alike.
+
 `org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency` runs 50 forks x
 400 iterations (20 000 transactions, 3 HQL queries each) on a 5-thread pool. It
 hits Hibernate's 120-second per-method limit while the other 16 tests in the
@@ -222,7 +234,7 @@ do not read it as a CHM cost. The allocation rows are clean.
   historical run worse, and its 2026-07-08 justification was a correctness
   guard, not a throughput one. HIB-TEMPORAL.1 was subsequently fixed and
   removed on 2026-07-29; see
-  `docs/internal/jit-bans/hib-temporal-1-retired-20260729.md`.
+  `jit-bans/hib-temporal-1-retired-20260729.md`.
 - `CRATONVM_JIT_VIRTUAL_TIERUP` — no longer a lever.
 
 ## Prior investigation

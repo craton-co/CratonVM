@@ -192,7 +192,7 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
 // 10_000 distinct `Properties` objects had EVER been registered in this
 // process's lifetime, every subsequent brand-new object silently lost all
 // `put`/`getProperty` calls forever (no exception, no eviction). See
-// docs/known-issues/h2/bug-h2-properties-sidetable-global-cap-silent-drop.md.
+// fixed-suite-bugs/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop-FIXED.md.
 // H2's `TestAnalyzeTableTx` (10_000 connections in a loop, each constructing
 // a JDBC-properties object) crosses that watermark and starts reading back
 // empty username/password, which H2 correctly reports as "Wrong user name or
@@ -2619,6 +2619,28 @@ fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectR
 /// `Properties.<init>` native skips populating that CHM, so the bytecode
 /// would yield an empty set even when `Properties.load` succeeded. Return
 /// the side-table keys directly so the fork sees the loaded properties.
+///
+/// Like `propertyNames()` — and unlike `keySet()` — this MUST also surface the
+/// `defaults` chain: the JDK's `stringPropertyNames` calls the same
+/// `enumerateStringProperties` walk that recurses into `defaults` first. This
+/// native did not, so `new Properties(base).stringPropertyNames()` returned
+/// only the child's own names while `propertyNames()` (which does walk, since
+/// 2026-07) returned all of them — two accessors of the same chain
+/// disagreeing. Measured against HotSpot 25 with `probes/MapLayoutMatrixProbe`
+/// on 2026-08-04: `[only-child, shared]` where the real JDK answers
+/// `[only-base, only-child, shared]`.
+///
+/// Two properties this must NOT break, both of which the probe pins:
+///
+/// * the Map view stays unchanged — `child.size()`, `child.get(k)` and
+///   `child.containsKey(k)` must still see only the child's own entries. That
+///   is why this collects names rather than copying entries;
+/// * only String-keyed AND String-valued entries qualify. That is exactly what
+///   `ordered_snapshot_kv` yields (the CHM-exclusive entries `keySet()` adds
+///   are the non-String-valued ones), so the chain walk deliberately uses it
+///   rather than `collect_own_property_names`, whose extra pass would let a
+///   `put("k", Integer)` in a defaults object surface as a string property
+///   name.
 fn native_properties_string_property_names(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2630,8 +2652,29 @@ fn native_properties_string_property_names(
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let mut this = this;
-    let set = build_key_set(ctx, &mut this);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    // Receiver first, so a shadowed name keeps the receiver's position; a
+    // depth cap guards a pathological self-referential `defaults` (the JDK
+    // chain is acyclic), mirroring `native_properties_property_names`.
+    let mut cur = Some(this);
+    let mut depth = 0;
+    while let Some(p) = cur {
+        if depth > 64 {
+            break;
+        }
+        let mut p_local = p;
+        for (k, _v) in ordered_snapshot_kv(ctx, &mut p_local) {
+            if seen.insert(k.clone()) {
+                names.push(k);
+            }
+        }
+        cur = props_defaults(ctx, p_local);
+        depth += 1;
+    }
+    // Same `LinkedHashSet` this returned before (see `build_key_set` for why
+    // that class and not `HashSet`).
+    let set = build_string_collection(ctx, "java/util/LinkedHashSet", names);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -3781,7 +3824,7 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
     // back to Quartz's own default, silently wiring up `RAMJobStore`
     // instead of `LocalDataSourceJobStore` even though the
     // `spring.quartz.job-store-type=jdbc` customizer ran successfully.
-    // See docs/known-issues/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied.md.
+    // See fixed-suite-bugs/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
     registry.register(
         "java/util/Properties",
         "putIfAbsent",

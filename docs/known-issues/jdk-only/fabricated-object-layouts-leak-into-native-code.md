@@ -11,6 +11,489 @@ silent wrong-field read or write, never an exception.**
 > names **six** drift families, not five, and the marker table's per-file
 > verdict split was slightly off.
 
+## What changed on 2026-08-04 — step 2 of four
+
+*What specifically must change* lists four steps. Step 2 — **adjudicate the two
+`unknown` verdicts in `vm/src/vm/vm_object.rs`** — is now partly answered, with
+evidence rather than an argument.
+
+Both are **overlays**, not mis-numbered slots: a VM-internal `Int` deliberately
+written on top of `java.lang.Class`'s instance field 0, which JDK 25 declares as
+`Constructor<T> cachedConstructor` — a *reference* slot. The question was never
+"is this the right slot" but "does writing an `Int` where the image declares a
+reference corrupt anything". The marker listed three checks. Two are run,
+against a real JDK 21 image, and both are clean:
+
+1. Three rounds of `getDeclaredConstructor()` on a nested class, interleaved
+   with `String.class.getConstructor(String.class)` — so the second and third
+   take the real bytecode's `cachedConstructor != null` fast path — all returned
+   the right `Constructor`. Nothing raised, and no `expected object reference,
+   got int(N)`.
+2. The same run under `CRATONVM_DBG=overlay`, whose hunter
+   (`overlay_write_is_destructive`) exists precisely to report a primitive
+   written to a reference slot, reported nothing.
+
+So the verdict stays `unknown` but **drops from ranked-HIGH**: the two checks
+that would have shown live harm did not.
+
+The third check — does anything still *depend* on the overlay — is the one whose
+answer removes code rather than reassuring about it, and nothing in the tree
+could answer it. `mirror_class_id` (`native-builtins/src/lang_class.rs`) is the
+overlay's only reader outside the VM, a fallback behind the reverse map, and it
+now reports its first hit under the same flag. **One broad real-JDK run makes
+the verdict decidable.** A ten-class probe does not: silence over a small
+workload is not silence over Spring Boot, and the marker says so rather than
+inviting a deletion on thin evidence.
+
+The primitive-mirror sibling (`Int(-1)` over the same slot) rides on that
+finding: it is the easier of the two to retire if check 3 comes back zero,
+because a primitive mirror has no legitimate `cachedConstructor` reader at all.
+
+## What is still open — steps 1, 3 and 4, which are the bulk
+
+* **Step 1, the sweep — it has a measured work list now (2026-08-04).** The
+  sweep was scoped as "read four crates for index-based field access". It does
+  not need reading first: **the runtime detector for exactly this defect already
+  exists** and had never been run broadly. `CRATONVM_DBG_OVERLAY=1` reports a
+  native writing a primitive to a reference slot *or* a reference to a primitive
+  slot on a class loaded from real JDK bytes. Add `CRATONVM_DBG_OVERLAY_ALL=1`
+  or the `java.util.Map` suppression hides the dominant family.
+
+  Three probes, both modes, JDK 25. **The results are identical under
+  `--real-jdk` and `--jdk-only`**, so this is a `Compatible`-mode defect too.
+  Distinct `(class, slot, value kind, real descriptor)` sites. **The two
+  `VarHandle` rows are struck through: fixed the same day, and the re-run
+  confirms they are gone — 13 classes / 24 slots became 11 / 21.**
+
+  | class | slot | writes | real desc | n |
+  |---|---:|---|---|---:|
+  | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
+  | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~1~~ | ~~`Object`~~ | ~~`Z`~~ | **FIXED** |
+  | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
+  | ~~`java/util/HashMap`~~ | ~~2~~ | ~~`Int`~~ | ~~`[`~~ | **FIXED (L2, 2026-08-04)** |
+  | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
+  | ~~`java/util/Properties`~~ | ~~7~~ | ~~`Float`~~ | ~~`L`~~ | **FIXED** |
+  | ~~`java/util/Properties`~~ | ~~6, 5~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
+  | ~~`java/util/Properties`~~ | ~~2~~ | ~~`Object`~~ | ~~`I`~~ | **FIXED (L2, 2026-08-04)** |
+  | ~~`java/util/Properties`~~ | ~~3~~ | ~~`Object`~~ | ~~`F`~~ | **FIXED (L2)** — never in this table: no probe called `new Properties(defaults)` until 2026-08-04 |
+  | ~~`ClassLoaders$PlatformClassLoader`~~ | ~~0, 3, 4, 6~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L1, 2026-08-05)** |
+  | ~~`ClassLoaders$AppClassLoader`~~ | ~~0, 3, 4, 6~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L1, 2026-08-05)** |
+  | `java/util/Scanner` | 3, 4 | `Int` | `L` | 2 each |
+  | `java/net/URI` | 5 | `Object` | `I` | 2 |
+  | `java/net/URI` | 2 | `Int` | `L` | 2 |
+  | `java/net/Proxy` | 0 | `Int` | `L` | 2 |
+  | `jdk/internal/math/FloatingDecimal$1` | 0 | `Object(None)` | `I` | 2 — **new 2026-08-05 (L4 gap 3)** |
+  | `ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter` | 0 | `Object(None)` | `I` | 2 — **new 2026-08-05 (L4 gap 3)** |
+
+  **This table is the WRITE half, and after L4 it is the smaller half.** The
+  widened detector's 135 sites include 70 reads and a separate per-class
+  shadow-layout census whose rows are not `(value kind, real desc)` tuples at
+  all; the section
+  [below](#the-detector-was-widened-2026-08-05-and-the-number-went-up) carries
+  them rather than stretching this table into a shape it was not built for.
+
+  **13 classes, 24 distinct slots**, from three small probes. Reading it:
+
+  > **Re-measured 2026-08-04 for lane L2**, with the three standing probes
+  > plus `probes/MapLayoutMatrixProbe`: the tree BEFORE L2 shows **6 classes /
+  > 15 slots**, and after L2 **5 classes / 12 slots**, with the `Properties`
+  > family gone entirely. That is not comparable to the 13/24 above, and the
+  > difference is not all L2's: these probes do not reproduce the
+  > `HashMap$Node`, `URI` or `Proxy` rows at all — either something else fixed
+  > them or nothing in this probe set exercises them. Only the three rows
+  > named under `Properties` below are attributed to L2, each A/B'd on the
+  > same workload against the pre-fix binary.
+
+  * The **`HashMap` family is the known-benign case** the hunter suppresses by
+    default — coercion-to-null lands the real bytecode in the null-initialised
+    state it expects. It dominates by volume and says nothing.
+  * **`VarHandle` — FIXED 2026-08-04, and it was the worst of the set.** It
+    mismatched in *both* directions on adjacent slots (`Int` over a reference at
+    0, an `Object` over a `boolean` at 1). The frames say why that mattered:
+    `MhUtil.findVarHandle`, reached from the `<clinit>` of
+    `java.util.concurrent.atomic.AtomicBoolean`, `AtomicReference` and
+    `java.io.ObjectInputFilter$Config`. Those are **real JDK classes whose
+    `static final VarHandle` fields real bytecode uses**, and slot 0 on a real
+    `VarHandle` is `vform` — so the VM was handing the JDK a `VarHandle` with a
+    null `VarForm`. It did not fault only because our natives intercept every
+    `VarHandle` operation and read the WP4.2 side table; the moment §7 step 3
+    routes one of those to real bytecode — the direction this whole feature is
+    going, on a path that already fires 3,344 times per run —
+    `vform.getMethodHandle(…)` is an NPE.
+
+    Fixed by writing the six synthetic slots only when the object actually has
+    our layout. No metadata is lost: `vh_meta_put` runs on every allocation path
+    and every reader consults it first.
+
+    **The first attempt at that guard was inert and nearly shipped.** It tested
+    `object_num_fields(vh) >= VH_FIELD_COUNT`, but `alloc_concurrent_synthetic`
+    returns at least the requested slot count either way, so a count test cannot
+    separate the layouts. It was caught by A/B against the pre-fix binary — 8
+    writes before, 8 after — after a first reading compared a six-run aggregate
+    (52) with a single run (8) and mistook the difference for a fix. The working
+    predicate asks by **name**: a real `VarHandle` declares an instance field
+    called `vform` and a fabricated stub does not. Verified 8 → 0 on the same
+    probe, with both probes still byte-identical to HotSpot in both modes.
+
+    Two lessons for the remaining 22 sites. **Field count does not identify a
+    layout** — ask for a field the real class declares and the stub cannot.
+    And **A/B the same workload against the pre-fix binary**; an aggregate and a
+    single run are not comparable numbers, however much they look like a
+    before/after.
+  * **`Properties` — diagnosed 2026-08-04, not yet fixed, and the fix shape is
+    already in the same file.** The frames put all four writes at
+    `new Properties()`, and the values name themselves: slot 5 `Int(0)`, slot 6
+    `Int(12)`, slot 7 `Float(0.75)` — `count`, `threshold` and `loadFactor`,
+    i.e. `native_map_init` writing a `HashMap`-shaped layout by raw slot index
+    onto a real `java.util.Properties`, where those slots are `defaults`/`map`
+    references and slot 2 is an `int`. It is in the group item 1 calls the
+    highest-risk in `native-collections`, and it is on the bootstrap path.
+
+    `native-collections/src/lib.rs` already demonstrates the correct pattern
+    twice, so this does not need inventing:
+    `native_props_init_defaults` resolves `defaults` with
+    `ctx.resolve_field_index("java/util/Properties", "defaults")` and writes
+    *both* the model slot and the real one, with a comment explaining that on a
+    real layout the inherited `Hashtable` fields push `defaults` onto
+    `loadFactor`; and `try_set_jdk_map_field(ctx, this, "loadFactor", …)` is the
+    by-name setter. `native_map_init` is the one still writing raw indices.
+
+    **Three of the four rows FIXED 2026-08-04, and the root cause was one
+    line.** `try_set_jdk_map_field` resolved every field name against a
+    hard-coded `"java/util/HashMap"` and then wrote that index into `this`,
+    whatever class `this` actually was. For a non-`HashMap` receiver the index
+    names a *different field*. Its `slot < object_num_fields(this)` bound does
+    not help: it stops an out-of-range write, not a wrong-field one — **the
+    third guard in this file's story that looks protective and is not**, after
+    the frozen divergence test and the field-count `VarHandle` predicate.
+
+    Fixed with `resolve_field_index_by_class_id`, which walks the receiver's
+    own hierarchy, so `loadFactor` on a `Properties` resolves through
+    `Hashtable` to its true slot; the API's own doc comment already recommended
+    it over the name-based form when the caller holds the object. Where the
+    receiver's class does not declare the field, nothing is written.
+
+    A/B on the same probe against the pre-fix binary: slots 5, 6 and 7 go 3 → 0
+    each, every other row byte-identical, both probes still identical to
+    HotSpot 25 in both modes, and 94 `native-collections` unit tests plus the
+    four ratchets green. This changes `Compatible` mode too — from *writes the
+    wrong field* to *writes the right field or none* — which is why it was
+    A/B'd separately rather than riding on the `VarHandle` verification.
+
+    ~~**Slot 2 survives**~~ — **FIXED 2026-08-04 (lane L2), together with the
+    `HashMap` slot-2 row and a `Properties` slot-3 row this table never
+    listed.** It came from the raw `MAP_FIELD_*` writes in `native_map_init`'s
+    legacy branch, not from `try_set_jdk_map_field`, and the same fixed-class
+    lookup was in four more places: `map_resize`, `resync_view_set`,
+    `map_state`'s bucket fallback and `hashmap_serialized_capacity`.
+
+    The shape is the one this record keeps describing:
+    `resolve_field_index("java/util/HashMap", "table")` answers `2`, and index
+    2 on a real `Properties` is the inherited `Hashtable.threshold`, an `int`.
+    `receiver_table_slot` asks the receiver's own class instead, and
+    `publish_map_table` is now the single idiom for publishing a bucket table:
+    slot 0 always (the natives read it), the receiver's real `table` when that
+    is a different slot, and the legacy `Int(capacity)` at slot 2 **only when
+    the receiver has no `table` field at all** — which is what "our fabricated
+    layout" means, asked by NAME. A slot count cannot answer it: the
+    allocators size a fabricated map to at least `MAP_NUM_FIELDS` and a real
+    one to at least its real field count, and the fabricated
+    `cratonvm/util/MapViewBacking` is WIDER than a real `HashMap`.
+
+    **The `HashMap` family did change, deliberately.** The sites that wrote
+    `Int(cap)` at absolute slot 2 unconditionally — `new HashMap<>(map)`,
+    `Map.of`, `Set.of`, `ConcurrentHashMap.newKeySet`, the `HashSet` backings —
+    were writing an int into the REAL `table` field of a real-layout receiver,
+    while `native_map_init` right next door already stored the bucket array
+    there. They now agree. `map_state` derives capacity from the bucket
+    array's length and only falls back to slot 2 when there is no array, so
+    nothing reads what was dropped.
+
+    A/B, pre-fix vs post-fix binary, four probes × both modes, JDK 25:
+
+    | row | pre | post |
+    |---|---:|---:|
+    | `java/util/Properties` slot 2 `Object` over `I` | 40 | **0** |
+    | `java/util/Properties` slot 3 `Object` over `F` | 12 | **0** |
+    | `java/util/HashMap` slot 2 `Int` over `[` | 66 | **0** |
+    | every other row | — | byte-identical |
+
+    Measured twice, on Windows and on Azure Linux, against the same Temurin
+    25.0.3 image and with each host's own pre-fix binary: the three rows above
+    are identical on both, as is every other row. On `JdkOnlyCensusLoadProbe`
+    alone the `Properties` slot-2 row goes **3 → 0**, which is the number the
+    lane doc predicted. The benign `HashMap`
+    slot-1 row moved 8,256 → 8,318; that is *not* this change — it is the
+    `stringPropertyNames` fix below building one more set per call, and the
+    row's own run-to-run spread on an unmodified binary is ±4 on a single
+    probe (1634/1636/1638 over three runs), so it is not a stable signal at
+    that resolution either way. Probe transcripts are identical pre/post
+    except an ephemeral TCP port and a timing line; the 10-member
+    `test_classes` corpus is identical in `Compatible` mode with timestamps
+    normalised.
+
+    ~~Note also that `native_props_init` writes `Value::Object(None)`~~ —
+    **also fixed (L2 step 3)**, and the note stands as written about the
+    detector: `overlay_write_is_destructive` only flags `Object(Some(_))` over
+    a primitive, so the null write to slot 3 (= `loadFactor`) never appeared
+    in any census and still would not. What DID appear, once a probe finally
+    called `new Properties(defaults)`, is the sibling `Object(Some(_))` write
+    from `native_props_init_defaults` — 12 hits, now 0. Both writers and every
+    reader of the chain link now go through `props_defaults_slot`, which
+    resolves `defaults` on the receiver and falls back to the model slot only
+    for a receiver that does not declare the field. **The `Object(None)` half
+    is verified by unit test, not by the census** — L4 gap 3 is what would
+    make it visible, and it is still open.
+  * **Both built-in class loaders — FIXED 2026-08-05 (lane L1). Kind 3, the
+    one neither earlier fix reaches.** `alloc_classloader` wrote CratonVM's
+    seven-slot loader model onto the object, and four of those slots were
+    `Int`:
+
+    | slot | synthetic meaning | real `ClassLoaders$AppClassLoader` |
+    |---:|---|---|
+    | 0 | `CL_LOADER_TYPE` | `parent`, a `ClassLoader` |
+    | 3 | `CL_CLASSES_LOADED` | `nameAndId`, a `String` |
+    | 4 | `CL_IS_PARALLEL_CAPABLE` | `parallelLockMap`, a `ConcurrentHashMap` |
+    | 6 | `CL_LOADER_ID` | `classes`, an `ArrayList` |
+
+    Reached from `Thread.currentThread()` → `current_thread_object` →
+    `get_or_create_system_cl` while initialising `contextClassLoader`, which is
+    why the Java stack said `BufferedWriter.initialBufferSize()` and why
+    grepping found nothing. Named by `CRATONVM_DBG=overlay-bt`, which exists
+    because of this site.
+
+    **`resolve_field_index_by_class_id` cannot fix these.** `loadFactor` on a
+    `Properties` has a real counterpart to resolve to; `CL_LOADER_TYPE` and
+    `CL_LOADER_ID` are VM-internal bookkeeping with **no real JDK field at
+    all**. There is nowhere correct to put them in a real loader's layout, so
+    on a real image they must not be in the object.
+
+    The fix is a `LoaderMeta` side table keyed by the loader OBJECT
+    (`classloader.rs`), plus a `cl_has_synthetic_layout` predicate that gates
+    every slot write and every raw-slot READ fallback. Two deliberate
+    departures from the `vh_meta_*` shape it copies, both forced by facts about
+    loaders: the key is the object, not `identity_hash_code` (an
+    address-derived hash recurs once a collection reuses the region, which is
+    why `loader_namespace_id_store` had already moved off it), and the table is
+    NOT a GC root (rooting user loaders would pin every one of them and defeat
+    loader unloading). It is pruned and remapped by
+    `gc_reconcile_defining_loaders` alongside the namespace store.
+
+    **Measured, A/B against the pre-fix binary, JDK 25, Azure Linux, both
+    probes:** the eight `ClassLoaders` rows go **8 → 0** and every other row in
+    the table above is byte-identical across the two arms (2,188 / 16 / 7 / 3 /
+    1 / 1). `probes/L1LoaderIdentityProbe` output is identical between the arms
+    and matches HotSpot 25 on loader identity
+    (`X.class.getClassLoader() == getSystemClassLoader()`, the TCCL, and the
+    `getParent()` walk).
+
+    **The three REFERENCE slots were the same defect, one kind quieter, and
+    are fixed too.** L1's brief said to leave `CL_PARENT_REF` (1),
+    `CL_NAME_REF` (2) and `CL_DEFAULT_DOMAIN` (5) alone because "they are
+    references with real counterparts and are already written by name too".
+    That is a factual error: the by-name write and the index write go to
+    DIFFERENT fields. Slot 1 is `name:String` and was receiving the parent
+    `ClassLoader`; slot 2 is `unnamedModule:Module` and was receiving the name
+    `String`; slot 5 is `package2certs:ConcurrentHashMap` and was receiving a
+    `ProtectionDomain`. A reference into a reference slot, so
+    `overlay_write_is_destructive` cannot see any of it — this is exactly the
+    "same-kind write" blind spot named two paragraphs below, sitting in the
+    function this record is about. It was live: `classloader_parent` falls back
+    to slot 1 whenever the by-name `parent` is null, which is the platform
+    loader's case, so **it returned the platform loader's own name String as
+    its parent** to every caller that walks the chain
+    (`builtin_loader_reachable`, `parent_namespace_id`, Tomcat's
+    `while (j.getParent() != null)`).
+  * `URI` and `Properties` each mismatch in both directions, which rules out a
+    single off-by-one against one layout.
+
+  ~~Two limits, so nobody reads this as complete. The detector covers
+  `NativeContextImpl::set_field` only: **reads are uninstrumented, and a
+  same-kind wrong-slot write is invisible**~~ — **both closed 2026-08-05 as lane
+  L4**, together with the `Object(None)`-over-a-primitive blind spot noted under
+  `Properties` above. Three probes is still not Spring Boot; every count here
+  remains a floor, for that reason rather than the detector's.
+
+  ### The detector was widened 2026-08-05, and the number went up
+
+  Lane [L4](../../feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md)
+  closed the three gaps. Same three probes, both modes, JDK 25, A/B against a
+  pre-fix binary built from the same tree:
+
+  | | pre | post |
+  |---|---:|---:|
+  | distinct `(op, class, slot, value kind, real desc)` sites | 4 | **135** |
+  | of which reads | 0 | **70** |
+  | modelled classes reached / of those disagreeing | — | 156 / **73** |
+  | disagreeing slots | — | **152** (129 by type class, 23 by name) |
+  | slots where our model NAMES a different field than the image | — | **23** across 12 classes (10 accessed) |
+
+  Every pre-fix row survives with its count (`MemberName` 50 → 50, both
+  `Scanner` rows 2 → 2, `HashMap` slot 1 8,314 → 8,312, inside its own ±4
+  spread), which is what makes the two numbers comparable rather than merely
+  both large.
+
+  Three things this record must now say differently:
+
+  * **Kind 5 is findable.** The paragraph below that says "no amount of
+    re-running the census will find another one" was true of the *old* detector
+    and is false of this one. CratonVM's `synthetic_stub_fields` model is diffed
+    against the real layout at define time (`classloading/src/shadow_layout.rs`),
+    so a slot where our model says `name:String` and the image says
+    `parent:ThreadGroup` is reported whether or not any value tag disagrees.
+    **`java/lang/ThreadGroup` has both `name`/`parent` and `daemon`/`maxPriority`
+    transposed** — the identical shape to the `ClassLoaders` defect L1 found by
+    hand, in a class nobody had looked at. So are `java/lang/Thread` slot 5
+    (`contextClassLoader` over `holder`), `java/security/ProtectionDomain` 1/2/3,
+    `java/security/CodeSource` 1, `java/io/BufferedWriter` / `BufferedReader` /
+    `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
+    / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
+    0/1. Each is its own change with its own A/B, and the list is this lane's
+    output. **`ThreadGroup` is FIXED (2026-08-05); the rest are open.**
+
+    ### Reading a NAME row — `ThreadGroup`, worked through
+
+    **A NAME row says the model and the image disagree. It does not say which
+    of the two is wrong, and for `ThreadGroup` the answer was BOTH, in
+    different places.** Tracing it is the whole job; four of the six reported
+    access sites turned out not to be defects at all.
+
+    The natives (`native-builtins/src/phases_late/concurrent.rs`) go through
+    `tg_slot`, which resolves the field **by name first** and only falls back
+    to a hard-coded index. On a real image every `ThreadGroup` declares all
+    four names, so the fallback is never reached and those writes were already
+    landing on the right fields — they were reported only because the *model*
+    they were being compared against was transposed. Fixing them would have
+    entrenched the bug; the fix was to correct the model
+    (`synthetic_stub_fields` now declares the real `parent, name, maxPriority,
+    daemon` order) and the fallback constants with it, under a test that
+    asserts the two tables agree **and** that they are the JDK's order — so a
+    future transposition of both together still fails.
+
+    Behind those four sat one real defect, on the one path that used a raw
+    index: `SecurityManager.getRootGroup` wrote the fields by name and then
+    wrote them **again** by raw index 0..3 in the legacy order, guarded by
+    `object_num_fields >= 4`. The raw pass ran second and won. Measured on the
+    pre-fix binary through `MethodHandles.findVirtual` (reflection cannot see a
+    registered native — `getDeclaredMethod` scans the real class's metadata and
+    answers `NO_SUCH_METHOD`):
+
+    | | pre-fix | post-fix / HotSpot |
+    |---|---|---|
+    | `getName()` | **null** | `system` |
+    | `getParent()` | **a `java.lang.String`** | null |
+    | `getMaxPriority()` | **0** | 10 |
+    | `isDaemon()` | **true** | false |
+
+    A `String` returned where every caller expects a `ThreadGroup` — the same
+    live shape as L1's `classloader_parent`. The guard it sat behind is the one
+    this record keeps describing: `object_num_fields >= 4` stops an
+    out-of-range write, not a wrong-field one. That is the fourth such guard in
+    this file's story.
+
+    **Two lessons for the remaining eleven classes.** A NAME row is a lead, not
+    a verdict: read the writer before changing it, because a by-name writer
+    under a wrong model produces rows that are noise. And a probe is not an
+    oracle until it goes red on the pre-fix binary —
+    `probes/ThreadGroupLayoutProbe.java` was byte-identical across the two arms
+    on every section until it reached `getRootGroup`, because everything else
+    resolves by name.
+  * **The `Object(None)` half is no longer verified only by unit test.** Two new
+    cross-type WRITE rows appear that the pre-fix binary is silent on, both
+    `Object(None)` over an `int`: `jdk/internal/math/FloatingDecimal$1` slot 0
+    and `ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter` slot 0. The
+    `Properties` slot-3 row the lane predicted does **not** appear — L2 step 3
+    had already removed that write. The prediction was stale, not wrong.
+  * **`java/util/Scanner`'s model is `instance_fields(5)`, not 3**, and slots 3
+    and 4 are the real `delimPattern` and `hasNextPattern`, both
+    `java.util.regex.Pattern` references. That settles L3 step 3's "either the
+    model grew or a different writer is involved" without running a tracer.
+
+  What the widened detector **still** cannot see, so the next reader does not
+  re-derive it: an anonymous `_fN` model slot over a real *reference* field is
+  unfalsifiable — the model declares `Ljava/lang/Object;` and so does every
+  reference field in the JDK. That is the residual half of kind 5, and the way
+  to shrink it is to name more of `synthetic_stub_fields`, not to run the census
+  again. A class with no arm in that table is outside the diff entirely.
+
+  ### The 19 open slots are FOUR defects, not nineteen
+
+  Classified 2026-08-04 by tracing each writer (`CRATONVM_DBG=overlay-bt` names
+  the Rust frame; the Java frames mislead). Each kind has a different fix, and
+  applying the wrong one is silent:
+
+  | # | kind | tell | fix | status |
+  |---|---|---|---|---|
+  | 1 | synthetic slots written onto a real layout | the real class declares a field our model does not have | write the slots only when the layout is ours, keyed on a field name the real class declares | **`VarHandle` fixed** |
+  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7, 2, 3 and `HashMap` 2 fixed** (L2); `URI` open |
+  | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does | **`ClassLoaders` ×2 fixed** (L1, 2026-08-05) |
+  | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | `Proxy` open |
+
+  Kind 3 is the one that cannot be fixed by resolving harder: there is nowhere
+  correct in a real layout to put a `CL_LOADER_ID`. Kind 4 likewise — resolving
+  `java.net.Proxy.type` by name finds a real field, and writing our `int` into
+  it is still wrong, because the real field holds a `Proxy$Type` **enum
+  reference**.
+
+  **Kind 5, added 2026-08-05 by the L1 fix — and made findable the same day by
+  L4.** A VM-internal reference written into a real reference slot. Same
+  wrong-field write as kind 1, but the value-tag predicate only flags
+  cross-type-class coercions, so nothing in the census above reported it. The
+  three `ClassLoader` reference slots (1/2/5) were all of this kind, and one of
+  them was returning a `String` where every caller expected a `ClassLoader`.
+
+  **The original filing of this paragraph said "no amount of re-running the
+  census will find another one" and that the only instrument is a behavioural
+  probe. That was true of the detector as it stood and is no longer true.** The
+  shadow-layout diff compares CratonVM's `synthetic_stub_fields` model against
+  the real layout by NAME, which is a signal the value's type tag does not
+  carry — and on its first run it found 23 such slots across 12 classes,
+  including `java/lang/ThreadGroup` with two field pairs transposed (fixed the
+  same day — see the worked example above for why four of its six reported
+  access sites were not defects). What is
+  still unfindable is the narrower case where the model slot is **anonymous**
+  (`_fN`, declared `Ljava/lang/Object;`): there the model asserts nothing, so
+  there is nothing to disagree with, and only a behavioural probe diffed against
+  the host JDK (`probes/L1LoaderIdentityProbe`) or reading the writer against
+  `javap` will do. Any file that writes a hand-numbered slot model onto a class
+  that can become real still has that exposure. Naming the model's fields is
+  what converts it into something checkable.
+
+  Two things found while classifying, both worth fixing alongside:
+
+  * **The synthetic `URI` model is duplicated**, with identical constants, in
+    `native-builtins/src/http2.rs` and `native-builtins/src/servlet.rs`. Two
+    copies of a layout is how the `real_protected_stub` allow-lists drifted.
+  * ~~`native_map_init`'s legacy branch still writes raw `MAP_FIELD_*`
+    indices~~ — **done 2026-08-04 as lane L2**, with its own A/B; see the
+    `Properties` bullet above for the numbers. It did want its own change:
+    the same fixed-class lookup turned out to be in five functions, and the
+    conversion had to keep the fabricated layout intact for receivers that
+    genuinely have it, which is a predicate on a field NAME and not on a slot
+    count.
+  * **Found while verifying L2, not layout defects, not fixed** — recorded
+    here so a later reader does not have to re-derive them.
+    `probes/MapLayoutMatrixProbe` diffs byte-for-byte against HotSpot 25
+    except for these, identical in both modes and unchanged by L2:
+    `Properties.getProperty(null)` / `setProperty(k, null)` / `put(null, v)` /
+    `load((InputStream) null)` return normally where the JDK throws
+    `NullPointerException`; `HashMap` iteration does not raise
+    `ConcurrentModificationException` when the map is structurally modified
+    mid-iteration (the probe's loop then runs to 99 entries where HotSpot
+    stops at 50); `Hashtable` accepts null keys and null values; and
+    `new Hashtable<>(h).equals(h)` is `false`. Each is a semantics change on a
+    shared hot path — `native_map_put` backs both `HashMap` and `Hashtable` —
+    so each wants its own change and its own A/B.
+* **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
+  Note the `ValueLayout` one cannot be converted at all — the marker is explicit
+  that there are no real fields to name, so it is a
+  `CompatibilityClassRequested` violation, not a slot-numbering bug, and fixing
+  it means letting the real `ValueLayout.<clinit>` run.
+* **Step 4**, making `safe` verdicts checkable rather than asserted. They are
+  claims about JDK 25 that nothing in the build re-checks; a JDK upgrade should
+  fail a test, not corrupt an object.
+
 ## What is wrong
 
 A large amount of CratonVM native and VM-internal code reaches into Java objects
@@ -161,7 +644,7 @@ finding, not a general rule.
 * `docs/known-issues/jdk-only/README.md` — index.
 * The `StringJoiner` divergence between the two real-protected-stub allow-lists
   is a *separate* consequence of the same class's layout drift; see
-  [real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md).
+  [real-protected-stub allow-lists diverge](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) (reconciled 2026-08-04).
 * [`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md)
   — the companion audit. The original filing recorded that this file did not
   exist; **it does now**, and it is the right starting point for the sweep in

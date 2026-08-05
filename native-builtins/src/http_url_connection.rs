@@ -179,7 +179,7 @@ fn registry() -> &'static Mutex<ConnRegistry> {
 // `getResponseCode`/`getInputStream` natives below misread it (`HUC_CONNECTED`
 // lands on an unrelated real field that reads 1 → `ensure_connected`
 // early-returns making NO request → `-1`; confirmed by tracing, see
-// docs/tomcat-suite-bugs/10-pagecontext-npe-contains-null-FAIL.md). Detect that
+// fixed-suite-bugs/tomcat/10-pagecontext-npe-contains-null-FAIL.md). Detect that
 // case via the URL object at field 0, perform the request from the *real* URL,
 // and cache the result keyed by the connection object's identity hash so a
 // follow-up `getInputStream` returns the same body. The synthetic resource-URL
@@ -707,7 +707,7 @@ fn huc_real_perform(
             }
         };
         let tls_restrictions = if parsed.scheme == "https" {
-            match huc_client_tls_restrictions(ctx, &parsed.host, parsed.port) {
+            match huc_client_tls_restrictions(ctx, Some(this), &parsed.host, parsed.port) {
                 Ok(r) => r,
                 Err(e) => {
                     ctx.unpin_native_roots(this_pin);
@@ -1577,7 +1577,7 @@ pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 /// NO handshake, so the re-entrant `invoke_virtual` can no longer reach the
 /// class-loading/vtable-install lock-ordering deadlock that a nested
 /// blocking connect once exposed (see this function's history in
-/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
 /// The old gate — "only up-call when the factory has a private `ciphers`
 /// field holding at least one rustls-mappable suite name" — was both
 /// test-helper-specific and, since the factory was never published to
@@ -1591,20 +1591,44 @@ pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 /// no restriction at all.
 fn huc_client_tls_restrictions(
     ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
     host: &str,
     port: u16,
 ) -> Result<Option<ClientTlsRestrictions>, MethodCallFailed> {
     let dbg = crate::nbflags().dbg_tls_auth_ok;
-    // Read the factory from the GC-rooted native slot, NOT from the real JDK
-    // static field: writing that field does not stick on this VM (measured —
-    // see `t27_tls::huc_default_factory_slot`), which silently disabled this
-    // whole mechanism.
-    let Some(factory) = crate::t27_tls::huc_default_ssl_socket_factory() else {
+    // FIX (huc-per-connection-ssf-readback): prefer THIS connection's own
+    // factory, installed by `HttpsURLConnection.setSSLSocketFactory`, over the
+    // process default — the JDK's precedence. Until that setter started
+    // storing the factory (see `t27_tls`'s registration) an instance-scoped
+    // factory's cipher/protocol restrictions were unreachable here, so an
+    // instance `setSSLSocketFactory` silently connected unrestricted while an
+    // otherwise identical `setDefaultSSLSocketFactory` was honoured.
+    //
+    // Read before anything below allocates or runs bytecode: `connection` is
+    // the caller's already-pin-refreshed reference, and a moving collection
+    // during the probe up-call would strand it.
+    let instance_factory = connection.and_then(|c| {
+        match ctx.get_field_by_name(c, "sslSocketFactory") {
+            Value::Object(Some(f)) => Some(f),
+            _ => None,
+        }
+    });
+    // The process default lives in a GC-rooted native slot, NOT in the real
+    // JDK static field: writing that field does not stick on this VM
+    // (measured — see `t27_tls::huc_default_factory_slot`), which silently
+    // disabled this whole mechanism.
+    let Some(factory) = instance_factory.or_else(crate::t27_tls::huc_default_ssl_socket_factory)
+    else {
         if dbg {
             eprintln!("[dbg-tls-auth] huc_client_tls_restrictions: no default factory installed");
         }
         return Ok(None);
     };
+    if dbg && instance_factory.is_some() {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions: using this connection's own factory"
+        );
+    }
     // Our own placeholder carrier has no overriding Java bytecode to run, so
     // probing it can only ever come back empty. Compare by `ClassId` rather
     // than by name: `alloc_concurrent_synthetic` documents that
@@ -1661,7 +1685,7 @@ fn huc_client_tls_restrictions(
 // Plain-HTTP keep-alive connection pool
 // ---------------------------------------------------------------------------
 //
-// docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md
+// fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md
 // — real JDK's `sun.net.www.http.HttpClient` pools/reuses a TCP connection to
 // the same `(host, port)` across separate `HttpURLConnection` instances once
 // a response is fully drained; `perform` previously always opened a brand
@@ -2313,9 +2337,22 @@ fn perform(
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
+    // `normalize_connect_addr` folds an IPv4-mapped destination
+    // (`::ffff:a.b.c.d`) to plain IPv4. A URL carries its host as TEXT, so this
+    // path never passes through `InetAddress` — which is where real JDK, and
+    // CratonVM's own mirror of it, collapses that literal to an
+    // `Inet4Address`. Without the fold we build an AF_INET6 socket, and on
+    // Windows `IPV6_V6ONLY` defaults to 1, so `connect` cannot reach a mapped
+    // destination: `TestStartupIPv6Connectors.testIPv6MappedIPv4` reported
+    // exactly "connect [::ffff:127.0.0.1]:<port>: ... (os error 10049)" from
+    // the `last_err` line below. The fold also makes the IPv4-first sort do
+    // what it says: a mapped address is a v4 destination wearing a v6
+    // sockaddr, so it used to sort LAST despite being the loopback we want
+    // tried first.
     let mut addrs: Vec<std::net::SocketAddr> =
         std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
             .map_err(|e| format!("resolve {addr}: {e}"))?
+            .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
             .collect();
     // preferIPv4Stack semantics: try IPv4 candidates before IPv6. On Windows a
     // "localhost" lookup returns `[::1, 127.0.0.1]` (IPv6 first), but an
@@ -2496,7 +2533,7 @@ fn perform(
         // rustls 0.23 categorically REFUSES renegotiation on both sides — a
         // post-handshake `HelloRequest` is answered with a `no_renegotiation`
         // alert and never processed (`rustls/src/common_state.rs::process_msg`;
-        // root-caused from the dependency's own source in `docs/internal/
+        // root-caused from the dependency's own source in `
         // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
         // "Residual #2 follow-up"). So no Java callback can fire from inside
         // `read_response`; keeping the window open there would buy nothing and
@@ -2675,8 +2712,8 @@ fn perform(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2/
-/// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
+/// pattern (`fixed-suite-bugs/h2-suite-bugs/
+/// bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
 /// tearing itself down, before ever writing a response. That is NOT a
@@ -2753,7 +2790,7 @@ fn perform_with_retry(
 // `TcpStream`. That's not just a performance gap: some servers key
 // connection-scoped state off the TCP connection itself (H2's `WebServer`
 // per-`WebThread` session-locale persistence is one confirmed case — see
-// `docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md`
+// `fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md`
 // for the full root-cause writeup with a `tcpdump`-confirmed repro).
 //
 // Deliberately scoped conservative for this first implementation:
@@ -2883,8 +2920,12 @@ fn is_poolable(resp_headers: &[(String, String)], req_headers: &[(String, String
 /// ~15-line loop).
 fn connect_plain(parsed: &Url1, connect_timeout: Duration) -> Result<TcpStream, String> {
     let addr = format!("{}:{}", parsed.host, parsed.port);
+    // Same IPv4-mapped fold as `perform`'s loop above — see the comment there.
+    // This function is a deliberate duplicate of that loop, so a fix to one is
+    // only half a fix.
     let mut addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
         .map_err(|e| format!("resolve {addr}: {e}"))?
+        .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
         .collect();
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
     let mut last_err: Option<String> = None;
@@ -3019,8 +3060,8 @@ fn perform_pooled(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2/
-/// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
+/// pattern (`fixed-suite-bugs/h2-suite-bugs/
+/// bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
 /// tearing itself down, before ever writing a response. That is NOT a
@@ -3102,7 +3143,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     // FIX (client-cipher-restriction): resolve any real caller-installed
     // SSLSocketFactory BEFORE calling perform — the probe up-call needs `ctx`.
     let tls_restrictions = if parsed.scheme == "https" {
-        huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
+        huc_client_tls_restrictions(ctx, Some(this), &parsed.host, parsed.port)?
     } else {
         None
     };

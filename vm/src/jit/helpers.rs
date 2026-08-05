@@ -249,6 +249,12 @@ pub mod mic_prof {
             cratonvm_jit::unowned_ic_entry_refusals(),
             cratonvm_jit::unowned_ic_entry_publishes(),
         );
+        // `pub_probe_none` says the inline cache never learned an entry; the
+        // tally says WHICH callees were refused and under which of the four
+        // reasons. Together they are a diagnosis; separately they are the
+        // "hit_entry=0 forever" observation that has been made before and left
+        // unexplained. No-op unless `CRATONVM_DBG=callee-probe` is also set.
+        crate::runtime::interpreter::jit_bridge::dump_callee_probe_tally();
     }
 }
 
@@ -1362,11 +1368,24 @@ unsafe fn try_call_compiled_entry_reentrant(
     // back to its live CompiledMethod and register the precise frame for the
     // full duration of the nested call.
     let mut needs_ctx = needs_ctx;
-    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
-        // SAFETY: the JIT code-range registry owns this CompiledMethod while
-        // its entry remains callable; the guard is dropped before this helper
-        // returns to the caller that holds the corresponding code cache entry.
-        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    // Pin, don't peek. This is the ONE path into compiled code that used to hold
+    // no owning reference to the body it entered: it resolved a bare `cm_ptr`
+    // out of the code-range registry and dereferenced it, on the argument that
+    // "the registry owns this CompiledMethod while its entry remains callable".
+    // The registry stores a raw address, not an `Arc`, so it owns nothing — and
+    // the caller's keep-alive here is a *thread-local dispatch cache entry*
+    // (`try_mic_rust_cached_entry` reads `entry`/`needs_context` out of the map
+    // and calls the raw pointer). A nested dispatch from the callee re-enters
+    // `flush_raw_entry_dispatch_caches`, whose `clear()` drops exactly that
+    // entry — measured releasing a published body at `active_jit_executions`
+    // = 1 on `BasicErrorControllerIntegrationTests`.
+    //
+    // Holding the pin across the call is what makes the process-wide invariant
+    // true: **a thread inside a compiled body always holds an owning reference
+    // to it**, so a reference count reaching zero is itself a proof that no
+    // thread is inside. One atomic increment (the registry carries a `Weak`).
+    let pinned = cratonvm_jit::pin_jit_code_range_owner(entry);
+    let jit_root_guard = pinned.as_deref().map(|compiled| {
         // cceres2 (WildFly SIGSEGV cores SF2/SF3/SM): the caller-supplied ABI
         // flag can come from a cache whose (entry, needs_context) pair was
         // read non-atomically across a concurrent inline-cache retarget or
@@ -1399,6 +1418,9 @@ unsafe fn try_call_compiled_entry_reentrant(
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
     drop(jit_root_guard);
+    // AFTER the guard: the pin is what keeps the body mapped for the whole
+    // call, so it must outlive both the call and the chain entry naming it.
+    drop(pinned);
     result
 }
 
@@ -1534,7 +1556,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
 /// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
@@ -1955,7 +1977,7 @@ fn publish_mic_rust_cached_entry(
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
-                _owner: Some(owner),
+                _owner: Some(owner.into()),
             },
         );
     });
@@ -1973,7 +1995,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -3070,7 +3092,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: docs/round7-gc.md §3).
+// free (audit: history/round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -3177,6 +3199,22 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
+    // Second attempt, BEFORE forcing a GC — the step `gc_alloc_array` takes and
+    // this helper did not (SB-LOADER-ZIPCONTENT, 2026-08-04). The interpreter
+    // runs `try_alloc_array_full` here, so a young generation that cannot serve
+    // the request spills into old gen and the mutator continues; the spill
+    // itself arms `note_young_spill_pressure`, which schedules the collection at
+    // the next native-call boundary where roots are pinned and remappable.
+    //
+    // Without it the JIT path forced a full STW GC for EVERY array the young
+    // free list could not fit. On `ZipContentTests` that was ~750 forced
+    // collections, one per 8 KB `byte[]`, each freeing ~10 KB — the difference
+    // between "the class is slow" and "the class does not finish". The young
+    // probe above is unchanged, so a healthy heap never reaches this line and
+    // pays nothing.
+    if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        return jit_newarray_finish(obj_ref, atype, length);
+    }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
     // Mirror the interpreter's `gc_alloc_array` (runtime/interpreter.rs:840):
     // retire the TLAB, run an orchestrated STW GC, then retry the fallible
@@ -3210,13 +3248,37 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // `java/lang/OutOfMemoryError` exactly as the interpreter's
     // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
     // (which would abort the process on a real OOM).
-    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): these two retries MUST use the
+    // old-gen-spilling `try_alloc_array_full`, not the young-only
+    // `try_alloc_array`. `gc_alloc_array` states the reason for the
+    // interpreter's identical arm — "once a non-moving JIT-safe sweep has left
+    // the young generation fragmented it can spill the request into old space
+    // ... retrying young-only here used to report OOM for a tiny array while
+    // most of the heap was available as old-generation headroom" — and this
+    // helper was the one primitive-array path that never got the same
+    // treatment (`jit_anewarray_object` already calls `try_alloc_array_full`
+    // and `jit_new_object` already calls `try_alloc_object_full`; see the
+    // `jit_alloc_oom` doc comment, which lists the asymmetry as fact).
+    //
+    // That gap is exactly how `ZipContentTests.nestedZip64CanBeRead` died:
+    // moving-young had fallen back to the non-moving sweep
+    // (`reason=unregistered-jit-frame-on-stack`), the young free list could no
+    // longer serve the compiled `byte[8192]` that assertj's `assertHasContent`
+    // allocates once per ZIP entry, and this arm reported
+    // `OutOfMemoryError: Java heap space (alloc_array length 8192)` with a
+    // 134 MB live set, a 1.5 GiB heap, and **1042 MB of old-generation
+    // headroom** (`CRATONVM_DBG=gc-overhead`: `old_gen_wedged=false`, so the
+    // overhead limit correctly never fired — the heap was not full, the
+    // allocator just refused to look at the free gigabyte). The same class
+    // passed 29/29 under `--nojit`, where every array runs `gc_alloc_array`.
+    let obj_ref = match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
         Some(o) => o,
         None => {
             if !jit_g1_last_ditch_full_cycle(vm) {
                 return jit_newarray_oom(vm, length as usize);
             }
-            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
                 Some(o) => o,
                 None => return jit_newarray_oom(vm, length as usize),
             }
@@ -3275,9 +3337,9 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
     }
 }
 
-/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
-/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
-/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`,
+/// `jit_anewarray_object` (both via `try_alloc_array_full`), and
+/// `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
 /// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
 /// returns the `0`/null sentinel; the alloc codegen site null-checks the result
 /// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
@@ -3819,7 +3881,7 @@ fn jit_cp_alloc_stash_failure(
 /// So a `new` whose target class had not been loaded yet used to bail the whole
 /// compile, permanently, leaving hot methods carrying a cold
 /// `throw new SomeException(...)` in the interpreter forever
-/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+/// (`jit-compile-bail-unresolved-new-cold-class.md`).
 ///
 /// Doing the same resolution HERE is sound for the reason the doc gives: it is
 /// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
@@ -3989,6 +4051,57 @@ pub unsafe extern "C" fn jit_new_object_cp(
         .map(|c| c.num_total_fields)
         .unwrap_or(0);
     jit_new_object(vm_ptr, i64::from(target_id.as_u32()), num_fields as i64)
+}
+
+/// CP-indexed `ldc <Class>` (0x12/0x13) slow path — see
+/// `jit_api::JitRuntimeHelpers::ldc_class_cp` for the ABI.
+///
+/// Resolves the target class through the same loader-faithful
+/// [`jit_resolve_cp_class`] the deferred-`new` helper uses, then returns its
+/// mirror. `0` means resolution failed and a pending exception is published.
+/// No `new`-style access check: JVMS resolves an `ldc` class reference but the
+/// allocation check belongs to `new`, and the interpreter's own `ldc` handler
+/// takes the mirror straight from `resolve_class_loader_aware`.
+///
+/// # Why the mirror is fetched per execution
+///
+/// It is an ordinary heap object, so a relocating collector can move it
+/// between two invocations of the same compiled body — a baked immediate would
+/// name freed or reused memory. Same reason [`jit_ldc_string`] re-interns its
+/// literal rather than baking an `ObjectRef`. `get_or_create_class_mirror` is
+/// a cached lookup, so the repeat cost is a map hit, not a re-creation.
+///
+/// Before this existed, an `ldc <Class>` had no representation anywhere in the
+/// JIT: the compile-time resolver returned `None`, which is the
+/// "permanently unrepresentable" answer, so the enclosing method was
+/// bail-listed and never compiled at any tier. See
+/// `docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`.
+///
+/// SAFETY: called from JIT-compiled code; `vm_ptr` must be a valid `SharedVm`
+/// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
+/// referencing class and constant-pool index of this `ldc` site.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_ldc_class_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // Resolution can run a user `ClassLoader.loadClass`, i.e. arbitrary Java
+    // that can itself GC — cross the boundary before it, exactly as
+    // `jit_new_object_cp` does.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: see `jit_new_object_cp`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    crate::vm::get_or_create_class_mirror(vm, target_id).as_ptr() as i64
 }
 
 /// CP-indexed `anewarray` (0xbd) slow path — the `anewarray` sibling of
@@ -4869,7 +4982,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -5540,6 +5653,87 @@ mod system_class_memo {
 // `System.out`/`err` intercept would fire on whatever class happened to hold
 // that id and never on the real `java/lang/System`. Do not reintroduce it
 // without a `vm_identity` in the key.
+
+/// Record a CONFIRMED class initialization in the lock-free memo.
+///
+/// Called from `finalize_class_init` (the single authoritative end of a
+/// successful `<clinit>`), so the memo answers for every initialized class
+/// rather than only for those a compiled `getstatic` has already missed on.
+/// Idempotent, lock-free, and a no-op for a VM that does not own the table.
+pub fn note_class_initialized(vm: &SharedVm, class_id: ClassId) {
+    class_init_memo::mark_initialized(vm.vm_identity, class_id.as_u32());
+}
+
+/// Compile-time resolver: where does this static field's storage live?
+///
+/// Returns the address of the `AtomicPtr` cell holding the declaring class's
+/// statics base (see `StaticsIndex::base_cell_addr`), or `0` for "not
+/// inlineable — keep the helper". The JIT bakes the returned address as an
+/// immediate and emits two dependent loads instead of a `CALL jit_getstatic`.
+///
+/// # Why every rejection below is required
+///
+/// * **`java/lang/System`** — its `out`/`err`/`in` statics are serviced by the
+///   bootstrap intercept inside [`jit_getstatic`], which returns a synthetic
+///   stream rather than the stored value. A direct load would read the raw
+///   slot and `println` would silently no-op on a null stream.
+/// * **Not yet initialized** — an inline load runs no `<clinit>` (JVMS §5.5).
+///   The helper's init check is the only thing standing between a compiled
+///   first-touch `getstatic` and the zero-initialized placeholder; a site is
+///   therefore only inlined when the class is ALREADY initialized at compile
+///   time, which is also exactly when HotSpot omits its init barrier.
+/// * **Nothing published / index off** — no address to bake.
+///
+/// # Lock discipline
+///
+/// This runs on whichever thread is compiling, including the background
+/// compiler, and takes **no VM lock at all**: three relaxed/acquire atomic
+/// loads. That is deliberate. The compiler is called from inside the
+/// interpreter's tier-up path and from a background thread, and a resolver that
+/// reached for `class_manager.read()` would be one queued writer away from
+/// deadlocking a compile against a class load.
+///
+/// # Safety
+///
+/// `vm_ptr` must be the `SharedVm` pointer the JIT registered alongside this
+/// function (see `set_static_base_resolver`), or 0.
+pub unsafe extern "C" fn jit_resolve_static_base(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+) -> i64 {
+    if vm_ptr == 0 || class_id_raw < 0 || field_index < 0 {
+        return 0;
+    }
+    // SAFETY: `vm_ptr` is the `&SharedVm` the VM registered with the JIT; the
+    // `SharedVm` lives inside an `Arc` for the life of the process.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let raw = class_id_raw as u32;
+    if vm
+        .classes
+        .system_class_id
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == raw
+    {
+        return 0;
+    }
+    if !class_init_memo::is_initialized(vm.vm_identity, raw) {
+        return 0;
+    }
+    if crate::vm::statics_index_disabled() {
+        return 0;
+    }
+    match vm
+        .classes
+        .statics_index
+        .base_cell_addr(ClassId::new(raw), field_index as usize)
+    {
+        // Cast: a user-space address always fits the positive i64 range; `0` is
+        // the sentinel and `base_cell_addr` never returns a null cell address.
+        Some(addr) => addr as i64,
+        None => 0,
+    }
+}
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6672,8 +6866,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
         // which is also the all-zero header the collector leaves over a
         // reclaimed span; free-list membership tells the two apart.
-        // See docs/known-issues/h2/
-        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+        // See docs/gc/old-sweep-liveness.md section 7.
         //
         // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
         // this defect — interpreted `checkcast`, compiled `checkcast`, and an
@@ -6771,7 +6964,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md).
+    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -7279,6 +7472,359 @@ fn admit_jit_fast_native_resolved(
     Some((callback, id))
 }
 
+/// Leaf-native fast-path hits from compiled code, reported on shutdown by
+/// `CRATONVM_DBG=intrinsic-stats` beside the interpreter's own counter.
+///
+/// This exists for the same reason that one does, and the reason is worth
+/// restating: **timings cannot tell "the fast path was never installed" from
+/// "it was installed and is no faster."** Two earlier attempts at the
+/// interpreter's `Thread.currentThread` bypass were inert, and only a counter
+/// showed it. A JIT-side path has one extra way to be silently inert — the
+/// site cache can resolve to `None` and cache the refusal forever — so the
+/// number this prints is the acceptance criterion, not the ns/op.
+static LEAF_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Leaf-native dispatches served from compiled code this run.
+pub fn leaf_native_hit_count() -> u64 {
+    LEAF_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Site-cached NON-leaf native dispatches from compiled code — the ones that
+/// skipped `invoke_or_native` but still entered the full funnel.
+///
+/// Reported separately from the leaf count because they answer different
+/// questions and have different expected magnitudes: this is every registered
+/// native a compiled method calls, whereas the leaf count is only the audited
+/// accessor set.
+static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Non-leaf natives dispatched from a resolved call site this run.
+pub fn site_cached_native_hit_count() -> u64 {
+    SITE_CACHED_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Call sites `resolve_native_site` declined, and why.
+///
+/// A hit count of zero has two very different explanations — "nothing on this
+/// workload is a leaf" and "every site was refused for a reason I did not
+/// intend" — and only the second is a bug. Rather than rebuild the VM to find
+/// out (a release build here is ~15 minutes), the refusal reason is recorded at
+/// fill time, which runs once per site and never on the dispatch path.
+///
+/// `CRATONVM_DBG=intrinsic-stats` prints the tally. The strings are `&'static`
+/// reason tags, not formatted messages, so nothing allocates unless the flag
+/// asked for the dump.
+mod site_refusal {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One counter per refusal reason, in the order they are tested.
+    pub(super) static COUNTS: [AtomicU64; 7] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub(super) const REASONS: [&str; 7] = [
+        "invoke-kind not virtual/interface/static, or receiver not a heap object",
+        "method name is special-cased by invoke_or_native",
+        "receiver class unavailable",
+        "capability-classified triple",
+        "no native for the triple on the receiver or its supers (bytecode wins)",
+        // Slot 5 is retired: it meant "registered, but does not claim leaf",
+        // which was a refusal only while this cache served leaves alone.
+        // Non-leaf natives now get an entry too — they skip `invoke_or_native`
+        // and still enter the funnel — so nothing reports it. Kept as a slot
+        // rather than renumbered, so a reader comparing an old run's output
+        // against a new one is not silently misled about which reason a count
+        // belongs to.
+        "(retired: not-a-leaf is no longer a refusal)",
+        "SyntheticStub / policy refused",
+    ];
+
+    #[inline]
+    pub(super) fn note(reason: usize) -> Option<super::NativeSiteCache> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// [`note`] for the dispatch-side bails, which return "not served here"
+    /// rather than "no cache entry".
+    #[inline]
+    pub(super) fn note_and_decline(reason: usize) -> Option<i64> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub(super) fn report() -> Vec<(&'static str, u64)> {
+        REASONS
+            .iter()
+            .zip(COUNTS.iter())
+            .map(|(r, c)| (*r, c.load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+}
+
+/// Per-reason tally of JIT call sites the leaf fast path declined. Cold; read
+/// once on shutdown by `CRATONVM_DBG=intrinsic-stats`.
+pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
+    site_refusal::report()
+}
+
+/// Does `invoke_or_native` special-case this method name BEFORE it reaches its
+/// generic "find the registered native" step?
+///
+/// `vm_exec::invoke_or_native` opens with a cascade of hand-written gates —
+/// `MethodHandle.type()`, the `invoke`/`invokeExact`/`invokeBasic` family, the
+/// `AnnotationProxy` retarget, `ClassLoader`'s resource + `loadClass` bridges,
+/// `setDefaultAssertionStatus`, the Spring Boot loader's jar shims, the
+/// `ToIntFunction.apply` SAM bridges — each of which can route a call somewhere
+/// other than the registry slot for its own triple. The leaf fast path skips
+/// that entire cascade, so it must not be installed for a site the cascade
+/// would have claimed.
+///
+/// The list is keyed on the **method name** alone, deliberately over-broad: it
+/// is consulted once per call site at cache-fill time, and refusing one extra
+/// name costs a fast path nobody has asked for while a missed name would be a
+/// miscompile. Nothing in the leaf set (field reads, field writes, atomics,
+/// `Math`, `System.nanoTime`, `Thread.currentThread`) is anywhere near it.
+///
+/// Pinned by `leaf_native_sites_avoid_invoke_or_native_special_cases` below: if
+/// a future registration marks one of these names leaf, that test fails rather
+/// than the VM silently taking a different call.
+fn site_name_is_special_cased(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "type"
+            | "invoke"
+            | "invokeExact"
+            | "invokeBasic"
+            | "apply"
+            | "loadClass"
+            | "setDefaultAssertionStatus"
+            | "getResource"
+            | "getResources"
+            | "getResourceAsStream"
+            | "isMultiRelease"
+            | "getJarEntry"
+            | "getRealName"
+            | "getCertificates"
+            | "getCodeSigners"
+            | "getEntry"
+            | "bufferEndsWithSignatureSuffix"
+            | "<init>"
+            | "<clinit>"
+    )
+}
+
+/// Resolve a JIT call site to a leaf native, or refuse.
+///
+/// Cold: called once per `(vm, call site)` and again only when the native
+/// registry's generation moves. Everything expensive — the registry hash, the
+/// policy round trip, the class-manager read for a virtual receiver's name —
+/// lives here and not on the dispatch path.
+///
+/// Refuses (returns `None`, cached as a negative) when any of these hold, and
+/// each refusal is a semantic obligation the fast path could not otherwise
+/// discharge:
+///
+/// * the invoke kind is `invokespecial` — a super-call resolves by walking from
+///   the CP class to the declaring class (`invoke_special_shared`), which is not
+///   what this cache's single-slot lookup answers;
+/// * the method name is one `invoke_or_native` special-cases (see above);
+/// * no native is registered for the triple, or its slot does not claim leaf;
+/// * the slot is a `SyntheticStub` — those are subject to the
+///   `real_protected_stub_class` / `has_real` yield-to-bytecode arbitration in
+///   `invoke_or_native`, which this path does not reproduce;
+/// * a capability policy is installed — `check_native_dispatch_capability` runs
+///   at the funnel's dispatch site, and skipping the funnel would skip the gate;
+/// * `admit_jit_fast_native_resolved` declines (`--jdk-only` §1.3).
+fn resolve_native_site(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    receiver_class_id: Option<ClassId>,
+) -> Option<NativeSiteCache> {
+    if !matches!(info.invoke_kind, 0 | 2 | 3) {
+        return site_refusal::note(0);
+    }
+    if site_name_is_special_cased(info.method_name) {
+        return site_refusal::note(1);
+    }
+    // Static sites resolve on the constant-pool owner; virtual/interface sites
+    // resolve on the receiver's runtime class, which is the only authority on
+    // which override actually runs.
+    let (lookup_class, guard) = match info.invoke_kind {
+        3 => (info.class_name.to_string(), None),
+        _ => {
+            let Some(cid) = receiver_class_id else {
+                return site_refusal::note(2);
+            };
+            let Some(name) = vm
+                .classes
+                .class_manager
+                .try_read()
+                .and_then(|cm| cm.get_class(cid).map(|class| class.name.to_string()))
+            else {
+                return site_refusal::note(2);
+            };
+            (name, Some(cid.as_u32()))
+        }
+    };
+    // The capability gate (`vm_exec::check_native_dispatch_capability`) runs at
+    // the funnel's dispatch site, so a path that skips the funnel must not skip
+    // a gate that could have said no — or, in Permissive mode, could have
+    // recorded an audit entry.
+    //
+    // The condition is `classify_native`, NOT "is a policy installed": a policy
+    // is ALWAYS installed (`vm_init` calls `set_capabilities` unconditionally,
+    // defaulting to Permissive, so that `capability_audit` can report), and an
+    // earlier cut of this function gated on its mere presence — which made the
+    // whole fast path inert in every configuration. That was caught by
+    // `LEAF_NATIVE_HITS` reading 0 on a run whose ns/op had not moved, which is
+    // exactly the failure mode that counter exists for; the timings alone said
+    // "no faster", not "never ran".
+    //
+    // `classify_native` is a pure function of `(class, method)` and is the FIRST
+    // thing the dispatch-site gate consults: when it answers `None`, that gate
+    // returns `Ok(())` in every mode without touching the policy or the audit
+    // log. So refusing the sensitive triples here is exactly equivalent, and no
+    // leaf native is one — the classified set is process spawn, library load,
+    // `Unsafe`, Panama, file and socket I/O, none of which could satisfy the
+    // leaf contract in the first place.
+    if cratonvm_native_api::capability::classify_native(&lookup_class, info.method_name).is_some() {
+        return site_refusal::note(3);
+    }
+    // The triple may be registered on the receiver's class OR inherited from a
+    // superclass — `AbstractOwnableSynchronizer.setExclusiveOwnerThread` is
+    // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
+    // and `invoke_or_native` has a specific rule for that walk which has to be
+    // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
+    let Some((owner_class, id)) = resolve_native_owner_for_receiver(vm, &lookup_class, info) else {
+        return site_refusal::note(4);
+    };
+    // `Thread.currentThread()` is served from the thread mirror instead of the
+    // registered body — see `LeafNativeKind::ThreadCurrentThread` — so it is
+    // recognised here rather than claimed at registration. Everything else
+    // about the resolution is identical, deliberately: the site is only
+    // installed if the native is registered AND policy admits it, so
+    // `--jdk-only` and the capability gate above still decide.
+    //
+    // Everything that is NOT a leaf still gets an entry. It skips only
+    // `invoke_or_native`, and still enters the full funnel through
+    // `safe_native_call_prevalidated_objects` — see the `leaf` field's doc for
+    // why that split is where the money is.
+    let (kind, leaf) = if info.invoke_kind == 3
+        && owner_class == "java/lang/Thread"
+        && info.method_name == "currentThread"
+        && info.descriptor == "()Ljava/lang/Thread;"
+    {
+        (LeafNativeKind::ThreadCurrentThread, true)
+    } else {
+        (
+            LeafNativeKind::Callback,
+            vm.natives.native_methods.is_leaf_id(id),
+        )
+    };
+    if vm.natives.native_methods.kind_of_id(id)
+        == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+    {
+        return site_refusal::note(6);
+    }
+    let Some(callback) = vm.natives.native_methods.callback_of(id) else {
+        return site_refusal::note(6);
+    };
+    let Some((callback, native_id)) = admit_jit_fast_native_resolved(
+        vm,
+        &owner_class,
+        info.method_name,
+        info.descriptor,
+        callback,
+        Some(id),
+    ) else {
+        return site_refusal::note(6);
+    };
+    Some(NativeSiteCache {
+        kind,
+        leaf,
+        callback,
+        native_id,
+        receiver_class_id: guard,
+    })
+}
+
+/// Which class's registered native `invoke_or_native` would actually dispatch
+/// for this site, or `None` if it would run bytecode instead.
+///
+/// This reproduces the tail of `vm_exec::invoke_or_native` — the part after its
+/// hand-written gate cascade — and it must stay faithful to it, because the
+/// site cache's whole point is not to run that function per call:
+///
+///  1. a native registered on the dispatch class itself wins outright;
+///  2. otherwise, if the dispatch class declares its OWN bytecode for the
+///     method, that bytecode wins and there is no fast path (the S107
+///     collection-`toString` rule);
+///  3. otherwise walk the superclass chain. The first parent that declares the
+///     method in bytecode ends the walk — **unless that same parent also has a
+///     registered native, in which case the native wins** (the round-19
+///     LinkedHashMap-overlay rule). A parent with a native and no bytecode also
+///     wins.
+///
+/// Rule 3's exception is the one that matters here:
+/// `AbstractOwnableSynchronizer` has both a real `setExclusiveOwnerThread` body
+/// and a registered native, and the native is the one that runs — which is why
+/// resolving on the receiver class alone (`ReentrantLock$NonfairSync`) found
+/// nothing and refused the site.
+///
+/// Cold: fill time only.
+fn resolve_native_owner_for_receiver(
+    vm: &SharedVm,
+    dispatch_class: &str,
+    info: &JitInvokeInfo,
+) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
+    let registry = &vm.natives.native_methods;
+    if let Some(id) = registry.resolve_id(dispatch_class, info.method_name, info.descriptor) {
+        return Some((dispatch_class.to_string(), id));
+    }
+    // `<init>` is never inherited; the walk below would be wrong for it. It is
+    // already refused by `site_name_is_special_cased`, but state it here
+    // too so this function is correct in isolation.
+    if info.method_name == "<init>" {
+        return None;
+    }
+    let cm = vm.classes.class_manager.try_read()?;
+    let mut cid = cm.get_loaded_class_id(dispatch_class)?;
+    if cm
+        .get_class(cid)
+        .is_some_and(|c| c.find_method(info.method_name, info.descriptor).is_some())
+    {
+        // Rule 2: the dispatch class's own bytecode wins.
+        return None;
+    }
+    while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+        let parent = cm.get_class(parent_id)?;
+        let parent_native =
+            registry.resolve_id(&parent.name, info.method_name, info.descriptor);
+        if parent
+            .find_method(info.method_name, info.descriptor)
+            .is_some()
+        {
+            // Rule 3: bytecode here ends the walk, and only a native declared
+            // on THIS parent may override it.
+            return parent_native.map(|id| (parent.name.to_string(), id));
+        }
+        if let Some(id) = parent_native {
+            return Some((parent.name.to_string(), id));
+        }
+        cid = parent_id;
+    }
+    None
+}
+
 /// Count one native dispatch on a JIT fast-path edge (§4 census).
 ///
 /// One `Option` test plus one relaxed `fetch_add` on an id resolved at
@@ -7303,7 +7849,20 @@ struct DispatchCache {
     entry: usize,
     needs_context: bool,
     /// Owns JIT code while this thread-local raw entry remains published.
-    _owner: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>>,
+    ///
+    /// [`cratonvm_jit::RetainedCode`], not a bare `Arc`, because this map is
+    /// evicted by the very thread that dispatches through it: a generation
+    /// flush (`flush_raw_entry_dispatch_caches`), a class-identity flush, a
+    /// replacement `insert`, or thread exit. Any of those can run while this
+    /// thread is *inside* the body it names — `try_mic_rust_cached_entry` reads
+    /// only `entry`/`needs_context` out of the map and calls the raw pointer, so
+    /// the map entry is the sole owner across the call, and a nested dispatch
+    /// from the callee re-enters the flush. Dropping a bare `Arc` there unmaps
+    /// the code under this thread's own return address; measured on
+    /// `BasicErrorControllerIntegrationTests` at
+    /// `active_jit_executions` = 1. The wrapper releases through
+    /// `defer_jit_owner`, which retains until no thread is in compiled code.
+    _owner: Option<cratonvm_jit::RetainedCode>,
 }
 
 #[derive(Clone, Copy)]
@@ -7344,6 +7903,84 @@ struct IntegerNativeDispatchCache {
     native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
+/// A JIT call site resolved to a **leaf** native — see
+/// [`cratonvm_native_api::NativeMethodRegistry::set_leaf`].
+///
+/// This is the compiled-code half of the funnel bypass the interpreter already
+/// has for `Thread.onSpinWait` / `Thread.currentThread`. Measured on
+/// `probes/NativeShapeProbe.java`, a no-argument static native from compiled
+/// code cost ~560 ns against ~8 ns for an ordinary Java call, and essentially
+/// none of it was the native's own body: it was `jit_invoke_dispatch`'s tail
+/// (`invoke_or_native`, a ~27-gate string cascade ending in a three-string
+/// registry hash) plus `safe_native_call`'s GC bookkeeping. This entry removes
+/// both — the cascade at cache-fill time, the funnel via
+/// `safe_native_call_leaf`.
+/// What a resolved leaf site actually does on a hit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafNativeKind {
+    /// Call the registered callback through `safe_native_call_leaf`.
+    Callback,
+    /// `Thread.currentThread()` — answered from `thread.java_thread_obj`
+    /// WITHOUT calling the native at all, exactly as the interpreter's inline
+    /// cache does (`dispatch_static.rs`, `InterpIntrinsic::ThreadCurrentThread`).
+    ///
+    /// It cannot be an ordinary leaf, because its registered body
+    /// (`native_thread_current_thread` → `NativeContext::current_thread_object`)
+    /// **allocates** when this thread's mirror has not been built yet — it
+    /// loads `java/lang/Thread`, allocates the mirror, builds the field holder
+    /// and the thread group. That is a real violation of leaf contract item 1,
+    /// so the claim is not made at registration; the site instead serves only
+    /// the warm case and falls through to the ordinary dispatcher (which runs
+    /// that allocating slow path) when the mirror is absent.
+    ///
+    /// Worth its own arm because of how often the JDK calls it: **twice per
+    /// uncontended `ReentrantLock.lock()`/`unlock()` pair**, censused with
+    /// `--dump-native-registry` in `probes/LockNativeCensusProbe.java`, plus
+    /// every AQS ownership check and every thread-local lookup. The interpreter
+    /// took it from 306 ns to 136 ns; compiled code was still paying 564 ns
+    /// because none of the compiled loop's calls reach the interpreter's cache.
+    ThreadCurrentThread,
+}
+
+#[derive(Clone, Copy)]
+struct NativeSiteCache {
+    kind: LeafNativeKind,
+    /// Whether the resolved slot claims the leaf contract, and may therefore go
+    /// through `safe_native_call_leaf` instead of the full funnel.
+    ///
+    /// `false` entries are the majority, and they are the reason this cache is
+    /// worth having for more than leaves: **skipping `invoke_or_native` is a
+    /// bigger win than skipping the funnel.** Measured on a quiet host with
+    /// `probes/AqsAttributionProbe.java`:
+    ///
+    /// | | ns/op |
+    /// |---|---:|
+    /// | ordinary Java call | 7.9 |
+    /// | `AtomicInteger.get` — leaf, site-cached | 233 |
+    /// | `AtomicInteger.compareAndSet` — non-leaf | 806 |
+    /// | `setExclusiveOwnerThread` — non-leaf, 2 object args | 821 |
+    ///
+    /// The ~570 ns between the leaf and non-leaf rungs is not the funnel — it
+    /// is the dispatcher's tail re-running `invoke_or_native`'s ~27-gate string
+    /// cascade and its three-string registry hash **on every call**. Resolving
+    /// the site once removes that for both flavours; the leaf claim then
+    /// decides only which call wrapper runs.
+    leaf: bool,
+    callback: cratonvm_native_api::NativeCallback,
+    /// §4 census handle — see [`NativeDispatchCache::native_id`].
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
+    /// Exact receiver class id this entry is valid for, or `None` for an
+    /// `invokestatic` site (no receiver to guard).
+    ///
+    /// A virtual/interface site is resolved on the RECEIVER's runtime class,
+    /// not on `info.class_name` (the constant-pool owner), for the same reason
+    /// [`NativeDispatchCache`] is keyed that way: an interface method resolves
+    /// to whatever the receiver overrides. The guard is re-tested on every hit
+    /// so a site that goes polymorphic falls out to the generic dispatcher
+    /// rather than calling the wrong body.
+    receiver_class_id: Option<u32>,
+}
+
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
 // Using a thread-local avoids synchronization on the hot path.
 // T10.9.B: FxHashMap — pointer values are internal; this is touched on every
@@ -7364,6 +8001,15 @@ thread_local! {
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static INTEGER_NATIVE_DISPATCH_CACHE:
         std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, Option<IntegerNativeDispatchCache>>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Leaf-native resolution per JIT call site — see
+    /// [`NativeSiteCache`]. `None` is a cached refusal ("this site is
+    /// not a leaf native"), which is what keeps the ~27-gate `invoke_or_native`
+    /// probe off every OTHER site's steady state; it is keyed on the registry
+    /// generation stored beside it so a lazy `register_*` pass that appears
+    /// later is still seen.
+    static NATIVE_SITE_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, (u32, Option<NativeSiteCache>)>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// Real `java/lang/Integer` class discovered from the first ordinary
     /// `valueOf` result in each VM, as `(vm_identity, class id)`. A different
@@ -7917,6 +8563,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
         }
     }
+    // Leaf-native fast path. Placed here — after the exact-receiver object
+    // native cache above, before the Integer cache and the whole compile /
+    // virtual-dispatch machinery below — because a leaf native is by definition
+    // a call with nothing to compile and nothing to dispatch: a field read, an
+    // atomic, or a constant. Everything after this point is per-call work that
+    // such a site was paying for no reason. See `NativeSiteCache`.
+    if let Some(result) = try_jit_site_cached_native_dispatch(vm, info, info_key, args_slice) {
+        return result;
+    }
     if !class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
         let cached =
             INTEGER_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
@@ -8088,7 +8743,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                         DispatchCache {
                                             entry,
                                             needs_context,
-                                            _owner: Some(owner),
+                                            _owner: Some(owner.into()),
                                         },
                                     );
                                 });
@@ -8199,7 +8854,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
-                        _owner: Some(compiled.clone()),
+                        _owner: Some(compiled.clone().into()),
                     },
                 );
             });
@@ -8261,7 +8916,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         DispatchCache {
                             entry,
                             needs_context: needs_ctx,
-                            _owner: Some(owner),
+                            _owner: Some(owner.into()),
                         },
                     );
                 });
@@ -8635,6 +9290,133 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     ret
 }
 
+/// The leaf-native fast path for compiled code, probed once per
+/// `jit_invoke_dispatch` before any of the compile/dispatch machinery runs.
+///
+/// `Some(ret)` means the call was fully served here; `None` means this site is
+/// not a leaf native and the caller must continue down its ordinary route.
+///
+/// # Why this is safe to take instead of `invoke_or_native`
+///
+/// `resolve_native_site` (which runs once per site) is where every
+/// obligation is discharged: the invoke kind, the `invoke_or_native` special
+/// cases, the `SyntheticStub` arbitration, the capability policy and the
+/// `--jdk-only` admission. What is left on this path is the receiver-class
+/// guard — re-tested on every hit so a site that goes polymorphic drops out —
+/// and the call itself.
+///
+/// # Redefinition
+///
+/// The entry is discarded when the target class has been redefined, on the
+/// same terms as the Integer cache below it, and re-resolved when the native
+/// registry's generation moves (so a lazily-registered native, or one whose
+/// re-registration dropped the leaf claim, is picked up rather than memoized
+/// wrong — the failure the `NativeCallSite` doc calls out for `OnceLock`).
+///
+/// SAFETY: `args_slice` is the JIT caller's own stack buffer, already forwarded
+/// by `forward_jit_reference_args` in the caller.
+unsafe fn try_jit_site_cached_native_dispatch(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    args_slice: &[i64],
+) -> Option<i64> {
+    // Every bail below is counted, including these pre-resolution ones. An
+    // uncounted `return None` here is what made the first cut of this path
+    // unexplainable: `AtomicInteger.get` showed neither a hit nor a refusal,
+    // because it was arriving at `jit_invoke_virtual_mic` — a different entry
+    // point — and never reaching this function at all.
+    if !matches!(info.invoke_kind, 0 | 2 | 3) {
+        return site_refusal::note_and_decline(0);
+    }
+    // The receiver's runtime class both selects the override to resolve and
+    // guards a warm entry. A static site has neither.
+    let receiver_class_id = if info.invoke_kind == 3 {
+        None
+    } else {
+        let raw = *args_slice.first()? as u64;
+        if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+            return site_refusal::note_and_decline(0);
+        }
+        match vm.mem.heap.is_object_address(raw as usize) {
+            Some(obj) => Some(vm.mem.heap.class_id_of(obj)),
+            None => return site_refusal::note(0).map(|_| 0),
+        }
+    };
+
+    let generation = vm.natives.native_methods.generation();
+    let cached = NATIVE_SITE_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+    let entry = match cached {
+        Some((gen, entry)) if gen == generation => entry,
+        _ => {
+            let resolved = resolve_native_site(vm, info, receiver_class_id);
+            NATIVE_SITE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(info_key, (generation, resolved));
+            });
+            resolved
+        }
+    };
+    let entry = entry?;
+    // Re-check the receiver guard on every hit: the entry was resolved against
+    // one runtime class, and this site may since have seen another.
+    if entry.receiver_class_id != receiver_class_id.map(|cid| cid.as_u32()) {
+        return None;
+    }
+    if class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
+        return None;
+    }
+    if let Some(cid) = receiver_class_id {
+        if class_was_redefined(vm, cid) {
+            return None;
+        }
+    }
+
+    let (thread, _guard) = jit_thread_mut()?;
+    if entry.kind == LeafNativeKind::ThreadCurrentThread {
+        // The mirror is a per-thread GC root the collector remaps, and handing
+        // it to the caller roots it again with no allocation in between. When
+        // it does not exist yet, fall through: the ordinary dispatcher runs
+        // `current_thread_object`'s allocating slow path that builds it.
+        let obj = thread.java_thread_obj?;
+        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count_jit_native_dispatch(vm, entry.native_id);
+        // Object-return handoff root, same contract as every other JIT native
+        // fast path (see `jit_integer_value_of_direct`).
+        thread.native_pending_return = Some(obj);
+        return Some(obj.as_ptr() as i64);
+    }
+    let values = decode_dispatch_values(vm, info, args_slice);
+    if entry.leaf {
+        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    count_jit_native_dispatch(vm, entry.native_id);
+    // `decode_dispatch_values` heap-validated every object argument, which is
+    // exactly the precondition `..._prevalidated_objects` names — and it is the
+    // same call `invoke_or_native` would have made after its cascade, so the
+    // non-leaf path here differs from the generic route only by what it did
+    // NOT re-resolve.
+    let called = if entry.leaf {
+        crate::vm::safe_native_call_leaf(vm, thread, entry.callback, &values)
+    } else {
+        crate::vm::safe_native_call_prevalidated_objects(vm, thread, entry.callback, &values)
+    };
+    let result = match called {
+        Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(v)) => v as i64,
+        Some(Value::Long(v)) => v,
+        Some(Value::Float(f)) => f.to_bits() as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        Some(_) => 0,
+    })
+}
+
 /// Try to compile a callee method from a JitInvokeInfo.
 /// Returns (entry_ptr, needs_context) if compilation succeeds.
 // SAFETY: Caller must ensure vm is a valid SharedVm reference and info points to a live
@@ -8669,7 +9451,7 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // Thin direct-call native helpers (`jit_integer_value_of_direct`,
 // `jit_integer_int_value_direct`, `jit_hashmap_put_direct`,
 // `jit_hashmap_get_direct`, `jit_string_latin1_to_lower_direct`,
-// `jit_string_locale_to_lower_direct`, `jit_concurrent_hashmap_get_direct`).
+// `jit_concurrent_hashmap_get_direct`).
 //
 // Each is a VM-side reimplementation of a registered native, baked straight
 // into the emitted `CALL` — no dispatch helper, and so no policy check, on the
@@ -8945,6 +9727,96 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
         &INTEGER_INT_VALUE_INFO as *const JitInvokeInfo as i64,
         args.as_ptr() as i64,
         1,
+    )
+}
+
+/// Synthetic call-site info for [`jit_thread_current_thread_direct`]'s
+/// cold arm (the first call on a thread whose mirror has not been built).
+static THREAD_CURRENT_THREAD_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Thread",
+    method_name: "currentThread",
+    descriptor: "()Ljava/lang/Thread;",
+    num_jit_args: 0,
+    return_type: b'L',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Process-wide count of compiled-code native-funnel bypasses.
+///
+/// The counter exists for the same reason
+/// `dispatch_static::INTRINSIC_HITS` does, and the source document says why
+/// in as many words: *"the counter exists because two earlier attempts at
+/// this shape were **inert**, and timings alone cannot tell 'never installed'
+/// from 'installed but no faster'."* A JIT-side bypass has one extra way to
+/// be inert that the interpreter one does not — `try_compile` may simply
+/// never recognise the site — so a counter incremented in the emitted call's
+/// own target is the only evidence that compiled code took this path.
+///
+/// Reported by `CRATONVM_INTRINSIC_STATS=1` alongside the interpreter count.
+pub static JIT_FUNNEL_BYPASS_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of compiled-code native-funnel bypasses since process start.
+pub fn jit_funnel_bypass_count() -> u64 {
+    JIT_FUNNEL_BYPASS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Thin direct-call target for JIT `invokestatic Thread.currentThread()`
+/// sites (registered into `cratonvm_jit::THREAD_CURRENT_THREAD_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// The JIT half of the bypass the interpreter got in
+/// `dispatch_static.rs`'s `InterpIntrinsic::ThreadCurrentThread` arm. Once a
+/// thread's `java_thread_obj` mirror exists, `currentThread()` is one field
+/// read of a value that is **already a per-thread GC root**: there is no
+/// argument to pin, nothing here allocates, collects or throws, and no Java
+/// code runs. Everything `safe_native_call` does for it — the argument copy
+/// and GC-forwarding barrier, `native_pin_roots`, the STW probe, the two
+/// GC-pressure probes, two `thread_state::record_transition` calls, the
+/// native ring, `catch_unwind`, the `memwatch`/`ec_watch` polls — is
+/// bookkeeping for hazards this operation does not have.
+///
+/// What the compiled site paid instead was *worse* than the funnel: an
+/// `invokestatic` whose callee is a registered native binds no compiled body,
+/// so it fell through `jit_invoke_dispatch` to `vm_exec::invoke_or_native`,
+/// which re-resolves the callee **by name** on every call and only then
+/// enters the funnel.
+///
+/// The cold arm — a thread whose mirror has not been built yet, i.e. at most
+/// once per thread — routes to `jit_invoke_dispatch` with the synthetic
+/// call-site info above, which is byte-for-byte the route the site took
+/// before this helper existed. That keeps `current_thread_object`'s
+/// allocating slow path in exactly one place.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_thread_current_thread_direct(vm_ptr: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as every other direct helper: the
+    // per-thread conservative-scan cache must be invalidated. No SATB flush —
+    // the fast arm below cannot allocate or enter the GC barrier, and the
+    // cold arm's `jit_invoke_dispatch` performs its own.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Some(obj) = thread.java_thread_obj {
+            // Mirror `safe_native_call`'s object-return handoff root, exactly
+            // as `call_integer_native_raw` does. The mirror is already rooted
+            // per-thread, so this is the diagnostic/contract half rather than
+            // a liveness requirement — but a returned object that is NOT in
+            // `native_pending_return` is a shape every other object-returning
+            // JIT edge here avoids, and nothing is gained by being the
+            // exception.
+            thread.native_pending_return = Some(obj);
+            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return obj.as_ptr() as i64;
+        }
+    }
+    // No mirror yet (or no JIT thread context): the ordinary route, which is
+    // what this site did on every call before the fast arm existed.
+    jit_invoke_dispatch(
+        vm_ptr,
+        &THREAD_CURRENT_THREAD_INFO as *const JitInvokeInfo as i64,
+        0,
+        0,
     )
 }
 
@@ -9245,19 +10117,6 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
     )
 }
 
-/// Direct receiver-typed `String.toLowerCase(Locale)` entry — the thin
-/// direct-call form the JIT emits instead of a generic native-dispatch round
-/// trip, which dominates repeated case folding.
-///
-/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
-pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
-    vm_ptr: i64,
-    source: i64,
-    locale: i64,
-) -> i64 {
-    jit_string_latin1_to_lower_direct(vm_ptr, source, 0, locale)
-}
-
 /// Compact-Latin1 sibling: `StringLatin1.toLowerCase(String, byte[], Locale)`,
 /// so `value` is the receiver's backing array (unused — the implementation
 /// reads the String) and `locale` the third argument.
@@ -9446,8 +10305,13 @@ fn call_integer_native_raw_inner(
                 // boxing-dominated compiled loop keeps spilling wrappers into
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.mem.heap.young_spill_pressure() {
+                    // `|| old_gen_needs_gc()`: same reasoning as the
+                    // `safe_native_call` hook this mirrors — the young trigger
+                    // cannot see pressure that has gone into old gen, which is
+                    // where every spill lands. See `vm_exec.rs`.
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.mem.heap.needs_gc_for_jit_allocation()
+                        && (vm.mem.heap.needs_gc_for_jit_allocation()
+                            || vm.mem.heap.old_gen_needs_gc())
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
@@ -10225,6 +11089,30 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
     let receiver_raw = args_slice[0];
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
+
+    // Leaf-native fast path — the invokevirtual/invokeinterface half.
+    //
+    // This entry point, not `jit_invoke_dispatch`, is where compiled virtual
+    // calls arrive: the x64 backend emits `jit_invoke_virtual_mic` for them and
+    // reserves the generic dispatcher for static/special sites and bailouts.
+    // Hooking only the dispatcher left every *instance* leaf native — the whole
+    // `AtomicInteger`/`AtomicLong` accessor set, i.e. item 2 of the AQS doc —
+    // still paying the full funnel, with the site never even reaching
+    // `resolve_native_site` to be counted as a refusal. `AtomicInteger.get`
+    // measured 1026 ns before and 926 ns after the dispatcher-only version:
+    // unchanged, while `Math.abs` (static, same mechanism) went 330 -> 84.
+    //
+    // Placed immediately after `forward_jit_reference_args` so the receiver this
+    // reads is the post-SATB-flush address, and before the MIC/PIC machinery,
+    // which a native leaf has no use for — there is no compiled callee to cache.
+    if let Some(result) = try_jit_site_cached_native_dispatch(
+        vm,
+        info,
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+        args_slice,
+    ) {
+        return result;
+    }
 
     // WS1 (kafka JIT throughput): the `Value` decode is deferred. The MIC-hit
     // fast path dispatches straight off the raw `args_slice` and never
@@ -11425,6 +12313,106 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // Leaf natives: the set, and the one thing that could make skipping
+    // `invoke_or_native` wrong
+    // -----------------------------------------------------------------------
+
+    /// Populate a registry the way `vm_init` does for **real-JDK mode**, so the
+    /// leaf set under test is the one a real run has rather than a hand-written
+    /// list.
+    ///
+    /// `register_essential_natives_with_shims` and not `register_builtins`,
+    /// deliberately: the latter is `#[cfg(feature = "synthetic-jdk")]`-gated in
+    /// `native-builtins` and degrades to a no-op shim
+    /// (`vm/src/native/builtins.rs`) without it, so a test built on it would
+    /// pass vacuously — an empty registry has no non-conforming leaf — in
+    /// exactly the configuration it was meant to cover. This entry point is
+    /// ungated and is the one every `--java-home` run takes, which is also the
+    /// mode the probes measure.
+    fn registry_with_builtins() -> cratonvm_native_api::NativeMethodRegistry {
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
+        cratonvm_native_builtins::register_essential_natives(&mut r);
+        r
+    }
+
+    /// The leaf fast path skips `vm_exec::invoke_or_native` entirely, and that
+    /// function opens with a cascade of hand-written gates that can route a
+    /// call somewhere OTHER than its own registry slot. If a triple is ever
+    /// marked leaf whose method name that cascade claims, compiled code would
+    /// silently start taking a different call than the interpreter — a
+    /// miscompile with no symptom at the registration site.
+    ///
+    /// `site_name_is_special_cased` is the fill-time refusal that prevents
+    /// it. This pins the two together: the actual boot-time leaf set, against
+    /// the actual predicate.
+    #[test]
+    fn leaf_native_sites_avoid_invoke_or_native_special_cases() {
+        let registry = registry_with_builtins();
+        let leaves = registry.leaf_registrations();
+
+        // Floor, not just "none are bad": a refactor that silently stopped
+        // applying `set_leaf` would leave this test green and vacuous while
+        // every leaf quietly went back to paying the funnel.
+        assert!(
+            leaves.len() >= 20,
+            "expected the boot leaf set to be populated, got {} entries: {:?}",
+            leaves.len(),
+            leaves
+        );
+
+        for (class, method, descriptor) in &leaves {
+            assert!(
+                !site_name_is_special_cased(method),
+                "{class}.{method}{descriptor} is registered as a leaf, but \
+                 `invoke_or_native` special-cases the method name `{method}` \
+                 before it reaches the registry — the JIT leaf fast path would \
+                 take a different call than the interpreter. Either drop the \
+                 leaf claim or remove the special case."
+            );
+        }
+    }
+
+    /// The leaf set is an audited list, so it is worth stating what is on it —
+    /// and, more importantly, what is deliberately NOT. The CAS / fetch-add
+    /// members of the atomics go through the monitor table's per-object CAS
+    /// lock, which is a lock this thread can be made to wait on; contract
+    /// item 2 excludes exactly that, so they must stay on the funnel.
+    #[test]
+    fn the_leaf_set_holds_the_accessors_and_not_the_locking_atomics() {
+        let registry = registry_with_builtins();
+        let is_leaf = |class: &str, method: &str, descriptor: &str| {
+            registry
+                .resolve_id(class, method, descriptor)
+                .is_some_and(|id| registry.is_leaf_id(id))
+        };
+
+        let ai = "java/util/concurrent/atomic/AtomicInteger";
+        assert!(is_leaf(ai, "get", "()I"), "AtomicInteger.get is a leaf");
+        assert!(is_leaf(ai, "set", "(I)V"), "AtomicInteger.set is a leaf");
+        assert!(is_leaf("java/lang/System", "nanoTime", "()J"));
+        assert!(is_leaf("java/lang/Math", "abs", "(I)I"));
+
+        assert!(
+            !is_leaf(ai, "compareAndSet", "(II)Z"),
+            "compareAndSet takes the CAS lock — it must not claim the leaf contract"
+        );
+        assert!(
+            !is_leaf(ai, "getAndIncrement", "()I"),
+            "getAndIncrement goes through atomic_fetch_add_int — not a leaf"
+        );
+        assert!(
+            !is_leaf(ai, "toString", "()Ljava/lang/String;"),
+            "toString allocates a String — not a leaf"
+        );
+        assert!(
+            !is_leaf("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
+            "currentThread's registered body allocates the mirror on first call; \
+             the JIT serves it through LeafNativeKind::ThreadCurrentThread, which \
+             falls through to the ordinary dispatcher instead of claiming leaf"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
     // (docs/vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
@@ -12446,7 +13434,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -13219,7 +14207,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/c2/vm-process-global-state.md`.
+/// `docs/feature-designs/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.
@@ -13249,6 +14237,21 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
     cratonvm_jit::x64::set_disarm_savebase_watch_fn(
         jit_disarm_savebase_watch as *const () as usize,
+    );
+
+    // Compile-time static-slot resolver. Registered through a process-global
+    // setter rather than a `JitRuntimeHelpers` field because it is never called
+    // from generated code — only by the compiler, while emitting — so it needs
+    // no ABI slot, no golden offset and no revision bump. The `SharedVm`
+    // pointer travels with it: the answer is per-VM (`ClassId`s are), and the
+    // setter latches the first VM and permanently disables inlining if a second
+    // one registers, rather than silently resolving VM A's ids against VM B's
+    // statics. A VM-less `build_helpers()` passes 0 and registers nothing.
+    cratonvm_jit::x64::set_static_base_resolver(
+        jit_resolve_static_base as *const () as usize,
+        vm_for_helpers
+            .map(|shared| shared as *const crate::vm::SharedVm as usize)
+            .unwrap_or(0),
     );
 
     // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything
@@ -13330,11 +14333,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_string_latin1_lower_direct_fn(
             jit_string_latin1_to_lower_direct as *const () as usize,
         );
-        cratonvm_jit::set_string_locale_lower_direct_fn(
-            jit_string_locale_to_lower_direct as *const () as usize,
-        );
         cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
             jit_concurrent_hashmap_get_direct as *const () as usize,
+        );
+        cratonvm_jit::set_thread_current_thread_direct_fn(
+            jit_thread_current_thread_direct as *const () as usize,
         );
     }
 
@@ -13353,6 +14356,10 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // hand-built test tables can leave them 0.
         new_object_cp: jit_new_object_cp as *const () as usize,
         anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
+        // Same story for `ldc <Class>`: the mirror is a heap object and the
+        // target may not be loaded at compile time, so the site is served by a
+        // CP-indexed helper. Always wired in production.
+        ldc_class_cp: jit_ldc_class_cp as *const () as usize,
         // These two existed but were unreachable from the JIT: correct
         // implementations with no table slot, so `ir_lower` had nothing to call
         // and monitors could not be lowered at all.
@@ -13553,6 +14560,7 @@ const _: () = {
     let _: HelperFnAnewarrayObject = jit_anewarray_object;
     let _: HelperFnNewObjectCp = jit_new_object_cp;
     let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
+    let _: HelperFnLdcClassCp = jit_ldc_class_cp;
     let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
     let _: HelperFnTlabPostInit = jit_post_tlab_init;
 

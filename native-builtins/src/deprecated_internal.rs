@@ -572,17 +572,18 @@ fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .replace('.', "/");
 
     // Resolve the loader id (arg 5). If null/bootstrap, use 0 to mean
-    // application loader; otherwise look up the loader's own
-    // synthetic id stored on field 6 (CL_LOADER_ID), if present.
+    // application loader; otherwise ask for the loader's own CratonVM
+    // namespace id.
+    //
+    // L1: this was a raw `get_field(loader_obj, 6)`. On a real JDK image slot
+    // 6 is `java.lang.ClassLoader.classes` — an `ArrayList<Class<?>>`
+    // reference, not our id — so the raw read could never answer anything but
+    // the `0` fallback there. `loader_id_of` consults the side table the
+    // `ClassLoader` constructor natives write and only reads the slot on our
+    // own synthetic layout.
     let loader_id = match args.get(5) {
         Some(Value::Object(Some(loader_obj))) => {
-            // Read field 6 (the synthetic loader id slot for our
-            // ClassLoader synthetic objects). Bootstrap/system real
-            // loaders won't have this set; fall through to 0.
-            match ctx.get_field(*loader_obj, 6) {
-                Value::Int(v) if v > 0 => v as u32,
-                _ => 0,
-            }
+            crate::classloader::loader_id_of(ctx, *loader_obj).unwrap_or(0)
         }
         _ => 0,
     };
@@ -1440,7 +1441,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // `Throwable.toString()`) silently reverted to the ORIGINAL short
     // constructor message, dropping the SQL-statement suffix (and any
     // password the test asserts is present in it). See
-    // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md.
+    // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md.
 
     // JBoss Modules JDKModuleFinder.findModule — bypass.
     //

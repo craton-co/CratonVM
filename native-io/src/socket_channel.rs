@@ -38,7 +38,7 @@
 //! All public surface is registered via `register_socket_channel_real`.
 
 use crate::io_flags;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use parking_lot::RwLock;
@@ -1828,8 +1828,15 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
         return Err(ioex(format!("connect denied by outbound policy: {reason}")));
     }
 
+    // Fold IPv4-mapped destinations (`::ffff:a.b.c.d`) to plain IPv4 before
+    // anything vets or dials them: on Windows an AF_INET6 socket cannot reach
+    // one (WSAEADDRNOTAVAIL), and real JDK never produces such a destination
+    // because `InetAddress` collapses the literal to an `Inet4Address`. See
+    // `outbound_policy::normalize_connect_addr`.
     let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
-        Ok(it) => it.collect(),
+        Ok(it) => it
+            .map(crate::outbound_policy::normalize_connect_addr)
+            .collect(),
         Err(e) => return Err(map_err(target, e)),
     };
     if addrs.is_empty() {
@@ -3043,7 +3050,7 @@ fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Opti
 /// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
 /// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
 /// the calling thread, silently killing it. See
-/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #3 — this silently killed HttpClient5's I/O reactor worker
 /// thread mid-connection-setup, before it ever reached `SocketChannel
 /// .connect()`, hanging every request through
@@ -4309,24 +4316,38 @@ fn new_resolved_inet_socket_address(
     host: &str,
     port: i32,
 ) -> MethodCallResult {
-    let h = ctx.create_string(host);
-    if let Ok(Some(Value::Object(Some(addr)))) = ctx.invoke(
+    // Cross-call GC-safety: a freshly created String handed straight into a
+    // re-entrant `invoke` has no root of its own between `create_string` and
+    // the callee reading it off the operand stack, and both calls below run
+    // Java (and therefore can collect). `net_accept` already pins for exactly
+    // this window — it surfaced there as `obj_arg` failing on args[1] inside
+    // the `InetSocketAddress(String,int)` native with "null object argument".
+    // The `InetAddress` `getByName` returns needs the same treatment before it
+    // becomes the second call's argument.
+    let mut scope = NativeHandleScope::new(ctx);
+    let h = scope.create_string(host);
+    let h_h = scope.root(h);
+    let h_cur = scope.get(&h_h);
+    let by_name = scope.invoke(
         "java/net/InetAddress",
         "getByName",
         "(Ljava/lang/String;)Ljava/net/InetAddress;",
-        &[Value::Object(Some(h))],
-    ) {
-        return ctx.new_object_initialized(
+        &[Value::Object(Some(h_cur))],
+    );
+    if let Ok(Some(Value::Object(Some(addr)))) = by_name {
+        let addr_h = scope.root(addr);
+        let addr_cur = scope.get(&addr_h);
+        return scope.new_object_initialized(
             "java/net/InetSocketAddress",
             "(Ljava/net/InetAddress;I)V",
-            &[Value::Object(Some(addr)), Value::Int(port)],
+            &[Value::Object(Some(addr_cur)), Value::Int(port)],
         );
     }
-    let h = ctx.create_string(host);
-    ctx.new_object_initialized(
+    let h_cur = scope.get(&h_h);
+    scope.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(h)), Value::Int(port)],
+        &[Value::Object(Some(h_cur)), Value::Int(port)],
     )
 }
 

@@ -184,3 +184,52 @@ Localizing it means instrumenting Weld's `BackedAnnotatedType`/observer-validati
 ## Next steps
 
 Trace the live bootstrap: enable Weld debug logging during `CdiSmokeTests` and diff the constructed `AnnotatedType`/observer model element-by-element against HotSpot, focusing on which member of `WeldSEBeanRegistrant` (or which `AnnotatedParameter` view) Weld actually feeds into the `WELD-000409` check.
+
+## 2026-08-04 correction — the whole 14-class CDI cluster FAILs again, by default, on fresh `dev`
+
+This doc's "Layer 2" fix (seed `org.jboss.weld.executor.threadPoolType=NONE`
+by default so Weld avoids `ForkJoinPool.invokeAll` entirely) was itself
+conditioned on `!flags().natives.real_forkjoinpool` (`vm/src/vm/vm_init.rs`).
+Commit `16ec5d7ad` ("wip: deep-audit agent handoff snapshot", 2026-07-30)
+changed `real_forkjoinpool`'s resolution from opt-in
+(`present(CRATONVM_REAL_FORKJOINPOOL)`) to **default-on**
+(`!present(CRATONVM_SYNTHETIC_FORKJOINPOOL) || present(CRATONVM_REAL_FORKJOINPOOL)`)
+— so the `threadPoolType=NONE` seed silently stopped firing by default, and
+every CDI class now goes through Weld's `ConcurrentBeanDeployer` again.
+
+That alone should be fine per this doc's "Real ForkJoinPool fix" section
+(gate ON was verified to make `CdiSmokeTests` etc. PASS) — except the real
+FJP bridge's method allow-list never covered
+`ForkJoinPool.invokeAll(Collection)`, the exact overload
+`AbstractExecutorServices.invokeAllAndCheckForExceptions` calls. That
+overload falls through to real JDK bytecode against the bridge's
+under-initialized `commonPool()` object and throws
+`RejectedExecutionException` at `submissionQueue()` — the identical
+mechanism this doc's own "Layer 2" section describes for the *synthetic*
+pool, just for real-pool mode's uncovered overload instead. Confirmed by a
+fresh 2026-08-04 run: all 14 `cdi.*`/`jpa.cdi.*` classes FAIL with this
+exact stack. Full analysis, evidence, and a confirmed workaround
+(`CRATONVM_SYNTHETIC_FORKJOINPOOL=1`, which restores the `threadPoolType=NONE`
+path and makes `CdiSmokeTests` PASS again) are in
+[`docs/internal/fixed-suite-bugs/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md`](cdi-cluster-forkjoinpool-invokeall-rejectedexecution-FIXED-20260804.md).
+This doc's Layers 1/2/3 fixes are all still present and correct — the
+regression is a *new* coverage gap in the real-FJP allow-list exposed only
+once real-FJP became the default, not a reversion of anything fixed here.
+
+## 2026-08-04 update — the coverage gap is FIXED; the workaround is retired
+
+`ForkJoinPool.invokeAll(Collection)` (plus `invokeAny`, `invokeAllUninterruptibly`,
+`lazySubmit` and `awaitQuiescence`) are now on both real-FJP bridge allow-lists,
+and all 14 `cdi.*` / `jpa.cdi.*` classes PASS in the **default** configuration
+with per-class `found`/`ok` counts identical to HotSpot.
+
+Two consequences for this doc:
+
+* The `CRATONVM_SYNTHETIC_FORKJOINPOOL=1` workaround quoted above is no longer
+  needed for this cluster and should not be used — it forces Weld back onto
+  `SimpleBeanDeployer` and hides whether the concurrent path works.
+* This doc's "Layer 2" fix (the `org.jboss.weld.executor.threadPoolType=NONE`
+  default seed, conditioned on `!flags().natives.real_forkjoinpool`) is now
+  genuinely dormant on the default path rather than accidentally so: Weld runs
+  its real `ConcurrentBeanDeployer` and the cluster is green that way. The seed
+  still guards the `CRATONVM_SYNTHETIC_FORKJOINPOOL` path.

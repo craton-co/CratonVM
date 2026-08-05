@@ -1203,10 +1203,16 @@ pub fn create_exception_object_for_class(
                     },
                 )));
             }
+            // SB-LOADER-ZIPCONTENT (2026-08-04): old-gen-spilling retry, same
+            // reason as `alloc_object_shared` / `gc_alloc_array` — a young free
+            // list fragmented by the non-moving JIT-safe sweep must not report
+            // OOM while the old generation still holds most of the heap. This
+            // one matters twice over: failing here replaces the exception the
+            // program actually threw with an `OutOfMemoryError`.
             shared
                 .mem
                 .heap
-                .try_alloc_object(class_id, num_fields)
+                .try_alloc_object_full(class_id, num_fields)
                 .ok_or_else(|| {
                     MethodCallFailed::InternalError(VmError::Runtime(
                         RuntimeError::OutOfMemoryError {
@@ -1782,6 +1788,19 @@ pub fn throw_runtime_error(
         RuntimeError::MatchException { message } => {
             ("java/lang/MatchException", Some(message.as_str()))
         }
+        // The concrete class, not its `IllegalArgumentException` parent: code
+        // that validates a user-supplied regex catches
+        // `PatternSyntaxException` by name, and a parent-class throw is
+        // invisible to that catch. Note the real class declares only
+        // `(String desc, String regex, int index)`, so
+        // `create_exception_object`'s `<init>(String)` path does not populate
+        // `getMessage()` — the same `msg=null` the real `Pattern.compile`
+        // bridge already produces. Getting the class right is the part that
+        // changes control flow; the description text is a separate gap.
+        RuntimeError::PatternSyntaxException { message } => (
+            "java/util/regex/PatternSyntaxException",
+            Some(message.as_str()),
+        ),
         RuntimeError::NotImplemented { feature: _ } => {
             // Not a real Java exception — keep as internal error.
             return MethodCallFailed::InternalError(VmError::Runtime(error));

@@ -455,7 +455,7 @@ thread_local! {
     /// OUTERMOST Java call: `0` means the thread is idle (between calls, parked
     /// in the host event loop) and is modelled as GC-blocked.
     static FOREIGN_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// CR-VXC-3 (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §5.3): the
+    /// CR-VXC-3 (`arch-2026-07-26/vm-exec-closeout.md` §5.3): the
     /// crash handler's publication guard for a foreign-attached thread.
     ///
     /// `crash_handler::java_stack_lines` renders whatever the *faulting* OS
@@ -5888,7 +5888,14 @@ fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) 
 /// Free a JValue array returned by `va_list_to_jvalues`.
 unsafe fn free_jvalues(ptr: *const JValue, len: usize) {
     if !ptr.is_null() && len > 0 {
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(
+        // Rebuild the `Box<[JValue]>` that `va_list_to_jvalues` forgot.
+        // `slice_from_raw_parts_mut` builds the fat pointer directly, instead
+        // of materialising a `&mut [JValue]` and casting it back to a raw
+        // pointer: the reference form asserts an exclusive borrow of memory
+        // this function is about to hand to `Box::from_raw`, which is what
+        // `clippy::cast_slice_from_raw_parts` (denied here) objects to. Same
+        // pointer, same length, no intermediate reference.
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             ptr as *mut JValue,
             len,
         )));

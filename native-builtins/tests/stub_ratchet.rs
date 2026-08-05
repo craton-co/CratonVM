@@ -24,7 +24,7 @@
 //!
 //! It is a *ratchet*: a change that ADDS a synthetic stub pushes the count over
 //! the baseline and fails CI; a change that REMOVES one is welcome and only
-//! requires lowering the baseline (see `docs/internal/stub-ratchet.md`).
+//! requires lowering the baseline (see `stub-ratchet.md`).
 //!
 //! Wire into CI with:
 //!
@@ -116,7 +116,7 @@ fn synthetic_stub_count_does_not_regress() {
          behavior) instead of a fake — do NOT just raise the baseline. If the stub is \
          genuinely, unavoidably needed, re-freeze BASELINE_SYNTHETIC_STUBS to \
          {synthetic} + SLACK ({}) and explain why in the PR. See \
-         docs/internal/stub-ratchet.md.",
+         stub-ratchet.md.",
         synthetic + SLACK,
     );
 }

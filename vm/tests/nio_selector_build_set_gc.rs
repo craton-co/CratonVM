@@ -25,7 +25,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
@@ -66,6 +74,15 @@ fn classpath_dir() -> Option<PathBuf> {
     })
 }
 
+// Un-ignored 2026-08-04. The `#[ignore]` this carried pointed at
+// `serversocket-bind-null-inetaddress-net-sockets-20260803`: under
+// `CRATONVM_REAL=net-sockets` + GC stress, `new ServerSocket(0)` (line 28 of
+// the fixture) NPE'd inside `sun.nio.ch.Net.bind` because the wildcard
+// `InetAddress` arrived null. Root cause was two cross-call GC-safety defects
+// — the `InetSocketAddress`/`InetAddress` construction path in native-builtins
+// losing its own freshly-allocated objects across a cold class load, and
+// `Class.getEnumConstants()` copying out of a relocated `$VALUES`. Both are
+// fixed; the assertions below are unchanged from when they were written.
 #[test]
 fn nio_selector_selected_keys_survives_gc_stress() {
     let Some(bin) = cratonvm_binary() else {
@@ -84,10 +101,19 @@ fn nio_selector_selected_keys_survives_gc_stress() {
         .arg("-c")
         .arg(&classpath)
         .arg(format!("cratonvm.{FIXTURE}"))
-        .env("CRATONVM_DISABLE_DEFAULT_WATCHDOG", "1")
-        .env("CRATONVM_REAL_NET_SOCKETS", "1")
-        .env("CRATONVM_GC_STRESS", "65536")
-        .env("CRATONVM_MOVING_YOUNG", "1")
+        // Grouped spelling. The per-flag `CRATONVM_DISABLE_DEFAULT_WATCHDOG` /
+        // `CRATONVM_REAL_NET_SOCKETS` / `CRATONVM_GC_STRESS` /
+        // `CRATONVM_MOVING_YOUNG` variables are REJECTED at startup now — the
+        // launcher prints the supported spelling and refuses to boot, so this
+        // probe was measuring a VM that never started rather than a selector
+        // under GC stress.
+        //
+        // `stress` carries its magnitude in the grouped value; the two GC
+        // tokens go in ONE `CRATONVM_GC`, because a second assignment replaces
+        // the first rather than adding to it.
+        .env("CRATONVM_THREADS", "-default-watchdog")
+        .env("CRATONVM_REAL", "net-sockets")
+        .env("CRATONVM_GC", "stress=65536,moving-young")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

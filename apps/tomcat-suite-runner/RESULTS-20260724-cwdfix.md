@@ -39,12 +39,12 @@ Diffing HotSpot-PASS vs CratonVM-not-PASS over the 195:
 **Corrected whole-suite total (646 classes): 520 PASS / 91 confirmed
 regressions / 35 true fixture gaps.** The 2026-07-21 and 2026-07-23 figures
 (23 regressions / 172 gaps, then 11/172) were both wrong — see
-[docs/internal/fixed-suite-bugs/tomcat/16-full-suite-6shard-rerun-20260721.md](../../docs/internal/fixed-suite-bugs/tomcat/16-full-suite-6shard-rerun-20260721.md)'s
+fixed-suite-bugs/tomcat/16-full-suite-6shard-rerun-20260721.md's
 correction notice for the full explanation. The 35 true gaps, categorized by
 actual root cause (missing `httpd`, missing `ant.jar`, `*LargeHeap` OOM,
 missing `conf/Catalina/localhost/*.xml`, missing `output/build/lib/`, an
 unbuilt Maven test-webapp submodule, and 2 not-yet-triaged oddities), are in
-[docs/internal/fixed-suite-bugs/tomcat/18-fixture-environment-gaps-20260724.md](../../docs/internal/fixed-suite-bugs/tomcat/18-fixture-environment-gaps-20260724.md).
+fixed-suite-bugs/tomcat/18-fixture-environment-gaps-20260724.md.
 
 ## Full list of 91 confirmed CratonVM-only regressions
 
@@ -56,7 +56,7 @@ unbuilt Maven test-webapp submodule, and 2 not-yet-triaged oddities), are in
 > stale-pointer events. Root cause was TOMCAT-JNDIREALM-JIT.3 — a per-thread
 > GC-root gap (`string_case_cache` published only to the GC initiator), which
 > also let both `com/unboundid/` JIT bans be removed. See
-> [docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md](../../docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md).
+> fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md.
 
 ```
 jakarta.servlet.jsp.el.TestScopedAttributeELResolver          FAIL

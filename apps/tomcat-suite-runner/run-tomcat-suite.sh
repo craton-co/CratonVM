@@ -31,6 +31,10 @@
 #   CLASSLIST     default class-list file if not passed positionally
 #   TIMEOUT_SEC   per-class hang timeout (default: 300)
 #   MAX_HEAP      -Xmx / --Xmx (default: 2g)
+#   HTTPD_PATH    Apache httpd binary for org.apache.tomcat.integration.httpd.*
+#                 (default: whatever `command -v httpd` finds). Debian names it
+#                 apache2, so on Debian either symlink it onto PATH as httpd or
+#                 set HTTPD_PATH=/usr/sbin/apache2.
 #
 # Example - all 6 shards of a craton run:
 #   for i in 0 1 2 3 4 5; do
@@ -51,6 +55,34 @@ JAVA_HOME25="${JAVA_HOME25:-/home/victor/jdk25}"
 CLASSLIST="${5:-${CLASSLIST:-$TC_ROOT/.suite/all-tests.txt}}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 MAX_HEAP="${MAX_HEAP:-2g}"
+HTTPD_PATH="${HTTPD_PATH:-$(command -v httpd 2>/dev/null || true)}"
+
+# org.apache.tomcat.integration.httpd.* proxies real traffic through an httpd
+# each test starts itself. Without a binary every class in that family fails
+# with a connection-refused to the proxy port - identically on HotSpot, so it
+# reads like a VM defect when it is only a missing fixture.
+# Always one argument (never an empty word, which `set -u` + an empty array
+# would make awkward): TesterHttpd falls back to a bare "httpd" on PATH when
+# the property is empty.
+HTTPD_PROP="-Dtomcat.test.httpd.path=$HTTPD_PATH"
+
+# Fixture precondition check (VERIFY-01, docs/known-issues/c2/verify-01-differential-harness.md):
+# a missing/unbuilt CATALINA_BASE-equivalent (output/build - conf/, webapps/)
+# or unbuilt test classes makes every class fail the same way
+# (FileNotFoundException/ClassNotFoundError before the test itself runs),
+# which reads exactly like a real regression sweep across the whole suite.
+# Fail loudly once, up front, instead of producing 645 identical wrong
+# results (this is the CATALINA_BASE gap verify-01 named explicitly).
+die_fixture() { echo "ERROR: $*" >&2; exit 1; }
+_missing=()
+{ [ -d "$TC_ROOT/output/testclasses" ] && [ -n "$(ls -A "$TC_ROOT/output/testclasses" 2>/dev/null)" ]; } || _missing+=("$TC_ROOT/output/testclasses (compiled test classes - ant test-compile)")
+[ -d "$TC_ROOT/output/build/conf" ] || _missing+=("$TC_ROOT/output/build/conf (CATALINA_BASE conf/ - ant deploy)")
+[ -d "$TC_ROOT/output/build/webapps" ] || _missing+=("$TC_ROOT/output/build/webapps (CATALINA_BASE webapps/ - ant deploy)")
+[ -s "$CP_FILE" ] || _missing+=("$CP_FILE (classpath file)")
+[ -s "$CLASSLIST" ] || _missing+=("$CLASSLIST (class list)")
+if [ "${#_missing[@]}" -gt 0 ]; then
+  die_fixture "Tomcat fixture incomplete under TC_ROOT=$TC_ROOT - missing or empty: ${_missing[*]}. See run-tomcat-suite.md."
+fi
 
 OUTDIR="$TC_ROOT/.suite/results/$RUN_NAME/shard-$SHARD_IDX"
 mkdir -p "$OUTDIR"
@@ -85,7 +117,7 @@ run_one() {
     # dynamic growth), so a humongous array that size can't fit even at
     # -Xmx8g even though HotSpot's region-based G1 handles it fine at 8g.
     # CratonVM's OWN G1 backend (gc/src/g1.rs, production-status per
-    # docs/internal/gaps/gc-tuning.md) doesn't have that fixed split and
+    # gaps/gc-tuning.md) doesn't have that fixed split and
     # passes both classes cleanly -- TestByteChunkLargeHeap at -Xmx8g,
     # TestCharChunkLargeHeap needs -Xmx10g (measured; HotSpot needs neither
     # bump, its G1 is somewhat more memory-efficient at this extreme). Never
@@ -102,6 +134,20 @@ run_one() {
       else
         heap="10g"
       fi
+    elif [ "$cls" = "org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy" ]; then
+      # Same shape without the naming convention: PAYLOAD_SIZE is literally
+      # 10 * 1024 * 1024 * 100 = 1 GiB and TomcatBaseTest.postUrl needs a second
+      # buffer of the same size. HotSpot fits that in the 2g default (26.6 s
+      # measured); the fixed Xmx/2 old-gen cap above means CratonVM cannot, and
+      # the class OOMs at exactly "native primitive array of length 1048576000".
+      # 4g clears it (110 s measured). `--Xmx 2g -XX:+UseG1GC` also passes but
+      # takes 275 s, close enough to the 300 s default timeout to score as a
+      # HANG, so prefer the heap bump.
+      if [[ "$MAX_HEAP" =~ ^([0-9]+)[gG]$ ]] && [ "${BASH_REMATCH[1]}" -ge 4 ]; then
+        heap="$MAX_HEAP"
+      else
+        heap="4g"
+      fi
     fi
     timeout "${TIMEOUT_SEC}s" "$CRATONVM_EXE" \
       --java-home "$JAVA_HOME25" --Xmx "$heap" $gc_flag \
@@ -110,6 +156,7 @@ run_one() {
       -Dtomcat.test.temp="$TC_ROOT/output/test-tmp" \
       -Dtomcat.test.tomcatbuild="$TC_ROOT/output/build" \
       -Dtomcat.test.relaxTiming=true \
+      "$HTTPD_PROP" \
       --add-opens java.base/java.lang=ALL-UNNAMED \
       --add-opens java.base/java.io=ALL-UNNAMED \
       --add-opens java.base/java.util=ALL-UNNAMED \
@@ -122,6 +169,7 @@ run_one() {
       -Dtomcat.test.temp="$TC_ROOT/output/test-tmp" \
       -Dtomcat.test.tomcatbuild="$TC_ROOT/output/build" \
       -Dtomcat.test.relaxTiming=true \
+      "$HTTPD_PROP" \
       --add-opens java.base/java.lang=ALL-UNNAMED \
       --add-opens java.base/java.io=ALL-UNNAMED \
       --add-opens java.base/java.util=ALL-UNNAMED \

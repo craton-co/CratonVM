@@ -569,8 +569,8 @@ fn compile_java_regex_uncached(
         return regex::Regex::new(&escaped)
             .map(JavaRegex::Std)
             .map_err(
-                |e| cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("PatternSyntaxException: {e}"),
+                |e| cratonvm_types::error::RuntimeError::PatternSyntaxException {
+                    message: format!("{e}"),
                 },
             );
     }
@@ -614,9 +614,14 @@ fn compile_java_regex_uncached(
     // Fallback: `fancy-regex` for lookaround/backrefs/etc.
     match fancy_regex::Regex::new(&full) {
         Ok(r) => Ok(JavaRegex::Fancy(Box::new(r))),
+        // The concrete `PatternSyntaxException`, not its
+        // `IllegalArgumentException` parent. Both engines rejecting the pattern
+        // is the same event HotSpot reports from `Pattern.compile`, and code
+        // that validates a user-supplied regex catches the concrete class by
+        // name.
         Err(e) => Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("PatternSyntaxException: {e}"),
+            cratonvm_types::error::RuntimeError::PatternSyntaxException {
+                message: format!("{e}"),
             },
         ),
     }
@@ -1373,7 +1378,7 @@ fn matcher_cache_lookup_captures(
 /// `Matcher` instead of re-decoding the entire backing array from the Java
 /// heap on every single native dispatch. Without this, an n-match `find()`
 /// loop over an n-length string cost O(n) per call * O(n) calls = O(n^2)
-/// (see `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`).
+/// (see `fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`).
 ///
 /// Returns `Arc<str>` rather than `String` so a cache HIT is an O(1)
 /// refcount bump, not an O(n) copy — the point of caching is lost if every
@@ -2172,7 +2177,7 @@ fn native_matcher_has_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // synthetic-layout bridge, unconditionally dropped in real-JDK mode by
 // `NativeMethodRegistry::register` (see `drop_real_layout_synthetic` in
 // `native-api/src/registry.rs`) — see
-// `docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`. It is
+// `fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`. It is
 // dead code for every program this VM actually runs by default.
 //
 // This section is different: it operates on the REAL OpenJDK
@@ -2183,7 +2188,7 @@ fn native_matcher_has_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // `Matcher.find()Z` / `Matcher.find(I)Z`, the two methods the interpreted
 // `java.util.regex` engine spends the vast majority of its time in for the
 // extremely common `while (m.find()) { ...; m.group(N); }` idiom (see
-// `docs/internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`
+// `fixed-suite-bugs/wildfly/bug-03-regex-perf-deployment-build.md`
 // for the interpreter-throughput root cause this works around). Every other
 // `Matcher` method — `group`/`start`/`end`/`region`/`appendReplacement`/
 // `matches`/`lookingAt`/`reset`/... — is left as real JDK bytecode, reading
@@ -2924,7 +2929,7 @@ pub(crate) fn native_matcher_find_at_realjdk(
 // populate correctly (see above) — no regex re-run, no text re-decode.
 // `group()`/`group(int)` delegate the actual character extraction to the
 // receiver `text` object's own (already-fast, see
-// `docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`)
+// `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`)
 // `String.substring(int,int)` via `invoke_virtual` rather than re-deriving a
 // UTF-8 slice from this fast path's own cached tables — avoids a redundant
 // cache lookup and reuses the exact substring Java itself would produce.

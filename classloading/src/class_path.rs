@@ -472,7 +472,7 @@ enum ClassPathEntry {
     /// boot classpath, so that cost 27,962 full deflate passes and ~136 MB of
     /// resident inflated bytes *before the first Java class loaded* — measured
     /// at 15-21 s even with optimised native zlib, and far worse in a debug
-    /// build. See `docs/internal/arch-2026-07-26/boot-classpath-lazy.md`.
+    /// build. See `arch-2026-07-26/boot-classpath-lazy.md`.
     ///
     /// The eager cache existed to stop existence probes paying a deflate each
     /// (`find_in_archive(..).is_some()` inflated the entry just to answer a
@@ -4086,16 +4086,22 @@ impl ClassPath {
                         None
                     };
                     let selected_entry = direct_entry.or(slash_entry);
-                    let found = selected_entry.is_some();
                     if dbg {
                         eprintln!(
                             "[GRES-DBG]   jar {} mr={} -> {}",
                             path.display(),
                             multi_release,
-                            if found { "HIT" } else { "miss" }
+                            if selected_entry.is_some() { "HIT" } else { "miss" }
                         );
                     }
-                    if found {
+                    // Bind the entry name by pattern rather than testing a
+                    // separate `found` bool and then `expect()`ing the same
+                    // Option: the two can only ever agree, but the file denies
+                    // `clippy::expect_used` outside tests, so the pair broke
+                    // `cargo clippy` for this crate and every crate that
+                    // depends on it. `None` means no entry matched, which is
+                    // exactly "push no URL" — the arm the bool already took.
+                    if let Some(suffix) = selected_entry {
                         let abs = self
                             .canonicalize_cached(path)
                             .unwrap_or_else(|_| path.clone());
@@ -4103,7 +4109,6 @@ impl ClassPath {
                         // Strip UNC prefix \\?\ that canonicalize produces on Windows.
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
-                        let suffix = selected_entry.expect("resource hit has an entry name");
                         urls.push(format!("jar:file:/{}!/{suffix}", encode_path_for_url(&p)));
                     }
                 }

@@ -16,6 +16,26 @@ now publishes the policy), §12 (all three documentation gaps are closed) and
 §13 (three of five stale doc paths remain, and the count is per-occurrence not
 per-path).
 
+## 2026-08-04 status
+
+* **§5 — RETRACTED.** Its premise does not hold: the memo is mode-independent.
+  Checking it turned up a real defect one level down — seven force-native
+  dispatch sites that bypassed `resolve_dispatch` and the census entirely —
+  which is **FIXED**. Read §5 before acting on any of it.
+* **§13 — CLOSED.** All three moved doc paths repointed. The re-verification
+  found **fourteen** occurrences, not the five this record counted: the
+  interpreter file split multiplied them, and the wrapped-comment form
+  (`docs/known-issues/` at end of line, basename on the next comment line) hides
+  from a grep for the full path. This record already said to search for the
+  basename rather than the path, and it was *still* an undercount.
+  *Separately:* the same scan found **403** dead `docs/…md` citations across
+  162 files tree-wide, all of them files that merely moved. That is a
+  pre-existing tree-wide condition, not a JDK-only one, and is filed on its own.
+* **§1, §2, §4, §6, §8, §9, §10, §11 — unchanged and open.** §3's residual
+  (`matcher_native_callback_uncached`, plus the unaudited arms of
+  `jit_invoke_dispatch` / `jit_invoke_virtual_mic`) is also unchanged.
+* **§12 — still closed.**
+
 ---
 
 ## 1. The JIT has the same missing-`NativeKind` hole as the interpreter's invoke cache — twice — but wave 1 bought time with a blanket refusal
@@ -54,9 +74,51 @@ record this, and the refusal is counted. The branch is reached only on an
 inline-cache **miss**, which already takes two mutexes, so `Compatible` is
 untouched.
 
-**Why it is still open.** The refusal is a tax, not a fix: every inline-cached
-native call site in a `--jdk-only` run permanently takes the slow dispatch path.
-And the missing kind still makes the census incomplete in `Compatible` mode. The
+### The "tax" is zero — measured 2026-08-04, and it re-ranks this item
+
+The original text below said the refusal "costs `JdkOnly` runs every
+inline-cached native call". That is a claim about a rate; the counter for it
+already existed (`--jdk-only-report`'s `refusals.jit_inline_cache_natives`) and
+nobody had read it. Measured on JDK 25 under `--jdk-only`, three workloads
+including a deliberately JIT-hot one (`probes/JdkOnlyIcHotProbe.java` — 400k
+iterations across monomorphic, polymorphic, megamorphic-interface and `String`
+sites, 3.4 s):
+
+| workload | `jit_inline_cache_natives` | `jit_direct_native_binds` | `jit_fastpath_admissions` | `interpreter_bytecode_preferred` |
+|---|---:|---:|---:|---:|
+| `JdkOnlyIcHotProbe` | **0** | 0 | 0 | 3,344 |
+| `JdkOnlyCensusLoadProbe` | **0** | 0 | 0 | 3,254 |
+| `JdkOnlyBreadthProbe` | **0** | 0 | 0 | 532 |
+
+**The refusal never fires**, and `vm/src/jit/helpers.rs` says why: *every*
+MIC/PIC publication path takes its entry from `try_jit_compile_callee` — a
+JIT-compiled Java callee, which has a live owner and therefore hits
+`jit_entry_publishable`'s `owner.is_some()` early return before the strict
+branch. That covers both `mic.update` sites, both `pic.install` sites, and
+`publish_mic_rust_cached_entry`, which additionally requires `pin_jit_entry` to
+succeed — i.e. a JIT entry. A native trampoline never reaches the refusal from
+these sites, so there is nothing for it to refuse.
+
+What this changes:
+
+* **This is not a performance defect and does not belong in the wave-2 critical
+  path.** What remains is real but narrower — the missing kind leaves the census
+  incomplete, in `Compatible` mode as much as strict. A completeness gap, not a
+  tax.
+* **`jit_direct_native_binds` and `jit_fastpath_admissions` are also zero.** Ask
+  the same question of §4's seven direct-call ladders before rewriting them.
+* **`interpreter_bytecode_preferred` is the column that is not zero** — 3,344
+  shadowing natives yielding to real bytecode in one 3.4-second run. That is §7
+  step 3, the hottest jdk-only path in the VM by three orders of magnitude, and
+  it is where the
+  [thread-start defect](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md)
+  lived. Effort spent here is worth more than effort spent on any of the zeroes.
+
+Fourth measurement in a row to contradict one of these records, and the first to
+contradict a claim about *cost* rather than *size*.
+
+**Why it is still open.** The missing kind leaves the census incomplete in
+`Compatible` mode. The
 MIC doc explains why storing it was rejected for wave 1 and exactly what wave 2
 must do:
 
@@ -71,7 +133,7 @@ array **appended at the TAIL**, since `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` /
 `NEEDS_CONTEXT_OFFSETS` / `MEGA_*_OFFSET` are all emitted-code immediates.
 
 Fix this together with
-[cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
+cached invoke targets retain and revalidate the `NativeKind`.
 A `NativeKind` stored in `CachedInvokeTarget` that is dropped again when the JIT
 installs an MIC slot buys nothing.
 
@@ -198,7 +260,7 @@ The seven, verified 2026-07-31:
 
 Two of the seven are in the `String` family, which makes the JIT a **third**
 location for the forced-native `String` policy documented in
-[the forced-native `String` policy](forced-native-string-policy-two-lists-that-disagree.md).
+[the forced-native `String` policy, FIXED 2026-08-04](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
 Be precise about which: 10204 is `java/lang/String` itself and `toLowerCase` is
 one of the 21 names on `check_override`'s positive list *and* is excluded by
 `force_native_over_real_jdk_bytecode`'s seven-pair whitelist — three paths,
@@ -216,7 +278,62 @@ would put a policy read on the hottest boxing/collection paths in the VM to
 defend against a state that cannot occur. If either gate above is ever removed,
 this comment is the reason these bodies look unguarded."*
 
-## 5. `jit-api`'s `force_native_cache` memoizes a hard-coded dispatcher, and the memo is not policy-qualified
+## 5. `jit-api`'s `force_native_cache` memo — RETRACTED, and replaced by a larger defect one level down
+
+**The premise is wrong.** The marker says the memoized `bool` must become
+policy-qualified because *"a `true` memoized under `Compatible` is not a valid
+answer under `JdkOnly` and this cell cannot tell the two apart"*. Checked
+2026-08-04: `force_native_over_real_jdk_bytecode(class_name, method_name,
+method_descriptor)` takes those three arguments and nothing else. It never reads
+the compatibility mode. The memo is mode-independent and sound, and the
+`OnceLock<(bool, u8)>` reshape it asks for would buy nothing. **Do not do it.**
+
+Policy is applied *downstream* of the memo, at dispatch — which is where the
+actual defect was.
+
+### The defect: seven dispatch sites bypassed `resolve_dispatch` entirely — FIXED 2026-08-04
+
+`intercept_force_registered_native` and
+`intercept_force_registered_native_cached` are reached from **seven** call sites
+across `dispatch_static`, `dispatch_virtual` and `invoke`, and both ended in a
+bare `safe_native_call` on a callback from `NativeMethodRegistry::find`. No
+`dispatch_policy`, no `resolve_native_dispatch_wave1`, no `record_invocation`.
+
+Their entire purpose is to make a registered native beat *concrete real-JDK
+bytecode* — precisely the inversion §1.4 forbids under `JdkOnly` — so under
+`--jdk-only` these were seven unguarded holes in contract §11's *"every
+strict-mode native dispatch"*, and in `Compatible` they were seven dispatches
+missing from the §4 census. Every sibling route (`invoke_or_native`,
+`try_stackless_invoke` steps 1 and 6, `invoke_on_class_shared_inner`) was routed
+in wave 1; these two were missed, and §5's framing is part of why nobody looked
+— it pointed at the memo, which is fine, and away from the dispatch, which was
+not.
+
+Both now go through `admit_forced_native`, which resolves the id, applies §7
+with `compat_native_wins: true` (the site's pre-existing unconditional verdict)
+and `bytecode_available: true` — concrete bytecode existing is the *premise* of
+reaching these sites, unlike `resolve_step1_native`, which runs before
+resolution and honestly passes `false` — then counts the dispatch. It has three
+answers, and the third matters: a `SyntheticStub` under `JdkOnly` **raises**
+`VmError::JdkOnly` rather than declining, matching
+`invoke_on_class_shared_inner`, because swallowing it would run the real
+bytecode quietly and leave a strict run reporting zero synthetic-stub
+invocations for a call that was one.
+
+`Compatible` is bit-for-bit unchanged: `resolve_native_dispatch_wave1` is a pure
+function of `compat_native_wins` there. The cached path keeps its
+generation-keyed `NativeCallSite` memo — added because the `find` it replaced
+measured as the #2 hottest symbol (~7% of samples) on
+`TestResponsePerformance` — by handing the resolved id to
+`admit_forced_native_id`, so the warm cost is two array indexes, the policy call
+and one relaxed `fetch_add`.
+
+Measured on a `--jdk-only` boot of a trivial program:
+`interpreter_bytecode_preferred` went 0 → **4**, and two
+`native-shadows-bytecode` violations appeared. Those four refusals were
+happening before and were invisible.
+
+### The original §5 text, kept for the correction it also carries
 
 `jit-api/src/lib.rs` 204:
 
@@ -435,15 +552,15 @@ are kept here so nobody re-opens them from a stale report.
 ## 13. Stale documentation paths in load-bearing code comments — three paths, five occurrences
 
 Several dispatch sites cite known-issue docs that have since been fixed and moved
-to `docs/internal/fixed-suite-bugs/` with a `-FIXED` suffix. The cited paths no
+to `fixed-suite-bugs/` with a `-FIXED` suffix. The cited paths no
 longer resolve. The original filing listed three rows; the re-verification found
 **five occurrences** of those three paths:
 
 | Cited in code as | Occurrences | Actually at |
 |---|---|---|
-| `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md` | `native-collections/src/lib.rs:24522` | `docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md` |
-| `docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md` | `vm/src/vm/vm_exec.rs:13501`, `vm/src/runtime/interpreter/invoke.rs:9998`, `:10149` | `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` |
-| `docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md` | `vm/src/runtime/interpreter/invoke.rs:23059` | `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md` |
+| `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md` | `native-collections/src/lib.rs:24522` | `fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md` |
+| `docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md` | `vm/src/vm/vm_exec.rs:13501`, `vm/src/runtime/interpreter/invoke.rs:9998`, `:10149` | `fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` |
+| `docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md` | `vm/src/runtime/interpreter/invoke.rs:23059` | `fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md` |
 
 Note that the `StringJoiner` path is *also* cited inside `invoke.rs`'s
 `real_protected_stub_class` comment, in a wrapped form

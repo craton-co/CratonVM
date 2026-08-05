@@ -33,6 +33,10 @@ param(
   [string]$SpringBootRoot = '',
   [string]$WorkDir = '',
   [string]$RefCsv = '',
+  # HotSpot results used to tell a CratonVM defect apart from a fixture or
+  # upstream failure the reference VM shares. Defaults to the file a `-Vm
+  # hotspot` run already writes: <work>/baseline/hotspot-baseline-latest.tsv.
+  [string]$HotspotBaseline = '',
   [string]$ClassList = '',
   [string[]]$Subtrees = @('core','module','cli','configuration-metadata','loader','test-support'),
   [string]$Exe = '',
@@ -358,6 +362,74 @@ function Get-RowStatus($Row) {
 }
 
 # ---------------------------------------------------------------------------
+# HotSpot baseline — reclassifying failures the reference VM shares
+# ---------------------------------------------------------------------------
+# A `-Vm hotspot` run already writes `<work>/baseline/hotspot-baseline-latest.tsv`,
+# but nothing ever read it back, so a class that fails IDENTICALLY on HotSpot was
+# still recorded as a plain CratonVM `FAIL`. That is how four
+# `loader/spring-boot-jarmode-tools` classes reached `docs/known-issues/` and two
+# residual lists as CratonVM defects when the real cause was the Spring Boot
+# fixture checkout carrying CRLF expected-output resources against a Linux
+# `println` (2026-08-04; HotSpot failed the same tests with the same counts).
+#
+# Loading the baseline lets those rows be recorded as BOTH-FAIL instead. The
+# rule is deliberately conservative -- see `Resolve-BothFailStatus`.
+function Import-HotspotBaseline {
+  if ($Vm -ne 'craton') { return $null }
+  $path = $HotspotBaseline
+  if (-not $path) {
+    $path = Join-Path (Join-Path $script:WorkRoot 'baseline') 'hotspot-baseline-latest.tsv'
+  }
+  if (-not (Test-Path $path)) {
+    Write-Info "hotspot baseline: none at $path — every failure will be attributed to CratonVM"
+    return $null
+  }
+  $map = @{}
+  foreach ($row in @(Import-Csv -Path $path -Delimiter "`t")) {
+    if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
+    $map["$($row.module)`t$($row.class)"] = [pscustomobject]@{
+      status = Get-RowStatus $row
+      failed = [int]([string]$row.failed -replace '[^0-9]', '' -replace '^$', '0')
+      tests  = [int]([string]$row.tests  -replace '[^0-9]', '' -replace '^$', '0')
+    }
+  }
+  # Say the size out loud: a baseline that silently loaded zero rows is
+  # indistinguishable from no baseline at all, and would quietly restore the
+  # exact misattribution this exists to prevent.
+  Write-Info "hotspot baseline: $($map.Count) classes from $path"
+  return $map
+}
+
+# Returns 'BOTH-FAIL' when the reference VM fails this class the same way or
+# worse, otherwise ''. Conservative on purpose:
+#
+#   * only a CratonVM `FAIL` is eligible. A CRASH/HANG/LOADFAIL is categorically
+#     worse than an assertion failure and must never be excused by one.
+#   * the baseline row must itself be `FAIL`, for the same reason in reverse.
+#   * CratonVM must not fail MORE tests than HotSpot did. If it fails 5 where
+#     HotSpot fails 2, three of those are ours and the row stays `FAIL`.
+#
+# Anything that does not qualify keeps its own status and gets the baseline
+# appended to its note, so a near-miss is visible rather than silently dropped.
+function Resolve-BothFailStatus {
+  param([object]$Baseline, [string]$Module, [string]$Class, [string]$Status, [int]$Failed)
+  if (-not $Baseline) { return '' }
+  $row = $Baseline["$Module`t$Class"]
+  if (-not $row) { return '' }
+  if ($Status -ne 'FAIL' -or $row.status -ne 'FAIL') { return '' }
+  if ($Failed -gt $row.failed) { return '' }
+  return 'BOTH-FAIL'
+}
+
+function Get-BaselineNote {
+  param([object]$Baseline, [string]$Module, [string]$Class)
+  if (-not $Baseline) { return '' }
+  $row = $Baseline["$Module`t$Class"]
+  if (-not $row) { return '' }
+  return "hotspot-baseline: $($row.status) $($row.failed)/$($row.tests)"
+}
+
+# ---------------------------------------------------------------------------
 # gradlew invocation helper
 # ---------------------------------------------------------------------------
 function Invoke-Gradlew {
@@ -592,7 +664,7 @@ function Get-EffectiveClassTimeoutSec {
   # test failures unrelated to hanging -- see
   # docs/known-issues/springboot/ for the specific residual docs) and the
   # validated wall-clock times below include headroom over the observed time.
-  # See docs/internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
+  # See springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
   $slowClasses = @{
     'module/spring-boot-cache|org.springframework.boot.cache.autoconfigure.CacheAutoConfigurationTests' = 600
     # Hibernate's complete JPA auto-configuration class is CPU-bound and has
@@ -810,6 +882,17 @@ function Complete-ProcessRecord {
   }
   if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
 
+  # Reclassify a failure the reference VM shares, and in every other case still
+  # record what HotSpot did, so a row that stayed FAIL despite a failing
+  # baseline (a crash, or more failed tests than HotSpot) shows why.
+  if ($status -ne 'PASS' -and $status -ne 'EMPTY') {
+    $baselineNote = Get-BaselineNote -Baseline $script:HotspotBaselineMap -Module $Record.module -Class $Record.class
+    $bothFail = Resolve-BothFailStatus -Baseline $script:HotspotBaselineMap -Module $Record.module `
+      -Class $Record.class -Status $status -Failed $failed
+    if ($bothFail) { $status = $bothFail }
+    if ($baselineNote) { $note = if ($note) { "$note | $baselineNote" } else { $baselineNote } }
+  }
+
   $line = @(
     $script:ResultIndex, $Record.module, $Record.class, $Vm, $(if ($Jit -eq 'off') { 'off' } else { 'on' }),
     $ExitCode, $status, (ConvertTo-InvariantString $Seconds), $tests, $failed, $aborted, $skipped, $containersFailed,
@@ -822,6 +905,7 @@ function Complete-ProcessRecord {
 
 function Invoke-Mode {
   param([object[]]$Classes)
+  $script:HotspotBaselineMap = Import-HotspotBaseline
   $jdk = Resolve-Jdk
   $javaBin = Join-Path $jdk 'bin'
   $java = @((Join-Path $javaBin 'java.exe'), (Join-Path $javaBin 'java')) | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -955,6 +1039,7 @@ function Invoke-AllModes {
       '-WorkDir', $script:WorkRoot, '-JdkHome', (Resolve-Jdk), '-MaxHeap', $MaxHeap)
     if ($Exe) { $args += @('-Exe', $Exe) }
     if ($RefCsv) { $args += @('-RefCsv', $RefCsv) }
+    if ($HotspotBaseline) { $args += @('-HotspotBaseline', $HotspotBaseline) }
     if ($ClassList) { $args += @('-ClassList', $ClassList) }
     if ($CratonArgs.Count -gt 0) { foreach ($extra in $CratonArgs) { $args += @('-CratonArgs', $extra) } }
     Write-Info "launching $($mode.name) in background"

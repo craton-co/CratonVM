@@ -26,7 +26,7 @@
 //!   object — see `gen_heap::collect_garbage_inner`).
 
 use crate::gc_flags;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// How deep any thread is inside a JIT call, process-wide.
 ///
@@ -222,7 +222,7 @@ pub fn publish_moving_young_enabled(on: bool) {
 /// COMPLETE rewritable precise root map via the shadow stack and the
 /// conservative frame scan is suppressed (see the vm crate's
 /// `conservative_roots::moving_young_enabled` and
-/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+/// `arch-2026-07-26/moving-young-precise-roots.md`).
 ///
 /// Reads what the VM published from the codegen gate; before the first publish
 /// it falls back to `gc_flags().moving_young`. Never an independent policy
@@ -573,7 +573,7 @@ fn read_reason_counts() -> [usize; incomplete_reason::COUNT] {
 ///
 /// Paired with [`moving_young_cycle_count`] this is the whole runtime answer to
 /// "is the young generation a copying collector, and if not, what is stopping
-/// it?" — see `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`.
+/// it?" — see `arch-2026-07-26/moving-young-corruption-rootcause.md`.
 pub fn moving_young_fallback_reason_counts() -> [usize; incomplete_reason::COUNT] {
     read_reason_counts()
 }
@@ -703,7 +703,7 @@ pub fn moving_young_coverage_incomplete() -> bool {
 /// **Emits at `warn` level, ON BY DEFAULT.** A silent regression to the
 /// non-moving sweep is precisely how the moving young generation stayed
 /// switched off while the architecture docs advertised it (see
-/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`): the only
+/// `arch-2026-07-26/moving-young-precise-roots.md`): the only
 /// signal was a `tracing::debug!` line reading "compaction deferred" and a
 /// counter behind `CRATONVM_MOVING_YOUNG_FALLBACKS`, which nobody set.
 /// Rate-limited (every occurrence up to 8, then powers of two) so a genuinely
@@ -1274,7 +1274,7 @@ pub fn pinned_jit_root_count() -> usize {
 // RandomizedContext.getPerThread()` returning null for its OWN WeakHashMap
 // key — the running suite thread's `java.lang.Thread` mirror — well after
 // the entry was legitimately created (see
-// docs/known-issues/elasticsearch-randomizedcontext-per-thread-null.md).
+// fixed-suite-bugs/elasticsearch-suite/elasticsearch-randomizedcontext-per-thread-null.md).
 //
 // Fix: the VM publishes the currently-registered Weak/Soft/Phantom referent
 // addresses here immediately before a collection (same thread that will run
@@ -1305,6 +1305,84 @@ pub fn set_watched_referents(addrs: &[usize]) {
         s.clear();
         s.extend(addrs.iter().copied());
     });
+}
+
+// ---------------------------------------------------------------------------
+// Cross-thread STW peer-scan coverage, published per collection.
+//
+// `xt_root_scan::take_over_pass` runs during ROOT COLLECTION, on the collecting
+// thread, immediately before the heap collection it feeds — so "last pass" is
+// this cycle's pass. It is published here rather than read from
+// `cratonvm_vm::jit::xt_root_scan` because the GC crate cannot depend on the VM
+// crate, and because the number that matters (did this sweep mark from a
+// COMPLETE root set?) belongs next to the sweep's own diagnostics rather than
+// in a shutdown summary a looping reproduction never reaches.
+//
+// `unclassified` is the load-bearing one. On Linux a peer is taken over by
+// signalling it and waiting for it to park in the handler; a peer that never
+// answers within the deadline is STILL RUNNING JIT CODE, and its JIT-frame
+// object references are in no root set at all. A sweep that runs with
+// `unclassified > 0` therefore decided liveness from an incomplete root set,
+// which is exactly the shape of a use-after-free the heap-side referrer scan
+// cannot see (it scans the heap and the root slice; these roots are in neither).
+// ---------------------------------------------------------------------------
+
+/// Take-over passes actually RUN this cycle.
+///
+/// The load-bearing one for reading the rest. `stw_takeover_should_scan` gates
+/// round 0 on the cheap `any_thread_in_jit()` hint, so a fully cooperative
+/// pause legitimately runs ZERO passes — and then `taken_over=0
+/// unclassified=0` means "never looked", not "looked and found nothing". Those
+/// two readings point at opposite conclusions, so they must not share an
+/// encoding.
+pub static XT_PASSES_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// Peers frozen and conservatively scanned this cycle.
+pub static XT_TAKEN_OVER_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// Peers this cycle could not classify — still running JIT code, roots unseen.
+pub static XT_UNCLASSIFIED_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// Conservative roots the take-over passes contributed this cycle.
+pub static XT_ROOTS_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// Helper windows found this cycle (blocked peers with JIT frames on stack).
+pub static XT_HW_WINDOWS_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// Conservative roots the helper-window pass contributed this cycle.
+pub static XT_HW_ROOTS_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// Zero the per-cycle cross-thread coverage. Called once at the top of the
+/// stop-the-world take-over, so what the sweep reads describes THIS cycle.
+pub fn reset_xt_cycle() {
+    XT_PASSES_LAST_CYCLE.store(0, Ordering::Relaxed);
+    XT_TAKEN_OVER_LAST_CYCLE.store(0, Ordering::Relaxed);
+    XT_UNCLASSIFIED_LAST_CYCLE.store(0, Ordering::Relaxed);
+    XT_ROOTS_LAST_CYCLE.store(0, Ordering::Relaxed);
+    XT_HW_WINDOWS_LAST_CYCLE.store(0, Ordering::Relaxed);
+    XT_HW_ROOTS_LAST_CYCLE.store(0, Ordering::Relaxed);
+}
+
+/// Accumulate one take-over pass's outcome into this cycle's totals.
+pub fn publish_xt_pass(taken_over: u64, unclassified: u64, roots: u64) {
+    XT_PASSES_LAST_CYCLE.fetch_add(1, Ordering::Relaxed);
+    XT_TAKEN_OVER_LAST_CYCLE.fetch_add(taken_over, Ordering::Relaxed);
+    XT_UNCLASSIFIED_LAST_CYCLE.fetch_add(unclassified, Ordering::Relaxed);
+    XT_ROOTS_LAST_CYCLE.fetch_add(roots, Ordering::Relaxed);
+}
+
+/// Accumulate the post-barrier helper-window pass's outcome.
+pub fn publish_xt_helper_window(windows: u64, roots: u64) {
+    XT_HW_WINDOWS_LAST_CYCLE.fetch_add(windows, Ordering::Relaxed);
+    XT_HW_ROOTS_LAST_CYCLE.fetch_add(roots, Ordering::Relaxed);
+}
+
+/// `(passes, taken_over, unclassified, roots, hw_windows, hw_roots)` for the
+/// cycle currently in progress.
+pub fn xt_cycle_coverage() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        XT_PASSES_LAST_CYCLE.load(Ordering::Relaxed),
+        XT_TAKEN_OVER_LAST_CYCLE.load(Ordering::Relaxed),
+        XT_UNCLASSIFIED_LAST_CYCLE.load(Ordering::Relaxed),
+        XT_ROOTS_LAST_CYCLE.load(Ordering::Relaxed),
+        XT_HW_WINDOWS_LAST_CYCLE.load(Ordering::Relaxed),
+        XT_HW_ROOTS_LAST_CYCLE.load(Ordering::Relaxed),
+    )
 }
 
 /// Is `addr` a currently-registered Weak/Soft/Phantom referent this cycle?

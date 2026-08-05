@@ -798,7 +798,7 @@ impl SharedVm {
         //
         // Both cells are one-shot and lock-free; see the `VM diagnostic
         // snapshot` section in `runtime::crash_handler` and
-        // `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` §6.1.
+        // `arch-2026-07-26/jdk-mode-determinism.md` §6.1.
         crate::runtime::crash_handler::publish_jdk_mode(
             config.jdk_mode(),
             config.java_home.as_deref(),
@@ -905,7 +905,7 @@ impl SharedVm {
         // all: the only way to find out where `SharedVm::new` spent its time
         // was to add `Instant::now()` by hand and rebuild. The three phases
         // below are the ones measurement showed actually matter (see
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2):
+        // `arch-2026-07-26/startup-and-diagnostics.md` §2):
         //
         //   1. classpath ingestion — `ClassManager::new` constructs the
         //      bootstrap/extension/application `ClassPath`s, and `load_jmod`
@@ -1088,8 +1088,11 @@ impl SharedVm {
         let iterator_id = class_manager
             .load_class("java/util/Iterator")
             .expect("java/util/Iterator must be loadable");
+        // Through `set_superclass`, not a raw `cls.superclass =` write: the
+        // store's direct-subclass index has to see the new edge, or
+        // `recompute_subclass_layouts` goes blind to this class.
+        class_manager.set_superclass(enum_impl_id, Some(object_id));
         if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
-            cls.superclass = Some(object_id);
             if !cls.interfaces.contains(&enumeration_id) {
                 cls.interfaces.push(enumeration_id);
             }
@@ -1108,8 +1111,8 @@ impl SharedVm {
         let comparator_id = class_manager
             .load_class("java/util/Comparator")
             .expect("java/util/Comparator must be loadable");
+        class_manager.set_superclass(cmp_native_id, Some(object_id));
         if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
-            cls.superclass = Some(object_id);
             if !cls.interfaces.contains(&comparator_id) {
                 cls.interfaces.push(comparator_id);
             }
@@ -1222,8 +1225,8 @@ impl SharedVm {
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
+                class_manager.set_superclass(cid, Some(object_id));
                 if let Some(cls) = class_manager.get_class_mut(cid) {
-                    cls.superclass = Some(object_id);
                     for iface in ifaces {
                         if !cls.interfaces.contains(iface) {
                             cls.interfaces.push(*iface);
@@ -1312,7 +1315,7 @@ impl SharedVm {
         // genuine ~250 MiB direct-buffer working set (chunk writer thread)
         // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
         // same heap size. See
-        // docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);
@@ -1504,7 +1507,7 @@ impl SharedVm {
                 // `CRATONVM_NO_STUBS`, "because some apps currently limp on
                 // these fakes and dropping them surfaces real gaps as clear
                 // errors." Leave it opt-in; do not force it on here. See
-                // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
+                // fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
                 //
@@ -1549,7 +1552,7 @@ impl SharedVm {
                 // real FileHandler() bytecode instead (which throws
                 // NoSuchFileException trying to actually lock a real log
                 // file). Register just the FileHandler natives directly here.
-                // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
                     &mut native_methods,
                 );
@@ -2028,7 +2031,7 @@ impl SharedVm {
             // real FileHandler() bytecode instead (which throws
             // NoSuchFileException trying to actually lock a real log
             // file). Register just the FileHandler natives directly here.
-            // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+            // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
             // See the twin above.
             cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
@@ -2134,7 +2137,7 @@ impl SharedVm {
             // TomcatBaseTest.tearDown. The real STPE constructor bytecode runs
             // correctly on CratonVM once the synthetic STPE natives are gone (the
             // native-collections copy is now gated behind synthetic-jdk). See
-            // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+            // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
             native_methods.register(
                 "java/util/concurrent/CopyOnWriteArrayList",
                 "addIfAbsent",
@@ -2813,6 +2816,54 @@ impl SharedVm {
             );
         }
 
+        // Keys HotSpot 25 publishes that this table did not, found 2026-08-04
+        // by diffing `System.getProperties()` against a HotSpot 25 control (45
+        // keys against 48). Each is read by real library code, not only by
+        // `-XshowSettings`:
+        //
+        // * `sun.cpu.endian` — Netty, Chronicle and several serialization
+        //   libraries branch on it, and code that finds it absent typically
+        //   assumes big-endian, which is wrong on every machine this runs on.
+        // * `sun.io.unicode.encoding` — read by `java.io.ObjectStreamClass` and
+        //   by the older text codecs.
+        // * `java.version.date`, `jdk.debug`, `sun.management.compiler`,
+        //   `java.vm.compressedOopsMode` — informational, but they appear in
+        //   crash reports, `RuntimeMXBean` dumps and support bundles, and their
+        //   absence is what makes a CratonVM dump obviously not a JVM dump.
+        //
+        // THIS is the table that reaches `System.getProperties()` in real-JDK
+        // mode. `native-builtins/src/system_bootstrap.rs::native_vm_properties`
+        // has its own, overlapping list which is NOT the source here — the tell
+        // is `java.vm.name`, which that one sets to "CratonVM" and this one to
+        // "cratonvm", and a real-JDK run reports the lower-case spelling. Add a
+        // key to both or you will add it to neither.
+        //
+        // `sun.java.command` and `sun.java.launcher` are deliberately absent:
+        // only the launcher knows them, and `vm-cli` supplies them through
+        // `config.system_properties`.
+        sys_props.insert(
+            "sun.cpu.endian".to_string(),
+            if cfg!(target_endian = "big") {
+                "big".to_string()
+            } else {
+                "little".to_string()
+            },
+        );
+        sys_props.insert(
+            "sun.io.unicode.encoding".to_string(),
+            "UnicodeLittle".to_string(),
+        );
+        sys_props.insert("java.version.date".to_string(), "2025-10-21".to_string());
+        sys_props.insert("jdk.debug".to_string(), "release".to_string());
+        sys_props.insert(
+            "sun.management.compiler".to_string(),
+            "CratonVM JIT".to_string(),
+        );
+        sys_props.insert(
+            "java.vm.compressedOopsMode".to_string(),
+            "Zero based".to_string(),
+        );
+
         // ---- Tier 2: platform-derived keys ----
         sys_props.insert("os.name".to_string(), canonical_os_name());
         sys_props.insert("os.arch".to_string(), canonical_os_arch());
@@ -3064,7 +3115,7 @@ impl SharedVm {
         // whichever arm of the two mode `cfg` blocks was compiled in. That
         // count is the honest answer to "is real-JDK mode really ~300
         // natives?" (it is not — see
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2.5).
+        // `arch-2026-07-26/startup-and-diagnostics.md` §2.5).
         // Note the registry pre-sizes four maps to 4,096 entries
         // unconditionally (`NativeMethodRegistry::new`), i.e. independently of
         // mode; that is one bounded allocation, not per-native work.
@@ -3110,6 +3161,10 @@ impl SharedVm {
                 anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
                 statics: RwLock::new(FxHashMap::default()),
                 statics_index: crate::vm::realms::class_realm::StaticsIndex::new(),
+                // u32::MAX = "java/lang/System not prepared yet"; a real
+                // ClassId can never be u32::MAX (see AUTOBOX_CLASS_ID's
+                // reserved-range note in `types`).
+                system_class_id: AtomicU32::new(u32::MAX),
                 resolution_cache: RwLock::new(ResolutionCache::new()),
                 // Round 8 audit fix (CRIT #2): reflective lookup cache.
                 link_resolver: LinkResolver::new(),
@@ -3215,6 +3270,7 @@ impl SharedVm {
                 swallow_counter: std::sync::atomic::AtomicU64::new(0),
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+                stack_sample_mode: std::sync::atomic::AtomicBool::new(false),
             },
             jit: crate::vm::realms::JitRealm {
                 jit_cache: JitCache::new(),
@@ -3376,7 +3432,11 @@ impl SharedVm {
         // in the VM's VtableManager too.
         {
             let cm = vm.classes.class_manager.read();
-            let store_len = cm.class_store.len() as u32;
+            // `slot_count()`, not `len()` — the latter is the live count and
+            // under-runs the id space as soon as anything has been unloaded
+            // (see `ClassStore::slot_count`). `vtable_descriptors_of` returns
+            // `None` for tombstoned ids, so the extra slots cost nothing.
+            let store_len = cm.class_store.slot_count() as u32;
             for cid in 0..store_len {
                 let cid = crate::classloading::ClassId::new(cid);
                 if let Some(entries) = cm.vtable_descriptors_of(cid) {
@@ -3536,6 +3596,14 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
 /// this closes the loop for the slower symbolic-reference cache.
 fn resolution_invalidate_adapter(class_id: u32) {
     let cid = crate::classloading::ClassId::new(class_id);
+    // Advance the resolution generation FIRST, so no thread can publish a new
+    // per-thread site-cache entry that snapshots the pre-invalidation epoch
+    // after the authoritative maps below have already been swept. Two of the
+    // four firing sites (`upgrade_synthetic_class`, `recompute_subclass_layouts`)
+    // move a class's field layout while leaving its `ClassId`, its name and the
+    // redefine latch alone — this bump is the only signal a resolved-field
+    // cache gets for them. See `runtime::interpreter::constants`'s `RESOLUTION_EPOCH`.
+    crate::runtime::interpreter::bump_resolution_epoch();
     // Fan out to every live VM: the hook carries no VM identity, and
     // over-invalidating another VM's cache costs a re-resolve, whereas
     // under-invalidating our own is a stale-resolution correctness bug.
@@ -3991,8 +4059,9 @@ impl SharedVm {
     ///
     /// ```json
     /// {
-    ///   "schema_version": 2,
+    ///   "schema_version": 3,
     ///   "mode": "compatible",
+    ///   "image_adjudication": true,
     ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
     ///   "natives": [
     ///     { "class": "java/lang/System", "name": "arraycopy",
@@ -4001,11 +4070,36 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
+    ///       "kind_stated": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
-    ///                                  "acc_native": true, "has_code": false } }
+    ///                                  "acc_native": true, "has_code": false },
+    ///       "image_declaring_method": { "image_has_class": true, "declared": true,
+    ///                                   "acc_native": true, "has_code": false } }
     ///   ]
     /// }
     /// ```
+    ///
+    /// ## Schema 3 — `image_declaring_method`
+    ///
+    /// Schema 2's `real_declaring_method` answers from the **loaded** class
+    /// store, so it is a measurement of the run: `loaded: false` means "this
+    /// workload never touched the class". That is the right answer to the
+    /// question it asks and the wrong instrument for adjudicating the registry,
+    /// because the registrations most in need of a verdict are the ones no
+    /// single workload exercises. `docs/known-issues/jdk-only/`'s sixteen
+    /// `JDK-ONLY-CLASSIFY: unknown — needs census` verdicts are all blocked on
+    /// exactly that.
+    ///
+    /// `image_declaring_method` asks the same four questions of the **bytes on
+    /// the class path**, parsed and thrown away — see
+    /// [`ClassManager::adjudicate_natives_against_image`], which explains at
+    /// length why it must not simply load the classes. It is populated only
+    /// when `verbose`, because it costs one class-file parse per distinct
+    /// registered class; `image_adjudication` at the top level says whether the
+    /// pass ran, so a `null` column is never ambiguous.
+    ///
+    /// Reading the two together is the point: `real` says whether this run
+    /// exercised the slot, `image` says whether the JDK declares it at all.
     ///
     /// Notes on the fields that are easy to misread:
     ///
@@ -4076,6 +4170,27 @@ impl SharedVm {
         path: impl AsRef<std::path::Path>,
         verbose: bool,
     ) -> std::io::Result<(usize, usize, usize)> {
+        let cm = self.classes.class_manager.read();
+        self.dump_native_census_json_with(path, verbose, Some(&cm))
+    }
+
+    /// [`Self::dump_native_census_json`] against a class manager the caller
+    /// already holds — or, with `cm = None`, the same census minus the one
+    /// column that needs the class store.
+    ///
+    /// The registry rows themselves come from `natives.native_methods`, which
+    /// has its own lock, so a `None` here degrades *narrowly*: every row is
+    /// still written with its kind, provenance and invocation count, and only
+    /// `real_declaring_method` becomes `null`. The file is marked
+    /// `"partial": true` all the same, because a reader cannot otherwise tell a
+    /// `null` that means "this run never loaded the class" from one that means
+    /// "nobody looked".
+    pub(crate) fn dump_native_census_json_with(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        verbose: bool,
+        cm: Option<&crate::classloading::ClassManager>,
+    ) -> std::io::Result<(usize, usize, usize)> {
         use cratonvm_native_api::NativeKind;
         let mut rows = self.natives.native_methods.census();
         rows.sort_by(|a, b| {
@@ -4092,12 +4207,41 @@ impl SharedVm {
             }
         }
 
-        let mut out = String::with_capacity(256 + 192 * rows.len());
-        out.push_str("{\n  \"schema_version\": 2,\n");
+        // The per-row image adjudication (`image_declaring_method`). Costs one
+        // class-file parse per DISTINCT registered class — roughly a thousand —
+        // so it rides `verbose` (`--explain-jdk-only`) rather than firing on
+        // every difftest child. The key is emitted either way, `null` when the
+        // pass did not run, so a reader never has to infer from the shape which
+        // kind of census this is; `image_adjudication` says it outright.
+        let image_verdicts: Option<Vec<cratonvm_classloading::ImageMethodVerdict>> =
+            match (verbose, cm) {
+                (true, Some(cm)) => {
+                    let triples: Vec<(String, String, String)> = rows
+                        .iter()
+                        .map(|r| (r.class.clone(), r.name.clone(), r.descriptor.clone()))
+                        .collect();
+                    Some(cm.adjudicate_natives_against_image(&triples))
+                }
+                _ => None,
+            };
+
+        let mut out = String::with_capacity(256 + 256 * rows.len());
+        out.push_str("{\n  \"schema_version\": 3,\n");
+        out.push_str(&format!(
+            "  \"image_adjudication\": {},\n",
+            image_verdicts.is_some()
+        ));
         out.push_str(&format!(
             "  \"mode\": {},\n",
             json_escape(self.compatibility_mode().as_str())
         ));
+        if cm.is_none() {
+            out.push_str(
+                "  \"partial\": true,\n  \"partial_reason\": \"class-manager lock unavailable \
+                 on the System.exit path; every real_declaring_method is null because the \
+                 class store was not read, not because the class was absent\",\n",
+            );
+        }
         out.push_str("  \"counts\": {\n");
         out.push_str(&format!("    \"intrinsic\": {n_intrinsic},\n"));
         out.push_str(&format!("    \"bridge\": {n_bridge},\n"));
@@ -4131,8 +4275,8 @@ impl SharedVm {
         // One read lock for the whole loop: `real_declaring_method` asks the
         // class manager a question per row, and re-acquiring L10 tens of
         // thousands of times would turn a diagnostic dump into a contention
-        // event.
-        let cm = self.classes.class_manager.read();
+        // event. The caller acquires it (or, on the `System.exit` path, fails
+        // to) so that all three artefacts describe the same instant.
         for (i, row) in rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -4167,23 +4311,43 @@ impl SharedVm {
                 None => out.push_str("      \"overwrote\": null,\n"),
             }
             out.push_str(&format!("      \"invocations\": {},\n", row.invocations));
+            // "Did anyone adjudicate this kind, or did it inherit an ambient
+            // `set_category`?" — the discriminator the 157-entry
+            // reclassification needs. See `NativeCensusEntry::kind_stated`.
+            out.push_str(&format!("      \"kind_stated\": {},\n", row.kind_stated));
 
-            let declaring = cm
-                .get_loaded_class_id(&row.class)
-                .and_then(|id| cm.get_class(id));
-            let method = declaring.and_then(|c| c.find_method(&row.name, &row.descriptor));
-            out.push_str("      \"real_declaring_method\": {");
-            out.push_str(&format!(
-                "\"loaded\": {}, \"declared\": {}, \"acc_native\": {}, \"has_code\": {}",
-                declaring.is_some(),
-                method.is_some(),
-                method.is_some_and(|m| m.is_native()),
-                method.is_some_and(|m| !m.is_native() && !m.is_abstract()),
-            ));
-            out.push_str("}\n");
+            match cm {
+                Some(cm) => {
+                    let declaring = cm
+                        .get_loaded_class_id(&row.class)
+                        .and_then(|id| cm.get_class(id));
+                    let method =
+                        declaring.and_then(|c| c.find_method(&row.name, &row.descriptor));
+                    out.push_str("      \"real_declaring_method\": {");
+                    out.push_str(&format!(
+                        "\"loaded\": {}, \"declared\": {}, \"acc_native\": {}, \"has_code\": {}",
+                        declaring.is_some(),
+                        method.is_some(),
+                        method.is_some_and(|m| m.is_native()),
+                        method.is_some_and(|m| !m.is_native() && !m.is_abstract()),
+                    ));
+                    out.push_str("},\n");
+                }
+                // Not `{"loaded": false, …}`: that is a *measurement* saying the
+                // run never touched the class, and it would be a lie here. See
+                // this function's `partial` note.
+                None => out.push_str("      \"real_declaring_method\": null,\n"),
+            }
+            match image_verdicts.as_ref().map(|v| v[i]) {
+                Some(v) => out.push_str(&format!(
+                    "      \"image_declaring_method\": {{\"image_has_class\": {}, \
+                     \"declared\": {}, \"acc_native\": {}, \"has_code\": {}}}\n",
+                    v.image_has_class, v.declared, v.acc_native, v.has_code
+                )),
+                None => out.push_str("      \"image_declaring_method\": null\n"),
+            }
             out.push_str("    }");
         }
-        drop(cm);
 
         if !rows.is_empty() {
             out.push_str("\n  ");
@@ -4244,14 +4408,42 @@ impl SharedVm {
         path: impl AsRef<std::path::Path>,
         verbose: bool,
     ) -> std::io::Result<usize> {
-        let mut rows = self.classes.class_manager.read().dump_class_origins();
-        let out = render_class_origins_json(&mut rows, verbose);
+        let cm = self.classes.class_manager.read();
+        self.dump_class_origins_json_with(path, verbose, Some(&cm))
+    }
+
+    /// [`Self::dump_class_origins_json`] against a class manager the caller
+    /// already holds — or, with `cm = None`, a **labelled empty** census.
+    ///
+    /// `None` exists for exactly one caller: the `System.exit` path, which runs
+    /// on an arbitrary Java thread and may find the class-manager lock held (see
+    /// [`Self::try_write_jdk_only_dumps_for_exit`]). Every row of this census
+    /// comes from the class store, so without the lock there is nothing to
+    /// report — and a zero-row census that does not *say* it is empty for want
+    /// of a lock reads as "this run fabricated nothing", which is the exact
+    /// false-green contract §11's acceptance criteria must be immune to. The
+    /// `"partial": true` key is therefore not decoration; it is what makes the
+    /// degraded file safe to publish.
+    pub(crate) fn dump_class_origins_json_with(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        verbose: bool,
+        cm: Option<&crate::classloading::ClassManager>,
+    ) -> std::io::Result<usize> {
+        let out = match cm {
+            Some(cm) => {
+                let mut rows = cm.dump_class_origins();
+                let n = rows.len();
+                (render_class_origins_json(&mut rows, verbose), n)
+            }
+            None => (render_partial_class_origins_json(), 0),
+        };
 
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
-        file.write_all(out.as_bytes())?;
+        file.write_all(out.0.as_bytes())?;
         file.sync_all()?;
-        Ok(rows.len())
+        Ok(out.1)
     }
 
     /// Snapshot of the three **process-global** JDK-only violation sinks, in a
@@ -4467,6 +4659,28 @@ impl SharedVm {
         path: impl AsRef<std::path::Path>,
         verbose: bool,
     ) -> std::io::Result<(usize, usize)> {
+        let cm = self.classes.class_manager.read();
+        self.dump_jdk_only_report_json_with(path, verbose, Some(&cm))
+    }
+
+    /// [`Self::dump_jdk_only_report_json`] against a class manager the caller
+    /// already holds — or, with `cm = None`, the report the `System.exit` path
+    /// can still produce without it.
+    ///
+    /// Two of the five violation sources are reachable without the class
+    /// manager (the native registry's refused registrations, and the three
+    /// process-global JIT/dispatch sinks), so a `None` report is not empty —
+    /// it is missing the `compatibility-class-requested` rows and the four
+    /// class-bucket counts. Marked `"partial": true`, and the class buckets are
+    /// **omitted** rather than written as zero, because a zero there would say
+    /// "no compatibility classes were requested" — the single most misleading
+    /// thing this file can say.
+    pub(crate) fn dump_jdk_only_report_json_with(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        verbose: bool,
+        cm: Option<&crate::classloading::ClassManager>,
+    ) -> std::io::Result<(usize, usize)> {
         use cratonvm_native_api::NativeKind;
 
         // `(kind, summary, body)`: the first two are the sort key, the third is
@@ -4480,16 +4694,18 @@ impl SharedVm {
         // One L10 acquisition for both questions the class manager answers
         // here — the census and the violation list must describe the same
         // instant, and re-locking between them would let a still-running
-        // thread load a class in the gap.
-        let (origins, origin_violations) = {
-            let cm = self.classes.class_manager.read();
-            let origins = cm.dump_class_origins();
-            let violations: Vec<(String, String, String)> = cm
-                .origin_violations()
-                .iter()
-                .map(|v| (v.kind().to_string(), v.summary(), v.to_json()))
-                .collect();
-            (origins, violations)
+        // thread load a class in the gap. The caller holds it.
+        let (origins, origin_violations) = match cm {
+            Some(cm) => {
+                let origins = cm.dump_class_origins();
+                let violations: Vec<(String, String, String)> = cm
+                    .origin_violations()
+                    .iter()
+                    .map(|v| (v.kind().to_string(), v.summary(), v.to_json()))
+                    .collect();
+                (Some(origins), violations)
+            }
+            None => (None, Vec::new()),
         };
         violations.extend(origin_violations);
         // §7: the three process-global sinks — JIT compile-time refusals, JIT
@@ -4538,16 +4754,15 @@ impl SharedVm {
             })
             .collect();
 
-        let buckets = fold_origin_buckets(&origins);
-        debug_assert_eq!(
-            buckets.total(),
-            origins.len() as u64,
-            "the origin fold must be a partition — no class may fall between buckets"
-        );
-        let boot_image = buckets.boot_image;
-        let application = buckets.application;
-        let generated = buckets.generated;
-        let compatibility = buckets.compatibility;
+        let buckets = origins.as_ref().map(|origins| {
+            let buckets = fold_origin_buckets(origins);
+            debug_assert_eq!(
+                buckets.total(),
+                origins.len() as u64,
+                "the origin fold must be a partition — no class may fall between buckets"
+            );
+            buckets
+        });
 
         let mut out = String::with_capacity(512 + 128 * violations.len());
         out.push_str("{\n  \"schema_version\": 1,\n");
@@ -4555,6 +4770,14 @@ impl SharedVm {
             "  \"mode\": {},\n",
             json_escape(self.compatibility_mode().as_str())
         ));
+        if buckets.is_none() {
+            out.push_str(
+                "  \"partial\": true,\n  \"partial_reason\": \"class-manager lock unavailable \
+                 on the System.exit path; compatibility-class-requested violations and the \
+                 four class-bucket counts are absent, the other four violation sources are \
+                 complete\",\n",
+            );
+        }
         match self.jdk_feature_version() {
             Some(f) => out.push_str(&format!("  \"jdk_feature\": {f},\n")),
             None => out.push_str("  \"jdk_feature\": null,\n"),
@@ -4572,12 +4795,27 @@ impl SharedVm {
             out.push_str("\n  ");
         }
         out.push_str("],\n  \"counts\": {\n");
-        out.push_str(&format!("    \"boot_image_classes\": {boot_image},\n"));
-        out.push_str(&format!("    \"application_classes\": {application},\n"));
-        out.push_str(&format!("    \"generated_classes\": {generated},\n"));
-        out.push_str(&format!(
-            "    \"compatibility_classes\": {compatibility},\n"
-        ));
+        // Omitted, not zeroed, when the class store could not be read: a
+        // `"compatibility_classes": 0` is the report's headline green result
+        // and must never be produced by a missing measurement.
+        if let Some(buckets) = &buckets {
+            out.push_str(&format!(
+                "    \"boot_image_classes\": {},\n",
+                buckets.boot_image
+            ));
+            out.push_str(&format!(
+                "    \"application_classes\": {},\n",
+                buckets.application
+            ));
+            out.push_str(&format!(
+                "    \"generated_classes\": {},\n",
+                buckets.generated
+            ));
+            out.push_str(&format!(
+                "    \"compatibility_classes\": {},\n",
+                buckets.compatibility
+            ));
+        }
         out.push_str(&format!(
             "    \"bridge_invocations\": {},\n",
             registry.invocations_of_kind(NativeKind::Bridge)
@@ -4616,7 +4854,82 @@ impl SharedVm {
         let mut file = std::fs::File::create(path)?;
         file.write_all(out.as_bytes())?;
         file.sync_all()?;
-        Ok((violations.len(), compatibility as usize))
+        Ok((
+            violations.len(),
+            buckets.map(|b| b.compatibility as usize).unwrap_or(0),
+        ))
+    }
+
+    /// Write whichever JDK-only census artefacts were requested, from a thread
+    /// that is about to call [`std::process::exit`] and must not hang.
+    ///
+    /// # Why this exists
+    ///
+    /// `vm-cli`'s `write_jdk_only_dumps` is called from four exit paths, and
+    /// `System.exit(N)` reaches none of them: `native_system_exit` /
+    /// `native_runtime_exit` end in `std::process::exit`, which does not unwind
+    /// — no `Drop`, no `catch_unwind`, no return to `run()`. So a strict run of
+    /// any program that detects a problem and exits (a Spring Boot failure
+    /// analyzer, a CLI argument-parse error path) produced **no census at all**,
+    /// and that gap was correlated with failure: the runs most likely to need
+    /// the report were exactly the runs that left none.
+    ///
+    /// # Why it is a try-lock and must stay one
+    ///
+    /// This runs on whichever Java thread called `System.exit`, at an arbitrary
+    /// point in that thread's execution, holding whatever locks that thread
+    /// already held. All three writers need the class-manager lock, which is an
+    /// `OrderedPlRwLock` participating in workspace lock-order enforcement.
+    /// A blocking acquire from here is both a deadlock risk and an order
+    /// violation — **and a deadlock in the exit path hangs the process instead
+    /// of losing a file, which is strictly worse than the bug being fixed.**
+    ///
+    /// So: [`try_read_untracked`], no retry loop, no timeout, no blocking
+    /// fallback. If the lock is not free at this instant, each artefact is
+    /// written in its labelled `"partial": true` form rather than not at all
+    /// (see the three `_with` writers for what each one degrades to). A census
+    /// that is usually complete and never hangs beats one that is sometimes
+    /// absent.
+    ///
+    /// [`try_read_untracked`]: cratonvm_types::lock_order::OrderedPlRwLock::try_read_untracked
+    ///
+    /// # Cost in `Compatible` mode
+    ///
+    /// Zero. Every argument is `None` unless the operator passed the matching
+    /// `--dump-*` / `--jdk-only-report` flag, and the three-`is_none` guard
+    /// returns before touching a lock or the filesystem.
+    ///
+    /// Returns `(wrote_anything, was_partial)`.
+    pub fn try_write_jdk_only_dumps_for_exit(
+        &self,
+        class_origins: Option<&str>,
+        native_registry: Option<&str>,
+        report: Option<&str>,
+        verbose: bool,
+    ) -> (bool, bool) {
+        if class_origins.is_none() && native_registry.is_none() && report.is_none() {
+            return (false, false);
+        }
+        let guard = self.classes.class_manager.try_read_untracked();
+        let cm = guard.as_deref();
+        let partial = cm.is_none();
+        let mut wrote = false;
+        if let Some(path) = class_origins {
+            if self.dump_class_origins_json_with(path, verbose, cm).is_ok() {
+                wrote = true;
+            }
+        }
+        if let Some(path) = native_registry {
+            if self.dump_native_census_json_with(path, verbose, cm).is_ok() {
+                wrote = true;
+            }
+        }
+        if let Some(path) = report {
+            if self.dump_jdk_only_report_json_with(path, verbose, cm).is_ok() {
+                wrote = true;
+            }
+        }
+        (wrote, partial)
     }
 
     /// NEW-10: append a missing-native entry to the audit log,
@@ -5326,6 +5639,31 @@ pub(crate) fn render_class_origins_json(rows: &mut [ClassOriginEntry], verbose: 
     out
 }
 
+/// The class-origin census a `System.exit` produced when it could not take the
+/// class-manager lock.
+///
+/// Deliberately *not* the same shape as an empty successful census. A consumer
+/// that sees `"total": 0` with no `"partial"` key is entitled to conclude the
+/// run fabricated nothing; this file says the opposite — the run was not
+/// measured. `difftest` and `scripts/jdk-only-census.sh` both categorise from
+/// these files, and a silently-short census would categorise a strict failure
+/// as a clean run.
+///
+/// The `counts` block is omitted rather than zero-filled for the same reason:
+/// a zero in a count key is a measurement, and there was none.
+pub(crate) fn render_partial_class_origins_json() -> String {
+    concat!(
+        "{\n",
+        "  \"schema_version\": 1,\n",
+        "  \"partial\": true,\n",
+        "  \"partial_reason\": \"class-manager lock unavailable on the System.exit path; ",
+        "no class-origin rows were read\",\n",
+        "  \"classes\": []\n",
+        "}\n"
+    )
+    .to_string()
+}
+
 impl SharedVm {
     /// Thread-safe class loading with per-class-name locks (Session 30).
     ///
@@ -5340,6 +5678,33 @@ impl SharedVm {
     pub fn load_class_concurrent(
         &self,
         name: &str,
+    ) -> Result<crate::classloading::ClassId, cratonvm_types::error::VmError> {
+        self.load_class_concurrent_for(name, None)
+    }
+
+    /// [`Self::load_class_concurrent`], naming the Java frame that asked.
+    ///
+    /// `requester` is `(owner_class, method_name, descriptor)` of the frame
+    /// whose `new` / `checkcast` / `Class.forName` drove this resolution. It
+    /// exists so that when the load fabricates a compatibility class, the
+    /// recorded `CompatibilityClassRequested` violation — and the
+    /// `--dump-class-origins` row — can say *who* depends on the fabrication.
+    /// "Class `X` was fabricated" is a name; "class `X` was fabricated because
+    /// `org/foo/Bar.baz(…)` resolved it" is a work item (contract §9).
+    ///
+    /// Passed as three borrowed `&str`s, not a formatted `String`: this is on
+    /// the path of every `new` in the VM, and the overwhelming majority of
+    /// loads fabricate nothing. Nothing is formatted or allocated unless the
+    /// load actually recorded a violation.
+    ///
+    /// `None` is the right answer for callers with no Java frame — VM
+    /// bootstrap, JNI, the JIT's own resolution — and leaves `requested_by`
+    /// null, which the census documents as "not attributable to a frame"
+    /// rather than "nobody asked".
+    pub fn load_class_concurrent_for(
+        &self,
+        name: &str,
+        requester: Option<(&str, &str, &str)>,
     ) -> Result<crate::classloading::ClassId, cratonvm_types::error::VmError> {
         // Fast path: read lock only — no contention for already-loaded classes.
         // Bind the result to a local so the `RwLockReadGuard` is dropped at
@@ -5493,7 +5858,17 @@ impl SharedVm {
 
         // Actually load the class (this takes the global write lock briefly)
         let mut cm_guard = self.classes.class_manager_write();
+        // Contract §9 `requested_by`: read the violation count under the same
+        // write lock that performs the load, so no other thread's fabrication
+        // can be misattributed to this frame. `origin_violation_count` is a
+        // `Vec::len`, and `attach_origin_requester` returns without allocating
+        // when the count did not move — which is every load but the ones that
+        // actually fabricate.
+        let violations_before = requester.map(|_| cm_guard.origin_violation_count());
         let result = cm_guard.load_class(name);
+        if let (Some(before), Some((owner, method, descriptor))) = (violations_before, requester) {
+            cm_guard.attach_origin_requester(before, owner, method, descriptor);
+        }
         drop(cm_guard);
 
         #[cfg(feature = "experimental-t19-diag")]
@@ -5533,16 +5908,58 @@ impl SharedVm {
             // extends `A`, and a method inlined from `A` was
             // devirtualized under the assumption that `A` had no
             // subclasses, loading `B` breaks that assumption.
-            let superclass = self
-                .classes
-                .class_manager
-                .read()
-                .get_class(*class_id)
-                .and_then(|c| c.superclass.map(|s| s.to_string()));
+            // PGO-02 R3 — two defects fixed here at once.
+            //
+            // 1. This used to be `c.superclass.map(|s| s.to_string())`.
+            //    `superclass` is a `ClassId`, whose `Display` prints the raw
+            //    u32, so the "superclass" handed to the name-keyed scans below
+            //    was a DECIMAL NUMBER — `"42"`, never a class name. The scans
+            //    match against `CompiledMethod::inlined_methods`, which holds
+            //    internal class names, so the whole superclass half of
+            //    class-load invalidation matched nothing and had been a silent
+            //    no-op. Nothing failed when it broke: the guarded/devirtualised
+            //    code stays CORRECT without the eviction (an exact class-id
+            //    guard rechecks the receiver, and a MIC/PIC re-targets), so the
+            //    only symptom was code that should have been retired staying
+            //    resident. That is precisely the failure mode this project
+            //    tracks — a capability that reads as landed but never runs.
+            //
+            // 2. Only the DIRECT superclass was consulted, which is the
+            //    "known coarseness" `docs/feature-designs/profile-guided-
+            //    inlining.md` §4 records: loading `C extends B extends A` did
+            //    not reach a dependency on `A`. Walk the whole supertype
+            //    closure — superclasses AND interfaces — so a speculation on
+            //    any ancestor is retired when a new descendant appears. The
+            //    closure is bounded by hierarchy depth and this runs once per
+            //    class DEFINE, not per call.
+            let supertypes: Vec<String> = {
+                let cm = self.classes.class_manager.read();
+                let store = cm.class_store();
+                let mut names: Vec<String> = Vec::new();
+                let mut stack: Vec<cratonvm_types::ClassId> = Vec::new();
+                let mut seen: std::collections::HashSet<cratonvm_types::ClassId> =
+                    std::collections::HashSet::new();
+                if let Some(class) = store.get(*class_id) {
+                    stack.extend(class.interfaces.iter().copied());
+                    stack.extend(class.superclass);
+                }
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let Some(class) = store.get(id) else {
+                        continue;
+                    };
+                    names.push(class.name.to_string());
+                    stack.extend(class.interfaces.iter().copied());
+                    stack.extend(class.superclass);
+                }
+                names
+            };
             {
                 let mut jit = self.jit.jit_cache.write();
                 let _ = jit.invalidate_for_class_change(name);
-                if let Some(ref sup) = superclass {
+                for sup in &supertypes {
                     let _ = jit.invalidate_for_class_change(sup);
                 }
             }
@@ -5555,8 +5972,8 @@ impl SharedVm {
             // entries whose inlined_methods list doesn't already name
             // the newly loaded class.
             let _evicted_by_cha = self.invalidate_jit_for_class(name);
-            if let Some(sup) = superclass {
-                let _evicted_sup = self.invalidate_jit_for_class(&sup);
+            for sup in &supertypes {
+                let _evicted_sup = self.invalidate_jit_for_class(sup);
             }
 
             // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load
@@ -5938,6 +6355,41 @@ impl SharedVm {
         self.debug
             .stack_dump_requested
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether stack dumps are being driven as a periodic *sampler* rather
+    /// than as the watchdog's one-shot pre-abort dump. See
+    /// [`crate::vm::realms::DebugRealm::stack_sample_mode`].
+    #[inline(always)]
+    pub fn stack_sample_mode(&self) -> bool {
+        self.debug
+            .stack_sample_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm sampling mode. Called once by the CLI when `--stack-sample-ms` is
+    /// given, before the sampler thread starts re-arming the dump request.
+    pub fn enable_stack_sampling(&self) {
+        self.debug
+            .stack_sample_mode
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the pending dump request (sampling mode only) so the next
+    /// re-arm from the sampler thread produces the next sample.
+    pub fn clear_stack_dump_request(&self) {
+        self.debug
+            .stack_dump_requested
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-arm the dump request without the watchdog's thread-summary and
+    /// unpark side effects, which are far too costly to repeat every
+    /// sampling interval (and would themselves distort the profile).
+    pub fn request_stack_sample(&self) {
+        self.debug
+            .stack_dump_requested
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// T19.H1 — dump the calling thread's frame chain to stderr.
@@ -6911,7 +7363,7 @@ impl Vm {
         // report for the thread most crashes happen on. Worker threads need
         // the equivalent publication at their own registration sites; see the
         // cross-owner request in
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md`.
+        // `arch-2026-07-26/startup-and-diagnostics.md`.
         crate::runtime::crash_handler::publish_primordial_frame_trace(
             main_thread.frame_trace.clone(),
         );

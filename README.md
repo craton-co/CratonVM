@@ -45,19 +45,53 @@ install, no `rt.jar`, one self-contained binary.
 
 ## Performance
 
-CPU, vs HotSpot JDK 25 C2 (same flags both sides, medians of alternating
-fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
+CPU, vs HotSpot JDK 25 C2, re-measured **2026-08-05** on `dev` (`ded183df8`):
+same flags both sides (`-Xmx8g`), one phase per fresh process pinned to one
+core, arms **alternated with the order flipped on alternate pairs**, 9 pairs
+per phase, no sample discarded, and every run's checksum verified against
+HotSpot's on every run — zero mismatches. Measured in a quiet window (1-minute
+load 1.9–3.7, checked for a competitor co-pinned to the measuring core before
+the window opened). Full methodology in [BENCHMARK.md](BENCHMARK.md).
 
-| Benchmark               | JDK 25 C2 | CratonVM  | Ratio |
-|-------------------------|-----------|-----------|-------|
-| Arithmetic (2B ops)     | 2,006 ms  | 4,895 ms  | 2.44x |
-| Fibonacci(44)           | 1,719 ms  | 4,790 ms  | 2.79x |
-| Sieve (100K × 20K)      | 2,851 ms  | 6,508 ms  | 2.28x |
-| Matrix 1280×1280        | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get)   | 1,017 ms  | 1,780 ms  | 1.75x |
-| String/Regex (100K)     | 55 ms     | 423 ms    | 7.7x  |
-| Binary Trees (depth 18) | 176 ms    | 1,468 ms  | 8.34x |
+| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
+|-------------------------|-----------|-----------|-----------|---------------|---------------|
+| Arithmetic (2B ops)     | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
+| Fibonacci(44)           | 1,444 ms  | 8,503 ms  | 5.89x     | 3.5% | 2.79x |
+| Sieve (100K × 20K)      | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
+| Matrix 1280×1280        | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
+| HashMap (10M put/get)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | 1.75x |
+| String/Regex (100K)     | 51 ms     | 274 ms    | 5.37x     | 1.1% | 7.7x  |
+| Binary Trees (depth 18) | 177 ms    | 1,674 ms  | 9.46x     | 0.4% | 8.34x |
 
+CratonVM's run-to-run spread is under 1% on five of the seven rows. Ratios are
+the durable content; absolute times are this host on this day.
+
+**Two rows are now at parity with HotSpot C2** — Matrix (from 2.93x) and Sieve.
+Arithmetic and String/Regex also closed materially against the July figures.
+Fibonacci, HashMap and Binary Trees moved the other way against numbers taken
+in July on a since-re-provisioned host, and those July absolutes were never
+re-measured under the current protocol — see BENCHMARK.md before reading the
+three as regressions.
+
+† **Sieve's HotSpot column is pooled across two runs, and that is not a
+convenience.** HotSpot on this phase is *bimodal*: across 18 samples it lands
+either at ~2,369 ms (10) or ~2,739 ms (8), with nothing in between, so a
+9-sample median falls wherever the split happens to go — one run read 2,386 ms
+and the next 2,734 ms on an unchanged binary. CratonVM's samples over the same
+18 runs are unimodal (2,276–2,498). Pooling both arms gives 2,376 vs 2,402;
+either mode read on its own puts the two within 15%. Parity is the honest
+reading, and 0.87x — which the single cleanest run would have supported — would
+not be.
+
+Sieve was **6.50x** on 2026-08-04 and is not any more. That was a live
+regression: `CratonBench.sieve([ZI)I` had begun getting a body from the
+optimizing (C2/IR) tier where it previously fell through to the single-pass
+backend, and the IR body was 6.4x slower than the C1 body it replaced. Fixed
+2026-08-04 — the optimizing tier now declines a method whose loops the
+single-pass backend would lower better, and what that backend can do and the IR
+tier cannot is enumerated rather than discovered one regression at a time
+(`jit/src/x64/single_pass_only.rs`,
+[docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md](docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md)).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

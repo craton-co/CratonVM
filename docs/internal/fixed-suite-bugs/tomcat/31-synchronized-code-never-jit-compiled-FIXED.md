@@ -30,6 +30,18 @@ Java handler, allowing javac's synthetic `monitorexit` cleanup to execute.
 `getfield`/`putfield` are therefore admitted at the relevant precise-frame
 sites instead of being rejected by RBC.6.
 
+> **Correction (2026-08-02).** The last sentence stopped being true within days
+> of this doc: `getfield`/`putfield` were taken back OUT of
+> `precise_frame_publishing_opcode` after `probes/Rbc6FieldProbe.java` found
+> the precise null trap had a single call site, on the inlined-callee
+> `putfield` path, while the top-level arms still took an inline fast path.
+> Both top-level arms grew one later (`cd451facc` for `putfield`; every
+> non-raw `getfield` path routes a null receiver through
+> `emit_post_invoke_exception_check`), and the admission was restored on
+> 2026-08-02 — but between 2026-07-28 and then, this paragraph was the only
+> doc saying so, and it was wrong. See
+> [rbc6-protected-field-ops-FIXED-20260802.md](../../rbc6-protected-field-ops-FIXED-20260802.md).
+
 ## Validation
 
 Task artifact: `cratonvm-tomcat-syncjit-r3.exe`.

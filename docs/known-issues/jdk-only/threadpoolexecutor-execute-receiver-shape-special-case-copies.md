@@ -7,6 +7,52 @@ mechanical "delete every `JDK-ONLY-WAVE2` ThreadPoolExecutor site" sweep leaves
 half the duplication behind. **The re-land did not change the undercount**;
 that is why this item moved up the ranking rather than down.
 
+## What changed on 2026-08-04 — the undercount is gone, the sites are not
+
+The ranking hazard is retired. What made this item tier-1 was not the
+duplication itself but that the *markers* named four of eight, so the obvious
+mechanical sweep would have left half the duplication enforcing a policy the
+other half no longer applied. That is now impossible:
+
+* **One census, in code.** `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
+  `vm/src/runtime/interpreter/native_override.rs` names all eight by
+  `(file, enclosing function)`, plus the ninth receiver-blind site they exist to
+  override, plus the four-step order the removal has to happen in — and why
+  getting that order wrong aborts the process instead of throwing.
+* **One implementation of the probe.** Two of the eight hand-inlined the
+  `workers`-field lookup instead of calling
+  `threadpool_executor_has_real_workers`, so the predicate had three bodies.
+  Worse, both inlined copies took a plain `read()` where the helper documents
+  that a nested `read_recursive()` is required — a lock-order panic in debug
+  builds and a possible deadlock in release. Both call the helper now.
+* **A gate that fails on a partial sweep.**
+  `exactly_eight_dispatch_sites_probe_the_threadpool_receiver_shape` asserts the
+  count, as an equality rather than a floor (this list only ever shrinks, and it
+  shrinks all at once), and
+  `no_hand_inlined_workers_probe_outside_the_helper` asserts nobody re-inlines
+  the probe. Verified by injection: deleting one site reports *"found 7 call(s)
+  … lists 8"*.
+
+The record's own *Coverage first* verification step said not to rely on the
+markers because they cover four of eight. The census constant and the gate are
+what replace that instruction.
+
+## What is still open — all four steps
+
+Nothing above deletes a site, and deleting one early is the failure mode with
+the worst blast radius in this directory (a native stack overflow and process
+abort, not a catchable `StackOverflowError`). The order is unchanged:
+
+1. give real `ThreadPoolExecutor` objects correct Java field initialisation so
+   `Executors.new*ThreadPool()` returns objects built by the real `<init>`
+   (`docs/jdk-only-runtime-services.md` P1). **This is the real work, and it
+   gates everything else** — reclassifying before it lands drops
+   `native_es_execute` under `CRATONVM_NO_STUBS` / `--jdk-only` and
+   synthetic-receiver executors lose their only implementation;
+2. reclassify `native_es_execute` as `NativeKind::SyntheticStub`;
+3. delete the ninth, receiver-blind site;
+4. delete the eight.
+
 ## What is wrong
 
 `native_es_execute` is a compatibility stand-in for CratonVM's synthetic 2-field
@@ -83,12 +129,12 @@ accumulated rather than being factored:
 * `invoke_or_native` — calling `.execute()` on a genuinely-real executor from
   native code (`ctx.invoke_virtual`) recursed back into the same native forever:
   *"a real stack overflow, confirmed via gdb"*. See
-  `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
+  `fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
 * `try_stackless_invoke` steps 1 and 6, and both `populate_virtual_invoke_cache`
   sites — without them a real `ThreadPoolExecutor` was shunted into
   `native_es_execute`'s "run inline" fallback, silently degrading async
   execution to synchronous. See
-  `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`.
+  `fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`.
   Step 6 is called out as *"a SEPARATE, independent double-check … that runs
   even after real bytecode was already resolved at step 4/5."*
 * The cache sites are the subtle ones: `populate_virtual_invoke_cache` had to
@@ -145,7 +191,7 @@ Per the wave-1 marker, all of them collapse into one structural rule:
 * Deleting only the four marked sites leaves the four unmarked ones enforcing a
   policy the other four no longer apply, i.e. the same cold-path/warm-path split
   documented in
-  [the forced-native `String` policy](forced-native-string-policy-two-lists-that-disagree.md).
+  [the forced-native `String` policy, FIXED 2026-08-04](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
 * Reclassifying `native_es_execute` to `SyntheticStub` while
   `CRATONVM_NO_STUBS` / `--jdk-only` is in play **drops the registration
   entirely** (see
