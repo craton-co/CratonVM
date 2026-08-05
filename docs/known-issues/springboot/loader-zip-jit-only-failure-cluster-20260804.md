@@ -1,17 +1,22 @@
 # Spring Boot loader/zip: the JIT-only failure cluster, root-caused
 
-**Status: the loader/zip half is CLOSED.** Root cause found 2026-08-04 and
-already fixed on `dev` by `4972cd9c91` ("the post-clinit fixup wrote Unsafe's
-long base-offsets as 32-bit ints"), which landed after the binary this page was
-originally filed against. Verified below. Two members of the original table
-were **not** this bug and are re-scoped as separate open issues at the bottom.
+**Status as of 2026-08-05 — three of the four things on this page are settled.**
 
-> **2026-08-05 re-verification — read this before acting on the two open items.**
-> Both are **NOT REPRODUCIBLE**, including on the pre-fix binary they were filed
-> against, and the second one's "JIT-only" framing is **falsified**. Details in
-> [Re-verification](#re-verification-2026-08-05). The page is deliberately NOT
-> retired: the failures were real when observed, and nothing here identifies a
-> fix for them.
+| # | item | status |
+|---|---|---|
+| 1 | the loader/zip header cluster (4 classes) | ✅ **CLOSED** — `4972cd9c91`, the mistyped `Unsafe` base offsets |
+| 2 | the same defect's **second door** | ✅ **FIXED 08-05** — `4ac429f2f`, `set_static_shared` seeded statics with a blanket `Value::Int(0)` |
+| 3 | `ZipContentTests` | ✅ **CLOSED — not a VM bug.** It is a **disk-capacity** failure; guarded in the oracle so it cannot be re-filed |
+| 4 | `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | ⚠️ **OPEN and NOT REPRODUCIBLE** — no fix, no attribution |
+
+Read this before acting on item 4: it does not reproduce on **any** condition
+tried, including on the pre-fix binary it was filed against and with the suite's
+own invocation flags. The page is deliberately **not** retired — the failure was
+real when observed, and nothing here identifies a fix for it.
+
+**The one thing worth doing when it next appears:** capture that run's full
+stderr, `CRATONVM_DBG=osr`, and the host's `df` and load *at that moment*. Every
+lever below asks a question about a failure that is currently absent.
 
 ## What it was
 
@@ -109,14 +114,14 @@ Spring Boot classes, one process per class, `dev`-new:
 | `loader.jar.NestedJarFileTests` | FAIL | **PASS 34/34** |
 | `loader.jar.SecurityInfoTests` | FAIL (both JIT and `--nojit`) | **PASS 3/3** |
 
-## Still open, and NOT this bug
+## The two that were NOT this bug
 
-Both were in this page's original table because they shared the `--nojit`-passes
-signature. Neither is fixed by `4972cd9c91`, and neither is a zip-header bug.
+Both were in this page's original table because they shared the `--nojit`-passes signature. Neither is fixed by `4972cd9c91`, and neither is a zip-header bug. As of 2026-08-05 the second is **closed** (it is the disk) and only the first is still open.
 
 ### 1. `core/spring-boot` `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` — an OSR miscompile
 
-Still FAILs on current `dev` with the same snakeyaml scanner error at line
+**As filed (2026-08-04)** it FAILed on then-current `dev` with a snakeyaml
+scanner error at line
 142539 of the generated document (`ry` on its own line, where the appended line
 is `- some list entry`). The test only does this:
 
@@ -308,7 +313,7 @@ The bug can only turn a red into a green, never the reverse, so this page's
 original FAIL observations stand unaffected — and its PASS rows all carry real
 test counts (37/37, 52/52, …), so none of them was a mis-scored load failure.
 
-### 2. `loader/spring-boot-loader` `ZipContentTests` — heap, not headers
+### 2. `loader/spring-boot-loader` `ZipContentTests` — CLOSED: it is the disk, not the VM
 
 On current `dev` it no longer corrupts: it dies with
 `OutOfMemoryError: Java heap space (alloc_array length 8192)` at `--Xmx 2g`
