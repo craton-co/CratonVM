@@ -465,6 +465,47 @@ checks) and `RMethodSiteCache` (44) — target the silent failure modes
 specifically, since every way these caches can be wrong returns a plausible
 number rather than throwing.
 
+#### The purpose-built probe hid a regression; independent vectors found it
+
+The first version of the cache held **one** epoch pair for the whole table and
+wiped all 1024 slots when either moved. `class_definition_epoch` advances on
+*every class definition*, so during start-up and any class-loading burst it
+moves constantly — and each field access was then paying an `O(SLOTS)` memset.
+
+`SiteCacheCostProbe` never showed this, because it reaches steady state and
+stops defining classes. Six regression vectors that never reach steady state
+(~500 ms runs, boot-dominated) did, and they were **uniformly slower** with the
+lever on:
+
+| vector | off | on (table-wide wipe) | on (per-entry epochs) |
+|---|---|---|---|
+| RCollections | 499 | 629 | 664 vs 666 off |
+| RStrings | 563 | 621 | 675 vs 628 off |
+| RSerial | 572 | 673 | 781 vs 781 off |
+| RExceptions | 526 | 623 | 669 vs 698 off |
+| RReflect | 552 | 592 | 709 vs 675 off |
+| RNumbers | 581 | 679 | 693 vs 713 off |
+
+Holding the epoch pair **per entry** removes the wipe entirely: an epoch change
+costs nothing, stale entries miss one at a time and are replaced in place, and a
+hit is one array index plus four integer compares on a single cache line. After
+that change the six vectors are at parity — the correct outcome for a
+boot-dominated run, where the cache should not help and must not hurt.
+
+Two things worth keeping from this:
+
+* **A probe written alongside a fix will tend to exercise the shape the fix is
+  good at.** The independent check was what caught it, and it is cheap.
+* **A cache's invalidation cost is part of its cost.** An `O(n)` wipe keyed on a
+  counter that moves during class loading is not a cache, it is a memset with a
+  lookup attached.
+
+Re-measured after the redesign the field arm still lands in the same band, but
+that run was taken on a box no longer idle (the `off` column spread 38k–127k
+against 37k–48k on the clean run), so **the 1.9x above is the clean-run figure**
+and the re-measurement should be read only as confirming direction and
+magnitude, not as an independent estimate.
+
 **Consequence for the exit criteria below: they are not reachable by tiering
 work.** ~240x against an interpreter that the JIT cannot help is a
 general-throughput problem. Anyone picking this up should either attack
