@@ -15613,19 +15613,37 @@ pub fn register_essential_natives_with_shims(
                     .into())
                 }
             };
-            for i in 0..ctx.array_length(constants) {
-                let candidate = match ctx.get_array_element(constants, i) {
+            // Cross-call GC-safety (2026-08-04): `invoke_virtual` runs
+            // `Enum.name()` — Java, and therefore a possible moving young
+            // collection — with `constants` and `candidate` held as bare
+            // `ObjectRef` locals. After one relocation the array walk reads a
+            // vacated from-space array, matches nothing, and this throws
+            // `No enum constant <NAME>` for a constant that exists. Root the
+            // array once and re-read it (and each element) per iteration; the
+            // MATCHED candidate is also re-read through its own root, because
+            // the `name()` call that identified it may itself have moved it.
+            // Companion fix to `native_class_get_enum_constants`, which had the
+            // same defect one call deeper.
+            let mut scope = NativeHandleScope::new(ctx);
+            let constants_h = scope.root(constants);
+            let constants_cur = scope.get(&constants_h);
+            let len = scope.array_length(constants_cur);
+            for i in 0..len {
+                let constants_cur = scope.get(&constants_h);
+                let candidate = match scope.get_array_element(constants_cur, i) {
                     Value::Object(Some(o)) => o,
                     _ => continue,
                 };
+                let candidate_h = scope.root(candidate);
+                let candidate_cur = scope.get(&candidate_h);
                 let name_val =
-                    ctx.invoke_virtual(candidate, "name", "()Ljava/lang/String;", &[])?;
+                    scope.invoke_virtual(candidate_cur, "name", "()Ljava/lang/String;", &[])?;
                 let name_obj = match name_val {
                     Some(Value::Object(Some(s))) => s,
                     _ => continue,
                 };
-                if ctx.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
-                    return Ok(Some(Value::Object(Some(candidate))));
+                if scope.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
             Err(RuntimeError::IllegalArgumentException {
