@@ -4862,7 +4862,22 @@ fn jni_encode(s: &str) -> String {
             '_' => out.push_str("_1"),
             ';' => out.push_str("_2"),
             '[' => out.push_str("_3"),
-            c if c.is_ascii() => out.push(c),
+            // JNI spec 11.3: only alphanumerics survive as themselves. EVERY
+            // other character takes the `_0XXXX` escape — it is not a
+            // non-ASCII escape.
+            //
+            // This arm used to be `c if c.is_ascii() => out.push(c)`, which
+            // passed `$` through verbatim. `$` is the separator in every
+            // nested class's binary name, so for
+            // `JdkOnlyPlatformProbe$JniProbe.add` the VM looked up
+            // `Java_JdkOnlyPlatformProbe$JniProbe_add` while the compiler had
+            // emitted `Java_JdkOnlyPlatformProbe_00024JniProbe_add` — verified
+            // against `nm -D` on a library HotSpot binds from the same file.
+            // dlsym never matched, and the method raised UnsatisfiedLinkError
+            // with the library loaded and the symbol present. NO native on a
+            // nested or inner class could bind by name, which is most of them:
+            // the conventional shape is a package-private nested holder.
+            c if c.is_ascii_alphanumeric() => out.push(c),
             c => {
                 // Unicode escape: _0XXXX
                 out.push_str(&format!("_0{:04x}", c as u32));
@@ -7908,6 +7923,51 @@ mod tests {
         assert!(find_jni_native("com/example/Other", "bar", "()J").is_none());
         // Different descriptor → not found
         assert!(find_jni_native("com/example/Foo", "bar", "()V").is_none());
+    }
+
+    /// JNI spec 11.3 name mangling, pinned against symbols a real toolchain
+    /// emits. The `$` case is the one that was broken: `jni_encode` passed
+    /// every ASCII character through unescaped, so no native on a NESTED class
+    /// could ever be found by `dlsym` — the symbol in the library is
+    /// `Java_JdkOnlyPlatformProbe_00024JniProbe_add` (confirmed with `nm -D` on
+    /// the library built by probes/jdkonly_jni_probe.c, which HotSpot binds
+    /// from the same file) and the VM looked up
+    /// `Java_JdkOnlyPlatformProbe$JniProbe_add`.
+    ///
+    /// Asserting the FULL expected symbol, not "contains _00024": a mangler
+    /// that escaped `$` and also mangled something else would still pass a
+    /// containment check.
+    #[test]
+    fn jni_mangling_escapes_every_non_alphanumeric() {
+        // Nested class — the regression.
+        assert_eq!(
+            jni_short_name("JdkOnlyPlatformProbe$JniProbe", "add"),
+            "Java_JdkOnlyPlatformProbe_00024JniProbe_add"
+        );
+        // Package separator, and the ordinary case still unchanged.
+        assert_eq!(
+            jni_short_name("java/lang/System", "arraycopy"),
+            "Java_java_lang_System_arraycopy"
+        );
+        // Underscore in a method name is `_1`, and it must not collide with
+        // the `/`→`_` rule.
+        assert_eq!(
+            jni_short_name("com/example/Foo_Bar", "do_it"),
+            "Java_com_example_Foo_1Bar_do_1it"
+        );
+        // Doubly nested.
+        assert_eq!(
+            jni_short_name("a/B$C$D", "m"),
+            "Java_a_B_00024C_00024D_m"
+        );
+        // Long form: the parameter block carries `;` → `_2` and `[` → `_3`,
+        // and a nested parameter type takes the `$` escape too.
+        assert_eq!(
+            jni_long_name("a/B$C", "m", "(Ljava/lang/String;[ILa/B$C;)V"),
+            "Java_a_B_00024C_m__Ljava_lang_String_2_3ILa_B_00024C_2"
+        );
+        // Non-ASCII still takes the same escape it always did.
+        assert_eq!(jni_short_name("a/Bé", "m"), "Java_a_B_000e9_m");
     }
 
     #[test]
