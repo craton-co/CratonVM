@@ -1297,9 +1297,24 @@ fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Verify the write LANDED before trusting it. `set_field_by_name` is a
+        // silent no-op when the receiver's class has no field of that name,
+        // and CratonVM's synthetic `java/io/FileDescriptor` is
+        // `instance_fields(4)` — four `_fN` slots, no `fd`, no `handle`. So in
+        // synthetic mode `fis_ensure_fd_object` attached a descriptor that
+        // could not hold the id, both writes vanished, and `fis_get_fd`
+        // returned `None` for the rest of the stream's life: every `read()`
+        // answered -1 and every `available()` 0. That took out five `TckIo`
+        // corpus tests, and read as "the file is empty" rather than as a lost
+        // descriptor. The real-JDK layout does declare both fields, so this
+        // read-back never falls through there.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
-    // Legacy synthetic layout: no `FileDescriptor` object — slot 0 is a
+    // Legacy synthetic layout: no usable `FileDescriptor` object — slot 0 is a
     // plain scratch slot, so stash the raw id there.
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
@@ -1404,7 +1419,25 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(s) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let path = validated_path(&path)?;
+    fis_open_path(ctx, this, &path, path_obj)
+}
+
+/// Open `path` for reading and wire the result into `this`.
+///
+/// Shared by `open0` / `<init>(String)` and `<init>(File)`. Takes the path as
+/// a `&str` rather than a `java.lang.String` on purpose: the `File` overload
+/// would otherwise have to `create_string` to call the other entry point, and
+/// that allocation can move `this` out from under the Rust local — the
+/// receiver is pinned as a native ARG and the collector remaps the pin, but
+/// not a bare copy of it. The first version of the `File` overload did exactly
+/// that and every `TckIo` read came back `-1`.
+fn fis_open_path(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+    path_obj: Option<ObjectRef>,
+) -> MethodCallResult {
+    let path = validated_path(path)?;
     let fd = ctx
         .fd_table()
         .open_read(&path)
@@ -1418,6 +1451,41 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     fis_backfill_constructor_fields(ctx, this, path_obj);
     fis_set_fd(ctx, this, fd);
     Ok(None)
+}
+
+/// `FileInputStream.<init>(Ljava/io/File;)V` — synthetic-mode only.
+///
+/// The `FileOutputStream` side of this block has had `<init>(File)` and
+/// `<init>(File, boolean)` since FOS-FIX; the input side only ever got
+/// `<init>(String)`. In `synthetic-jdk` mode there is no bytecode constructor
+/// to fall back to, so `new FileInputStream(file)` raised
+/// `NoSuchMethodError: java.io.FileInputStream.<init>(Ljava/io/File;)V` — which
+/// took out seven `TckIo` corpus tests (`fis_readEof`, `fis_available`,
+/// `fis_skip`, `fis_closeIdempotent`, `fos_writeSingleByte`, `fos_writeBulk`,
+/// `e2e_writeReadRoundtrip`), all of which open their file through a `File`.
+///
+/// Resolves the path off the `File` exactly as `native_fos_init_file` does and
+/// then reuses [`fis_open_path`], so the fd layout and the constructor-field
+/// backfill stay in one place.
+fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing this".to_string(),
+            }))
+        }
+    };
+    let file_obj = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing File arg".to_string(),
+            }))
+        }
+    };
+    let path = read_file_path(ctx, file_obj).unwrap_or_default();
+    fis_open_path(ctx, this, &path, None)
 }
 
 fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1750,7 +1818,15 @@ fn fos_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fos_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Same read-back as `fis_set_fd` — see the writeup there for the
+        // synthetic `FileDescriptor` that has neither field. The output side
+        // never hit it (nothing attaches a descriptor to a synthetic
+        // `FileOutputStream`), but the asymmetry was luck, not design.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
@@ -5157,6 +5233,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
             "<init>",
             "(Ljava/lang/String;)V",
             native_fis_open0,
+        );
+        // ...and the `File` overload, the one every `TckIo` fixture actually
+        // uses. Its absence was invisible for as long as the corpus was dark.
+        registry.register(
+            "java/io/FileInputStream",
+            "<init>",
+            "(Ljava/io/File;)V",
+            native_fis_init_file,
         );
         // Public FileInputStream read surface. In real-JDK mode the bytecode
         // read()/read(byte[])/read(byte[],i,i)/available()/skip()/close() call

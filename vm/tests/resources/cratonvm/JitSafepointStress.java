@@ -1,3 +1,8 @@
+// Declares the package its directory implies — see the note in
+// ManifestNullValue.java for why a `cratonvm/`-resident source that declares
+// no package produces a `.class` whose `this_class` contradicts its path.
+package cratonvm;
+
 public final class JitSafepointStress {
     private static volatile boolean stop;
     private static volatile long sink;

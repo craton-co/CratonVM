@@ -399,9 +399,38 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
     / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
     0/1. Each is its own change with its own A/B, and the list is this lane's
-    output. **`ThreadGroup`, `java/lang/Thread` and
-    `java/security/ProtectionDomain` are FIXED (2026-08-05); the rest are
-    open.**
+    output. **Seven of the twelve are FIXED (2026-08-05)** — `ThreadGroup`,
+    `java/lang/Thread`, `java/security/ProtectionDomain`,
+    `java/security/CodeSource`, `java/io/BufferedReader`,
+    `java/io/BufferedWriter` and `java/util/Collections$SingletonMap`. Five
+    remain, and they are the ones that are not model rotations; see
+    [§What is left](#what-is-left-and-why-each-one-is-not-a-rotation).
+
+    ### The fourth batch — four more rotations, one root cause each
+
+    * **`CodeSource`** repeated `ProtectionDomain`'s mistake in the class next
+      to it: model `(location, certs)`, the `CodeSource(URL, Certificate[])`
+      constructor order, against a declared `location, signers, certs, …`. Slot
+      0 is `location` either way, which is why the dozen raw
+      `get_field(cs, 0)` readers scattered across the tree were all correct and
+      only slot 1 was wrong. Two raw slot-1 writes went by-name with it.
+    * **`BufferedReader`** and **`BufferedWriter`** named the wrapped stream at
+      index 0, where `java.io.Reader` puts `lock` and `java.io.Writer` puts
+      `writeBuffer`. Both are at index 2.
+    * **`Collections$SingletonMap`** named `k`/`v` at 0/1, where `AbstractMap`
+      puts `keySet`/`values`.
+
+    All four are model-only: every writer already went by name. One test now
+    pins all six corrected models against the JDK's declaration order in one
+    place, so the family cannot drift back one class at a time.
+
+    ### What is left, and why each one is not a rotation
+
+    | class | why it is not just a reorder |
+    |---|---|
+    | `java/io/InputStreamReader`, `OutputStreamWriter` | the model names `in`/`out`, which the real classes **do not declare at all** — the wrapped stream lives inside `sd:StreamDecoder` / `se:StreamEncoder`. Kind 3 or 4, and `servlet.rs` has raw slot-0 consumers gated to synthetic mode. |
+    | `java/lang/reflect/Field`, `Method`, `Constructor` | the models are the real layouts minus the inherited `AccessibleObject`/`Executable` fields, so everything from index 1 shifts — across **58 raw slot accesses**, and `MockNativeContext`'s `mock_jdk_field_slot` encodes a **third** mapping that agrees with neither. |
+    | `java/io/BufferedWriter` slot 0 (separate from its model) | `Files.newBufferedWriter` parks an fd `Int` there, i.e. in `Writer.writeBuffer`, and `bw_delegate_out` uses that slot's *value* as a layout discriminator. Kind 3 — wants a side table. Filed as [files-newbufferedwriter-parks-an-fd-in-writebuffer.md](files-newbufferedwriter-parks-an-fd-in-writebuffer.md). |
 
     ### The third worked example — `ProtectionDomain`, and what the mock hid
 

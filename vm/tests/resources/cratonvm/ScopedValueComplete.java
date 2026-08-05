@@ -367,23 +367,31 @@ public class ScopedValueComplete {
     // ========================================================================
 
     // 26: ScopedValue visible in child thread (via shared object state)
+    // A ScopedValue binding is NOT inherited by an ordinary child thread.
+    //
+    // JEP 506: `where(k, v).run(op)` binds for the dynamic extent of `op` **on
+    // the running thread**. Only a StructuredTaskScope fork inherits the
+    // binding; a plain `new Thread(...)` started inside the extent sees the
+    // ScopedValue as unbound. This test used to assert the opposite, with the
+    // comment "in our VM model, ScopedValue binding is per-object-field, so
+    // child threads see the same state" — i.e. it pinned a CratonVM
+    // implementation detail as if it were the specification. Under a real JDK
+    // 25 it returns 0, not 1.
     public static int testThreadVisibility() {
         ScopedValue<Integer> sv = ScopedValue.newInstance();
-        final int[] result = {0};
-        // In our VM model, ScopedValue binding is per-object-field, so child threads
-        // see the same ScopedValue object state
+        final int[] childSaw = {-1};
         ScopedValue.where(sv, 100).run(() -> {
             Thread t = new Thread(() -> {
-                // Child thread should see the binding since we use field-based model
-                if (sv.isBound()) {
-                    result[0] = (int) sv.get();
-                }
+                childSaw[0] = sv.isBound() ? (int) sv.get() : 0;
             });
             t.start();
             try { t.join(); } catch (InterruptedException e) {}
+            // The binding is still in effect on THIS thread.
+            if (!sv.isBound() || sv.get() != 100) {
+                childSaw[0] = -2;
+            }
         });
-        if (result[0] == 100) return 1;
-        return 0;
+        return childSaw[0] == 0 ? 1 : 0;
     }
 
     // 27: Rebinding in child thread doesn't affect parent
