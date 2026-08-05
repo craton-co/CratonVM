@@ -2,8 +2,15 @@
 
 **Status: OPEN**, found 2026-08-02. Blocks `org.h2.test.unit.TestFileSystem`.
 Pre-existing, but only newly *reachable*: until the `nioMemLZF:` per-element
-throughput gap was closed (see the retired `h2-jitban-residuals-20260726`
-write-up), the class never survived long enough to get here.
+throughput gap was closed (see the retired `h2-jitban-longtail1` write-up), the
+class never survived long enough to get here.
+
+> **Currently masked.** As of 2026-08-05 the class dies in ~1 second on the
+> first, plain-disk filesystem with `IOException: pread0/pwrite0: bad
+> addr/len/pos` — see
+> [`bug-h2-testfilesystem-pread0-bad-addr-len-pos-20260805.md`](bug-h2-testfilesystem-pread0-bad-addr-len-pos-20260805.md).
+> Everything below was measured before that regression landed and is still
+> valid; it is simply unreachable until that one is fixed.
 
 ## The failure
 

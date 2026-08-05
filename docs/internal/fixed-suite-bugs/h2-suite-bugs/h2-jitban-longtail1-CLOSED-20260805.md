@@ -135,10 +135,19 @@ What is kept from that line of work is only what stands on its own:
 `regression-suite` is 22/22 including `RDirectBufferElem`, the 444-check witness
 that these accessors are byte-identical to the bytecode they replace.
 
-The decisive consequence: `TestFileSystem` no longer stops at `nioMemLZF:`. It
-now clears `memFS:`, `memLZF:`, `nioMemFS:`, `nioMemLZF:1:`, `nioMemLZF:12:`,
-`rec:memFS:`, `testUserHome()` and `cache:` and runs on into `nioMapped:` — see
-the hand-off below.
+The decisive consequence, measured 2026-08-02: `TestFileSystem` no longer stops
+at `nioMemLZF:`. It cleared `memFS:`, `memLZF:`, `nioMemFS:`, `nioMemLZF:1:`,
+`nioMemLZF:12:`, `rec:memFS:`, `testUserHome()` and `cache:` and ran on into
+`nioMapped:` at 784 s — see the hand-off below.
+
+**That is not reproducible on `dev` as of 2026-08-05**, for a reason unrelated to
+anything here: the class now dies in ~1 second on the *first*, plain-disk
+filesystem with `IOException: pread0/pwrite0: bad addr/len/pos`, identically on
+`dev` and on this branch, where the 2026-08-02 binary did not. Filed as
+`docs/known-issues/h2/bug-h2-testfilesystem-pread0-bad-addr-len-pos-20260805.md`.
+So `TestFileSystem` cannot presently serve as this page's acceptance test; the
+`DbbElemProbe` / `LzfProbe` / `DirectReclaimProbe` numbers above and the
+per-class table earlier are what the verdict rests on.
 
 ### What is left of residual 4
 
