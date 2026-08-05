@@ -3906,8 +3906,22 @@ fn ise_scanner_closed() -> MethodCallFailed {
 /// Read the scanner's input, refusing a closed scanner the way the real
 /// `Scanner` does. Every token/predicate native goes through here, so the
 /// `ensureOpen()` check lives in one place rather than at twenty call sites.
+///
+/// A missing entry is NOT by itself "closed". `java.util.Scanner` has fourteen
+/// constructors and we register four, so a `new Scanner(path, UTF_8)` runs real
+/// bytecode, never reaches `scan_set_source`, and arrives here with no entry.
+/// That scanner reads as empty — which is what it did before this state moved
+/// off the object, when `scan_input` read the real `buf` field and got a
+/// `CharBuffer` it could not decode. Only the `closed` flag makes it an
+/// `IllegalStateException`.
 fn scan_input(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Arc<str>, MethodCallFailed> {
-    scan_source_opt(ctx, this).ok_or_else(ise_scanner_closed)
+    if let Some(text) = scan_source_opt(ctx, this) {
+        return Ok(text);
+    }
+    if scan_is_closed(ctx, this) {
+        return Err(ise_scanner_closed());
+    }
+    Ok(Arc::from(""))
 }
 
 /// Non-throwing input read, for the paths the real `Scanner` also allows after
@@ -3981,6 +3995,18 @@ fn scan_set_delim(ctx: &mut dyn NativeContext, this: ObjectRef, pattern: Value) 
 fn scan_set_closed(ctx: &mut dyn NativeContext, this: ObjectRef, closed: bool) {
     let slot = scan_slot(ctx, this, "closed", SCAN_FIELD_CLOSED);
     ctx.set_field(this, slot, Value::Int(i32::from(closed)));
+}
+
+/// Has `close()` been called? On the real layout this is the real `boolean
+/// closed` field and reads back what `scan_set_closed` wrote. On a FABRICATED
+/// `Scanner` stub the slot is declared `Ljava/lang/Object;`, so the `Int` is
+/// coerced to null on the way in and this always answers false — the same
+/// lossiness every primitive has on a fabricated layout, and the reason the
+/// close-then-read case degrades to "empty input" rather than
+/// `IllegalStateException` in synthetic-JDK mode.
+fn scan_is_closed(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let slot = scan_slot(ctx, this, "closed", SCAN_FIELD_CLOSED);
+    matches!(ctx.get_field(this, slot), Value::Int(v) if v != 0)
 }
 
 // --- Scanner state, for the `Scanner` natives that live in other crates ---
