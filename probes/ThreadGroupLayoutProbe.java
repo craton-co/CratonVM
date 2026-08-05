@@ -38,6 +38,7 @@ public class ThreadGroupLayoutProbe {
         section("daemon", ThreadGroupLayoutProbe::daemon);
         section("reflection", ThreadGroupLayoutProbe::reflection);
         section("membership", ThreadGroupLayoutProbe::membership);
+        section("rootgroup", ThreadGroupLayoutProbe::rootGroup);
         section("errors", ThreadGroupLayoutProbe::errors);
         System.out.println("TGLAYOUT sections=" + sections + " failed=" + failed);
     }
@@ -150,6 +151,74 @@ public class ThreadGroupLayoutProbe {
         int n = g.enumerate(arr);
         System.out.println("mem enumerateAfterJoin=" + n);
         System.out.println("mem activeCountIsNonNegative=" + (g.activeCount() >= 0));
+    }
+
+    /**
+     * The one path that actually built a `ThreadGroup` by raw slot index.
+     *
+     * CratonVM registers a `getRootGroup()` native on
+     * `java.lang.SecurityManager` (JBoss Modules' Host Controller bootstrap
+     * asks for it). The stock JDK has no such method, so HotSpot's expected
+     * line is `NO_SUCH_METHOD` or an access refusal — the point of this section
+     * is the CONTENT of the group CratonVM hands back, which before 2026-08-05
+     * had a null name and a `String` where the parent belongs.
+     *
+     * Reached through `MethodHandles.Lookup.findVirtual`, NOT
+     * `Class.getDeclaredMethod`: reflection scans the class's own metadata,
+     * which is the real JDK's and has no such member, so it answers
+     * NO_SUCH_METHOD on CratonVM too. `findVirtual` goes through the VM's
+     * method resolution and does reach the registered native.
+     *
+     * Every read goes through reflection rather than a direct call so a slot
+     * holding the wrong type surfaces as a printable class name instead of
+     * taking the probe down.
+     */
+    static void rootGroup() {
+        Object sm;
+        try {
+            java.lang.reflect.Constructor<?> c =
+                    SecurityManager.class.getDeclaredConstructor();
+            c.setAccessible(true);
+            sm = c.newInstance();
+        } catch (Throwable t) {
+            System.out.println("root ctor=" + t.getClass().getName());
+            return;
+        }
+        Object g;
+        try {
+            java.lang.invoke.MethodHandle mh = java.lang.invoke.MethodHandles.lookup()
+                    .findVirtual(SecurityManager.class, "getRootGroup",
+                            java.lang.invoke.MethodType.methodType(ThreadGroup.class));
+            g = mh.invoke(sm);
+        } catch (NoSuchMethodException e) {
+            System.out.println("root getRootGroup=NO_SUCH_METHOD");
+            return;
+        } catch (Throwable t) {
+            System.out.println("root getRootGroup=" + t.getClass().getName());
+            return;
+        }
+        if (g == null) {
+            System.out.println("root group=null");
+            return;
+        }
+        System.out.println("root groupClass=" + g.getClass().getName());
+        for (String accessor : new String[] {"getName", "getParent", "getMaxPriority", "isDaemon"}) {
+            try {
+                Object v = ThreadGroup.class.getMethod(accessor).invoke(g);
+                String shown;
+                if (v == null) {
+                    shown = "null";
+                } else if (v instanceof ThreadGroup) {
+                    shown = "TG:" + ((ThreadGroup) v).getName();
+                } else {
+                    shown = v.getClass().getName() + ":" + v;
+                }
+                System.out.println("root " + accessor + "=" + shown);
+            } catch (Throwable t) {
+                Throwable cause = (t.getCause() == null) ? t : t.getCause();
+                System.out.println("root " + accessor + "=THREW " + cause.getClass().getName());
+            }
+        }
     }
 
     /** The JDK's error behaviour is part of the contract. */
