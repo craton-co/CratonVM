@@ -86,17 +86,30 @@ pub mod swing;
 
 use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 
-// JDK-ONLY-CLASSIFY: unknown — needs census. This is the crate's ONLY category
-// call: `natives::register_all` is passed as a function pointer, so all 122
-// registrations in `natives.rs` inherit `Bridge` from this one line without any
-// per-site judgement. Measured against JDK 25 (`javap -p -s`), only 10 of the
-// 122 target an ACC_NATIVE method (`Toolkit.initIDs`, `Disposer.initIDs`,
-// `PlatformGraphicsInfo.hasDisplays0`, the `JPEGImageReader`/`JPEGImageWriter`
-// family); 74 target methods with concrete bytecode, 4 are abstract, 4 do not
-// exist in the image. Per-function verdicts are annotated in `natives.rs`. Do
-// NOT narrow this call before the runtime census: the `Bridge` tag is what
-// keeps these registered under `CRATONVM_NO_STUBS` today, and t7 desktop
-// conformance depends on them. See docs/jdk-only-ambient-category-audit.md.
+// JDK-ONLY-CLASSIFY: unknown for 167 of 188, bridge for 21 — the census has
+// been taken (L5b, 2026-08-05) and it supersedes the static `javap -p -s` read
+// this marker used to carry. This is still the crate's ONLY category call:
+// `natives::register_all` is passed as a function pointer, so every
+// registration in `natives.rs` inherits `Bridge` from this one line. What
+// changed is that 21 of the 188 registration rows no longer *only* inherit it:
+// the image declares their target ACC_NATIVE, so they state `Bridge` at their
+// own call sites in `natives.rs` and this line is no longer the whole story
+// for them.
+//
+// The other 167 still inherit, and this line stays exactly as it is: the
+// `Bridge` tag is what keeps them registered under `CRATONVM_NO_STUBS`, and t7
+// desktop conformance depends on them. Do NOT narrow it — that is a
+// reclassification, a different wave, and the per-function verdicts in
+// `natives.rs` are where it must start.
+//
+// Two corrections the census forced on the old count of "10 of the 122":
+// the real figure is 21 of 188 rows (the count was of registration *sites*,
+// and 27 drawing primitives are registered three times over), and
+// `sun/awt/PlatformGraphicsInfo.hasDisplays0` — the crate's ONE
+// `JDK-ONLY-CLASSIFY: bridge` verdict — **is not in it**. See
+// `register_headless_natives` in `natives.rs`.
+// See docs/jdk-only-ambient-category-audit.md and
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md.
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {
     registry.with_category(NativeKind::Bridge, natives::register_all);

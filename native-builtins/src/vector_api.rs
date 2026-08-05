@@ -11,7 +11,7 @@
 //!   - VectorOperators — operation code constants
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -1887,23 +1887,26 @@ pub(crate) fn register_vector_api_natives(r: &mut NativeMethodRegistry) {
 pub(crate) fn register_vector_support_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    r.register(
+    r.register_with_kind(
         VECTOR_SUPPORT,
         "registerNatives",
         "()I",
         vector_support_register_natives,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         VECTOR_SUPPORT,
         "getCPUFeatures",
         "()Ljava/lang/String;",
         vector_support_get_cpu_features,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         VECTOR_SUPPORT,
         "getMaxLaneCount",
         "(Ljava/lang/Class;)I",
         vector_support_get_max_lane_count,
+        NativeKind::Bridge,
     );
     r.set_category(__prev_cat);
 }

@@ -1753,6 +1753,38 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        // A real `jdk.internal.ref.Cleaner` is NOT the synthetic `Cleanable`
+        // shape the rest of this loop assumes (field 0 = action, field 1 =
+        // cleaned flag) — its slots are `PhantomReference`'s. It carries its own
+        // `clean()`, which unlinks it from the class's static list and runs its
+        // thunk exactly once, and that is precisely what the JDK's
+        // `ReferenceHandler` calls when it sees one. Dispatch to it and skip the
+        // `Cleanable` decoding entirely: reading field 1 of a `Cleaner` as a
+        // "cleaned" flag would be reading its `queue`.
+        //
+        // See `native_phantom_ref_init` for why these arrive here at all.
+        {
+            let class_id = shared.mem.heap.class_id_of(cleanable);
+            let is_jdk_cleaner = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .is_some_and(|c| c.name.as_ref() == "jdk/internal/ref/Cleaner");
+            if is_jdk_cleaner {
+                // Errors are swallowed per the Cleaner contract, exactly as for
+                // the `Cleanable` arm below.
+                let _ = crate::vm::invoke_shared(
+                    shared,
+                    thread,
+                    "jdk/internal/ref/Cleaner",
+                    "clean",
+                    "()V",
+                    &[Value::Object(Some(cleanable))],
+                );
+                continue;
+            }
+        }
         // Idempotency: skip if user code already invoked clean().
         let already = matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1),);
         if already {

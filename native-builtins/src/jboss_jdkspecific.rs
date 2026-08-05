@@ -29,7 +29,7 @@
 //! This module is loaded from `lib.rs::register_essential_natives` alongside
 //! the existing `jboss_module_xml` handlers.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1020,11 +1020,12 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // Still missing (ESCALATION, needs a NativeContext accessor): there is no
     // `module_add_package`, so the package -> module direction consulted by
     // `module_for_package` is still only whatever the class manager derived.
-    registry.register(
+    registry.register_with_kind(
         m,
         "defineModule0",
         "(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V",
         native_module_define_module0,
+        NativeKind::Bridge,
     );
     // The three `addExports*0` hooks are NOT bookkeeping-free: they are the
     // only place the VM learns about a dynamic export, and CratonVM's own
@@ -1036,19 +1037,21 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // `--add-exports` edge, so an export that had been granted still failed
     // the access check. The stale comment that used to sit above them
     // ("there is no extra VM module table to update") was simply wrong.
-    registry.register(
+    registry.register_with_kind(
         m,
         "addExports0",
         "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
         native_module_add_exports0,
+        NativeKind::Bridge,
     );
     // Unqualified export (`exports pkg;`). `ModuleRegistry::add_exports`
     // treats an empty target as "to all modules".
-    registry.register(
+    registry.register_with_kind(
         m,
         "addExportsToAll0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
         native_module_add_exports_to_all0,
+        NativeKind::Bridge,
     );
     // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`). The
     // unnamed module's registry name is the empty string
@@ -1057,11 +1060,12 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // `addExportsToAll0` implementation. That is a widening (we grant to all
     // modules rather than only unnamed ones); the alternative, dropping the
     // edge entirely, produced spurious IllegalAccessErrors.
-    registry.register(
+    registry.register_with_kind(
         m,
         "addExportsToAllUnnamed0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
         native_module_add_exports_to_all0,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/module/ResolvedModule",

@@ -2208,6 +2208,43 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// implementation MUST bounds-check and MUST NOT read out of range (M4a).
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value;
 
+    /// [`get_field`](Self::get_field) for a caller that already knows the
+    /// field's declared descriptor byte (`I`, `J`, `Z`, `L`, ...).
+    ///
+    /// `get_field` has to ask the class metadata what the slot's declared type
+    /// is before it can decode the raw storage — a per-read lookup that a
+    /// native which resolved its field indices once already has the answer to.
+    /// Passing the descriptor in skips that lookup; passing a WRONG one decodes
+    /// the slot as the wrong type, exactly as if the class had declared it that
+    /// way, so only use it with a descriptor read out of the same class
+    /// metadata the index came from.
+    ///
+    /// The default implementation ignores the hint and delegates, so an
+    /// implementor with no cheaper path needs to do nothing.
+    fn get_field_typed(&self, obj: ObjectRef, index: usize, descriptor: u8) -> Value {
+        let _ = descriptor;
+        self.get_field(obj, index)
+    }
+
+    /// [`get_field_typed`](Self::get_field_typed) for several slots of ONE
+    /// object at once.
+    ///
+    /// Each element of `slots` is `(slot index, descriptor byte)`; results land
+    /// in `out` at the matching position, and the shorter of the two bounds the
+    /// batch.
+    ///
+    /// Every single-field read has to canonicalise the reference first (an
+    /// object may have been evacuated since the caller obtained it). A native
+    /// that needs three or four fields of the same receiver per call — which is
+    /// what the per-element `java.nio.DirectByteBuffer` accessors do, once per
+    /// byte moved — pays that, and the dynamic dispatch, once instead of once
+    /// per field.
+    fn get_fields_typed(&self, obj: ObjectRef, slots: &[(usize, u8)], out: &mut [Value]) {
+        for (slot, dst) in slots.iter().zip(out.iter_mut()) {
+            *dst = self.get_field_typed(obj, slot.0, slot.1);
+        }
+    }
+
     /// Write an object field by slot index.
     ///
     /// `index` is an absolute heap field slot (see [`FieldMetadata::slot_index`]).

@@ -311,7 +311,8 @@ diagnosis is complete for this class: nothing else in it carries the shape.
 
 ## Related
 
-* `../h2/bug-h2-testmultithread-concurrent-update-timeout.md` — the same class's
+* `h2-update-path-throughput-20260802.md` (and the retired
+  `bug-h2-testmultithread-concurrent-update-timeout` write-up) — the same class's
   throughput problem, which this now hides: the class cannot reach
   `testConcurrentUpdate` at all on an affected binary.
 * `jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`, `jit-ir-tier-code-buffer-*` —
