@@ -265,6 +265,7 @@ requests are refused or declined, and the other rows say which.
 | `probes/OsrExitDifferentialProbe.java` | new |
 | `regression-suite/perf/osr-exit-differential.sh` | new |
 | `vm/src/runtime/interpreter/osr_frame_trace.rs` | new — §8 |
+| `probes/OsrFrameProbe.java` | new — the injective ground truth §8 needs |
 | `regression-suite/perf/osr-frame-comparator.py` | new — §8 |
 | `regression-suite/perf/osr-frame-differential.sh` | new — §8 |
 
@@ -310,6 +311,39 @@ Two placements are load-bearing:
   current value, so a record built from the reconstruction would describe a
   frame that never exists.
 
+### What the first real run against a VM corrected
+
+Three things, all of them **red on a correct VM**, which is the only reason they
+were findable. Each is a property of the comparison, not of OSR:
+
+1. **Reference slots hold raw heap addresses**, and two runs of one program do
+   not share a heap layout, so every frame containing any object reference
+   compared unequal. References now render `null` / `ref`. The loss is real and
+   is stated at the renderer: a reference *retargeted* to a different non-null
+   object is invisible. Nullness still shows, which is the shape a mis-seeded
+   reference takes in the recorded OSR defects.
+2. **The category-2 high half legitimately differs.** `lload N` reads the full
+   value from `N` and never reads `N+1`; the interpreter's `lstore` leaves the
+   tag `LONG` in the reserved slot while the OSR-exit transfer writes the
+   snapshot's `Undefined` as `Int(0)` — which `deopt_resume.rs` argues at length
+   and calls the correct two-slot layout. It is excluded, by a **forward** scan:
+   the look-behind version ("slot `i-1` is tagged `LONG`") cascades and
+   swallowed a real local.
+3. **The forced-exit counter is per compiled METHOD, not per entry.** Once
+   `CRATONVM_OSR_EXIT_AFTER=N` reaches are spent, every later entry into that
+   artifact bails on its first header reach — advance 0, and correct, because
+   there reject and transfer coincide. Requiring every pair to advance reported
+   a clean run as a replay.
+
+A fourth, smaller one: an `E` names the same program point as the `A` before it
+(one call records both), so it may match the index already consumed and does not
+advance the trajectory.
+
+`probes/OsrFrameProbe.java` exists for the same reason. The comparator needs an
+**injective** ground truth and `OsrExitDifferentialProbe` has none — it runs
+every shape twice and several of its methods hold references. One call, one
+loop, a strictly monotone induction variable, primitive locals only.
+
 ### The two assertions, and why one was not enough
 
 For each `(key, bci)` site, `osr-frame-comparator.py` maps every record of the
@@ -319,9 +353,12 @@ equality**, and requires:
 1. **the index sequence to increase strictly** — a frame matching nothing is a
    state the program cannot be in (the case §2's oracle misses when the slot is
    never read again); an index that repeats is an iteration executing twice;
-2. **`index(X) - index(E) >= --min-advance`** — how far the compiled body got,
-   measured on the un-compiled run's own trajectory rather than taken from
-   anything the JIT claims.
+2. **no pair may resume BEHIND its entry, and at least one must reach
+   `--min-advance`** — how far the compiled body got, measured on the
+   un-compiled run's own trajectory rather than taken from anything the JIT
+   claims. *At least one*, not every one, for correction 3 above; a systematic
+   replay drives every pair to zero, including the first, so the floor still
+   bites.
 
 **Assertion 2 exists because a hand-built fixture walked straight through
 assertion 1.** Compiled iterations produce no arrival records, so the historical
@@ -336,16 +373,37 @@ is the OSR; its size is reported, not judged.
 
 ### The checker is itself guarded
 
-`--selftest` builds six transcript pairs with known verdicts — `clean`,
-`replay`, `corrupt-local`, `backwards`, `no-exit`, `no-truth` — and the
-differential script runs it **before** the real comparison, so a comparator that
-has stopped catching anything cannot report a green run. Two of the six are
-vacuity cases rather than defects: an empty ground truth (the class filter
-matched nothing) and a run under test with no exits (no OSR happened, so nothing
-about OSR was tested). Both must be red.
+`--selftest` builds eight transcript pairs with known verdicts — `clean`,
+`replay`, `spent-counter`, `resume-behind-entry`, `corrupt-local`, `backwards`,
+`no-exit`, `no-truth` — and the differential script runs it **before** the real
+comparison, so a comparator that has stopped catching anything cannot report a
+green run. Two are vacuity cases rather than defects (an empty ground truth,
+and a run with no exits at all), and `spent-counter` is the opposite: a shape
+that must be **green**, pinning correction 3 so the over-strict rule cannot come
+back.
+
+### End to end, with the defect injected
+
+The comparison was run against a VM carrying the same injected defect as §2
+(skip writing the JIT-advanced locals back). It reported **all five entry/exit
+pairs advancing 0** and failed — while the program's **output was
+byte-identical**, because re-running iterations 400…406 from the state at 400
+re-derives the same accumulator. A result check could not have seen it. That is
+the frame comparator earning its place, and the patch was reverted and never
+committed.
 
 ### What it still does not cover
 
+* **It does not, on its own, prove no iteration re-ran.** A single advance-0
+  exit is indistinguishable *from frames alone* from "the body ran seven
+  iterations and resumed where it started" — because if the body really advanced
+  nothing, resuming at the entry frame is right. Whether the body ran is a
+  question about behaviour, and §2's per-execution counter answers it. **The two
+  halves are complementary and neither subsumes the other**: this one catches a
+  resumed frame that is not on the trajectory at all, which behaviour cannot
+  see; that one catches the loop body running more times than the program says,
+  which frames cannot see.
+* **A retargeted reference is invisible**, per correction 1.
 * **Only frames at a loop header.** The trace records arrivals at back edges and
   the resume point, which is where OSR entry and exit happen. A divergence
   introduced and repaired *within* one iteration is invisible to both halves of
