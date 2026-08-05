@@ -560,7 +560,19 @@ native at all) never republishes.
 Resolve the pc first, because it is what this whole page was named after.
 
 **The caller pc a dispatch failure reports is the POST-invoke pc**, i.e. the
-return address, not the call site. Three witnesses, three builds, all consistent:
+return address, not the call site. That is not an inference from the numbers —
+the interpreter advances the frame's pc BEFORE it dispatches, and the terminal
+report reads `thread.frames.last().pc`:
+
+```rust
+// invokeinterface — stackless dispatch with monomorphic inline cache
+0xb9 => {
+    // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
+    thread.frames[frame_idx].pc = saved_pc + 5;
+    let cached_result = execute_invokevirtual_cached(…, saved_pc, …);
+```
+
+Three witnesses, three builds, all consistent with it:
 
 | witness | call site | reported pc | site + length |
 | --- | --- | --- | --- |
