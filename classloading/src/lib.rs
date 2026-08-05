@@ -76,6 +76,11 @@ pub use class_origin::{ClassOrigin, ClassOriginEntry};
 pub use class_manager::ImageMethodVerdict;
 pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::synthetic_stub_instance_field_count;
+// The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
+// against the real layout; a build-time gate over the `*_FIELD_*` constants —
+// the follow-up `docs/jdk-only-object-layout-audit.md` §"A gate worth adding"
+// asks for — would want the same table.
+pub use class_manager::synthetic_stub_field_model;
 pub use class_manager::{
     any_class_redefined,
     class_definition_epoch,
