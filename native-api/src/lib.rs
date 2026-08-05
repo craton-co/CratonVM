@@ -21,6 +21,7 @@ pub mod plain_server_socket;
 pub mod registry;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
+pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other
 /// workspace crates that opt in via the `test-mock` feature.
@@ -41,7 +42,7 @@ pub use capability::{
     CapabilityAuditReport, CapabilityCheck, CapabilityDenied, CapabilityKind, CapabilityMode,
     CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
 };
-pub use class_identity::{ClassIdentityError, NameLookup};
+pub use class_identity::{refusal_to_java_failure, ClassIdentityError, NameLookup};
 pub use intrinsic::InterpIntrinsic;
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///

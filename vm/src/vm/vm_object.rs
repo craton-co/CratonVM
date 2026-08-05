@@ -477,12 +477,37 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
                 Some(a) => a,
                 None => return false,
             };
-            for (i, &u) in units.iter().enumerate() {
-                let _ =
-                    shared
-                        .mem
-                        .heap
-                        .set_array_element(byte_array, i, Value::Int((u & 0xFF) as i32));
+            // Bulk-write, matching `try_alloc_java_string_object_from_ascii`.
+            // This path is no longer only used by `String(char[])`: string
+            // CONCATENATION now builds its result as units (so an unpaired
+            // surrogate survives -- see `execute_string_concat`), and concat is
+            // the hottest allocation site in the VM. A per-element
+            // `set_array_element` boxes a `Value` and re-checks bounds for every
+            // byte, which would have turned the common all-Latin-1 concat from a
+            // memcpy into an N-iteration loop.
+            if !units.is_empty() {
+                match shared.mem.heap.array_data_ptr(byte_array) {
+                    Some(base) => unsafe {
+                        cratonvm_gc::heap::cell_watch_check(
+                            base as usize,
+                            units.len(),
+                            "populate_java_string_fields/latin1",
+                            &byte_array.as_ptr(),
+                        );
+                        for (i, &u) in units.iter().enumerate() {
+                            *base.add(i) = (u & 0xFF) as u8;
+                        }
+                    },
+                    None => {
+                        for (i, &u) in units.iter().enumerate() {
+                            let _ = shared.mem.heap.set_array_element(
+                                byte_array,
+                                i,
+                                Value::Int((u & 0xFF) as i32),
+                            );
+                        }
+                    }
+                }
             }
             shared
                 .mem
@@ -512,19 +537,39 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
                 Some(a) => a,
                 None => return false,
             };
-            for (i, &unit) in units.iter().enumerate() {
-                // Little-endian: low byte at even index, high byte at odd index.
-                let lo = (unit & 0xFF) as u8;
-                let hi = (unit >> 8) as u8;
-                let _ = shared
-                    .mem
-                    .heap
-                    .set_array_element(byte_array, i * 2, Value::Int(lo as i32));
-                let _ =
-                    shared
-                        .mem
-                        .heap
-                        .set_array_element(byte_array, i * 2 + 1, Value::Int(hi as i32));
+            // Bulk-write for the same reason as the LATIN1 branch above.
+            // Little-endian: low byte at even index, high byte at odd index.
+            if !units.is_empty() {
+                match shared.mem.heap.array_data_ptr(byte_array) {
+                    Some(base) => unsafe {
+                        cratonvm_gc::heap::cell_watch_check(
+                            base as usize,
+                            byte_len,
+                            "populate_java_string_fields/utf16",
+                            &byte_array.as_ptr(),
+                        );
+                        for (i, &unit) in units.iter().enumerate() {
+                            *base.add(i * 2) = (unit & 0xFF) as u8;
+                            *base.add(i * 2 + 1) = (unit >> 8) as u8;
+                        }
+                    },
+                    None => {
+                        for (i, &unit) in units.iter().enumerate() {
+                            let lo = (unit & 0xFF) as u8;
+                            let hi = (unit >> 8) as u8;
+                            let _ = shared.mem.heap.set_array_element(
+                                byte_array,
+                                i * 2,
+                                Value::Int(lo as i32),
+                            );
+                            let _ = shared.mem.heap.set_array_element(
+                                byte_array,
+                                i * 2 + 1,
+                                Value::Int(hi as i32),
+                            );
+                        }
+                    }
+                }
             }
             shared
                 .mem
@@ -656,22 +701,73 @@ pub fn decode_java_string_value_array(
     }
 }
 
+/// Decode a String's `value` array to its UTF-16 code **units**, without going
+/// through a Rust `String`.
+///
+/// Lossless twin of [`decode_java_string_value_array`]. That one ends in
+/// `String::from_utf16_lossy`, which replaces an unpaired surrogate with
+/// U+FFFD because a Rust `str` cannot represent one. Any caller that reads a
+/// Java `String` only to build another Java `String` must use this instead —
+/// the round trip through UTF-8 is where the surrogate dies.
+pub fn decode_java_string_value_array_units(
+    heap: &VmHeap,
+    value_array: ObjectRef,
+    coder: i32,
+) -> Option<Vec<u16>> {
+    if heap.kind_of(value_array) != crate::memory::heap::ObjectKind::Array {
+        return None;
+    }
+    match heap.array_element_type(value_array)? {
+        ArrayElementType::Char => Some(heap.read_char_array_bulk(value_array)),
+        ArrayElementType::Byte => {
+            let bytes = read_byte_array_bulk(heap, value_array);
+            if coder == CODER_LATIN1 {
+                Some(bytes.iter().map(|&b| u16::from(b)).collect())
+            } else {
+                // Little-endian pairs, matching `create_java_string` and
+                // `StringUTF16.isBigEndian() == false`. `chunks_exact(2)`
+                // drops a trailing odd byte exactly as the `str` decoder does.
+                Some(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from(c[0]) | (u16::from(c[1]) << 8))
+                        .collect(),
+                )
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Read a Java String object back to a Rust `String`.
 ///
 /// Supports both compact string layout (JDK 9+: byte[] + coder) and legacy
 /// layout (char[] value).
+///
+/// **Lossy for unpaired surrogates** — see [`read_java_string_units`].
 pub fn read_java_string(heap: &VmHeap, obj_ref: ObjectRef) -> Option<String> {
-    read_java_string_inner(heap, obj_ref, false)
+    let (value_array, coder) = java_string_value_and_coder(heap, obj_ref)?;
+    decode_java_string_value_array(heap, value_array, coder)
 }
 
-/// Inner implementation with explicit compact_strings flag override.
-/// When `compact_override` is true, reads compact layout; when false, tries
-/// to auto-detect by examining the array element type.
-fn read_java_string_inner(
-    heap: &VmHeap,
-    obj_ref: ObjectRef,
-    _compact_override: bool,
-) -> Option<String> {
+/// Read a Java String object back to its UTF-16 code **units**.
+///
+/// Same receiver guards as [`read_java_string`], but lossless: an unpaired
+/// surrogate survives. Use this whenever the destination is another Java
+/// `String` rather than Rust text.
+pub fn read_java_string_units(heap: &VmHeap, obj_ref: ObjectRef) -> Option<Vec<u16>> {
+    let (value_array, coder) = java_string_value_and_coder(heap, obj_ref)?;
+    decode_java_string_value_array_units(heap, value_array, coder)
+}
+
+/// The `(value, coder)` pair of a `java/lang/String`, behind every shape guard
+/// that makes the positional slot read safe on a receiver that may not be a
+/// String at all.
+///
+/// Factored out of `read_java_string` so the `str` and the code-unit readers
+/// cannot drift: the guards below are subtle and were each added for a named
+/// misidentification, and two copies of them would be two chances to weaken one.
+fn java_string_value_and_coder(heap: &VmHeap, obj_ref: ObjectRef) -> Option<(ObjectRef, i32)> {
     // Undersized-receiver guard. This function is invoked speculatively by
     // hash-key / equality / toString helpers (`map_hash_key`,
     // `obj_to_display_string`, etc.) that don't know whether the receiver
@@ -742,9 +838,7 @@ fn read_java_string_inner(
         _ => CODER_LATIN1,
     };
     match elem_type {
-        Some(ArrayElementType::Char) | Some(ArrayElementType::Byte) => {
-            decode_java_string_value_array(heap, value_array, coder)
-        }
+        Some(ArrayElementType::Char) | Some(ArrayElementType::Byte) => Some((value_array, coder)),
         _ => {
             // Field 0 is an array but it's neither a char[] nor a byte[].
             // This means `obj_ref` is NOT a java.lang.String — it's some
@@ -1104,7 +1198,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // to the app loader and same-named class selection crosses loaders.
     if let (Some(idx), Some(loader)) = (
         slots.class_loader,
-        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32()),
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32()),
     ) {
         shared
             .mem
@@ -1134,7 +1228,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // scanning). Built-in-loader classes need no entry: their mirrors stay
     // unconditionally rooted directly.
     if let Some(loader) =
-        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32())
     {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
             let name = shared

@@ -3,7 +3,7 @@
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -1236,29 +1236,33 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Runtime;",
         native_runtime_get_runtime,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "availableProcessors",
         "()I",
         native_runtime_available_processors,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "maxMemory",
         "()J",
         native_runtime_max_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "totalMemory",
         "()J",
         native_runtime_total_memory,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
         "()J",
         native_runtime_free_memory,
+        NativeKind::Bridge,
     );
     // JDK 9+ / WildFly: `Runtime.version()` and `Runtime.Version.feature()`.
     registry.register(
@@ -1303,10 +1307,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
-    registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
+    registry.register_with_kind("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)
-    });
+    }, NativeKind::Bridge);
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
     // `Runtime.halt(int)` is NOT intercepted — its real bytecode runs, and it
@@ -1319,11 +1323,17 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError: java/lang/Shutdown.beforeHalt()V` and the process
     // kept running: a caller asking to die immediately got a linkage error out
     // of a method that cannot legally return.
-    registry.register("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
+    registry.register_with_kind("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
         // HotSpot's does nothing an application can observe.
         Ok(None)
-    });
-    registry.register("java/lang/Shutdown", "halt0", "(I)V", native_shutdown_halt0);
+    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "halt0",
+        "(I)V",
+        native_shutdown_halt0,
+        NativeKind::Bridge,
+    );
 
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
     registry.register(
@@ -2165,34 +2175,32 @@ pub(crate) fn native_system_getenv(
 // `gc_update_system_singleton_refs` (wired into `gc.rs`); `reset_system_singletons`
 // clears them when a new VM is created (mirrors `reset_loader_singletons`).
 // ---------------------------------------------------------------------------
-use std::sync::{Mutex, OnceLock};
+use cratonvm_native_api::vm_scoped::VmScoped;
 
-fn system_env_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
-}
-
-fn system_props_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
-}
+/// One cell per VM, not per process. `reset_system_singletons` was correct
+/// only while VMs were created strictly in sequence — a `Vm::new` on one test
+/// thread wiped the cell another live VM was using, and the loser then read
+/// back a `Map`/`Properties` object allocated in the other VM's heap. Keyed by
+/// `vm_identity` and torn down from `release_vm_native_state`; see
+/// `cratonvm_native_api::vm_scoped`.
+static SYSTEM_ENV: VmScoped<Option<ObjectRef>> = VmScoped::new();
+static SYSTEM_PROPS: VmScoped<Option<ObjectRef>> = VmScoped::new();
 
 /// The cached no-arg `System.getenv()` Map singleton, if already built.
-fn system_env_singleton() -> Option<ObjectRef> {
-    *system_env_store().lock().unwrap_or_else(|e| e.into_inner())
+fn system_env_singleton(vm: usize) -> Option<ObjectRef> {
+    SYSTEM_ENV.peek(vm, |cell| *cell).flatten()
 }
 
 /// Publish `obj` as the `System.getenv()` singleton (double-checked, like
 /// [`set_system_props_singleton`]); returns the canonical singleton.
-fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
-    let mut g = system_env_store().lock().unwrap_or_else(|e| e.into_inner());
-    match *g {
+fn set_system_env_singleton(vm: usize, obj: ObjectRef) -> ObjectRef {
+    SYSTEM_ENV.with(vm, |cell| match *cell {
         Some(existing) => existing,
         None => {
-            *g = Some(obj);
+            *cell = Some(obj);
             obj
         }
-    }
+    })
 }
 
 /// Return the OpenJDK-shaped read-only wrapper used by `System.getenv()`.
@@ -2203,71 +2211,77 @@ fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
 /// that backing map. System Rules reflects on that field by name, so the
 /// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
 /// slot 0, matching the JDK's `m` field slot.
-fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7 residual R1): the
+/// wrapper stands in for `java.util.Collections$UnmodifiableMap`, whose real
+/// bytecode is not running, so under `--jdk-only` it is refused as a catchable
+/// `NoClassDefFoundError` rather than fabricated behind a recorded violation.
+fn wrap_system_env_map(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(map);
-    let wrapper_class = ctx.ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    // Not `?`: the pin above must be released before unwinding.
+    let wrapper_class =
+        match ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2) {
+            Ok(id) => id,
+            Err(err) => {
+                ctx.unpin_native_roots(pin);
+                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+            }
+        };
     let map = ctx.read_native_pin(pin, map);
     let wrapper = ctx.alloc_object(wrapper_class, 2);
     let map = ctx.read_native_pin(pin, map);
     ctx.set_field(wrapper, 0, Value::Object(Some(map)));
     ctx.unpin_native_roots(pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
-pub fn system_props_singleton() -> Option<ObjectRef> {
-    *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+pub fn system_props_singleton(vm_identity: usize) -> Option<ObjectRef> {
+    SYSTEM_PROPS.peek(vm_identity, |cell| *cell).flatten()
 }
 
 /// Publish `obj` as the `System.getProperties()` singleton, unless another
 /// thread already won the race вЂ” in which case the existing one is returned and
 /// `obj` is discarded (it becomes unreachable and is collected). Returns the
 /// canonical singleton so all callers converge on one identity.
-pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
-    let mut g = system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match *g {
+pub fn set_system_props_singleton(vm_identity: usize, obj: ObjectRef) -> ObjectRef {
+    SYSTEM_PROPS.with(vm_identity, |cell| match *cell {
         Some(existing) => existing,
         None => {
-            *g = Some(obj);
+            *cell = Some(obj);
             obj
         }
-    }
+    })
 }
 
 /// Replace the cached `System.getProperties()` singleton. Used by
 /// `System.setProperties(Properties)`, which HotSpot implements as a global
 /// swap of `System.props`, not as a mutation of the previous Properties object.
 /// Returns the previous singleton so callers can drop any system-props marker.
-pub fn replace_system_props_singleton(obj: Option<ObjectRef>) -> Option<ObjectRef> {
-    let mut g = system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::replace(&mut *g, obj)
+pub fn replace_system_props_singleton(
+    vm_identity: usize,
+    obj: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    SYSTEM_PROPS.with(vm_identity, |cell| std::mem::replace(cell, obj))
 }
 
 /// GC root scan for the `System.getenv()` / `System.getProperties()` singletons
 /// (companion to [`gc_update_system_singleton_refs`]). Mirrors
 /// `classloader::gc_scan_loader_singleton_roots`.
-pub fn gc_scan_system_singleton_roots(out: &mut Vec<ObjectRef>) {
-    if let Some(o) = *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) {
-        out.push(o);
-    }
-    if let Some(o) = *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-    {
-        out.push(o);
-    }
+pub fn gc_scan_system_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    out.extend(system_env_singleton(vm_identity));
+    out.extend(system_props_singleton(vm_identity));
 }
 
 /// Post-GC remap for the system singletons (companion to
 /// [`gc_scan_system_singleton_roots`]). Repoints the cached `ObjectRef`s to
 /// their relocated addresses after a moving collection.
-pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_system_singleton_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
@@ -2280,22 +2294,21 @@ pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<u
             }
         }
     };
-    remap(&mut system_env_store().lock().unwrap_or_else(|e| e.into_inner()));
-    remap(
-        &mut system_props_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    );
+    SYSTEM_ENV.with(vm_identity, remap);
+    SYSTEM_PROPS.with(vm_identity, remap);
 }
 
-/// Reset the cached system singletons. Called when creating a new VM so a stale
-/// `ObjectRef` from a previous VM instance is never returned (mirrors
-/// `classloader::reset_loader_singletons`).
-pub fn reset_system_singletons() {
-    *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+/// Per-VM teardown for the cached system singletons. Called from
+/// `release_vm_native_state`.
+///
+/// This replaces the old `reset_system_singletons()`, which `Vm::new` called
+/// to clear a *previous* VM's leftovers. That only worked while VMs were
+/// created in sequence: with two live at once it wiped a running VM's cell.
+/// A fresh `vm_identity` starts with no row, so there is nothing to reset at
+/// construction time any more.
+pub fn forget_vm_system_singletons(vm_identity: usize) {
+    SYSTEM_ENV.forget(vm_identity);
+    SYSTEM_PROPS.forget(vm_identity);
 }
 
 pub(crate) fn native_system_getenv_all(
@@ -2311,7 +2324,7 @@ pub(crate) fn native_system_getenv_all(
     // fallback still returns the OpenJDK-shaped unmodifiable wrapper but is left
     // uncached so a later call retries once the real `java/util/HashMap` layout
     // is resolvable.
-    if let Some(cached) = system_env_singleton() {
+    if let Some(cached) = system_env_singleton(ctx.vm_identity()) {
         return Ok(Some(Value::Object(Some(cached))));
     }
 
@@ -2440,8 +2453,8 @@ pub(crate) fn native_system_getenv_all(
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
-        let env = wrap_system_env_map(ctx, map);
-        let env = set_system_env_singleton(env);
+        let env = wrap_system_env_map(ctx, map)?;
+        let env = set_system_env_singleton(ctx.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
 
@@ -2478,7 +2491,7 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    let env = wrap_system_env_map(ctx, map);
+    let env = wrap_system_env_map(ctx, map)?;
     Ok(Some(Value::Object(Some(env))))
 }
 
@@ -2592,7 +2605,7 @@ pub(crate) fn build_stack_trace_element_array(
     for (i, e) in trace.iter().rev().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
-            Some(cid) => crate::lang_class::dotted_class_name(cid, &e.class_name),
+            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name),
             None => std::sync::Arc::from(e.class_name.replace('/', ".")),
         };
         crate::lang_misc::fill_stack_trace_element(
@@ -3687,7 +3700,7 @@ fn same_loader_already_defined_mirror(
     }
     if loader_id != 0 {
         if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
-            crate::classloader::register_defining_loader(class_id.as_u32(), loader_obj);
+            crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), loader_obj);
             return Some(ctx.get_class_mirror(class_id));
         }
     }
@@ -3787,7 +3800,7 @@ pub(crate) fn native_classloader_define_class1(
             // The JDK's Class.getClassLoader bytecode reads this instance
             // field directly. Keep it aligned with the VM's loader registry.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -3871,7 +3884,7 @@ pub(crate) fn native_classloader_define_class2(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -3997,7 +4010,7 @@ pub(crate) fn native_classloader_define_class0(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))

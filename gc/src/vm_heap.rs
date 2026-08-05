@@ -2015,6 +2015,20 @@ impl VmHeap {
                 );
             }
         }
+        // H2-CID0 — the marking fail-open in `compact_oop_scan`. Printed only
+        // when non-zero, because zero is the expected reading and a line that
+        // is always there stops being read.
+        {
+            let n = crate::heap::COMPACT_OOP_MAP_MISSING
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if n != 0 {
+                eprintln!(
+                    "[GC] compact_oop_map_missing={n} — MARKING FAIL-OPEN: that many \
+                     GC_FLAG_COMPACT objects were scanned as legacy `Value` cells, so \
+                     every reference they hold was invisible to the collector"
+                );
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
@@ -2168,6 +2182,15 @@ impl VmHeap {
     /// G1/ZGC return `None`: their liveness is region/registry based and
     /// `is_addr_live` already answers exactly, so there is no free-list view
     /// to consult.
+    /// H2-CID0 — see [`GenerationalHeap::live_holders_of`]. Empty for every
+    /// non-generational backend.
+    pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
+        match self {
+            VmHeap::Generational(h) => h.live_holders_of(addr, cap),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
         match self {
             VmHeap::Generational(h) => h.reclaimed_hole_at(addr),

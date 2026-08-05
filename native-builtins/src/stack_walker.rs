@@ -33,7 +33,7 @@
 //! registered by `phases_late::register_p59_stackwalker`; we do **not**
 //! re-register those here.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -395,11 +395,12 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
     // swallowed at `<clinit>` and a downstream NPE on
     // `StackFrameTraverser.<clinit>` because the verbatim `mode` static
     // never gets initialised. Same semantics — return true.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/StackStreamFactory",
         "checkStackWalkModes",
         "()Z",
         native_check_stack_walk_modes,
+        NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }
