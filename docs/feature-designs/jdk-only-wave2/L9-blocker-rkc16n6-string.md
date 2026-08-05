@@ -72,28 +72,59 @@ implementation, in three separate ways, and no test asked.
 * **`--jdk-only` census**: zero `native-shadows-bytecode` violations for
   `java/lang/String`, from 12; the registry goes from 80 `String` rows to 26.
 * **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, both modes
-  byte-identical to each other.
+  byte-identical to each other. The two follow-up fixes below took it to
+  **21** (37 -> 21: 16 fixed, **0 regressed**, and no still-divergent row
+  changed value — a count alone cannot see a row *worsen*).
 * **`Compatible` byte-for-byte over `test_classes`**: 9 of 9 identical.
+
+## What is left, and what each remaining row costs
+
+The 21 residual matrix rows are not 21 problems. They are four:
+
+| group | rows | cause |
+|---|---:|---|
+| A | **13** | `msg=null` on out-of-bounds exceptions. The *class* is right (F4); only the message text is missing. This is [`preconditions-ignores-the-exception-formatter`](../../known-issues/preconditions-ignores-the-exception-formatter.md), still open. One fix, 13 rows. |
+| B | 4 | regex message text, plus `replaceAll` with a bad group reference not throwing at all |
+| C | 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null") vs our own text. A VM-wide feature, not a `String` defect. |
+| D | 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
+
+Group A is the only one whose fix is scoped to this lane, and it is the largest.
+Group C is deliberately out of scope: it is `NullPointerException` message
+synthesis for the whole VM, not anything `String` does.
 
 ## Three defects the removal surfaced
 
 Taking a shadow off makes the shadowed code reachable, and two of the three
-things underneath were broken. All three are filed rather than re-masked,
-except the first, where re-masking is the correct answer and the reason is
-recorded at the registration site:
+things underneath were broken. None of the three ended up re-masked — the
+first looked like it had to be, and did not:
 
-* `String.hashCode()` is **wrong for UTF-16 strings** — it hashes the backing
-  BYTES sign-extended, not the code units. The native is kept, stated
-  `Intrinsic`, for correctness rather than speed
-  ([record](../../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md)).
+* `String.hashCode()` was **wrong for UTF-16 strings** — it hashed the backing
+  BYTES sign-extended, not the code units. **Root-caused and FIXED 2026-08-05**
+  ([record](../../internal/string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md)).
+  The defect was never in `String` or `StringUTF16` bytecode: it was the
+  `ArraysSupport.vectorizedHashCode` **native**, which read one array slot per
+  element for every `BasicType`. `StringUTF16.hashCode` calls it with `T_CHAR`
+  over a **`byte[]`** of UTF-16 pairs, so it folded bytes where it owed code
+  units. One shadow was hiding a second shadow. The `hashCode()` native this
+  doc originally proposed to keep is therefore **dropped** — the bytecode is
+  correct now, and keeping the native would have frozen the real bug in place
+  where nothing reached it.
 * `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
   instead of `StringIndexOutOfBoundsException`
-  ([record](../../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md)).
+  ([record](../../known-issues/preconditions-ignores-the-exception-formatter.md)
+  — supersedes the original `string-substring-bounds-…` record, which named the
+  wrong subsystem: the fault is `Preconditions` ignoring its exception-formatter
+  argument, not anything `substring` does).
   Deliberately not re-masked — the native was wrong there too, and re-masking
   would cost the four rows the bytecode fixes, including `substring` splitting
   a surrogate pair into U+FFFD.
-* `+` concatenation loses an unpaired surrogate
-  ([record](../../known-issues/string-concat-loses-unpaired-surrogates.md)).
+* `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
+  ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
+  `execute_string_concat` accumulated into a Rust `String`, which cannot
+  represent one. It now accumulates `Vec<u16>`. It was **three** loss points,
+  not the one the record named — the argument, the folded recipe literal, and
+  the `TAG_CONST` constant — and a probe written to separate them is the only
+  reason it did not ship half-fixed with its own reproducer green.
 
 ## Residual
 
