@@ -1725,6 +1725,22 @@ impl Frame {
     /// finished with, still in slot 8 for the rest of the method), and
     /// reporting it would bury the case that matters — a LIVE local whose
     /// object the collector took anyway.
+    /// The `local_kinds` mark for slot `idx` — `LKIND_LONG` / `LKIND_DOUBLE`
+    /// mean `Frame::scan_local_objects` SKIPS the slot outright, because a
+    /// primitive `long` whose NaN-boxed bits collide with the object sub-tag
+    /// must never be rooted or remapped.
+    ///
+    /// Exposed for the stale-address reporter: a live object local that the
+    /// root snapshot does not contain is either liveness-filtered or
+    /// kind-filtered, and those two have completely different fixes. `aload`
+    /// does not consult this mark, so a slot whose kind byte says LONG while
+    /// its value is a genuine reference reads back fine from bytecode and is
+    /// invisible to every root scan — exactly the shape of a live local that
+    /// was reclaimed.
+    pub(crate) fn local_kind_at(&self, idx: usize) -> u8 {
+        self.local_kinds.get(idx).copied().unwrap_or(u8::MAX)
+    }
+
     pub(crate) fn live_locals_mask_here(&self) -> u64 {
         if crate::runtime::env_cache::no_local_liveness() {
             crate::runtime::local_liveness::ALL_LIVE
