@@ -488,7 +488,13 @@ fn owner_seeded_roots_follow_the_owner_across_a_relocation() {
     //    stricter of the two: it fails if the entry merely stayed at the
     //    owner's OLD address, which the union above cannot see.
     for (i, v) in vals.iter().enumerate() {
-        let owned = gc_overlay_roots_for_collection(moved_cols[i].as_ptr() as usize);
+        // `None` for the owner-class discriminator: this harness relocates the
+        // owners itself and never recycles an address under a different class,
+        // which is the only case the filter exists to catch. `None` is the
+        // behaviour the assertion below was written against, before
+        // `gc_overlay_roots_for_collection` grew the parameter — the call site
+        // was not updated then, so this test target has not compiled since.
+        let owned = gc_overlay_roots_for_collection(moved_cols[i].as_ptr() as usize, None);
         assert!(
             owned.iter().any(|r| r.as_ptr() == v.as_ptr()),
             "{} is not reachable from its owner's POST-move address — the \
