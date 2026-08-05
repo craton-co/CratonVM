@@ -24,6 +24,7 @@ build and in what order*, including the cross-feature dependencies below.
 | [`jit-machine-level-and-instruction-selection.md`](jit-machine-level-and-instruction-selection.md) | **Increment 0 landed; 1–4 on hold, and the hold is the result.** Four compiler levels, not three; the missing one is a machine list. Shadow selection measured **15.7–19.0%** tiler coverage on real compiles with `Rule::Lea`/`AluImm` firing zero times, so the next step is six 32-bit pattern rows — not a machine level. | S (then L, gated) | — |
 | [`embedding-api.md`](embedding-api.md) | `libcratonvm` C-ABI + JNI Invocation-API parity (`JNI_CreateJavaVM`). | L | — |
 | [`keystore-mldsa-mlkem.md`](keystore-mldsa-mlkem.md) | `KeyStore.getInstance` PKCS12/JKS + route ML-DSA/ML-KEM to a real provider. | M | — |
+| [`jdk-only-wave2/`](jdk-only-wave2/README.md) | **Parallel execution plan** for finishing `--jdk-only` (contract: [`jdk-only-mode.md`](jdk-only-mode.md)). Twelve lanes with an explicit file-ownership map and conflict matrix; **nine can start simultaneously**. The defect evidence stays in [`docs/known-issues/jdk-only/`](../known-issues/jdk-only/). | L | L9 (real `String` bytecode during JDK `<clinit>`) and L10 (real `ThreadPoolExecutor` field init) gate the deletions — **neither is itself a jdk-only change** |
 
 ## Dependency note
 
