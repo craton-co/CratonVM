@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{
     LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
 };
@@ -1032,67 +1032,92 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
-    r.register(
+    r.register_with_kind(
         vh,
         "get",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.set(Object...) → void
-    r.register(vh, "set", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(vh, "set", "([Ljava/lang/Object;)V", varhandle_set, NativeKind::Bridge);
 
     // VarHandle.compareAndSet(Object...) → boolean
-    r.register(
+    r.register_with_kind(
         vh,
         "compareAndSet",
         "([Ljava/lang/Object;)Z",
         varhandle_compare_and_set,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getAndSet(Object...) → Object
-    r.register(
+    r.register_with_kind(
         vh,
         "getAndSet",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get_and_set,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getVolatile(Object...) → Object (same as get for now — no hardware fences)
-    r.register(
+    r.register_with_kind(
         vh,
         "getVolatile",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.setVolatile(Object...) → void
-    r.register(vh, "setVolatile", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(
+        vh,
+        "setVolatile",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
 
     // VarHandle.getOpaque / getAcquire — read semantics
-    r.register(
+    r.register_with_kind(
         vh,
         "getOpaque",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         vh,
         "getAcquire",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_get,
+        NativeKind::Bridge,
     );
 
     // VarHandle.setOpaque / setRelease — write semantics
-    r.register(vh, "setOpaque", "([Ljava/lang/Object;)V", varhandle_set);
-    r.register(vh, "setRelease", "([Ljava/lang/Object;)V", varhandle_set);
+    r.register_with_kind(
+        vh,
+        "setOpaque",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vh,
+        "setRelease",
+        "([Ljava/lang/Object;)V",
+        varhandle_set,
+        NativeKind::Bridge,
+    );
 
     // VarHandle.compareAndExchange
-    r.register(
+    r.register_with_kind(
         vh,
         "compareAndExchange",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         varhandle_compare_and_exchange,
+        NativeKind::Bridge,
     );
 
     // VarHandle.getAndAdd and its ordering variants — single Object-return
@@ -1100,11 +1125,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // the generic Object descriptor first and unbox_poly_return coerces the
     // result back to the call-site numeric type (H2 uses [III)I).
     for name in &["getAndAdd", "getAndAddAcquire", "getAndAddRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_add,
+            NativeKind::Bridge,
         );
     }
 
@@ -1115,11 +1141,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseOrAcquire",
         "getAndBitwiseOrRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_or,
+            NativeKind::Bridge,
         );
     }
     for name in &[
@@ -1127,11 +1154,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseAndAcquire",
         "getAndBitwiseAndRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_and,
+            NativeKind::Bridge,
         );
     }
     for name in &[
@@ -1139,11 +1167,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "getAndBitwiseXorAcquire",
         "getAndBitwiseXorRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_bitwise_xor,
+            NativeKind::Bridge,
         );
     }
 
@@ -1157,27 +1186,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "weakCompareAndSetAcquire",
         "weakCompareAndSetRelease",
     ] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Z",
             varhandle_compare_and_set,
+            NativeKind::Bridge,
         );
     }
     for name in &["compareAndExchangeAcquire", "compareAndExchangeRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_compare_and_exchange,
+            NativeKind::Bridge,
         );
     }
     for name in &["getAndSetAcquire", "getAndSetRelease"] {
-        r.register(
+        r.register_with_kind(
             vh,
             name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             varhandle_get_and_set,
+            NativeKind::Bridge,
         );
     }
     r.set_category(__prev_cat);
@@ -8075,7 +8107,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // invoke(...) — polymorphic signature with automatic type adaptation.
     // Boxing/unboxing and widening conversions are applied implicitly.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(
+    r.register_with_kind(
         mh,
         "invoke",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -8110,12 +8142,13 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 auto_box_return(ctx, result, &desc)
             }
         },
+        NativeKind::Bridge,
     );
 
     // invokeExact(...) — strict type checking: argument count must match.
     // Throws WrongMethodTypeException if arity mismatches.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(
+    r.register_with_kind(
         mh,
         "invokeExact",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -8144,6 +8177,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 auto_box_return(ctx, result, &desc)
             }
         },
+        NativeKind::Bridge,
     );
     r.register(
         mh,

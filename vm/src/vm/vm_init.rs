@@ -441,6 +441,61 @@ fn require_jdk_image_for_jdk_only(config: &VmConfig) -> Result<Option<PathBuf>, 
     }
 }
 
+/// Pre-register one of the bootstrap block's compatibility stand-ins,
+/// **refusing diagnosably** under [`CompatibilityMode::JdkOnly`].
+///
+/// # Why this exists
+///
+/// The three call sites below (`Enumeration$Impl`, `Comparator$Native`, the
+/// eleven `cratonvm/internal/Unmodifiable*`) are the *only* fabrications a
+/// strict boot performs — measured 2026-08-05 with `--dump-class-origins`
+/// against a real JDK 25 image: 13 `compatibility-stub` rows from exactly
+/// these three lines. They used to go through the infallible
+/// `ensure_synthetic_class`, which records the `--jdk-only` violation and then
+/// fabricates anyway, so a strict run reported a violation while continuing in
+/// the state contract §5 forbids.
+///
+/// # What a refusal means here
+///
+/// `None`, and the caller skips the wiring — but never *silently*. Two
+/// independent records survive the refusal:
+///
+/// 1. `ClassManager::admit_compatibility_class` has already pushed a
+///    `CompatibilityClassRequested` violation naming the class, the reason and
+///    this Rust call site, so `--jdk-only-report` and `--trace-jdk-only` both
+///    show it;
+/// 2. the `warn!` below, which the CLI's default `EnvFilter` (WARN, stderr)
+///    prints with no extra flag, and which states the *consequence* — the
+///    natives bound to the class are unreachable — rather than just the fact.
+///
+/// The boot deliberately continues. Under `--jdk-only` a real
+/// `java.util.Collections`/`Enumeration`/`Comparator` is on the boot classpath
+/// and runs its own bytecode; these stand-ins exist for the synthetic
+/// collection shims, which strict mode does not register. Failing the boot
+/// instead would refuse a run that is otherwise conforming.
+///
+/// Under the default `Compatible` mode `try_ensure_synthetic_class` is
+/// byte-for-byte `ensure_synthetic_class`, so this is a no-op there.
+fn ensure_bootstrap_compat_class(
+    class_manager: &mut ClassManager,
+    name: &str,
+    num_fields: usize,
+) -> Option<ClassId> {
+    match class_manager.try_ensure_synthetic_class(name, num_fields) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                class = name,
+                error = %err,
+                "--jdk-only: refusing to fabricate this bootstrap compatibility class. It is \
+                 NOT registered, the natives bound to it are unreachable, and any code that \
+                 needs it will fail at its own call site naming this class."
+            );
+            None
+        }
+    }
+}
+
 /// State for the `main_thread_group` lazy singleton's claim/wait
 /// coordination (see `SharedVm::main_thread_group_init`'s doc). Mirrors the
 /// `Class::initializing_thread` + `class_init_waiters` shape used for JVMS
@@ -1049,7 +1104,14 @@ impl SharedVm {
         // Registering as synthetic stubs (with empty `methods`) routes
         // dispatch through the native registry on `Enumeration$Impl` instead,
         // where `hasMoreElements`/`nextElement`/`hasNext`/`next` are bound.
-        let enum_impl_id = class_manager.ensure_synthetic_class("java/util/Enumeration$Impl", 2);
+        //
+        // Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under
+        // `--jdk-only` this is refused and the wiring below is skipped. See
+        // `ensure_bootstrap_compat_class` for what "refused" is required to
+        // mean — a recorded violation plus a WARN naming the consequence, not
+        // a silent `None`.
+        let enum_impl_id =
+            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 2);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
         // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
         // `org.apache.commons.logging.LogFactory.getResources`) can perform
@@ -1091,13 +1153,15 @@ impl SharedVm {
         // Through `set_superclass`, not a raw `cls.superclass =` write: the
         // store's direct-subclass index has to see the new edge, or
         // `recompute_subclass_layouts` goes blind to this class.
-        class_manager.set_superclass(enum_impl_id, Some(object_id));
-        if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
-            if !cls.interfaces.contains(&enumeration_id) {
-                cls.interfaces.push(enumeration_id);
-            }
-            if !cls.interfaces.contains(&iterator_id) {
-                cls.interfaces.push(iterator_id);
+        if let Some(enum_impl_id) = enum_impl_id {
+            class_manager.set_superclass(enum_impl_id, Some(object_id));
+            if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
+                if !cls.interfaces.contains(&enumeration_id) {
+                    cls.interfaces.push(enumeration_id);
+                }
+                if !cls.interfaces.contains(&iterator_id) {
+                    cls.interfaces.push(iterator_id);
+                }
             }
         }
 
@@ -1107,14 +1171,17 @@ impl SharedVm {
         // synthetic class must declare `Object` as superclass and
         // `java/util/Comparator` as an implemented interface for the cast to
         // succeed.
-        let cmp_native_id = class_manager.ensure_synthetic_class("java/util/Comparator$Native", 3);
+        let cmp_native_id =
+            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Comparator$Native", 3);
         let comparator_id = class_manager
             .load_class("java/util/Comparator")
             .expect("java/util/Comparator must be loadable");
-        class_manager.set_superclass(cmp_native_id, Some(object_id));
-        if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
-            if !cls.interfaces.contains(&comparator_id) {
-                cls.interfaces.push(comparator_id);
+        if let Some(cmp_native_id) = cmp_native_id {
+            class_manager.set_superclass(cmp_native_id, Some(object_id));
+            if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
+                if !cls.interfaces.contains(&comparator_id) {
+                    cls.interfaces.push(comparator_id);
+                }
             }
         }
 
@@ -1224,7 +1291,20 @@ impl SharedVm {
                 ("cratonvm/internal/UnmodifiableMapEntry", &[map_entry_id]),
             ];
             for (name, ifaces) in unmod_specs {
-                let cid = class_manager.ensure_synthetic_class(name, 1);
+                // These eleven are the largest group of compatibility classes
+                // on a strict boot and the most tempting to reclassify as
+                // `VmInternal` — no class file exists under
+                // `cratonvm/internal/UnmodifiableList`, which is the
+                // `VmInternal` shape. They stay `CompatibilityStub` on
+                // purpose: they stand in for `java.util.Collections$Unmodifiable*`
+                // and friends, whose real bytecode is not running, and that is
+                // a compatibility substitution whatever the stand-in is named.
+                // Reclassifying them would silence the violation, keep
+                // fabricating, and make the zero-stub census read green while
+                // the substitution continued.
+                let Some(cid) = ensure_bootstrap_compat_class(&mut class_manager, name, 1) else {
+                    continue;
+                };
                 class_manager.set_superclass(cid, Some(object_id));
                 if let Some(cls) = class_manager.get_class_mut(cid) {
                     for iface in ifaces {
@@ -7970,6 +8050,10 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // The synthetic `ReentrantLock` / `ReentrantReadWriteLock` state tables,
     // keyed by `(vm_identity, identity_hash)`.
     cratonvm_native_builtins::forget_vm_lock_state(vm_identity);
+    // The generated `$ProxyN` class cache and the per-loader proxy module
+    // numbering. Both store `ClassId`s / ids that only this class manager can
+    // interpret.
+    cratonvm_native_builtins::forget_vm_proxy_classes(vm_identity);
     // The `Class.getName()` / simple / canonical / package name memos, keyed
     // by `(vm_identity, class_id)`.
     cratonvm_native_builtins::lang_class::forget_vm_class_name_caches(vm_identity);

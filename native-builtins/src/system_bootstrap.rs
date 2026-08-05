@@ -15,7 +15,7 @@
 //! These are called during the real JDK 25 `System.initPhase1()` bytecode
 //! execution path and must return correct values for the bootstrap to succeed.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, Value};
 
@@ -396,47 +396,53 @@ pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SystemProps$Raw — platform and VM properties
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/util/SystemProps$Raw",
         "platformProperties",
         "()[Ljava/lang/String;",
         native_platform_properties,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/util/SystemProps$Raw",
         "vmProperties",
         "()[Ljava/lang/String;",
         native_vm_properties,
+        NativeKind::Bridge,
     );
 
     // FileDescriptor / FileInputStream / FileOutputStream — initIDs noops
     // These are called by <clinit> on first class load; they initialize
     // JNI field IDs in HotSpot but we resolve fields by name, so noop.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileDescriptor",
         "initIDs",
         "()V",
         crate::native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "initIDs",
         "()V",
         crate::native_noop,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "initIDs",
         "()V",
         crate::native_noop,
+        NativeKind::Bridge,
     );
 
     // Win32ErrorMode — Windows-only, safe noop returning 0
-    registry.register(
+    registry.register_with_kind(
         "sun/io/Win32ErrorMode",
         "setErrorMode",
         "(J)J",
         native_win32_set_error_mode,
+        NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }

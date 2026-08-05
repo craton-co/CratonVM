@@ -1486,7 +1486,7 @@ mod deopt_snapshot_tests {
 
     use super::{
         classify_local_kinds, code_uses_long_float_double, opcode_touches_long_float_double,
-        refine_ambiguous_local_kinds, wide_local_high_halves,
+        pure_high_halves, refine_ambiguous_local_kinds, wide_local_high_halves,
         typed_local_frame_value, LocalKind,
     };
 
@@ -1690,13 +1690,63 @@ mod deopt_snapshot_tests {
         let halves = wide_local_high_halves(&code, code.len());
         assert!(halves.contains(&1) && halves.contains(&3));
 
-        // The filter the OSR publication applies: strip 1, keep 3.
-        let stripped: Vec<usize> = halves
-            .iter()
-            .copied()
-            .filter(|&hh| matches!(kinds.get(hh), Some(LocalKind::HighHalf)))
-            .collect();
-        assert_eq!(stripped, vec![1], "a reused high half must keep its home");
+        // The filter the OSR publication applies — the same function it calls,
+        // not a copy of its predicate: a copy passes while the call site drifts.
+        assert_eq!(
+            pure_high_halves(&kinds, &halves),
+            vec![1],
+            "a reused high half must keep its home"
+        );
+    }
+
+    /// The same rule for a slot reused as a **reference**, which is the shape
+    /// the Tomcat annotation-scan SIGSEGV was: every stage of
+    /// `probes/AnnotationScanSplitProbe` (and of the minimised
+    /// `probes/OsrRefSlotReuseProbe`) has
+    ///
+    ///     slot 4 : Iterator, then `lstore 4` for the trailing `long ns`
+    ///     slot 5 : byte[] b inside the loop, high half after it
+    ///
+    /// so slot 5 is a LIVE `byte[]` at the OSR entry PC and a dead high half
+    /// forty bytecodes later. Stripping its register home there left the
+    /// trampoline seeding only the frame slot while the compiled body read the
+    /// register: `b.length` off a garbage base (SIGSEGV on Windows, a silently
+    /// wrong checksum on Linux, where slot 5 lands elsewhere in `LOCAL_REGS`).
+    ///
+    /// The sibling case in `only_pure_high_halves_may_lose_their_osr_register_home`
+    /// reuses the slot as an `int`. Both are `Ambiguous`, but they arrive
+    /// through different opcode families (`iload`/`istore` vs `aload`/`astore`)
+    /// and `local_access_at` classifies them in different arms, so one passing
+    /// is not evidence for the other.
+    #[test]
+    fn a_high_half_reused_as_a_reference_keeps_its_osr_register_home() {
+        // slot 4: astore/aload (Ref) AND lstore (Long)  -> Ambiguous
+        // slot 5: astore/aload (Ref), and `lstore 4`'s would-be high half
+        let code = [
+            0x3a, 0x04, // astore 4  -> Ref@4
+            0x19, 0x04, // aload  4
+            0x3a, 0x05, // astore 5  -> Ref@5
+            0x19, 0x05, // aload  5
+            0x37, 0x04, // lstore 4  -> @4 Ambiguous, would-be HighHalf@5
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 6);
+        assert_eq!(kinds[4], LocalKind::Ambiguous, "Ref then Long in slot 4");
+        assert_eq!(
+            kinds[5],
+            LocalKind::Ref,
+            "slot 5 is only ever a reference: slot 4 never settles on Long, so \
+             the cat-2 high-half pass must not even reach it"
+        );
+
+        // The whole-method scan still names slot 5 — `lstore 4` is there.
+        let halves = wide_local_high_halves(&code, code.len());
+        assert!(halves.contains(&5), "the scan names it; the filter is the gate");
+
+        assert!(
+            pure_high_halves(&kinds, &halves).is_empty(),
+            "a live reference slot must keep its OSR register home"
+        );
     }
 
     #[test]

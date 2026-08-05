@@ -5,6 +5,38 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-05 (second pass) — the instrument was narrower than the question
+
+`kind_stated` is now true on **843 rows** (`native-builtins` 637, `native-io`
+173, `native-awt` 23, `vm` 10) after the L5 residual pass took the remaining
+`unknown`-marked registrars, the mixed sites, and `vm/src/runtime/instrument.rs`.
+
+What that pass actually found is bigger than the count. **Two of the
+adjudications L5/L5b made were wrong, and both were wrong for the same reason:
+`image_declaring_method` asks about ONE class in ONE image.** Filed in full as
+[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md),
+with the two instruments that close it. In short:
+
+* **Inheritance.** Of the 2,542 rows the census calls *class present, method
+  not declared*, **1,939 are inherited** — 1,612 concrete (§1.4 shadows), 308
+  abstract (the every-implementor hazard), and **19 `ACC_NATIVE`** (§1.5
+  bridges the census did not credit). Only 603 are genuinely dead.
+  `sun/nio/ch/SocketDispatcher.close`, which this record's L5 residual called
+  "dispatched 3× while resolving to no declared method", is one of them: the
+  method is concrete on `sun.nio.ch.UnixDispatcher`. Mystery closed, and it was
+  never a mystery — it was a column that could not see a supertype.
+* **Platform.** CratonVM adjudicates an image it cannot *run*, so a Windows JDK
+  unpacked on the Linux host yields a full census. **59 registrations are a
+  genuine `ACC_NATIVE` bridge only on Windows** and 78 only on Linux;
+  **1,735 are dead on both**. Every "needs a Windows-image census" in this
+  directory is answerable with one command now.
+
+Two concrete corrections to what is written elsewhere: the
+`sun/awt/PlatformGraphicsInfo.hasDisplays0` marker was **right** (it is a
+bridge, on the platform that has it), and `sun/nio/ch/WindowsFileDispatcherImpl`
+exists on **neither** image — the Windows JDK names that class
+`FileDispatcherImpl` too, so its 28 rows are dead everywhere.
+
 ## What changed on 2026-08-05 — the number is now PINNED, and re-measured
 
 Still open, and still nothing reclassified. What is new is that the number can
@@ -48,12 +80,14 @@ assertion, `total_rows >= 8_000`, is a **collapse detector, not a measurement**.
 
 **`kind_stated` is no longer false on all rows.** 9 of the 687 `Intrinsic` rows
 state their kind (the `java/lang/String` natives L9 migrated), and — as of L5,
-landed the same day — **87 `Bridge` rows do too**, so `kind_stated` is true on 96
-of 11,916. The sentence below, "`register_with_kind` exists and has zero
-callers", is out of date by ninety-six.
+L5b and L5c, all landed 2026-08-05 — **690 `Bridge` rows do too**, so
+`kind_stated` is true on **699 of 11,916**: `native-io` 87, `native-awt` 21,
+`native-builtins` 582. The sentence below, "`register_with_kind` exists and has
+zero callers", is out of date by six hundred and ninety-nine.
 
-**L5 moved `kind_stated` by 87 and moved the 10,069 by nothing, and that is not
-a disappointment — it is the two numbers measuring different things.** The
+**L5/L5b/L5c moved `kind_stated` by 690 and moved the 10,069 by nothing, and
+that is not a disappointment — it is the two numbers measuring different
+things.** The
 ratchet above counts `Bridge` rows *with no `ACC_NATIVE` target*. The 87 rows L5
 stated are exactly the rows that DO have one; they were never in the 10,069.
 Expect every honest `register_with_kind` migration to look like this: it moves
@@ -75,6 +109,27 @@ filed as [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md);
 the largest group there is 25 `Bridge` registrations on VM-minted
 `cratonvm/synthetic/Process*` classes — the `Function$Identity` shape found in a
 second place.
+
+**L5b/L5c then measured the same thing at crate scale**
+([`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md)),
+and added three facts this record should carry:
+
+* **The marker is the starting point; the image is the evidence.** The only
+  `JDK-ONLY-CLASSIFY: bridge` verdict in the whole tree outside `native-io` —
+  `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` — turns out **not to be
+  declared at all on a Linux JDK 25 image**; it belongs to the Windows and macOS
+  variants of the class. Every one of the 603 statements L5b/L5c made rests on
+  the census, and the one marker that licensed a statement produced none.
+* **`native-collections` has nothing to migrate.** Its single
+  `set_category(Bridge)` covers 1,350 rows and the image declares `ACC_NATIVE`
+  on **zero** of them — the crate marker's static claim, now confirmed per row
+  at runtime. Every row there is a reclassification question, so no
+  `register_with_kind` lane will ever touch it.
+* **`ABSENT` on a platform-named class means "not measured here", not "dead".**
+  `WindowsSocketOptions`, `WindowsFileDispatcherImpl`, `WinNTFileSystem`,
+  `PlatformGraphicsInfo.hasDisplays0` are all correct registrations on the
+  platform that has them. Until a Windows-image census exists, no automated pass
+  may treat absence as evidence of a defect.
 
 **Where they come from now** (top five registering files, `Bridge` rows with no
 `ACC_NATIVE` target): `native-collections/src/lib.rs` 1,350 ·

@@ -26,9 +26,9 @@
 //! Only the first went through the admission checks. The other two grew
 //! *hand-copied* subsets of them, each added reactively after its own bug:
 //! the permanent bail-list (after 35 923 wasted pipelines on `Nat.inc`), the
-//! bisect levers (after every bisect step on
-//! `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md` read "no
-//! effect" while 11 methods were still compiling), and the OSR-entry-rejected
+//! bisect levers (after every bisect step on the annotation-scan SIGSEGV — the
+//! retired `annotation-scan-arrayread-sigsegv` write-up — read "no effect"
+//! while 11 methods were still compiling), and the OSR-entry-rejected
 //! memo (after 256 re-compiles over ten H2 operations). Three separate
 //! discoveries of one fact.
 //!

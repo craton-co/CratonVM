@@ -4140,6 +4140,30 @@ static CALLEE_PROBE_TALLY: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<String, u64>>,
 > = std::sync::OnceLock::new();
 
+/// Report a callee that only compiles because the generic-metadata scan reads
+/// the DECLARING class's constant pool (see the call site in
+/// `try_jit_compile_callee_slow`). Each distinct callee is printed ONCE, the
+/// first time it is admitted.
+///
+/// Printed eagerly rather than accumulated into the tally above for two
+/// reasons: the tally's dump is truncated to its 30 hottest rows, and the run
+/// this exists to diagnose is one that fails -- possibly by aborting before any
+/// end-of-run dump would happen. The line format is `class.method` first so the
+/// output feeds `CRATONVM_JIT_DENY` (a substring match on `class.method`)
+/// directly.
+fn note_newly_admitted_callee(class_name: &str, method_name: &str, descriptor: &str) {
+    const NEWLY_ADMITTED_CAP: usize = 8192;
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let key = format!("{class_name}.{method_name}");
+    let mut guard = seen.lock();
+    if guard.len() >= NEWLY_ADMITTED_CAP || !guard.insert(key.clone()) {
+        return;
+    }
+    eprintln!("[callee-probe] NEWLY-ADMITTED {key} {descriptor}");
+}
+
 /// Dump the [`callee_probe_tally`] histogram, hottest first. Called from the
 /// `mic-prof` dump so one run answers both "how often does the inline cache
 /// fail to hold an entry" and "for which callees, and why".
@@ -4337,12 +4361,35 @@ pub(super) fn try_jit_compile_callee_slow(
     // code each took the entryless helper path instead of a direct call. That
     // made JIT-on ~2x SLOWER than `--nojit` on that test, which is what
     // docs/known-issues/hibernate/hib-inpredicate-*.md has been tracking.
-    if jit_method_calls_forced_class_generic_metadata(
+    let scan_refuses = jit_method_calls_forced_class_generic_metadata(
         &cm,
         declaring_id,
         &code_attr.code,
         code_attr.code.len(),
-    ) {
+    );
+    // DIAG (`CRATONVM_DBG=callee-probe`): name the set of methods the
+    // `callee_class_id` -> `declaring_id` fix above newly ADMITS, i.e. every
+    // method the buggy argument would have bail-listed and this one compiles.
+    //
+    // That set is the search space for a miscompile the fix exposes: the fix
+    // itself is a trigger, not a cause, so the question "which method does the
+    // backend get wrong" has to be answered over the methods whose status it
+    // actually changed -- not over the whole program. Diffing the tally across
+    // two builds cannot answer it (the dump is truncated to 30 rows, and the
+    // two runs load different code), but evaluating BOTH arguments in the one
+    // build that exhibits the failure names the delta exactly.
+    if callee_probe_dbg() && !scan_refuses && declaring_id != callee_class_id {
+        let old_arg_refuses = jit_method_calls_forced_class_generic_metadata(
+            &cm,
+            callee_class_id,
+            &code_attr.code,
+            code_attr.code.len(),
+        );
+        if old_arg_refuses {
+            note_newly_admitted_callee(class_name, method_name, descriptor);
+        }
+    }
+    if scan_refuses {
         crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
         return None;
     }

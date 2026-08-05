@@ -1807,23 +1807,56 @@ fn flush_class_identity_dispatch_memos() {
     });
 }
 
-/// Flush the per-thread caches that hold RAW compiled entry pointers, so a
-/// probe cannot call a body that has since been superseded or invalidated.
+/// Flush every per-thread memo keyed by [`JitSiteKey`], so a probe cannot serve
+/// one call site's resolution to a different one.
 ///
-/// Both dispatch helpers publish into `VIRTUAL_DISPATCH_CACHE`, so both must
-/// run this before probing it — `jit_invoke_virtual_mic` uses it for callees
-/// the machine-code MIC/PIC cascade is barred from holding (see its
-/// consult site). Two thread-local compares on the steady-state path.
+/// **The key half that makes this mandatory is the `JitInvokeInfo` pointer.**
+/// Those boxes are owned by `CompiledMethod::_jit_invoke_infos` and are freed
+/// when that method drops (see the field doc in `jit/src/lib.rs`). The allocator
+/// is then free to hand the same address to the next compile's `JitInvokeInfo` —
+/// at which point `(vm_identity, info_ptr)` names a DIFFERENT call site while
+/// every memo still holds the old site's answer. What the old site's answer is
+/// decides how the aliasing surfaces:
+///
+///  * `NATIVE_SITE_CACHE` holds a resolved leaf-native callback, so the reused
+///    site CALLS the previous site's native and returns whatever that returns —
+///    e.g. a `boolean` 1 landing in a slot the caller then treats as an
+///    `Annotation[]`, whose `arraylength` reads `1 + 0xC`. That is the
+///    `EXCEPTION_ACCESS_VIOLATION ... read at address 0x000000000000000D`
+///    signature of the `OffsetDateTimeTest` discovery crash.
+///  * `VIRTUAL_TARGET_CACHE` holds the resolved dispatch CLASS NAME, so the
+///    reused site resolves its own (correct) method name against the previous
+///    site's class — surfacing as `NoSuchMethodError:
+///    java.lang.Object.annotationType()` /
+///    `java.lang.Class.annotationType()`, a real method name against a class
+///    that never declared it.
+///  * `OBJECT_NATIVE_DISPATCH_CACHE` / `INTEGER_NATIVE_DISPATCH_CACHE` hold the
+///    same shape of decision for their own fast paths.
+///
+/// Only `DISPATCH_CACHE` and `VIRTUAL_DISPATCH_CACHE` were flushed here before,
+/// because the hazard was framed as "a raw entry pointer can go stale". The
+/// address-reuse hazard is broader: a memo does not have to hold a code pointer
+/// to be wrong once its key stops identifying its site.
+///
+/// The JIT cache generation closes it exactly: publishing the new
+/// `CompiledMethod` that owns the reused `JitInvokeInfo` is itself an
+/// unconditional `JIT_CACHE_GENERATION.fetch_add` (`JitCache::put` /
+/// `put_osr`), so an address can never be re-issued without a generation the
+/// thread has not yet seen — and this runs before every consult.
+///
+/// Cost on the steady state is unchanged: two thread-local compares, and the
+/// `clear()` calls only ever execute inside the changed-generation branch.
 fn flush_raw_entry_dispatch_caches() {
     // Every compiled publication/invalidation advances this generation. Flush
-    // raw-entry dispatch caches before probing them, both to pick up tier
-    // replacements and to release their code owners after invalidation.
+    // the site-keyed memos before probing them, to pick up tier replacements,
+    // to release their code owners after invalidation, and above all so a
+    // recycled `JitInvokeInfo` address cannot inherit the previous site's
+    // resolution.
     let generation = cratonvm_jit::jit_cache_generation();
     DISPATCH_CACHE_JIT_GENERATION.with(|seen| {
         if seen.get() != generation {
             seen.set(generation);
-            DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-            VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            clear_site_keyed_dispatch_memos();
         }
     });
     // Retain the older supersede epoch as a compatibility signal for tiering
@@ -1833,10 +1866,26 @@ fn flush_raw_entry_dispatch_caches() {
     DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
         if e.get() != epoch {
             e.set(epoch);
-            DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-            VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            clear_site_keyed_dispatch_memos();
         }
     });
+}
+
+/// Drop every thread-local memo whose key contains a `JitInvokeInfo` address.
+///
+/// Kept as one function so a memo added later cannot be flushed by one of the
+/// two triggers above and missed by the other — the split that left
+/// `NATIVE_SITE_CACHE` and `VIRTUAL_TARGET_CACHE` unflushed by either.
+#[cold]
+fn clear_site_keyed_dispatch_memos() {
+    DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
+    VIRTUAL_DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
+    OBJECT_NATIVE_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    INTEGER_NATIVE_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    NATIVE_SITE_CACHE.with(|dc| dc.borrow_mut().clear());
+    VIRTUAL_TARGET_CACHE.with(|dc| dc.borrow_mut().clear());
 }
 
 /// May a callee that declares an exception table be published into the
@@ -7533,6 +7582,49 @@ pub fn leaf_native_hit_count() -> u64 {
 static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Is the per-call-site native fast path for compiled code enabled?
+///
+/// **Default ON.** `CRATONVM_JIT=-native-site-cache` is the kill switch, and it
+/// exists because this path spent 2026-08-05 as the prime suspect for the
+/// Spring Boot corruption family with no way to take it out of a run short of a
+/// ten-minute rebuild.
+///
+/// # What the switch is for
+///
+/// The path serves a registered native at the TOP of `jit_invoke_dispatch` /
+/// `jit_invoke_virtual_mic`, ahead of the inline cache and the compile probes,
+/// and it reads `NATIVE_SITE_CACHE` — one of the memos keyed on a
+/// `JitInvokeInfo` ADDRESS. While those addresses were recyclable (fixed in
+/// `383e7f5cf`, "a recycled JitInvokeInfo address let one call site serve
+/// another's dispatch") this cache was the loudest way that hazard surfaced: a
+/// site would call the PREVIOUS site's native and hand back whatever it
+/// returned.
+///
+/// Measured on `module/spring-boot-batch-data-mongodb`'s
+/// `BatchDataMongoAutoConfigurationTests` (13 tests; `--nojit` green; HotSpot
+/// green), one fixture, one host, the path switched at runtime:
+///
+/// | tree | site cache | runs | runs with >=1 failure |
+/// |---|---|---:|---:|
+/// | before `383e7f5cf` | off | 14 | **0** |
+/// | before `383e7f5cf` | leaves only | 12 | 3 |
+/// | before `383e7f5cf` | every registered native | 8 | **8** |
+/// | with `383e7f5cf` | every registered native | 14 | **0** |
+///
+/// The cache was the amplifier, not the defect. The last row is why it is still
+/// on by default; the row above it is why the switch is worth its two lines — a
+/// path whose failure mode is "call some other call site's native" should be
+/// removable from a run in one flag.
+///
+/// See
+/// `docs/internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+pub(crate) fn native_site_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none()
+    })
+}
+
 /// Non-leaf natives dispatched from a resolved call site this run.
 pub fn site_cached_native_hit_count() -> u64 {
     SITE_CACHED_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -7849,9 +7941,13 @@ fn resolve_native_site(
     // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
     // and `invoke_or_native` has a specific rule for that walk which has to be
     // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
-    let Some((owner_class, id)) =
-        resolve_native_owner_for_receiver(vm, &lookup_class, info, mode.walks_supers())
-    else {
+    let Some((owner_class, id)) = resolve_native_owner_for_receiver(
+        vm,
+        &lookup_class,
+        receiver_class_id,
+        info,
+        mode.walks_supers(),
+    ) else {
         return site_refusal::note(4);
     };
     // `Thread.currentThread()` is served from the thread mirror instead of the
@@ -7930,10 +8026,28 @@ fn resolve_native_site(
 /// resolving on the receiver class alone (`ReentrantLock$NonfairSync`) found
 /// nothing and refused the site.
 ///
+/// # The walk must start from the receiver's `ClassId`, never from its name
+///
+/// `dispatch_class` is only a NAME, and a name does not identify a class once
+/// more than one loader has defined it — `get_loaded_class_id(name)` then
+/// answers with whichever one the global table happens to hold.
+/// `invoke_or_native` says this in as many words at its own tail ("A virtual
+/// call's receiver IS the authoritative answer"), and this test class is the
+/// everyday case: `FilteredClassLoader` gives `autoconfigurationBacksOffEntirely
+/// IfSpringMongoDbAbsent` a second, child-first definition of classes the other
+/// twelve tests already loaded through the app loader. Resolving the walk
+/// against the other loader's copy reads ANOTHER class's method table, so rules
+/// 2 and 3 answer about a class the receiver is not an instance of — and the
+/// entry that installs is then guarded by the REAL receiver's class id, so it
+/// keeps firing. `receiver_class_id` is passed in for exactly this reason and
+/// the name is used only for the registry lookups, which are name-keyed by
+/// construction.
+///
 /// Cold: fill time only.
 fn resolve_native_owner_for_receiver(
     vm: &SharedVm,
     dispatch_class: &str,
+    receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
     walk_supers: bool,
 ) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
@@ -7956,7 +8070,10 @@ fn resolve_native_owner_for_receiver(
         return None;
     }
     let cm = vm.classes.class_manager.try_read()?;
-    let mut cid = cm.get_loaded_class_id(dispatch_class)?;
+    let mut cid = match receiver_class_id {
+        Some(cid) => cid,
+        None => cm.get_loaded_class_id(dispatch_class)?,
+    };
     if cm
         .get_class(cid)
         .is_some_and(|c| c.find_method(info.method_name, info.descriptor).is_some())
@@ -8685,6 +8802,14 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // `(vm_identity, info pointer)`. The VM half is not decoration: the direct
     // helpers below pass the address of a process-global `static JitInvokeInfo`,
     // which is identical in every VM. See [`JitSiteKey`].
+    //
+    // Revalidate BEFORE the first memo read, not after the compile probes: the
+    // native fast paths immediately below are memo consults keyed on this very
+    // address, and a `JitInvokeInfo` box is freed with its `CompiledMethod`, so
+    // the address can already belong to a different call site. This call was
+    // further down (past those probes) and left them serving the previous
+    // owner's native. See `flush_raw_entry_dispatch_caches`.
+    flush_raw_entry_dispatch_caches();
     let info_key = jit_site_key(vm.vm_identity, info_ptr as usize);
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
@@ -9480,6 +9605,11 @@ unsafe fn try_jit_site_cached_native_dispatch(
     info_key: JitSiteKey,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // One-flag kill switch (`CRATONVM_JIT=-native-site-cache`). Default ON —
+    // see `native_site_cache_enabled` for what it is for.
+    if !native_site_cache_enabled() {
+        return None;
+    }
     // Every bail below is counted, including these pre-resolution ones. An
     // uncounted `return None` here is what made the first cut of this path
     // unexplainable: `AtomicInteger.get` showed neither a hit nor a refusal,
@@ -11267,6 +11397,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // Placed immediately after `forward_jit_reference_args` so the receiver this
     // reads is the post-SATB-flush address, and before the MIC/PIC machinery,
     // which a native leaf has no use for — there is no compiled callee to cache.
+    //
+    // `NATIVE_SITE_CACHE` is keyed on `(vm_identity, info_ptr)`, and a
+    // `JitInvokeInfo` box dies with its `CompiledMethod`, so the key can already
+    // name a different call site. Revalidate here rather than at the MIC/PIC
+    // block further down, which this path returns before ever reaching. See
+    // `flush_raw_entry_dispatch_caches`.
+    flush_raw_entry_dispatch_caches();
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
         info,
@@ -12497,6 +12634,42 @@ mod tests {
         r
     }
 
+    /// The kill switch has to actually kill, and the default has to be ON.
+    ///
+    /// Both halves matter and they fail differently. A switch that silently
+    /// does nothing is worse than no switch: the next investigation runs with
+    /// `-native-site-cache`, sees the failure anyway, and CLEARS this path as a
+    /// suspect when it never left the run. And an accidental default-OFF gives
+    /// back the AQS pair's 2,687 → 1,229 ns with nothing saying so.
+    ///
+    /// Measured on `BatchDataMongoAutoConfigurationTests`, this path on:
+    /// 8 of 8 runs failed before `383e7f5cf`, 0 of 14 after it. See
+    /// [`native_site_cache_enabled`].
+    #[test]
+    fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
+        assert!(
+            std::env::var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
+        );
+        assert!(
+            native_site_cache_enabled(),
+            "the JIT native site cache is default-ON; if it has been turned off \
+             by default, say why where the perf it gives back is documented"
+        );
+        // The token has to reach the reader's key. `CRATONVM_JIT=-native-site-cache`
+        // sets `CRATONVM_JIT_NO_NATIVE_SITE_CACHE`, and nothing else does.
+        let entry = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .find(|e| e.token == "native-site-cache")
+            .expect("`CRATONVM_JIT=-native-site-cache` must stay declared");
+        assert_eq!(
+            entry.off_key,
+            Some("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"),
+            "the kill switch's off_key must be the key `native_site_cache_enabled` reads, \
+             or `-native-site-cache` is a no-op that reads as a cleared suspect"
+        );
+    }
+
     /// The leaf fast path skips `vm_exec::invoke_or_native` entirely, and that
     /// function opens with a cascade of hand-written gates that can route a
     /// call somewhere OTHER than its own registry slot. If a triple is ever
@@ -12506,7 +12679,8 @@ mod tests {
     ///
     /// `site_name_is_special_cased` is the fill-time refusal that prevents
     /// it. This pins the two together: the actual boot-time leaf set, against
-    /// the actual predicate.
+    /// the actual predicate. It still matters with the path default-OFF: the
+    /// refusal is what a re-landing has to keep.
     #[test]
     fn leaf_native_sites_avoid_invoke_or_native_special_cases() {
         let registry = registry_with_builtins();
@@ -12931,6 +13105,92 @@ mod tests {
         DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
         assert_eq!(a, Some(5));
         assert_eq!(b, None, "hotness counted in VM A must not tier up VM B");
+    }
+
+    /// A `JitInvokeInfo` box dies with its `CompiledMethod`, so its address can
+    /// be re-issued to the next compile's info — at which point every memo
+    /// keyed on `(vm_identity, info_ptr)` names a DIFFERENT call site while
+    /// still holding the old site's answer. `NATIVE_SITE_CACHE` then calls the
+    /// previous site's native (returning, say, a `boolean` 1 into a slot the
+    /// caller treats as an `Annotation[]`) and `VIRTUAL_TARGET_CACHE` resolves
+    /// the new site's method name against the old site's class
+    /// (`NoSuchMethodError: java.lang.Object.annotationType()`).
+    ///
+    /// Publishing the new `CompiledMethod` bumps the JIT cache generation
+    /// unconditionally, so the generation is the signal that closes it — but
+    /// only if EVERY site-keyed memo is on the flush list. Before this fix four
+    /// of the eight were on neither trigger's list.
+    ///
+    /// Non-vacuous by construction: each memo is populated first and the
+    /// assertion is that the flush emptied it, so a memo dropped from
+    /// `clear_site_keyed_dispatch_memos` fails here rather than passing on an
+    /// already-empty map.
+    #[test]
+    fn a_jit_generation_change_clears_every_site_keyed_memo() {
+        let _g = memo_test_guard();
+        let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
+        let key = jit_site_key(9001, info_ptr);
+        let vkey = (key, 77u32);
+
+        DISPATCH_COUNTER.with(|c| {
+            c.borrow_mut().insert(key, 3);
+        });
+        VIRTUAL_DISPATCH_COUNTER.with(|c| {
+            c.borrow_mut().insert(vkey, 3);
+        });
+        INTEGER_NATIVE_DISPATCH_CACHE.with(|c| {
+            c.borrow_mut().insert(key, None);
+        });
+        NATIVE_SITE_CACHE.with(|c| {
+            c.borrow_mut().insert(key, (0, None));
+        });
+        VIRTUAL_TARGET_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                vkey,
+                CachedDispatchTarget {
+                    class_name: std::rc::Rc::from("com/example/PreviousOwnerOfThisAddress"),
+                    cacheable_receiver: true,
+                    globally_named: true,
+                },
+            );
+        });
+
+        // Every memo populated — otherwise the assertions below would pass on
+        // maps that were empty to begin with.
+        assert!(DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&key)));
+        assert!(VIRTUAL_DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&vkey)));
+        assert!(INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key)));
+        assert!(NATIVE_SITE_CACHE.with(|c| c.borrow().contains_key(&key)));
+        assert!(VIRTUAL_TARGET_CACHE.with(|c| c.borrow().contains_key(&vkey)));
+
+        // Make this thread's remembered generation differ from the live one,
+        // which is exactly the state a publication elsewhere leaves it in.
+        DISPATCH_CACHE_JIT_GENERATION
+            .with(|seen| seen.set(cratonvm_jit::jit_cache_generation().wrapping_sub(1)));
+        flush_raw_entry_dispatch_caches();
+
+        assert!(
+            !DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&key)),
+            "DISPATCH_COUNTER survived a JIT generation change"
+        );
+        assert!(
+            !VIRTUAL_DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&vkey)),
+            "VIRTUAL_DISPATCH_COUNTER survived a JIT generation change"
+        );
+        assert!(
+            !INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key)),
+            "INTEGER_NATIVE_DISPATCH_CACHE survived a JIT generation change"
+        );
+        assert!(
+            !NATIVE_SITE_CACHE.with(|c| c.borrow().contains_key(&key)),
+            "NATIVE_SITE_CACHE survived a JIT generation change — a recycled \
+             JitInvokeInfo address would call the previous site's native"
+        );
+        assert!(
+            !VIRTUAL_TARGET_CACHE.with(|c| c.borrow().contains_key(&vkey)),
+            "VIRTUAL_TARGET_CACHE survived a JIT generation change — a recycled \
+             JitInvokeInfo address would resolve against the previous site's class"
+        );
     }
 
     #[test]
