@@ -237,6 +237,14 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 ## Open
 
+- **`OffsetDateTimeTest`** — SIGSEGV during JUnit discovery (`ReflectionUtils.findMethods`
+  / `LifecycleMethodUtils`), before any test body runs. Fault address `0x0E` (near-null)
+  with **zero GC cycles** having occurred in-process — explicitly ruled out as a witness
+  of the `ClassId(0)` stale-pointer family (see that doc's own two checks). Likely a JIT
+  codegen null-check bug in compiled reflection-heavy code. Single occurrence, not yet
+  confirmed deterministic. See
+  `offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805.md`.
+
 - ~~`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT~~
   — **FIXED 2026-08-04**, retired to
   `../../internal/hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md`.

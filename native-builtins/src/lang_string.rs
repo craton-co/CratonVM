@@ -6538,17 +6538,38 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
     // and bypasses them entirely for every String-domain caller — substring(II),
     // indexOf(I,I,I), String(byte[],int,int[,Charset]) ctors, getChars(II[CI),
     // getBytes(II[BI), …
-    registry.register(
+    //
+    // `register_with_kind(.., Intrinsic)` is LOAD-BEARING, and this is the
+    // second time these two have been deleted by accident. Every other
+    // `java/lang/String` `Bridge` is dropped in real-JDK mode by
+    // `NativeMethodRegistry::register` (contract §1.4, the forced-native
+    // `String` policy's replacement). These two are `Bridge` by the ambient
+    // category here, so that drop took them — and F4 came straight back:
+    // `"Hello, World".substring(-1)` threw `ArrayIndexOutOfBoundsException`
+    // instead of `StringIndexOutOfBoundsException`, because the generic
+    // `Preconditions` override underneath is exactly what F4 exists to bypass.
+    // `catch (StringIndexOutOfBoundsException)` does not catch an AIOOBE, so
+    // this is a control-flow change, not a message change.
+    //
+    // They ARE §1.4-reviewed intrinsics in the strict sense: the native is not
+    // a faster stand-in for the bytecode, it is the CORRECT answer where the
+    // bytecode's dependency (`Preconditions.checkFromToIndex` honouring
+    // `SIOOBE_FORMATTER`) is not implemented. Fixing that override is what
+    // would let these go — see
+    // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+    registry.register_with_kind(
         "java/lang/String",
         "checkBoundsBeginEnd",
         "(III)V",
         native_string_check_bounds_begin_end,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/String",
         "checkBoundsOffCount",
         "(III)I",
         native_string_check_bounds_off_count,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
 
     // PERF: String(char[]) / String(char[], int, int) constructor

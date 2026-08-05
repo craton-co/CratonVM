@@ -10607,11 +10607,17 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
-    registry.register(
+    // The `AbstractStringBuilder` half of DF05 — see the
+    // `(Ljava/lang/StringBuilder;)V` sibling in `deprecated_util.rs` for the
+    // full story and the measurement. `Intrinsic` for the same load-bearing
+    // reason: this VM's builders are `char[]`-backed and the real ctor's
+    // `Arrays.copyOfRange` over a `byte[]` reads them one byte at a time.
+    registry.register_with_kind(
         "java/lang/String",
         "<init>",
         "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
         lang_string::native_string_init_abstract_string_builder,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
