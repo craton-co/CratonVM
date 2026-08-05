@@ -1925,14 +1925,30 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         {
             return Some(slot);
         }
-        // NOT extended to the fabricated-model fallback that
-        // `get_field_by_name`/`set_field_by_name` use below. Doing so is a
-        // genuine fidelity improvement and it moves five unrelated tests
-        // (`c5_field_get_declaring_class_*`, `c6_method_*`, three
-        // `xnio_worker` cases) because production code takes different
-        // branches once this answers `Some`. That is its own change with its
-        // own investigation, not a rider on a layout fix.
-        mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
+        // Then the same tail `get_field_by_name` / `set_field_by_name` use, in
+        // the SAME order. The VM resolves a name against
+        // `ClassManager::synthetic_stub_fields` for any class with no real
+        // bytes, so a mock answering `None` for those is answering "no such
+        // field" about fields the VM does resolve — which makes a predicate of
+        // the form "does this class declare <a field only the REAL JDK class
+        // has>" unfalsifiable, and a test of it vacuous.
+        // (`classloader::cl_has_synthetic_layout` is such a predicate.)
+        //
+        // ORDER IS LOAD-BEARING. `mock_jdk_field_slot` is a deliberately
+        // arbitrary shared name->slot namespace for the Field/Method/
+        // Constructor/MemberName mirrors, and it disagrees with the fabricated
+        // model on every one of those names. It stays authoritative here for
+        // exactly the same reason it is authoritative in the by-name chains: a
+        // reader and a writer that resolve the same name differently is worse
+        // than either mapping being "wrong", and putting the model first makes
+        // `create_method_object` write `modifiers` to one slot and
+        // `method_modifiers_value` read it from another. The model fills the
+        // genuine gaps — classes the hand-written tables never covered — which
+        // is what this fallback is for.
+        let class_name = self.class_name_of_id(class_id);
+        mock_undertow_exchange_field_slot(class_name.as_deref(), field_name)
+            .or_else(|| mock_jdk_field_slot(field_name))
+            .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
