@@ -12,9 +12,6 @@
 //!
 //! `test_chm_basic_put_get` is the WP4.6 acceptance criterion: 1000 puts past
 //! the default 16-bucket initial capacity → forces ≥1 transfer() resize pass.
-//! As of WP4.6 landing the K1 fix gets us past initTable, but transfer()
-//! data-loss is still observed (entries 12+ become unreachable after first
-//! resize — see follow-up `WP4.6-FOLLOWUP-A`).
 //!
 //! `test_chm_pre_resize_put_get` is the smallest no-resize baseline:
 //! 11 puts stays under the 0.75 × 16 = 12 entry resize threshold so transfer()
@@ -23,6 +20,24 @@
 //!
 //! Sibling probes verify resize, mutation cycles, and clear/isEmpty invariants
 //! on the same JDK 25 ConcurrentHashMap.
+//!
+//! # Every String-keyed test here was `#[ignore]`d until 2026-08-04
+//!
+//! Under two separate labels — "CHM `get()` misses a key the same VM just
+//! stored, in-process only" and "WP4.6-FOLLOWUP-A: CHM transfer() data-loss
+//! after resize past 16 buckets" — and they were one bug, in neither CHM nor
+//! `transfer()`. `NativeContextImpl::java_strings_equal` answered `false` (not
+//! "I did not read these") for two Strings whose character storage it could
+//! not decode, and this VM's fabricated `java/lang/String` is `char[]`-backed
+//! rather than the JDK-9+ `byte[]`+`coder` layout it assumed. `CHM.get`
+//! believed that `false`. `HashMap.get`'s String fast path compares decoded
+//! text and never asked, which is why HashMap looked healthy throughout, and
+//! the Integer-keyed `test_chm_resize_path` was ignored for a resize defect it
+//! never had.
+//!
+//! So a String-keyed failure here is evidence about String equality first and
+//! about CHM second: read `vm/src/vm/vm_exec.rs`'s `java_string_storage`
+//! before any CHM code.
 //!
 //! See `apps/chm_basic/ChmBasic.java` for the standalone CLI variant of the
 //! same probe (used as a smoke test for the cratonvm.exe binary).
@@ -152,7 +167,6 @@ macro_rules! require_class_files {
 /// Baseline without resize: 11 entries -> no `transfer()` path.
 /// Pins boxed `Integer` put/get through default-mode autoboxing.
 #[test]
-#[ignore = "CHM get() misses a key the same VM just stored, in-process only — CLI with a real JDK returns 1; see docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md"]
 fn test_chm_pre_resize_put_get() {
     require_class_files!();
     let mut vm = test_vm();
@@ -173,16 +187,15 @@ fn test_chm_pre_resize_put_get() {
     }
 }
 
-/// WP4.6 acceptance gate: 1000 puts then gets. Currently FAILS because of a
-/// bug in CHM `transfer()` resize path (entries become unreachable after the
-/// table grows past 16 buckets). When the bug is fixed this test becomes the
-/// regression pin. Marked `#[ignore]` until the resize-path fix lands so the
-/// vm test suite stays green.
+/// WP4.6 acceptance gate: 1000 puts then gets.
 ///
-/// To unignore once the fix lands: remove `#[ignore]` and run with
-/// `cargo test --release -p cratonvm-vm --test wp4_6_chm_basic`.
+/// Note what this catches and what it does not. It returns 0 for *any*
+/// failure, so it cannot say which key was lost — that is why the diagnosis
+/// ran through `test_chm_pre_resize_put_get`'s staged return codes instead.
+/// Its value is scale: 1000 String keys across 16 segments do force real
+/// per-segment growth, so it is the pin that a resize genuinely relinks
+/// chains.
 #[test]
-#[ignore = "WP4.6-FOLLOWUP-A: CHM transfer() data-loss after resize past 16 buckets"]
 fn test_chm_basic_put_get() {
     require_class_files!();
     let mut vm = test_vm();
@@ -198,10 +211,12 @@ fn test_chm_basic_put_get() {
     }
 }
 
-/// 64-entry resize probe — currently FAILS for the same WP4.6-FOLLOWUP-A
-/// transfer() bug.
+/// 64-entry resize probe, keyed by `Integer` rather than `String`. It is the
+/// control for its String-keyed siblings: it passed throughout the 2026-08-03
+/// investigation (it was `#[ignore]`d on a resize hypothesis it never
+/// confirmed), which is what located the defect in String equality rather
+/// than in the resize path both keys share.
 #[test]
-#[ignore = "WP4.6-FOLLOWUP-A: CHM transfer() data-loss after resize past 16 buckets"]
 fn test_chm_resize_path() {
     require_class_files!();
     let mut vm = test_vm();
@@ -239,7 +254,6 @@ fn test_chm_mutation_cycle() {
 /// from one VM instance must not be reused by the next VM in the same Rust test
 /// process.
 #[test]
-#[ignore = "CHM get() misses a key the same VM just stored, in-process only — CLI with a real JDK returns 1; see docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md"]
 fn test_chm_boxed_cache_is_vm_scoped() {
     require_class_files!();
 

@@ -1,13 +1,13 @@
 ``# HIR-01 — settle the lowering contract before splitting the IR
 
-**Status:** not started. **Blocks:** `hir-02`. **Owns:** `docs/` only —
+**Status:** not started. **Blocks:** `hir-02`. **Owns:** `../..` only —
 this lane writes a contract, not code.
 
 ## The claim to check first
 
-The report asks for HIR/LIR/MIR. CratonVM has **one** IR level: `jit/src/ir.rs`
+The report asks for HIR/LIR/MIR. CratonVM has **one** IR level: `../../../jit/src/ir.rs`
 (sea-of-nodes, ~8k lines), lowered directly to machine code by
-`jit/src/ir_lower.rs` (~10.6k lines). There is no intermediate form.
+`../../../jit/src/ir_lower.rs` (~10.6k lines). There is no intermediate form.
 
 Before proposing three levels, establish what the single level is actually
 failing at. That is a real question with a real answer in this tree, and the
@@ -18,8 +18,8 @@ answer may be "two levels, not three". Evidence to weigh:
   that its value model has no register-residency concept at all — a linear-scan
   consumer had to be added as a *write-through cache* rather than a real
   allocator precisely because the lowerer cannot express "this value is in a
-  register" (`docs/jit/linear-scan-wiring.md`).
-* `jit/src/x64/isel.rs` exists, is now compiled, and has an IR-level tiler with
+  register" (`../../jit/linear-scan-wiring.md`).
+* `../../../jit/src/x64/isel.rs` exists, is now compiled, and has an IR-level tiler with
   a cost model — but no production call site, because its output has nowhere to
   go. That is the missing level, concretely.
 * The single level is why `ir_lower`'s catch-all was able to compile a monitor

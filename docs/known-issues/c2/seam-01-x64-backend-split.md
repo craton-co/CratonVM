@@ -1,6 +1,6 @@
-# SEAM-01 — split `jit/src/x64.rs` (40,303 lines)
+# SEAM-01 — split `../../../jit/src/x64.rs` (40,303 lines)
 
-**Status:** not started. **Owns:** `jit/src/x64.rs` and `jit/src/x64/*`.
+**Status:** not started. **Owns:** `../../../jit/src/x64.rs` and `jit/src/x64/*`.
 **Conflicts with:** every JIT lane, while it is in flight. Land it between
 waves, not during one.
 
