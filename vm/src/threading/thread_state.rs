@@ -755,20 +755,50 @@ pub fn try_record_transition(
 /// Seeding is deliberately *not* a transition: the recorder cannot know what a
 /// thread was doing before it was first instrumented, so the first record
 /// establishes the baseline instead of being checked against `Starting`.
+/// The steady-state path runs `f` against a **borrow** of the thread-local
+/// handle. It used to `Arc::clone` the cell out of TLS and call `f` on the
+/// owned copy, which put a refcount increment *and* a decrement on every
+/// transition — and every native call in the VM performs two transitions
+/// (`vm_exec::safe_native_call_impl` records `NativeRunning` on entry and
+/// restores the caller's state on return).
+///
+/// That was measured, not guessed. `native_funnel_profile::funnel_cost_
+/// breakdown` (`vm/src/vm/vm_exec.rs`) times each component of the native
+/// funnel separately: with the clone in place, the two `record_transition`
+/// calls were **67-115 ns of a ~110-128 ns funnel**, while every other
+/// component — the A3 diagnostic mask, `catch_unwind`, the pin push, the STW
+/// probe, the GC-pressure probes, the JNI-exception drain — measured 1-20 ns
+/// each. `current_state()`, which reads the same TLS cell through the same
+/// `RefCell` but does *not* clone, measured 3 ns. The refcount traffic was
+/// the funnel's fixed cost.
+///
+/// The borrow is safe because `f` is confined: its one caller
+/// ([`try_record_transition`]) touches only `cell.state` / `cell.thread_id`
+/// and never re-enters `SELF_CELL`, so it cannot trip the `RefCell`. The
+/// cold arm scopes the shared borrow before taking the mutable one — an
+/// `if let` scrutinee temporary otherwise lives to the end of the whole
+/// `if/else` and `borrow_mut()` would panic on a thread's first transition.
+///
+/// Nothing about the census changes: `CellHandle` still owns the `Arc`, the
+/// registry still holds its own, and the cell is still dropped out of
+/// `CELLS` by `CellHandle::drop`.
 fn with_cell<R>(seed: ThreadExecState, f: impl FnOnce(&ThreadStateCell) -> R) -> R {
-    let cell = SELF_CELL.with(|c| {
-        if let Some(existing) = c.borrow().as_ref() {
-            return Arc::clone(&existing.0);
+    SELF_CELL.with(|c| {
+        {
+            let borrowed = c.borrow();
+            if let Some(existing) = borrowed.as_ref() {
+                return f(&existing.0);
+            }
         }
+        // First observation on this OS thread — once per thread, ever.
         let fresh = Arc::new(ThreadStateCell {
             thread_id: AtomicU64::new(PENDING_THREAD_ID.with(|p| p.get())),
             state: AtomicU8::new(seed.as_u8()),
         });
         *c.borrow_mut() = Some(CellHandle(Arc::clone(&fresh)));
         cells().write().push(Arc::clone(&fresh));
-        fresh
-    });
-    f(&cell)
+        f(&fresh)
+    })
 }
 
 /// Drop the calling thread's cell out of the census registry (it has
@@ -902,6 +932,92 @@ pub fn thread_state_roster() -> Vec<(u64, ThreadExecState)> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Prices [`with_cell`]'s borrow against the `Arc::clone` it replaced, in one
+/// process, with the two arms interleaved.
+///
+/// A before/after taken from two separate runs cannot answer this. The build
+/// host here is shared: between the two breakdown runs that motivated the
+/// change, every rung on the board moved — `current_state()` went 3.6 ns to
+/// 1.1 ns without being touched at all — so a cross-run delta prices the box,
+/// not the code. (The A4b measurement in
+/// `arch-2026-08-04/architecture-review-a1-a9.md` records the
+/// same hazard and the same remedy: interleave, and quote minima.)
+///
+/// Both arms here run in the same process, alternating on every pass, against
+/// the same TLS cell. `old_shape` is a verbatim copy of the pre-fix body — an
+/// `Arc::clone` out of the thread-local handle, the closure against the owned
+/// copy, then the drop — so the difference between the arms is exactly one
+/// refcount increment and one decrement per call, which is what the fix
+/// removes.
+///
+/// `#[ignore]`d: it is a measurement, not an assertion. Run it with
+///
+/// ```text
+/// cargo test --release -p cratonvm-vm --lib with_cell -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod with_cell_ab {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// The pre-fix `with_cell`, kept verbatim so the A/B has a real control.
+    fn old_shape<R>(seed: ThreadExecState, f: impl FnOnce(&ThreadStateCell) -> R) -> R {
+        let cell = SELF_CELL.with(|c| {
+            if let Some(existing) = c.borrow().as_ref() {
+                return Arc::clone(&existing.0);
+            }
+            let fresh = Arc::new(ThreadStateCell {
+                thread_id: AtomicU64::new(PENDING_THREAD_ID.with(|p| p.get())),
+                state: AtomicU8::new(seed.as_u8()),
+            });
+            *c.borrow_mut() = Some(CellHandle(Arc::clone(&fresh)));
+            cells().write().push(Arc::clone(&fresh));
+            fresh
+        });
+        f(&cell)
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion — see the module doc"]
+    fn borrow_versus_arc_clone() {
+        const ROUNDS: u32 = 2_000_000;
+        // Seed the cell so neither arm ever takes the cold branch.
+        record_transition(ThreadExecState::JavaRunning, "with_cell-ab:seed");
+
+        let read_state = |cell: &ThreadStateCell| cell.state.load(Ordering::Relaxed);
+
+        let mut new_ns = Vec::new();
+        let mut old_ns = Vec::new();
+        // A-B-A-B, six passes each. Alternating on every pass (rather than
+        // running one arm's passes and then the other's) is the point: a
+        // drift that clusters into one arm is what a block layout cannot
+        // separate from the effect.
+        for _ in 0..6 {
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                black_box(with_cell(ThreadExecState::JavaRunning, read_state));
+            }
+            new_ns.push(t0.elapsed().as_nanos() as f64 / f64::from(ROUNDS));
+
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                black_box(old_shape(ThreadExecState::JavaRunning, read_state));
+            }
+            old_ns.push(t0.elapsed().as_nanos() as f64 / f64::from(ROUNDS));
+        }
+
+        let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        println!("with_cell   borrow (new): {new_ns:?}  min={:.2} ns", min(&new_ns));
+        println!("with_cell Arc::clone (old): {old_ns:?}  min={:.2} ns", min(&old_ns));
+        println!(
+            "minima separate by {:.2} ns/call; the native funnel performs TWO \
+             transitions per call",
+            min(&old_ns) - min(&new_ns)
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

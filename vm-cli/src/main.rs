@@ -4207,6 +4207,21 @@ fn run() -> Result<()> {
         for (reason, count) in cratonvm_vm::jit::helpers::leaf_native_refusals() {
             eprintln!("[cratonvm]   leaf sites refused, {reason}: {count}");
         }
+        // `Thread.currentThread()` is served one level earlier still: the
+        // compilers bake a direct `CALL` to `jit_thread_current_thread_direct`,
+        // so those sites never reach the leaf path above, or any dispatch
+        // helper at all. The per-door site counts prove the bind is not inert;
+        // the denominators are what named the compile door that was missing.
+        // See `native-call-funnel-per-call-floor-item2-20260805.md`.
+        let (sp_sites, ir_sites, osr_sites) = cratonvm_jit::thread_current_thread_bound_sites();
+        let (sp_seen, ir_seen) = cratonvm_jit::static_sites_seen();
+        eprintln!(
+            "[cratonvm] compiled Thread.currentThread direct calls: {} \
+             (sites bound per compile door: single-pass {sp_sites}/{sp_seen}, \
+             IR {ir_sites}/{ir_seen}, OSR {osr_sites}; the two denominators are \
+             invokestatic sites those ladders examined)",
+            cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
+        );
     }
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown

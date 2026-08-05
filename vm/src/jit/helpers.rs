@@ -9597,6 +9597,96 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site info for [`jit_thread_current_thread_direct`]'s
+/// cold arm (the first call on a thread whose mirror has not been built).
+static THREAD_CURRENT_THREAD_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Thread",
+    method_name: "currentThread",
+    descriptor: "()Ljava/lang/Thread;",
+    num_jit_args: 0,
+    return_type: b'L',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Process-wide count of compiled-code native-funnel bypasses.
+///
+/// The counter exists for the same reason
+/// `dispatch_static::INTRINSIC_HITS` does, and the source document says why
+/// in as many words: *"the counter exists because two earlier attempts at
+/// this shape were **inert**, and timings alone cannot tell 'never installed'
+/// from 'installed but no faster'."* A JIT-side bypass has one extra way to
+/// be inert that the interpreter one does not — `try_compile` may simply
+/// never recognise the site — so a counter incremented in the emitted call's
+/// own target is the only evidence that compiled code took this path.
+///
+/// Reported by `CRATONVM_INTRINSIC_STATS=1` alongside the interpreter count.
+pub static JIT_FUNNEL_BYPASS_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of compiled-code native-funnel bypasses since process start.
+pub fn jit_funnel_bypass_count() -> u64 {
+    JIT_FUNNEL_BYPASS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Thin direct-call target for JIT `invokestatic Thread.currentThread()`
+/// sites (registered into `cratonvm_jit::THREAD_CURRENT_THREAD_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// The JIT half of the bypass the interpreter got in
+/// `dispatch_static.rs`'s `InterpIntrinsic::ThreadCurrentThread` arm. Once a
+/// thread's `java_thread_obj` mirror exists, `currentThread()` is one field
+/// read of a value that is **already a per-thread GC root**: there is no
+/// argument to pin, nothing here allocates, collects or throws, and no Java
+/// code runs. Everything `safe_native_call` does for it — the argument copy
+/// and GC-forwarding barrier, `native_pin_roots`, the STW probe, the two
+/// GC-pressure probes, two `thread_state::record_transition` calls, the
+/// native ring, `catch_unwind`, the `memwatch`/`ec_watch` polls — is
+/// bookkeeping for hazards this operation does not have.
+///
+/// What the compiled site paid instead was *worse* than the funnel: an
+/// `invokestatic` whose callee is a registered native binds no compiled body,
+/// so it fell through `jit_invoke_dispatch` to `vm_exec::invoke_or_native`,
+/// which re-resolves the callee **by name** on every call and only then
+/// enters the funnel.
+///
+/// The cold arm — a thread whose mirror has not been built yet, i.e. at most
+/// once per thread — routes to `jit_invoke_dispatch` with the synthetic
+/// call-site info above, which is byte-for-byte the route the site took
+/// before this helper existed. That keeps `current_thread_object`'s
+/// allocating slow path in exactly one place.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_thread_current_thread_direct(vm_ptr: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as every other direct helper: the
+    // per-thread conservative-scan cache must be invalidated. No SATB flush —
+    // the fast arm below cannot allocate or enter the GC barrier, and the
+    // cold arm's `jit_invoke_dispatch` performs its own.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Some(obj) = thread.java_thread_obj {
+            // Mirror `safe_native_call`'s object-return handoff root, exactly
+            // as `call_integer_native_raw` does. The mirror is already rooted
+            // per-thread, so this is the diagnostic/contract half rather than
+            // a liveness requirement — but a returned object that is NOT in
+            // `native_pending_return` is a shape every other object-returning
+            // JIT edge here avoids, and nothing is gained by being the
+            // exception.
+            thread.native_pending_return = Some(obj);
+            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return obj.as_ptr() as i64;
+        }
+    }
+    // No mirror yet (or no JIT thread context): the ordinary route, which is
+    // what this site did on every call before the fast arm existed.
+    jit_invoke_dispatch(
+        vm_ptr,
+        &THREAD_CURRENT_THREAD_INFO as *const JitInvokeInfo as i64,
+        0,
+        0,
+    )
+}
+
 /// Synthetic call-site infos for the exact-HashMap thin direct-call helpers'
 /// fallback/dispatch paths (perf/halfgap-20260717).
 static HASHMAP_PUT_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
@@ -14112,6 +14202,9 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         );
         cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
             jit_concurrent_hashmap_get_direct as *const () as usize,
+        );
+        cratonvm_jit::set_thread_current_thread_direct_fn(
+            jit_thread_current_thread_direct as *const () as usize,
         );
     }
 

@@ -7886,6 +7886,99 @@ pub fn set_integer_int_value_direct_fn(addr: usize) {
     INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `Thread.currentThread()` thin direct-call helper — the JIT half of the
+/// funnel bypass the interpreter already has.
+///
+/// The interpreter answers `Thread.currentThread()` inline from the thread's
+/// own `java_thread_obj` mirror (see `InterpIntrinsic::ThreadCurrentThread`),
+/// which took it from 306 ns to 136 ns under `--nojit`. **With the JIT on that
+/// fix is inert**: compiled code never consults the interpreter's inline
+/// cache, and an `invokestatic` whose callee is a registered native has no
+/// compiled body to bind, so every call fell through `jit_invoke_dispatch` to
+/// `vm_exec::invoke_or_native` — a by-name resolution *plus* the native funnel,
+/// measured at ~400 ns/call
+/// (`native-call-funnel-per-call-floor-item2-20260805.md`).
+///
+/// The JDK leans on it constantly: **two calls per uncontended
+/// `ReentrantLock.lock()`/`unlock()` pair**, censused with
+/// `--dump-native-registry` (`probes/LockNativeCensusProbe.java`), plus every
+/// AQS ownership check and thread-local lookup.
+///
+/// `0` = not wired → the recognition below is skipped and the site keeps the
+/// generic dispatch helper, exactly like every other `*_DIRECT_FN`.
+pub static THREAD_CURRENT_THREAD_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Thread.currentThread` thin direct-call helper (called once
+/// from the VM's `build_helpers`).
+pub fn set_thread_current_thread_direct_fn(addr: usize) {
+    THREAD_CURRENT_THREAD_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many `Thread.currentThread()` call sites the compiler has bound to the
+/// thin direct helper, split by backend.
+///
+/// A *compile-time* counter, distinct from the VM's run-time
+/// `JIT_FUNNEL_BYPASS_HITS`. The two answer different questions and both are
+/// needed: sites-bound `== 0` means the recognition never ran, while
+/// sites-bound `> 0` with run-time hits `== 0` means it ran and the emitted
+/// call is not being taken. Nothing else separates those, and the first cut
+/// of this bypass was inert in exactly the first way — for a reason no
+/// timing could have shown (the optimizing tier resolves direct calls in its
+/// own loop, which had no route to the thin helpers at all).
+///
+/// Reported by `CRATONVM_INTRINSIC_STATS=1`.
+pub static THREAD_CURRENT_THREAD_SITES_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static THREAD_CURRENT_THREAD_SITES_IR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `invokestatic` sites each backend's direct-call ladder actually
+/// examined.
+///
+/// The denominators for the two counters above, and they exist because
+/// "bound 0 sites" has two completely different causes that no other signal
+/// separates: the ladder ran and the triple did not match (denominator > 0),
+/// or the ladder never ran for this method at all (denominator == 0). The
+/// first is a recognition bug; the second means the compile took a route
+/// neither ladder is on. Diagnosing the inert first cut of the
+/// `Thread.currentThread` bypass needed exactly this distinction.
+pub static STATIC_SITES_SEEN_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static STATIC_SITES_SEEN_IR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The OSR door's copy of the counter, incremented by the VM crate's
+/// `jit_bridge::compile_osr_artifact` — the **third** compile door, which
+/// reaches `x64::compile_with_param_slots` directly and carries its own
+/// direct-call ladder.
+///
+/// It lives here, next to the other two, precisely because that door is easy
+/// to forget: a `Thread.currentThread` bypass bound in `jit::try_compile`'s
+/// two ladders and not in this one reported `0` bypasses on a loop making
+/// 8,000,000 calls. Three doors, three binds, three counters in one line.
+pub static THREAD_CURRENT_THREAD_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(single-pass, IR)` counts of `invokestatic` sites each direct-call ladder
+/// examined since process start.
+pub fn static_sites_seen() -> (u64, u64) {
+    (
+        STATIC_SITES_SEEN_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        STATIC_SITES_SEEN_IR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(single-pass, IR, OSR)` sites bound to the `Thread.currentThread` thin
+/// direct helper since process start — one per compile door.
+pub fn thread_current_thread_bound_sites() -> (u64, u64, u64) {
+    (
+        THREAD_CURRENT_THREAD_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        THREAD_CURRENT_THREAD_SITES_IR.load(std::sync::atomic::Ordering::Relaxed),
+        THREAD_CURRENT_THREAD_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Direct thin-lock monitor helpers registered by the VM at bootstrap.
 ///
 /// They stay outside `JitRuntimeHelpers` to avoid expanding that stable
@@ -14886,7 +14979,23 @@ fn try_compile_inner(
                         //    (single-pass does the same before its
                         //    `callee_compiler` call). Without this a super call
                         //    could be bound to the wrong method body.
+                        if is_static {
+                            STATIC_SITES_SEEN_IR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let mut direct_target: Option<(usize, bool)> = None;
+                        // Set when `direct_target` came from a thin VM-side
+                        // helper rather than from a compiled callee. Those two
+                        // are the same thing to the *lowerer* — both are just
+                        // an address to `CALL` — and completely different to
+                        // `prepare_for_publication`, which pins every entry in
+                        // `_direct_callee_entries` and REFUSES to publish a
+                        // body whose baked target it cannot resolve to a live
+                        // JIT artifact. A thin helper is a process-lifetime
+                        // `extern "C"` function with no artifact to resolve, so
+                        // recording it there would make every compile that
+                        // binds one look like the use-after-free window that
+                        // check exists to catch.
+                        let mut direct_target_is_thin_helper = false;
                         if ir_direct && (is_static || is_special) && !is_ctor && !is_self_recursive {
                             let special_owner: Option<String> = if is_special {
                                 cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
@@ -14897,7 +15006,57 @@ fn try_compile_inner(
                                 special_owner.as_deref().unwrap_or(cn.as_str());
                             let closes_cycle =
                                 note_jit_recursive_compile_cycle(direct_class, &mn, &desc);
-                            if !closes_cycle
+                            // `Thread.currentThread()` thin direct-call native
+                            // helper. This has to be recognised HERE as well as
+                            // in the single-pass ladder, because the two
+                            // backends resolve direct calls independently and
+                            // this loop asks only `callee_compiler` — which
+                            // answers `None` for a registered native, since a
+                            // native has no compiled body to bind.
+                            //
+                            // That asymmetry is exactly why the interpreter-side
+                            // `Thread.currentThread` fix read as landed while
+                            // being inert with the JIT on: hot loops are
+                            // OSR-compiled at the optimizing tier, which is this
+                            // path, and it had no route to the thin helpers at
+                            // all. Measured with `CRATONVM_INTRINSIC_STATS=1`:
+                            // the compiled-code bypass counter sat at 0 for a
+                            // 8,000,000-call loop until this was added.
+                            //
+                            // Scope note: the other six `*_DIRECT_FN` helpers
+                            // (`Integer.valueOf`, `Integer.intValue`, the two
+                            // `HashMap` ones, the two `String` lower-case ones)
+                            // are still single-pass-only for the same reason.
+                            // That is a real and separate finding — see
+                            // `native-call-funnel-per-call-floor-item2-20260805.md`
+                            // — and is deliberately NOT fixed here: each of
+                            // those changes what the optimizing tier emits on a
+                            // measured hot path, and none of them has been
+                            // A/B'd at this tier.
+                            if is_static
+                                && direct_class == "java/lang/Thread"
+                                && mn == "currentThread"
+                                && desc == "()Ljava/lang/Thread;"
+                            {
+                                let entry = direct_native_helper(
+                                    &THREAD_CURRENT_THREAD_DIRECT_FN,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    // `needs_ctx = true`: the helper's first
+                                    // argument is `vm_ptr`, which
+                                    // `emit_direct_cross_call` loads from
+                                    // `context_slot_off` into `ENTRY_ABI_REGS[0]`.
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    THREAD_CURRENT_THREAD_SITES_IR
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            if direct_target.is_none()
+                                && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
                             {
                                 if let Some(compiler) = callee_compiler.as_ref() {
@@ -14923,7 +15082,9 @@ fn try_compile_inner(
                         }
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
-                            ir_direct_callee_entries.push(entry);
+                            if !direct_target_is_thin_helper {
+                                ir_direct_callee_entries.push(entry);
+                            }
                         } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
                             .is_some()
                         {
@@ -16316,6 +16477,10 @@ fn try_compile_inner(
                 }
 
                 if !planned_inline {
+                    if invoke_kind == 3 {
+                        STATIC_SITES_SEEN_SINGLEPASS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // `Integer.valueOf(I)` thin direct call (see
                     // `INTEGER_VALUE_OF_DIRECT_FN`): statically bound, native
                     // callee — the eager callee-compile attempt below can
@@ -16356,6 +16521,47 @@ fn try_compile_inner(
                                     entry,
                                     needs_context: true,
                                     num_params: 3,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // `Thread.currentThread()` thin direct call (see
+                    // `THREAD_CURRENT_THREAD_DIRECT_FN`). Same shape as the
+                    // `Integer.valueOf` bind below — statically bound,
+                    // native callee, no compiled body to find — but with no
+                    // arguments at all: `num_params: 0` with
+                    // `needs_context: true` makes `emit_stack_arg_setup` pass
+                    // `vm_ptr` in ARG_REGS[0] and nothing else.
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
+                        && class_name == "java/lang/Thread"
+                        && method_name == "currentThread"
+                        && descriptor == "()Ljava/lang/Thread;"
+                    {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        let entry = direct_native_helper(
+                            &THREAD_CURRENT_THREAD_DIRECT_FN,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            THREAD_CURRENT_THREAD_SITES_SINGLEPASS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 0,
                                     return_type: b'L',
                                     guard_class_id: 0,
                                 },
