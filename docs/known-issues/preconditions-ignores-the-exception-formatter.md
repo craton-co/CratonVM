@@ -1,10 +1,10 @@
 # `Preconditions.checkFromToIndex` ignores its exception formatter and always throws `ArrayIndexOutOfBoundsException`
 
-**Status:** OPEN, but narrowed on 2026-08-05. Every `java/lang/String`-domain
-symptom is now fixed by bypass (F4 gained a third member); what remains is the
-non-`String` half -- NIO's callers still get `ArrayIndexOutOfBoundsException`
-where the JDK throws `IndexOutOfBoundsException`, and the `BiFunction`
-formatter is still never invoked.
+**Status:** OPEN in mechanism, CLOSED in observable behaviour, 2026-08-05.
+Every caller -- `String`-domain and NIO alike -- now gets HotSpot's exact
+exception class and message. What is still literally true of the title is that
+the `BiFunction` formatter is never *invoked*: the overrides reproduce what it
+would have produced instead of calling it. See *Where this stands* at the end.
 
 **Supersedes** `string-substring-bounds-throw-arrayindexoutofbounds.md`, filed
 2026-08-04, **which was wrong about the cause and wrong about the blame.** That
@@ -131,20 +131,61 @@ exactly the predicted ones (31-35 `charAt`, 83-88 `substring`, 292-293
 `new String(byte[],int,int,Charset)`), **0 regressions**, and no still-divergent
 row changed value. Identical in default (JIT), `--nojit` and `--jdk-only`.
 
-### What is still open
+### Item 2 closed the same day: the non-`String` callers
 
-1. **The `BiFunction` is still never invoked.** The bypass makes the
-   `String`-domain answers right without it; it does not make `Preconditions`
-   correct.
-2. **The non-`String` callers still get the wrong class.** With a `null`
-   formatter the real `Preconditions.outOfBounds` throws
-   `IndexOutOfBoundsException`; our overrides throw
-   `ArrayIndexOutOfBoundsException`, a *subclass*, which is the direction that
-   breaks a `catch`. Fixing it needs a plain `IndexOutOfBoundsException` variant
-   in `RuntimeError` (there is none today) and touches NIO buffer slicing rather
-   than `String`, so it was left out of the `String` lane deliberately.
+The `Preconditions` overrides threw `ArrayIndexOutOfBoundsException` where the
+JDK throws plain `IndexOutOfBoundsException` -- a *subclass*, i.e. wrong in the
+direction that breaks a `catch`. `RuntimeError` had no plain variant; it has one
+now (`RuntimeError::ioobe`), and all five overrides use it with HotSpot's own
+message text. `checkFromIndexSize` also stopped overflowing on `from + size`,
+which is why the JDK prints that addition unevaluated.
 
-Item 2 is what still stands between here and deleting F4 entirely.
+`StringPolicyMatrixProbe` cannot see any of this -- every out-of-bounds row in
+it is `String`-domain, and those are already served by the F4 bypass.
+`probes/NioOutOfBoundsClassProbe` exists for exactly that blind spot and checks
+the direct callers against a HotSpot control:
+
+```text
+Objects.checkIndex(9,8)        IndexOutOfBoundsException  "Index 9 out of bounds for length 8"
+Objects.checkFromToIndex(3,2)  IndexOutOfBoundsException  "Range [3, 2) out of bounds for length 8"
+Objects.checkFromIndexSize     IndexOutOfBoundsException  "Range [6, 6 + 5) out of bounds for length 8"
+```
+
+All three now match HotSpot exactly, class and message.
+
+## Where this stands
+
+**Behaviourally closed.** Nothing observable is known to differ from HotSpot for
+either the `String` or the NIO callers.
+
+**Mechanically still open**, and worth keeping this record for:
+
+* The `BiFunction` is never invoked. The overrides reproduce the two formatters'
+  output rather than calling them, so a caller passing a *custom* formatter --
+  legal, and what the four-argument overloads exist for -- still gets the
+  built-in wording. No JDK or library code in this VM's corpus is known to do
+  that, which is why this is a note rather than a defect.
+* **F4's three `java/lang/String.check*` natives are therefore still load-bearing
+  and must not be deleted.** They are what keeps the `String` domain on the
+  right exception class; `Preconditions` reaching parity does not make them
+  redundant, because they exist to bypass the formatter question entirely.
+  `the_surviving_string_registration_set_is_exactly_this` pins all three.
+
+## Found while fixing this, NOT caused by it
+
+`probes/NioOutOfBoundsClassProbe` turned up two unrelated divergences on the
+same run. Recorded here because the probe is the reproducer, not because they
+belong to this record:
+
+* **`ByteBuffer.get(99)` does not throw at all** -- an out-of-range absolute
+  read returns silently. That is a missing bounds check, not a wrong class, and
+  changing which exception `Preconditions` throws cannot produce a NO-THROW.
+* **`List.of("a").get(3)` throws `ArrayIndexOutOfBoundsException`** where HotSpot
+  throws `IndexOutOfBoundsException: Index: 3 Size: 1`. It kept the old class
+  through this change, which is itself the evidence that it does not route
+  through `Preconditions`.
+
+Both need their own owner.
 
 ## What must change
 
