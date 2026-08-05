@@ -23884,8 +23884,8 @@ mod tests {
     #[test]
     fn equal_strings_compare_equal_in_the_embedded_string_layout() {
         let shared = test_shared();
-        let a = super::create_java_string_uninterned(&shared, "k0");
-        let b = super::create_java_string_uninterned(&shared, "k0");
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
         assert_ne!(a.as_ptr(), b.as_ptr(), "the probe needs two distinct objects");
         assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
         // "k0" == 'k' * 31 + '0' == 3365, the value String.hashCode() returns.
@@ -23904,9 +23904,9 @@ mod tests {
     #[test]
     fn non_latin1_strings_round_trip_through_the_compact_readers() {
         let shared = test_shared();
-        let a = super::create_java_string_uninterned(&shared, "kπ0");
-        let b = super::create_java_string_uninterned(&shared, "kπ0");
-        let c = super::create_java_string_uninterned(&shared, "kπ1");
+        let a = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let c = crate::vm::create_java_string_uninterned(&shared, "kπ1");
         assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
         assert_eq!(compact_java_strings_equal(&shared, a, c), Some(false));
         let expected = "kπ0"
@@ -23920,8 +23920,8 @@ mod tests {
     #[test]
     fn different_strings_compare_unequal_in_the_embedded_string_layout() {
         let shared = test_shared();
-        let a = super::create_java_string_uninterned(&shared, "k0");
-        let b = super::create_java_string_uninterned(&shared, "k1");
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k1");
         assert_eq!(compact_java_strings_equal(&shared, a, b), Some(false));
     }
 
@@ -23932,8 +23932,8 @@ mod tests {
     #[test]
     fn unreadable_string_storage_is_unknown_not_unequal() {
         let shared = test_shared();
-        let a = super::create_java_string_uninterned(&shared, "k0");
-        let b = super::create_java_string_uninterned(&shared, "k0");
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
         shared.mem.heap.set_field(b, 0, Value::Object(None));
         assert_eq!(compact_java_strings_equal(&shared, a, b), None);
         assert_eq!(compact_java_string_hash(&shared, b), None);
