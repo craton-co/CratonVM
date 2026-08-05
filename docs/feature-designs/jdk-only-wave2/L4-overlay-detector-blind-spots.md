@@ -187,7 +187,7 @@ of zero". It is not any more. Live sites, from three small probes:
 | `java/lang/ThreadGroup` | 1 | `parent:ThreadGroup` | `name:String` |
 | `java/lang/ThreadGroup` | 2 | `daemon:Z` | `maxPriority:I` |
 | `java/lang/ThreadGroup` | 3 | `maxPriority:I` | `daemon:Z` |
-| `java/lang/Thread` | 5 | `contextClassLoader:ClassLoader` | `holder:Thread$FieldHolder` |
+| ~~`java/lang/Thread`~~ | ~~5~~ | ~~`contextClassLoader:ClassLoader`~~ | ~~`holder:Thread$FieldHolder`~~ **FIXED 08-05** |
 | `java/security/ProtectionDomain` | 1 | `permissions` | `classloader` |
 | `java/security/ProtectionDomain` | 2 | `classloader` | `principals:[Principal` |
 | `java/security/CodeSource` | 1 | `certs:[Certificate` | `signers:[CodeSigner` |

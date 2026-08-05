@@ -11398,18 +11398,41 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // Check if this is a virtual thread.
         //
         // Two paths matter here:
-        //   1. Synthetic-mode `Thread`: 5-slot layout with `is_virtual` at
-        //      slot 4 (set by the synthetic Thread.Builder.start native).
+        //   1. Synthetic-mode `Thread`: the fabricated layout, with `is_virtual`
+        //      at `SYNTHETIC_THREAD_VIRTUAL_SLOT` (set by the synthetic
+        //      Thread.Builder.start native).
         //   2. Real-JDK mode (JEP 444): a `BoundVirtualThread` (or any
         //      future `VirtualThread`) extends `BaseVirtualThread`. We must
         //      detect this by walking the class hierarchy вЂ” the synthetic
-        //      slot-4 trick won't work because the real Thread layout puts
-        //      different fields at slot 4. Without this detection, virtual
+        //      slot trick won't work because the real Thread layout puts
+        //      different fields there. Without this detection, virtual
         //      threads created by `Thread.ofVirtual().start(r)` wouldn't
         //      release the carrier semaphore on `Thread.sleep`/`park`,
         //      starving the carrier pool under load (e.g. 10K vthreads).
-        let is_virtual_synthetic = header.num_slots() >= 5
-            && matches!(self.shared.mem.heap.get_field(thread_obj, 4), Value::Int(1));
+        //
+        // The synthetic read is gated on the receiver actually HAVING the
+        // fabricated layout, asked by a field NAME the real class declares and
+        // the stub does not (`eetop`). It used to be gated on
+        // `num_slots() >= 5`, which every real `Thread` satisfies (19 fields),
+        // so the read was landing on the real `contextClassLoader` and was
+        // correct only because a reference can never `matches!` an `Int(1)`.
+        // A slot count cannot identify a layout — that lesson is written down
+        // in three other places in this tree.
+        let is_virtual_synthetic = {
+            const VSLOT: usize =
+                cratonvm_native_builtins::jdk25_concurrency::SYNTHETIC_THREAD_VIRTUAL_SLOT;
+            let fabricated = {
+                let cm = self.shared.classes.class_manager.read();
+                resolve_field_index_in_hierarchy(header.class_id, "eetop", &cm.class_store)
+                    .is_none()
+            };
+            fabricated
+                && header.num_slots() as usize > VSLOT
+                && matches!(
+                    self.shared.mem.heap.get_field(thread_obj, VSLOT),
+                    Value::Int(1)
+                )
+        };
         let is_virtual_real_jdk = {
             let cm = self.shared.classes.class_manager.read();
             // Look up `BaseVirtualThread`'s class id once. If not loaded
