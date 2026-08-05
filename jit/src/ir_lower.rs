@@ -2036,6 +2036,25 @@ fn reloc_emit_enabled() -> bool {
             return;
         }
         if let Some((start, end)) = self.thread_fetch_span.take() {
+            // Jumping over the span is only safe while nothing branches INTO
+            // its interior: a site patched at `start + 1` would overwrite the
+            // rel8 displacement, and one that TARGETS `start + 1` would decode
+            // the displacement as an opcode. Under the old NOP fill neither
+            // was fatal, so the invariant was never stated — it holds because
+            // the span is emitted at the top of the prologue, before any block
+            // is lowered, so every recorded patch site is past `end`.
+            //
+            // This runs before `patch_branches` / `patch_self_calls`, so both
+            // lists are still intact here and the invariant is checkable
+            // rather than merely true.
+            debug_assert!(
+                self.branch_patches
+                    .iter()
+                    .all(|&(pos, _)| pos < start || pos >= end)
+                    && self.self_call_patches.iter().all(|&pos| pos < start || pos >= end),
+                "a patch site landed inside the erased thread-fetch span {start}..{end}; \
+                 jumping over it would corrupt that patch (or its target)"
+            );
             self.buf.erase_range_with_jump_over(start, end);
         }
     }
