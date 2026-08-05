@@ -680,6 +680,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_COMPONENT_TYPE` | DBG | `CRATONVM_DBG=component-type` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_CORRUPT_FRAMES` | DBG | `CRATONVM_DBG=corrupt-frames` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_CTOR_FIX` | DBG | `CRATONVM_DBG=ctor-fix` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_DBB_ELEM` | DBG | `CRATONVM_DBG=dbb-elem` | opt-in | off | diag | snapshot | native-io |
 | `CRATONVM_DBG_DEFINE` | DBG | `CRATONVM_DBG=define` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_DEFLATE` | DBG | `CRATONVM_DBG=deflate` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_DEOPT` | DBG | `CRATONVM_DBG=deopt` | opt-in | off | diag | snapshot | jit, types, vm |

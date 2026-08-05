@@ -119,6 +119,7 @@ export inherited from a parent shell.
 | `component-type` | `CRATONVM_DBG_COMPONENT_TYPE` |
 | `corrupt-frames` | `CRATONVM_DBG_CORRUPT_FRAMES` |
 | `ctor-fix` | `CRATONVM_DBG_CTOR_FIX` |
+| `dbb-elem` | `CRATONVM_DBG_DBB_ELEM` |
 | `debug-sfi` | `CRATONVM_DEBUG_SFI` |
 | `debug-stack-tag` | `CRATONVM_DEBUG_STACK_TAG` |
 | `debug-stackwalk` | `CRATONVM_DEBUG_STACKWALK` |

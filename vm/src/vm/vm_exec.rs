@@ -1450,6 +1450,18 @@ fn blockgc_dbg() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some())
 }
 
+/// Cached `CRATONVM_DBG_HEAPCOPY` gate — the managed-heap-destination tripwire
+/// on `copy_to_native_memory`. PERF: that tripwire sat on the single-byte
+/// `DirectByteBuffer.put` path, so an uncached `runtime_var_os` probe ran once
+/// per byte written through a direct buffer. Same read-once treatment as
+/// [`blockgc_dbg`] and for the same reason.
+#[inline]
+fn heapcopy_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some())
+}
+
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
 thread_local! {
@@ -9482,6 +9494,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     // -- Heap access methods --
 
+    fn get_field_typed(&self, obj: ObjectRef, index: usize, descriptor: u8) -> Value {
+        // Same decode as `get_field`, minus `resolve_field_descriptor_byte_cached`
+        // — the caller supplied the answer that lookup would have produced.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        self.shared.mem.heap.get_field_as(obj, index, descriptor)
+    }
+
+    fn get_fields_typed(&self, obj: ObjectRef, slots: &[(usize, u8)], out: &mut [Value]) {
+        // One forwarding read for the whole batch — that is the point.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        for (slot, dst) in slots.iter().zip(out.iter_mut()) {
+            *dst = self.shared.mem.heap.get_field_as(obj, slot.0, slot.1);
+        }
+    }
+
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let obj = self.shared.mem.heap.load_and_forward(obj);
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
@@ -10828,6 +10855,22 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         queue: Option<ObjectRef>,
     ) {
         use cratonvm_gc::ReferenceType;
+        let ref_addr = reference_obj.as_ptr() as usize;
+        let referent_addr = referent.as_ptr() as usize;
+        let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
+        // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
+        // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
+        // rather than a referent, so it must never reach the pre-GC
+        // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        if ref_type == 4 {
+            self.shared
+                .mem
+                .ref_processor
+                .lock()
+                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            return;
+        }
         let rt = match ref_type {
             0 => ReferenceType::Weak,
             1 => ReferenceType::Soft,
@@ -10835,9 +10878,6 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        let ref_addr = reference_obj.as_ptr() as usize;
-        let referent_addr = referent.as_ptr() as usize;
-        let queue_addr = queue.map(|q| q.as_ptr() as usize);
         self.shared.mem.ref_processor.lock().discover_reference(
             rt,
             ref_addr,
@@ -13552,9 +13592,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // routed here with a heap dst). Catch it with the live Java stack so
         // the offending call site is pinned. is_heap_addr is region-membership
         // only (no header read) so it is safe on an arbitrary address.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some()
-            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
-        {
+        if heapcopy_dbg() && self.shared.mem.heap.is_heap_addr(addr as usize).is_some() {
             let n = data.len().min(16);
             eprintln!(
                 "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
@@ -14804,7 +14842,7 @@ pub(super) fn convert_element_value(
 // `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
 // proves the VM is dispatching and says nothing about *what*, which is the
 // entire diagnosis: the `nioMemLZF:` residual in
-// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` read as "a long
+// the retired `h2-jitban-longtail1` write-up read as "a long
 // interpreter tail with no second hot spot to attack" for two revisions purely
 // because nobody had the callee histogram.
 //

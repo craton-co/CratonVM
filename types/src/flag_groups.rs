@@ -223,6 +223,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "component-type", on_key: Some("CRATONVM_DBG_COMPONENT_TYPE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "corrupt-frames", on_key: Some("CRATONVM_DBG_CORRUPT_FRAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ctor-fix", on_key: Some("CRATONVM_DBG_CTOR_FIX"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "dbb-elem", on_key: Some("CRATONVM_DBG_DBB_ELEM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-sfi", on_key: Some("CRATONVM_DEBUG_SFI"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-stack-tag", on_key: Some("CRATONVM_DEBUG_STACK_TAG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-stackwalk", on_key: Some("CRATONVM_DEBUG_STACKWALK"), off_key: None, off_word: None },
