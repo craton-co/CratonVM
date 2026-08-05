@@ -175,6 +175,18 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 const IA_HOST: usize = 0;
 const IA_ADDR: usize = 1;
 
+/// The side table's host slot for an `InetAddress` that carries NO hostName —
+/// the JDK's null `InetAddressHolder.hostName`.
+///
+/// An empty string rather than an `Option` because the table is
+/// `(String, String)` and several readers already treat an empty host as
+/// "nothing stored" (`inet_addr_field_string_or` substitutes its default,
+/// `p52_isa_host_from_addr` falls through to the IP). `populate_inet_holder`
+/// translates it back to a genuine `null` in the real-JDK `holder`, so
+/// un-overridden `InetAddress.toString()` bytecode renders `/ip` exactly as
+/// HotSpot does.
+const NO_HOST_NAME: &str = "";
+
 const ISA_HOST: usize = 0;
 const ISA_PORT: usize = 1;
 
@@ -867,6 +879,60 @@ pub(crate) fn alloc_inet_address_external(
     alloc_inet_address(ctx, host, ip)
 }
 
+/// Mint an `InetAddress` mirror that remembers **no hostName**, the way the JDK
+/// leaves `holder.hostName` null for an address nobody supplied a name for.
+///
+/// `InetAddress.toString()` is
+/// `Objects.toString(holder().getHostName(), "") + "/" + getHostAddress()`, so
+/// this is directly observable: HotSpot prints `/127.0.0.1` for
+/// `getByName("127.0.0.1")` and `getByAddress(byte[])`, and for every address
+/// the socket layer decodes from a peer's raw IP. CratonVM used to hand
+/// `alloc_inet_address(ip, ip)` for all of those, which printed
+/// `127.0.0.1/127.0.0.1`.
+///
+/// **This is NOT the same question as "does host equal ip".** The wildcard
+/// `InetAddress.anyLocalAddress()` genuinely carries `hostName = "0.0.0.0"`
+/// (HotSpot prints `0.0.0.0/0.0.0.0`), so a render-time `host == ip` test would
+/// get that row backwards. The distinction is "was a name supplied", which is
+/// only decidable HERE, at construction. Sites that want the named wildcard
+/// keep calling [`alloc_inet_address_external`] with an explicit host.
+pub(crate) fn alloc_inet_address_unnamed(ctx: &mut dyn NativeContext, ip: &str) -> ObjectRef {
+    alloc_inet_address(ctx, NO_HOST_NAME, ip)
+}
+
+/// Mint a mirror for a RESOLVING entry point (`getByName`, `getAllByName`,
+/// `InetSocketAddress(String,int)`, …), where whether a name exists is decided
+/// by what the caller passed: a numeric literal is not a name, anything else is.
+///
+/// `getByName("0.0.0.0")` therefore yields an UNNAMED wildcard (HotSpot:
+/// `/0.0.0.0`) even though `anyLocalAddress()` yields a named one — same IP,
+/// opposite answer, and the reason this decision cannot be deferred to the
+/// renderer.
+pub(crate) fn alloc_inet_address_for_input(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    ip: &str,
+) -> ObjectRef {
+    if host_input_is_numeric_literal(input) {
+        alloc_inet_address(ctx, NO_HOST_NAME, ip)
+    } else {
+        alloc_inet_address(ctx, input, ip)
+    }
+}
+
+/// True when `input` is an IP literal rather than a hostname, i.e. the JDK
+/// would not have a name to remember. Accepts the bracketed IPv6 form
+/// (`[::1]`) and a scoped literal (`fe80::1%3`), both of which
+/// `getByName` takes and neither of which parses bare.
+fn host_input_is_numeric_literal(input: &str) -> bool {
+    let bare = input
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(input);
+    let unscoped = bare.split('%').next().unwrap_or(bare);
+    !unscoped.is_empty() && unscoped.parse::<IpAddr>().is_ok()
+}
+
 /// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
 /// to resolve a hostname/literal to an IP string without duplicating the
 /// IPv4/IPv6-literal-then-DNS-fallback logic (used by `phases_early.rs`'s
@@ -1047,9 +1113,23 @@ fn populate_inet_holder(
     // field is absent and `set_field_by_name` is a harmless no-op anyway.
     let holder = alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3);
     let holder_h = scope.root(holder);
-    let host_str = scope.create_string(host);
+    // An absent hostName must be a genuine `null`, not an empty String: the
+    // real-JDK readers test the field for null, not for emptiness.
+    // `InetAddress.toString()` is
+    // `Objects.toString(holder().getHostName(), "") + "/" + getHostAddress()`
+    // — an empty String is non-null and renders identically, but
+    // `InetSocketAddressHolder.getHostString()` is
+    // `addr.holder().getHostName() != null ? … : addr.getHostAddress()`, and an
+    // empty String there would make `getHostString()` answer "" instead of the
+    // IP. See `NO_HOST_NAME`.
+    let host_val = if host.is_empty() {
+        Value::Object(None)
+    } else {
+        let host_str = scope.create_string(host);
+        Value::Object(Some(host_str))
+    };
     let holder_cur = scope.get(&holder_h);
-    scope.set_field_by_name(holder_cur, "hostName", Value::Object(Some(host_str)));
+    scope.set_field_by_name(holder_cur, "hostName", host_val);
     // `address` is the IPv4 address packed big-endian into an int; for IPv6
     // it stays 0 (the bytes live in the separate `Inet6Address` holder).
     let parsed = ip.parse::<std::net::IpAddr>();
@@ -1111,6 +1191,33 @@ fn inet_addr_field(ctx: &mut dyn NativeContext, this: ObjectRef, which: usize) -
         return Value::Object(Some(ctx.create_string(&s)));
     }
     ctx.get_field(this, which)
+}
+
+/// `InetAddress.getHostName()` / `getCanonicalHostName()`.
+///
+/// A mirror that carries a name answers with it verbatim. One that does NOT
+/// (see [`NO_HOST_NAME`]) must fall back to the numeric text — reading the
+/// empty host straight out of the side table would answer `""`, and this
+/// method is declared to return a hostname, never nothing. HotSpot reaches the
+/// same place by a different route: it attempts a reverse lookup and returns
+/// `getHostAddress()` when there is no PTR record.
+///
+/// **Deliberately does not cache.** HotSpot writes its reverse-lookup answer
+/// back into `holder.hostName`, so a later `toString()` on the same object
+/// prints the discovered name. Replicating that here would write the *IP* into
+/// the holder and flip `toString()` from `/127.0.0.1` to `127.0.0.1/127.0.0.1`
+/// for any address some internal caller happened to ask the name of —
+/// reintroducing the very divergence this file was corrected for, at an
+/// unpredictable moment. A stable `toString()` is worth the one lost mutation;
+/// the difference is recorded in
+/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`.
+fn inet_addr_host_name_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let name = inet_addr_field_string_or(ctx, this, IA_HOST, "");
+    if !name.is_empty() {
+        return Value::Object(Some(ctx.create_string(&name)));
+    }
+    let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
+    Value::Object(Some(ctx.create_string(&ip)))
 }
 
 /// String form of one logical InetAddress field, with a default for the
@@ -1877,14 +1984,22 @@ fn native_inet_get_by_address(
         octets.copy_from_slice(&b);
         Ipv6Addr::from(octets).to_string()
     } else {
-        return Err(iae(format!("addr is of illegal length: {len}")));
+        // The JDK throws UnknownHostException here, not IllegalArgumentException
+        // (`InetAddress.getByAddress` declares `throws UnknownHostException` and
+        // uses it for the bad-length case). Real callers catch it by that type;
+        // an IAE escapes their catch and propagates as an unrelated failure.
+        return Err(uhex(format!("addr is of illegal length: {len}")));
     };
     // `getByAddress` has no separately supplied hostname. Use the same
     // HotSpot-normalized numeric text for both logical fields; otherwise a
     // caller that reads the host-side value (such as Jetty's connector setup)
     // can still observe Rust's RFC-5952-compressed IPv6 form.
     let ip_text = hotspot_ip_string(&ip_str);
-    let obj = alloc_inet_address(ctx, &ip_text, &ip_text);
+    // `getByAddress(byte[])` is handed raw octets and NO name, so the mirror
+    // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
+    // factory `getByAddress(String, byte[])` is a different method and keeps
+    // its host, however bogus (it is never resolved).
+    let obj = alloc_inet_address_unnamed(ctx, &ip_text);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -3924,8 +4039,11 @@ fn re1_socket_adaptor_inet(
     if host.is_empty() {
         return Ok(None);
     }
+    // `getHostString()` hands back a real hostname when the socket address has
+    // one and the numeric text otherwise, so route through the input-sensitive
+    // allocator rather than assuming either.
     let ip = host.trim_matches(&['[', ']'][..]);
-    Ok(Some(alloc_inet_address(ctx, ip, ip)))
+    Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)))
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
@@ -5313,7 +5431,29 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             let ip = ip
                 .or_else(|| (!side.host.is_empty()).then(|| side.host.clone()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
-            let ia = alloc_inet_address(ctx, &ip, &ip);
+            // `ServerSocket.getInetAddress()` hands back the very `InetAddress`
+            // that was passed to `bind`, so whether it carries a name is
+            // inherited from THAT object rather than decided here. This surface
+            // only retained the address as text, so reconstruct the one
+            // distinction that is observable: a wildcard bind can only have
+            // come from `InetAddress.anyLocalAddress()`, which IS named
+            // (HotSpot prints `0.0.0.0/0.0.0.0`), whereas an explicit bind
+            // address came from `getByName`/`getByAddress` and is not.
+            //
+            // This is NOT "unspecified implies named" in general:
+            // `DatagramSocket.getLocalAddress()` on a wildcard-bound socket
+            // prints `/0:0:0:0:0:0:0:0`, because that one is rebuilt from the
+            // fd through `getByAddress` rather than remembered. Those sites
+            // stay on `alloc_inet_address_unnamed`.
+            let is_wildcard = ip
+                .parse::<IpAddr>()
+                .map(|parsed| parsed.is_unspecified())
+                .unwrap_or(false);
+            let ia = if is_wildcard {
+                alloc_inet_address(ctx, &ip, &ip)
+            } else {
+                alloc_inet_address_unnamed(ctx, &ip)
+            };
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -5409,7 +5549,11 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             } else {
                 host
             };
-            let obj = alloc_inet_address(ctx, &name, &ip.to_string());
+            // `getByName(null)`/`getByName("")` mean the loopback and DO carry
+            // the name "localhost". A numeric literal carries none — HotSpot's
+            // `getByName("127.0.0.1").toString()` is `/127.0.0.1` — which is
+            // what `alloc_inet_address_for_input` decides.
+            let obj = alloc_inet_address_for_input(ctx, &name, &ip.to_string());
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5458,7 +5602,8 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 host
             };
             for (i, ip) in addrs.iter().enumerate() {
-                let obj = alloc_inet_address(ctx, &name, ip);
+                // Same rule as `getByName` above: a literal keeps no name.
+                let obj = alloc_inet_address_for_input(ctx, &name, ip);
                 ctx.set_array_element(arr, i, Value::Object(Some(obj)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -5495,7 +5640,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     });
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+        Ok(Some(inet_addr_host_name_value(ctx, this)))
     });
     r.register(
         ia,
@@ -5503,7 +5648,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+            Ok(Some(inet_addr_host_name_value(ctx, this)))
         },
     );
     r.register(ia, "getAddress", "()[B", |ctx, args| {
@@ -5576,9 +5721,15 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
             },
         );
+        // These CONCRETE-subclass registrations are the ones that actually
+        // run: every mirror is an `Inet4Address`/`Inet6Address`, so they win
+        // over the `java/net/InetAddress` pair registered above. Reading
+        // `IA_HOST` raw answered `""` for an address carrying no hostName --
+        // both pairs must share `inet_addr_host_name_value` or they silently
+        // disagree depending on which class the receiver happens to be.
         r.register(cls, "getHostName", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+            Ok(Some(inet_addr_host_name_value(ctx, this)))
         });
         r.register(
             cls,
@@ -5586,7 +5737,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+                Ok(Some(inet_addr_host_name_value(ctx, this)))
             },
         );
         r.register(cls, "getAddress", "()[B", |ctx, args| {
@@ -12737,7 +12888,8 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .ok()
                 .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
-            let ia = alloc_inet_address(ctx, &addr, &addr);
+            // The UDP socket's own bound address, read back as numeric text.
+            let ia = alloc_inet_address_unnamed(ctx, &addr);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -12792,7 +12944,8 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .ok()
                 .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
-            let ia = alloc_inet_address(ctx, &addr, &addr);
+            // The UDP socket's own bound address, read back as numeric text.
+            let ia = alloc_inet_address_unnamed(ctx, &addr);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -12945,7 +13098,8 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
             if let Some((oh, op)) = origin.rsplit_once(':') {
                 let port = op.parse::<i32>().unwrap_or(0);
-                let ia = alloc_inet_address(ctx, oh, oh);
+                // The datagram's origin, as numeric text off the wire.
+                let ia = alloc_inet_address_unnamed(ctx, oh);
                 ctx.set_field(pkt, DP_ADDR, Value::Object(Some(ia)));
                 ctx.set_field(pkt, DP_PORT, Value::Int(port));
             }

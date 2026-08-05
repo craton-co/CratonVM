@@ -2894,7 +2894,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            let address = crate::net_phase_e::alloc_inet_address_for_input(ctx, &host, &host);
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -2937,7 +2937,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
             let address =
-                crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1");
             Ok(Some(Value::Object(Some(address))))
         },
     );
