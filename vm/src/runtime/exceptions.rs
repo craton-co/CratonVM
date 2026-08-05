@@ -52,6 +52,22 @@ fn iae_trace_enabled() -> bool {
     *IAE_TRACE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok())
 }
 
+/// Substring filter for the NPE-origin stack dump: set
+/// `CRATONVM_DBG_NPE_MATCH=<substring>` to print the interpreter frame stack
+/// for every `NullPointerException` whose (JEP 358) message contains it.
+///
+/// The two hardcoded predicates below (`isInterface`, `Name is null`) each
+/// exist because someone needed exactly this and had to rebuild the VM to get
+/// it. A caught-and-logged NPE deep inside a framework — Spring's
+/// `AnnotationUtils.handleIntrospectionFailure` logs the message and swallows
+/// the stack — is otherwise invisible: you get the JEP 358 text and no site.
+fn dbg_npe_match() -> Option<&'static str> {
+    static NPE_MATCH: OnceLock<Option<String>> = OnceLock::new();
+    NPE_MATCH
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_NPE_MATCH").ok())
+        .as_deref()
+}
+
 cached_env_flag!(dbg_npe_none, "CRATONVM_DBG_NPE_NONE");
 cached_env_flag!(dbg_aioobe, "CRATONVM_DBG_AIOOBE");
 cached_env_flag!(dbg_bufunder, "CRATONVM_DBG_BUFUNDER");
@@ -1621,6 +1637,27 @@ pub fn throw_runtime_error(
                     }
                 }
             }
+            // Targeted NPE-origin dump: `CRATONVM_DBG_NPE_MATCH=<substring>`.
+            // Narrower than `CRATONVM_IAE_TRACE` (which dumps EVERY NPE, and
+            // Spring startup raises hundreds it catches), so a rare, swallowed
+            // NPE can be located without drowning the log.
+            if let Some(needle) = dbg_npe_match() {
+                if let RuntimeError::NullPointerException { message: Some(m) } = &error {
+                    if m.contains(needle) {
+                        eprintln!("[NPE-MATCH] msg={m}");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
+                            let cn = shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            eprintln!("[NPE-MATCH-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
+                    }
+                }
+            }
             // S111r20: broad NPE trace for spring context NPE hunt
             if iae_trace_enabled() {
                 eprintln!("NPE-TRACE msg={:?}", error);
@@ -2461,7 +2498,7 @@ mod tests {
             RuntimeError::IllegalMonitorStateException {
                 message: "not owner".to_string(),
             },
-            RuntimeError::StringIndexOutOfBoundsException { index: 99 },
+            RuntimeError::sioobe_index(99, 5),
             RuntimeError::NoSuchFieldException {
                 field_name: "missing".to_string(),
             },

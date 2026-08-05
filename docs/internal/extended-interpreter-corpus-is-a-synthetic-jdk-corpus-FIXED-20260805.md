@@ -5,7 +5,7 @@
 | **Status** | ✅ RESOLVED 2026-08-05. Root-caused, fixed, and re-baselined. Retired from `docs/known-issues/`. |
 | **Area** | `vm/tests/interpreter_tests.rs` (the `CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1` corpus) |
 | **Original symptom** | Opting in yielded `710 passed; 214 failed` serially, and `STATUS_ACCESS_VIOLATION` / SIGSEGV in the default parallel run. |
-| **Now** | `924 passed; 0 failed` serially and deterministically; no crash in 30+ full-parallel runs. Two pinned lists: 5 real synthetic-library gaps, 11 order-dependent. A residual parallel flake in the proxy cluster is tracked in `corpus-is-order-dependent-20260805`. |
+| **Now** | `924 passed; 0 failed` serially and in a full-parallel run, both deterministic. 11 real synthetic-library gaps pinned in `KNOWN_SYNTHETIC_JDK_GAPS`. |
 
 ## What the original triage got wrong
 
@@ -96,15 +96,15 @@ Five process-global tables were converted to per-`vm_identity` rows
 | `lang_system`'s `System.getenv()` / `getProperties()` singletons | one cell per process; `Vm::new` reset it |
 | `phases_late`'s `ClassValue` memoization cache | keyed by a pair of 32-bit identity hashes |
 | `lib.rs`'s `ReentrantLock` state table (and the new `ReentrantReadWriteLock` one) | keyed by a 32-bit identity hash |
+| `lib.rs`'s `PROXY_CLASS_CACHE` + `PROXY_LOADER_MODULES` | keyed by `ClassId`/`loader_id`, and the VALUE is a `ClassId` — see the parallel-flake section below |
 
 Their GC scan/remap hooks now take a `vm_identity` too — handing one VM's
 object to another VM's collector as a root was the same bug wearing a hat.
 
 After the change: 30+ consecutive full-parallel runs, no crash — against
-2-in-3 crashing before. The corpus also runs ~12× faster than serially. What
-survives is a non-fatal parallel flake confined to the proxy/annotation
-cluster; the serial run, which is how the corpus is documented to be invoked,
-is deterministic.
+2-in-3 crashing before. The corpus also runs ~12× faster than serially. The
+non-fatal tail of the same defect took one more table to close; see "The
+parallel flake" below.
 
 ## What else was fixed on the way
 
@@ -146,27 +146,56 @@ Both live in `require_extended_interpreter_tests`:
    unbuildable source stages nothing — which is how the corpus stayed dark
    until `f715d1367`, printing a green `924 passed` that had run none of it.
 
-## The pinned baseline — and why it is two lists
+## The pinned baseline
 
-The 16 remaining `(class, method)` pairs were each verified against real JDK 25,
-and then verified a second way: **run alone** in a fresh process, via
-`--exact <test>`. Eleven of them PASS that way. They are not missing features —
-the feature works when nothing else has run first — so they moved to
-`KNOWN_ORDER_DEPENDENT` and are tracked as the non-fatal tail of the very
-VM-lifecycle defect this document is about
-(`docs/known-issues/corpus-is-order-dependent-20260805.md`).
+`KNOWN_SYNTHETIC_JDK_GAPS` in `vm/tests/interpreter_tests.rs` lists the 11
+remaining `(class, method)` pairs, each verified twice: **real JDK 25 agrees
+with the expectation** (`probes/CorpusOracle`), and each **still fails run
+alone** via `--exact` in a fresh process, so none is an artefact of the ~900
+VMs that precede it. It is a two-way gate: an unlisted mismatch fails the run,
+and a listed pair that starts passing also fails it, telling you to delete the
+entry. See `docs/known-issues/synthetic-jdk-class-library-gaps-20260802.md`.
 
-That leaves **5** genuine gaps in `KNOWN_SYNTHETIC_JDK_GAPS`, all in the
-`java.lang.reflect.Proxy` / annotation-proxy surface
-(`docs/known-issues/synthetic-jdk-class-library-gaps-20260802.md`). It is a
-**two-way** gate: an unlisted mismatch fails the run, and a listed pair that
-starts passing also fails the run, telling you to delete the entry.
-`KNOWN_ORDER_DEPENDENT` deliberately does not trip on an unexpected pass,
-because execution order decides it.
+### A measurement trap worth naming
 
-The second check is the transferable part. "Fails in the suite" and "is a
-missing feature" are different claims, and eleven of sixteen entries here were
-the first without being the second.
+The `--exact` check reports `FAILED` for a listed entry that **passes** — that
+is the unexpected-pass arm firing, not the fixture. Grepping the run for
+`result: FAILED` therefore inverts the verdict for every listed entry, and I
+did exactly that: it filed the eleven genuine gaps as merely "order dependent"
+and the five proxy/annotation tests (which pass) as gaps. Re-measuring with
+both lists emptied — so nothing was absorbed — gave the real answer in one run.
+**When a harness can rewrite a test's verdict, read the panic text, not the
+exit status**, or empty the list first.
+
+## The parallel flake, and what actually caused it
+
+For a while the parallel run reported 1–5 failures in roughly half of all runs,
+always in the proxy/annotation cluster, flipping in both directions. The cause
+was a ninth unscoped table, found by looking for what the cluster shares rather
+than by guessing at counters:
+
+`PROXY_CLASS_CACHE` (`native-builtins/src/lib.rs`) memoises generated `$ProxyN`
+classes on `(loader_id, ordered_iface_class_ids) -> ClassId`. Every component
+of that is per-VM — `loader_id` is a small per-VM integer, the key's `ClassId`s
+are minted per VM from zero, and **the value is a `ClassId`**, a handle only the
+issuing class manager can interpret. A third call site (the deserialization
+path) additionally scanned the whole map ignoring the loader namespace, so it
+would match *any* VM's entry with the same interface set. VM B was routinely
+handed VM A's generated proxy class; `class_name_of_id` then answered `None` for
+it, which is the `?` in `ClassCastException: ? cannot be cast to …`.
+
+Keyed by `(vm_identity, loader_id, ifaces)`, with the scan filtered on the VM
+and the rows dropped in `release_vm_native_state`. Measured A/B on the same
+tree, eight full-parallel runs each:
+
+| | runs containing `? cannot be cast to` |
+|---|---:|
+| before | **6 of 8** (11 occurrences, 3 distinct interfaces) |
+| after | **0 of 8** |
+
+Note what this did *not* fix: the five proxy/annotation tests pass on the
+baseline build too, so their removal from the gap list is dev's work, not this
+change. This change removes the cross-VM `ClassId` leak and with it the flake.
 
 ## Reproducing (current)
 

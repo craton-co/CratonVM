@@ -355,7 +355,13 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
 /// has already gone wrong; it takes the snapshot mutex, which is why it is a
 /// separate call rather than folded into `report_reclaimed_receiver` (that one
 /// is reached in bulk on healthy runs).
-pub(crate) fn report_root_slice_provenance(thread: &JvmThread, addr: usize, site: &'static str) {
+pub(crate) fn report_root_slice_provenance(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    addr: usize,
+    site: &'static str,
+) {
+    let collections_now = shared.mem.heap.collection_count();
     static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
         return;
@@ -373,12 +379,20 @@ pub(crate) fn report_root_slice_provenance(thread: &JvmThread, addr: usize, site
         .last()
         .map(|f| format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc))
         .unwrap_or_else(|| "<no frame>".to_string());
+    let (publish_cc, publish_pc) = last_root_publish();
     tracing::error!(
         target: "cratonvm::gc::guard",
         obj = format!("{addr:#x}"),
         site = site,
         in_published_snapshot = in_snapshot,
         published_roots = snap_len,
+        // How old the snapshot the collector marked this thread from was.
+        // `collections_since_publish > 0` means at least one collection
+        // completed after this thread last published — so it was marked from a
+        // snapshot that could not contain anything allocated since.
+        last_publish_at_collection = publish_cc,
+        collections_now = collections_now,
+        last_publish_pc = publish_pc,
         in_blocked_region = blocked,
         frames = thread.frames.len(),
         top_frame = %top,
@@ -387,4 +401,34 @@ pub(crate) fn report_root_slice_provenance(thread: &JvmThread, addr: usize, site
          collector marks this thread from did not contain a slot the thread's \
          frames hold — a root COLLECTION gap, not a mark or sweep one.",
     );
+}
+
+thread_local! {
+    /// Collection count at this thread's last root-snapshot publish, and the
+    /// top frame's pc at that moment.
+    ///
+    /// The collector marks a thread it did not stop from that thread's LAST
+    /// PUBLISHED snapshot, so "how old is the snapshot the collector used"
+    /// is the difference between this and the collection count now. A thread
+    /// that allocated an object and then had a collection complete without
+    /// publishing again is marked from a snapshot that predates the object —
+    /// the shape the 2026-08-05 `DriverManager.getConnection` witness has, where
+    /// a brand-new `Properties` in LOCAL 3 was reclaimed while the thread sat
+    /// out the pause. `Properties.<init>()V` returns void, and the publish
+    /// hook fires on object-RETURNING native calls, so nothing between
+    /// `new` and the failing `put` necessarily republishes.
+    static LAST_PUBLISH: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+}
+
+/// Stamp the current collection count and top-frame pc as this thread's last
+/// root publish. One `Cell` store; called from every publish site.
+pub(crate) fn note_root_publish(shared: &SharedVm, thread: &JvmThread) {
+    let pc = thread.frames.last().map_or(0, |f| f.pc as u32);
+    let cc = shared.mem.heap.collection_count();
+    LAST_PUBLISH.with(|c| c.set((cc, pc)));
+}
+
+/// `(collection_count, pc)` of this thread's last root publish.
+pub(crate) fn last_root_publish() -> (u64, u32) {
+    LAST_PUBLISH.with(std::cell::Cell::get)
 }
