@@ -25,7 +25,7 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{REF_FIELD_NEXT, REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
 
@@ -368,40 +368,7 @@ fn discover_ref_from_args(
     } else {
         None
     };
-    // `jdk.internal.ref.Cleaner` (8u name `sun.misc.Cleaner`) IS a
-    // `PhantomReference`, so it arrives here typed `Phantom` and used to be
-    // discovered as one: cleared, enqueued onto its queue, and then ignored --
-    // its queue is the JDK's `dummyQueue`, which by design has no reader,
-    // because in the real JDK it is the `ReferenceHandler` thread that
-    // special-cases `instanceof Cleaner` and calls `clean()` instead of
-    // enqueuing. We have no ReferenceHandler, so nothing ever ran the thunk,
-    // and a `DirectByteBuffer`'s `Deallocator` never fired: every direct buffer
-    // leaked its `Bits` reservation for the life of the VM.
-    //
-    // Typing it `Cleaner` here routes it through the reference processor's
-    // `cleaner_refs`, whose `cleaner_actions`
-    // `interpreter::gc_and_alloc::run_cleaner_actions` executes. Both JDK
-    // classes are `final`, so an exact class-id match is the whole test.
-    let ref_type = if ref_type == REF_TYPE_PHANTOM && is_jdk_cleaner(ctx, reference_obj) {
-        REF_TYPE_CLEANER
-    } else {
-        ref_type
-    };
     ctx.discover_reference(ref_type, reference_obj, referent, queue);
-}
-
-/// Wire values for [`cratonvm_native_api::NativeContext::discover_reference`]
-/// (see `vm/src/vm/vm_exec.rs::discover_reference`).
-const REF_TYPE_PHANTOM: u8 = 2;
-const REF_TYPE_CLEANER: u8 = 3;
-
-/// Is `obj` one of the JDK's `Cleaner` phantom references — the shape whose
-/// reclamation action is `clean()` rather than "enqueue and let somebody poll"?
-fn is_jdk_cleaner(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
-    let cid = ctx.class_id_of_object(obj);
-    ["jdk/internal/ref/Cleaner", "sun/misc/Cleaner"]
-        .iter()
-        .any(|n| ctx.class_id_by_name(n) == Some(cid))
 }
 
 fn native_weak_ref_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -453,9 +420,49 @@ fn native_soft_ref_init_queue(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
+/// `jdk.internal.ref.Cleaner` — the real JDK's own pre-`java.lang.ref.Cleaner`
+/// reclamation hook, and the one `java.nio.DirectByteBuffer` still uses.
+const JDK_INTERNAL_CLEANER: &str = "jdk/internal/ref/Cleaner";
+
+/// Is this reference object a `jdk.internal.ref.Cleaner`?
+///
+/// Its constructor is `super(referent, dummyQueue)`, so it arrives at
+/// [`native_phantom_ref_init`] as an ordinary `PhantomReference`.
+fn is_jdk_internal_cleaner(ctx: &mut dyn NativeContext, reference_obj: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(reference_obj);
+    ctx.class_name_of_id(class_id)
+        .is_some_and(|name| name == JDK_INTERNAL_CLEANER)
+}
+
 fn native_phantom_ref_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ref_init_impl(ctx, args, true);
-    discover_ref_from_args(ctx, args, 2, true);
+    // A `jdk.internal.ref.Cleaner` is discovered as a CLEANER, not as a plain
+    // phantom.
+    //
+    // In the real JDK the difference is made by `ReferenceHandler`, which
+    // special-cases `instanceof Cleaner` and calls `clean()` directly instead of
+    // enqueueing: a `Cleaner`'s queue is a private `dummyQueue` that nothing
+    // ever polls, so a Cleaner routed down the ordinary phantom path is
+    // cleared, parked on a queue with no consumer, and never runs its thunk.
+    //
+    // `java.nio.DirectByteBuffer`'s entire reclamation path is one of these —
+    // `Cleaner.create(this, new Deallocator(base, size, cap))` — so without this
+    // NOTHING ever returns off-heap memory or refunds `Bits.reserveMemory`.
+    // Measured: `probes/DirectReclaimProbe.java` died with
+    // `OutOfMemoryError: Direct buffer memory` after exactly 16384 dropped
+    // 64 KiB buffers at `-Xmx 1g` — i.e. zero reclaimed — where HotSpot churns
+    // 2.5 GiB through the same loop.
+    //
+    // Wire encoding 4 = "phantom that RUNS instead of enqueueing"; it stays a
+    // PHANTOM rather than becoming `ReferenceType::Cleaner` because only phantom
+    // entries get their referent nulled before marking, and a `Cleaner` is
+    // reachable forever from its class's static list — so without that nulling
+    // the referent stays strongly reachable and can never die.
+    let ref_type = match args.first() {
+        Some(Value::Object(Some(obj))) if is_jdk_internal_cleaner(ctx, *obj) => 4,
+        _ => 2,
+    };
+    discover_ref_from_args(ctx, args, ref_type, true);
     Ok(None)
 }
 

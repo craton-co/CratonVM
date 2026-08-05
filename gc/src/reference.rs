@@ -90,6 +90,20 @@ pub struct ReferenceEntry {
     pub clear_emitted: bool,
     /// `action_emitted`: the cleaner action for this entry was already handed out.
     pub action_emitted: bool,
+    /// PHANTOM entries only: this reference is a `jdk.internal.ref.Cleaner`, so
+    /// clearing it must RUN it rather than enqueue it.
+    ///
+    /// The JDK draws exactly this distinction inside its `ReferenceHandler`
+    /// thread: an ordinary phantom goes on its `ReferenceQueue`, while a
+    /// `Cleaner` — whose queue is a private `dummyQueue` nothing ever polls —
+    /// has `clean()` invoked directly. It has to stay a *phantom* entry rather
+    /// than move to [`ReferenceType::Cleaner`], because only the phantom list
+    /// gets its referent nulled before marking
+    /// (`weakref_null_referents_pre_gc` -> `weak_phantom_active_pairs`): a
+    /// `Cleaner` is reachable forever from its class's own static list, so
+    /// without that nulling its referent is strongly reachable through it and
+    /// can never die — a leak with no symptom until something counts the bytes.
+    pub runs_cleaner: bool,
 }
 
 /// Aggregated stats for one round of reference processing.
@@ -304,6 +318,25 @@ impl ReferenceProcessor {
     // -- Discovery ----------------------------------------------------------
 
     /// Register a newly-discovered reference during the marking phase.
+    /// [`Self::discover_reference`] for a `jdk.internal.ref.Cleaner`.
+    ///
+    /// Tracked as a PHANTOM (which is what it is — the class extends
+    /// `PhantomReference`) so it participates in the pre-GC referent nulling,
+    /// but flagged [`ReferenceEntry::runs_cleaner`] so clearing it emits a
+    /// cleaner ACTION instead of a queue entry. See that field for why the two
+    /// halves cannot be separated.
+    pub fn discover_phantom_cleaner(
+        &mut self,
+        reference_obj: usize,
+        referent: usize,
+        queue: Option<usize>,
+    ) {
+        self.discover_reference(ReferenceType::Phantom, reference_obj, referent, queue);
+        if let Some(entry) = self.phantom_refs.last_mut() {
+            entry.runs_cleaner = true;
+        }
+    }
+
     pub fn discover_reference(
         &mut self,
         ref_type: ReferenceType,
@@ -342,6 +375,7 @@ impl ReferenceProcessor {
             last_access_time_ms: creation_stamp,
             clear_emitted: false,
             action_emitted: false,
+            runs_cleaner: false,
         };
         match ref_type {
             ReferenceType::Soft => {
@@ -658,6 +692,16 @@ impl ReferenceProcessor {
                 cleaner_actions.push(entry.reference_obj);
             }
         }
+        // `jdk.internal.ref.Cleaner`s live in `phantom_refs` (see
+        // `ReferenceEntry::runs_cleaner`) and become actions once their referent
+        // is gone — `enqueued` is what `process_phantom_refs` sets for a phantom
+        // whose referent died, and it is set exactly once.
+        for entry in &mut self.phantom_refs {
+            if entry.runs_cleaner && entry.enqueued && !entry.action_emitted {
+                entry.action_emitted = true;
+                cleaner_actions.push(entry.reference_obj);
+            }
+        }
         self.stats.cleaner_refs_processed = cleaner_actions.len();
 
         ReferenceProcessingResult {
@@ -842,6 +886,13 @@ impl ReferenceProcessor {
             // Java 9+: referent is NOT cleared for PhantomReferences.
             entry.enqueued = true;
             self.stats.phantom_refs_enqueued += 1;
+            // A `jdk.internal.ref.Cleaner` is never enqueued — its queue is a
+            // private `dummyQueue` with no consumer. It is RUN, in
+            // `process_references`'s gather step. See
+            // `ReferenceEntry::runs_cleaner`.
+            if entry.runs_cleaner {
+                continue;
+            }
             if let Some(q) = entry.queue_addr {
                 self.pending_queues
                     .entry(q)
@@ -1179,36 +1230,11 @@ impl ReferenceProcessor {
     /// the GC pointer map to locate the post-collection objects.
     ///
     /// SoftReferences are intentionally excluded — they stay strongly reachable
-    /// (kept alive) so soft-cache semantics are unchanged. `Finalizer` entries
-    /// are excluded for the opposite reason: `finalize()` must be able to reach
-    /// the object.
-    ///
-    /// **`Cleaner` entries ARE included.** A `Cleaner` *is* a
-    /// `PhantomReference` — this file's own Phase 3/4 comment says so and folds
-    /// it into the phantom liveness rule — but this pass, the one that decides
-    /// whether the referent can die at all, listed only weak and phantom. The
-    /// consequence was total for direct buffers: the JDK keeps every live
-    /// `jdk.internal.ref.Cleaner` on a static doubly-linked list, so a Cleaner
-    /// whose referent slot is never nulled makes its `DirectByteBuffer`
-    /// permanently reachable, `process_final_refs` never sees it die, no
-    /// cleaner action is ever emitted, and `Bits.reserved` only ever grows.
-    /// `ByteBuffer.allocateDirect` in a loop therefore OOM'd at exactly
-    /// `MaxDirectMemorySize` where HotSpot runs indefinitely
-    /// (`probes/DirectBufProbe.java`).
-    ///
-    /// The name is kept for its callers; "weak/phantom" now means "every
-    /// reference kind whose referent is allowed to die", which is what the
-    /// callers always wanted.
+    /// (kept alive) so soft-cache semantics are unchanged; only weak + phantom
+    /// references must allow their referent to be reclaimed.
     pub fn weak_phantom_active_pairs(&self) -> Vec<(usize, usize)> {
-        let mut v = Vec::with_capacity(
-            self.weak_refs.len() + self.phantom_refs.len() + self.cleaner_refs.len(),
-        );
-        for e in self
-            .weak_refs
-            .iter()
-            .chain(self.phantom_refs.iter())
-            .chain(self.cleaner_refs.iter())
-        {
+        let mut v = Vec::with_capacity(self.weak_refs.len() + self.phantom_refs.len());
+        for e in self.weak_refs.iter().chain(self.phantom_refs.iter()) {
             if !e.cleared && !e.enqueued {
                 v.push((e.reference_obj, e.referent));
             }

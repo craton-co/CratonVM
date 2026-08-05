@@ -257,7 +257,7 @@ things underneath it were broken. This is the honest cost of the change and it
 is why the divergence count went from 57 to 37 rather than to zero.
 
 **1. `String.hashCode()` is wrong for UTF-16 strings** —
-[filed](../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md).
+[FIXED 2026-08-05](string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md).
 The bytecode hashes the first `length()` BYTES of the backing array, each
 sign-extended to a `char`, instead of the `length()` code units:
 `"ΣΟΣ".hashCode()` is `62956255` where the JLS and HotSpot say
@@ -267,12 +267,20 @@ sign-extended to a `char`, instead of the `length()` code units:
 sequence gives that exact reading for all four probe strings, sign extension
 included (`0xA3` hashed as `0xFFA3`).
 
-**So `String.hashCode()` is registered `Intrinsic` for CORRECTNESS.** Letting
-the bytecode win would replace a right answer with a wrong one for every
-non-ASCII `String` key in the VM. When the `StringUTF16` defect is fixed, that
-registration should be re-measured and probably deleted — at that point it is a
-pure performance optimisation again (the ~1950x caching win) and has to argue
-on those terms.
+**So `String.hashCode()` was registered `Intrinsic` for CORRECTNESS** — letting
+the bytecode win would have replaced a right answer with a wrong one for every
+non-ASCII `String` key in the VM.
+
+**That registration is now withdrawn (2026-08-05), and the paragraph above was
+wrong about where the defect lived.** It is not a `StringUTF16` bytecode bug:
+`StringUTF16.hashCode` delegates to `ArraysSupport.vectorizedHashCode`, and the
+*native override* of that helper read one array slot per element for every
+`BasicType`. `T_CHAR` over a `byte[]` is two slots. So one shadow was hiding a
+second shadow, and the "the bytecode under it is broken" reasoning that
+justified keeping this native was itself a consequence of a different native.
+With the helper fixed the bytecode is correct, and the re-measurement this
+paragraph asked for came back a wash overall and **2-4x slower on the cached
+read** — so the registration was deleted rather than kept.
 
 **2. `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`** —
 **superseded; see the correction above.** This was a regression of this change,
@@ -292,7 +300,7 @@ a valid input is worse than a loud exception of the wrong class. The trade is
 stated here rather than hidden.
 
 **3. `+` concatenation loses an unpaired surrogate to U+FFFD** —
-[filed](../known-issues/string-concat-loses-unpaired-surrogates.md). Found by
+[FIXED 2026-08-05](string-concat-loses-unpaired-surrogates-FIXED-20260805.md). Found by
 accident: `probes/StringUtf16HashProbe` builds its lone-surrogate string with
 `new String(char[])` and it survives, while
 `probes/StringPolicyMatrixProbe` builds the same string with `+` and it does

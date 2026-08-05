@@ -1,3 +1,10 @@
+// Declares the package its directory implies. Without it javac staged this
+// hand-run probe in the DEFAULT package while the file lived under
+// `cratonvm/`, so its `this_class` contradicted its path — the shape HotSpot
+// rejects outright and only CratonVM's loader tolerated. No corpus test
+// invokes it under a package name today; the declaration is here so one can.
+package cratonvm;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;

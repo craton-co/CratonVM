@@ -1,7 +1,13 @@
+> **RETIRED 2026-08-05.** Kept only for the A/B numbers below. Everything this
+> page concluded has since been settled: the three regressions were one bug and
+> it is fixed, the `org/h2/` ban it argued to keep no longer exists in the tree
+> at all, and the `TestFileSystem` hang it could not attribute has been
+> root-caused. Read [`h2-jitban-longtail1-CLOSED-20260805.md`](h2-jitban-longtail1-CLOSED-20260805.md) instead.
+
 # HIB-LONGTAIL.1 (`org/h2/`) — re-verified 2026-07-28, ban STAYS
 
 > **Superseded — do not read this for the current state.** Its date (07-28) is
-> LATER than the page that supersedes it (`h2-jitban-longtail1-ban-stays-testmetadata.md`),
+> LATER than the page that supersedes it (`h2-jitban-longtail1-CLOSED-20260805.md`),
 > which is exactly the trap the old `h2-jitban*-residuals-*` names set. Kept
 > only for the A/B measurements recorded below.
 
@@ -18,7 +24,7 @@ but it was NOT sufficient on its own.
 
 The ban still stays, for one different and PRE-EXISTING reason this page's
 lifted arm never isolated: `org.h2.test.jdbc.TestMetaData`. See
-`docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` for the current state;
+`h2-jitban-longtail1-CLOSED-20260805.md` for the current state;
 this page is kept for the A/B numbers it recorded.
 
 **Status**: re-tested against the 2026-07-27 atomic-array RMW fix
@@ -30,7 +36,7 @@ banned.**
 
 ## Why this re-test happened
 
-`docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` recorded this
+`h2-jitban-longtail1-CLOSED-20260805.md` recorded this
 ban's sharpest blocker as a CORRECTNESS bug: `TestFileSystem`'s
 `memLZF:`/`nioMemLZF:` `testConcurrent` intermittently read a stale
 `expected` value against fresh file bytes, root-caused to
@@ -183,7 +189,7 @@ divergence), both freshly re-verified against current `dev`
 (`072f3de9c`) with a clean A/B control. `TestFileSystem`'s hang is
 real but orthogonal to this ban and tracked separately above.
 
-See also: `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` (prior
+See also: `h2-jitban-longtail1-CLOSED-20260805.md` (prior
 history, atomic-array root cause), `vm/src/jit/skip_list.rs`'s
 `HIB-LONGTAIL.1` comment, and
 `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md`.

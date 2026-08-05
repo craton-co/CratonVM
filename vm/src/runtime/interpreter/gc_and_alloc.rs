@@ -1023,14 +1023,6 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             maybe_concurrent_gc(shared, thread);
             // Run any pending finalizers
             run_finalizers(shared, thread);
-            // ...and any pending Cleaner actions. This used to run ONLY from
-            // `force_gc_from_native` (i.e. only on an explicit `System.gc()`),
-            // so an ordinary allocation-triggered collection cleared a
-            // `Cleaner` and then left its action queued forever — which is
-            // half of why direct `ByteBuffer`s were never reclaimed. The
-            // finalizer drain one line up has always been on both paths; this
-            // is the asymmetry, not a new policy.
-            run_cleaner_actions(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
             let mut counted_os_tids: Vec<u32> = Vec::new();
@@ -1155,9 +1147,6 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 maybe_concurrent_gc(shared, thread);
                 // Run any pending finalizers
                 run_finalizers(shared, thread);
-                // ...and any pending Cleaner actions — see the single-threaded
-                // path above for why this was missing.
-                run_cleaner_actions(shared, thread);
             } else {
                 // Another thread is already doing GC — just participate
                 safepoint_check(shared, thread);
@@ -1232,6 +1221,38 @@ pub(crate) fn create_string_or_oom(
     Err(MethodCallFailed::InternalError(VmError::Runtime(
         RuntimeError::OutOfMemoryError {
             message: format!("Java heap space (String of {} chars)", text.len()),
+        },
+    )))
+}
+
+/// [`create_string_or_oom`] for UTF-16 code units.
+///
+/// Identical escalation ladder — the only difference is that the source is a
+/// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
+/// allocated `String`. String concatenation builds its result this way; see
+/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+pub(crate) fn create_string_from_units_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    units: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_from_units as try_new_string;
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, units) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", units.len()),
         },
     )))
 }
@@ -1695,44 +1716,15 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     run_cleaner_actions(shared, thread);
 }
 
-/// `CRATONVM_DBG_CLEANERS=1` — trace the direct-buffer / Cleaner reclamation
-/// chain: whether the drain ran, how many actions it found, and which ones were
-/// the JDK's own `jdk.internal.ref.Cleaner`.
-///
-/// Read once. This runs after every collection now (see the two
-/// `run_cleaner_actions` calls in `maybe_gc`), and `runtime_var_os` takes the
-/// process-environment lock, so an uncached read would put that lock on the
-/// post-GC path.
-fn dbg_cleaners() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CLEANERS").is_some())
-}
-
 /// Drain pending Cleaner actions and invoke their Runnable.run() method.
 ///
-/// Each entry is the address of either a `java/lang/ref/Cleaner$Cleanable`
-/// synthetic — field 0 the Runnable action, field 1 the cleaned flag
-/// (idempotency guard, also set by user-triggered `Cleanable.clean()`) — or a
-/// `jdk.internal.ref.Cleaner`, the JDK's own phantom-reference subclass, whose
-/// action is its own `clean()` method. The loop dispatches on the class; see
-/// the comment at that branch for why reading field 0/1 of the latter would be
-/// reading its reference fields instead.
+/// Each entry is the address of a `java/lang/ref/Cleaner$Cleanable`
+/// synthetic. Field 0 holds the Runnable action; field 1 is the cleaned
+/// flag (idempotency guard, also set by user-triggered Cleanable.clean()).
 ///
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
-    let dbgclean = dbg_cleaners();
-    if dbgclean {
-        eprintln!(
-            "[dbgclean] run_cleaner_actions entered: pending={} no_refproc={} \
-             no_cleaners={} jit_thread_set={}",
-            shared.mem.cleaner_thread.pending_count(),
-            no_refproc(),
-            no_cleaners(),
-            crate::jit::helpers::is_jit_thread_set(),
-        );
-    }
     // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
     if no_refproc() || no_cleaners() {
         return;
@@ -1790,44 +1782,40 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     let _cleaner_depth_guard = CleanerDepthGuard;
 
     let addrs = shared.mem.cleaner_thread.drain_actions();
-    if dbgclean {
-        eprintln!("[dbgclean] draining {} cleaner action(s)", addrs.len());
-    }
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
-        // Two shapes reach this queue. `java.lang.ref.Cleaner$Cleanable` (the
-        // one handled below) is our own two-field object: field 0 the action,
-        // field 1 an already-cleaned flag. `jdk.internal.ref.Cleaner` is the
-        // JDK's own class — a `PhantomReference` holding a `thunk` — and its
-        // action is `clean()`, which unlinks it from the Cleaner list and runs
-        // the thunk. Reading field 0/1 of THAT object would be reading its
-        // reference fields as if they were ours, so dispatch on the class
-        // first. See `native-builtins::reference::is_jdk_cleaner` for why these
-        // arrive here at all. `clean()` is idempotent in the JDK
-        // (`if (!remove(this)) return;`), so a user who already called it
-        // makes this a no-op.
-        let jdk_cleaner_name = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(shared.mem.heap.class_id_of(cleanable))
-            .map(|c| c.name.to_string())
-            .filter(|n| n == "jdk/internal/ref/Cleaner" || n == "sun/misc/Cleaner");
-        if let Some(name) = jdk_cleaner_name {
-            if dbgclean {
-                eprintln!("[dbgclean] running JDK Cleaner.clean() on {name}");
+        // A real `jdk.internal.ref.Cleaner` is NOT the synthetic `Cleanable`
+        // shape the rest of this loop assumes (field 0 = action, field 1 =
+        // cleaned flag) — its slots are `PhantomReference`'s. It carries its own
+        // `clean()`, which unlinks it from the class's static list and runs its
+        // thunk exactly once, and that is precisely what the JDK's
+        // `ReferenceHandler` calls when it sees one. Dispatch to it and skip the
+        // `Cleanable` decoding entirely: reading field 1 of a `Cleaner` as a
+        // "cleaned" flag would be reading its `queue`.
+        //
+        // See `native_phantom_ref_init` for why these arrive here at all.
+        {
+            let class_id = shared.mem.heap.class_id_of(cleanable);
+            let is_jdk_cleaner = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .is_some_and(|c| c.name.as_ref() == "jdk/internal/ref/Cleaner");
+            if is_jdk_cleaner {
+                // Errors are swallowed per the Cleaner contract, exactly as for
+                // the `Cleanable` arm below.
+                let _ = crate::vm::invoke_shared(
+                    shared,
+                    thread,
+                    "jdk/internal/ref/Cleaner",
+                    "clean",
+                    "()V",
+                    &[Value::Object(Some(cleanable))],
+                );
+                continue;
             }
-            // Errors are silently swallowed per the Cleaner contract.
-            let _ = crate::vm::invoke_shared(
-                shared,
-                thread,
-                &name,
-                "clean",
-                "()V",
-                &[Value::Object(Some(cleanable))],
-            );
-            continue;
         }
         // Idempotency: skip if user code already invoked clean().
         let already = matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1),);
@@ -1976,6 +1964,7 @@ pub(super) fn process_references_after_gc(
             pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
         };
         let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
             &is_marked,
             pointer_map,
         );
@@ -3680,6 +3669,31 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             }
         }
     }
+    // H2-CID0: once per collection per thread, ask whether any LIVE frame slot
+    // now points into memory the collector reclaimed. The blocked-region
+    // deposit/wake pair covers a PARKED thread; this covers a RUNNING one, and
+    // it bounds the loss window to "since the previous safepoint" — which no
+    // reader-side reporter can do, because by the time a `checkcast` or an
+    // `invoke` trips over the address, any number of collections have passed.
+    //
+    // One relaxed load per publish on the common path; the frame walk runs only
+    // when the collection counter actually moved. Unconditional, and that is
+    // the point: this family has been chased across four sessions on runs that
+    // were never armed.
+    {
+        thread_local! {
+            static AUDIT_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.mem.heap.collection_count();
+        let prev = AUDIT_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            crate::memory::reclaim_guard::audit_thread_frames(
+                shared,
+                thread,
+                "running frame slot (safepoint)",
+            );
+        }
+    }
     // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
     // thread, verify no frame slot holds an already-forwarded (quarantined)
     // address at the safepoint publish. A hit here bounds the miss window to
@@ -5076,7 +5090,11 @@ pub(super) fn g1_remark_process_references(
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
     let no_moves = std::collections::HashMap::new();
     let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(is_marked, &no_moves);
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
+            is_marked,
+            &no_moves,
+        );
     let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(
