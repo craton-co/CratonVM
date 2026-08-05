@@ -350,7 +350,50 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `InputStreamReader` / `OutputStreamWriter` slot 0, `java/lang/reflect/Field`
     / `Method` / `Constructor` slots 1/3/4/6, and `Collections$SingletonMap`
     0/1. Each is its own change with its own A/B, and the list is this lane's
-    output. **`ThreadGroup` is FIXED (2026-08-05); the rest are open.**
+    output. **`ThreadGroup` and `java/lang/Thread` are FIXED (2026-08-05); the
+    rest are open.**
+
+    ### The second worked example — `java/lang/Thread`, which had NO live defect
+
+    Recorded because it is the opposite outcome to `ThreadGroup` and the two
+    together are what a NAME row actually means.
+
+    The model declared `contextClassLoader` at index **5**, which is `holder` on
+    every real image (`threadLocals` and `inheritableThreadLocals` at 6 and 7
+    were right by accident). `CRATONVM_DBG=overlay-bt` named the writer at the
+    flagged site in one run: `populate_real_thread_holder`, storing the
+    `FieldHolder` at slot 5 — **the correct field**. Every other accessor
+    resolves on the receiver's own class. `probes/ThreadLayoutProbe.java`, run
+    against the pre-fix binary in both modes, is byte-identical to the post-fix
+    binary and matches HotSpot on every behavioural line, including a reflective
+    read of all six leading fields.
+
+    So: **no reproducible defect, and the change is hardening rather than a
+    fix.** What it removes is a landmine and a false census row. Three things
+    moved:
+
+    * the model names `contextClassLoader` at 4, where the image has it, and
+      leaves 5 anonymous. Slot 5 is deliberately **not** named `holder`:
+      `populate_real_thread_holder` uses `get_field_by_name(this,
+      "holder").is_none()` to detect the fabricated layout, so declaring it
+      would silently disable that fallback;
+    * the fabricated-only virtual-thread flag moved 4 → 5 so it stops sharing a
+      slot with a field that is shared with the image. **Moving the model
+      without moving the flag was the obvious half-fix and it is wrong** — a
+      test asserts the two do not overlap, and it fails on exactly that
+      intermediate state;
+    * `is_virtual_synthetic` in `vm_exec.rs` asked `num_slots() >= 5`, which
+      every real `Thread` satisfies (19 fields), so it was reading a real
+      `contextClassLoader` and comparing it to `Int(1)` — correct only because a
+      reference can never match. It now asks whether the receiver declares
+      `eetop`, a name the real class has and the stub does not. The fifth
+      count-based layout guard this record has had to correct.
+
+    The `java/lang/Thread` row goes 2 → 1 in the census; the survivor is
+    `slot 1 value=Long(3) real=tid:J`, a correct write flagged only because an
+    anonymous model slot declares `Ljava/lang/Object;`. That is the
+    map-entry-not-a-defect family, and it is why `verdict=NAME` is the
+    actionable filter.
 
     ### Reading a NAME row — `ThreadGroup`, worked through
 
