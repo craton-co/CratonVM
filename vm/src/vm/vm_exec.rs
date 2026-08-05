@@ -4188,6 +4188,7 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
+        crate::memory::reclaim_guard::note_root_publish(self.shared, self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -23126,6 +23127,7 @@ fn invoke_on_class_shared_inner(
                         // 2026-08-05 `DriverManager.getConnection` witness
                         // leaves open.
                         crate::memory::reclaim_guard::report_root_slice_provenance(
+                            shared,
                             thread,
                             addr,
                             "invoke dispatch",
