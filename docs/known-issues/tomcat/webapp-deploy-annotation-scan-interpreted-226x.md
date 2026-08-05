@@ -452,7 +452,7 @@ this is not a vacuous green.
   classpath), so the loader arm was inert here. It remains unvalidated on real
   loader-heavy code, which is exactly where it is supposed to matter.
 
-#### Sizing: 1024 slots thrash on broad application code
+#### Sizing: NOT a sizing problem — the misses are compulsory, not conflict
 
 The hit rate that makes the scan number possible does **not** generalise:
 
@@ -461,15 +461,37 @@ The hit rate that makes the scan number possible does **not** generalise:
 | Tomcat annotation scan | 1,329,432 | 1,234 | **99.9%** |
 | `SpringApplicationShutdownHookTests` | 184,126 | 166,035 | **53%** |
 
-Nearly every Spring Boot miss causes a fill — the table is thrashing, not
-warming. 1024 was sized against a narrow hot loop. `CRATONVM_JIT=field-site-slots=N`
-exists to settle this with data rather than a guess; hit rate is
-**load-independent**, so it is measurable on this shared host even when timings
-are not.
+> **Retracted the same day.** I first read `fill ≈ miss` as "the 1024-slot table
+> is thrashing" and added `CRATONVM_JIT=field-site-slots=N` to fix the size.
+> **The sweep says the size is not the problem.** Hit rate against slot count,
+> `CRATONVM_DBG=field-site` (hit rate is load-independent, so this is valid on a
+> loaded host):
+>
+> | slots | `SpringApplicationShutdownHookTests` | `ConfigDataActivationContextTests` | annotation scan |
+> |---|---|---|---|
+> | 1024 | 52% | 87% | 99% |
+> | 4096 | 52% | 88% | — |
+> | 16384 | 52% | 88% | 99% (miss 4055 → 367) |
+> | 65536 | **52%** | 88% | — |
+>
+> A **64x** larger table moves Spring Boot by nothing. So those are **compulsory
+> (cold) misses, not conflict misses**: each site is touched once or twice and
+> never reused. `fill ≈ miss` is equally consistent with cold misses — every
+> first touch fills — so it never distinguished the two, and I named the
+> mechanism before checking capacity.
 
-**This is why the default stays OFF.** The scan gain is real and measured, but
-the benefit on broad application code is *unmeasured in time* — only its hit
-rate is known, and that hit rate says the current size is wrong for that shape.
+What the numbers actually say is the ordinary thing a cache says: **it pays
+where there is REUSE and is neutral where there is not.** The annotation scan
+re-executes a small set of field sites 1.3M times (99%); a short-lived unit-test
+class executes a large set a handful of times each (52%). Both are correct
+behaviour, and it matches the independent-vector result above — parity on
+boot-dominated runs, 12.7% on the scan.
+
+**This is why the default stays OFF:** not because the size is wrong, but
+because the benefit is *workload-shaped*, and the broad-code case is still
+unmeasured in time. `field-site-slots` is kept as a diagnostic — it is the only
+cheap way to tell a conflict miss from a compulsory one on a future workload —
+with its default unchanged at 1024, which the sweep confirms is sufficient.
 
 #### What those two levers are worth — ON THE SCAN (2026-08-05)
 
