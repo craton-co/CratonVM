@@ -10125,6 +10125,25 @@ mod classloader_tests {
     // L1 — the four VM-internal loader fields live beside the object
     // -----------------------------------------------------------------
 
+    /// Drop THIS test's entries from the process-global L1 table, and only
+    /// those.
+    ///
+    /// `loader_meta_store()` is process-global and the test binary runs its
+    /// tests on many threads at once, so a `.clear()` here deletes whatever a
+    /// concurrently-running test just recorded. That is not hypothetical: it
+    /// made two of these tests fail alternately, a different one each run,
+    /// which reads like flakiness in the code under test rather than in the
+    /// harness. Remove by address, the way
+    /// `loader_namespace_store_is_pruned_and_remapped_by_gc_reconcile`
+    /// already removes by id.
+    fn forget_loader_meta(loaders: &[ObjectRef]) {
+        let mine: Vec<usize> = loaders.iter().map(|l| l.as_ptr() as usize).collect();
+        loader_meta_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(l, _)| !mine.contains(&(l.as_ptr() as usize)));
+    }
+
     /// Declare `names` as instance fields of `cid`, so
     /// `resolve_field_index_by_class_id` finds them — the mock's resolver
     /// consults `declared_fields`.
@@ -10288,10 +10307,7 @@ mod classloader_tests {
         assert_eq!(loader_id_of(&ctx, loader), meta.loader_id);
         assert_eq!(loader_parallel_capable_of(&ctx, loader), Some(1));
 
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        forget_loader_meta(&[loader, parent]);
     }
 
     /// Synthetic-JDK mode is unchanged: the slots are still written, so a
@@ -10328,10 +10344,7 @@ mod classloader_tests {
 
         // The raw-slot fallback is what keeps a loader allocated outside our
         // path working. Drop the table entry and the slots must still answer.
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        forget_loader_meta(&[loader]);
         assert_eq!(loader_type_of(&ctx, loader), Some(LOADER_CUSTOM));
         assert_eq!(loader_classes_loaded_of(&ctx, loader), Some(0));
         assert_eq!(loader_parallel_capable_of(&ctx, loader), Some(1));
@@ -10426,10 +10439,7 @@ mod classloader_tests {
         );
         assert_eq!(classloader_parent(&mut ctx, loader), Some(parent));
 
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        forget_loader_meta(&[loader, parent]);
     }
 
     /// `classloader_parent`'s slot fallback read slot 1 unconditionally. On a
@@ -10484,10 +10494,7 @@ mod classloader_tests {
         ctx.set_field(loader, CL_CLASSES_LOADED, Value::Int(5));
         assert_eq!(loader_classes_loaded_of(&ctx, loader), Some(5));
 
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        forget_loader_meta(&[loader]);
     }
 
     /// Same GC contract as `loader_namespace_id_store`, and for the same
@@ -10546,10 +10553,7 @@ mod classloader_tests {
             "the pre-collection address must no longer resolve"
         );
 
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(_, m)| m.loader_id != Some(DEAD_NS) && m.loader_id != Some(MOVED_NS));
+        forget_loader_meta(&[dead, moved_from, moved_to]);
     }
 
     /// `loader_object_for_namespace_id` has to be able to invert an id that a
@@ -10584,10 +10588,7 @@ mod classloader_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(_, id)| *id != ns);
-        loader_meta_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        forget_loader_meta(&[loader]);
     }
 
     #[test]
