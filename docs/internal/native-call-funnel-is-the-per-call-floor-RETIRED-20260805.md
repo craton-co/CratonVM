@@ -1,16 +1,5 @@
 # The per-call floor is the NATIVE funnel — RETIRED 2026-08-05
 
-> **2026-08-05, same day — the numbers below are NO LONGER what a default run
-> gets.** The mechanism they were measured on (the JIT's per-call-site native
-> cache, `jit::helpers::try_jit_site_cached_native_dispatch`) is **default OFF**
-> as of `fix/springboot-mongocustomconversions-20260805`: it serves a registered
-> native ahead of the inline cache, so the same call site can also be bound to a
-> bytecode body, and `BatchDataMongoAutoConfigurationTests` failed 8 runs out of
-> 8 with it on against 0 of 14 with it off. `CRATONVM_JIT=native-site-cache`
-> reproduces every figure here. See
-> [`batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805`](fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md).
-
-
 | | |
 |---|---|
 | **Status** | RETIRED — the three items it named are done or answered |

@@ -7584,53 +7584,44 @@ static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
 
 /// Is the per-call-site native fast path for compiled code enabled?
 ///
-/// **Default OFF since 2026-08-05.** `CRATONVM_JIT=native-site-cache` turns it
-/// back on for measurement and for the work that has to make it sound.
+/// **Default ON.** `CRATONVM_JIT=-native-site-cache` is the kill switch, and it
+/// exists because this path spent 2026-08-05 as the prime suspect for the
+/// Spring Boot corruption family with no way to take it out of a run short of a
+/// ten-minute rebuild.
 ///
-/// # Why it is off
+/// # What the switch is for
 ///
 /// The path serves a registered native at the TOP of `jit_invoke_dispatch` /
-/// `jit_invoke_virtual_mic`, ahead of the inline cache and the compile probes.
-/// That is upstream of the route those calls used to take, and the two routes
-/// do not agree for every triple: the MIC can bind the same site to a compiled
-/// or interpreted BYTECODE body, so one call site ends up with two
-/// implementations, and which one runs depends on which warmed first. For a
-/// native whose state does not live where the bytecode reads it, that is
-/// corruption — silent, timing-dependent, and it does not name its origin.
+/// `jit_invoke_virtual_mic`, ahead of the inline cache and the compile probes,
+/// and it reads `NATIVE_SITE_CACHE` — one of the memos keyed on a
+/// `JitInvokeInfo` ADDRESS. While those addresses were recyclable (fixed in
+/// `383e7f5cf`, "a recycled JitInvokeInfo address let one call site serve
+/// another's dispatch") this cache was the loudest way that hazard surfaced: a
+/// site would call the PREVIOUS site's native and hand back whatever it
+/// returned.
 ///
 /// Measured on `module/spring-boot-batch-data-mongodb`'s
-/// `BatchDataMongoAutoConfigurationTests` (13 tests, `--nojit` green, HotSpot
-/// green), one binary, one host, the mechanism switched at runtime:
+/// `BatchDataMongoAutoConfigurationTests` (13 tests; `--nojit` green; HotSpot
+/// green), one fixture, one host, the path switched at runtime:
 ///
-/// | site cache | runs | runs with ≥1 failure |
-/// |---|---:|---:|
-/// | off (pre-2026-08-04 route) | 14 | **0** |
-/// | leaves only (2026-08-04) | 12 | 3 (7, 1 and 1 failures) |
-/// | every registered native (2026-08-05) | 8 | **8** (9-12 failures, one SIGSEGV) |
+/// | tree | site cache | runs | runs with >=1 failure |
+/// |---|---|---:|---:|
+/// | before `383e7f5cf` | off | 14 | **0** |
+/// | before `383e7f5cf` | leaves only | 12 | 3 |
+/// | before `383e7f5cf` | every registered native | 8 | **8** |
+/// | with `383e7f5cf` | every registered native | 14 | **0** |
 ///
-/// The failures are the whole 2026-08-05 corruption family — `NoSuchMethodError`
-/// naming a receiver of the wrong class, `NoClassDefFoundError` for a class that
-/// is on the classpath, `ClassCastException` between unrelated types, NPEs
-/// inside ByteBuddy and Mockito — never the same set twice.
+/// The cache was the amplifier, not the defect. The last row is why it is still
+/// on by default; the row above it is why the switch is worth its two lines — a
+/// path whose failure mode is "call some other call site's native" should be
+/// removable from a run in one flag.
 ///
-/// # What was tried and did NOT fix it
-///
-/// * resolving the superclass walk from the receiver's `ClassId` instead of its
-///   NAME (a real defect, fixed and kept — see
-///   `resolve_native_owner_for_receiver` — but not this one);
-/// * preserving `native_pending_return` across a primitive-returning native, so
-///   an earlier native's object return keeps its handoff root;
-/// * the full funnel (`safe_native_call`) instead of the prevalidated one;
-/// * refusing any site whose target has a real bytecode body;
-/// * `CRATONVM_JIT=-scan-cache`, and a 12 GB heap (so it is not simply
-///   GC pressure or the JIT scan cache).
-///
-/// So the entry point stays, the counters stay, and the flag decides. See
+/// See
 /// `docs/internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NATIVE_SITE_CACHE").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none()
     })
 }
 
@@ -9487,8 +9478,8 @@ unsafe fn try_jit_site_cached_native_dispatch(
     info_key: JitSiteKey,
     args_slice: &[i64],
 ) -> Option<i64> {
-    // Default OFF — see `native_site_cache_enabled` for the measurements and
-    // for what this path does that its predecessor did not.
+    // One-flag kill switch (`CRATONVM_JIT=-native-site-cache`). Default ON —
+    // see `native_site_cache_enabled` for what it is for.
     if !native_site_cache_enabled() {
         return None;
     }
@@ -12516,31 +12507,39 @@ mod tests {
         r
     }
 
-    /// The per-call-site native fast path is DEFAULT OFF, and a run that has not
-    /// asked for it must not get it.
+    /// The kill switch has to actually kill, and the default has to be ON.
     ///
-    /// This is not a style preference. With the path on, one call site can have
-    /// two implementations — the registered native it serves here, and a
-    /// bytecode body the inline cache bound at the same site — and which one
-    /// runs depends on which warmed first. Measured on
-    /// `BatchDataMongoAutoConfigurationTests`: 0 of 14 runs failed with the path
-    /// off, 3 of 12 with leaves only, 8 of 8 with every registered native. See
-    /// [`native_site_cache_enabled`] for the full table and for the four
-    /// repairs that did not fix it.
+    /// Both halves matter and they fail differently. A switch that silently
+    /// does nothing is worse than no switch: the next investigation runs with
+    /// `-native-site-cache`, sees the failure anyway, and CLEARS this path as a
+    /// suspect when it never left the run. And an accidental default-OFF gives
+    /// back the AQS pair's 2,687 → 1,229 ns with nothing saying so.
     ///
-    /// Asserting on the flag READER rather than on the table entry is
-    /// deliberate: the token could stay declared while the reader defaults to
-    /// true, and that flip is exactly what this test exists to catch.
+    /// Measured on `BatchDataMongoAutoConfigurationTests`, this path on:
+    /// 8 of 8 runs failed before `383e7f5cf`, 0 of 14 after it. See
+    /// [`native_site_cache_enabled`].
     #[test]
-    fn native_site_cache_is_off_unless_asked_for() {
+    fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
         assert!(
-            std::env::var_os("CRATONVM_JIT_NATIVE_SITE_CACHE").is_none(),
-            "this test asserts the DEFAULT; unset CRATONVM_JIT_NATIVE_SITE_CACHE to run it"
+            std::env::var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
         );
         assert!(
-            !native_site_cache_enabled(),
-            "the JIT native site cache is default-OFF (2026-08-05); turning it \
-             back on re-opens the 2026-08-05 Spring Boot corruption family"
+            native_site_cache_enabled(),
+            "the JIT native site cache is default-ON; if it has been turned off \
+             by default, say why where the perf it gives back is documented"
+        );
+        // The token has to reach the reader's key. `CRATONVM_JIT=-native-site-cache`
+        // sets `CRATONVM_JIT_NO_NATIVE_SITE_CACHE`, and nothing else does.
+        let entry = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .find(|e| e.token == "native-site-cache")
+            .expect("`CRATONVM_JIT=-native-site-cache` must stay declared");
+        assert_eq!(
+            entry.off_key,
+            Some("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"),
+            "the kill switch's off_key must be the key `native_site_cache_enabled` reads, \
+             or `-native-site-cache` is a no-op that reads as a cleared suspect"
         );
     }
 

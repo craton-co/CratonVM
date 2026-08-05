@@ -1,16 +1,5 @@
 # `safe_native_call`'s fixed cost is now the wall — and nobody has profiled it
 
-> **2026-08-05, same day — read the table below with the flag in mind.** Every
-> figure here was measured with the JIT's per-call-site native cache ON. That
-> path is **default OFF** as of
-> `fix/springboot-mongocustomconversions-20260805`
-> ([why](../../internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md)),
-> so a default run pays `invoke_or_native` per call again and the ~1,200 ns pair
-> is back above 2,600 ns. `CRATONVM_JIT=native-site-cache` restores what was
-> measured. The funnel's fixed cost is still real and still unprofiled — it is
-> just no longer the LARGEST remaining term until that path is sound again.
-
-
 | | |
 |---|---|
 | **Status** | OPEN — measured, bounded, and never profiled |
