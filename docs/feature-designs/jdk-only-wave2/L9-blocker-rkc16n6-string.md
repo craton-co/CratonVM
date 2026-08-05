@@ -87,14 +87,15 @@ The lane took the matrix from **57 -> 8** divergences in four steps, each with a
 | drop the forced-native `String` policy | 57 -> 37 | 20 | 0 |
 | UTF-16 `hashCode` + concat surrogates | 37 -> 21 | 16 | 0 |
 | out-of-bounds class and message | 21 -> 8 | 13 | 0 |
+| regex errors, US-ASCII decode | 8 -> 3 | 5 | 0 |
 
-The 8 that remain are three problems, none of them a `java/lang/String` defect:
-
-| rows | cause |
-|---:|---|
-| 4 | regex: `PatternSyntaxException` message text, and `replaceAll` with a bad group reference does not throw at all |
-| 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null"). VM-wide message synthesis, not `String`. |
-| 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
+**The 3 that remain are one problem, and it is not a `String` defect**: HotSpot's
+*helpful* `NullPointerException` messages ("Cannot invoke
+\"String.isEmpty()\" because \"this.pattern\" is null") against our own
+wording, on rows 241 / 259 / 275. That is `NullPointerException` message
+synthesis for the whole VM -- it needs the bytecode operand that was null, which
+is a interpreter/JIT feature, not anything `java/lang/String` does. Every
+`String`-domain divergence this lane began with is closed.
 
 ## Three defects the removal surfaced
 

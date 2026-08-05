@@ -1660,7 +1660,10 @@ pub fn throw_runtime_error(
     };
 
     match create_exception_object(shared, thread, class_name, message) {
-        Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
+        Ok(obj_ref) => {
+            populate_pattern_syntax_fields(shared, obj_ref, &error);
+            MethodCallFailed::ExceptionThrown(obj_ref)
+        }
         Err(e) => {
             // If the failure was heap exhaustion (couldn't allocate the
             // exception object or its detail-message String), throw the
@@ -1686,6 +1689,47 @@ pub fn throw_runtime_error(
             MethodCallFailed::InternalError(VmError::Runtime(error))
         }
     }
+}
+
+/// Fill in `PatternSyntaxException`'s `desc` / `pattern` / `index` after the
+/// generic constructor path has allocated it.
+///
+/// That class is the one throwable here whose message is NOT
+/// `Throwable.detailMessage`: it declares only `(String desc, String regex,
+/// int index)`, overrides `getMessage()`, and assembles a three-line report
+/// from the fields. `create_exception_object` knows how to call `()V` and
+/// `(String)V`, neither of which exists on it, so without this the object came
+/// out with all three fields null/zero and `getMessage()` returned
+/// `"null near index 0\r\nnull"`.
+///
+/// A no-op for every other error, and by-name so it cannot depend on the JDK's
+/// private field order.
+fn populate_pattern_syntax_fields(shared: &SharedVm, obj_ref: ObjectRef, error: &RuntimeError) {
+    let RuntimeError::PatternSyntaxException {
+        description,
+        pattern,
+        index,
+    } = error
+    else {
+        return;
+    };
+    let set = |name: &str, value: Value| {
+        let class_id = shared.mem.heap.class_id_of(obj_ref);
+        let cm = shared.classes.class_manager.read();
+        if let Some(i) =
+            crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, name, &cm.class_store)
+        {
+            drop(cm);
+            shared.mem.heap.set_field(obj_ref, i, value);
+        }
+    };
+    if let Some(d) = crate::vm::try_create_java_string_uninterned(shared, description) {
+        set("desc", Value::Object(Some(d)));
+    }
+    if let Some(p) = crate::vm::try_create_java_string_uninterned(shared, pattern) {
+        set("pattern", Value::Object(Some(p)));
+    }
+    set("index", Value::Int(*index));
 }
 
 /// Pre-allocate the singleton `java.lang.OutOfMemoryError` while the heap still
