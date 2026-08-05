@@ -233,6 +233,36 @@ not. That difference is what proves the residual `LONE` rows are a concat
 defect and not a `charAt` / `trim` / `hashCode` defect — a distinction the
 matrix alone would have got wrong.
 
+## The h2-bnf natives were not just wrong, they were SLOWER
+
+The record these entries came from argues them as a measured performance fix.
+Re-measured on the workload they were written for
+(`probes/StringForcedNativeCanaryProbe`, 4,000 iterations, A-B-B-A interleaved,
+three rounds, identical checksums on every run):
+
+| arm | ms |
+|---|---|
+| baseline (natives forced) | 3800, 4027, 4112, 4716, 5447, 6390 |
+| this branch (real bytecode) | 2441, 2443, 2485, 2504, 2868, 3568 |
+
+Removing them made the h2-bnf scan **~1.6x faster**. That is not a paradox:
+every native call pays the `safe_native_call` funnel, which is the per-call
+floor for this VM, while the real bytecode gets JIT-compiled and inlined. The
+canary census says the same thing from the other side — over a
+120,000-iteration loop the baseline recorded `charAt`, `length` and `isEmpty`
+at **1 invocation each**, because the JIT had already taken the loop; only
+`startsWith` (2,881) and `substring(I)` (173) were reached at all.
+
+So the h2-bnf entries bought a slowdown and 20 divergences, and their own
+record's premise ("a real fix that this gate gap left completely unreachable")
+was measuring the wrong thing.
+
+The four `CRATONVM_NATIVE_STRING_REGEX` shapes are the opposite case, which is
+why they were kept: same interleaving, `probes/StringRegexCostProbe`, identical
+digests, and no difference between the arms (`replaceAll` 58-77 ms baseline vs
+58-68 ms here) against HotSpot's 118 ms. They are genuinely ~2x faster than
+HotSpot and dropping them would have cost that.
+
 ## Verification
 
 * **Both lists removed, strict boot clean** — L9's stated exit criterion. Done
@@ -252,7 +282,19 @@ matrix alone would have got wrong.
   once the loop compiles, so the h2-bnf entries' real footprint is far smaller
   than their record implies.
 * **The `--jdk-only` census reports zero `native-shadows-bytecode` violations
-  for `java/lang/String`** (12 before).
+  for `java/lang/String`** — 0, from 12. The registry goes from **80
+  `java/lang/String` rows to 26**: the 54 dropped are the `Bridge` surface,
+  `intern()` survives with 5 invocations, and the five rows carrying
+  `kind_stated: true` are exactly the `register_with_kind` calls this change
+  introduced.
+* **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, and the
+  `--real-jdk` and `--jdk-only` transcripts are byte-identical to each other.
+  The 37 residuals are the three filed defects plus exception-message text; not
+  one of them is a case the deleted natives had right.
+* **`Compatible` byte-for-byte over `test_classes`** (contract section 5): all
+  nine runnable entries, both binaries, exit status compared. **9 of 9
+  identical** once a `best_ns=` timing figure and one interleaved WARN line are
+  normalised; nothing functional differs.
 * **Guards verified by injection**, per this feature's own failure log:
   `no_string_shape_is_forced_native_by_name_on_any_dispatch_path` and the
   source scan both fail when an arm is restored, and

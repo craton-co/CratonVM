@@ -60,12 +60,40 @@ implementation, in three separate ways, and no test asked.
   **both** CratonVM modes and therefore not a strict-mode defect.
 * **The h2-bnf fix confirmed with a counter**, not by reading the code:
   `startsWith` 2,881 invocations, `substring(I)` 173, via
-  `--dump-native-registry` on `probes/StringForcedNativeCanaryProbe`. Worth
-  recording that `charAt`, `length` and `isEmpty` came back at **1 each** over a
-  120,000-iteration loop — the JIT bypasses them once the loop compiles, so
-  those entries' real footprint is far smaller than their record implies.
+  `--dump-native-registry` on `probes/StringForcedNativeCanaryProbe`. So the
+  2026-08-04 reachability fix did execute. `charAt`, `length` and `isEmpty`
+  came back at **1 each** over a 120,000-iteration loop, because the JIT takes
+  the loop and stops calling them.
+* **...and then removing those natives made the same workload ~1.6x FASTER**
+  (baseline 3800-6390 ms, this branch 2441-3568 ms, A-B-B-A interleaved, three
+  rounds, identical checksums). Every native call pays the `safe_native_call`
+  funnel; the bytecode gets compiled. The h2-bnf entries bought a slowdown and
+  20 divergences.
 * **`--jdk-only` census**: zero `native-shadows-bytecode` violations for
-  `java/lang/String`, from 12.
+  `java/lang/String`, from 12; the registry goes from 80 `String` rows to 26.
+* **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, both modes
+  byte-identical to each other.
+* **`Compatible` byte-for-byte over `test_classes`**: 9 of 9 identical.
+
+## Three defects the removal surfaced
+
+Taking a shadow off makes the shadowed code reachable, and two of the three
+things underneath were broken. All three are filed rather than re-masked,
+except the first, where re-masking is the correct answer and the reason is
+recorded at the registration site:
+
+* `String.hashCode()` is **wrong for UTF-16 strings** — it hashes the backing
+  BYTES sign-extended, not the code units. The native is kept, stated
+  `Intrinsic`, for correctness rather than speed
+  ([record](../../known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md)).
+* `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`
+  instead of `StringIndexOutOfBoundsException`
+  ([record](../../known-issues/string-substring-bounds-throw-arrayindexoutofbounds.md)).
+  Deliberately not re-masked — the native was wrong there too, and re-masking
+  would cost the four rows the bytecode fixes, including `substring` splitting
+  a surrogate pair into U+FFFD.
+* `+` concatenation loses an unpaired surrogate
+  ([record](../../known-issues/string-concat-loses-unpaired-surrogates.md)).
 
 ## Residual
 
