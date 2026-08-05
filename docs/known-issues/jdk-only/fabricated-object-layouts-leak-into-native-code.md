@@ -210,8 +210,11 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     | `java/util/HashMap` slot 2 `Int` over `[` | 66 | **0** |
     | every other row | — | byte-identical |
 
-    On `JdkOnlyCensusLoadProbe` alone the `Properties` slot-2 row goes **3 →
-    0**, which is the number the lane doc predicted. The benign `HashMap`
+    Measured twice, on Windows and on Azure Linux, against the same Temurin
+    25.0.3 image and with each host's own pre-fix binary: the three rows above
+    are identical on both, as is every other row. On `JdkOnlyCensusLoadProbe`
+    alone the `Properties` slot-2 row goes **3 → 0**, which is the number the
+    lane doc predicted. The benign `HashMap`
     slot-1 row moved 8,256 → 8,318; that is *not* this change — it is the
     `stringPropertyNames` fix below building one more set per call, and the
     row's own run-to-run spread on an unmodified binary is ±4 on a single

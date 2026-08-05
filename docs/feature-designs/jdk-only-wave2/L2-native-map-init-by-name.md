@@ -180,8 +180,27 @@ recorded in the evidence file. One divergence it did fix, in a second commit:
 
 ### Verified on
 
-Windows 11 / JDK 25.0.3 (Temurin), release binaries built from
-`d81e220b3` (pre) and this branch (post). The shared Linux build host refused
-connections for the whole session, so the Linux half is **not** covered —
-`native-collections` has no host-conditional code, but that is an argument, not
-a measurement.
+**Both hosts, independently, against the same Temurin 25.0.3+9 image.**
+
+* Windows 11: release binaries from `d81e220b3` (pre) and this branch (post);
+  101 `--lib` tests and all 8 integration targets green, 107 with
+  `--features synthetic-jdk`.
+* Azure Linux (`/data/data/wt-l2mapinit-20260804`, `wt-l2base-20260804`):
+  release binaries from `2572ea9af` (pre — the dev tip this branch merges) and
+  this branch (post). Census A/B identical to the Windows numbers row for row
+  (`Properties` 2: 40 → 0, `Properties` 3: 12 → 0, `HashMap` 2: 66 → 0, every
+  other row unchanged); probe transcripts identical pre/post but for an
+  ephemeral port, a timing line, and the three `stringPropertyNames` lines that
+  now MATCH HotSpot; `test_classes` corpus 10/10 identical in `Compatible`
+  mode; 101 `--lib` tests green in the release profile and all 14 test targets
+  green in the debug profile.
+
+`JdkOnlyBreadthProbe` is byte-identical to HotSpot on Linux but differs on
+Windows in one `DecimalFormat` grouping separator — a pre-existing,
+host-specific locale divergence, present on both arms and not this change's.
+
+A full `cargo test --release -p cratonvm-native-collections` (every target, not
+just `--lib`) was killed twice on the shared host with no compiler error and no
+OOM line in `dmesg`, which is the failure mode the wave-2 README warns about;
+the same command completes in the debug profile, and `--lib` completes in
+release.
