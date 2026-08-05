@@ -2291,6 +2291,39 @@ pub fn default_value_for_descriptor(descriptor: &str) -> Value {
     }
 }
 
+/// Default-value slots for a class's statics block, each typed by its static
+/// field's **descriptor** rather than left at a blanket `Value::Int(0)`.
+///
+/// A statics slot holding a well-formed `Value` of the wrong WIDTH is invisible
+/// from the interpreter (which widens an `Int` where a long is wanted) and
+/// fatal from JIT-compiled code, which lowers `getstatic …:J` to a 64-bit load
+/// at `FIELD_CELL_PAYLOAD64_OFFSET` and reads whatever sits beside an
+/// `Int`-tagged cell. That is the defect behind the Spring Boot loader/zip
+/// cluster, and `4972cd9c91` fixed it for exactly one writer
+/// (`post_clinit_fixup`) — the hazard itself is a property of the slot, not of
+/// that writer.
+///
+/// `StaticsBlock::new` fills every slot with `Value::Int(0)`, so a block NOT
+/// built by `prepare_class` — which does call [`default_value_for_descriptor`]
+/// per slot — starts out mistyped for every `J`/`D` static it holds.
+/// `set_static_shared` builds one that way whenever a static is written before
+/// its class is prepared. This is the shared helper that makes both paths
+/// agree.
+///
+/// `total_len` is the block length the caller wants: historically the class's
+/// TOTAL field count, while slot indices are the STATIC-field enumeration
+/// order. The tail past `static_descriptors` is slack and keeps the zero fill.
+pub fn typed_default_static_slots<S: AsRef<str>>(
+    static_descriptors: &[S],
+    total_len: usize,
+) -> Vec<Value> {
+    let mut slots = vec![Value::Int(0); total_len];
+    for (slot, descriptor) in slots.iter_mut().zip(static_descriptors.iter()) {
+        *slot = default_value_for_descriptor(descriptor.as_ref());
+    }
+    slots
+}
+
 /// Resolve a `ConstantValue` attribute index into a `Value`.
 pub fn resolve_constant_value(
     cp: &cratonvm_reader::constant_pool::ConstantPool,
@@ -4912,6 +4945,7 @@ mod tests {
 #[cfg(test)]
 mod post_clinit_fixup_typing_tests {
     use super::coerce_static_to_descriptor;
+    use super::typed_default_static_slots;
     use crate::types::Value;
 
     /// The defect this guards: `Unsafe`'s nine `ARRAY_*_BASE_OFFSET` fields are
@@ -4964,6 +4998,42 @@ mod post_clinit_fixup_typing_tests {
             coerce_static_to_descriptor("Ljava/lang/Object;", Value::Object(None)),
             Some(Value::Object(None))
         ));
+    }
+
+    /// The whole point of [`typed_default_static_slots`]: a `J`/`D` slot must
+    /// NOT come back as `Value::Int(0)`.
+    ///
+    /// `StaticsBlock::new` zero-fills with `Int(0)`, which the interpreter
+    /// widens and JIT-compiled code reads as garbage — it takes the load width
+    /// from the descriptor and pulls 8 bytes over a 4-byte payload. Asserting
+    /// the WIDTH (the `Value` variant), not the numeric value, is what makes
+    /// this test able to fail: every arm below is zero either way.
+    #[test]
+    fn wide_static_slots_default_to_their_descriptor_width_not_int_zero() {
+        let descriptors = ["J", "I", "D", "F", "Ljava/lang/Object;", "[B", "Z"];
+        let slots = typed_default_static_slots(&descriptors, descriptors.len());
+        assert!(matches!(slots[0], Value::Long(0)), "J must be Long, got {:?}", slots[0]);
+        assert!(matches!(slots[1], Value::Int(0)));
+        assert!(matches!(slots[2], Value::Double(d) if d == 0.0), "D must be Double");
+        assert!(matches!(slots[3], Value::Float(f) if f == 0.0));
+        assert!(matches!(slots[4], Value::Object(None)));
+        assert!(matches!(slots[5], Value::Object(None)));
+        assert!(matches!(slots[6], Value::Int(0)));
+    }
+
+    /// The block is historically sized by the class's TOTAL field count while
+    /// slot indices are the STATIC-field enumeration order, so the tail is
+    /// slack. It must stay allocated (callers index into it) and must not run
+    /// off the end when there are fewer descriptors than slots.
+    #[test]
+    fn the_slack_tail_past_the_static_descriptors_is_kept_and_zeroed() {
+        let slots = typed_default_static_slots(&["J"], 4);
+        assert_eq!(slots.len(), 4);
+        assert!(matches!(slots[0], Value::Long(0)));
+        assert!(matches!(slots[3], Value::Int(0)));
+        // Fewer slots than descriptors must truncate, not panic.
+        assert_eq!(typed_default_static_slots(&["J", "D", "I"], 1).len(), 1);
+        assert!(typed_default_static_slots::<&str>(&[], 0).is_empty());
     }
 
     /// A mismatch the fixup cannot repair must be REFUSED, not written: a

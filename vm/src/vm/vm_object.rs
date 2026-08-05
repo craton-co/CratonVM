@@ -1367,15 +1367,33 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
         // Reading class_manager while holding statics write is fine because
         // class_manager read is non-exclusive, and no code path holds
         // class_manager write while trying to acquire statics.
-        let num_fields = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.fields.len())
-            .unwrap_or(0);
+        //
+        // Type each slot from its static field's DESCRIPTOR. `StaticsBlock::new`
+        // fills with `Value::Int(0)`, and a `J`/`D` static left at `Int(0)` is
+        // read correctly by the interpreter (which widens) but as garbage by
+        // JIT-compiled code, which takes the load width from the descriptor and
+        // reads 8 bytes over a 4-byte payload. That is the loader/zip cluster's
+        // defect arriving through a second door: `prepare_class` seeds typed
+        // defaults, but this path runs when a static is written BEFORE its class
+        // is prepared, and it used to undo that.
+        let (static_descriptors, num_fields) = {
+            let cm = shared.classes.class_manager.read();
+            match cm.get_class(class_id) {
+                Some(c) => (
+                    c.fields
+                        .iter()
+                        .filter(|f| f.is_static())
+                        .map(|f| f.descriptor.to_string())
+                        .collect::<Vec<_>>(),
+                    c.fields.len(),
+                ),
+                None => (Vec::new(), 0),
+            }
+        };
         republish = true;
-        crate::vm::realms::class_realm::StaticsBlock::new(num_fields)
+        crate::vm::realms::class_realm::StaticsBlock::from_values(
+            super::vm_util::typed_default_static_slots(&static_descriptors, num_fields),
+        )
     });
     if field_index >= fields.len() {
         // Growth relocates the block (the old one stays mapped for any
