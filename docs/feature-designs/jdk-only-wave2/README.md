@@ -27,7 +27,7 @@ can work on what, simultaneously, without colliding.**
 | Lane | What | Owned files (the parallelism contract) | Gated on | Effort |
 |---|---|---|---|---|
 | [L1](L1-classloader-side-table.md) | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
-| [L2](L2-native-map-init-by-name.md) | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
+| [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
 | [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
@@ -39,7 +39,7 @@ can work on what, simultaneously, without colliding.**
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists | `native_override.rs`, `vm_exec.rs` ⚠ | **L9, L10** | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**L1–L9 can all start today, in parallel, by different people.**
+**L1–L9 can all start today, in parallel, by different people.** (L2 is done.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -48,7 +48,7 @@ exist:
 
 | Pair | Collides on | Resolution |
 |---|---|---|
-| L2 ↔ L10 | `native-collections/src/lib.rs` | **Serialize.** L2 is smaller — land it first, then L10 rebases. |
+| L2 ↔ L10 | `native-collections/src/lib.rs` | **Resolved:** L2 landed 2026-08-04; L10 rebases onto it. |
 | L4 ↔ L11 | `vm/src/vm/vm_exec.rs` | L4 owns the overlay hunter (~line 3070–3200); L11 owns dispatch (~14700, ~22700). Disjoint regions in one file — coordinate, do not both `git add -A`. |
 | L3 ↔ L12 | `lang_invoke.rs` | L3 is a handful of lines; land it first. |
 | L5/L6/L12 ↔ each other | `register_with_kind` semantics | Only L5 changes call sites; L6 only reads the census; L12 §4 is JIT-side. Safe. |
@@ -133,3 +133,16 @@ thread; `MethodType.toString()`; eight missing system properties.
 
 Item 2: 24 measured slots → **15 open**. Item 1: instrument built, migration not
 started. Items 3/7: blocked on L9/L10.
+
+**Update, later on 2026-08-04 — L2 landed.** The `Properties` family is gone
+from the census (slots 2 and 3 → 0) along with the `HashMap` slot-2 `Int` over
+`[`; `map_state`, `map_resize`, `resync_view_set`,
+`hashmap_serialized_capacity` and both `HashMap` constructors resolve `table`
+on the receiver instead of on a fixed `java/util/HashMap`. Re-measured with
+the three standing probes plus the new `probes/MapLayoutMatrixProbe`: 6
+classes / 15 slots before, 5 / 12 after — not comparable to the 24 above, see
+the evidence record for why. `Compatible` corpus byte-identical.
+
+Two things that block a clean read of item 2's remaining rows, both L4's:
+a null written over a primitive is still invisible to the hunter, and a
+same-kind wrong-slot write always was. **Every count in item 2 is a floor.**
