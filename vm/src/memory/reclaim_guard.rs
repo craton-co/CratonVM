@@ -107,6 +107,36 @@ pub(crate) fn report_reclaimed_receiver(
                      collector left behind, not a real Object.",
                 );
             }
+            // H2-CID0 (2026-08-05): and WHO still holds it. The verdict above
+            // says the address is reclaimed; this says which live object and
+            // slot still names it, which is the one fact the "survived
+            // un-rewritten" face has never had. Decoded through each object's
+            // own slot enumerator — a raw word scan of this heap reports ~1 M
+            // stale `Value`-cell padding words per compaction.
+            let holders = shared.mem.heap.live_holders_of(addr, 8);
+            if holders.is_empty() {
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    obj = format!("{addr:#x}"),
+                    site = site,
+                    "…and NO live heap object holds this address in a decoded reference \
+                     slot. The holder is therefore a frame local, a register, or a native \
+                     side table — not a heap field.",
+                );
+            } else {
+                for (holder, cid, slot) in holders {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{addr:#x}"),
+                        site = site,
+                        holder = format!("{holder:#x}"),
+                        holder_class = %class_name_of(shared, cid),
+                        holder_slot = slot,
+                        "…and this LIVE object still holds the stale address in a reference \
+                         slot — the reference was not rewritten when the referent moved.",
+                    );
+                }
+            }
         }
     }
     // What the block held, and which reclamation freed it. Unconditional, so
