@@ -10542,6 +10542,30 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }
     }
 
+    /// A slot this VM parks its OWN value in — an fd, a wrapped stream, a
+    /// discriminator — for which the real JDK class declares no field.
+    ///
+    /// Spelled `_vmN` so the L4 shadow-layout diff reports it
+    /// (`SlotVerdict::VmInternal`) whenever a real field turns out to live at
+    /// that index. The two alternatives both lie: naming the slot after the real
+    /// field makes the diff agree with the overlay, and leaving it anonymous
+    /// (`_fN`) makes the diff say nothing at all — which is how the fd that
+    /// `Files.newBufferedWriter` writes into `java.io.Writer.writeBuffer` read
+    /// as a harmless `pad` for a day.
+    ///
+    /// A `_vmN` slot past the end of the real layout is NOT reported: that is
+    /// the shape to aim for (see `FIELD_EXTRA_OFFSET_*` in
+    /// `native-builtins/src/lang_class.rs`, which anchors CratonVM's extra
+    /// reflection metadata past `class_num_total_fields`).
+    fn vm_internal_field(index: usize) -> ClassFileField {
+        ClassFileField {
+            access_flags: FieldAccessFlags::empty(),
+            name: cratonvm_types::intern_arc(&format!("_vm{index}")),
+            descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
+            attributes: vec![],
+        }
+    }
+
     /// Pad a hand-written field list out to `total` INSTANCE fields.
     ///
     /// The factory (`alloc_concurrent_synthetic(ctx, name, n)`) and bytecode
@@ -10557,29 +10581,6 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
     /// Padding preserves the named slots and their indices exactly and appends
     /// anonymous ones, so existing `set_field_by_name` and raw-index access both
     /// keep working.
-    /// A single named field at absolute instance index `index`, with anonymous
-    /// `_fN` slots before it.
-    ///
-    /// For a class whose real superclass declares fields ahead of the one this
-    /// model cares about: `java.io.Reader` puts `lock` and `skipBuffer` before
-    /// `BufferedReader.in`, and `java.io.Writer` puts `writeBuffer` and `lock`
-    /// before `BufferedWriter.out`. Naming the field at 0 claims a name the
-    /// image has somewhere else — the L4 shadow-layout diff reports exactly
-    /// that, and it is invisible to any value-tag check when both are
-    /// references.
-    fn pad_named_at(name: &str, descriptor: &str, index: usize) -> Vec<ClassFileField> {
-        let mut fields: Vec<ClassFileField> = (0..index)
-            .map(|i| ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc(&format!("_f{i}")),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-                attributes: vec![],
-            })
-            .collect();
-        fields.push(named_field(name, descriptor));
-        fields
-    }
-
     fn pad_to(mut fields: Vec<ClassFileField>, total: usize) -> Vec<ClassFileField> {
         let existing = fields
             .iter()
@@ -10915,26 +10916,56 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
-        "java/io/InputStreamReader" => vec![named_field("in", "Ljava/io/InputStream;")],
+        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
+        // `lock` and `skipBuffer` from `java.io.Reader`. There is no `in` on it
+        // anywhere — the wrapped stream lives inside the `StreamDecoder`. The
+        // model used to name slot 0 `in`, which is `Reader.lock`.
+        //
+        // The synthetic ISR natives (`native_isr_init` and friends, all
+        // `#[cfg(feature = "synthetic-jdk")]`) park an fd-or-stream at slot 0
+        // and the raw stream at slot 1, so neither slot can be named honestly:
+        // both are `_vmN`. That keeps them in the census as kind 3 rather than
+        // silently agreeing with `lock`/`skipBuffer`.
+        "java/io/InputStreamReader" => vec![
+            vm_internal_field(0),
+            vm_internal_field(1),
+            named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
+        ],
         // `in` is at 2 on a real `BufferedReader`: `java.io.Reader` declares
         // `lock` and `skipBuffer` ahead of it. Naming it at 0 put it on `lock`.
-        "java/io/BufferedReader" => {
-            pad_named_at("in", "Ljava/io/Reader;", 2)
-        }
-        "java/io/OutputStreamWriter" => {
-            vec![named_field("out", "Ljava/io/OutputStream;")]
-        }
+        // Slot 0 is where `native_br_init` copies the wrapped reader's fd, so it
+        // is `_vm0`, not anonymous.
+        "java/io/BufferedReader" => vec![
+            vm_internal_field(0),
+            named_field("skipBuffer", "[C"),
+            named_field("in", "Ljava/io/Reader;"),
+        ],
+        // Same shape as `InputStreamReader`: a real `OutputStreamWriter`
+        // declares only `se`, and inherits `writeBuffer` and `lock` from
+        // `java.io.Writer`. `native_osw_init` writes an fd Int at slot 0 —
+        // `writeBuffer`, a `char[]` — and `native_osw_write/flush/close` all
+        // read it back expecting an `Int`, returning silently when it is not.
+        "java/io/OutputStreamWriter" => vec![
+            vm_internal_field(0),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("se", "Lsun/nio/cs/StreamEncoder;"),
+        ],
         // `out` is at 2 on a real `BufferedWriter`: `java.io.Writer` declares
         // `writeBuffer` and `lock` ahead of it. Naming it at 0 put it on
         // `writeBuffer`, a `char[]`.
         //
-        // Slot 0 stays anonymous rather than being named `writeBuffer`, because
+        // Slot 0 is `_vm0`, not `writeBuffer` and not anonymous:
         // `Files.newBufferedWriter` parks a VM-internal fd there and
         // `bw_delegate_out` uses "is slot 0 an Int?" to tell its own fd-backed
         // object from a real one. That overlay is a separate defect (kind 3 —
-        // a VM value with no real field, which belongs in a side table); this
-        // change corrects the model only and deliberately does not disturb it.
-        "java/io/BufferedWriter" => pad_named_at("out", "Ljava/io/Writer;", 2),
+        // a VM value with no real field, which belongs in a side table); naming
+        // the slot `_vm0` is what keeps it *counted* until it is fixed. It spent
+        // a day as an anonymous `_f0`, which reads as an innocuous `pad`.
+        "java/io/BufferedWriter" => vec![
+            vm_internal_field(0),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("out", "Ljava/io/Writer;"),
+        ],
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
         // PrintStream/PrintWriter = 1 field (fd)
@@ -11551,142 +11582,70 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // only uses the name, so minor descriptor mismatches wouldn't matter
         // for synthetic-jdk's native-driven paths.
         "java/lang/reflect/AccessibleObject" => vec![
-            // AccessibleObject.override (boolean, JDK field name `override`)
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("override"),
-                descriptor: cratonvm_types::intern_arc("Z"),
-                attributes: vec![],
-            },
+            named_field("override", "Z"),
+            named_field("accessCheckCache", "Ljava/lang/Object;"),
         ],
+        // `java.lang.reflect.Field` extends `AccessibleObject`, which declares
+        // TWO instance fields, not one: `override` and `accessCheckCache`. The
+        // model listed only `override`, so every slot from index 1 down was off
+        // by one against the image -- `clazz` sat on `accessCheckCache`, `name`
+        // on `slot`, and so on. Both halves of each pair are references, or both
+        // int-class primitives, often enough that a value-tag check sees
+        // nothing; the L4 shadow-layout diff reported slots 1/4/6 as NAME and
+        // 2/3/5 as TYPE.
+        //
+        // Nothing positional had to change with it: `create_field_object` and
+        // `read_field_meta` (native-builtins/src/lang_class.rs) address every
+        // JDK-layout field BY NAME, and CratonVM's own extra metadata is
+        // anchored at `base + FIELD_EXTRA_OFFSET_*` where
+        // `base = max(FIELD_NUM_FIELDS_LEGACY_FLOOR, class_num_total_fields)` --
+        // past whichever layout is wider. That is the shape every hand-numbered
+        // model should be converging on.
         "java/lang/reflect/Field" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("override"),
-                descriptor: cratonvm_types::intern_arc("Z"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("clazz"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("slot"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("type"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("modifiers"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("trustedFinal"),
-                descriptor: cratonvm_types::intern_arc("Z"),
-                attributes: vec![],
-            },
+            named_field("override", "Z"),
+            named_field("accessCheckCache", "Ljava/lang/Object;"),
+            named_field("clazz", "Ljava/lang/Class;"),
+            named_field("slot", "I"),
+            named_field("name", "Ljava/lang/String;"),
+            named_field("type", "Ljava/lang/Class;"),
+            named_field("modifiers", "I"),
+            named_field("trustedFinal", "Z"),
         ],
+        // `Method` and `Constructor` extend `java.lang.reflect.Executable`,
+        // which adds `parameterData` and `declaredAnnotations` on top of
+        // `AccessibleObject`'s two -- so their own fields start at index 4, not
+        // index 1. Same by-name access story as `Field` above.
+        //
+        // `callerSensitive` is dropped rather than moved: it is the LAST of
+        // `Method`'s sixteen fields (index 19 on the real layout), and naming it
+        // would require modelling the nine between. The pad keeps the model's
+        // width where `create_method_object`'s legacy floor expects it.
         "java/lang/reflect/Method" => pad_to(
             vec![
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("override"),
-                    descriptor: cratonvm_types::intern_arc("Z"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("clazz"),
-                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("slot"),
-                    descriptor: cratonvm_types::intern_arc("I"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("name"),
-                    descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("returnType"),
-                    descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("parameterTypes"),
-                    descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("modifiers"),
-                    descriptor: cratonvm_types::intern_arc("I"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("callerSensitive"),
-                    descriptor: cratonvm_types::intern_arc("B"),
-                    attributes: vec![],
-                },
+                named_field("override", "Z"),
+                named_field("accessCheckCache", "Ljava/lang/Object;"),
+                named_field("parameterData", "Ljava/lang/reflect/Executable$ParameterData;"),
+                named_field("declaredAnnotations", "Ljava/util/Map;"),
+                named_field("clazz", "Ljava/lang/Class;"),
+                named_field("slot", "I"),
+                named_field("name", "Ljava/lang/String;"),
+                named_field("returnType", "Ljava/lang/Class;"),
+                named_field("parameterTypes", "[Ljava/lang/Class;"),
+                named_field("exceptionTypes", "[Ljava/lang/Class;"),
+                named_field("modifiers", "I"),
             ],
-            12,
+            15,
         ),
         "java/lang/reflect/Constructor" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("override"),
-                descriptor: cratonvm_types::intern_arc("Z"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("clazz"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("slot"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("parameterTypes"),
-                descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("modifiers"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
+            named_field("override", "Z"),
+            named_field("accessCheckCache", "Ljava/lang/Object;"),
+            named_field("parameterData", "Ljava/lang/reflect/Executable$ParameterData;"),
+            named_field("declaredAnnotations", "Ljava/util/Map;"),
+            named_field("clazz", "Ljava/lang/Class;"),
+            named_field("slot", "I"),
+            named_field("parameterTypes", "[Ljava/lang/Class;"),
+            named_field("exceptionTypes", "[Ljava/lang/Class;"),
+            named_field("modifiers", "I"),
         ],
 
         // ---- T16.5 / T16.6: NIO async channels + UDP ----
