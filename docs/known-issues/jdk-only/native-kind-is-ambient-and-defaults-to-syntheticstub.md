@@ -5,6 +5,87 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-05 — the number is now PINNED, and re-measured
+
+Still open, and still nothing reclassified. What is new is that the number can
+no longer rise unnoticed: wave-2 lane L6 shipped a slack-free ratchet on it
+([`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md)).
+
+```sh
+JAVA_HOME=<JDK25> sh regression-suite/bridge-ratchet.sh
+sh regression-suite/bridge-ratchet.sh --selftest   # hermetic: no VM, no JDK
+```
+
+It lives in `regression-suite/` and not in a unit test because the question needs
+a real JDK image at measurement time. It boots the VM, takes the schema-3 census
+itself (`--explain-jdk-only` — without it the column this record is about is
+null), and scores it against `scripts/baselines/jdk-only-bridge-ratchet.json`,
+keyed `<jdk-feature>/<os>` because the registrars are platform-conditional. A key
+it has no entry for is a **refusal**, not a pass.
+
+**Re-measured on dev `d010d611b4`, JDK 25.0.3, linux — every count in the
+2026-08-04 table below is superseded by this one.** The shape is unchanged; the
+tree moved (L1, L2, L9 and the `String` residuals landed).
+
+**11,916 registrations**, not 11,909: 687 `Intrinsic`, 10,842 `Bridge`, 387
+`SyntheticStub`.
+
+| what the image says about the `Bridge` target | rows | share | (was 08-04) |
+|---|---:|---:|---:|
+| `ACC_NATIVE` — a genuine bridge, §1.5 | 773 | 7% | 760 |
+| concrete bytecode (`has_code`) — a **shadow** | 4,755 | 44% | 4,796 |
+| abstract method — intercepts every implementor | 1,321 | 12% | 1,321 |
+| class present, method **not declared** | 2,497 | 23% | 2,489 |
+| class absent from the image | 1,496 | 14% | 1,478 |
+| **no `ACC_NATIVE` target** | **10,069** | **93%** | 10,084 |
+
+**Two numbers are ratcheted, not one.** `10,069` and — separately — the `4,755`
+shadowing rows, because that is the subgroup that has already produced a defect
+(§7 step 3's decline reaching `UnsatisfiedLinkError` instead of the bytecode; see
+*The first thing it found* below) and because the aggregate alone would let a
+shadow trade places with an abstract-method intercept invisibly. A third
+assertion, `total_rows >= 8_000`, is a **collapse detector, not a measurement**.
+
+**`kind_stated` is no longer false on all rows.** 9 of the 687 `Intrinsic` rows
+state their kind (the `java/lang/String` natives L9 migrated), and — as of L5,
+landed the same day — **87 `Bridge` rows do too**, so `kind_stated` is true on 96
+of 11,916. The sentence below, "`register_with_kind` exists and has zero
+callers", is out of date by ninety-six.
+
+**L5 moved `kind_stated` by 87 and moved the 10,069 by nothing, and that is not
+a disappointment — it is the two numbers measuring different things.** The
+ratchet above counts `Bridge` rows *with no `ACC_NATIVE` target*. The 87 rows L5
+stated are exactly the rows that DO have one; they were never in the 10,069.
+Expect every honest `register_with_kind` migration to look like this: it moves
+`kind_stated`, and only a *reclassification* can move the ratchet. A migration
+that did move the 10,069 would have done so by stating `Bridge` on rows the
+image does not back — the codemod this record warns against.
+
+**What L5 found that generalises.** Of the 204 registrations in `native-io`'s
+four `JDK-ONLY-CLASSIFY: bridge` registrars, only 87 have an `ACC_NATIVE`
+target. Not one of the four could have its `set_category` scope deleted, because
+not one is wholly adjudicated — not even `random_access_file.rs`, where 10 of 11
+are `ACC_NATIVE` and the eleventh (`close0()V`) is not declared by JDK 25 at
+all. And in two of them a *single registration site* produced rows with
+different verdicts, because one `for cls in [...]` loop registers the same
+native under several platform class names and at most one of those names is the
+declarer on any given image. **The unit of adjudication is the row, not the
+registrar and not even the call site.** The 117 rows L5 declined to claim are
+filed as [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md);
+the largest group there is 25 `Bridge` registrations on VM-minted
+`cratonvm/synthetic/Process*` classes — the `Function$Identity` shape found in a
+second place.
+
+**Where they come from now** (top five registering files, `Bridge` rows with no
+`ACC_NATIVE` target): `native-collections/src/lib.rs` 1,350 ·
+`native-builtins/src/lib.rs` 1,097 · `native-builtins/src/lang_misc.rs` 1,022 ·
+`phases_late/nio_file.rs` 406 · `phases_late/foreign_ffm.rs` 367. Re-derive with
+`python3 scripts/jdk-only-adjudicate.py <census.json>` section 4; section 7 is
+the machine-readable block the ratchet freezes.
+
+**The under-tagging direction is still clean:** zero `SyntheticStub` rows target
+a method the image declares `ACC_NATIVE`.
+
 ## What changed on 2026-08-04 — step 2 exists, and the blocking evidence gap is closed
 
 *What specifically must change* lists three steps. Step 1 (provenance) was
@@ -75,7 +156,9 @@ script refuses rather than printing zeroes that read like a clean result.
 
 **`kind_stated` is `false` on all 11,909 rows.** `register_with_kind` exists and
 has **zero callers**. Step 2's migration has not begun — which the section below
-says, but the census makes it a measurement rather than a claim.
+says, but the census makes it a measurement rather than a claim. *(Superseded
+2026-08-05: 96 rows state their kind. See the section above.)* *(Superseded
+2026-08-05: 96 rows now state their kind. See the section above.)*
 
 **The `Bridge` population, adjudicated against the image:**
 
@@ -336,7 +419,11 @@ requires knowing, per registration, whether the tag was *chosen* or *inherited*.
    cb, kind)`) and migrate registrars to it subsystem by subsystem, so the kind
    is a local fact rather than a property of the call stack. **Start with the
    `JDK-ONLY-CLASSIFY`-marked registrars**, which already carry an adjudicated
-   verdict.
+   verdict. *(Entry point: done. `native-io`'s four `bridge` registrars: done
+   2026-08-05, 87 of 204 registrations — a marked verdict is where to start, not
+   a licence to convert the whole function; adjudicate per row.)* *(Entry point: done. `native-io`'s four `bridge` registrars: done
+   2026-08-05, 87 of 204 registrations — the marked verdict is a starting point,
+   not a licence to convert the whole function; adjudicate per row.)*
 3. Only then reclassify. Flip the default last: once every registration states
    its kind, `current_category` can default to something that fails loudly (or
    be deleted).

@@ -43330,10 +43330,13 @@ const PROPS_FIELD_DEFAULTS: usize = 3;
 /// fabricated four-field `Properties` model. On a real
 /// `java.util.Properties` the inherited `Hashtable` fields occupy 0..=7 and
 /// absolute slot 3 is `float loadFactor`, so `native_props_init`'s
-/// `Object(None)` landed on a primitive — and the overlay hunter does NOT
-/// report it, because `overlay_write_is_destructive` only flags
-/// `Object(Some(_))` over a primitive descriptor. It is invisible in the
-/// census for that reason, not absent from the defect.
+/// `Object(None)` landed on a primitive — and the overlay hunter did NOT
+/// report it, because its predicate only flagged `Object(Some(_))` over a
+/// primitive descriptor. It was invisible in the census for that reason, not
+/// absent from the defect. **Closed 2026-08-05 as L4 gap 3**:
+/// `overlay_access_is_cross_type` now flags `Object(_)`, so a write of this
+/// exact shape appears in the census, and the shadow-layout diff reports the
+/// slot as a `TYPE` disagreement whether or not anything writes it.
 ///
 /// Reading the same slot back was the other half: `getProperty`'s fallback
 /// walk read slot 3, got a `Float`, and stopped — so on a real layout a

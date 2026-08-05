@@ -525,27 +525,65 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // Registration
 // ---------------------------------------------------------------------------
 
-// JDK-ONLY-CLASSIFY: bridge — 8 of the 11 registrations here resolve to
-// ACC_NATIVE methods on `java.io.RandomAccessFile` in JDK 25 (`open0`, `read0`,
-// `readBytes`, `write0`, `writeBytes`, `getFilePointer`, `seek0`, `length`,
-// `setLength`, `initIDs`). These are file-descriptor operations: the descriptor
-// lives in this crate's fd table and there is no bytecode fallback in the
-// image. Correctly `Bridge`, and correct for the right reason rather than by
-// inheritance — the category is set explicitly on the next line.
+// JDK-ONLY-CLASSIFY: bridge — 10 of the 11 registrations here resolve to
+// ACC_NATIVE methods on `java.io.RandomAccessFile` in JDK 25 (`initIDs`,
+// `open0`, `read0`, `readBytes0`, `write0`, `writeBytes0`, `getFilePointer`,
+// `seek0`, `length0`, `setLength0`). These are file-descriptor operations: the
+// descriptor lives in this crate's fd table and there is no bytecode fallback
+// in the image. Those ten now state `NativeKind::Bridge` at their own call
+// sites rather than inheriting it from the scope below (L5, 2026-08-05).
+//
+// The eleventh is NOT one of them. `close0()V` is not declared by JDK 25's
+// `RandomAccessFile` at all — schema-3 census `image_has_class: true,
+// declared: false`, confirmed with `javap -p java.io.RandomAccessFile`, which
+// closes through `FileCleanable`/`fd` and has `close()` as ordinary bytecode.
+// A registration that targets nothing on this image is not an adjudicated
+// bridge, so it keeps the ambient category and the `set_category` scope stays
+// for it. (The earlier "8 of the 11" and the names `readBytes`, `length`,
+// `setLength` in this marker came from a static read of pre-JDK-19 spellings;
+// the census names the descriptors this crate actually registers.) Residuals:
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
+    use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    registry.set_category(NativeKind::Bridge);
     let raf = "java/io/RandomAccessFile";
-    registry.register(raf, "initIDs", "()V", native_initIDs);
-    registry.register(raf, "open0", "(Ljava/lang/String;I)V", native_open0);
-    registry.register(raf, "read0", "()I", native_read0);
-    registry.register(raf, "readBytes0", "([BII)I", native_readBytes0);
-    registry.register(raf, "write0", "(I)V", native_write0);
-    registry.register(raf, "writeBytes0", "([BII)V", native_writeBytes0);
-    registry.register(raf, "getFilePointer", "()J", native_getFilePointer);
-    registry.register(raf, "seek0", "(J)V", native_seek0);
-    registry.register(raf, "length0", "()J", native_length0);
-    registry.register(raf, "setLength0", "(J)V", native_setLength0);
+    registry.register_with_kind(raf, "initIDs", "()V", native_initIDs, NativeKind::Bridge);
+    registry.register_with_kind(
+        raf,
+        "open0",
+        "(Ljava/lang/String;I)V",
+        native_open0,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(raf, "read0", "()I", native_read0, NativeKind::Bridge);
+    registry.register_with_kind(
+        raf,
+        "readBytes0",
+        "([BII)I",
+        native_readBytes0,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(raf, "write0", "(I)V", native_write0, NativeKind::Bridge);
+    registry.register_with_kind(
+        raf,
+        "writeBytes0",
+        "([BII)V",
+        native_writeBytes0,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        raf,
+        "getFilePointer",
+        "()J",
+        native_getFilePointer,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(raf, "seek0", "(J)V", native_seek0, NativeKind::Bridge);
+    registry.register_with_kind(raf, "length0", "()J", native_length0, NativeKind::Bridge);
+    registry.register_with_kind(raf, "setLength0", "(J)V", native_setLength0, NativeKind::Bridge);
+    // Not ACC_NATIVE — not declared by JDK 25's RandomAccessFile at all.
+    // Left on the ambient category deliberately; see the marker above.
     registry.register(raf, "close0", "()V", native_close0);
     registry.set_category(__prev_cat);
 }

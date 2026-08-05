@@ -12,6 +12,7 @@ pub use cratonvm_classloading::bytecode_verifier;
 pub use cratonvm_classloading::loaders;
 pub use cratonvm_classloading::module;
 pub use cratonvm_classloading::resolution;
+pub use cratonvm_classloading::shadow_layout;
 pub use cratonvm_classloading::verifier;
 pub use cratonvm_classloading::verify_frame;
 pub use cratonvm_classloading::verify_insn;
