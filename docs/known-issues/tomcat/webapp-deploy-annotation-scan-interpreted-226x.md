@@ -414,6 +414,63 @@ Both are answered by the same thing: a per-thread, epoch-validated resolved
 constant pool (`vm/src/runtime/interpreter/site_cache.rs`), behind
 `CRATONVM_JIT=field-site-cache` and `CRATONVM_JIT=method-site-cache`.
 
+#### Real-application validation: 351 Spring Boot test classes (2026-08-05)
+
+The regression suite and the two dedicated vectors do not answer "is this safe
+on a real, loader-heavy application". Spring Boot's own unit tests do. Corpus:
+351 compiled test classes from `core/spring-boot`, driven one process per class
+through a JUnit Platform launcher harness, both arms.
+
+**Result: 346/351 vs 347/351 rc=0, and all 5 divergent classes are FLAKY IN BOTH
+ARMS**, not cache defects:
+
+| class | evidence |
+|---|---|
+| `SpringApplicationTests` | 5 reps/arm: off `failed=0,0,8,0,0`; on `0,0,4,0,0` — flakes in both |
+| `SpringApplicationBuilderTests` | 15 reps/arm, **alternating**: off bad 3/15, on bad 4/15 |
+| `StringToPeriodConverterTests` | 5 reps/arm: 0/5 both; the original `containersFailed=1` was in the OFF arm |
+| `DefaultSslManagerBundleTests` | 5 reps/arm: 0/5 both; original `failed=2` was in the OFF arm |
+| `ThreadPoolTaskSchedulerBuilderTests` | 5 reps/arm: 0/5 both |
+
+The divergences were **bidirectional** — 3 classes did better with the cache on,
+2 worse — which is the signature of flakiness, not of a defect. A cache serving
+a wrong field is one-directional and deterministic.
+
+The lever demonstrably fires on this corpus (`hit=184126` on one test class), so
+this is not a vacuous green.
+
+**Two honest caveats.**
+
+* **The 351-class run was blocked, not interleaved** (`off` × 351, then `on` ×
+  351). The off arm ran at host load 16–30 and the on arm after load dropped,
+  which systematically favours ON for load-sensitive flaky tests — and 3 of the
+  5 divergences favoured ON. That is a violation of this repo's own interleaving
+  rule; the follow-ups above alternate arms per repetition, which is what makes
+  the 3/15-vs-4/15 comparison trustworthy.
+* **This does NOT validate `field-site-cache-loader`.** Every site in this
+  corpus is loader-blind (`reject_loader` ≈ 0 — the tests run off a plain
+  classpath), so the loader arm was inert here. It remains unvalidated on real
+  loader-heavy code, which is exactly where it is supposed to matter.
+
+#### Sizing: 1024 slots thrash on broad application code
+
+The hit rate that makes the scan number possible does **not** generalise:
+
+| workload | hit | miss | rate |
+|---|---|---|---|
+| Tomcat annotation scan | 1,329,432 | 1,234 | **99.9%** |
+| `SpringApplicationShutdownHookTests` | 184,126 | 166,035 | **53%** |
+
+Nearly every Spring Boot miss causes a fill — the table is thrashing, not
+warming. 1024 was sized against a narrow hot loop. `CRATONVM_JIT=field-site-slots=N`
+exists to settle this with data rather than a guess; hit rate is
+**load-independent**, so it is measurable on this shared host even when timings
+are not.
+
+**This is why the default stays OFF.** The scan gain is real and measured, but
+the benefit on broad application code is *unmeasured in time* — only its hit
+rate is known, and that hit rate says the current size is wrong for that shape.
+
 #### What those two levers are worth — ON THE SCAN (2026-08-05)
 
 The authoritative measurement: real BCEL, real JARs, Azure host, load steady at
