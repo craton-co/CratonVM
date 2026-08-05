@@ -9584,11 +9584,18 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
             };
-            // ForkJoinTask is a Runnable subtype in real JDK; calling
-            // its `exec()` method runs the encapsulated logic and
-            // returns Z (true if completed normally). We discard the
-            // boolean since `execute(...)` is void.
-            let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+            // Run the task through the shared side-table path rather than a
+            // bare `exec()` invoke. The bare invoke never RECORDED the task
+            // as done, so the matching `join()` saw `done == false` and ran
+            // the body a SECOND time — a matrix probe against the host JDK
+            // caught `execute(t); t.join()` executing `compute()` twice
+            // (`ran=2` where HotSpot reports `ran=1`). Silent double
+            // execution is a correctness bug for any non-idempotent task.
+            //
+            // `execute` is void and must not raise the task's exception at
+            // the submitter (it surfaces at the matching `join()`/`get()`),
+            // which is exactly `fjp_compute_for_submit`'s policy.
+            let _ = phases_early::fjp_compute_for_submit(ctx, task)?;
             Ok(None)
         },
     );
@@ -15636,19 +15643,37 @@ pub fn register_essential_natives_with_shims(
                     .into())
                 }
             };
-            for i in 0..ctx.array_length(constants) {
-                let candidate = match ctx.get_array_element(constants, i) {
+            // Cross-call GC-safety (2026-08-04): `invoke_virtual` runs
+            // `Enum.name()` — Java, and therefore a possible moving young
+            // collection — with `constants` and `candidate` held as bare
+            // `ObjectRef` locals. After one relocation the array walk reads a
+            // vacated from-space array, matches nothing, and this throws
+            // `No enum constant <NAME>` for a constant that exists. Root the
+            // array once and re-read it (and each element) per iteration; the
+            // MATCHED candidate is also re-read through its own root, because
+            // the `name()` call that identified it may itself have moved it.
+            // Companion fix to `native_class_get_enum_constants`, which had the
+            // same defect one call deeper.
+            let mut scope = NativeHandleScope::new(ctx);
+            let constants_h = scope.root(constants);
+            let constants_cur = scope.get(&constants_h);
+            let len = scope.array_length(constants_cur);
+            for i in 0..len {
+                let constants_cur = scope.get(&constants_h);
+                let candidate = match scope.get_array_element(constants_cur, i) {
                     Value::Object(Some(o)) => o,
                     _ => continue,
                 };
+                let candidate_h = scope.root(candidate);
+                let candidate_cur = scope.get(&candidate_h);
                 let name_val =
-                    ctx.invoke_virtual(candidate, "name", "()Ljava/lang/String;", &[])?;
+                    scope.invoke_virtual(candidate_cur, "name", "()Ljava/lang/String;", &[])?;
                 let name_obj = match name_val {
                     Some(Value::Object(Some(s))) => s,
                     _ => continue,
                 };
-                if ctx.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
-                    return Ok(Some(Value::Object(Some(candidate))));
+                if scope.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
             Err(RuntimeError::IllegalArgumentException {

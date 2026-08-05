@@ -161,7 +161,7 @@ fn spring_dbg_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::nbflags().spring_dbg)
 }
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
@@ -876,6 +876,17 @@ pub(crate) fn resolve_host_external(host: &str) -> Option<String> {
     resolve_host(host).ok().map(|ip| ip.to_string())
 }
 
+/// `pub(crate)` re-export of [`inet_addr_resolve`] so sibling modules can
+/// render an `InetAddress` mirror the way HotSpot's `InetAddress.toString()`
+/// does (`hostName + "/" + hostAddress`) without duplicating the
+/// side-table-then-`holder` lookup order.
+pub(crate) fn inet_addr_resolve_external(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Option<(String, String)> {
+    inet_addr_resolve(ctx, this)
+}
+
 /// Read an InetAddress's `(hostName, ipAddress)` from the side table.
 /// Returns `None` for an InetAddress we never recorded.
 ///
@@ -1004,13 +1015,41 @@ const IA_FAMILY_V6: i32 = 2;
 /// when it calls `inetAddress.getHostName().toLowerCase(Locale)`).
 ///
 /// Mirrors the `alloc_inet_socket_address` holder-population pattern.
-fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, ip: &str) {
+fn populate_inet_holder(
+    ctx: &mut dyn NativeContext,
+    ia: ObjectRef,
+    host: &str,
+    ip: &str,
+) -> ObjectRef {
+    // Cross-call GC-safety (2026-08-04). Every `alloc_concurrent_synthetic` /
+    // `create_string` / `new_array` below ALLOCATES, and the first one is
+    // especially dangerous: on a cold VM it also loads and initialises
+    // `java/net/InetAddress$InetAddressHolder`, which runs a lot of Java and
+    // therefore reliably triggers a moving young collection. Holding `ia` (and
+    // `holder`) as bare `ObjectRef` locals across that meant `holder` was
+    // written into a VACATED from-space copy of the address mirror, and the
+    // caller was handed the stale `ia` too.
+    //
+    // Downstream that reads as the defect this function's callers were filed
+    // for: `new ServerSocket(0)` → `new InetSocketAddress(null, 0)` stored the
+    // stale mirror in the `InetSocketAddress` holder, `getAddress()` then
+    // answered **null** while `isUnresolved()` still answered false, and
+    // `sun.nio.ch.Net.bind`'s first act — `addr.isLinkLocalAddress()` — threw
+    // `NullPointerException: … because "addr" is null`. See
+    // `docs/internal/fixed-suite-bugs/serversocket-bind-null-inetaddress-net-sockets-FIXED.md`.
+    //
+    // Returns the CURRENT (post-GC) address of `ia` so the caller propagates
+    // the live reference instead of its own stale copy.
+    let mut scope = NativeHandleScope::new(ctx);
+    let ia_h = scope.root(ia);
     // Only populate if the class actually declares a `holder` field — i.e.
     // a real-JDK `InetAddress` is loaded. With a purely synthetic stub the
     // field is absent and `set_field_by_name` is a harmless no-op anyway.
-    let holder = alloc_concurrent_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 3);
-    let host_str = ctx.create_string(host);
-    ctx.set_field_by_name(holder, "hostName", Value::Object(Some(host_str)));
+    let holder = alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3);
+    let holder_h = scope.root(holder);
+    let host_str = scope.create_string(host);
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field_by_name(holder_cur, "hostName", Value::Object(Some(host_str)));
     // `address` is the IPv4 address packed big-endian into an int; for IPv6
     // it stays 0 (the bytes live in the separate `Inet6Address` holder).
     let parsed = ip.parse::<std::net::IpAddr>();
@@ -1019,9 +1058,13 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
         Ok(std::net::IpAddr::V6(_)) => (0, IA_FAMILY_V6),
         Err(_) => (0, IA_FAMILY_V4),
     };
-    ctx.set_field_by_name(holder, "address", Value::Int(packed));
-    ctx.set_field_by_name(holder, "family", Value::Int(family));
-    ctx.set_field_by_name(ia, "holder", Value::Object(Some(holder)));
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field_by_name(holder_cur, "address", Value::Int(packed));
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field_by_name(holder_cur, "family", Value::Int(family));
+    let ia_cur = scope.get(&ia_h);
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field_by_name(ia_cur, "holder", Value::Object(Some(holder_cur)));
 
     // NIO-SERVER-SOCKET (IPv6): a real-JDK `Inet6Address` stores its 16-byte
     // address in a SEPARATE `holder6` field
@@ -1032,19 +1075,30 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     // socket path — dereferences `holder6`; leaving it null NPEs before bind0
     // is ever reached. Populate it so the real path resolves v6 correctly.
     if let Ok(std::net::IpAddr::V6(v6)) = parsed {
-        let h6 = alloc_concurrent_synthetic(ctx, "java/net/Inet6Address$Inet6AddressHolder", 5);
+        let h6 =
+            alloc_concurrent_synthetic(&mut *scope, "java/net/Inet6Address$Inet6AddressHolder", 5);
+        let h6_h = scope.root(h6);
         let octets = v6.octets();
-        let arr = ctx.new_array(ArrayElementType::Byte, octets.len());
+        let arr = scope.new_array(ArrayElementType::Byte, octets.len());
+        let arr_h = scope.root(arr);
         for (i, b) in octets.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+            let arr_cur = scope.get(&arr_h);
+            scope.set_array_element(arr_cur, i, Value::Int(*b as i32));
         }
-        ctx.set_field_by_name(h6, "ipaddress", Value::Object(Some(arr)));
+        let h6_cur = scope.get(&h6_h);
+        let arr_cur = scope.get(&arr_h);
+        scope.set_field_by_name(h6_cur, "ipaddress", Value::Object(Some(arr_cur)));
         // Loopback / global addresses carry no scope; link-local scope ids are
         // not recoverable from a bare `Ipv6Addr`, so leave scope_id unset (0).
-        ctx.set_field_by_name(h6, "scope_id", Value::Int(0));
-        ctx.set_field_by_name(h6, "scope_id_set", Value::Int(0));
-        ctx.set_field_by_name(ia, "holder6", Value::Object(Some(h6)));
+        let h6_cur = scope.get(&h6_h);
+        scope.set_field_by_name(h6_cur, "scope_id", Value::Int(0));
+        let h6_cur = scope.get(&h6_h);
+        scope.set_field_by_name(h6_cur, "scope_id_set", Value::Int(0));
+        let ia_cur = scope.get(&ia_h);
+        let h6_cur = scope.get(&h6_h);
+        scope.set_field_by_name(ia_cur, "holder6", Value::Object(Some(h6_cur)));
     }
+    scope.get(&ia_h)
 }
 
 /// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table
@@ -1792,8 +1846,14 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
     // un-overridden real-JDK `InetAddress` / `Inet4Address` bytecode (the
     // `final` `getHostName()` accessor, `toString()`, …) reads a consistent
     // shape instead of dereferencing a null `holder`.
-    populate_inet_holder(ctx, ia, host, ip);
-    ia
+    //
+    // `populate_inet_holder` allocates, so it RETURNS the mirror's current
+    // address: returning our own pre-call `ia` handed every caller a stale
+    // reference under a moving young GC. `inet_addr_set` keys the side table
+    // on the pre-GC identity, but that table is a scanned+remapped root
+    // (`gc_scan_inet_addr_roots` / `gc_update_inet_addr_refs`), so it follows
+    // the relocation on its own.
+    populate_inet_holder(ctx, ia, host, ip)
 }
 
 /// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
@@ -1840,16 +1900,29 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     // addr, port match the real layout exactly) and link it so both
     // the synthetic `read_inet_socket_address` reader AND real-JDK
     // bytecode see consistent state.
-    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-    let holder =
-        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
-    let h = ctx.create_string(host);
-    ctx.set_field(holder, 0, Value::Object(Some(h)));
-    ctx.set_field(holder, 1, Value::Object(None));
-    ctx.set_field(holder, 2, Value::Int(port));
-    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
-    ctx.set_field(isa, ISA_PORT, Value::Int(port));
-    isa
+    //
+    // Cross-call GC-safety: `alloc_concurrent_synthetic` / `create_string`
+    // allocate and can move everything already in hand, so `isa` and `holder`
+    // are rooted and re-read before every write. See `populate_inet_holder`
+    // for the failure this shape produced when it was missing.
+    let mut scope = NativeHandleScope::new(ctx);
+    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
+    let isa_h = scope.root(isa);
+    let holder = alloc_concurrent_synthetic(
+        &mut *scope,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
+    let holder_h = scope.root(holder);
+    let h = scope.create_string(host);
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field(holder_cur, 0, Value::Object(Some(h)));
+    scope.set_field(holder_cur, 1, Value::Object(None));
+    scope.set_field(holder_cur, 2, Value::Int(port));
+    let isa_cur = scope.get(&isa_h);
+    scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
+    scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
+    isa_cur
 }
 
 /// Like [`alloc_inet_socket_address`], but populates the holder's `addr`
@@ -1869,17 +1942,32 @@ fn alloc_inet_socket_address_resolved(
     ip: &str,
     port: i32,
 ) -> ObjectRef {
-    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-    let holder =
-        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
-    let h = ctx.create_string(host);
-    let addr = alloc_inet_address(ctx, host, ip);
-    ctx.set_field(holder, 0, Value::Object(Some(h)));
-    ctx.set_field(holder, 1, Value::Object(Some(addr)));
-    ctx.set_field(holder, 2, Value::Int(port));
-    ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
-    ctx.set_field(isa, ISA_PORT, Value::Int(port));
-    isa
+    // Cross-call GC-safety: see `alloc_inet_socket_address`. `alloc_inet_address`
+    // in particular runs class initialisation on a cold VM, so everything held
+    // across it must be rooted.
+    let mut scope = NativeHandleScope::new(ctx);
+    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
+    let isa_h = scope.root(isa);
+    let holder = alloc_concurrent_synthetic(
+        &mut *scope,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
+    let holder_h = scope.root(holder);
+    let h = scope.create_string(host);
+    let h_h = scope.root(h);
+    let addr = alloc_inet_address(&mut *scope, host, ip);
+    let addr_h = scope.root(addr);
+    let holder_cur = scope.get(&holder_h);
+    let h_cur = scope.get(&h_h);
+    let addr_cur = scope.get(&addr_h);
+    scope.set_field(holder_cur, 0, Value::Object(Some(h_cur)));
+    scope.set_field(holder_cur, 1, Value::Object(Some(addr_cur)));
+    scope.set_field(holder_cur, 2, Value::Int(port));
+    let isa_cur = scope.get(&isa_h);
+    scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
+    scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
+    isa_cur
 }
 
 fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallFailed> {

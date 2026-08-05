@@ -2584,8 +2584,10 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
 
     /// Return the raw Java `String.hashCode()` for a confirmed String object.
-    /// `None` means that `obj` is not a String. Implementations may override
-    /// this to inspect compact storage without allocating a host String.
+    /// `None` means "no hash was computed": `obj` is not a String, or an
+    /// overriding implementation could not read its character storage.
+    /// Implementations may override this to inspect compact storage without
+    /// allocating a host String.
     fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
         self.read_string(obj).map(|text| {
             text.encode_utf16().fold(0i32, |hash, unit| {
@@ -2595,7 +2597,15 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     }
 
     /// Compare two confirmed Java Strings without routing through Java
-    /// dispatch. `None` means at least one operand is not a String.
+    /// dispatch.
+    ///
+    /// `Some(_)` is an answer. `None` means **the comparison was not made** —
+    /// an operand is not a String, or an overriding implementation could not
+    /// read one operand's character storage — and the caller must fall back to
+    /// dispatching `String.equals`. An implementation must never report `false`
+    /// for a pair it did not actually read: doing so silently turned every
+    /// `ConcurrentHashMap.get` on a String key into a miss (see
+    /// `docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }
@@ -5263,6 +5273,44 @@ impl NativeMethodRegistry {
                         "submit",
                         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
                     )
+                    // `awaitQuiescence` was in the interpreter's
+                    // `is_forkjoin_native_override` list but NOT here, so the
+                    // registration was dropped and the interpreter's "force the
+                    // native" had no native to force: the call fell through to
+                    // real bytecode and answered "quiescent" immediately while
+                    // an `execute(Runnable)` daemon thread was still running.
+                    // A `--dump-native-registry` census (no awaitQuiescence
+                    // row) plus a probe observing `execute(slow);
+                    // awaitQuiescence()` with ran=0 where HotSpot reports
+                    // ran=1 is what surfaced it. The two lists must agree
+                    // entry-for-entry — a name present in only one of them is
+                    // silently inert.
+                    | ("awaitQuiescence", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    // BULK SUBMISSION — see the matching block in
+                    // `is_forkjoin_native_override`. `invokeAll(Collection)` is
+                    // the overload Weld's `ConcurrentBeanDeployer` calls and was
+                    // on neither list, which failed the entire hibernate
+                    // `org.hibernate.orm.test.cdi.*` cluster. `invokeAny` was
+                    // uncovered too and failed SILENTLY (ran the callables,
+                    // returned null); `lazySubmit` threw like invokeAll.
+                    | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/List;")
+                    | (
+                        "invokeAll",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/util/List;",
+                    )
+                    | (
+                        "invokeAllUninterruptibly",
+                        "(Ljava/util/Collection;)Ljava/util/List;",
+                    )
+                    | ("invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;")
+                    | (
+                        "invokeAny",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+                    )
+                    | (
+                        "lazySubmit",
+                        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
             );
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
@@ -5304,6 +5352,10 @@ impl NativeMethodRegistry {
                     | ("isCancelled", "()Z")
                     | ("cancel", "(Z)Z")
                     | ("complete", "(Ljava/lang/Object;)V")
+                    // Reads the throwable the side table records for an
+                    // abnormally completed task, so it cannot disagree with
+                    // join()/get() about whether the task failed.
+                    | ("getException", "()Ljava/lang/Throwable;")
             );
         if real_forkjoinpool_enabled()
             && matches!(

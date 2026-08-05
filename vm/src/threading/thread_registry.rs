@@ -2098,10 +2098,52 @@ impl ThreadRegistry {
     /// are this fold (keyed by those addresses) and the wake-side apply,
     /// so the chain stays consistent.
     pub fn fold_pointer_map_into_blocked(&self, pointer_map: &HashMap<usize, usize>) {
+        self.fold_pointer_map_into_blocked_audited(pointer_map, None)
+    }
+
+    /// [`Self::fold_pointer_map_into_blocked`] plus the post-fold invariant
+    /// check, for the production call site that can hand over the heap.
+    ///
+    /// The invariant: once this fold returns, no address a blocked thread will
+    /// resume on may lie in the INACTIVE young semispace. That arena is what
+    /// the moving cycle just evacuated and zeroed, so a reference into it is a
+    /// still-referenced object the collector took — the "all-zero header
+    /// `java.lang.Object` receiver" family — and it is detectable HERE, in the
+    /// cycle that caused it, with the frame and slot that hold it. Every other
+    /// witness of this bug is downstream: a `NoSuchMethodError` against
+    /// `java.lang.Object`, a `checkcast` failure, an out-of-bounds field read —
+    /// each an unbounded distance from the collection with the gap, and each
+    /// naming only the victim's *use* site.
+    ///
+    /// The check that runs UNCONDITIONALLY is the precise one: a
+    /// `slot_origins` entry — the exact `(frame, slot)` tracker, filled by the
+    /// blocking deposit and advanced through each cycle's pointer map — whose
+    /// `cur` lands in the vacated arena. Its report carries
+    /// `was_a_scanned_root`, which forks the fix: `false` means the deposit
+    /// never published that slot (a root COVERAGE gap), `true` means the
+    /// collector was handed the address and left it behind (an EVACUATION
+    /// gap).
+    ///
+    /// The whole-snapshot version of the same question is behind
+    /// `CRATONVM_DBG_BLOCKGC`, because a snapshot legitimately carries
+    /// conservative candidates that are not object starts and which
+    /// `forward_object` correctly declines to relocate.
+    ///
+    /// `heap` is `None` only from tests that drive the fold directly with a
+    /// synthetic pointer map.
+    pub fn fold_pointer_map_into_blocked_audited(
+        &self,
+        pointer_map: &HashMap<usize, usize>,
+        heap: Option<&crate::memory::VmHeap>,
+    ) {
         if pointer_map.is_empty() {
             return;
         }
         let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some();
+        // One arena lock for the whole fold; the per-address test below is two
+        // integer compares, so the audit is affordable unconditionally and does
+        // not need a flag to have been set before the run that reproduces.
+        let vacated = heap.and_then(|h| h.young_inactive_semispace_range());
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -2153,6 +2195,50 @@ impl ThreadRegistry {
                 for so in origins.iter_mut() {
                     if let Some(&new) = pointer_map.get(&so.cur) {
                         so.cur = new;
+                    }
+                }
+                if let Some((lo, hi)) = vacated {
+                    // Built lazily: a frame slot landing in the vacated arena
+                    // is the rare case, and this set is only needed to report
+                    // one.
+                    let mut in_snapshot: Option<rustc_hash::FxHashSet<usize>> = None;
+                    for so in origins.iter() {
+                        // A DEAD local in the vacated arena is the per-bci
+                        // liveness analysis working as designed, not a defect
+                        // — see `SlotOrigin::live`.
+                        if !so.live || so.cur < lo || so.cur >= hi {
+                            continue;
+                        }
+                        let published = in_snapshot
+                            .get_or_insert_with(|| {
+                                snapshot.iter().map(|r| r.as_ptr() as usize).collect()
+                            })
+                            .contains(&so.cur);
+                        // The remap above rewrote the snapshot in place, so a
+                        // hit means the collector had this exact address as a
+                        // root and left it behind; a miss means the deposit
+                        // never published it.
+                        blocked_root_gap_report(
+                            tid.0, so.frame, so.idx, so.is_stack, so.orig, so.cur, published,
+                        );
+                    }
+                }
+            }
+            // The whole-snapshot version of the same question. Gated, unlike
+            // the per-slot check above, because the snapshot legitimately
+            // carries CONSERVATIVE candidates — register/stack words and
+            // JIT-band scans that are not object starts — and `forward_object`
+            // correctly declines to relocate those, so they land in the vacated
+            // arena on every moving cycle by design. Only a hit that is ALSO a
+            // frame slot is unambiguous, and that is what the check above
+            // reports unconditionally.
+            if dbg {
+                if let Some((lo, hi)) = vacated {
+                    for r in snapshot.iter() {
+                        let a = r.as_ptr() as usize;
+                        if a >= lo && a < hi {
+                            blocked_snapshot_gap_report(tid.0, a);
+                        }
                     }
                 }
             }
@@ -2444,6 +2530,74 @@ impl ThreadRegistry {
             }
         }
     }
+}
+
+/// Rate limit for the two blocked-root-gap reporters below. The defect
+/// cascades — one blocked thread typically has many slots pointing at the
+/// same lost subgraph — and the first handful carry all the information.
+const BLOCKED_ROOT_GAP_REPORTS: u64 = 12;
+
+/// A blocked thread's frame slot still points into the arena this moving
+/// cycle evacuated: the object it names was NOT relocated, so on wake the
+/// slot reads the all-zero header the collector left behind.
+///
+/// `in_snapshot` is the fork that decides where the fix goes. `false` (the
+/// common case) means `deposit_root_snapshot`'s frame scan never published
+/// this slot, so the collector could not have known to evacuate it — a
+/// root-coverage gap in the deposit. `true` means the collector held this
+/// exact address as a root and left it behind anyway — an evacuation gap.
+fn blocked_root_gap_report(
+    tid: u64,
+    frame: u32,
+    idx: u32,
+    is_stack: bool,
+    orig: usize,
+    cur: usize,
+    in_snapshot: bool,
+) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, Ordering::Relaxed) >= BLOCKED_ROOT_GAP_REPORTS {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        tid = tid,
+        frame = frame,
+        slot = if is_stack { "stack" } else { "local" },
+        idx = idx,
+        deposited_addr = format!("{orig:#x}"),
+        current_addr = format!("{cur:#x}"),
+        was_a_scanned_root = in_snapshot,
+        "blocked-thread frame slot points into the semispace this moving cycle just \
+         evacuated — the object was not relocated and the slot will read an all-zero \
+         `java.lang.Object` header on wake. `was_a_scanned_root=false` means the \
+         blocking deposit never published this slot (root-coverage gap); `true` means \
+         the collector was handed it and did not evacuate it (evacuation gap).",
+    );
+}
+
+/// A blocked thread's deposited root snapshot still names the evacuated
+/// arena after the fold remapped it.
+///
+/// `CRATONVM_DBG_BLOCKGC` only. Most hits are benign by construction: the
+/// snapshot carries conservative candidates (register/stack words, JIT-band
+/// scans) that are not object starts, and `forward_object` declines to
+/// relocate anything `young_object_starts` does not vouch for. A hit is only
+/// interesting when the SAME address is also a frame slot — which
+/// [`blocked_root_gap_report`] reports on its own, unconditionally.
+fn blocked_snapshot_gap_report(tid: u64, addr: usize) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, Ordering::Relaxed) >= BLOCKED_ROOT_GAP_REPORTS {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        tid = tid,
+        obj = format!("{addr:#x}"),
+        "blocked-thread root snapshot still names the semispace this moving cycle just \
+         evacuated, after the fold's remap — the collector scanned this root and did not \
+         relocate it. The next collection would scan the same stale address.",
+    );
 }
 
 impl Default for ThreadRegistry {

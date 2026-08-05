@@ -3,6 +3,20 @@
 **Status:** OPEN, reduced 2026-08-04. Filed 2026-07-31 from wave-1
 implementation findings; re-verified against the re-landed tree the same day.
 
+> ## Looking for the plan? It is not here.
+>
+> **This directory is the evidence base** — what is broken, how it was measured,
+> what the blast radius is. One record per defect; a record moves to
+> `docs/internal/` when it is fixed.
+>
+> **The parallel execution plan is
+> [`docs/feature-designs/jdk-only-wave2/`](../../feature-designs/jdk-only-wave2/README.md)** —
+> twelve lanes with an explicit file-ownership map, a conflict matrix, and a
+> verification protocol. Nine of the twelve can start simultaneously. Read that
+> to decide *what to work on*; read this to understand *what you are fixing*.
+>
+> Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md).
+
 ---
 
 ## 2026-08-04 pass — what closed, what moved, what did not

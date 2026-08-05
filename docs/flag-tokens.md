@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-396 tokens.
+398 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -318,9 +318,11 @@ export inherited from a parent shell.
 | `owner-filter` | `CRATONVM_DBG_OWNER_FILTER` |
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
+| `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
+| `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
