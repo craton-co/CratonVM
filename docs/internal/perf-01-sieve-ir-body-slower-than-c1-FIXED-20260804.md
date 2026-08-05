@@ -2,7 +2,7 @@
 
 **Landed 2026-08-03 with `cov-02`. Found 2026-08-04. Fixed the same day.**
 The brief this closes is
-[`docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`](../known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md).
+[`../known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`](../known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md).
 
 ## What happened
 

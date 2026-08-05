@@ -3,6 +3,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -339,6 +341,94 @@ public class LinkedHashMapNodeProbe {
         check("  LHM null value stays null", null, m.get("n"));
         check("  LHM containsKey for null value", Boolean.TRUE,
                 Boolean.valueOf(m.containsKey("n")));
+
+        // A Set may hold one null element, which has no reference of its own to
+        // serve as the PRESENT marker.
+        Set<String> withNull = new HashSet<>();
+        check("  add(null)", Boolean.TRUE, Boolean.valueOf(withNull.add(null)));
+        check("  add(null) again", Boolean.FALSE, Boolean.valueOf(withNull.add(null)));
+        check("  contains(null)", Boolean.TRUE, Boolean.valueOf(withNull.contains(null)));
+        check("  remove(null)", Boolean.TRUE, Boolean.valueOf(withNull.remove(null)));
+        check("  remove(null) again", Boolean.FALSE, Boolean.valueOf(withNull.remove(null)));
+        Set<String> lhsNull = new LinkedHashSet<>();
+        lhsNull.add(null);
+        check("  LHS remove(null)", Boolean.TRUE, Boolean.valueOf(lhsNull.remove(null)));
+    }
+
+    /**
+     * The map VIEWS — {@code keySet}, {@code entrySet}, {@code values} — are
+     * backed by snapshot sets built by {@code map_alloc_node}, whose nodes bind
+     * to the real {@code java.util.HashMap$Node} and so DO carry field
+     * descriptors. Their PRESENT markers were the ones actually being coerced
+     * to null; nothing read them back, which is why it stayed invisible.
+     *
+     * <p>These gate the mutating view operations that report a boolean, so a
+     * marker that stops surviving shows up as a wrong answer, not as silence.
+     */
+    private static void mapViewsReportMutationCorrectly() {
+        System.out.println("== map view sets report their mutations");
+        Map<String, String> m = threeEntries();
+        check("keySet().remove(present)", Boolean.TRUE,
+                Boolean.valueOf(m.keySet().remove("a")));
+        check("keySet().remove(absent)", Boolean.FALSE,
+                Boolean.valueOf(m.keySet().remove("zz")));
+        check("  map shrank", Integer.valueOf(2), Integer.valueOf(m.size()));
+        check("  key gone from map", null, m.get("a"));
+
+        m = threeEntries();
+        check("keySet().removeAll", Boolean.TRUE,
+                Boolean.valueOf(m.keySet().removeAll(Arrays.asList("a", "b"))));
+        check("  size", Integer.valueOf(1), Integer.valueOf(m.size()));
+
+        m = threeEntries();
+        check("keySet().retainAll", Boolean.TRUE,
+                Boolean.valueOf(m.keySet().retainAll(Arrays.asList("a"))));
+        check("  size", Integer.valueOf(1), Integer.valueOf(m.size()));
+
+        m = threeEntries();
+        Map.Entry<String, String> found = null;
+        for (Map.Entry<String, String> e : m.entrySet()) {
+            if (e.getKey().equals("a")) {
+                found = e;
+            }
+        }
+        check("entrySet().remove(entry)", Boolean.TRUE,
+                Boolean.valueOf(m.entrySet().remove(found)));
+        check("  size", Integer.valueOf(2), Integer.valueOf(m.size()));
+
+        m = threeEntries();
+        check("values().remove", Boolean.TRUE, Boolean.valueOf(m.values().remove("1")));
+        check("  size", Integer.valueOf(2), Integer.valueOf(m.size()));
+
+        // The same over a LinkedHashMap, whose nodes are the real Entry class.
+        Map<String, String> lm = new LinkedHashMap<>();
+        lm.put("a", "1");
+        lm.put("b", "2");
+        check("LHM keySet().remove", Boolean.TRUE, Boolean.valueOf(lm.keySet().remove("a")));
+        check("  order", "[b=2]", entryListOf(lm).toString());
+
+        // A view over many entries, so the snapshot spans several buckets.
+        Map<String, String> big = new HashMap<>();
+        for (int i = 0; i < 200; i++) {
+            big.put("k" + i, "v" + i);
+        }
+        int reported = 0;
+        for (int i = 0; i < 200; i++) {
+            if (big.keySet().remove("k" + i)) {
+                reported++;
+            }
+        }
+        check("200 keySet removes report true", Integer.valueOf(200),
+                Integer.valueOf(reported));
+        check("  map emptied", Boolean.TRUE, Boolean.valueOf(big.isEmpty()));
+    }
+
+    private static Map<String, String> threeEntries() {
+        Map<String, String> m = new HashMap<>();
+        m.put("a", "1");
+        m.put("b", "2");
+        m.put("c", "3");
+        return m;
     }
 
     private static void manyEntriesSurviveResize() {
@@ -379,6 +469,7 @@ public class LinkedHashMapNodeProbe {
         entrySetSetValueWritesThrough();
         accessOrderIsLru();
         setMembershipIsReportedCorrectly();
+        mapViewsReportMutationCorrectly();
         serializationRoundTrip();
         manyEntriesSurviveResize();
 

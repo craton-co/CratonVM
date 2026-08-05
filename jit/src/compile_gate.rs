@@ -374,8 +374,26 @@ mod tests {
         format!("cratonvm/test/compile_gate/{tag}")
     }
 
+    /// Serialises every test that reads a process-global counter, does
+    /// something, and asserts the delta.
+    ///
+    /// `unique()` keeps the *bail-list* keys from colliding, but `ADMISSIONS`
+    /// and `UNGATED_BACKEND_ENTRIES` are single counters shared by the whole
+    /// binary: three tests here call `admit(.., CompileDoor::Osr)` and three
+    /// call `note_backend_entry()`, so a read-then-assert pair in one sees
+    /// another's increment and the `+1` becomes `+2`. It reproduced as
+    /// `admissions_are_counted_per_door` failing in the full suite and passing
+    /// in isolation — the shape that reads as flakiness and is not.
+    ///
+    /// A `>= before + 1` assertion would also make it pass, and would be
+    /// strictly worse: the point of the counter is that it moves by exactly the
+    /// number of admissions, and a `>=` cannot tell a double-count from a
+    /// correct one.
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn an_admission_opens_and_closes_the_thread_scope() {
+        let _guard = COUNTER_LOCK.lock();
         assert!(!admission_is_open());
         let cls = unique("scope");
         let a = admit(&cls, "m", "()V", CompileDoor::Osr).expect("clean method admits");
@@ -390,6 +408,7 @@ mod tests {
     /// the rest of the outer compile read as ungated.
     #[test]
     fn admissions_nest() {
+        let _guard = COUNTER_LOCK.lock();
         let outer = admit(&unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry)
             .expect("admits");
         let inner = admit(&unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry)
@@ -407,6 +426,7 @@ mod tests {
     /// refused at every door, not just the one that recorded the bail.
     #[test]
     fn a_bail_listed_method_is_refused_at_every_door() {
+        let _guard = COUNTER_LOCK.lock();
         let cls = unique("bail-listed");
         crate::mark_jit_bail_listed(&cls, "m", "()V");
         for door in CompileDoor::ALL {
@@ -434,6 +454,7 @@ mod tests {
     /// assertion pass vacuously.
     #[test]
     fn admissions_are_counted_per_door() {
+        let _guard = COUNTER_LOCK.lock();
         let before = admissions(CompileDoor::Osr);
         let _a = admit(&unique("counted"), "m", "()V", CompileDoor::Osr).expect("admits");
         assert_eq!(admissions(CompileDoor::Osr), before + 1);
@@ -445,6 +466,7 @@ mod tests {
     /// VM side.
     #[test]
     fn the_ungated_witness_fires_only_without_a_token() {
+        let _guard = COUNTER_LOCK.lock();
         let before = ungated_backend_entries();
         note_backend_entry();
         assert_eq!(
@@ -470,6 +492,7 @@ mod tests {
     /// reach for it and both layers would go quiet at once.
     #[test]
     fn the_backend_test_token_is_still_counted_as_ungated() {
+        let _guard = COUNTER_LOCK.lock();
         let before = ungated_backend_entries();
         let t = CompileAdmission::for_backend_test();
         assert!(

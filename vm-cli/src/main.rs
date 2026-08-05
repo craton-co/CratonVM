@@ -85,7 +85,27 @@ fn maybe_dump_shutdown_reports() {
                  arm_bytes={arm_bytes} enc_bytes={enc_bytes}"
             );
         }
+        // Increment 2's verdict tally. Printed on its own line and with the
+        // three states kept apart on purpose: `verified` methods with a zero
+        // `values` total and `nothing_to_cover` methods look identical in any
+        // collapsed "ok" count, and only the first is evidence. `rejected` is
+        // not a ratio — any non-zero value is a compiler bug.
+        let (verified, values, vacuous, indescribable, rejected) =
+            cratonvm_jit::ir_lower::mir_totals::read_alloc();
+        if verified + vacuous + indescribable + rejected != 0 {
+            eprintln!(
+                "[ir-isel] MIR ALLOC verified={verified} values={values} \
+                 nothing_to_cover={vacuous} indescribable={indescribable} \
+                 rejected={rejected}"
+            );
+        }
     }
+
+    // Final tally for the resolved-field site cache. Self-gated on
+    // `CRATONVM_DBG=field-site`; a run that never sets it prints nothing. This
+    // is what proves the lever is live before anyone times it — an inert gate
+    // reports `hit=0` here rather than hiding inside a timing wash.
+    cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();

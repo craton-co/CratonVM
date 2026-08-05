@@ -1659,6 +1659,34 @@ pub(crate) fn is_forkjoin_native_override(
                     "awaitQuiescence",
                     "(JLjava/util/concurrent/TimeUnit;)Z"
                 )
+                // BULK SUBMISSION — `invokeAll(Collection)` is the overload
+                // Weld's ConcurrentBeanDeployer ->
+                // AbstractExecutorServices.invokeAllAndCheckForExceptions
+                // calls. It was on NEITHER allow-list, so it fell through to
+                // real JDK bytecode against the under-initialized
+                // `commonPool()` bridge object and threw
+                // RejectedExecutionException at submissionQueue() — the whole
+                // `org.hibernate.orm.test.cdi.*` cluster. `invokeAny` was
+                // uncovered too and failed silently (ran the callables, then
+                // returned null), and `lazySubmit` threw like invokeAll.
+                | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/List;")
+                | (
+                    "invokeAll",
+                    "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/util/List;"
+                )
+                | (
+                    "invokeAllUninterruptibly",
+                    "(Ljava/util/Collection;)Ljava/util/List;"
+                )
+                | ("invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;")
+                | (
+                    "invokeAny",
+                    "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"
+                )
+                | (
+                    "lazySubmit",
+                    "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;"
+                )
         )
     {
         return true;
@@ -1686,6 +1714,10 @@ pub(crate) fn is_forkjoin_native_override(
             | ("isCancelled", "()Z")
             | ("cancel", "(Z)Z")
             | ("complete", "(Ljava/lang/Object;)V")
+            // Reads the throwable the side table records for an abnormally
+            // completed task, so it cannot disagree with join()/get() about
+            // whether the task failed.
+            | ("getException", "()Ljava/lang/Throwable;")
     )
 }
 
