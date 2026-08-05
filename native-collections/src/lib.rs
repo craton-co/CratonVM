@@ -5642,15 +5642,21 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         return (None, 0, MAP_DEFAULT_CAPACITY as i32);
     }
 
-    let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
+    // The receiver's OWN bucket slot: its `table` when it has one, the
+    // fabricated model's slot 0 otherwise. This used to read slot 0
+    // unconditionally and fall back to the resolved `table` only when slot 0
+    // held no array — which worked because the writers ALSO wrote slot 0, i.e.
+    // `AbstractMap.keySet` on a real `HashMap`. See `map_buckets_slot`.
+    let buckets_slot = map_buckets_slot(ctx, this);
+    let buckets_primary = match ctx.get_field(this, buckets_slot) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
                 Some(arr)
             } else {
-                // Diagnostic only — slot 0 is not the `table` field for
-                // JDK-constructed maps, and the fallback below resolves it
-                // properly. Gate the probe behind the cached HM-trace flag
-                // so the common path does no stderr I/O.
+                // Diagnostic only — the receiver is not bucket-backed at all
+                // (a `Collections$EmptyMap`, a wrapper, a JDK-constructed map
+                // whose table is still null). Gate the probe behind the cached
+                // HM-trace flag so the common path does no stderr I/O.
                 if dbg_hm_trace() {
                     let map_cls = ctx
                         .class_name_of_id(ctx.class_id_of_object(this))
@@ -5659,9 +5665,9 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
                         .class_name_of_id(ctx.class_id_of_object(arr))
                         .unwrap_or_default();
                     eprintln!(
-                        "[MAP-STATE-GUARD] non-array buckets slot0: map={:?}({}) slot0={:?}({}) \
+                        "[MAP-STATE-GUARD] non-array buckets slot{}: map={:?}({}) held={:?}({}) \
                          — receiver was not a bucket-backed HashMap; treating buckets as absent",
-                        this, map_cls, arr, slot0_cls
+                        buckets_slot, this, map_cls, arr, slot0_cls
                     );
                 }
                 None
@@ -5669,97 +5675,35 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         }
         _ => None,
     };
-    // For JDK-constructed maps (e.g. AnnotationAttributes via Spring's
-    // `new AnnotationAttributes(annotationType, false)`), the absolute
-    // slot 0 is NOT necessarily the `table` field. Fall back to the
-    // JDK-resolved `table` slot when slot 0 doesn't yield a bucket array.
-    let hashtable_layout = uses_native_hashtable_layout(ctx, this);
-    let buckets = buckets_slot0.or_else(|| {
-        if hashtable_layout {
-            return None;
-        }
-        // JDK-ONLY-LAYOUT (L2): the `table` field of the class the receiver
-        // ACTUALLY is, not of `java/util/HashMap`. Resolving against a fixed
-        // class name reads `HashMap`'s index off an unrelated layout — on a
-        // `Properties` that is `Hashtable.threshold`, an `int`, so this
-        // fallback probed a field that can never hold a bucket array.
-        let slot = receiver_table_slot(ctx, this)?;
-        if slot == MAP_FIELD_BUCKETS {
-            return None;
-        }
-        match ctx.get_field(this, slot) {
-            Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
-            _ => None,
-        }
-    });
-    // S111r28: Read size from the JDK-resolved `size` field by name when the
-    // class metadata is available. The synthetic absolute-slot-1 fallback
-    // only fires for raw `alloc_object(ClassId::new(0), ...)` allocations
-    // that were never bound to the real `java/util/HashMap` class — those
-    // still use the legacy `slot 1 = Int(size)` convention.
+    // No slot-0 secondary. A first cut kept one, for "a map some older path
+    // populated at the model slot", and the widened census answered that
+    // empirically: 50 reads across the probe set, every one of them returning
+    // `Int(0)` — an unset `AbstractMap.keySet` — and never an array. It was a
+    // read of the wrong field that could not succeed, so it is gone; the one
+    // writer of a bucket table is `publish_map_table`, which writes exactly
+    // the slot `map_buckets_slot` reads.
+    // `uses_native_hashtable_layout` is no longer consulted here: it existed to
+    // stop the slot-0 secondary from firing on a `Hashtable` (whose slot 0 IS
+    // its `table`, so the secondary would have re-read the primary). With the
+    // secondary gone, `map_buckets_slot` already answers 0 for that family for
+    // the right reason.
+    let buckets = buckets_primary;
+    // Read the entry count from the slot the receiver declares for it — the
+    // same question `set_map_size` asks, through the same function, so the two
+    // cannot drift. See [`map_size_slot`].
     //
-    // Why name-resolution: real-JDK HashMap inherits AbstractMap's
-    // `keySet`/`values` reference fields, so absolute slot 1 actually
-    // corresponds to the inherited `values` field (descriptor
-    // `Ljava/util/Collection;`). Writing `Int(0)` there triggers the
-    // descriptor-aware coercion path which rewrites `Int(0)` as
-    // `Object(None)` (see `coerce_field_value_by_descriptor`'s `b'L'` arm),
-    // so subsequent reads see `Object(None)` instead of `Int(0)` and we
-    // would fall through to slot 2 (`MAP_FIELD_CAPACITY`) and report the
-    // bucket count as the size.
-    // BUG fix (Tomcat Jasper/ecj JSP-compile NPE — TestDefaultServlet
-    // .testBug57601 / TestMapperWebapps.testWelcomeFileStrict): this used to
-    // hardcode `"java/util/HashMap"` regardless of the receiver's actual
-    // class. For a genuine `HashMap`/`LinkedHashMap` that is harmless (same
-    // class, same slot). For a `Hashtable` receiver — a completely
-    // different, unrelated class hierarchy that merely shares this generic
-    // bucket-map native machinery — resolving "size" against HashMap's OWN
-    // layout can land on whatever field happens to sit at that same
-    // absolute index in Hashtable's layout, which is NOT a "size" field at
-    // all (Hashtable's own count-tracking field is named `count`, and
-    // separately `bump_map_mod_count` — correctly, via `get/set_field_by_name`
-    // — resolves and increments Hashtable's real `modCount` field by the
-    // OBJECT's own class). If HashMap's "size" slot and Hashtable's
-    // "modCount" slot coincide, `set_map_size`'s write and the very next
-    // `bump_map_mod_count` call both land on the identical physical slot:
-    // size is set to N, then immediately incremented again to N+1 as a
-    // side effect of "bumping modCount" — silently DOUBLING the tracked
-    // size on every put. That corrupted `Hashtable(11).size()` (used by
-    // ecj's `CompilationResult.getClassFiles()`: `new
-    // ClassFile[compiledTypes.size()]` then `.toArray(classFiles)`),
-    // leaving the caller-supplied array null-padded past the real entry
-    // count and NPEing in `CompilationUnitDeclaration.cleanUp()`. Resolve
-    // against the RECEIVER's own actual class (matching
-    // `get_field_by_name`/`bump_map_mod_count`) instead of a hardcoded
-    // class name — for HashMap/LinkedHashMap this is a no-op (same
-    // inherited field, same index); for every other class it correctly
-    // returns `None` (they have no field literally named "size") and falls
-    // through to the legacy slot-1 convention below, which nothing else
-    // independently mutates.
-    //
-    // PERF (collections-classification-cost): `class_name_of_id` is a
-    // `class_manager` read lock plus a fresh heap `String` on every call, and
-    // `map_state` runs on every node-path map operation. `class_name_rc`
-    // memoizes the name per `ClassId` (sound because ids are never reissued —
-    // see the `class_facts` module comment) and hands out an `Rc<str>` clone:
-    // a non-atomic refcount bump, no lock, no allocation. The resolved name is
-    // byte-identical, so `resolve_field_index` sees exactly what it saw before;
-    // the field index itself is deliberately NOT memoized, since JVMTI
-    // redefinition may change a class's field layout while its name and
-    // supertypes stay fixed.
-    let receiver_class_name: std::rc::Rc<str> =
-        class_name_rc(ctx, ctx.class_id_of_object(this)).unwrap_or_else(|| std::rc::Rc::from(""));
-    let size_by_name = ctx
-        .resolve_field_index(
-            if hashtable_layout {
-                "java/util/Hashtable"
-            } else {
-                &*receiver_class_name
-            },
-            if hashtable_layout { "count" } else { "size" },
-        )
-        .filter(|&slot| slot < ctx.object_num_fields(this))
-        .map(|slot| ctx.get_field(this, slot));
+    // The long history this replaces is worth keeping in one line: resolving
+    // "size" against a hard-coded `java/util/HashMap` landed on `Hashtable`'s
+    // `modCount` for a `Hashtable` receiver, so `set_map_size` and the next
+    // `bump_map_mod_count` wrote the same physical slot and DOUBLED the size on
+    // every put (ecj's `CompilationResult.getClassFiles()` then null-padded its
+    // array and NPE'd). Resolving on the receiver's own class fixed that; this
+    // change finishes the job by making the fallback slot a property of the
+    // receiver rather than a constant.
+    let size_by_name = {
+        let slot = map_size_slot(ctx, this);
+        Some(ctx.get_field(this, slot))
+    };
     // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
     // any Map-typed receiver, including non-synthetic JDK maps with fewer than 3
     // slots (e.g. `java/util/Collections$EmptyMap`, which has only AbstractMap's
@@ -5804,33 +5748,40 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     (buckets, size, cap)
 }
 
-/// S111r28: Write the HashMap `size` field to BOTH the legacy synthetic
-/// slot (absolute slot 1) and the JDK-resolved `size` slot when the class
-/// metadata is available. Reads through `map_state` prefer the name-resolved
-/// slot, which has descriptor `I` and is immune from the `b'L'` Int→Object
-/// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
-fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
-    ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
-    // See the matching comment in `map_state` — resolve "size" against the
-    // RECEIVER's own actual class, not a hardcoded "java/util/HashMap". For
-    // a non-HashMap-family receiver (e.g. `Hashtable`) this correctly finds
-    // no such field instead of colliding with an unrelated field (observed:
-    // Hashtable's own `modCount`) at whatever index HashMap's "size"
-    // happens to occupy.
-    // PERF (collections-classification-cost): memoized per `ClassId` — see the
-    // matching note in `map_state`.
-    let receiver_class_name: std::rc::Rc<str> =
-        class_name_rc(ctx, ctx.class_id_of_object(this)).unwrap_or_else(|| std::rc::Rc::from(""));
-    let (class_name, field_name) = if uses_native_hashtable_layout(ctx, this) {
-        ("java/util/Hashtable", "count")
-    } else {
-        (&*receiver_class_name, "size")
-    };
-    if let Some(slot) = ctx.resolve_field_index(class_name, field_name) {
-        if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
-            ctx.set_field(this, slot, Value::Int(size));
+/// The slot this receiver keeps its entry count in: its own `size` (the
+/// `HashMap` family) or `count` (the `Hashtable` family, which `Properties`
+/// inherits), and only otherwise the fabricated model's slot 1.
+///
+/// Read and write go through this one function on purpose. They used to
+/// disagree in shape — the writer wrote BOTH slot 1 and a name-resolved slot,
+/// the reader preferred the name-resolved one and fell back to slot 1 — which
+/// is survivable only because slot 1 on a real `HashMap` is
+/// `AbstractMap.values`, a reference, so the `Int` coerced to `null` and read
+/// back as "absent". That is the 8,000-hit benign census row: benign in
+/// outcome, still a write to a field the native did not mean.
+///
+/// Resolving `count` by NAME on the receiver also removes the last fixed-class
+/// lookup here: `Properties` has no `size`, and its `count` is inherited from
+/// `Hashtable` at absolute slot 1 — the old code got that right by writing the
+/// raw slot, which is right for exactly the layouts where it is an accident.
+fn map_size_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let class_id = ctx.class_id_of_object(this);
+    let nf = ctx.object_num_fields(this);
+    for name in ["size", "count"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, name) {
+            if slot < nf {
+                return slot;
+            }
         }
     }
+    MAP_FIELD_SIZE
+}
+
+/// Write the map's entry count to the slot the receiver actually declares for
+/// it — see [`map_size_slot`].
+fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
+    let slot = map_size_slot(ctx, this);
+    ctx.set_field(this, slot, Value::Int(size));
 }
 
 /// S111r28 helper: best-effort write of a JDK-named HashMap field to the
@@ -5913,6 +5864,41 @@ fn receiver_table_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize
         .filter(|&slot| slot < ctx.object_num_fields(this))
 }
 
+/// The slot this receiver's bucket array lives in: its own `table` field when
+/// it has one, and only otherwise the fabricated model's slot 0.
+///
+/// This is the whole of the "model slots on a real layout" fix. L2 made the
+/// WRITES land on the receiver's own `table`, but kept writing slot 0 as well,
+/// because every reader still went there. On a real `java.util.HashMap` slot 0
+/// is `AbstractMap.keySet` — a `Set`-typed field holding a bucket array.
+///
+/// No census could see it: both are references, so the cross-type predicate is
+/// blind by construction, and L4's shadow-layout diff can only say the model
+/// and the image disagree, not what the slot holds at runtime. What sees it is
+/// `probes/MapModelSlotProbe`, reading the field reflectively. Before this
+/// change, against HotSpot 25.0.3+9:
+///
+/// ```text
+///   HotSpot   fresh/filled/copyCtor/sizedCtor  keySet=null
+///   CratonVM  fresh/filled/copyCtor/sizedCtor  keySet=ARRAY[Object]
+/// ```
+///
+/// and it stayed `ARRAY[Object]` after `keySet()` was called, where HotSpot
+/// caches a `HashMap$KeySet` there. That is the failure mode, not a tidiness
+/// argument: real `HashMap.keySet()` bytecode is `if (ks == null) ks = new
+/// KeySet(); return ks`, so a non-null bucket array short-circuits the lazy
+/// init and returns an `Object[]` to a caller that will `invokeinterface
+/// Set.iterator()` on it. It does not fault today only because the natives
+/// shadow every reader — the same conditional safety the `VarHandle` row had,
+/// and item 3/7 (L11) is in the business of removing exactly that shadow.
+///
+/// Cost: one `resolve_field_index_by_class_id` per call on a path that runs
+/// per map operation. Deliberately NOT memoized until measured — see the A/B
+/// in the commit message.
+fn map_buckets_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    receiver_table_slot(ctx, this).unwrap_or(MAP_FIELD_BUCKETS)
+}
+
 /// Publish a freshly built bucket table on `map`, honouring both storage
 /// conventions this crate maintains:
 ///
@@ -5959,24 +5945,29 @@ fn publish_map_table_inner(
     volatile: bool,
 ) {
     let table_slot = receiver_table_slot(ctx, map);
+    // ONE store, to the slot this receiver actually keeps its table in.
+    //
+    // This used to write slot 0 as well, unconditionally, so that the readers
+    // could go there without resolving anything. On a real `HashMap` slot 0 is
+    // `AbstractMap.keySet`, so every map this VM built handed the image a
+    // `Set` field holding an `Object[]` (`probes/MapModelSlotProbe`:
+    // `keySet=ARRAY[Object]` where HotSpot has `null`). `map_state` now asks
+    // `map_buckets_slot` the same question, so the second store bought
+    // nothing but the wrong field.
+    let slot = table_slot.unwrap_or(MAP_FIELD_BUCKETS);
     if volatile {
-        ctx.set_field_volatile(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        ctx.set_field_volatile(map, slot, Value::Object(Some(buckets)));
     } else {
-        ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        ctx.set_field(map, slot, Value::Object(Some(buckets)));
     }
-    match table_slot {
-        Some(slot) if slot != MAP_FIELD_BUCKETS => {
-            if volatile {
-                ctx.set_field_volatile(map, slot, Value::Object(Some(buckets)));
-            } else {
-                ctx.set_field(map, slot, Value::Object(Some(buckets)));
-            }
-        }
-        Some(_) => {}
-        // Fabricated layout: slot 2 means `capacity` and nothing else. The
-        // write stays unguarded, as it has always been — `set_field` is
-        // contractually bounds-checked (M4a) and drops an out-of-range index.
-        None => ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap)),
+    // Fabricated layout: slot 2 means `capacity` and nothing else. On a real
+    // layout it is a declared field (`table` on `HashMap`, `threshold` on
+    // `Hashtable`) and `map_state` derives the capacity from the array length,
+    // so there is nothing to store. The write stays unguarded, as it has
+    // always been — `set_field` is contractually bounds-checked (M4a) and
+    // drops an out-of-range index.
+    if table_slot.is_none() {
+        ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap));
     }
 }
 
@@ -10248,13 +10239,12 @@ fn alloc_view_backing(
             ctx.alloc_object(hashmap_cid, n_fields)
         });
         ctx.set_field(backing, f_table, Value::Object(Some(buckets)));
-        // Dual-storage: also keep the bucket array at the synthetic slot 0 so the
-        // legacy slot-0 readers (`map_state`'s fast path, the `collect_view_
-        // snapshot` HashMap-like guard) see it without the table-slot fallback,
-        // and stay consistent with what `map_resize`/`resync_view_set` maintain.
-        if f_table != MAP_FIELD_BUCKETS {
-            ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-        }
+        // No slot-0 mirror. This backing is allocated as a real
+        // `java/util/HashMap`, so slot 0 is `AbstractMap.keySet` and the array
+        // does not belong there; `map_state` and the `collect_view_snapshot`
+        // guard both ask `map_buckets_slot`, which answers `f_table` for this
+        // object. (The mirror existed so those readers could go straight to
+        // slot 0 without resolving anything.)
         ctx.set_field(backing, f_size, Value::Int(0));
         if let Some(f) = f_modcount {
             ctx.set_field(backing, f, Value::Int(0));
@@ -34091,9 +34081,12 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if is_lhm_receiver(ctx, backing) {
                 return collect_view_snapshot_ordered(ctx, backing);
             }
-            // Otherwise verify it's a HashMap-like (slot 0 = bucket array).
-            if MAP_FIELD_BUCKETS < ctx.object_num_fields(backing) {
-                let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
+            // Otherwise verify it's a HashMap-like: its bucket slot holds an
+            // array. Asks `map_buckets_slot` rather than slot 0, which on a
+            // real-layout backing is `AbstractMap.keySet`.
+            let bucket_slot = map_buckets_slot(ctx, backing);
+            if bucket_slot < ctx.object_num_fields(backing) {
+                let s0 = ctx.get_field(backing, bucket_slot);
                 if let Value::Object(Some(arr)) = s0 {
                     if ctx.heap_kind_of(arr) == ObjectKind::Array {
                         return collect_view_snapshot_ordered(ctx, backing);
@@ -55390,21 +55383,32 @@ mod tests {
         /// `table` field (`arraylength` on an int) and produced the
         /// `HashMap` slot-2 census row.
         #[test]
-        fn publish_map_table_mirrors_into_the_real_table_slot() {
+        fn publish_map_table_writes_only_the_receivers_own_table_slot() {
             let mut ctx = MockCtx::new(1);
             define_real_hashmap(&ctx);
             let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            // A sentinel in slot 0 (`AbstractMap.keySet` on a real HashMap):
+            // the test is that publishing a table does not touch it.
+            let sentinel = ctx.alloc_object_of(STUB_CID, 1);
+            ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(sentinel)));
             let buckets = ctx.new_ref_array(ClassId::new(0), 16);
 
             publish_map_table(&mut ctx, map, buckets, 16);
 
             assert!(
-                matches!(ctx.get_field(map, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
-                "slot 0 is what every native map op reads"
+                matches!(ctx.get_field(map, 2), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "the real `table` slot holds the array"
             );
             assert!(
-                matches!(ctx.get_field(map, 2), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
-                "the real `table` slot must hold the array, never an Int"
+                matches!(ctx.get_field(map, MAP_FIELD_BUCKETS), Value::Object(Some(o)) if o.as_ptr() == sentinel.as_ptr()),
+                "slot 0 is `AbstractMap.keySet` on this receiver and must be                  left alone — HotSpot keeps it null until keySet() is called,                  and a non-null value there short-circuits the JDK's lazy init"
+            );
+            // Read-back through the accessor the natives use: the array must
+            // still be findable, or every map operation breaks.
+            assert_eq!(map_buckets_slot(&ctx, map), 2);
+            assert!(
+                matches!(map_state(&ctx, map).0, Some(b) if b.as_ptr() == buckets.as_ptr()),
+                "map_state must find the table where publish_map_table put it"
             );
         }
 
@@ -55536,6 +55540,68 @@ mod tests {
                  note this stub is WIDER than the real HashMap, so a field \
                  count could not have told them apart"
             );
+        }
+
+        /// `size` lives where the receiver declares it, and the read and the
+        /// write must agree — they are the same function.
+        #[test]
+        fn map_size_slot_is_the_receivers_own_count_field() {
+            let ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            let stub = ctx.alloc_object_of(STUB_CID, 16);
+
+            // `HashMap.size` is slot 4 — NOT slot 1, which is
+            // `AbstractMap.values` and took the Int for years.
+            assert_eq!(map_size_slot(&ctx, map), 4);
+            // `Properties` has no `size`; it inherits `Hashtable.count` at 1.
+            // The old code got this right only because the raw model slot
+            // happens to be 1 as well.
+            assert_eq!(map_size_slot(&ctx, props), 1);
+            // Fabricated: the model's slot 1 stands.
+            assert_eq!(map_size_slot(&ctx, stub), MAP_FIELD_SIZE);
+        }
+
+        /// The round-trip that matters: whatever `set_map_size` writes,
+        /// `map_state` reads back, on every layout.
+        #[test]
+        fn map_size_round_trips_on_every_layout() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+
+            for (label, obj) in [
+                ("hashmap", ctx.alloc_object_of(HASHMAP_CID, 8)),
+                ("properties", ctx.alloc_object_of(PROPERTIES_CID, 10)),
+                ("stub", ctx.alloc_object_of(STUB_CID, 16)),
+            ] {
+                set_map_size(&mut ctx, obj, 7);
+                assert_eq!(map_state(&ctx, obj).1, 7, "size round-trip on {label}");
+            }
+        }
+
+        /// Slot 1 on a real `HashMap` is `AbstractMap.values`. Nothing may
+        /// write it — that is the 8,000-hit census row this lane removes.
+        #[test]
+        fn set_map_size_leaves_abstract_map_values_alone() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let sentinel = ctx.alloc_object_of(HASHMAP_CID, 1);
+            ctx.set_field(map, 1, Value::Object(Some(sentinel)));
+
+            set_map_size(&mut ctx, map, 3);
+
+            assert!(
+                matches!(ctx.get_field(map, 1), Value::Object(Some(o)) if o.as_ptr() == sentinel.as_ptr()),
+                "`values` must survive a size write"
+            );
+            assert_eq!(ctx.get_field(map, 4), Value::Int(3), "`size` got it");
         }
 
         /// The bound matters: a real class can declare `table` at an index the
