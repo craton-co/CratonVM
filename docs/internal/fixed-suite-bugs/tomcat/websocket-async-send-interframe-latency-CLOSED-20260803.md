@@ -6,7 +6,7 @@
 | **Test** | still FAILS (SEQ2), and is expected to until the residue doc closes |
 | **HotSpot** | PASS 3/3 (SEQ2 = 1, 2, 0 of 500) |
 | **CratonVM** | FAIL 3/3 (SEQ2 = 476, 486, 481 of 500; before the fix, 491, 489, 483) |
-| **Residue owned by** | [`aqs-thread-handoff-latency` — RETIRED 2026-08-05](../../aqs-thread-handoff-latency-RETIRED-20260805.md), residual now [`uncontended-reentrantlock-pair-is-mostly-unattributed`](../../../known-issues/vm/uncontended-reentrantlock-pair-is-mostly-unattributed-20260805.md) |
+| **Residue owned by** | [`aqs-thread-handoff-latency` — RETIRED 2026-08-05](../../aqs-thread-handoff-latency-RETIRED-20260805.md), residual now [`native-funnel-fixed-cost-is-the-remaining-wall`](../../../known-issues/vm/native-funnel-fixed-cost-is-the-remaining-wall-20260805.md) |
 
 This doc opened with "**root cause not found**" and three Next Steps. All three
 are answered below. It is closed on the same basis as

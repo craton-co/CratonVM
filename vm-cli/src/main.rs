@@ -4201,6 +4201,13 @@ fn run() -> Result<()> {
             "[cratonvm] compiled leaf-native dispatches: {}",
             cratonvm_vm::jit::helpers::leaf_native_hit_count()
         );
+        // The non-leaf half of the same cache: these skipped `invoke_or_native`
+        // but still entered the funnel. Reported separately because it is the
+        // larger population and the one that carries `java.util.concurrent`.
+        eprintln!(
+            "[cratonvm] compiled site-cached native dispatches (non-leaf): {}",
+            cratonvm_vm::jit::helpers::site_cached_native_hit_count()
+        );
         // A zero above is ambiguous — "nothing here is a leaf" and "every site
         // was refused for a reason nobody intended" look identical — so the
         // fill-time refusal reasons are reported alongside it.
