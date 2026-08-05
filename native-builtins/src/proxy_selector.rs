@@ -437,14 +437,64 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16)
     isa
 }
 
+/// The `java.net.Proxy$Type` enum constant for one of our `PROXY_TYPE` codes.
+///
+/// JDK-ONLY-LAYOUT: our model stores the proxy kind as an `Int`; the real
+/// `java.net.Proxy` stores `type` as a **`Proxy$Type` enum reference**. That is
+/// a different defect from the index mismatches elsewhere in this sweep —
+/// resolving `type` by name finds a perfectly real field, and writing our `int`
+/// into it is *still* wrong. The value has to be converted, not relocated.
+///
+/// Returns `None` when the enum is not loaded or the constant is missing, in
+/// which case the caller leaves the real field alone rather than writing a
+/// plausible-looking wrong value.
+fn proxy_type_constant(ctx: &mut dyn NativeContext, kind: i32) -> Option<ObjectRef> {
+    let name = match kind {
+        PROXY_TYPE_HTTP => "HTTP",
+        PROXY_TYPE_SOCKS => "SOCKS",
+        _ => "DIRECT",
+    };
+    let class_id = ctx.class_id_by_name("java/net/Proxy$Type")?;
+    let field_idx = ctx.static_field_index_by_name(class_id, name)?;
+    match ctx.get_static_field(class_id, field_idx) {
+        Value::Object(obj) => obj,
+        _ => None,
+    }
+}
+
+/// Does `p` have OUR two-slot `Proxy` layout rather than the real class's?
+///
+/// Asked by NAME, never by field count: `alloc_concurrent_synthetic` hands back
+/// at least the requested slot count either way, so a count test cannot tell the
+/// layouts apart. The real `java.net.Proxy` declares `type`; a fabricated stub
+/// has generated placeholders and does not.
+fn has_synthetic_proxy_layout(ctx: &mut dyn NativeContext, p: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(p);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "type")
+}
+
 fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) -> ObjectRef {
     let p = alloc_concurrent_synthetic(ctx, "java/net/Proxy", 2);
-    ctx.set_field(p, PROXY_TYPE, Value::Int(kind));
     let addr_val = match addr {
         Some(a) => Value::Object(Some(a)),
         None => Value::Object(None),
     };
-    ctx.set_field(p, PROXY_ADDRESS, addr_val);
+    if has_synthetic_proxy_layout(ctx, p) {
+        ctx.set_field(p, PROXY_TYPE, Value::Int(kind));
+        ctx.set_field(p, PROXY_ADDRESS, addr_val);
+    } else {
+        // Real layout. `type` is an enum reference — writing `Int(kind)` there
+        // was measured on 2026-08-04 destroying it (coerced to null), which
+        // makes `Proxy.type()` return null and `Proxy.toString()` throw. `sa`
+        // is the real name of the address field.
+        if let Some(type_obj) = proxy_type_constant(ctx, kind) {
+            ctx.set_field_by_name(p, "type", Value::Object(Some(type_obj)));
+        }
+        ctx.set_field_by_name(p, "sa", addr_val);
+    }
     p
 }
 

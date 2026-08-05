@@ -18362,14 +18362,30 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
         .unwrap_or(("0.0.0.0", 0));
-    let sa = alloc_synthetic(ctx, "java/net/InetSocketAddress", 2);
-    let sa_pin = ctx.pin_native_root(sa);
+    // Build the address through the real constructor rather than writing the
+    // legacy two-slot layout by hand. The hand-written form put a bare host
+    // String in slot 0 — where a real-layout `InetSocketAddress` keeps its
+    // `holder` — so `getAddress()` fell through to an out-of-range slot read
+    // and answered **null** while `isUnresolved()` still answered **false**.
+    // That is the same broken pair that let `ServerSocket.bind` walk past its
+    // unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`; here it
+    // simply meant `DatagramChannel.getLocalAddress().getAddress()` was null on
+    // a channel that was demonstrably bound. `(Ljava/lang/String;I)V` resolves
+    // the numeric literal and populates the holder, so both answers agree and
+    // match HotSpot.
     let host_s = ctx.create_string(host);
-    let sa = ctx.read_native_pin(sa_pin, sa);
-    ctx.unpin_native_roots(sa_pin);
-    ctx.set_field(sa, 0, Value::Object(Some(host_s)));
-    ctx.set_field(sa, 1, Value::Int(port));
-    Ok(Some(Value::Object(Some(sa))))
+    let host_pin = ctx.pin_native_root(host_s);
+    let host_s = ctx.read_native_pin(host_pin, host_s);
+    let built = ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(host_s)), Value::Int(port)],
+    );
+    ctx.unpin_native_roots(host_pin);
+    match built {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 // ---------------------------------------------------------------------------

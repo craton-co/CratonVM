@@ -97,7 +97,15 @@ public class ColdNewCpProbe {
 }
 "#;
 
+mod common;
+
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING binary is
+/// reported differently. See `common::require_binary`.
 fn cratonvm_binary() -> Option<PathBuf> {
+    common::require_binary(cratonvm_binary_lookup())
+}
+
+fn cratonvm_binary_lookup() -> Option<PathBuf> {
     if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
@@ -122,7 +130,13 @@ fn cratonvm_binary() -> Option<PathBuf> {
     None
 }
 
+/// Prerequisite gate: the lookup below is unchanged — only a MISSING JDK is
+/// reported differently. See `common::require_jdk`.
 fn jdk_home() -> Option<PathBuf> {
+    common::require_jdk(jdk_home_lookup())
+}
+
+fn jdk_home_lookup() -> Option<PathBuf> {
     for var in &["CRATONVM_TEST_JDK", "JAVA_HOME"] {
         if let Ok(j) = std::env::var(var) {
             let p = PathBuf::from(&j);

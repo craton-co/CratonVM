@@ -101,6 +101,12 @@ fn maybe_dump_shutdown_reports() {
         }
     }
 
+    // Final tally for the resolved-field site cache. Self-gated on
+    // `CRATONVM_DBG=field-site`; a run that never sets it prints nothing. This
+    // is what proves the lever is live before anyone times it — an inert gate
+    // reports `hit=0` here rather than hiding inside a timing wash.
+    cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and
@@ -603,6 +609,18 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
+    /// If set, sample every interpreter thread's Java frame chain to stderr
+    /// every `MILLIS` and keep running (no abort). Unlike
+    /// `--stack-dump-on-timeout`, which emits one dump per nested interpreter
+    /// entry and therefore ranks methods by CALL COUNT, this is a
+    /// time-weighted profile: aggregate the leaf frame of each emitted
+    /// `T19.H1 stack dump` record to see where wall-clock actually goes.
+    /// Diagnostic-only. JIT-compiled frames never reach the dispatch loop and
+    /// so are not sampled — pair it with `--nojit`, or read the result as
+    /// "of the interpreted time, ...".
+    #[arg(long = "stack-sample-ms", value_name = "MILLIS")]
+    stack_sample_ms: Option<u64>,
+
     // -----------------------------------------------------------------------
     // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
     //
@@ -1045,6 +1063,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--add-modules",
     "--Xlog",
     "--stack-dump-on-timeout",
+    "--stack-sample-ms",
     "--gpu-device",
     "--gpu-min-work",
 ];
@@ -3655,6 +3674,30 @@ fn run() -> Result<()> {
         cratonvm_vm::dispatch_trace::enable();
     }
 
+    // `--stack-sample-ms`: periodic, time-weighted Java-frame profiler. Arms
+    // sampling mode (which makes the interpreter CONSUME each dump request
+    // instead of latching it once per nested `execute()`), then re-arms the
+    // request every interval. Never aborts the process, so it composes with a
+    // normal run; the run just gets slower in proportion to the sample rate.
+    if let Some(ms) = args.stack_sample_ms.filter(|ms| *ms > 0) {
+        vm.shared.enable_stack_sampling();
+        let shared_for_sampler = std::sync::Arc::clone(&vm.shared);
+        let sampler_completed = std::sync::Arc::clone(&watchdog_completed);
+        std::thread::Builder::new()
+            .name("cratonvm-stack-sampler".into())
+            .spawn(move || {
+                eprintln!("=== stack sampler: armed at {ms}ms intervals ===");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if sampler_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    shared_for_sampler.request_stack_sample();
+                }
+            })
+            .ok();
+    }
+
     if let Some(secs) = effective_watchdog {
         // Enable the native-call ring buffer so the watchdog's "0 Java
         // threads dumped" fallback can show the last ~64 native methods
@@ -4148,30 +4191,36 @@ fn run() -> Result<()> {
             "[cratonvm] interpreter intrinsic dispatches: {}",
             cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
         );
-        // The compiled-code counterpart. The interpreter counter alone cannot
-        // answer the question the native-funnel work actually asks: with the
-        // JIT on, hot code never reaches the interpreter's inline cache, so an
-        // interpreter-side bypass reads as "landed" while being inert for
-        // every compiled call — which is exactly what happened to the
-        // `Thread.currentThread` fix. See `jit::helpers::JIT_FUNNEL_BYPASS_HITS`
-        // and native-call-funnel-per-call-floor-RETIRED-20260804.md.
+        // Compiled code's own funnel bypass. Reported beside the interpreter's
+        // counter because the two answer the same question for different
+        // execution tiers, and the JIT half is the one that was missing: a
+        // compiled loop's calls do not reach the interpreter's inline cache, so
+        // a run whose first number moves and whose second stays at zero has NOT
+        // been sped up where it is hot. See `jit::helpers::LEAF_NATIVE_HITS`.
+        eprintln!(
+            "[cratonvm] compiled leaf-native dispatches: {}",
+            cratonvm_vm::jit::helpers::leaf_native_hit_count()
+        );
+        // A zero above is ambiguous — "nothing here is a leaf" and "every site
+        // was refused for a reason nobody intended" look identical — so the
+        // fill-time refusal reasons are reported alongside it.
+        for (reason, count) in cratonvm_vm::jit::helpers::leaf_native_refusals() {
+            eprintln!("[cratonvm]   leaf sites refused, {reason}: {count}");
+        }
+        // `Thread.currentThread()` is served one level earlier still: the
+        // compilers bake a direct `CALL` to `jit_thread_current_thread_direct`,
+        // so those sites never reach the leaf path above, or any dispatch
+        // helper at all. The per-door site counts prove the bind is not inert;
+        // the denominators are what named the compile door that was missing.
+        // See `native-call-funnel-per-call-floor-item2-20260805.md`.
         let (sp_sites, ir_sites, osr_sites) = cratonvm_jit::thread_current_thread_bound_sites();
         let (sp_seen, ir_seen) = cratonvm_jit::static_sites_seen();
         eprintln!(
-            "[cratonvm] compiled-code native-funnel bypasses: {} \
-             (Thread.currentThread sites bound per compile door: \
-             single-pass {sp_sites}/{sp_seen}, IR {ir_sites}/{ir_seen}, OSR {osr_sites}; \
-             the two denominators are invokestatic sites those ladders examined)",
+            "[cratonvm] compiled Thread.currentThread direct calls: {} \
+             (sites bound per compile door: single-pass {sp_sites}/{sp_seen}, \
+             IR {ir_sites}/{ir_seen}, OSR {osr_sites}; the two denominators are \
+             invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
-        );
-        // LEAF natives (`cratonvm_native_api::leaf`). The violation count is
-        // always printed, not only when non-zero: a silent `0` from an
-        // un-armed audit and a genuine clean audit look identical otherwise,
-        // and that is the distinction the whole mechanism rests on.
-        eprintln!(
-            "[cratonvm] leaf-native funnel-free dispatches: {} (audit violations: {})",
-            cratonvm_vm::vm::leaf_native_dispatch_count(),
-            cratonvm_vm::vm::leaf_audit_violation_count(),
         );
     }
 

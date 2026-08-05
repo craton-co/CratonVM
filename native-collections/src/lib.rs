@@ -5602,8 +5602,13 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         if hashtable_layout {
             return None;
         }
-        let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
-        if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
+        // JDK-ONLY-LAYOUT (L2): the `table` field of the class the receiver
+        // ACTUALLY is, not of `java/util/HashMap`. Resolving against a fixed
+        // class name reads `HashMap`'s index off an unrelated layout — on a
+        // `Properties` that is `Hashtable.threshold`, an `int`, so this
+        // fallback probed a field that can never hold a bucket array.
+        let slot = receiver_table_slot(ctx, this)?;
+        if slot == MAP_FIELD_BUCKETS {
             return None;
         }
         match ctx.get_field(this, slot) {
@@ -5792,6 +5797,110 @@ fn try_set_jdk_map_field(
         if slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, value);
         }
+    }
+}
+
+/// The receiver's OWN bucket-array field (`table`), resolved by NAME against
+/// the class the receiver actually is, and bounded by its allocated slot count.
+///
+/// JDK-ONLY-LAYOUT (L2): every caller of this used to ask
+/// `resolve_field_index("java/util/HashMap", "table")` — a fixed class name —
+/// and then write that index into whatever `this` happened to be. On a
+/// `java.util.Properties` (which is deliberately excluded from
+/// `CF_HASHTABLE_LAYOUT`, because JDK 25 backs it with a side
+/// `ConcurrentHashMap`) `HashMap.table` is index 2, and index 2 on a real
+/// `Properties` is the inherited `Hashtable.threshold` — an `int`. That is the
+/// surviving `Properties` slot-2 row of the overlay census (`Object` written
+/// over an `I`): the bucket array both destroyed a live field and was stored
+/// where nothing reads it. The receiver's own `table` (inherited from
+/// `Hashtable`) is index 0, which slot 0 already holds.
+///
+/// `None` is the answer for a receiver that has no real `table` field at all —
+/// CratonVM's own fabricated map layouts (`cratonvm/util/MapViewBacking`, the
+/// bare `ClassId(0)` CHM segments, a synthetic-mode `HashMap` stub whose fields
+/// are `_f0.._fN`). That is the layout predicate this file needs, and it asks
+/// for a field NAME the real class declares rather than counting slots: a
+/// count test cannot separate the two layouts, because the allocators size
+/// every synthetic map to at least `MAP_NUM_FIELDS` and a real one to at least
+/// its real field count. (`object_num_fields(x) >= N` was exactly the inert
+/// `VarHandle` guard that nearly shipped on 2026-08-04.)
+///
+/// Caveat, shared with the `try_set_jdk_map_field` conversion that landed the
+/// same day: a subclass that declares its own field literally called `table`
+/// shadows the inherited one, and this resolves to the subclass's. That is the
+/// receiver's own answer to "where is your `table`", which is the best a name
+/// lookup can do; it is still strictly better than answering with a fixed
+/// class's index, which is right for exactly one receiver class.
+fn receiver_table_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let class_id = ctx.class_id_of_object(this);
+    ctx.resolve_field_index_by_class_id(class_id, "table")
+        .filter(|&slot| slot < ctx.object_num_fields(this))
+}
+
+/// Publish a freshly built bucket table on `map`, honouring both storage
+/// conventions this crate maintains:
+///
+/// * absolute slot 0 (`MAP_FIELD_BUCKETS`) always gets the array — it is what
+///   every other native map operation reads, and the native surface is the
+///   authoritative implementation for the `HashMap` family;
+/// * the receiver's REAL `table` field gets the same array when it is a
+///   different slot, so JDK bytecode that reads `getfield map.table` directly
+///   (`HashMap.resize`, `KeySpliterator`, `writeObject`) sees a live array
+///   rather than a stale value or an `Int`;
+/// * the legacy `Int(capacity)` at absolute slot 2 (`MAP_FIELD_CAPACITY`) is
+///   written ONLY when the receiver actually has our fabricated layout. On a
+///   real layout slot 2 is a declared field — `table` on `HashMap`,
+///   `threshold` on `Hashtable`/`Properties` — and the raw write either
+///   clobbers the bucket array with `Int(16)` (`arraylength` on an int, and
+///   the `HashMap` slot-2 census row) or destroys an unrelated field.
+///   `map_state` derives the capacity from the bucket array's length and only
+///   falls back to slot 2 when there is no array, so dropping the write costs
+///   nothing.
+///
+/// Neither `set_field` variant is a GC point (`gen_heap::write_barrier` never
+/// allocates from the Java heap), so callers may pass references they have
+/// already re-read through their pins.
+fn publish_map_table(ctx: &mut dyn NativeContext, map: ObjectRef, buckets: ObjectRef, cap: i32) {
+    publish_map_table_inner(ctx, map, buckets, cap, false);
+}
+
+/// [`publish_map_table`] with a release-style store of the bucket array, for
+/// `map_resize`'s publication of a rehashed table to lock-free CHM readers.
+fn publish_map_table_volatile(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+) {
+    publish_map_table_inner(ctx, map, buckets, cap, true);
+}
+
+fn publish_map_table_inner(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    buckets: ObjectRef,
+    cap: i32,
+    volatile: bool,
+) {
+    let table_slot = receiver_table_slot(ctx, map);
+    if volatile {
+        ctx.set_field_volatile(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    } else {
+        ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    }
+    match table_slot {
+        Some(slot) if slot != MAP_FIELD_BUCKETS => {
+            if volatile {
+                ctx.set_field_volatile(map, slot, Value::Object(Some(buckets)));
+            } else {
+                ctx.set_field(map, slot, Value::Object(Some(buckets)));
+            }
+        }
+        Some(_) => {}
+        // Fabricated layout: slot 2 means `capacity` and nothing else. The
+        // write stays unguarded, as it has always been — `set_field` is
+        // contractually bounds-checked (M4a) and drops an out-of-range index.
+        None => ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap)),
     }
 }
 
@@ -6746,28 +6855,30 @@ fn map_resize_inner(
     // fallback) complete before this volatile store. The non-CHM
     // (single-threaded HashMap) callers see identical semantics — a
     // volatile store is at least as strong as a plain store.
-    ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
-    set_map_size(ctx, this, size);
-    // Mirror the bucket array to the JDK-resolved `table` slot when present
+    // Mirror the bucket array to the receiver's own `table` slot when present
     // (and different from slot 0). This is critical for AnnotationAttributes
     // and other JDK-constructed maps where slot 0 may not be the `table`
     // field — without this mirror, subsequent reads via `map_state` (which
     // reads slot 0) would see the new buckets, but any JDK-bytecode path
     // that reads `table` directly would see null. Also keeps the two
     // storage locations in sync.
+    //
+    // JDK-ONLY-LAYOUT (L2): `publish_map_table_volatile` resolves `table` on
+    // the RECEIVER's class. This used to resolve it on `java/util/HashMap` and
+    // write index 2 into whatever `this` was — on a `Properties` (excluded
+    // from `CF_HASHTABLE_LAYOUT`, so it reaches this arm) index 2 is
+    // `Hashtable.threshold`, an `int`, and every rehash overwrote it with the
+    // bucket array. Same census row as `native_map_init`'s.
     if !uses_native_hashtable_layout(ctx, this) {
-        let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-        if let Some(slot) = table_slot {
-            if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
-                ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+        publish_map_table_volatile(ctx, this, new_buckets, new_cap);
+        set_map_size(ctx, this, size);
+    } else {
+        ctx.set_field_volatile(this, MAP_FIELD_BUCKETS, Value::Object(Some(new_buckets)));
+        set_map_size(ctx, this, size);
+        if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
             }
-        }
-        if table_slot != Some(MAP_FIELD_CAPACITY) {
-            ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
-        }
-    } else if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
-        if slot < ctx.object_num_fields(this) {
-            ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
         }
     }
     ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
@@ -7310,9 +7421,6 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    let this = ctx.read_native_pin(this_pin, this);
-    set_map_size(ctx, this, 0);
     // S111r29: Resolve the JDK `table` slot (descriptor `[Ljava/util/HashMap$Node;`)
     // and store the bucket array there. Writing `Int(MAP_DEFAULT_CAPACITY)` to
     // `MAP_FIELD_CAPACITY` (absolute slot 2) is dangerous when the JDK class
@@ -7324,23 +7432,20 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // capacity Int write if it would clobber `table`. `map_state` already
     // prefers the bucket array's length over `MAP_FIELD_CAPACITY`, so dropping
     // the Int write is safe.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot < ctx.object_num_fields(this) {
-            let this = ctx.read_native_pin(this_pin, this);
-            let buckets = ctx.read_native_pin(buckets_pin, buckets);
-            ctx.set_field(this, slot, Value::Object(Some(buckets)));
-        }
-    }
+    //
+    // JDK-ONLY-LAYOUT (L2): `publish_map_table` resolves `table` on the
+    // RECEIVER's class rather than on a hard-coded `java/util/HashMap`. This is
+    // the legacy branch the census pinned the surviving `Properties` slot-2 row
+    // on: a `Properties` reaches here (it is deliberately excluded from
+    // `CF_HASHTABLE_LAYOUT` because JDK 25 backs it with a side
+    // `ConcurrentHashMap`), `HashMap.table` is index 2, and index 2 on a
+    // `Properties` is the inherited `Hashtable.threshold` — an `int`. Its own
+    // `table` is index 0, which slot 0 already holds, so the mirror correctly
+    // collapses to a single write.
+    publish_map_table(ctx, this, buckets, MAP_DEFAULT_CAPACITY as i32);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(
-            this,
-            MAP_FIELD_CAPACITY,
-            Value::Int(MAP_DEFAULT_CAPACITY as i32),
-        );
-    }
+    set_map_size(ctx, this, 0);
 
     // Best-effort JDK-named field population for bytecode readers. `size`
     // was already mirrored by `set_map_size`; the rest are best-effort.
@@ -7408,26 +7513,14 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    let this = ctx.read_native_pin(this_pin, this);
-    set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
-    // into the JDK `table` slot so `HashMap.resize()` bytecode sees an array
-    // (or null), never an Int. Skip the legacy Int-capacity write when it
-    // would land on the same slot as JDK `table`.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot < ctx.object_num_fields(this) {
-            let this = ctx.read_native_pin(this_pin, this);
-            let buckets = ctx.read_native_pin(buckets_pin, buckets);
-            ctx.set_field(this, slot, Value::Object(Some(buckets)));
-        }
-    }
+    // into the receiver's own `table` slot so `HashMap.resize()` bytecode sees
+    // an array (or null), never an Int; write the legacy Int capacity only on
+    // our fabricated layout (JDK-ONLY-LAYOUT, L2).
+    publish_map_table(ctx, this, buckets, cap as i32);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
-    }
+    set_map_size(ctx, this, 0);
 
     // Best-effort JDK-named field population for bytecode readers.
     // `size` is mirrored by `set_map_size`.
@@ -10109,9 +10202,8 @@ fn alloc_view_backing(
     let backing = rooted_across(ctx, &mut [&mut source, &mut buckets], |ctx| {
         alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS)
     });
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing, buckets, cap as i32);
     set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
     ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
     backing
@@ -10482,30 +10574,23 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
     let backing = ctx.read_native_pin(roots_base, backing);
     let source = ctx.read_native_pin(source_pin, source);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    // Synthetic slot-0 bucket store (what map_state / iterator / remove read).
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    // Mirror the bucket array into the real `java/util/HashMap` `table` slot so
-    // JDK `keySet()/entrySet().spliterator()` bytecode (which reads `getfield
-    // map.table` directly) sees the live array instead of a stale value — and
-    // only write the synthetic `Int(capacity)` when `table` is NOT that same
-    // slot, otherwise it clobbers the bucket array and `arraylength` panics with
+    // Synthetic slot-0 bucket store (what map_state / iterator / remove read),
+    // plus a mirror into the backing's own `table` slot so JDK
+    // `keySet()/entrySet().spliterator()` bytecode (which reads `getfield
+    // map.table` directly) sees the live array instead of a stale value. The
+    // synthetic `Int(capacity)` is written only on our fabricated layout,
+    // otherwise it clobbers the bucket array and `arraylength` panics with
     // `expected object reference, got int(16)`. This mirrors the dual-storage
-    // `map_resize` already maintains (see its `table_slot` mirror).
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(t) = table_slot {
-        if t != MAP_FIELD_BUCKETS && t < ctx.object_num_fields(backing) {
-            ctx.set_field(backing, t, Value::Object(Some(buckets)));
-        }
-    }
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap));
-    }
+    // `map_resize` already maintains.
+    //
+    // JDK-ONLY-LAYOUT (L2): a view backing is EITHER a real `java/util/HashMap`
+    // (the branch above, ≥16 slots) or the fabricated
+    // `cratonvm/util/MapViewBacking`, and `publish_map_table` tells them apart
+    // by asking each receiver for its own `table` field — the fixed
+    // `java/util/HashMap` lookup answered `2` for both.
+    publish_map_table(ctx, backing, buckets, cap);
     // Reset modCount so the JDK spliterator's CME check stays consistent.
-    if let Some(mc) = ctx.resolve_field_index("java/util/HashMap", "modCount") {
-        if mc < ctx.object_num_fields(backing) {
-            ctx.set_field(backing, mc, Value::Int(0));
-        }
-    }
+    try_set_jdk_map_field(ctx, backing, "modCount", Value::Int(0));
     set_map_size(ctx, backing, 0);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
@@ -11112,9 +11197,8 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
     let backing_map_pin = ctx.pin_native_root(backing_map);
     let buckets = alloc_ref_array(ctx, cap);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing_map, buckets, cap as i32);
     set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
@@ -15546,9 +15630,8 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     let buckets_pin = ctx.pin_native_root(buckets);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing_map, buckets, cap as i32);
     set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
@@ -15591,9 +15674,8 @@ fn make_map_of(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodC
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let buckets = alloc_ref_array(ctx, cap);
     let map = ctx.read_native_pin(map_pin, map);
-    ctx.set_field(map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, map, buckets, cap as i32);
     set_map_size(ctx, map, 0);
-    ctx.set_field(map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
     for (i, (key, value)) in pairs.iter().enumerate() {
         let map = ctx.read_native_pin(map_pin, map);
@@ -26236,13 +26318,8 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             let this_pin = ctx.pin_native_root(this);
             let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+            publish_map_table(ctx, this, buckets, MAP_DEFAULT_CAPACITY as i32);
             set_map_size(ctx, this, 0);
-            ctx.set_field(
-                this,
-                MAP_FIELD_CAPACITY,
-                Value::Int(MAP_DEFAULT_CAPACITY as i32),
-            );
             ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
@@ -26269,9 +26346,14 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let cap = MAP_DEFAULT_CAPACITY;
     let buckets = alloc_ref_array(ctx, cap);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    // JDK-ONLY-LAYOUT (L2): `new HashMap<>(map)` gets the same treatment as the
+    // no-arg constructor. Writing `Int(cap)` at absolute slot 2 landed on the
+    // real `table` field of every real-layout receiver — the `HashMap` slot-2
+    // `Int` over `[` census row — leaving JDK bytecode an int where it expects
+    // the bucket array, while `native_map_init` right next door already stored
+    // the array there.
+    publish_map_table(ctx, this, buckets, cap as i32);
     set_map_size(ctx, this, 0);
-    ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
     // Copy entries from source, dispatching on its concrete backend
     // (LinkedHashMap overlay, TreeMap tree, HashMap/CHM buckets, or — via the
@@ -26341,13 +26423,13 @@ fn hashmap_table_size_for_u64(cap: u64) -> i32 {
 /// `HashMap.putMapEntries` does. The value is advisory — `readObject` recomputes
 /// threshold from `loadFactor` — so an approximation round-trips correctly.
 fn hashmap_serialized_capacity(ctx: &dyn NativeContext, this: ObjectRef, size: i32) -> i32 {
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "table") {
-        if slot < ctx.object_num_fields(this) {
-            if let Value::Object(Some(tab)) = ctx.get_field(this, slot) {
-                let len = ctx.array_length(tab);
-                if len > 0 {
-                    return len as i32;
-                }
+    // JDK-ONLY-LAYOUT (L2): the receiver's own `table`, not `HashMap`'s index
+    // read off an unrelated layout.
+    if let Some(slot) = receiver_table_slot(ctx, this) {
+        if let Value::Object(Some(tab)) = ctx.get_field(this, slot) {
+            let len = ctx.array_length(tab);
+            if len > 0 {
+                return len as i32;
             }
         }
     }
@@ -40626,9 +40708,10 @@ fn chm_init_segments(
         let seg_pin = ctx.pin_native_root(seg);
         let buckets = alloc_ref_array(ctx, cap_per_segment);
         let seg = ctx.read_native_pin(seg_pin, seg);
-        ctx.set_field(seg, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        // Segments are bare `ClassId(0)` three-slot objects — the fabricated
+        // layout — so this keeps writing `Int(capacity)` at slot 2.
+        publish_map_table(ctx, seg, buckets, cap_per_segment as i32);
         set_map_size(ctx, seg, 0);
-        ctx.set_field(seg, MAP_FIELD_CAPACITY, Value::Int(cap_per_segment as i32));
         let segments = ctx.read_native_pin(segments_pin, segments);
         let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
         ctx.unpin_native_roots(seg_pin);
@@ -42919,13 +43002,8 @@ fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let buckets = rooted_across(ctx, &mut [&mut set, &mut backing], |ctx| {
         alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY)
     });
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    publish_map_table(ctx, backing, buckets, MAP_DEFAULT_CAPACITY as i32);
     set_map_size(ctx, backing, 0);
-    ctx.set_field(
-        backing,
-        MAP_FIELD_CAPACITY,
-        Value::Int(MAP_DEFAULT_CAPACITY as i32),
-    );
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     Ok(Some(Value::Object(Some(set))))
 }
@@ -43150,6 +43228,48 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 const PROPS_FIELD_DEFAULTS: usize = 3;
+
+/// Where this `Properties` receiver's `defaults` chain link actually lives.
+///
+/// JDK-ONLY-LAYOUT (L2, step 3): `PROPS_FIELD_DEFAULTS` (3) is a slot of the
+/// fabricated four-field `Properties` model. On a real
+/// `java.util.Properties` the inherited `Hashtable` fields occupy 0..=7 and
+/// absolute slot 3 is `float loadFactor`, so `native_props_init`'s
+/// `Object(None)` landed on a primitive — and the overlay hunter does NOT
+/// report it, because `overlay_write_is_destructive` only flags
+/// `Object(Some(_))` over a primitive descriptor. It is invisible in the
+/// census for that reason, not absent from the defect.
+///
+/// Reading the same slot back was the other half: `getProperty`'s fallback
+/// walk read slot 3, got a `Float`, and stopped — so on a real layout a
+/// `Properties(defaults)` chain never resolved a single inherited key, even
+/// though `native_props_init_defaults` had already learned to mirror the
+/// reference into the real `defaults` field by name.
+///
+/// The real field is resolved on the RECEIVER's class (a `Properties`
+/// subclass — `java.security.Provider`, Ant's `PropertySet` — inherits it),
+/// and only a receiver that does not declare `defaults` at all, i.e. the
+/// fabricated stub, falls back to the raw model slot.
+fn props_defaults_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let class_id = ctx.class_id_of_object(this);
+    if let Some(idx) = ctx.resolve_field_index_by_class_id(class_id, "defaults") {
+        if idx < ctx.object_num_fields(this) {
+            return idx;
+        }
+    }
+    PROPS_FIELD_DEFAULTS
+}
+
+/// Read the `defaults` link of a `Properties`-shaped receiver.
+fn props_get_defaults(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    ctx.get_field(this, props_defaults_slot(ctx, this))
+}
+
+/// Write the `defaults` link of a `Properties`-shaped receiver.
+fn props_set_defaults(ctx: &mut dyn NativeContext, this: ObjectRef, value: Value) {
+    let slot = props_defaults_slot(ctx, this);
+    ctx.set_field(this, slot, value);
+}
 
 // JDK-ONLY-CLASSIFY: unknown — needs census. HIGHEST-RISK GROUP IN THIS CRATE.
 // All 43 registrations target `java.util.Properties` methods that have concrete
@@ -43390,7 +43510,7 @@ fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(None),
     };
     native_map_init(ctx, &[Value::Object(Some(this))])?;
-    ctx.set_field(this, PROPS_FIELD_DEFAULTS, Value::Object(None));
+    props_set_defaults(ctx, this, Value::Object(None));
     Ok(None)
 }
 
@@ -43400,20 +43520,19 @@ fn native_props_init_defaults(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(None),
     };
     native_map_init(ctx, &[Value::Object(Some(this))])?;
-    ctx.set_field(this, PROPS_FIELD_DEFAULTS, args[1]);
-    // Also store the defaults reference in the REAL `defaults` field, resolved
-    // by name. On a real-layout `java.util.Properties` the inherited Hashtable
-    // fields push `defaults` to a different slot than this native model's
-    // `PROPS_FIELD_DEFAULTS` (3) — which there lands on `loadFactor` (a float),
-    // so the reference is misplaced. The side-table `getProperty` reads the
-    // by-name `defaults` slot to walk the fallback chain (TC0622 follow-up);
-    // without this write it always sees null. Writing both keeps the native
-    // model (slot 3) and the real layout consistent.
-    if let Some(idx) = ctx.resolve_field_index("java/util/Properties", "defaults") {
-        if idx != PROPS_FIELD_DEFAULTS {
-            ctx.set_field(this, idx, args[1]);
-        }
-    }
+    // Store the defaults reference in the REAL `defaults` field, resolved by
+    // name on the receiver's class. On a real-layout `java.util.Properties` the
+    // inherited Hashtable fields push `defaults` well past this native model's
+    // `PROPS_FIELD_DEFAULTS` (3) — which there lands on `loadFactor`, a float —
+    // so the raw slot both misplaces the reference and destroys a live field.
+    // The side-table `getProperty` reads the by-name `defaults` slot to walk
+    // the fallback chain (TC0622 follow-up).
+    //
+    // JDK-ONLY-LAYOUT (L2, step 3): this used to write BOTH slots, so a real
+    // receiver still took the destructive write; `props_set_defaults` writes
+    // the one slot that is right for this receiver, and every reader now
+    // resolves the same way.
+    props_set_defaults(ctx, this, args[1]);
     Ok(None)
 }
 
@@ -43428,13 +43547,13 @@ fn native_props_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(result);
     }
     // Fall through to defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
         if let Some(Value::Object(Some(_))) = def_result {
             return Ok(def_result);
         }
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
     }
     Ok(Some(Value::Object(None)))
 }
@@ -43453,13 +43572,13 @@ fn native_props_get_property_default(
         return Ok(result);
     }
     // Fall through to defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let def_result = native_map_get(ctx, &[Value::Object(Some(defs)), args[1]])?;
         if let Some(Value::Object(Some(_))) = def_result {
             return Ok(def_result);
         }
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
     }
     // Return the default value arg
     Ok(Some(args[2]))
@@ -43945,7 +44064,7 @@ fn native_props_string_property_names(
     let result = native_map_key_set(ctx, &[Value::Object(Some(this))])?;
 
     // Also add keys from defaults chain
-    let mut defaults_val = ctx.get_field(this, PROPS_FIELD_DEFAULTS);
+    let mut defaults_val = props_get_defaults(ctx, this);
     while let Value::Object(Some(defs)) = defaults_val {
         let defs_pin = ctx.pin_native_root(defs);
         let def_keys = props_collect_keys(ctx, defs);
@@ -43978,7 +44097,7 @@ fn native_props_string_property_names(
             }
         }
         let defs = ctx.read_native_pin(defs_pin, defs);
-        defaults_val = ctx.get_field(defs, PROPS_FIELD_DEFAULTS);
+        defaults_val = props_get_defaults(ctx, defs);
         ctx.unpin_native_roots(defs_pin);
     }
     Ok(result)
@@ -53581,6 +53700,13 @@ mod tests {
             /// class hierarchy to `classify_class`. Empty by default, which
             /// reproduces the previous always-`None` `superclass_of` stub.
             superclasses: HashMap<ClassId, ClassId>,
+            /// Modelled `(class, field name) -> absolute slot`, so a `MockCtx`
+            /// can present a REAL field layout to the by-name resolvers.
+            /// Empty by default, which reproduces the previous always-`None`
+            /// `resolve_field_index_by_class_id` stub — a class nothing has
+            /// declared a field for is exactly a fabricated stub, whose slots
+            /// are `_f0.._fN`.
+            field_indices: HashMap<(ClassId, String), usize>,
             /// Distinct per `Shared`, so two `MockCtx`s in one process are two
             /// different "VMs".
             ///
@@ -53607,6 +53733,7 @@ mod tests {
                     object_classes: HashMap::new(),
                     class_names: HashMap::new(),
                     superclasses: HashMap::new(),
+                    field_indices: HashMap::new(),
                     vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
@@ -53686,6 +53813,29 @@ mod tests {
                     .unwrap()
                     .superclasses
                     .insert(child, parent);
+            }
+
+            /// Declare that `class_id` (or a subclass of it) has instance field
+            /// `name` at absolute slot `index`, so
+            /// `resolve_field_index_by_class_id` answers like a real layout.
+            /// A class with no declared field of that name is a fabricated
+            /// stub as far as the resolver is concerned.
+            pub(super) fn define_field(&self, class_id: ClassId, name: &str, index: usize) {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .field_indices
+                    .insert((class_id, name.to_string()), index);
+            }
+
+            /// Allocate an object of `class_id` with `num_fields` slots.
+            pub(super) fn alloc_object_of(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                let obj = s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); num_fields],
+                });
+                s.object_classes.insert(obj.as_ptr() as usize, class_id);
+                obj
             }
 
             /// Model `ClassStore::remove`: the class becomes invisible to
@@ -53876,11 +54026,26 @@ mod tests {
             // cratonvm-native-collections --lib` on `dev`. This mock has no
             // notion of class field layout, so `None` (matching the trait's
             // documented "field not found" case) is the correct stub.
+            /// Resolve against the layout the test declared with
+            /// `define_field`, walking `define_superclass` edges the way the
+            /// real `resolve_field_index_in_hierarchy` walks a class's
+            /// ancestry. A class nothing declared a field for still answers
+            /// `None` — that is the fabricated-stub case — so every
+            /// pre-existing test's expectations are unchanged.
             fn resolve_field_index_by_class_id(
                 &self,
-                _class_id: ClassId,
-                _field_name: &str,
+                class_id: ClassId,
+                field_name: &str,
             ) -> Option<usize> {
+                let s = self.shared.lock().unwrap();
+                let mut cur = Some(class_id);
+                for _ in 0..64 {
+                    let c = cur?;
+                    if let Some(idx) = s.field_indices.get(&(c, field_name.to_string())) {
+                        return Some(*idx);
+                    }
+                    cur = s.superclasses.get(&c).copied();
+                }
                 None
             }
             fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
@@ -54970,6 +55135,212 @@ mod tests {
                 ))
             });
             assert!(res.is_err(), "comparator error must propagate");
+        }
+
+        // ---------------------------------------------------------------
+        // JDK-ONLY-LAYOUT (L2) — `publish_map_table` / `props_defaults_slot`
+        //
+        // The defect these cover is silent by construction: a raw index
+        // resolves, type-checks and lands on a DIFFERENT field. So each test
+        // states the real layout, does the write, and then asserts on the
+        // field that must NOT have moved — the assertion that fails when the
+        // resolution regresses to a fixed class name.
+        // ---------------------------------------------------------------
+
+        const HASHMAP_CID: ClassId = ClassId::new(41);
+        const HASHTABLE_CID: ClassId = ClassId::new(42);
+        const PROPERTIES_CID: ClassId = ClassId::new(43);
+        const STUB_CID: ClassId = ClassId::new(44);
+
+        /// Real `java/util/HashMap`: `AbstractMap` contributes `keySet`(0) and
+        /// `values`(1), so `table` is absolute slot 2 — the same index the
+        /// fabricated layout calls `capacity`.
+        fn define_real_hashmap(ctx: &MockCtx) {
+            ctx.define_class(HASHMAP_CID, "java/util/HashMap");
+            ctx.define_field(HASHMAP_CID, "table", 2);
+            ctx.define_field(HASHMAP_CID, "size", 4);
+            ctx.define_field(HASHMAP_CID, "modCount", 5);
+        }
+
+        /// Real `java/util/Properties extends Hashtable`: `Hashtable` declares
+        /// `table`(0), `count`(1), `threshold`(2), `loadFactor`(3), and
+        /// `Properties` adds `defaults`(8). Absolute slot 2 — where the fixed
+        /// `java/util/HashMap` lookup put the bucket array — is an `int`.
+        fn define_real_properties(ctx: &MockCtx) {
+            ctx.define_class(HASHTABLE_CID, "java/util/Hashtable");
+            ctx.define_field(HASHTABLE_CID, "table", 0);
+            ctx.define_field(HASHTABLE_CID, "count", 1);
+            ctx.define_field(HASHTABLE_CID, "threshold", 2);
+            ctx.define_field(HASHTABLE_CID, "loadFactor", 3);
+            ctx.define_class(PROPERTIES_CID, "java/util/Properties");
+            ctx.define_superclass(PROPERTIES_CID, HASHTABLE_CID);
+            ctx.define_field(PROPERTIES_CID, "defaults", 8);
+        }
+
+        /// A real `HashMap` receiver keeps today's behaviour exactly: the
+        /// bucket array at slot 0 AND at the real `table` slot, and no legacy
+        /// `Int(capacity)` — writing one there is what put an `Int` in the
+        /// `table` field (`arraylength` on an int) and produced the
+        /// `HashMap` slot-2 census row.
+        #[test]
+        fn publish_map_table_mirrors_into_the_real_table_slot() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let buckets = ctx.new_ref_array(ClassId::new(0), 16);
+
+            publish_map_table(&mut ctx, map, buckets, 16);
+
+            assert!(
+                matches!(ctx.get_field(map, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "slot 0 is what every native map op reads"
+            );
+            assert!(
+                matches!(ctx.get_field(map, 2), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "the real `table` slot must hold the array, never an Int"
+            );
+        }
+
+        /// The receiver the whole lane is about. `Properties` is excluded from
+        /// `CF_HASHTABLE_LAYOUT`, so it reaches the legacy branch; its own
+        /// `table` is slot 0, and slot 2 is `threshold`, an `int` that must
+        /// survive untouched.
+        #[test]
+        fn publish_map_table_leaves_a_properties_int_field_alone() {
+            let mut ctx = MockCtx::new(1);
+            // A real VM has `java/util/HashMap` loaded too — that is the whole
+            // point: the old lookup found ITS `table` (index 2) and wrote it
+            // into a `Properties`. Without this the fixture cannot express the
+            // defect and the test passes vacuously.
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.set_field(props, 2, Value::Int(12)); // threshold
+            let buckets = ctx.new_ref_array(ClassId::new(0), 16);
+
+            publish_map_table(&mut ctx, props, buckets, 16);
+
+            assert!(
+                matches!(ctx.get_field(props, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "`Hashtable.table` IS slot 0, so one write covers both roles"
+            );
+            assert_eq!(
+                ctx.get_field(props, 2),
+                Value::Int(12),
+                "slot 2 is `Hashtable.threshold` on this receiver — the bucket \
+                 array must not land there (the surviving census row)"
+            );
+        }
+
+        /// A fabricated receiver — nothing declares a field called `table` —
+        /// keeps the legacy `(buckets, size, capacity)` model, including the
+        /// `Int` at slot 2. The predicate is the field NAME, never the slot
+        /// count: this stub has MORE slots than the real `HashMap` above.
+        #[test]
+        fn publish_map_table_keeps_the_capacity_int_on_the_fabricated_layout() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+            let backing = ctx.alloc_object_of(STUB_CID, 16);
+            let buckets = ctx.new_ref_array(ClassId::new(0), 32);
+
+            publish_map_table(&mut ctx, backing, buckets, 32);
+
+            assert!(
+                matches!(ctx.get_field(backing, MAP_FIELD_BUCKETS), Value::Object(Some(b)) if b.as_ptr() == buckets.as_ptr()),
+                "slot 0 always holds the array"
+            );
+            assert_eq!(
+                ctx.get_field(backing, MAP_FIELD_CAPACITY),
+                Value::Int(32),
+                "slot 2 means `capacity` on our own layout"
+            );
+        }
+
+        /// `native_props_init`'s `Object(None)` used to land on `loadFactor`,
+        /// and the overlay hunter cannot see it (`Object(None)` over a
+        /// primitive is not reported). Resolve `defaults` on the receiver.
+        #[test]
+        fn props_defaults_resolves_the_real_field_and_spares_load_factor() {
+            let mut ctx = MockCtx::new(1);
+            define_real_properties(&ctx);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.set_field(props, 3, Value::Float(0.75)); // loadFactor
+            let parent = ctx.alloc_object_of(PROPERTIES_CID, 10);
+
+            props_set_defaults(&mut ctx, props, Value::Object(Some(parent)));
+
+            assert_eq!(
+                ctx.get_field(props, 3),
+                Value::Float(0.75),
+                "slot 3 is `loadFactor` on a real Properties"
+            );
+            assert!(
+                matches!(ctx.get_field(props, 8), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "the reference belongs in the real `defaults` field"
+            );
+            assert!(
+                matches!(props_get_defaults(&ctx, props), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "and the getProperty fallback walk must read it back — reading \
+                 raw slot 3 got a Float and stopped the chain dead"
+            );
+        }
+
+        /// A fabricated `Properties` stub has no `defaults` field to resolve,
+        /// so the four-field model's slot 3 stays in force.
+        #[test]
+        fn props_defaults_falls_back_to_the_model_slot_on_a_stub() {
+            let mut ctx = MockCtx::new(1);
+            ctx.define_class(STUB_CID, "java/util/Properties");
+            let props = ctx.alloc_object_of(STUB_CID, 4);
+            let parent = ctx.alloc_object_of(STUB_CID, 4);
+
+            props_set_defaults(&mut ctx, props, Value::Object(Some(parent)));
+
+            assert!(
+                matches!(ctx.get_field(props, PROPS_FIELD_DEFAULTS), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "synthetic layout keeps slot 3"
+            );
+            assert!(
+                matches!(props_get_defaults(&ctx, props), Value::Object(Some(p)) if p.as_ptr() == parent.as_ptr()),
+                "and reads back from the same slot"
+            );
+        }
+
+        /// `map_state`'s bucket fallback used to probe `HashMap`'s `table`
+        /// index on any receiver. On a `Properties` that index is an `int`
+        /// field; the receiver's own `table` is slot 0.
+        #[test]
+        fn receiver_table_slot_answers_per_receiver_not_per_hashmap() {
+            let ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            define_real_properties(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            let props = ctx.alloc_object_of(PROPERTIES_CID, 10);
+            ctx.define_class(STUB_CID, "cratonvm/util/MapViewBacking");
+            let stub = ctx.alloc_object_of(STUB_CID, 16);
+
+            assert_eq!(receiver_table_slot(&ctx, map), Some(2));
+            assert_eq!(receiver_table_slot(&ctx, props), Some(0));
+            assert_eq!(
+                receiver_table_slot(&ctx, stub),
+                None,
+                "no `table` field means our own layout — asked by NAME, and \
+                 note this stub is WIDER than the real HashMap, so a field \
+                 count could not have told them apart"
+            );
+        }
+
+        /// The bound matters: a real class can declare `table` at an index the
+        /// receiver was allocated too small for (a backing map sized to
+        /// `MAP_NUM_FIELDS`), and a write there would be dropped or land out
+        /// of range.
+        #[test]
+        fn receiver_table_slot_is_bounded_by_the_allocated_slots() {
+            let ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+            let undersized = ctx.alloc_object_of(HASHMAP_CID, 2);
+            assert_eq!(receiver_table_slot(&ctx, undersized), None);
         }
     }
 

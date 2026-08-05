@@ -2584,8 +2584,10 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
 
     /// Return the raw Java `String.hashCode()` for a confirmed String object.
-    /// `None` means that `obj` is not a String. Implementations may override
-    /// this to inspect compact storage without allocating a host String.
+    /// `None` means "no hash was computed": `obj` is not a String, or an
+    /// overriding implementation could not read its character storage.
+    /// Implementations may override this to inspect compact storage without
+    /// allocating a host String.
     fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
         self.read_string(obj).map(|text| {
             text.encode_utf16().fold(0i32, |hash, unit| {
@@ -2595,7 +2597,15 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     }
 
     /// Compare two confirmed Java Strings without routing through Java
-    /// dispatch. `None` means at least one operand is not a String.
+    /// dispatch.
+    ///
+    /// `Some(_)` is an answer. `None` means **the comparison was not made** —
+    /// an operand is not a String, or an overriding implementation could not
+    /// read one operand's character storage — and the caller must fall back to
+    /// dispatching `String.equals`. An implementation must never report `false`
+    /// for a pair it did not actually read: doing so silently turned every
+    /// `ConcurrentHashMap.get` on a String key into a miss (see
+    /// `docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }
@@ -4406,6 +4416,18 @@ struct NativeSlot {
     /// Re-registration of the same triple rewrites this in place, so the slot
     /// index (and thus any handle already handed out) stays valid.
     reg_index: u32,
+    /// Whether this callback satisfies the **leaf** contract — see
+    /// [`NativeMethodRegistry::set_leaf`]. Dispatch paths that hold the
+    /// `NativeMethodId` may then invoke it through `safe_native_call_leaf`
+    /// instead of the full funnel.
+    ///
+    /// Carried on the slot rather than derived from the triple so that
+    /// re-registration cannot leave a stale claim behind: the `Some(idx)` arm
+    /// of [`register`](NativeMethodRegistry::register) overwrites this with
+    /// whatever the *new* registration declared, and the default is `false`.
+    /// A phase that re-registers a triple without opting in therefore
+    /// demotes it back to the funnel, which is the safe direction.
+    leaf: bool,
 }
 
 /// Where one accepted registration came from, index-parallel with
@@ -4520,6 +4542,10 @@ pub struct NativeMethodRegistry {
     /// The category applied to subsequent `register()` calls. Scoped via
     /// `with_category`. Defaults to `SyntheticStub` (conservative).
     current_category: NativeKind,
+    /// The leaf claim applied to subsequent `register()` calls. Scoped via
+    /// [`Self::set_leaf`] / [`Self::with_leaf`]. Defaults to `false`
+    /// (conservative — every native pays the full funnel until it opts out).
+    current_leaf: bool,
     /// Whether `current_category` was **stated at the registration site**
     /// ([`NativeMethodRegistry::register_with_kind`]) rather than inherited
     /// from an ambient `set_category` / `with_category` in an ancestor frame.
@@ -4699,6 +4725,7 @@ impl NativeMethodRegistry {
             ),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: NativeKind::SyntheticStub,
+            current_leaf: false,
             next_kind_stated: false,
             kind_stated: Vec::new(),
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
@@ -4862,6 +4889,63 @@ impl NativeMethodRegistry {
         self.current_category = kind;
         f(self);
         self.current_category = prev;
+    }
+
+    /// Declare that subsequent `register()` calls install **leaf** natives.
+    ///
+    /// # The contract a leaf callback must satisfy
+    ///
+    /// A leaf native may be invoked through `safe_native_call_leaf` — the
+    /// funnel with its GC bookkeeping removed — so all four of these must hold
+    /// for the registered body, on **every** path including its error returns:
+    ///
+    ///  1. **It cannot allocate on the Java heap.** No `alloc_object`,
+    ///     `new_array`, `new_ref_array`, no string interning, no boxing.
+    ///  2. **It cannot safepoint or block.** No `begin_blocking_region`, no
+    ///     monitor acquisition, no lock on a structure another thread holds
+    ///     across a safepoint, no `park`, no re-entry into Java.
+    ///  3. **It cannot initiate or observe a collection.** No `maybe_gc_*`, and
+    ///     no retained raw `ObjectRef` across anything that could move the heap
+    ///     (which follows from 1 and 2).
+    ///  4. **It cannot throw a JNI-pending exception.** Returning
+    ///     `Err(MethodCallFailed)` is fine — the caller routes that exactly as
+    ///     the funnel does — but nothing may go through
+    ///     `jni::set_pending_exception`, because the leaf path does not drain
+    ///     that slot.
+    ///
+    /// What is left is a field read, a field write, an atomic RMW, or pure
+    /// arithmetic: the bodies for which the funnel's ~180-330 ns of pinning,
+    /// STW probing, thread-state transitions and unwind bookkeeping is the
+    /// entire cost of the call. Measured on `probes/NativeShapeProbe.java`;
+    /// see `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+    ///
+    /// The claim rides on the **callback**, not on the triple: it is captured
+    /// into the slot by `register()` alongside the category, so a later phase
+    /// that re-registers the same triple with a different body demotes it back
+    /// to the full funnel unless that phase opts in as well. That ordering
+    /// property is why this is a scoped ambient flag and not a
+    /// `mark_leaf(class, method, descriptor)` post-pass: a post-pass keyed by
+    /// triple would keep claiming leafness for whatever body happened to win
+    /// the slot last.
+    ///
+    /// Prefer [`with_leaf`](Self::with_leaf) for a scoped set/restore.
+    pub fn set_leaf(&mut self, leaf: bool) {
+        self.current_leaf = leaf;
+    }
+
+    /// The leaf claim currently applied to new registrations.
+    pub fn current_leaf(&self) -> bool {
+        self.current_leaf
+    }
+
+    /// Run `f` with the leaf claim set, restoring the previous value after.
+    /// See [`set_leaf`](Self::set_leaf) for the contract `f`'s registrations
+    /// are asserting.
+    pub fn with_leaf(&mut self, leaf: bool, f: impl FnOnce(&mut Self)) {
+        let prev = self.current_leaf;
+        self.current_leaf = leaf;
+        f(self);
+        self.current_leaf = prev;
     }
 
     /// [`Self::register`], with the kind stated **at the registration site**
@@ -5189,6 +5273,44 @@ impl NativeMethodRegistry {
                         "submit",
                         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
                     )
+                    // `awaitQuiescence` was in the interpreter's
+                    // `is_forkjoin_native_override` list but NOT here, so the
+                    // registration was dropped and the interpreter's "force the
+                    // native" had no native to force: the call fell through to
+                    // real bytecode and answered "quiescent" immediately while
+                    // an `execute(Runnable)` daemon thread was still running.
+                    // A `--dump-native-registry` census (no awaitQuiescence
+                    // row) plus a probe observing `execute(slow);
+                    // awaitQuiescence()` with ran=0 where HotSpot reports
+                    // ran=1 is what surfaced it. The two lists must agree
+                    // entry-for-entry — a name present in only one of them is
+                    // silently inert.
+                    | ("awaitQuiescence", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    // BULK SUBMISSION — see the matching block in
+                    // `is_forkjoin_native_override`. `invokeAll(Collection)` is
+                    // the overload Weld's `ConcurrentBeanDeployer` calls and was
+                    // on neither list, which failed the entire hibernate
+                    // `org.hibernate.orm.test.cdi.*` cluster. `invokeAny` was
+                    // uncovered too and failed SILENTLY (ran the callables,
+                    // returned null); `lazySubmit` threw like invokeAll.
+                    | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/List;")
+                    | (
+                        "invokeAll",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/util/List;",
+                    )
+                    | (
+                        "invokeAllUninterruptibly",
+                        "(Ljava/util/Collection;)Ljava/util/List;",
+                    )
+                    | ("invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;")
+                    | (
+                        "invokeAny",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+                    )
+                    | (
+                        "lazySubmit",
+                        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
             );
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
@@ -5230,6 +5352,10 @@ impl NativeMethodRegistry {
                     | ("isCancelled", "()Z")
                     | ("cancel", "(Z)Z")
                     | ("complete", "(Ljava/lang/Object;)V")
+                    // Reads the throwable the side table records for an
+                    // abnormally completed task, so it cannot disagree with
+                    // join()/get() about whether the task failed.
+                    | ("getException", "()Ljava/lang/Throwable;")
             );
         if real_forkjoinpool_enabled()
             && matches!(
@@ -5451,6 +5577,64 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: `java/lang/String`'s real class bytes are
+        // authoritative (contract §1.4), so a `Bridge` registered on it does
+        // not survive into a real-JDK registry at all.
+        //
+        // # This is where the forced-native `String` policy went
+        //
+        // FOUR hard-coded lists used to decide this at DISPATCH time — a
+        // 21-name descriptor-blind arm in `check_override`, a 12-shape
+        // inverted whitelist in `force_native_over_real_jdk_bytecode`, a JIT
+        // direct bind for `toLowerCase(Locale)`, and
+        // `is_jdk_string_charset_name_constructor_override`, which the record
+        // that catalogued the first three had missed because it is a
+        // differently-named predicate rather than a `String` list. They
+        // disagreed with each other, so which implementation of
+        // `String.equals`/`hashCode`/`substring` ran depended on how many times
+        // the call site had executed. All four are deleted.
+        //
+        // They are not deleted because they looked redundant. They were
+        // MEASURED inert first: a binary with both interpreter lists removed
+        // produced a byte-identical 392-case `String` transcript in both modes
+        // and identical invocation counts on all 38 exercised `String` registry
+        // slots. Neither list ever decided anything, because
+        // `resolve_step1_native` (`try_stackless_invoke` step 1) resolves the
+        // triple and dispatches whatever it finds before either list runs, and
+        // it has no list of its own. Registration was always the real gate;
+        // this is that gate, stated once, for every dispatch path.
+        //
+        // # Why the rule is a KIND and not another method list
+        //
+        // Adjudicated against the JDK 25 image, 79 of the 80 registrations on
+        // `java/lang/String` target a method the image declares with a `Code`
+        // attribute — §1.4's `NativeShadowsBytecode` — and exactly one,
+        // `intern()`, is genuinely `ACC_NATIVE` and therefore a legitimate
+        // §1.5 bridge. So "drop the bridges, keep `intern`" is the adjudication
+        // itself rather than a list that has to be kept in step with one.
+        //
+        // `Intrinsic` survives on purpose: §1.4's reviewed exception. The
+        // `CRATONVM_NATIVE_STRING_REGEX` family registers under it
+        // (`register_with_kind`, so `kind_stated` is true and the census can
+        // see somebody decided), which is what a same-answer-just-faster
+        // native is supposed to look like — it wins on kind, with no name
+        // anywhere. `SyntheticStub` survives too: it never dispatches under
+        // `--jdk-only`, and in compatible mode it is the fallback for a
+        // synthetic `String` that has no real class bytes behind it.
+        //
+        // Anything promoted into this exception needs the evidence, not the
+        // intent: `probes/StringPolicyMatrixProbe` diffed against HotSpot, and
+        // a measurement that the native is actually faster. The five h2-bnf
+        // shapes were argued to be "trivially equivalent to the real bytecode
+        // for every input" and were wrong about that for unpaired surrogates,
+        // for every out-of-range index's exception message, and for `null`.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/lang/String"
+            && self.current_category == NativeKind::Bridge
+            && !(method_name == "intern" && descriptor == "()Ljava/lang/String;")
+        {
+            return;
+        }
         // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
         // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
         // `Cleanable.clean()`). These were meant only as a fallback for when
@@ -5641,12 +5825,19 @@ impl NativeMethodRegistry {
         // stay valid (and pick up the new callback, matching the documented
         // last-registration-wins behavior of `register`).
         let category = self.current_category;
+        // The leaf claim is a property of the CALLBACK being registered, not of
+        // the triple: it travels with `current_leaf` exactly like `category`
+        // does, so a later phase that re-registers the same triple with a
+        // different body silently demotes it to the funnel unless that phase
+        // opts in too. See `set_leaf`.
+        let leaf = self.current_leaf;
         match prior_slot {
             Some(idx) => {
                 if let Some(slot) = self.slots.get_mut(idx as usize) {
                     slot.callback = callback;
                     slot.kind = category;
                     slot.reg_index = reg_index as u32;
+                    slot.leaf = leaf;
                 }
             }
             None => {
@@ -5655,6 +5846,7 @@ impl NativeMethodRegistry {
                     callback,
                     kind: category,
                     reg_index: reg_index as u32,
+                    leaf,
                 });
                 // The ONLY place `slot_invocations` grows — it must stay
                 // index-parallel with `slots`, and `slots` only ever grows in
@@ -5666,26 +5858,6 @@ impl NativeMethodRegistry {
                     .push(std::sync::atomic::AtomicU64::new(0));
                 self.slot_by_key.insert(key, idx);
             }
-        }
-        // LEAF: record the callback address if this triple is declared leaf
-        // (`crate::leaf::LEAF_NATIVES`). Done here — at the registration, where
-        // the triple and the callback are both in hand — because that is where
-        // the property belongs: `native-call-funnel-per-call-floor-RETIRED-
-        // 20260804.md` asks for the funnel bypass to generalise
-        // as a class whose "predicate wants to live on the registration (a
-        // `NativeKind`-adjacent flag), not in a growing `match` in
-        // `helpers.rs`". Every dispatch route reads it from one place —
-        // `vm_exec::safe_native_call_impl` — so marking a triple changes the
-        // interpreter, the JIT and `invoke_or_native` at once.
-        //
-        // Re-registration re-marks rather than un-marking: `mark` is
-        // idempotent, and a triple whose implementation is replaced by a
-        // NON-leaf one keeps the old address marked (harmless — nothing
-        // dispatches it any more) while the new address is only marked if the
-        // triple is still declared leaf. There is no path here that can mark
-        // an address the table does not name.
-        if crate::leaf::triple_is_leaf(class_name, method_name, descriptor) {
-            crate::leaf::mark(callback as usize);
         }
         // CAPABILITY: classify the slot once, here, so the dispatch-side gate
         // (`check_dispatch_capability`) is an integer map lookup rather than a
@@ -5920,6 +6092,29 @@ impl NativeMethodRegistry {
     #[inline]
     pub fn kind_of_id(&self, id: NativeMethodId) -> Option<NativeKind> {
         self.slots.get(id.index()).map(|slot| slot.kind)
+    }
+
+    /// Whether the native behind `id` was registered as a **leaf** — i.e. may
+    /// be dispatched through `safe_native_call_leaf` rather than the full
+    /// funnel. See [`set_leaf`](Self::set_leaf) for the contract.
+    ///
+    /// `false` for an unknown handle, which is the safe answer: an unrecognised
+    /// id takes the funnel.
+    #[inline]
+    pub fn is_leaf_id(&self, id: NativeMethodId) -> bool {
+        self.slots.get(id.index()).is_some_and(|slot| slot.leaf)
+    }
+
+    /// Every registered triple currently claiming leaf status, as
+    /// `(class, method, descriptor)`. Cold — for the census and for the test
+    /// that pins the leaf set, never for dispatch.
+    pub fn leaf_registrations(&self) -> Vec<(&str, &str, &str)> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.leaf)
+            .filter_map(|slot| self.registrations.get(slot.reg_index as usize))
+            .map(|(c, m, d)| (&**c, &**m, &**d))
+            .collect()
     }
 
     /// Count one dispatch of `id`. Called by every dispatch path immediately
@@ -6414,6 +6609,96 @@ mod tests {
 
     fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(42)))
+    }
+
+    /// The leaf claim is a property of the registered CALLBACK, and a later
+    /// phase that re-registers the triple without opting in must take it away.
+    ///
+    /// This is the whole reason `set_leaf` is a scoped ambient flag rather than
+    /// a `mark_leaf(class, method, descriptor)` post-pass. `native-builtins`
+    /// genuinely does re-register triples: `register_atomic_integer_natives`
+    /// runs twice, and phase 54 installs its own (buggy) atomics in between. A
+    /// triple-keyed post-pass would keep claiming "this is a leaf" for whichever
+    /// body happened to win the slot last, and the leaf contract — no
+    /// allocation, no safepoint, no collection, no JNI exception — would be
+    /// asserted about code that never agreed to it.
+    #[test]
+    fn a_re_registration_that_does_not_opt_in_drops_the_leaf_claim() {
+        let mut r = NativeMethodRegistry::new();
+
+        r.set_leaf(true);
+        r.register("p/C", "get", "()I", dummy_native);
+        r.set_leaf(false);
+        let id = r
+            .resolve_id("p/C", "get", "()I")
+            .expect("registered triple resolves");
+        assert!(r.is_leaf_id(id), "the opted-in registration claims leaf");
+
+        // A later phase re-registers the SAME triple with a different body and
+        // says nothing about leafness.
+        r.register("p/C", "get", "()I", dummy_native_2);
+        assert_eq!(
+            r.resolve_id("p/C", "get", "()I"),
+            Some(id),
+            "re-registration updates the slot in place, so the handle stays valid"
+        );
+        assert!(
+            !r.is_leaf_id(id),
+            "the new body never asserted the leaf contract, so the claim must be gone"
+        );
+
+        // And restating it brings it back, which is what the second
+        // `register_atomic_integer_natives` pass relies on.
+        r.set_leaf(true);
+        r.register("p/C", "get", "()I", dummy_native);
+        r.set_leaf(false);
+        assert!(r.is_leaf_id(id));
+    }
+
+    /// Nothing is a leaf unless it says so, and `with_leaf` restores.
+    #[test]
+    fn the_leaf_claim_defaults_off_and_is_scoped() {
+        let mut r = NativeMethodRegistry::new();
+        r.register("p/C", "plain", "()V", dummy_native);
+        let plain = r.resolve_id("p/C", "plain", "()V").expect("resolves");
+        assert!(!r.is_leaf_id(plain), "default is the full funnel");
+
+        r.with_leaf(true, |r| {
+            r.register("p/C", "leafy", "()V", dummy_native);
+        });
+        let leafy = r.resolve_id("p/C", "leafy", "()V").expect("resolves");
+        assert!(r.is_leaf_id(leafy));
+        assert!(!r.current_leaf(), "with_leaf restores the previous claim");
+
+        r.register("p/C", "after", "()V", dummy_native);
+        let after = r.resolve_id("p/C", "after", "()V").expect("resolves");
+        assert!(
+            !r.is_leaf_id(after),
+            "a registration outside the scope is not leaf"
+        );
+
+        let leaves = r.leaf_registrations();
+        assert_eq!(leaves, vec![("p/C", "leafy", "()V")]);
+    }
+
+    /// A handle from another registry must not read as leaf. `is_leaf_id` is
+    /// consulted on a dispatch path that would then skip the funnel's GC
+    /// bookkeeping, so "unknown" has to mean "take the funnel".
+    #[test]
+    fn an_out_of_range_handle_is_not_leaf() {
+        let mut a = NativeMethodRegistry::new();
+        a.set_leaf(true);
+        for i in 0..4 {
+            a.register("p/C", &format!("m{i}"), "()V", dummy_native);
+        }
+        a.set_leaf(false);
+        let far = a.resolve_id("p/C", "m3", "()V").expect("resolves");
+
+        let b = NativeMethodRegistry::new();
+        assert!(
+            !b.is_leaf_id(far),
+            "an id that does not index this registry's slots is not a leaf"
+        );
     }
 
     #[test]

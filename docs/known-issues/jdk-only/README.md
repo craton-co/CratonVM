@@ -3,6 +3,20 @@
 **Status:** OPEN, reduced 2026-08-04. Filed 2026-07-31 from wave-1
 implementation findings; re-verified against the re-landed tree the same day.
 
+> ## Looking for the plan? It is not here.
+>
+> **This directory is the evidence base** — what is broken, how it was measured,
+> what the blast radius is. One record per defect; a record moves to
+> `docs/internal/` when it is fixed.
+>
+> **The parallel execution plan is
+> [`docs/feature-designs/jdk-only-wave2/`](../../feature-designs/jdk-only-wave2/README.md)** —
+> twelve lanes with an explicit file-ownership map, a conflict matrix, and a
+> verification protocol. Nine of the twelve can start simultaneously. Read that
+> to decide *what to work on*; read this to understand *what you are fixing*.
+>
+> Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md).
+
 ---
 
 ## 2026-08-04 pass — what closed, what moved, what did not
@@ -169,7 +183,6 @@ behaviour** — no exception, no log line, no failing test.
 |---|---|---|
 | 1 | [`NativeKind` is ambient and defaults to `SyntheticStub`](native-kind-is-ambient-and-defaults-to-syntheticstub.md) | `register()` takes no kind; it is inherited from a mutable registry field defaulting to `SyntheticStub`. The dominant defect is the **opposite** of under-tagging: 1,195 `native-collections` registrations are tagged `Bridge` by a single `set_category` line, and **not one** of them targets an `ACC_NATIVE` method. Under-tagging is real too and already caused one boot regression (2026-07-14, `java.util.Properties`). Both directions are silent at the point of the mistake. |
 | 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
-| 3 | [The forced-native `String` policy exists in three places, in disagreeing forms](forced-native-string-policy-two-lists-that-disagree.md) | A 21-name positive list (cold path) versus a 7-pair exclusion (warm path), plus a JIT direct-call ladder. The disagreement has already made a landed, measured h2-bnf performance fix into **statically unreachable code**. |
 | 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
 | 5 | [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md) | `AnonymousObject$N` and `Proxy$Instance` are stamped `CompatibilityStub` to avoid flipping the derived `is_synthetic_stub` bool that 181 read sites across 20 files depend on. Correct deferral — but it makes contract §11's zero-stub criterion unachievable by construction, and two of those read sites gate native-vs-bytecode dispatch. |
 | 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
@@ -177,6 +190,17 @@ behaviour** — no exception, no log line, no failing test.
 Item 8 left this table on 2026-08-04:
 [the real-protected-stub allow-lists](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md)
 are one predicate now.
+
+Item 3 left it the same day:
+[the forced-native `String` policy](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
+is gone — all four copies of it, the fourth having gone uncounted by this
+record. The lists were removed after being MEASURED inert (a binary without
+them produced a byte-identical 392-case `String` transcript in both modes and
+identical invocation counts on every exercised slot), and the policy now lives
+at registration: `NativeMethodRegistry::register` drops every `java/lang/String`
+`Bridge` in real-JDK mode. It closes **L9** as well — RKC16N.6 does not
+reproduce, because the class-load defect behind the April symptom was fixed by
+RKC16N.9 and nobody went back to the workaround.
 
 Retired item 6: cached invoke targets retain and revalidate `NativeKind`
 was fixed on 2026-08-01. The interpreter invoke cache now carries the id and

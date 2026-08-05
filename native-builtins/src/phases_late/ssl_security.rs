@@ -2894,7 +2894,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            let address = crate::net_phase_e::alloc_inet_address_for_input(ctx, &host, &host);
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -2937,7 +2937,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
             let address =
-                crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1");
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -2959,6 +2959,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // identified by the tls_id stored in field 0 of the synthetic stream
     // instance. A -1 id or short-read of 0 maps to Java EOF (-1) per
     // InputStream.read semantics.
+    //
+    // PERF NOTE (testssl-testpost bulk TLS, 2026-08-05): this native's own body
+    // is NOT what makes a byte-at-a-time reader slow. Measured against
+    // `SSLSocketOutputStream.flush()` — a registered no-op native on the same
+    // receiver, so the difference is the body and nothing else — one `read()`
+    // costs 814 ns at 1 thread, of which 549 ns is the Java->native transition
+    // and only ~265 ns is everything this closure does. Counters over a full
+    // `testPost` confirmed the two candidate slow spots are absent: the field
+    // read at slot 0 hits every time (16,777,216 of 16,777,216 calls — the
+    // side-table fallback never fires), and the readahead does exactly one real
+    // socket read per 16 KiB (1024 refills, avg 16384 bytes). What remained of
+    // the body was the descriptor lookup behind `get_field`; see
+    // `vm_exec::resolve_field_descriptor_byte_cached`'s stub note.
     let ssl_is = "javax/net/ssl/SSLSocketInputStream";
     r.register(ssl_is, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3057,8 +3070,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
-                for i in 0..n {
-                    ctx.set_array_element(arr, off + i, Value::Int(buf[i] as i8 as i32));
+                // PERF (testssl-testpost bulk TLS): one bulk copy instead of one
+                // virtual `set_array_element` (plus a `Value` box) per byte. The
+                // range was bounds-checked against `arr_len` above, so a `false`
+                // here can only mean the pinned array came back smaller — report
+                // that rather than silently claim bytes that never landed.
+                if !ctx.write_byte_array_from(arr, off, &buf[..n]) {
+                    return Err(RuntimeError::IOException {
+                        message: "SSLSocketInputStream.read: destination array shrank".into(),
+                    }
+                    .into());
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
@@ -3192,12 +3213,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if len == 0 {
             return Ok(None);
         }
-        let mut buf = Vec::with_capacity(len);
-        for i in 0..len {
-            if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-                buf.push(b as u8);
-            }
-        }
+        // PERF (testssl-testpost bulk TLS): one bulk copy instead of one virtual
+        // `get_array_element` per byte. `TestSsl.testPost` alone pushes 16 MiB
+        // per thread through here in 128 KiB blocks.
+        let mut buf = vec![0u8; len];
+        let copied = ctx.read_byte_array_into(arr, off, &mut buf);
+        // The range was bounds-checked against `arr_len` above, so a short copy
+        // means the array is not the byte[] this signature promises. Writing the
+        // zero tail would put bytes on the wire the caller never supplied.
+        buf.truncate(copied);
         // Drain the write — TlsStream::write may return short writes under
         // pressure, which callers would otherwise interpret as silent data
         // loss. Loop until the whole buffer has been accepted.

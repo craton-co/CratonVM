@@ -685,12 +685,50 @@ pub(super) fn lookup_loader_initiated(
 /// preserves JVMS resolution semantics.
 pub(super) const INITIATING_RESOLUTION_CACHE_CAP: usize = 4096;
 
+/// Generation of everything a cached *symbolic-reference resolution* depends on
+/// other than the class-name → `ClassId` mapping.
+///
+/// Sibling of `cratonvm_classloading::class_definition_epoch`. Together the two
+/// counters cover the complete input set of a resolved field/method reference,
+/// so a cache whose validity condition is "this reference still resolves to
+/// this answer" can be revalidated with two atomic loads instead of re-running
+/// the resolution. That is what
+/// [`crate::runtime::interpreter::field_access::FieldSiteCache`] does.
+///
+/// Bumped by:
+///
+/// * [`cache_loader_initiated`] below and the unload sweep in `memory::gc` —
+///   the two writers of the per-loader initiating-resolution memo. Memoizing a
+///   parent-delegated resolution changes what a loader answers **without**
+///   touching `loaded_classes`, so `class_definition_epoch` does not see it.
+/// * `vm_init::resolution_invalidate_adapter`, the hook classloading fires
+///   whenever cached resolutions must be dropped. Two of its four sites —
+///   `upgrade_synthetic_class` and `recompute_subclass_layouts` — change a
+///   class's **field layout in place**, keeping both its `ClassId` and its name.
+///   Neither the definition epoch nor the redefine latch moves for those, so
+///   without this bump a resolved-field cache would keep serving a field index
+///   from the pre-upgrade layout.
+static RESOLUTION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current [`RESOLUTION_EPOCH`]. One `Acquire` load.
+#[inline]
+pub fn resolution_epoch() -> u64 {
+    RESOLUTION_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record that cached resolutions may no longer be valid.
+#[inline]
+pub(crate) fn bump_resolution_epoch() {
+    RESOLUTION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub(super) fn cache_loader_initiated(
     shared: &SharedVm,
     loader: cratonvm_types::ClassLoaderId,
     name: &str,
     class_id: ClassId,
 ) {
+    bump_resolution_epoch();
     let mut caches = shared.classes.initiating_resolution_cache.write();
     let cache = caches.entry(loader).or_default();
     let key = cratonvm_types::intern_arc(name);

@@ -118,6 +118,11 @@ pub fn unload_dead_class_metadata(
     cratonvm_native_builtins::classloader::forget_unloaded_class_mirrors(&dead_mirrors);
 
     {
+        // Second writer of the initiating-resolution memo; advance the
+        // resolution generation so the interpreter's resolved-field site cache
+        // treats its entries as stale (see
+        // `runtime::interpreter::constants`'s `RESOLUTION_EPOCH`).
+        crate::runtime::interpreter::bump_resolution_epoch();
         let mut cache = shared.classes.initiating_resolution_cache.write();
         cache.retain(|_, entries| {
             entries.retain(|_, id| !ids.contains(id));
@@ -1118,7 +1123,7 @@ pub fn update_all_roots(
     shared
         .threads
         .thread_registry
-        .fold_pointer_map_into_blocked(pointer_map);
+        .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs

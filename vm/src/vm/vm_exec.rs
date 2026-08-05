@@ -1644,6 +1644,133 @@ pub(crate) fn safe_native_call_prevalidated_objects(
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
+/// The funnel with everything a **leaf** native cannot need taken out.
+///
+/// `callback` must have been registered through
+/// [`NativeMethodRegistry::set_leaf`](cratonvm_native_api::NativeMethodRegistry::set_leaf),
+/// whose doc comment states the four-part contract: no Java-heap allocation,
+/// no safepoint or block, no collection, no JNI-pending exception. Callers
+/// establish that by holding a `NativeMethodId` whose slot answers
+/// `is_leaf_id`; they do not get to decide it themselves.
+///
+/// # What this drops, and why each is dead for a leaf
+///
+/// | funnel step | why a leaf does not need it |
+/// |---|---|
+/// | argument pinning into `native_pin_roots` | pins exist so a collection *during* the callback can remap the arguments. A leaf cannot reach a collection, so nothing can move under it. |
+/// | the STW probe + `safepoint_check` | a leaf is a handful of instructions and returns to a mutator that polls safepoints itself; entering one here buys the collector nothing. |
+/// | `native_array_gc_requested` / `young_spill_pressure` relief | both exist for natives that ALLOCATE. A leaf does not. |
+/// | the remap-args-after-GC rebuild | unreachable once the two GC hooks above are gone. |
+/// | `NativeRunning` / restore `record_transition` pair | the state exists so the STW census WAITS for a native holding raw `ObjectRef`s in Rust locals. A leaf holds them for a few instructions and cannot block, so the thread stays exactly what it was — running Java. |
+/// | the JNI pending-exception drain | contract item 4. |
+/// | the pin-watermark truncate + unpin ring | nothing was pinned. |
+/// | `native_diag_pre_call` / `post_call` | these are already behind a mask that is zero on every production run; the leaf path simply does not offer them. A run that needs them can unset the leaf claim. |
+///
+/// # What it keeps
+///
+/// * **The argument forwarding barrier.** Object arguments have just left the
+///   GC-visible operand stack, and a collection may have run between the frame
+///   read and this call — that is the same window the funnel's own
+///   `load_and_forward` covers, and it is two instructions.
+/// * **`catch_unwind`.** A leaf must not panic, but "must not" is a contract,
+///   not a proof, and a panic escaping into JIT-compiled or interpreter frames
+///   is a process-level failure rather than a bad answer. It costs nothing
+///   when nothing unwinds.
+/// * **The return-value forwarding + `native_pending_return` handoff root**,
+///   so an object-returning leaf hands its result over by the same rule every
+///   other native does and the JIT's post-invoke drain sees what it expects.
+///
+/// Measured effect: `probes/NativeShapeProbe.java`, and
+/// `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+pub(crate) fn safe_native_call_leaf(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+) -> MethodCallResult {
+    const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
+    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    let mut heap_forwarded: Vec<Value>;
+    let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+        inline_forwarded[..args.len()].copy_from_slice(args);
+        &mut inline_forwarded[..args.len()]
+    } else {
+        heap_forwarded = args.to_vec();
+        &mut heap_forwarded[..]
+    };
+    for value in forwarded_args.iter_mut() {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.mem.heap.load_and_forward(*obj);
+        }
+    }
+
+    let result = {
+        let mut ctx = NativeContextImpl { shared, thread };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&mut ctx, forwarded_args)
+        }))
+    };
+
+    let mut out: MethodCallResult = match result {
+        Ok(method_result) => method_result,
+        Err(payload) => {
+            // A leaf that panicked has broken its contract. Report it with the
+            // same shape the funnel uses — the callee name plus the Java frame
+            // that called it — rather than letting the payload fall on the
+            // floor, because the whole point of the leaf list is that it is
+            // auditable and a violation must be attributable.
+            thread.native_pending_return = None;
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown native method panic".to_string()
+            };
+            let callee = native_callee_name(callback);
+            let top = thread
+                .frames
+                .last()
+                .map(|f| {
+                    format!(
+                        "{}.{}{}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor()
+                    )
+                })
+                .unwrap_or_default();
+            tracing::error!(
+                "LEAF native {} panicked: {} (invoked from {}). A leaf native must not \
+                 panic — see NativeMethodRegistry::set_leaf; drop its leaf claim.",
+                callee,
+                msg,
+                top,
+            );
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("leaf native method panic: {msg}"),
+            }));
+        }
+    };
+
+    thread.native_pending_return = None;
+    match &mut out {
+        Ok(Some(v)) => {
+            if let Value::Object(Some(o)) = v {
+                *o = shared.mem.heap.load_and_forward(*o);
+            }
+            if let Some(o) = value_as_validated_object_ref(shared, *v) {
+                thread.native_pending_return = Some(o);
+            }
+        }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            thread.native_pending_return = Some(*exc);
+        }
+        _ => {}
+    }
+    out
+}
+
 /// DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector.
 ///
 /// A native that returns with FEWER pins than it entered with truncated its
@@ -1866,154 +1993,6 @@ fn native_diag_post_call(
     }
 }
 
-/// Whether the leaf audit (`CRATONVM_DBG=leafaudit`) is armed. Memoized.
-#[inline]
-fn leaf_audit_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LEAFAUDIT").is_some())
-}
-
-/// Count of leaf natives dispatched without the funnel. Reported by
-/// `CRATONVM_INTRINSIC_STATS=1`, for the same "prove it is not inert" reason
-/// as every other counter on this path.
-pub static LEAF_NATIVE_DISPATCHES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Number of funnel-free leaf-native dispatches since process start.
-pub fn leaf_native_dispatch_count() -> u64 {
-    LEAF_NATIVE_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Count of leaf-predicate violations the audit caught. Non-zero means a
-/// triple in `cratonvm_native_api::leaf::LEAF_NATIVES` is mis-marked.
-pub static LEAF_AUDIT_VIOLATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Number of leaf-predicate violations observed. Zero unless
-/// `CRATONVM_DBG=leafaudit` armed the audit.
-pub fn leaf_audit_violation_count() -> u64 {
-    LEAF_AUDIT_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Dispatch a native that is declared LEAF
-/// (`cratonvm_native_api::leaf` — cannot allocate, collect, safepoint, block,
-/// throw, or retain a ref past its return), skipping the funnel's bookkeeping.
-///
-/// What is skipped and why it is safe is the module doc on `leaf`; what is
-/// *kept* is the interesting half:
-///
-/// * `catch_unwind` stays. It costs ~2 ns and it is the difference between a
-///   mis-implemented native being reported and it unwinding through the
-///   interpreter. The leaf predicate says a native cannot throw a *Java*
-///   exception; it says nothing about a Rust bug.
-/// * The audit (`CRATONVM_DBG=leafaudit`) stays behind one memoized bool.
-///
-/// A leaf native returns a primitive or void, so there is no object-return
-/// handoff to publish: nothing here writes `native_pending_return`. That is
-/// stricter than the general funnel, which would have run a `Value::Long`
-/// return through `value_as_validated_object_ref` and rooted any timestamp
-/// that happened to alias a heap address. The audit asserts the return shape,
-/// so this is checked rather than assumed.
-#[inline]
-fn safe_native_call_leaf(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    callback: NativeCallback,
-    args: &[Value],
-) -> MethodCallResult {
-    LEAF_NATIVE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if leaf_audit_enabled() {
-        return leaf_audit_dispatch(shared, thread, callback, args);
-    }
-    let out = {
-        let mut ctx = NativeContextImpl { shared, thread };
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut ctx, args)))
-    };
-    match out {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown native method panic".to_string());
-            Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: format!("native method panic (leaf): {msg}"),
-            }))
-        }
-    }
-}
-
-/// `CRATONVM_DBG=leafaudit` — check that a native declared LEAF actually is.
-///
-/// A mis-marked leaf is a silent heap-corruption bug: the funnel's pinning and
-/// GC-pressure hooks are skipped for it, so a native that allocates or
-/// collects would run with its arguments unrooted and nothing would say so.
-/// This is the guard that can fail. It runs the native through the FULL
-/// funnel — so the run stays correct while the audit is armed — and then
-/// checks the four claims the predicate makes:
-///
-/// 1. no collection ran (the heap's collection count is unchanged),
-/// 2. no pin was left behind and none was consumed,
-/// 3. nothing was published to `native_pending_return`, and
-/// 4. the native neither threw a Java exception nor returned an object.
-///
-/// A violation names the native and is counted; it does not abort, because
-/// the whole point is to be able to arm this over a real workload.
-#[cold]
-#[inline(never)]
-fn leaf_audit_dispatch(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    callback: NativeCallback,
-    args: &[Value],
-) -> MethodCallResult {
-    let collections_before = shared.mem.heap.collection_count();
-    let pins_before = thread.native_pin_roots.len();
-    // The FULL funnel, reached directly rather than through
-    // `safe_native_call_impl` — going back through the dispatcher would take
-    // the leaf branch again and recurse forever.
-    let out = safe_native_call_funnel(shared, thread, callback, args, false, native_diag_mask());
-    let mut complaint: Option<&'static str> = None;
-    if shared.mem.heap.collection_count() != collections_before {
-        complaint = Some("initiated a collection");
-    } else if thread.native_pin_roots.len() != pins_before {
-        complaint = Some("left the pin stack changed");
-    } else if thread.native_pending_return.is_some() {
-        complaint = Some("published a native_pending_return");
-    } else {
-        match &out {
-            Err(MethodCallFailed::ExceptionThrown(_)) => {
-                complaint = Some("threw a Java exception");
-            }
-            Ok(Some(Value::Object(Some(_)))) => complaint = Some("returned an object"),
-            _ => {}
-        }
-    }
-    if let Some(what) = complaint {
-        LEAF_AUDIT_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let callee = native_callee_name(callback);
-        eprintln!(
-            "[leafaudit] VIOLATION {callee} is declared LEAF but {what} — \
-             remove it from cratonvm_native_api::leaf::LEAF_NATIVES"
-        );
-    }
-    out
-}
-
-/// Route a native dispatch: LEAF natives skip the funnel, everything else
-/// takes it.
-///
-/// The check is one relaxed load, a shift and a test for the ~3,100 non-leaf
-/// natives (`leaf::is_leaf_callback`'s bloom word); the exact table is
-/// consulted only behind a set bit.
-///
-/// The leaf branch is gated on an all-clear diagnostic mask deliberately:
-/// with any diagnostic armed a leaf native must still appear in the ring, the
-/// dispatch trace and the straystack, or arming a diagnostic to chase a hang
-/// would make an entire class of natives invisible — the same failure the A3
-/// static/dynamic split guards against for `dispatch_trace`/`native_ring`.
-#[inline]
 fn safe_native_call_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -2022,24 +2001,8 @@ fn safe_native_call_impl(
     prevalidated_objects: bool,
 ) -> MethodCallResult {
     // ARCH-2026-08-04 A3 — the funnel's thirteen diagnostic gates, as one word.
-    // Zero on every production run; see the `native_diag` module header. Read
-    // ONCE here and handed to the funnel, so routing costs the common path
-    // nothing beyond the bloom test.
+    // Zero on every production run; see the `native_diag` module header.
     let diag = native_diag_mask();
-    if diag == 0 && cratonvm_native_api::leaf::is_leaf_callback(callback as usize) {
-        return safe_native_call_leaf(shared, thread, callback, args);
-    }
-    safe_native_call_funnel(shared, thread, callback, args, prevalidated_objects, diag)
-}
-
-fn safe_native_call_funnel(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    callback: NativeCallback,
-    args: &[Value],
-    prevalidated_objects: bool,
-    diag: u32,
-) -> MethodCallResult {
     let _pin_floor_guard = (diag & native_diag::BLOCKGC != 0).then(|| PinFloorGuard {
         floor: thread.native_pin_roots.len(),
         thread: thread as *const JvmThread,
@@ -2974,8 +2937,12 @@ thread_local! {
     /// millions of consecutive writes to the same `(class, slot)`; once the
     /// shared cache has a definitive result, repeating its RwLock + hash probe
     /// adds no correctness value. The VM identity prevents cross-VM reuse.
+    ///
+    /// Entries carry the [`class_origin_epoch`] they were resolved under, so
+    /// a TRANSIENT miss can live here too — see
+    /// [`resolve_field_descriptor_byte_cached`]'s stub note.
     static FIELD_DESCRIPTOR_LAST:
-        std::cell::Cell<Option<(usize, u32, usize, u8)>> =
+        std::cell::Cell<Option<(usize, u32, usize, u8, u64)>> =
         const { std::cell::Cell::new(None) };
 
     /// PERF (perf/halfgap-20260717): the single-entry cache above thrashes
@@ -3004,8 +2971,8 @@ thread_local! {
     /// so a collision can only cost a re-walk, never return another field's
     /// descriptor.
     static FIELD_DESCRIPTOR_RING:
-        std::cell::RefCell<[(usize, u32, usize, u8); 64]> =
-        const { std::cell::RefCell::new([(0, 0, 0, 0); 64]) };
+        std::cell::RefCell<[(usize, u32, usize, u8, u64); 64]> =
+        const { std::cell::RefCell::new([(0, 0, 0, 0, 0); 64]) };
 }
 
 /// Bucket for [`FIELD_DESCRIPTOR_RING`]. Slot indices are small and dense, so
@@ -3016,14 +2983,40 @@ fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
     ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
 }
 
-/// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
-/// in both thread-local tiers.
-fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, byte: u8) {
-    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
+/// Stamp for a DEFINITIVE thread-local entry: one resolved against a real,
+/// fully-loaded hierarchy, whose layout is immutable. Such an entry must not
+/// expire — it was durable before the epoch existed, and making it perishable
+/// would push every lookup back onto the shared `RwLock` for the duration of
+/// any class-loading burst, which is a net loss on boot-dominated work.
+/// [`class_origin_epoch`] can never return this: it starts at 0 and counts up.
+const FIELD_DESCRIPTOR_DURABLE: u64 = u64::MAX;
+
+/// Record a descriptor result (byte, or 0 = negative) in both thread-local
+/// tiers.
+///
+/// `epoch` is [`FIELD_DESCRIPTOR_DURABLE`] for a definitive result, or the
+/// observed [`class_origin_epoch`] for a TRANSIENT one (stub, or an ancestor
+/// not loaded yet). Stamping the transient case is what lets it be memoized at
+/// all: the entry is honoured only while provenance has not moved, so a stub's
+/// promotion retires it.
+///
+/// The epoch is held PER ENTRY, never as one stamp over the whole table. A
+/// table-wide stamp would turn every bump into an O(table) wipe, and
+/// provenance moves on every class definition — that shape is a memset with a
+/// lookup attached. Per entry, a bump costs nothing: stale entries miss one at
+/// a time and are overwritten in place.
+fn field_descriptor_remember(
+    vm_key: usize,
+    class_id: u32,
+    slot_index: usize,
+    byte: u8,
+    epoch: u64,
+) {
+    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte, epoch))));
     FIELD_DESCRIPTOR_RING.with(|cell| {
         let mut ring = cell.borrow_mut();
         let idx = field_descriptor_bucket(class_id, slot_index);
-        ring[idx] = (vm_key, class_id, slot_index, byte);
+        ring[idx] = (vm_key, class_id, slot_index, byte, epoch);
     });
 }
 
@@ -3050,26 +3043,38 @@ fn resolve_field_descriptor_byte_cached(
     // especially by unit tests. Use the process-unique lifetime identity so
     // thread-local descriptor entries can never bleed into a later VM.
     let vm_key = shared.vm_identity;
-    if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
+    // Provenance generation. Entries in the two thread-local tiers are only
+    // honoured while this is unchanged, which is what lets a synthetic-stub
+    // answer be memoized at all (see the stub note on the slow path).
+    let epoch = cratonvm_classloading::class_origin_epoch();
+    // An entry is live if it is DURABLE (definitive, immutable layout) or was
+    // stamped under the provenance generation still in force.
+    let live = |stamp: u64| stamp == FIELD_DESCRIPTOR_DURABLE || stamp == epoch;
+    if let Some((cached, stamp)) = FIELD_DESCRIPTOR_LAST.with(|cache| {
         cache
             .get()
-            .filter(|(vm, cid, slot, _)| {
+            .filter(|(vm, cid, slot, _, _)| {
                 *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
             })
-            .map(|(_, _, _, byte)| byte)
+            .map(|(_, _, _, byte, ep)| (byte, ep))
     }) {
-        return if cached == 0 { None } else { Some(cached) };
+        if live(stamp) {
+            return if cached == 0 { None } else { Some(cached) };
+        }
     }
     // Second tier: the direct-mapped table (see FIELD_DESCRIPTOR_RING's doc).
     let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
         let ring = cell.borrow();
         let entry = ring[field_descriptor_bucket(class_id.as_u32(), slot_index)];
-        (entry.0 == vm_key && entry.1 == class_id.as_u32() && entry.2 == slot_index)
-            .then_some(entry.3)
+        (entry.0 == vm_key
+            && entry.1 == class_id.as_u32()
+            && entry.2 == slot_index
+            && live(entry.4))
+            .then_some((entry.3, entry.4))
     });
-    if let Some(byte) = ring_hit {
+    if let Some((byte, stamp)) = ring_hit {
         FIELD_DESCRIPTOR_LAST
-            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte))));
+            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte, stamp))));
         return if byte == 0 { None } else { Some(byte) };
     }
     // Fast path: read lock, hash lookup, early return on hit.
@@ -3087,7 +3092,13 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.classes.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                b,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -3203,10 +3214,7 @@ fn resolve_field_descriptor_byte_cached(
     // miss (`cacheable`) caches the `0u8` sentinel so the next lookup short-
     // circuits in the fast path instead of re-walking the hierarchy вЂ” this is
     // the common case for any real field/slot with no descriptor mapping, which
-    // previously re-walked under the read lock on every single access. A
-    // TRANSIENT miss (`!cacheable`: class/ancestor not loaded, or a synthetic
-    // stub that may be promoted) is NOT cached, so it re-walks and picks up the
-    // real descriptor once the class is loaded/promoted.
+    // previously re-walked under the read lock on every single access.
     //
     // Correctness under class redefinition: JEP 109 / JVMTI redefinition
     // performs an in-place method-body swap and MUST preserve field layout, so
@@ -3218,13 +3226,44 @@ fn resolve_field_descriptor_byte_cached(
             // never collide with the negative sentinel.
             debug_assert_ne!(b, 0, "descriptor first byte must not be NUL");
             cache_field_descriptor(shared, (class_id, slot_index), b);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                b,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
         }
         None if cacheable => {
             cache_field_descriptor(shared, (class_id, slot_index), 0u8);
-            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8);
+            field_descriptor_remember(
+                vm_key,
+                class_id.as_u32(),
+                slot_index,
+                0u8,
+                FIELD_DESCRIPTOR_DURABLE,
+            );
         }
-        None => {}
+        // TRANSIENT miss: the receiver's class — or an ancestor — is a
+        // synthetic stub whose descriptors are placeholders, or is not loaded
+        // yet. The answer may change (a stub can be promoted to the real class,
+        // an ancestor can load), so it must NOT go into the SHARED cache, which
+        // has no invalidation.
+        //
+        // PERF (testssl-testpost bulk TLS): it may, however, be memoized in the
+        // THREAD-LOCAL tiers, because those are epoch-stamped and
+        // `Class::set_origin` bumps the epoch on exactly the events that could
+        // change the answer. Without this, every `NativeContext::get_field` on a
+        // synthetic receiver re-took the process-global `class_manager` read
+        // lock to re-derive an answer that never changes in practice — and
+        // CratonVM's own stream/socket stand-ins (`SSLSocketInputStream` and
+        // friends) are all synthetic. `TestSsl.testPost` reads 16 MiB one byte
+        // at a time on each of 8 threads, so that lock was acquired ~134 million
+        // times in one test; measured against a no-op native on the same
+        // receiver, the field read cost 167 ns/call at 1 thread and 1166 ns/call
+        // at 8 — the superlinear part being the shared-cacheline RMW of the read
+        // acquire, not any real work.
+        None => field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8, epoch),
     }
     desc_byte
 }
@@ -4010,11 +4049,11 @@ impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
-    /// See `update_root_snapshot` (`vm/src/runtime/interpreter.rs`) for why the
-    /// operand-stack-sourced roots are filtered against `heap.is_object_address`:
-    /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
-    /// roots without heap validation (its file is restricted from edits), and
-    /// the resulting bogus addresses crash the GC at the next mark/move.
+    /// Operand-stack-sourced roots are filtered against `heap.is_heap_addr`
+    /// (alignment + arena containment) — the SAME screen `scan_local_objects`
+    /// applies to locals, and deliberately not the strict `is_object_address`
+    /// header probe. See `scan_frame_roots` in
+    /// `runtime/interpreter/gc_and_alloc.rs` for the full rationale.
     pub(crate) fn deposit_root_snapshot(&mut self) {
         // A thread that is about to PARK cannot consult its per-thread JIT memo
         // caches, but this deposit publishes them as GC roots — so any entry
@@ -4122,7 +4161,11 @@ impl<'a> NativeContextImpl<'a> {
                 let added = snapshot.split_off(before);
                 for o in added {
                     let addr = o.as_ptr() as usize;
-                    if self.shared.mem.heap.is_object_address(addr).is_some() {
+                    // `is_heap_addr`, not `is_object_address` — see
+                    // `scan_frame_roots`. This deposit is the collector's ONLY
+                    // view of the thread once it blocks, so a root dropped here
+                    // is an object reclaimed under a live frame slot.
+                    if self.shared.mem.heap.is_heap_addr(addr).is_some() {
                         snapshot.push(o);
                     }
                 }
@@ -4168,6 +4211,11 @@ impl<'a> NativeContextImpl<'a> {
             let mut origins = self.thread.gc_block_state.slot_origins.lock();
             origins.clear();
             for (fi, fr) in self.thread.frames.iter().enumerate() {
+                // Recorded per slot, not applied as a filter: every slot is
+                // still tracked and written back, but the fold's invariant
+                // check needs to know which of them the collector was actually
+                // obliged to keep. See `SlotOrigin::live`.
+                let live_mask = fr.live_locals_mask_here();
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
@@ -4175,6 +4223,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: li as u32,
                             is_stack: false,
+                            live: li >= 64 || live_mask & (1u64 << li) != 0,
                             orig: a,
                             cur: a,
                         });
@@ -4187,6 +4236,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: si as u32,
                             is_stack: true,
+                            live: true,
                             orig: a,
                             cur: a,
                         });
@@ -4340,6 +4390,74 @@ impl<'a> NativeContextImpl<'a> {
             });
         }
 
+        // DIAGNOSTIC (CRATONVM_DBG_BLOCKGC) — the deposit-side precondition of
+        // the blocked-frame stale-receiver family, checked WITHOUT needing the
+        // rare collection to land in the window.
+        //
+        // This snapshot is the ONLY view a cross-thread collector has of this
+        // thread while it is blocked. So a frame slot that decodes as
+        // `Value::Object(Some(_))`, is LIVE at this frame's pc, and is not in
+        // the snapshot, is an object the collector will not know to keep — and
+        // the owner will read it again on wake. `slot_origins` (recorded just
+        // above) cannot rescue it either: that tracker advances `cur` through
+        // each cycle's pointer map, and an object nothing rooted is never IN a
+        // pointer map.
+        //
+        // What can differ: this walk decodes a slot with `to_value()`, while
+        // the two publishing scans additionally consult the parallel kind
+        // marks (`Frame::local_kinds`, `ValueStack::kinds`) and skip a slot
+        // marked `long`/`double`, so the moving collector cannot relocate a
+        // pointer-shaped primitive. A slot whose kind mark and whose value tag
+        // DISAGREE therefore falls between the two, and is published by
+        // neither. Non-zero output here names that slot.
+        if blockgc_dbg() && raise_blocked_flag {
+            let published: rustc_hash::FxHashSet<usize> =
+                snapshot.iter().map(|r| r.as_ptr() as usize).collect();
+            let heap = &self.shared.mem.heap;
+            let mut gaps = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                let live_mask = fr.live_locals_mask_here();
+                let mut report = |what: &str, idx: usize, a: usize| {
+                    if published.contains(&a) || heap.is_heap_addr(a).is_none() {
+                        return;
+                    }
+                    gaps += 1;
+                    if gaps <= 8 {
+                        eprintln!(
+                            "[blockgc] UNPUBLISHED-LIVE-SLOT tid={} frame#{fi} {}.{} pc={} \
+                             {what}[{idx}] 0x{a:x} — a live object frame slot the blocking \
+                             deposit did not publish as a root",
+                            self.thread.thread_id.0,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.pc,
+                        );
+                    }
+                };
+                for li in 0..fr.locals_len() {
+                    if li < 64 && live_mask & (1u64 << li) == 0 {
+                        continue;
+                    }
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        report("local", li, o.as_ptr() as usize);
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        report("stack", si, o.as_ptr() as usize);
+                    }
+                }
+            }
+            if gaps > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} frames={} snapshot={} UNPUBLISHED-LIVE-SLOTS={}",
+                    self.thread.thread_id.0,
+                    self.thread.frames.len(),
+                    snapshot.len(),
+                    gaps,
+                );
+            }
+        }
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
         // thread can read where THIS thread is parked (cross-thread
@@ -5576,97 +5694,215 @@ fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
         .is_some_and(|class| class.name.as_ref() == "java/lang/String")
 }
 
-/// Return the raw Java String hash directly from compact storage.
+/// How a `java.lang.String` instance stores its characters.
+///
+/// The first two match the JDK's own `String.LATIN1` / `String.UTF16` coder
+/// constants and describe a `byte[]` payload. [`STRING_STORAGE_CHARS`] is the
+/// pre-JDK-9 `char[]` payload, which CratonVM's own fabricated
+/// `java/lang/String` still uses — see [`java_string_storage`].
+const STRING_STORAGE_LATIN1: u8 = 0;
+const STRING_STORAGE_UTF16: u8 = 1;
+const STRING_STORAGE_CHARS: u8 = 2;
+
+/// The element type of `object`, or `None` when `object` is not an array at
+/// all. `VmHeap::array_element_type` reads a header word that is only
+/// meaningful on an array, so every layout probe below goes through here.
+fn array_element_type_of(shared: &SharedVm, object: ObjectRef) -> Option<ArrayElementType> {
+    if shared.mem.heap.kind_of(object) != ObjectKind::Array {
+        return None;
+    }
+    shared.mem.heap.array_element_type(object)
+}
+
+/// Locate a String's character array and how that array is encoded.
+///
+/// Returning `None` means *"this object's characters could not be located"* —
+/// never *"the string is empty"* and never anything about a comparison. Every
+/// caller must treat `None` as "fall back to running `String.hashCode()` /
+/// `String.equals()`".
+///
+/// # Why this is not just slots 0 and 1
+///
+/// The JDK-9+ compact layout (`value:[B` at slot 0, `coder:B` at slot 1) is
+/// probed first and answered without touching class metadata: it is the layout
+/// of every String in a real-JDK run and these readers sit under the hottest
+/// comparison in the map natives.
+///
+/// But it is not the only layout this VM runs. CratonVM's fabricated
+/// `java/lang/String` (booted whenever no real JDK image is in play — every
+/// in-process `VmConfig::new()` test) declares `value` + `hash` and has **no
+/// `coder` field at all**, so its slot 1 holds the *cached hash*. Reading that
+/// as a coder is what made `compact_java_strings_equal` answer "not equal" for
+/// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
+/// every String key the same map had just stored
+/// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+/// So when the positional probe does not describe a String, resolve `value`
+/// and `coder` by NAME off the receiver's own class before giving up.
+fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let heap = &shared.mem.heap;
+    if let Value::Object(Some(value)) = heap.get_field(object, 0) {
+        // `array_element_type` / `array_length` read header words that only
+        // mean anything on an array, so the kind check comes first — same
+        // order, and for the same reason, as `read_java_string`'s.
+        match array_element_type_of(shared, value) {
+            Some(ArrayElementType::Char) => return Some((value, STRING_STORAGE_CHARS)),
+            Some(ArrayElementType::Byte) => match heap.get_field(object, 1) {
+                Value::Int(0) => return Some((value, STRING_STORAGE_LATIN1)),
+                Value::Int(1) => return Some((value, STRING_STORAGE_UTF16)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    java_string_storage_by_name(shared, object)
+}
+
+/// Metadata-driven half of [`java_string_storage`], for any `java/lang/String`
+/// whose layout is not the JDK-9+ positional one. A missing `coder` field means
+/// a `byte[]` payload is LATIN1 — the same default `NativeContextImpl
+/// ::read_string` applies when it takes this route.
+fn java_string_storage_by_name(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let class_id = shared.mem.heap.class_id_of(object);
+    let (value_index, coder_index) = {
+        let cm = shared.classes.class_manager.read();
+        (
+            resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?,
+            resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store),
+        )
+    };
+    let Value::Object(Some(value)) = shared.mem.heap.get_field(object, value_index) else {
+        return None;
+    };
+    match array_element_type_of(shared, value) {
+        Some(ArrayElementType::Char) => Some((value, STRING_STORAGE_CHARS)),
+        Some(ArrayElementType::Byte) => {
+            match coder_index.map(|index| shared.mem.heap.get_field(object, index)) {
+                None | Some(Value::Int(0)) => Some((value, STRING_STORAGE_LATIN1)),
+                Some(Value::Int(1)) => Some((value, STRING_STORAGE_UTF16)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Number of UTF-16 code units in a character array of `element_count`
+/// elements under `storage`. `None` for a UTF16 `byte[]` of odd length, which
+/// is not a decodable String payload.
+fn string_unit_count(element_count: usize, storage: u8) -> Option<usize> {
+    match storage {
+        STRING_STORAGE_LATIN1 => Some(element_count),
+        STRING_STORAGE_UTF16 => (element_count % 2 == 0).then(|| element_count / 2),
+        _ => Some(element_count),
+    }
+}
+
+/// Read one UTF-16 code unit out of a String's character array.
+///
+/// # Safety
+/// `data` must point at `storage`'s payload and `index` must be less than the
+/// [`string_unit_count`] computed for that same payload.
+unsafe fn string_unit_at(data: *const u8, storage: u8, index: usize) -> u16 {
+    if storage == STRING_STORAGE_LATIN1 {
+        return unsafe { *data.add(index) } as u16;
+    }
+    // Both the UTF16 `byte[]` payload and a `char[]` payload are pairs of
+    // little-endian bytes (`StringUTF16.isBigEndian() == false`, and `char[]`
+    // elements are stored as native-endian `u16` on the little-endian targets
+    // this VM builds for).
+    unsafe {
+        u16::from_le_bytes([*data.add(index * 2), *data.add(index * 2 + 1)])
+    }
+}
+
+/// Return the raw Java String hash directly from the receiver's character
+/// storage, without materialising a host `String`.
+///
+/// `None` means the storage could not be read, not that the hash is 0.
 fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32> {
     if !is_real_java_string(shared, object) {
         return None;
     }
-    let (Value::Object(Some(bytes)), Value::Int(coder)) = (
-        shared.mem.heap.get_field(object, 0),
-        shared.mem.heap.get_field(object, 1),
-    ) else {
-        return None;
-    };
-    if !matches!(coder, 0 | 1)
-        || shared.mem.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
-    {
-        return None;
-    }
-    let ptr = shared.mem.heap.array_data_ptr(bytes)?;
-    let raw = unsafe {
-        std::slice::from_raw_parts(ptr as *const u8, shared.mem.heap.array_length(bytes))
-    };
+    let (value, storage) = java_string_storage(shared, object)?;
+    let data = shared.mem.heap.array_data_ptr(value)?;
+    let units = string_unit_count(shared.mem.heap.array_length(value), storage)?;
     let mut hash = 0i32;
-    if coder == 0 {
-        for &byte in raw {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
-        }
-    } else {
-        if raw.len() & 1 != 0 {
-            return None;
-        }
-        for unit in raw.chunks_exact(2) {
-            hash = hash
-                .wrapping_mul(31)
-                .wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
-        }
+    for index in 0..units {
+        // SAFETY: `data` is `value`'s payload and `index < units`, the unit
+        // count computed for that payload.
+        let unit = unsafe { string_unit_at(data, storage, index) };
+        hash = hash.wrapping_mul(31).wrapping_add(unit as i32);
     }
     Some(hash)
 }
 
-/// Compare final compact `java.lang.String` instances without creating a
-/// host `String`. Cache entries originate only from confirmed String keys; the
-/// class-id equality guard therefore also rejects unrelated objects that happen
-/// to expose a similar field layout.
-fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectRef) -> bool {
+/// Compare two `java.lang.String` instances without creating a host `String`.
+///
+/// `Some(_)` is an ANSWER; `None` means "this comparison was not made" — the
+/// caller must fall back to dispatching `String.equals`. Returning `false` for
+/// a String whose storage this function does not understand is what made
+/// `ConcurrentHashMap.get` miss keys the map held (see [`java_string_storage`]
+/// and the known-issue file it names): a "not equal" verdict is only ever
+/// correct once BOTH operands have actually been read.
+fn compact_java_strings_equal(
+    shared: &SharedVm,
+    left: ObjectRef,
+    right: ObjectRef,
+) -> Option<bool> {
     if left == right {
-        return true;
+        return Some(true);
     }
     if shared.mem.heap.class_id_of(left) != shared.mem.heap.class_id_of(right) {
-        return false;
+        return Some(false);
     }
-    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) = (
-        shared.mem.heap.get_field(left, 0),
-        shared.mem.heap.get_field(left, 1),
+    let (left_value, left_storage) = java_string_storage(shared, left)?;
+    let (right_value, right_storage) = java_string_storage(shared, right)?;
+    let (Some(left_data), Some(right_data)) = (
+        shared.mem.heap.array_data_ptr(left_value),
+        shared.mem.heap.array_data_ptr(right_value),
     ) else {
-        return false;
+        return None;
     };
-    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) = (
-        shared.mem.heap.get_field(right, 0),
-        shared.mem.heap.get_field(right, 1),
-    ) else {
-        return false;
-    };
-    if !matches!(left_coder, 0 | 1)
-        || !matches!(right_coder, 0 | 1)
-        || shared.mem.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
-        || shared.mem.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
-    {
-        return false;
+    let left_elements = shared.mem.heap.array_length(left_value);
+    let right_elements = shared.mem.heap.array_length(right_value);
+    if left_storage == right_storage {
+        // Same representation: one raw payload compare, no decoding at all.
+        //
+        // Bytes per ELEMENT, not per code unit: `array_length` already counts
+        // elements, and a UTF16 String's value array is a `byte[]` whose length
+        // is the byte count. Only a `char[]` has 2-byte elements. (Deriving the
+        // span from the unit count instead would read twice the payload of
+        // every UTF16 String.)
+        let element_bytes = if left_storage == STRING_STORAGE_CHARS {
+            2
+        } else {
+            1
+        };
+        let left_raw =
+            unsafe { std::slice::from_raw_parts(left_data, left_elements * element_bytes) };
+        let right_raw =
+            unsafe { std::slice::from_raw_parts(right_data, right_elements * element_bytes) };
+        return Some(left_raw == right_raw);
     }
-    let (Some(left_ptr), Some(right_ptr)) = (
-        shared.mem.heap.array_data_ptr(left_bytes),
-        shared.mem.heap.array_data_ptr(right_bytes),
-    ) else {
-        return false;
-    };
-    let left_len = shared.mem.heap.array_length(left_bytes);
-    let right_len = shared.mem.heap.array_length(right_bytes);
-    let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
-    let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
-    if left_coder == right_coder {
-        return left_raw == right_raw;
+    let left_units = string_unit_count(left_elements, left_storage)?;
+    let right_units = string_unit_count(right_elements, right_storage)?;
+    if left_units != right_units {
+        return Some(false);
     }
-    let (latin, utf16) = if left_coder == 0 {
-        (left_raw, right_raw)
-    } else {
-        (right_raw, left_raw)
-    };
-    utf16.len() == latin.len().saturating_mul(2)
-        && latin
-            .iter()
-            .zip(utf16.chunks_exact(2))
-            .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
+    for index in 0..left_units {
+        // SAFETY: each pointer is its own value array's payload and `index` is
+        // below that array's unit count.
+        let (l, r) = unsafe {
+            (
+                string_unit_at(left_data, left_storage, index),
+                string_unit_at(right_data, right_storage, index),
+            )
+        };
+        if l != r {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 impl<'a> NativeContextImpl<'a> {
@@ -10050,7 +10286,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if !is_real_java_string(self.shared, a) || !is_real_java_string(self.shared, b) {
             return None;
         }
-        Some(compact_java_strings_equal(self.shared, a, b))
+        compact_java_strings_equal(self.shared, a, b)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -20375,36 +20611,32 @@ fn invoke_on_class_shared_inner(
                         // builds a genuine `Thread$FieldHolder` for every
                         // real-JDK Thread, so the real `Cleaner` /
                         // `CleanerImpl` bytecode runs unmodified.
-                        // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
-                        // bytecode resolution is failing for these basic methods
-                        // during JDK class clinits like
-                        // java/nio/charset/StandardCharsets.<clinit>; route to
-                        // our layout-neutral natives (registered in
-                        // register_essential_natives) so the boot can advance
-                        // past String dispatch. Drop when RKC16N.6 lands a
-                        // permanent fix.
+                        // The 21-name forced-native `java/lang/String` arm that
+                        // stood here from "RKC16N.6 RECON" (Session 94) until
+                        // 2026-08-04 IS GONE, and so is its warm-path twin in
+                        // `force_native_over_real_jdk_bytecode`. Both were
+                        // measured inert before removal, not argued to be: a
+                        // binary with both deleted produced a byte-identical
+                        // 392-case `String` transcript in BOTH modes and
+                        // identical invocation counts on all 38 exercised
+                        // `java/lang/String` registry slots. They never decided
+                        // anything, because `resolve_step1_native`
+                        // (`try_stackless_invoke` step 1) takes ANY registered
+                        // native for the triple before either list is consulted
+                        // and has no list of its own.
                         //
-                        // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
-                        // policy, POSITIVE FORM (21 method names, matched
-                        // descriptor-blind). The list itself now lives in
-                        // `cold_forced_native_string_name`, beside the WARM
-                        // path's inverted-exclusion twin
-                        // (`warm_forced_native_string_candidate`), so the two
-                        // halves of one policy can be compared by a test
-                        // instead of by a reader diffing two files — see that
-                        // function for the RKC16N.6 defect they both work
-                        // around, for the five entries that were statically
-                        // unreachable until 2026-08-04, and for why they must
-                        // be deleted together.
-                        || (class_name == "java/lang/String"
-                            && crate::runtime::interpreter::cold_forced_native_string_name(
-                                method_name,
-                            ))
+                        // So the policy for `java/lang/String` is decided where
+                        // it was always actually decided — at REGISTRATION, in
+                        // `NativeMethodRegistry::register`'s real-JDK drop —
+                        // and a shape that must lose to real bytecode is simply
+                        // not registered. See
+                        // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
+                        //
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
                         // this cold call-site can warm. Keep this concrete
-                        // bytecode override in sync with interpreter.rs's
-                        // force_native_over_real_jdk_bytecode gate.
+                        // bytecode override in sync with the
+                        // `force_native_over_real_jdk_bytecode` gate.
                         || (class_name == "java/lang/StringUTF16"
                             && method_name == "getChars"
                             && descriptor == "([BII[CI)V")
@@ -21587,11 +21819,6 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_jdk_string_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_jdk_string_charset_name_constructor_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -23669,7 +23896,7 @@ impl Drop for JniImplicitFrameGuard {
 
 /// Where the native funnel's fixed per-call cost actually goes.
 ///
-/// `native-call-funnel-per-call-floor-RETIRED-20260804.md`
+/// `native-call-funnel-per-call-floor-item2-20260805.md`
 /// measured the funnel at ~180-330 ns for zero arguments and then said so
 /// itself: *"Nobody has profiled it; this document asserts where the time is,
 /// not which line."* This module is the answer to that. It drives
@@ -23849,163 +24076,6 @@ mod native_funnel_profile {
             black_box(&mut forwarded);
             black_box(&mut roots);
         });
-    }
-}
-
-/// The LEAF class: routing, and an audit that is shown to FAIL.
-///
-/// A guard that cannot fail reads exactly like one that works, so the audit
-/// is driven here with a callback that deliberately violates the predicate
-/// and the violation is asserted, not assumed. Without that injection
-/// `leaf_audit_violation_count() == 0` on a clean run proves nothing.
-#[cfg(test)]
-mod leaf_native_tests {
-    use super::*;
-    use crate::config::VmConfig;
-    use crate::threading::jvm_thread::{JvmThread, ThreadId};
-    use std::sync::Arc;
-
-    fn shared() -> Arc<SharedVm> {
-        Arc::new(SharedVm::new(VmConfig::default()))
-    }
-
-    /// Three well-behaved leaves, one per test, **with deliberately different
-    /// bodies**.
-    ///
-    /// Separate functions because `leaf::mark` is process-global and libtest
-    /// runs these concurrently: one shared callback marked by one test would
-    /// be already-marked when another asserted it was not.
-    ///
-    /// Different *return values* because separate `fn` items are **not enough
-    /// to guarantee separate addresses**. The MSVC linker's identical COMDAT
-    /// folding (`/OPT:ICF`, on by default in release) merges functions with
-    /// identical machine code, so three byte-identical bodies collapse to one
-    /// address and marking any of them marks all three. That is not a
-    /// hypothetical — it is how this test first failed, and it is a real
-    /// property of keying the leaf class on the callback ADDRESS. See the
-    /// identical-code-folding note in `cratonvm_native_api::leaf`.
-    fn leafy_unmarked(
-        _ctx: &mut dyn cratonvm_native_api::NativeContext,
-        _a: &[Value],
-    ) -> MethodCallResult {
-        Ok(Some(Value::Long(7)))
-    }
-
-    fn leafy_marked(
-        _ctx: &mut dyn cratonvm_native_api::NativeContext,
-        _a: &[Value],
-    ) -> MethodCallResult {
-        Ok(Some(Value::Long(11)))
-    }
-
-    fn leafy_audited(
-        _ctx: &mut dyn cratonvm_native_api::NativeContext,
-        _a: &[Value],
-    ) -> MethodCallResult {
-        Ok(Some(Value::Long(13)))
-    }
-
-    /// A native that LIES about being a leaf: it allocates and hands the
-    /// object back, which is two violations at once (object return, and a
-    /// published `native_pending_return`).
-    fn liar(ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Object(Some(ctx.alloc_object(ClassId::new(0), 0)))))
-    }
-
-    #[test]
-    fn an_unmarked_callback_is_not_routed_to_the_leaf_path() {
-        let shared = shared();
-        let mut thread = JvmThread::new(ThreadId(0), "leaf-route");
-        let cb: NativeCallback = leafy_unmarked;
-        assert_eq!(
-            safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
-            Some(Value::Long(7))
-        );
-        // Asserted on the ROUTING PREDICATE, not on the global dispatch
-        // counter. The counter is process-wide and any concurrently-running
-        // test that boots a VM and touches `System.nanoTime` moves it, so
-        // `assert_eq!(count, before)` would be a race dressed up as a
-        // regression check.
-        assert!(
-            !cratonvm_native_api::leaf::is_leaf_callback(cb as usize),
-            "a callback that was never marked leaf must not be classified leaf"
-        );
-    }
-
-    #[test]
-    fn a_marked_callback_takes_the_funnel_free_path() {
-        let cb: NativeCallback = leafy_marked;
-        cratonvm_native_api::leaf::mark(cb as usize);
-        let before = leaf_native_dispatch_count();
-        let shared = shared();
-        let mut thread = JvmThread::new(ThreadId(0), "leaf-route-marked");
-        assert_eq!(
-            safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
-            Some(Value::Long(11)),
-            "the leaf path must deliver the native's own result unchanged"
-        );
-        assert!(
-            leaf_native_dispatch_count() > before,
-            "a marked callback must be routed past the funnel — an inert \
-             bypass and a working one are indistinguishable by timing alone"
-        );
-        assert_eq!(
-            thread.native_pin_roots.len(),
-            0,
-            "the leaf path pins nothing and must leave the pin stack alone"
-        );
-    }
-
-    /// The audit is driven directly (rather than through the env flag, which
-    /// is memoized process-wide and would leak into every other test in this
-    /// binary) and handed a native that breaks the predicate.
-    #[test]
-    fn the_audit_catches_a_native_that_is_not_really_a_leaf() {
-        let shared = shared();
-        let mut thread = JvmThread::new(ThreadId(0), "leaf-audit-injection");
-
-        let clean_before = leaf_audit_violation_count();
-        let cb: NativeCallback = leafy_audited;
-        let _ = leaf_audit_dispatch(&shared, &mut thread, cb, &[]);
-        assert_eq!(
-            leaf_audit_violation_count(),
-            clean_before,
-            "an honest leaf must not be reported"
-        );
-
-        let before = leaf_audit_violation_count();
-        let liar_cb: NativeCallback = liar;
-        let _ = leaf_audit_dispatch(&shared, &mut thread, liar_cb, &[]);
-        assert!(
-            leaf_audit_violation_count() > before,
-            "the audit must FAIL on a native that allocates and returns an \
-             object while claiming to be a leaf — if it cannot fail here it \
-             is not evidence of anything on a real workload"
-        );
-    }
-
-    /// Every triple in the table is registered by a real registrar, so the
-    /// mechanism is wired end-to-end rather than merely present.
-    ///
-    /// This is the check that catches the mechanism going inert: a rename in
-    /// `native-builtins` (or a descriptor typo in the table) leaves
-    /// `LEAF_NATIVES` naming a triple nothing registers, `mark` is never
-    /// called for it, and the bypass silently stops existing.
-    #[test]
-    fn every_declared_leaf_triple_is_actually_registered() {
-        let shared = shared();
-        let registry = &shared.natives.native_methods;
-        for (class, method, descriptor) in cratonvm_native_api::leaf::LEAF_NATIVES {
-            assert!(
-                registry.find(class, method, descriptor).is_some(),
-                "{class}.{method}{descriptor} is declared LEAF but nothing \
-                 registers it — the bypass for it is inert"
-            );
-        }
-        assert!(
-            cratonvm_native_api::leaf::marked_count() >= cratonvm_native_api::leaf::LEAF_NATIVES.len(),
-            "booting a VM must have marked every declared leaf callback"
-        );
     }
 }
 
@@ -24280,6 +24350,74 @@ mod tests {
             Value::Object(Some(o)) => o.as_ptr() as usize,
             other => panic!("expected an object slot, got {other:?}"),
         }
+    }
+
+    /// Two distinct `java.lang.String` objects with the same characters must
+    /// compare EQUAL through the native-context fast path, whatever layout
+    /// this VM's `java/lang/String` happens to use.
+    ///
+    /// `VmConfig::default()` boots the fabricated `java/lang/String`, which is
+    /// `char[]`-backed and has no `coder` field. The positional reader used to
+    /// read its slot 1 (the cached hash) as a coder, reject the value, and
+    /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
+    /// String-keyed CHM missed every key it held
+    /// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    #[test]
+    fn equal_strings_compare_equal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
+        assert_ne!(a.as_ptr(), b.as_ptr(), "the probe needs two distinct objects");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        // "k0" == 'k' * 31 + '0' == 3365, the value String.hashCode() returns.
+        assert_eq!(compact_java_string_hash(&shared, a), Some(3365));
+        assert_eq!(
+            compact_java_string_hash(&shared, a),
+            compact_java_string_hash(&shared, b)
+        );
+    }
+
+    /// Non-Latin1 content, which is the UTF16 `byte[]` payload on a real-JDK
+    /// String and a `char[]` payload here. Both are 2 bytes per code unit but
+    /// only one of them is 2 bytes per *array element*, and the same-storage
+    /// compare spans `array_length` elements — so getting that conversion
+    /// backwards reads past the end of every UTF16 String.
+    #[test]
+    fn non_latin1_strings_round_trip_through_the_compact_readers() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "kπ0");
+        let c = crate::vm::create_java_string_uninterned(&shared, "kπ1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        assert_eq!(compact_java_strings_equal(&shared, a, c), Some(false));
+        let expected = "kπ0"
+            .encode_utf16()
+            .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+        assert_eq!(compact_java_string_hash(&shared, a), Some(expected));
+    }
+
+    /// Different characters still compare unequal — the fix must not make
+    /// every comparison "unknown".
+    #[test]
+    fn different_strings_compare_unequal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(false));
+    }
+
+    /// A String whose character storage cannot be located answers `None`
+    /// ("not compared"), never `Some(false)`. This is the whole contract: a
+    /// caller reading `false` stops looking, and that is how a present key
+    /// becomes an absent one.
+    #[test]
+    fn unreadable_string_storage_is_unknown_not_unequal() {
+        let shared = test_shared();
+        let a = crate::vm::create_java_string_uninterned(&shared, "k0");
+        let b = crate::vm::create_java_string_uninterned(&shared, "k0");
+        shared.mem.heap.set_field(b, 0, Value::Object(None));
+        assert_eq!(compact_java_strings_equal(&shared, a, b), None);
+        assert_eq!(compact_java_string_hash(&shared, b), None);
     }
 
     /// A virtual thread parked across a MOVING collection must resume with
@@ -25858,6 +25996,133 @@ mod tests {
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)
+    }
+
+    /// A synthetic stub's descriptor answer may be memoized — but ONLY for as
+    /// long as it is still a stub. Promotion to the real class must retire the
+    /// memo, or the promoted class would keep serving the stub's answer (raw,
+    /// descriptor-unaware reads) forever.
+    ///
+    /// This is the invariant that makes the thread-local memoization of a
+    /// TRANSIENT miss safe, so it is the invariant worth pinning. It is
+    /// exercised by INJECTING the promotion: resolve once against the stub,
+    /// then flip the origin the way `upgrade_synthetic_class` does and resolve
+    /// again. Without the epoch in the thread-local key, the second resolve
+    /// returns the stale `None` and this test fails.
+    #[test]
+    fn promoting_a_stub_retires_its_memoized_descriptor() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/StubPromote", &["J"]);
+
+        // Make it a stub after the fact, exactly as a fabricated stand-in would
+        // be, and confirm the resolver refuses to trust its descriptors.
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::compatibility_stub(
+                "test stub",
+            ));
+        }
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            None,
+            "a synthetic stub's placeholder descriptors must not be trusted"
+        );
+        // Repeat: this is the call the memo now serves without the global lock.
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            None,
+            "the stub answer is stable while the class is still a stub"
+        );
+
+        // INJECT the promotion the memo has to survive.
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::default());
+        }
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "after promotion the REAL descriptor must win — a memo that \
+             outlived the stub would pin the placeholder answer forever"
+        );
+    }
+
+    /// A DEFINITIVE descriptor — resolved against a real, fully-loaded
+    /// hierarchy whose layout is immutable — must keep being served from the
+    /// thread-local tiers across class definitions.
+    ///
+    /// This is the half that is easy to get wrong in the *safe* direction.
+    /// Stamping every entry with the provenance epoch is correct, and it is
+    /// also a performance bug: provenance moves on every class definition, so
+    /// during a class-loading burst every lookup would miss the thread-local
+    /// tiers and fall back to the shared `RwLock` — the exact cost those tiers
+    /// exist to avoid, on precisely the workloads (boot-dominated) least able
+    /// to afford it. Only TRANSIENT answers may expire.
+    #[test]
+    fn a_definitive_descriptor_survives_class_loading() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/Durable", &["J"]);
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "a real class's declared descriptor resolves"
+        );
+
+        // Define unrelated classes — each one bumps the provenance epoch.
+        let before = cratonvm_classloading::class_origin_epoch();
+        for i in 0..3 {
+            add_real_class_with_field_descriptors(
+                &shared,
+                &format!("cratonvm/test/DurableNoise{i}"),
+                &["I"],
+            );
+        }
+        assert!(
+            cratonvm_classloading::class_origin_epoch() > before,
+            "defining classes must move the epoch, or this test proves nothing"
+        );
+
+        assert_eq!(
+            resolve_field_descriptor_byte_cached(&shared, cid, 0),
+            Some(b'J'),
+            "a definitive entry must not be retired by unrelated class loading"
+        );
+    }
+
+    /// The epoch only has to move when provenance is rewritten in place; a
+    /// bump on every call would make the memo above useless, and no bump at all
+    /// would make it unsafe.
+    #[test]
+    fn class_origin_epoch_moves_only_on_a_provenance_write() {
+        let shared = test_shared();
+        let (cid, _n) =
+            add_real_class_with_field_descriptors(&shared, "cratonvm/test/EpochStill", &["I"]);
+        // Sampled AFTER the class is added: defining a class bumps the epoch
+        // too (a new class can be someone's previously-missing ancestor).
+        let before = cratonvm_classloading::class_origin_epoch();
+        // Resolving does not touch provenance.
+        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        assert_eq!(
+            cratonvm_classloading::class_origin_epoch(),
+            before,
+            "reads must not bump the epoch, or every memo is invalidated \
+             immediately and the lock is back on the hot path"
+        );
+        {
+            let mut cm = shared.classes.class_manager_write();
+            let cls = cm.class_store.get_mut(cid).expect("class present");
+            cls.set_origin(cratonvm_classloading::ClassOrigin::compatibility_stub("x"));
+        }
+        assert!(
+            cratonvm_classloading::class_origin_epoch() > before,
+            "set_origin is the documented single writer of provenance, so it \
+             must be the thing that retires provenance-derived memos"
+        );
     }
 
     #[test]

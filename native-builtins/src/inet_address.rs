@@ -119,7 +119,10 @@ fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAdd
     // `NoSuchMethodError java/lang/String.getHostName()` /
     // `java/lang/Object.toLowerCase(...)` when real-JDK InetAddress bytecode
     // ran against these mirrors.
-    crate::net_phase_e::alloc_inet_address_external(ctx, host, &ip.to_string())
+    // `host` is whatever the caller passed to `getByName`/`getAllByName`: a
+    // NAME to remember, or a numeric literal that the JDK remembers nothing
+    // about (`getByName("127.0.0.1").toString()` is `/127.0.0.1`).
+    crate::net_phase_e::alloc_inet_address_for_input(ctx, host, &ip.to_string())
 }
 
 fn read_string_arg(

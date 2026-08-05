@@ -632,7 +632,7 @@ pub(super) fn compile_osr_artifact(
                     // BY NAME and only then enters the funnel. The JDK calls it
                     // twice per uncontended `ReentrantLock` lock/unlock pair.
                     // See `jit::helpers::jit_thread_current_thread_direct` and
-                    // native-call-funnel-per-call-floor-RETIRED-20260804.md.
+                    // native-call-funnel-per-call-floor-item2-20260805.md.
                     //
                     // Binding it in all THREE compile doors is the whole lesson
                     // of that document. A version bound only in
@@ -1589,6 +1589,22 @@ pub(super) fn try_osr(
             return None;
         }
     };
+
+    // osr-02 frame comparator: record the ENTRY frame — the state compiled code
+    // is about to start from. Here, because the entry has validated and nothing
+    // has run yet.
+    //
+    // Without this record the comparator cannot see a replay at all: compiled
+    // iterations produce no back-edge arrivals, so "entered at frame 5, ran to
+    // 12, resumed at 5" and "entered at 5 and advanced nothing" are the same
+    // sequence of arrival indices, both strictly increasing. A hand-written
+    // fixture modelling the historical defect passed without it. Paired with
+    // the next exit record this makes the advance a MEASURED quantity —
+    // `index(X) - index(E)` over the un-compiled run's own trajectory, not
+    // anything the JIT claims.
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_entry(&thread.frames[frame_idx], entry_pc);
+    }
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
@@ -2559,6 +2575,17 @@ pub(super) fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: C
     elidable
 }
 
+/// `CRATONVM_JIT=sync-methods` — admit `ACC_SYNCHRONIZED` methods to the
+/// invocation-counter compile path, where the interpreter's call wrapper owns
+/// the implicit monitor. Read once and cached; this sits on the hot
+/// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
+fn jit_sync_methods_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
+    })
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -2606,10 +2633,31 @@ pub(super) fn try_jit_upgrade_with_gate(
     if gate.generation > 0 {
         return None;
     }
-    // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
-    // Do not let a cached interpreter target become a compiled monitor-less
-    // body through the invocation-counter upgrade path.
-    if cached.is_synchronized {
+    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
+    // the *caller* supplies it. Both interpreter entry points into compiled code
+    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
+    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
+    // class mirror's) monitor for the whole native activation and releases it on
+    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
+    // through those two, so admitting a synchronized method here is contained.
+    //
+    // The three entries that would NOT be wrapped each refuse a synchronized
+    // callee independently, and must keep doing so:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`'s
+    //     `named_method_is_synchronized` gate;
+    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
+    //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
+    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
+    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
+    // deploy interpreted — the method was rejected here *before* it was ever
+    // counted, which is why `jit-method-stats` reported it neither compiled nor
+    // `hot_but_stuck_in_interpreter`. See
+    // docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    //
+    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
+    if cached.is_synchronized && !jit_sync_methods_enabled() {
         return None;
     }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
@@ -3932,7 +3980,12 @@ pub fn try_jit_compile_callee(
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         if callee_probe_dbg() {
-            callee_probe_note("BAIL-LISTED", class_name, method_name, descriptor);
+            // Carry the recorded refusal site into the tally key: "bail-listed"
+            // alone says only that some earlier compile said no, and the
+            // whole point of the tally is to name what has to be fixed.
+            let why = cratonvm_jit::jit_bail_reason_for(class_name, method_name, descriptor)
+                .unwrap_or_else(|| "reason-not-recorded".to_string());
+            callee_probe_note(&format!("BAIL-LISTED[{why}]"), class_name, method_name, descriptor);
         }
         return None;
     }
@@ -4000,6 +4053,7 @@ pub fn try_jit_compile_callee(
                     ids
                 );
             }
+            callee_probe_tally("CACHE-MISS", class_name, method_name);
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -4008,6 +4062,7 @@ pub fn try_jit_compile_callee(
     if slot.load(Ordering::Relaxed) == fp {
         let n = CALLEE_NEG_HITS.fetch_add(1, Ordering::Relaxed);
         if n & CALLEE_NEG_REPROBE_MASK != 0 {
+            callee_probe_tally("NEG-CACHE", class_name, method_name);
             return None;
         }
         // Periodic re-probe: fall through and re-run the full pipeline.
@@ -4051,6 +4106,52 @@ fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor:
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 25 {
         eprintln!("[callee-probe] {why} {class_name}.{method_name}{descriptor}");
+    }
+    callee_probe_tally(why, class_name, method_name);
+}
+
+/// Per-`(reason, callee)` tally behind the same flag as [`callee_probe_note`].
+///
+/// The first-25 sample above is spent entirely on class loading before the
+/// workload's own code runs, so it cannot answer the question the counter
+/// `pub_probe_none` raises — *which* callees are refused, and for which of the
+/// four reasons. Bounded to [`CALLEE_PROBE_TALLY_CAP`] distinct keys so a
+/// pathological run cannot grow it without limit.
+fn callee_probe_tally(why: &str, class_name: &str, method_name: &str) {
+    if !callee_probe_dbg() {
+        return;
+    }
+    const CALLEE_PROBE_TALLY_CAP: usize = 4096;
+    let tally = CALLEE_PROBE_TALLY
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = tally.lock();
+    let key = format!("{why} {class_name}.{method_name}");
+    if guard.len() >= CALLEE_PROBE_TALLY_CAP && !guard.contains_key(&key) {
+        return;
+    }
+    *guard.entry(key).or_insert(0) += 1;
+}
+
+#[allow(clippy::type_complexity)]
+static CALLEE_PROBE_TALLY: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// Dump the [`callee_probe_tally`] histogram, hottest first. Called from the
+/// `mic-prof` dump so one run answers both "how often does the inline cache
+/// fail to hold an entry" and "for which callees, and why".
+pub(crate) fn dump_callee_probe_tally() {
+    if !callee_probe_dbg() {
+        return;
+    }
+    let Some(tally) = CALLEE_PROBE_TALLY.get() else {
+        return;
+    };
+    let mut rows: Vec<(String, u64)> = tally.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("[callee-probe] tally ({} distinct keys)", rows.len());
+    for (key, count) in rows.iter().take(30) {
+        eprintln!("[callee-probe]   {count:>10} {key}");
     }
 }
 
@@ -4213,9 +4314,29 @@ pub(super) fn try_jit_compile_callee_slow(
     let code_attr = method.code()?;
     // `cm` is intentionally passed through: do not recursively read-lock the
     // class manager while this guard and its borrowed method are alive.
+    //
+    // The class id here MUST be `declaring_id`, not `callee_class_id`. The scan
+    // resolves the constant-pool indices embedded in `code_attr.code`, and
+    // those indices only mean anything in the constant pool of the class that
+    // DECLARES the method. `callee_class_id` is the RECEIVER's class, which for
+    // any inherited method is a different class with a completely unrelated
+    // pool: the same index there is a Utf8, a Fieldref, or out of range, so the
+    // scan's `_ => return true` arm fired and the method was permanently
+    // `mark_jit_bail_listed`ed for a constant it never referenced.
+    //
+    // The cost of that landed on exactly the code least able to absorb it —
+    // framework hierarchies whose hot methods are inherited accessors. On
+    // `InPredicateTest`'s 100k-element criteria IN-list, every hot SQM
+    // accessor (`SqmTextValuedSimplePath.getReferencedPathSource`,
+    // `BasicSqmPathSource.getExpressible`, ...) was bail-listed this way, so
+    // `jit_invoke_virtual_mic` reported `hit_entry=0 / pub_probe_none=2228315`
+    // — the inline cache NEVER held an entry, and 2.2M dispatches from compiled
+    // code each took the entryless helper path instead of a direct call. That
+    // made JIT-on ~2x SLOWER than `--nojit` on that test, which is what
+    // docs/known-issues/hibernate/hib-inpredicate-*.md has been tracking.
     if jit_method_calls_forced_class_generic_metadata(
         &cm,
-        callee_class_id,
+        declaring_id,
         &code_attr.code,
         code_attr.code.len(),
     ) {
