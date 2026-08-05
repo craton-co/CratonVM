@@ -47,12 +47,22 @@ see that doc), but a different null site in each case: `MergedAnnotations.from()
 itself here, vs. an `IdentityHashMap` primitive-wrapper lookup there. Given
 three annotation-metadata nulls surfacing across four classes on the same
 day (this doc's two, plus couchbase's `attributeType` regression, plus
-cache's later native-registry NoSuchMethodError — see
-`cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-20260805.md`),
-this looks like a systemic weak spot in CratonVM's `MergedAnnotations`/ASM
-annotation-scanning path under GC or class-loading pressure rather than 4
-unrelated bugs, but no single shared code-level defect was confirmed in the
-time available.
+cache's later native-registry NoSuchMethodError), this looks like a systemic
+weak spot in CratonVM's `MergedAnnotations`/ASM annotation-scanning path
+under GC or class-loading pressure rather than 4 unrelated bugs, but no
+single shared code-level defect was confirmed in the time available.
+
+**Update 2026-08-05 — the cache member of that group was NOT a GC or
+class-loading-pressure defect, so the grouping argument should be re-tested
+before it is leant on.** It was a JIT native-dispatch defect: the per-call-site
+native cache had been widened to serve non-leaf natives, so compiled code
+dispatched targets `invoke_or_native` would never have reached and calls
+returned their own first argument. The GC reading was refuted directly — the
+crashing arm ran **zero** young collections. Fixed and retired to
+`docs/internal/fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
+The two null sites here may share that cause; the cheap check is
+`--dump-native-registry` on a JIT arm and a `--nojit` arm, diffed per native.
+That named the cache defect in one comparison after code reading had stalled.
 
 ## Where to look next
 
