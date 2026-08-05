@@ -1,7 +1,8 @@
 # `MockNativeContext::set_field_by_name` was a silent no-op for most modelled classes
 
-**Status:** half FIXED 2026-08-05 (reads and writes); the third entry point is
-still open, deliberately — see §3.
+**Status:** FIXED 2026-08-05. Reads and writes first, then the third entry
+point — see §3, whose "moves five unrelated tests" turned out to be two, and
+whose real blocker was somewhere else entirely.
 
 ## What was wrong
 
@@ -46,23 +47,54 @@ the fallback only fires where the mock previously said "no such field".
 
 Blast radius: exactly one test, updated to assert what the VM produces.
 
-## 3. Still open: `resolve_field_index_by_class_id`
+## 3. `resolve_field_index_by_class_id` — fixed, and what it actually cost
 
 The same fallback belongs on `resolve_field_index_by_class_id`, whose own doc
-comment already makes the argument ("a predicate of the form *does this class
+comment already made the argument ("a predicate of the form *does this class
 declare a field only the REAL JDK class has* is unfalsifiable under the mock").
-It is **not** wired, because doing so moves five unrelated tests:
+This page deferred it as "moves five unrelated tests … its own change with its
+own investigation". Doing the investigation:
 
-* `lang_class::tests::c5_field_get_declaring_class_returns_declared_not_object`
-* `lang_class::tests::c6_method_get_declaring_class_returns_declared_not_object`
-* `xnio_worker::tests::wf_domain_create_tcp_connection_server_returns_accepting_channel`
-* `xnio_worker::tests::wf_domain_real_nio_worker_is_adopted_without_slot_handle`
-* `xnio_worker::tests::wf_domain_stream_connection_worker_identity_uses_io_thread_mirror`
+**It moved two, not five.** The three `xnio_worker` cases were fixed on `dev` in
+the interim. The survivors were
+`lang_class::tests::c5_field_get_declaring_class_returns_declared_not_object`
+and its `c6_method_*` sibling.
 
-Those move because production code takes a different branch once the lookup
-answers `Some`, which is the whole point — each needs reading to decide whether
-the new behaviour or the old assertion is right. That is its own change, not a
-rider on a layout fix.
+**And they did not move for the reason this page assumed.** The problem was not
+"production takes a different branch once the lookup answers `Some`". It was
+that `mock_jdk_field_slot` — a deliberately arbitrary shared name→slot namespace
+for the `Field`/`Method`/`Constructor`/`MemberName` mirrors — **disagrees with
+the fabricated model on every one of those names**, and
+`get_field_by_name`/`set_field_by_name` consult it FIRST. Adding the model to
+`resolve_field_index_by_class_id` without matching that order gave a reader and
+a writer two different answers for the same name: `create_method_object` wrote
+`modifiers` to one slot and `method_modifiers_value` read it from another.
+
+Putting the model ahead of the hand-written namespace in the by-name chains
+instead — the "obvious" reconciliation — is worse, not better: it swaps which
+two tests fail and adds a third (`g2_create_method_object_populates_parameter_types_non_null`),
+because production carries a FOURTH mapping of its own
+(`METHOD_LEGACY_SLOT_*` in `lang_class.rs`) as a fallback for exactly these
+reads.
+
+**The fix is one line and an ordering constraint.**
+`resolve_field_index_by_class_id` now ends with the same tail the by-name chains
+use, in the same order: `mock_undertow_exchange_field_slot` →
+`mock_jdk_field_slot` → `mock_stub_model_field_slot`. The hand-written namespace
+keeps winning where it exists, because a reader and a writer that disagree is
+worse than either mapping being "wrong"; the model fills the genuine gaps, which
+is what the fallback was for. `native-builtins --lib` is 3273/3273.
+
+Two tests in `classloader.rs` pin it, and the first was verified to go **red**
+without the fallback:
+
+* `resolve_by_class_id_sees_the_fabricated_model` — `ProtectionDomain`'s four
+  modelled fields resolve to their modelled slots, and a name the class does not
+  declare still answers `None` (a fallback that answered `Some` for everything
+  would be as useless as one answering `None`).
+* `the_hand_written_namespace_still_wins_for_the_reflect_mirrors` — pins the
+  ordering, so the reconciliation that looks tidier cannot be applied without
+  the test that measured it failing.
 
 ## How to check whether a native is affected
 
