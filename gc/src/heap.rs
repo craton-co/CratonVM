@@ -71,6 +71,16 @@ use std::sync::Arc;
 /// grew after this object was allocated. Callers iterate `ref_offsets` in
 /// ascending order and stop at the first offset that would read past
 /// `body_size`, so a grown class never makes the GC read out of bounds.
+/// H2-CID0 (2026-08-05) — compact objects whose class oop map the layout
+/// registry could not produce, so the GC fell back to scanning their packed
+/// body as legacy 16-byte `Value` cells and saw none of their reference slots.
+///
+/// A marking FAIL-OPEN: non-zero means some object's outgoing edges were
+/// invisible to the collector, which is licence to reclaim its referents while
+/// it is live. Expected to be ZERO. Reported by `VmHeap::print_gc_summary`.
+pub static COMPACT_OOP_MAP_MISSING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayout>, usize)> {
     if !is_compact_object(header) {
@@ -100,7 +110,26 @@ pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayo
         let arc = class_layout_for_fields(cid, header.num_slots())?;
         *c.borrow_mut() = Some((cid, header.num_slots(), gen, arc.clone()));
         Some(arc)
-    })?;
+    });
+    let Some(layout) = layout else {
+        // See `COMPACT_OOP_MAP_MISSING`. Returning `None` here is not a
+        // "this is a legacy object" answer — the header already said it is
+        // not — it is the GC agreeing to scan a packed body as `Value` cells
+        // and miss every reference in it.
+        let n = COMPACT_OOP_MAP_MISSING.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                class_id = cid,
+                num_slots = header.num_slots(),
+                layout_generation = gen,
+                "object carries GC_FLAG_COMPACT but the layout registry has no oop map for \
+                 (class_id, num_slots) — the GC is about to scan its packed body as legacy \
+                 16-byte `Value` cells and will miss every reference slot it holds.",
+            );
+        }
+        return None;
+    };
     let body_size = layout.body_size as usize;
     Some((layout, body_size))
 }

@@ -15922,10 +15922,19 @@ fn try_compile_inner(
                         // triggered it and instead surfaces as a hard
                         // `InternalError` against an unrelated outer method —
                         // see `CompiledMethod::stamp_deopt_method_key`.
-                        compiled.stamp_deopt_method_key(&format!(
+                        let method_key = format!(
                             "{}.{}:{}",
                             cached.class_name, cached.method_name, cached.method_descriptor
-                        ));
+                        );
+                        compiled.stamp_deopt_method_key(&method_key);
+                        // The single-pass backend gets its label from the same
+                        // key at `Compiler::new`; this backend never had one, so
+                        // an optimizing-tier frame was anonymous to every
+                        // consumer that has only the artifact to go on --
+                        // including the Java-visible stack trace, which names
+                        // compiled frames by exactly this string (see
+                        // `vm::runtime::stackwalker::compiled_frame_entry`).
+                        compiled.method_label = method_key;
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
                         // bailed out of IR to single-pass never reaches here, so it

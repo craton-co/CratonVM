@@ -4293,34 +4293,66 @@ pub(crate) fn wrap_as_invocation_target_exception(
 ) -> MethodCallFailed {
     let original = match failure {
         MethodCallFailed::ExceptionThrown(obj) => obj,
-        // A genuine Java `Error` raised by the invoked code вЂ” most notably an
-        // `OutOfMemoryError` from a huge allocation inside the constructor /
-        // method body (e.g. `new ArrayList(Integer.MAX_VALUE)`) вЂ” surfaces as a
-        // VM-internal `RuntimeError` rather than a materialized `Throwable`.
-        // HotSpot's `Constructor.newInstance` / `Method.invoke` wrap ANY
-        // Throwable the callee throws (Errors included) in
-        // `InvocationTargetException`, so SpEL's `catch (Exception)` can turn it
-        // into `CONSTRUCTOR_INVOCATION_PROBLEM` (ArrayConstructorTests.errorCases).
-        // Materialize the corresponding Java throwable and wrap it; every other
-        // `InternalError` kind (real VM defects) still propagates unchanged so we
-        // don't mask implementation bugs.
-        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-            cratonvm_types::error::RuntimeError::OutOfMemoryError { message },
-        )) => {
-            let msg_obj = ctx.create_string(&message);
-            match ctx.new_object_initialized(
-                "java/lang/OutOfMemoryError",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(msg_obj))],
-            ) {
+        // A native callee raises its Java exception as a `RuntimeError`
+        // rather than as a materialized `Throwable` -- `Iterator.remove()`'s
+        // `UnsupportedOperationException`, a collection's
+        // `ConcurrentModificationException`, an `IllegalStateException` from a
+        // half-initialised shim, and so on. HotSpot wraps ANY Throwable the
+        // callee throws (Errors included), so these must be materialized and
+        // wrapped too -- which is what lets SpEL's `catch (Exception)` turn a
+        // constructor's `OutOfMemoryError` into `CONSTRUCTOR_INVOCATION_PROBLEM`
+        // (ArrayConstructorTests.errorCases).
+        //
+        // This arm used to name `OutOfMemoryError` alone, because that was the
+        // one variant somebody had hit; every other native-raised exception fell
+        // through to `other => return other` and reached the caller RAW.
+        // `TestBase.assertThrows` (H2 `TestMVStore.testIterate`) is the shape
+        // that finds it: it wraps the receiver in a `Proxy` whose handler
+        // catches `InvocationTargetException`, so an unwrapped
+        // `UnsupportedOperationException: remove` sails past that catch and out
+        // of the test. `RuntimeError::as_java_throwable` is the same table the
+        // interpreter's own throw site uses, so the two cannot drift.
+        //
+        // Only the *dispatch of the callee* is wrapped (see this function's
+        // four call sites); argument coercion has already happened by then, so
+        // an `IllegalArgumentException` from marshalling still surfaces
+        // unwrapped, as `Method.invoke` specifies.
+        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(re)) => {
+            let Some((class_name, message)) = re.as_java_throwable() else {
+                // `NotImplemented` -- a VM gap, not something the callee threw.
+                return MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(re),
+                );
+            };
+            // Own the message so `re` is free again for the failure path below.
+            let message = message.map(str::to_string);
+            let built = match &message {
+                Some(m) => {
+                    let msg_obj = ctx.create_string(m);
+                    ctx.new_object_initialized(
+                        class_name,
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(msg_obj))],
+                    )
+                }
+                // `None` means "no detail message": `getMessage()` must be
+                // null, so the no-arg constructor, not `("")`.
+                None => ctx.new_object_initialized(class_name, "()V", &[]),
+            };
+            match built {
                 Ok(Some(Value::Object(Some(obj)))) => obj,
-                // Couldn't materialize the throwable вЂ” propagate the original
-                // internal error rather than swallow it.
+                // Couldn't materialize the throwable -- propagate the original
+                // rather than swallow it.
                 _ => {
-                    return cratonvm_types::error::RuntimeError::OutOfMemoryError { message }.into()
+                    return MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(re),
+                    )
                 }
             }
         }
+        // Every other `InternalError` kind (`VmError::Internal` -- real VM
+        // defects) still propagates unchanged so we don't mask implementation
+        // bugs behind a reflective wrapper.
         other => return other,
     };
 
@@ -19012,7 +19044,10 @@ pub(crate) fn native_class_get_protection_domain0(
         }
         let arr = ctx.read_native_pin(arr_pin, arr);
         let cs = ctx.read_native_pin(cs_pin, cs);
-        ctx.set_field(cs, 1, Value::Object(Some(arr)));
+        // BY NAME only: raw slot 1 is `signers` on a real `CodeSource`, so the
+        // raw write parked a `Certificate[]`-shaped array in the signer field
+        // and the by-name write beside it put the real one in `certs`. The
+        // by-name write covers both layouts on its own.
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
     let cs = ctx.read_native_pin(cs_pin, cs);
