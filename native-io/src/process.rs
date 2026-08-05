@@ -2458,21 +2458,40 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // Registration
 // ---------------------------------------------------------------------------
 
-// JDK-ONLY-CLASSIFY: bridge — process control is one of the categories
-// jdk-only-native-review.md §5 names explicitly, and the evidence agrees: 8 of
-// the statically resolvable triples here are ACC_NATIVE in JDK 25
-// (`ProcessHandleImpl.getCurrentPid0`, `isAlive0`, `waitForProcessExit0`,
-// `destroy0`, the `ProcessImpl` spawn entry points). A subprocess cannot be
-// created or reaped from bytecode, and the live `std::process::Child` lives in
-// this crate's table, so these must survive `--jdk-only`. Most of this
-// function's remaining registrations use a class name this static audit could
-// not resolve; confirm them from the schema-v2 census rather than assuming the
-// whole function inherits the verdict.
+// JDK-ONLY-CLASSIFY: bridge — for 9 of the 51 registrations, and the census
+// (schema 3, JDK 25, 2026-08-05) says exactly which. Process control is one of
+// the categories jdk-only-native-review.md §5 names explicitly, and the nine
+// `java.lang.ProcessHandleImpl` / `ProcessHandleImpl$Info` entries below are
+// ACC_NATIVE on the image: `initNative`, `getCurrentPid0`, `isAlive0`,
+// `waitForProcessExit0`, `destroy0`, `parent0`, `getProcessPids0`,
+// `Info.initIDs`, `Info.info0`. A subprocess cannot be created or reaped from
+// bytecode and the live `std::process::Child` lives in this crate's table, so
+// those must survive `--jdk-only`; they state their kind at their own call
+// sites (L5, 2026-08-05).
+//
+// The other 42 do NOT resolve to an ACC_NATIVE method and stay on the ambient
+// category, because they are three quite different things:
+//
+//   * 25 registrations on `cratonvm/synthetic/Process*` classes — a class the
+//     image does not contain and the VM mints. `Bridge` is what keeps them
+//     alive under `--jdk-only`, which is the same unresolved shape as the
+//     `Function$Identity` successor defect in the record below, not a bridge.
+//   * 13 on `java.lang.Process` itself, which declares them abstract (6) or
+//     with concrete bytecode (7) — shadows, adjudicated by contract §1.4, not
+//     §1.5.
+//   * `ProcessImpl.create` (the Windows spawn entry point; the Linux image
+//     declares `forkAndExec` instead), `UNIXProcess.forkAndExec` (class gone
+//     since JDK 9), `ProcessHandleImpl.destroyProcess0` (superseded by
+//     `destroy0(JJZ)Z`) and `ProcessBuilder.start` — dead or shadowing.
+//
+// Details and the per-row table:
+// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
 /// Register every WP1.12-owned subprocess native.  Called from
 /// `register_io_natives` at VM boot.
 pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
+    use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    registry.set_category(NativeKind::Bridge);
     // Platform-specific spawn natives that the JDK invokes from inside
     // ProcessImpl / UNIXProcess.  Only the Windows one is registered on
     // non-Linux targets, and vice-versa, so we don't override each
@@ -2501,29 +2520,33 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // HotSpot's process-reaper thread. CratonVM resolves fields by name and
     // reaps through `PROCESS_TABLE`, so there is genuinely nothing to do —
     // the same reasoning as the `initIDs` no-ops elsewhere in this crate.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "initNative",
         "()V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "getCurrentPid0",
         "()J",
         native_proc_handle_current_pid0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "isAlive0",
         "(J)J",
         native_proc_handle_is_alive0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "waitForProcessExit0",
         "(JZ)I",
         native_proc_handle_wait_for_process_exit0,
+        NativeKind::Bridge,
     );
     registry.register(
         "java/lang/ProcessHandleImpl",
@@ -2532,7 +2555,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         native_proc_handle_destroy_process0,
     );
     // Real JDK 25 signature: destroy0(pid, startTime, forcibly) -> boolean.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "destroy0",
         "(JJZ)Z",
@@ -2545,6 +2568,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             let ok = destroy_handle(handle, force);
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         },
+        NativeKind::Bridge,
     );
     // parent0(pid, startTime) -> long. Was a hardcoded -1 ("unknown") for
     // every process, so `ProcessHandle.parent()` was permanently empty — a
@@ -2552,41 +2576,45 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // by a known supervisor) silently got nothing. The `long` here really IS
     // an OS pid: `Process.pid()` resolves the table handle through
     // `pid_for_handle` before the JDK bytecode reaches this native.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "parent0",
         "(JJ)J",
         native_proc_handle_parent0,
+        NativeKind::Bridge,
     );
     // getProcessPids0(pid, pids[], ppids[], starttimes[]) -> int (count).
     // Was a hardcoded 0, i.e. "this process has no children and the machine is
     // running no processes" — indistinguishable from a real empty answer, so
     // `ProcessHandle.children()`/`allProcesses()` quietly returned nothing.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl",
         "getProcessPids0",
         "(J[J[J[J)I",
         native_proc_handle_get_process_pids0,
+        NativeKind::Bridge,
     );
 
     // KEEP: `ProcessHandleImpl$Info.initIDs()` is a JNI jfieldID cache init;
     // CratonVM resolves fields by name, so an empty body is the spec-correct
     // implementation (same as every other `initIDs` in this crate).
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl$Info",
         "initIDs",
         "()V",
         |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
     );
     // info0(pid) fills command/commandLine/arguments/startTime/totalTime/user
     // on the receiver. It used to leave every field at its constructor default,
     // so `ProcessHandle.info()` reported an entirely empty record for a process
     // that plainly has a command line. Populate what the OS will tell us.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessHandleImpl$Info",
         "info0",
         "(J)V",
         native_proc_handle_info0,
+        NativeKind::Bridge,
     );
 
     // Process methods on our synthetic Process — override the stubs
