@@ -139,6 +139,42 @@ fn release(size: i64) {
     b.count.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// How many collect-and-retry rounds a direct-memory reservation gets before it
+/// gives up. The JDK retries while `Reference.waitForReferenceProcessing()`
+/// reports progress; our `force_gc` is synchronous — it marks, processes
+/// references and runs the cleaner actions before returning — so a small fixed
+/// count is the equivalent.
+const RESERVE_GC_RETRIES: usize = 3;
+
+/// [`try_reserve`], but collect first if it would fail — which is what makes
+/// transient direct buffers transient.
+///
+/// `java.nio.Bits.reserveMemory` in the JDK does exactly this: when the
+/// reservation would exceed `MaxDirectMemorySize` it runs a full GC, waits for
+/// reference processing and retries, because the memory it needs is usually
+/// held by `DirectByteBuffer`s that are already unreachable and have merely not
+/// had their `Cleaner` run yet. Our native replaced that method and threw on
+/// the first failure.
+///
+/// This is load-bearing rather than belt-and-braces: direct memory is
+/// *off-heap*, so a program that allocates nothing else puts no pressure on the
+/// Java heap and may never trigger a collection on its own. The JDK's explicit
+/// `System.gc()` here is the only thing that reclaims it.
+fn reserve_with_reclaim(ctx: &mut dyn NativeContext, size: i64) -> Result<(), MethodCallFailed> {
+    let mut last = match try_reserve(size) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for _ in 0..RESERVE_GC_RETRIES {
+        ctx.force_gc();
+        match try_reserve(size) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 // ---------------------------------------------------------------------------
 // Pool — power-of-two bucket free list
 // ---------------------------------------------------------------------------
@@ -304,7 +340,7 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
 /// returned are 8-byte aligned (sufficient for any primitive type used
 /// by `Unsafe.put*` writes through the buffer).  Returns the raw
 /// address as a u64 the JDK can stash in `DirectByteBuffer.address`.
-fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
+fn dbb_allocate(ctx: &mut dyn NativeContext, size: i64) -> Result<u64, MethodCallFailed> {
     if size < 0 {
         return Err(oom(format!("negative direct buffer size: {size}")));
     }
@@ -324,7 +360,7 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     // live and must be reserved exactly once here. We reserve up front so
     // the soft cap is honoured before we commit any memory; on any later
     // failure path we `release` to refund it.
-    try_reserve(size)?;
+    reserve_with_reclaim(ctx, size)?;
     let usize_size = size as usize;
     let addr: *mut u8 = match pool_take(usize_size) {
         Some((_, p)) => p,
@@ -551,12 +587,12 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
 /// "size" (the raw byte count to reserve) and "cap" (the capacity
 /// reported back to the user, sometimes inflated to a page boundary).
 /// Our accounting only cares about `size`.
-fn bits_reserve_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn bits_reserve_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = arg_long(args, 0);
     if size < 0 {
         return Err(oom(format!("negative reserveMemory: {size}")));
     }
-    try_reserve(size)?;
+    reserve_with_reclaim(ctx, size)?;
     Ok(None)
 }
 
@@ -586,7 +622,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let addr = dbb_allocate(cap)?;
+    let addr = dbb_allocate(ctx, cap)?;
     let cleaner_id = if cap > 0 {
         register_cleaner(addr, cap)
     } else {
@@ -807,9 +843,9 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// records the (addr, size) so `freeMemory(addr)` can reclaim it
 /// accurately. JVM users who go via `ByteBuffer.allocateDirect` use
 /// `dbb_allocate_direct0` above and don't touch this path.
-fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn unsafe_allocate_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = unsafe_long_arg(args);
-    let addr = dbb_allocate(size)?;
+    let addr = dbb_allocate(ctx, size)?;
     if addr != 0 {
         record_unsafe_alloc(addr, size);
     }
@@ -1701,7 +1737,7 @@ mod tests {
     fn wp35_allocate_then_free_returns_to_pool_for_4k() {
         let _g = bits_test_lock();
         let baseline = bits().reserved.load(Ordering::Relaxed);
-        let addr = dbb_allocate(4096).expect("alloc 4k");
+        let addr = dbb_allocate(&mut MockNativeContext::new(), 4096).expect("alloc 4k");
         assert_ne!(addr, 0);
         assert_eq!(bits().reserved.load(Ordering::Relaxed), baseline + 4096);
         dbb_free(addr, 4096);
@@ -1711,7 +1747,7 @@ mod tests {
         // (or tests interleaved on parallel threads) may have populated
         // the same bucket; the invariant is that allocation succeeds and
         // accounting balances after free.
-        let addr2 = dbb_allocate(4096).expect("alloc 4k from pool");
+        let addr2 = dbb_allocate(&mut MockNativeContext::new(), 4096).expect("alloc 4k from pool");
         assert_ne!(addr2, 0);
         assert_eq!(bits().reserved.load(Ordering::Relaxed), baseline + 4096);
         dbb_free(addr2, 4096);
@@ -1745,7 +1781,7 @@ mod tests {
 
     #[test]
     fn wp35_zero_size_alloc_yields_null_address() {
-        let addr = dbb_allocate(0).unwrap();
+        let addr = dbb_allocate(&mut MockNativeContext::new(), 0).unwrap();
         assert_eq!(addr, 0);
         // No accounting impact for zero-size.
         dbb_free(0, 0);
@@ -1827,7 +1863,7 @@ mod tests {
         // confirm the parked entry carries the canonical size — the value used
         // to rebuild the original `Layout` on eviction. Without this, eviction
         // would dealloc 100 bytes against a 128-byte allocation (UB).
-        let addr = dbb_allocate(100).expect("alloc 100");
+        let addr = dbb_allocate(&mut MockNativeContext::new(), 100).expect("alloc 100");
         assert_ne!(addr, 0);
         dbb_free(addr, 100);
         let idx = bucket_for(100).expect("bucket");

@@ -368,7 +368,40 @@ fn discover_ref_from_args(
     } else {
         None
     };
+    // `jdk.internal.ref.Cleaner` (8u name `sun.misc.Cleaner`) IS a
+    // `PhantomReference`, so it arrives here typed `Phantom` and used to be
+    // discovered as one: cleared, enqueued onto its queue, and then ignored --
+    // its queue is the JDK's `dummyQueue`, which by design has no reader,
+    // because in the real JDK it is the `ReferenceHandler` thread that
+    // special-cases `instanceof Cleaner` and calls `clean()` instead of
+    // enqueuing. We have no ReferenceHandler, so nothing ever ran the thunk,
+    // and a `DirectByteBuffer`'s `Deallocator` never fired: every direct buffer
+    // leaked its `Bits` reservation for the life of the VM.
+    //
+    // Typing it `Cleaner` here routes it through the reference processor's
+    // `cleaner_refs`, whose `cleaner_actions`
+    // `interpreter::gc_and_alloc::run_cleaner_actions` executes. Both JDK
+    // classes are `final`, so an exact class-id match is the whole test.
+    let ref_type = if ref_type == REF_TYPE_PHANTOM && is_jdk_cleaner(ctx, reference_obj) {
+        REF_TYPE_CLEANER
+    } else {
+        ref_type
+    };
     ctx.discover_reference(ref_type, reference_obj, referent, queue);
+}
+
+/// Wire values for [`cratonvm_native_api::NativeContext::discover_reference`]
+/// (see `vm/src/vm/vm_exec.rs::discover_reference`).
+const REF_TYPE_PHANTOM: u8 = 2;
+const REF_TYPE_CLEANER: u8 = 3;
+
+/// Is `obj` one of the JDK's `Cleaner` phantom references — the shape whose
+/// reclamation action is `clean()` rather than "enqueue and let somebody poll"?
+fn is_jdk_cleaner(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    ["jdk/internal/ref/Cleaner", "sun/misc/Cleaner"]
+        .iter()
+        .any(|n| ctx.class_id_by_name(n) == Some(cid))
 }
 
 fn native_weak_ref_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

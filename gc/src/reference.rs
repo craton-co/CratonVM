@@ -1179,11 +1179,36 @@ impl ReferenceProcessor {
     /// the GC pointer map to locate the post-collection objects.
     ///
     /// SoftReferences are intentionally excluded — they stay strongly reachable
-    /// (kept alive) so soft-cache semantics are unchanged; only weak + phantom
-    /// references must allow their referent to be reclaimed.
+    /// (kept alive) so soft-cache semantics are unchanged. `Finalizer` entries
+    /// are excluded for the opposite reason: `finalize()` must be able to reach
+    /// the object.
+    ///
+    /// **`Cleaner` entries ARE included.** A `Cleaner` *is* a
+    /// `PhantomReference` — this file's own Phase 3/4 comment says so and folds
+    /// it into the phantom liveness rule — but this pass, the one that decides
+    /// whether the referent can die at all, listed only weak and phantom. The
+    /// consequence was total for direct buffers: the JDK keeps every live
+    /// `jdk.internal.ref.Cleaner` on a static doubly-linked list, so a Cleaner
+    /// whose referent slot is never nulled makes its `DirectByteBuffer`
+    /// permanently reachable, `process_final_refs` never sees it die, no
+    /// cleaner action is ever emitted, and `Bits.reserved` only ever grows.
+    /// `ByteBuffer.allocateDirect` in a loop therefore OOM'd at exactly
+    /// `MaxDirectMemorySize` where HotSpot runs indefinitely
+    /// (`probes/DirectBufProbe.java`).
+    ///
+    /// The name is kept for its callers; "weak/phantom" now means "every
+    /// reference kind whose referent is allowed to die", which is what the
+    /// callers always wanted.
     pub fn weak_phantom_active_pairs(&self) -> Vec<(usize, usize)> {
-        let mut v = Vec::with_capacity(self.weak_refs.len() + self.phantom_refs.len());
-        for e in self.weak_refs.iter().chain(self.phantom_refs.iter()) {
+        let mut v = Vec::with_capacity(
+            self.weak_refs.len() + self.phantom_refs.len() + self.cleaner_refs.len(),
+        );
+        for e in self
+            .weak_refs
+            .iter()
+            .chain(self.phantom_refs.iter())
+            .chain(self.cleaner_refs.iter())
+        {
             if !e.cleared && !e.enqueued {
                 v.push((e.reference_obj, e.referent));
             }
