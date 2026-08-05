@@ -11148,16 +11148,51 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/text/NumberFormat" => instance_fields(4),
         // MessageFormat = 1 field (pattern=0)
         "java/text/MessageFormat" => instance_fields(1),
-        // Thread = 8 fields. Keep the first five synthetic slots stable
-        // (name=0, priority=1, tid=2, target/runnable=3, virtualFlag=4), and
-        // append the real Thread fields JBoss Threads reflects during its
-        // Unsafe bootstrap.
+        // Thread = 8 fields, and **every NAMED slot sits at its real JDK
+        // index**. The anonymous ones carry CratonVM's fabricated conventions
+        // (name=0, priority=1, tid=2, target/runnable=3, virtualFlag=5) and
+        // must stay anonymous — an `_fN` asserts nothing, which is exactly
+        // right for a slot whose meaning differs between the two layouts.
+        //
+        // Real JDK 21–25 `java.lang.Thread`, instance fields in declaration
+        // order: `eetop`(J), `tid`(J), `name`, `interrupted`(Z),
+        // `contextClassLoader`, `holder`, `threadLocals`,
+        // `inheritableThreadLocals`, … (19 in all).
+        //
+        // Until 2026-08-05 this arm was `instance_fields(5)` followed by
+        // `contextClassLoader`, i.e. it declared that name at index **5**,
+        // which is `holder` on every real image; `threadLocals` and
+        // `inheritableThreadLocals` at 6 and 7 were right by accident. No
+        // accessor was writing the wrong field — they all resolve on the
+        // receiver's own class — but it is a live landmine for anything that
+        // resolves against the CLASS NAME while the receiver carries the other
+        // layout, and this tree already carries a scar from one such instance:
+        // see the defensive type check in
+        // `native_thread_get_context_class_loader`, whose comment records a
+        // mis-slotted read observed as a `String` during Mockito plugin
+        // discovery.
+        //
+        // Slot 5 is deliberately NOT named `holder`.
+        // `populate_real_thread_holder` detects the fabricated layout with
+        // `get_field_by_name(this, "holder").is_none()` and falls back to its
+        // own slot conventions, so declaring `holder` here would silently turn
+        // that fallback off. It is the fabricated-only virtual-thread flag
+        // instead — `SYNTHETIC_THREAD_VIRTUAL_SLOT` in
+        // `native-builtins/src/jdk25_concurrency.rs` moved off index 4 in the
+        // same change so it stops sharing a slot with `contextClassLoader`.
         "java/lang/Thread" => {
-            let mut fields = instance_fields(5);
+            let mut fields = instance_fields(4);
             fields.push(ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
                 name: cratonvm_types::intern_arc("contextClassLoader"),
                 descriptor: cratonvm_types::intern_arc("Ljava/lang/ClassLoader;"),
+                attributes: vec![],
+            });
+            // Slot 5 — anonymous on purpose (see above).
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("_f5"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             });
             fields.push(ClassFileField {
