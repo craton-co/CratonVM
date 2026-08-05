@@ -414,14 +414,51 @@ Both are answered by the same thing: a per-thread, epoch-validated resolved
 constant pool (`vm/src/runtime/interpreter/site_cache.rs`), behind
 `CRATONVM_JIT=field-site-cache` and `CRATONVM_JIT=method-site-cache`.
 
-#### What those two levers are worth (2026-08-04)
+#### What those two levers are worth — ON THE SCAN (2026-08-05)
 
-Measured on an idle Windows box with `probes/SiteCacheCostProbe.java`, four
-interleaved passes with the arm order reversed on even passes. **This is the
-mechanism's price, not the annotation-scan number** — the probe is deliberately
-field-saturated, and the scan's field cluster is ~12% of its profile, so do not
-extrapolate the ratio. The scan number still has to be taken on the Azure host
-against real BCEL; that host was unreachable throughout this session.
+The authoritative measurement: real BCEL, real JARs, Azure host, load steady at
+**1.39–1.47** for the whole run. Four interleaved passes, arm order reversed on
+even passes, HotSpot control every pass. `us/class`, both `parse` readings per
+pass:
+
+| arm | pass1 | pass2 | pass3 | pass4 | mean |
+|---|---|---|---|---|---|
+| off | 1845.2 / 1821.8 | 1884.3 / 1822.1 | 1855.9 / 1807.0 | 1878.5 / 1818.0 | **1841.6** |
+| `field-site-cache` | 1623.1 / 1577.6 | 1639.5 / 1592.1 | 1616.0 / 1585.6 | 1632.7 / 1596.8 | **1607.9** |
+| + loader arm | 1615.4 / 1595.1 | 1617.7 / 1601.8 | 1614.2 / 1584.5 | 1608.7 / 1583.4 | **1602.6** |
+| + `method-site-cache` | 1598.0 / 1585.2 | 1604.2 / 1577.1 | 1606.1 / 1583.9 | 1622.8 / 1589.6 | **1595.9** |
+| HotSpot | 7.4 / 6.2 | 6.7 / 6.8 | 8.3 / 7.7 | 7.2 / 6.6 | **7.11** |
+
+**12.7% off the scan for `field-site-cache` alone; 13.3% with all three.** The
+separation is total: every one of the 8 `off` readings is 1807–1884, and every
+one of the 24 lever readings is 1577–1640. No overlap, in either order, on a
+quiet host.
+
+Against HotSpot that is **259x → 224x**. Real, and nowhere near the ~5x exit
+criterion — which is the point the rest of this document makes.
+
+Structural check, same run — the lever fires 1.33M times on one scan:
+
+```
+off:    field: hit=0        miss=0    | method: hit=0
+field:  field: hit=1329432  miss=1234 | method: hit=0
+fieldl: field: hit=1329436  miss=1234 | method: hit=0
+all:    field: hit=1329434  miss=1234 | method: hit=52566
+```
+
+`reject_loader=0` throughout: this probe runs off a plain classpath, so every
+site is loader-blind and the loader arm has nothing extra to admit — which is
+why it adds only 0.3%. Inside a real webapp deploy, where the scanning code runs
+under a user-defined loader, that arm is what keeps the base arm from being
+inert; `reject_loader` is the counter that will say so.
+
+`method-site-cache` adds 0.4% on top (1602.6 → 1595.9) — consistent with the
+"measures nothing" verdict below, marginally positive rather than negative.
+
+#### The mechanism's own price, in isolation
+
+Measured separately with `probes/SiteCacheCostProbe.java`, which is deliberately
+field-saturated, so its ratio is the *mechanism's* headroom and not the scan's.
 
 Structural check first — both levers demonstrably fire, which is the thing the
 retracted measurement above never established:
@@ -585,6 +622,17 @@ pwsh apps/tomcat-suite-runner/run-one.ps1 -Vm craton -Exe <cratonvm.exe> -Class 
 > and `--nojit` is *faster* than the default, so the remaining distance is
 > interpreter throughput. Closing this doc means either a broad interpreter
 > dispatch improvement or a re-scoped criterion.
+>
+> **Progress 2026-08-05: 259x → 224x** (12.7–13.3%) from the interpreter's
+> resolved constant pool, `CRATONVM_JIT=field-site-cache` (still default-OFF).
+> That is the first lever in this investigation to move the number outside
+> noise, and it confirms the diagnosis — the win came from deleting per-access
+> symbolic work, not from compiling anything. It also sizes what is left: at
+> 224x, reaching ~5x needs roughly another 45x, which no cache on the field path
+> can supply. The remaining mass is the dispatch loop itself
+> (`execute_frame_from_index` + `execute_instruction` ≈ 13.5%), frame push/pop,
+> and the per-invoke native-registry and heap-check work — i.e. a genuine
+> interpreter rewrite, or a re-scoped criterion.
 
 `AnnotationScanCostProbe` within ~5x of HotSpot per class, which should bring
 the `examples` redeploy under the ~1 s the `list` assertion needs and the
