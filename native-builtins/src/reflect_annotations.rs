@@ -2524,11 +2524,11 @@ pub(crate) fn register_reflect_array_natives(registry: &mut NativeMethodRegistry
 /// `jdk/proxyN`), assigned in first-encounter order starting at 1. Same loader →
 /// same number, so all of that loader's public-interface proxies land in one
 /// `jdk/proxyN` package — matching HotSpot's per-loader dynamic module.
-fn proxy_module_number(loader_id: u32) -> u32 {
+fn proxy_module_number(vm: usize, loader_id: u32) -> u32 {
     {
         let guard = PROXY_LOADER_MODULES.read();
         if let Some(map) = guard.as_ref() {
-            if let Some(&n) = map.get(&loader_id) {
+            if let Some(&n) = map.get(&(vm, loader_id)) {
                 return n;
             }
         }
@@ -2536,11 +2536,11 @@ fn proxy_module_number(loader_id: u32) -> u32 {
     let mut guard = PROXY_LOADER_MODULES.write();
     let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
     // Re-check under the write lock — another thread may have assigned it.
-    if let Some(&n) = map.get(&loader_id) {
+    if let Some(&n) = map.get(&(vm, loader_id)) {
         return n;
     }
     let n = PROXY_MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    map.insert(loader_id, n);
+    map.insert((vm, loader_id), n);
     n
 }
 
@@ -3700,7 +3700,10 @@ fn build_proxy_spec_for(
     let gen_class_name = match non_public_pkg {
         Some(pkg) if pkg.is_empty() => format!("$Proxy{n}"),
         Some(pkg) => format!("{pkg}/$Proxy{n}"),
-        None => format!("jdk/proxy{}/$Proxy{n}", proxy_module_number(loader_id)),
+        None => format!(
+            "jdk/proxy{}/$Proxy{n}",
+            proxy_module_number(ctx.vm_identity(), loader_id)
+        ),
     };
 
     // BFS over interface inheritance. Collect public, non-static,

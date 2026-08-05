@@ -38423,7 +38423,10 @@ static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// global [`PROXY_CLASS_COUNTER`]). Public-interface proxies of the SAME loader
 /// share one `jdk/proxyN` package, exactly like the JDK's `ProxyBuilder`.
 static PROXY_MODULE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<u32, u32>>> =
+/// Keyed by `(vm_identity, loader_id)`: loader ids are small per-VM integers,
+/// so an unqualified key let VM B's loader 2 inherit VM A's module number and
+/// generate its `$ProxyN` into a package that VM A had already claimed.
+static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<(usize, u32), u32>>> =
     parking_lot::RwLock::new(None);
 
 /// WP2.5 v3 item 6 — classify a thrown exception from
