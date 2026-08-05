@@ -1116,10 +1116,7 @@ pub(crate) fn native_string_char_at(
     let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => {
-            return Err(
-                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }
-                    .into(),
-            )
+            return Err(cratonvm_types::error::RuntimeError::sioobe_no_length(index).into())
         }
     };
     let is_byte_array = matches!(
@@ -1132,7 +1129,7 @@ pub(crate) fn native_string_char_at(
 
     if index < 0 || index >= char_count as i32 {
         return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::sioobe_index(index, char_count as i32).into(),
         );
     }
 
@@ -1364,12 +1361,7 @@ pub(crate) fn native_string_substring(
     };
 
     if begin < 0 || end < begin || end > char_count as i32 {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: if begin < 0 { begin } else { end },
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -2441,12 +2433,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // [srcBegin, srcEnd) window against the builder length via
     // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: src_begin,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
     }
     let n = (src_end - src_begin) as usize;
     // Destination-range check: the underlying `System.arraycopy` into `dst`
@@ -2575,9 +2562,7 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if index < 0 || index >= count {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
@@ -2615,12 +2600,7 @@ pub(crate) fn native_sb_code_point_at(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -2650,12 +2630,7 @@ pub(crate) fn native_sb_code_point_before(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 <= 0 || (index_i32 as usize) > chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index - 1];
@@ -4049,10 +4024,7 @@ pub(crate) fn native_string_substring_one(
     let end = char_count as i32;
 
     if begin < 0 || begin > end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }
-                .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -4779,12 +4751,7 @@ pub(crate) fn native_string_code_point_at(
     let s = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = s.encode_utf16().collect();
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -6268,10 +6235,8 @@ pub(crate) fn native_string_utf16_get_chars(
     // StringIndexOutOfBoundsException rather than overflowing Rust arithmetic.
     let count = src_end.wrapping_sub(src_begin);
     let source_len = (ctx.array_length(value) / 2) as i32;
-    if let Some(index) = bounds_off_count_violation(src_begin, count, source_len) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(src_begin, count, source_len).is_some() {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(src_begin, count, source_len).into());
     }
     // The bytecode validates the source before its first destination access.
     // Preserve that ordering when both inputs are invalid/null.
@@ -6358,6 +6323,47 @@ pub(crate) fn native_string_utf16_get_chars(
 //
 // Reference: JDK 25 `java/lang/String.java` and `jdk/internal/util/Preconditions.java`.
 
+/// `static void java.lang.String.checkIndex(int index, int length)`
+///
+/// F4's third member, added 2026-08-05. `String.charAt` -> `StringLatin1
+/// .charAt` -> `StringLatin1.checkIndex` -> `String.checkIndex` ->
+/// `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`, and the generic
+/// `Preconditions` override underneath discards the formatter and throws
+/// `ArrayIndexOutOfBoundsException`. Measured, not assumed:
+///
+/// ```text
+///                 HotSpot                              CratonVM before this
+///   charAt(-1)    SIOOBE "Index -1 out of bounds..."   ArrayIndexOutOfBounds, msg=null
+///   charAt(12)    SIOOBE "Index 12 out of bounds..."   SIOOBE, msg=null
+/// ```
+///
+/// The negative case got the WRONG CLASS -- `catch
+/// (StringIndexOutOfBoundsException)` misses an AIOOBE, so that is a
+/// control-flow defect, not a message defect. The two cases diverged because
+/// only one of them reached `Preconditions`.
+///
+/// Same bypass shape, same rationale and the same load-bearing
+/// `register_with_kind(.., Intrinsic)` as its two siblings below. It goes away
+/// when `Preconditions` honours its formatter -- see
+/// `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+pub(crate) fn native_string_check_index(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let index = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if index < 0 || index >= length {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, length).into());
+    }
+    Ok(None)
+}
+
 /// `static void java.lang.String.checkBoundsBeginEnd(int begin, int end, int length)`
 ///
 /// Spec: throws `StringIndexOutOfBoundsException` iff
@@ -6379,12 +6385,8 @@ pub(crate) fn native_string_check_bounds_begin_end(
         _ => 0,
     };
     if begin < 0 || begin > end || end > length {
-        // Mirror the index the JDK puts in the SIOOBE message: `begin` if it's
-        // the offending arg, otherwise `end`.
-        let index = if begin < 0 { begin } else { end };
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot's `Preconditions.checkFromToIndex` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, length).into());
     }
     Ok(None)
 }
@@ -6428,10 +6430,9 @@ pub(crate) fn native_string_check_bounds_off_count(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if let Some(index) = bounds_off_count_violation(offset, count, length) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(offset, count, length).is_some() {
+        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
     }
     Ok(Some(Value::Int(offset)))
 }
@@ -6535,10 +6536,9 @@ pub(crate) fn native_string_init_from_char_array_range(
         _ => 0,
     };
     let length = ctx.array_length(arr) as i32;
-    if let Some(index) = bounds_off_count_violation(offset, count, length) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(offset, count, length).is_some() {
+        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
     }
     let mut units = vec![0u16; count as usize];
     let written = ctx.read_char_array_into(arr, offset as usize, &mut units);
@@ -6588,6 +6588,13 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
     // `SIOOBE_FORMATTER`) is not implemented. Fixing that override is what
     // would let these go — see
     // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+    registry.register_with_kind(
+        "java/lang/String",
+        "checkIndex",
+        "(II)V",
+        native_string_check_index,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
     registry.register_with_kind(
         "java/lang/String",
         "checkBoundsBeginEnd",

@@ -215,6 +215,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "classpath", on_key: Some("CRATONVM_DBG_CLASSPATH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cleaners", on_key: None, off_key: Some("CRATONVM_DBG_NO_CLEANERS"), off_word: None },
     E { group: Group::DBG, token: "clinit-fail", on_key: Some("CRATONVM_DBG_CLINIT_FAIL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "clinit-order", on_key: Some("CRATONVM_DBG_CLINIT_ORDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "clone", on_key: Some("CRATONVM_DBG_CLONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "coerce", on_key: Some("CRATONVM_DBG_COERCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "compact-inline", on_key: Some("CRATONVM_DBG_COMPACT_INLINE"), off_key: None, off_word: None },
@@ -934,7 +935,6 @@ pub const INVENTORY: &[E] = &[
     // the single call site that reads both.
     E { group: Group::REAL, token: "annotations", on_key: Some("CRATONVM_REAL_ANNOTATIONS"), off_key: Some("CRATONVM_SYNTHETIC_ANNOTATIONS"), off_word: None },
     E { group: Group::REAL, token: "aqs", on_key: Some("CRATONVM_REAL_AQS"), off_key: Some("CRATONVM_SYNTHETIC_AQS"), off_word: None },
-    E { group: Group::REAL, token: "buffered-writer", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_BUFFERED_WRITER"), off_word: None },
     E { group: Group::REAL, token: "dsa", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_DSA"), off_word: None },
     E { group: Group::REAL, token: "ec", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EC"), off_word: None },
     E { group: Group::REAL, token: "eqe", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EQE"), off_word: None },

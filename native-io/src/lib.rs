@@ -63,7 +63,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -5119,11 +5119,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // Registered here (not inside the synthetic-jdk-gated `register_nio_natives`)
     // so it is present in real-JDK mode, where the module finder runs the
     // genuine JDK bytecode.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/jimage/NativeImageBuffer",
         "getNativeMap",
         "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
         native_jimage_get_native_map,
+        NativeKind::Bridge,
     );
 
     // Phase B (RB.3 / RB.4): real-mode sun.nio.cs.StreamDecoder /
@@ -5448,19 +5449,33 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `initIDs` only caches jfieldIDs for HotSpot's own JNI code; CratonVM
     // resolves fields by name, so there is nothing to cache and an empty body
     // is the spec-correct implementation.
-    registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "open0",
         "(Ljava/lang/String;)V",
         native_fis_open0,
+        NativeKind::Bridge,
     );
-    registry.register("java/io/FileInputStream", "read0", "()I", native_fis_read);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "read0",
+        "()I",
+        native_fis_read,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "readBytes",
         "([BII)I",
         native_fis_read_bytes,
+        NativeKind::Bridge,
     );
     // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
     // scanning reaches this signature directly, so route it to the same native
@@ -5483,12 +5498,19 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_fis_read_bytes,
     );
-    registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "skip0",
+        "(J)J",
+        native_fis_skip,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "available0",
         "()I",
         native_fis_available,
+        NativeKind::Bridge,
     );
     // `length0`/`position0` both returned a hardcoded 0 — i.e. "this file is
     // empty and we are at its start" for EVERY file. JDK 25's
@@ -5498,58 +5520,76 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // fd table: `file_size` is the real length, and `available()` (already
     // used by the `available0` native) is bytes-remaining, so
     // `position = length - available`.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "length0",
         "()J",
         native_fis_length0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "position0",
         "()J",
         native_fis_position0,
+        NativeKind::Bridge,
     );
     // Previously hardcoded "not a regular file" so that `readAllBytes()`
     // avoided the `length0()`-sized fast path, which the stub above would
     // have sized at zero. With `length0`/`position0` real, this can report
     // the truth: `file_size` only succeeds for fd-table entries that really
     // are files (sockets/pipes/stdin fail), which is precisely the predicate.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "isRegularFile0",
         "(Ljava/io/FileDescriptor;)Z",
         native_fis_is_regular_file0,
+        NativeKind::Bridge,
     );
 
     // FileOutputStream: open0, write(I,Z), writeBytes
     // Same as `FileInputStream.initIDs` above — jfieldID caching only, which
     // CratonVM's by-name field resolution does not need.
-    registry.register("java/io/FileOutputStream", "initIDs", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileOutputStream",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "open0",
         "(Ljava/lang/String;Z)V",
         native_fos_init_string_append,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "write",
         "(IZ)V",
         native_fos_write_byte_ignore_append,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "writeBytes",
         "([BIIZ)V",
         native_fos_write_bytes_ignore_append,
+        NativeKind::Bridge,
     );
 
     // FileDescriptor.close0() — the real-JDK `FileInputStream.close()` /
     // `FileOutputStream.close()` bytecode routes through
     // `FileDescriptor.closeAll` -> `FileDescriptor.close()` -> `close0()`.
     // Releases the OS fd stashed on the descriptor's own `fd`/`handle`.
-    registry.register("java/io/FileDescriptor", "close0", "()V", native_fd_close0);
+    registry.register_with_kind(
+        "java/io/FileDescriptor",
+        "close0",
+        "()V",
+        native_fd_close0,
+        NativeKind::Bridge,
+    );
 
     // sun.nio.ch.UnixDispatcher.close0(FileDescriptor) — the static
     // NativeDispatcher-family close used by java.net.MulticastSocket's
@@ -5562,11 +5602,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
     // either way (an explicit static parameter here vs. `this` there) —
     // so the same handler applies unchanged.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "close0",
         "(Ljava/io/FileDescriptor;)V",
         native_fd_close0,
+        NativeKind::Bridge,
     );
 
     /// Platform `sockaddr_in`/`sockaddr_in6` ABI facts for the
@@ -5650,77 +5691,89 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // implementations do (`offsetof`/`sizeof` on `struct sockaddr_in*`). These
     // are not stubbed values standing in for runtime state.
     use sockaddr_abi as sa;
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "AFINET",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "AFINET6",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR4))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr6",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR6))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofFamily",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_FAMILY))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetFamily",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_FAMILY))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Port",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_PORT))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Addr",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_ADDR))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Port",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_PORT))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Addr",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_ADDR))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6ScopeId",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_SCOPE_ID))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6FlowInfo",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_FLOWINFO))),
+        NativeKind::Bridge,
     );
 
     // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
@@ -10513,11 +10566,12 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // available through this VM" answer, and the JDK's own
     // `UnixNativeDispatcher` treats it exactly that way by taking its portable
     // fallbacks. Claiming a capability we do not implement is what would break.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "init",
         "()I",
         |_ctx, _args| Ok(Some(cratonvm_types::Value::Int(0))),
+        NativeKind::Bridge,
     );
     // `UnixUserPrincipals.fromUid(uid)` / `fromGid(gid)` — reached from
     // `UnixFileAttributes.owner()`/`group()`, i.e. from `Files.getOwner` and
@@ -10529,7 +10583,7 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // `fromUid`/`fromGid` then fall back to the decimal id as the name; we
     // return those same decimal bytes directly rather than synthesising a
     // `UnixException`, which is indistinguishable to every caller.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getpwuid",
         "(I)[B",
@@ -10541,8 +10595,9 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getgrgid",
         "(I)[B",
@@ -10554,8 +10609,9 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getcwd",
         "()[B",
@@ -10567,6 +10623,7 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
 
     // Paths factory

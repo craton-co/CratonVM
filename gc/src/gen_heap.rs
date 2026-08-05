@@ -4322,6 +4322,87 @@ impl GenerationalHeap {
     /// nothing unless something already went wrong (it is called from
     /// exception paths only), and needs no flag to have been set in advance.
     ///
+    /// H2-CID0 (2026-08-05) — which LIVE objects still hold `addr` in a
+    /// reference slot?
+    ///
+    /// The answer to "the reference survived un-rewritten" is an object and a
+    /// slot, and nothing reports it on the unperturbed path:
+    /// `CRATONVM_DBG_STALE_OBJREF`'s attribution needs the quarantine (which
+    /// changes the arena-reuse timing the defect lives in) and its thread-local
+    /// half only walks frames, while the measured holder came out of a
+    /// `getfield`.
+    ///
+    /// Walks old gen and the live young arena and asks each object's own slot
+    /// ENUMERATOR — never a raw word comparison. A 16-byte legacy `Value` cell
+    /// overwritten by a narrower variant keeps the previous `Object`'s pointer
+    /// in its unused upper half, and this heap carries ~1 M such words per
+    /// compaction, so a word scan would report holders that no decoder can
+    /// produce.
+    ///
+    /// Returns `(holder_addr, holder_class_id, slot)` triples, capped. Only
+    /// ever called from a terminal error path, so the O(heap) cost is paid
+    /// exactly once and only after something has already gone wrong.
+    pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
+        let mut out: Vec<(usize, u32, usize)> = Vec::new();
+        if addr == 0 {
+            return out;
+        }
+        {
+            let old_gen = self.old_gen.lock();
+            for (obj_ptr, _size) in old_gen.walk_objects() {
+                if out.len() >= cap {
+                    return out;
+                }
+                // SAFETY: `walk_objects` yields valid old-gen object starts.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                let cid = h.class_id.as_u32();
+                // SAFETY: a walked base with a valid header and in-bounds body
+                // — `for_each_ref_slot`'s contract.
+                unsafe {
+                    for_each_ref_slot(obj_ptr, h, |p, slot| {
+                        if p as usize == addr && out.len() < cap {
+                            out.push((obj_ptr as usize, cid, slot));
+                        }
+                    });
+                }
+            }
+        }
+        {
+            let young = self.young_from.lock();
+            let base = young.base_ptr() as usize;
+            let used = young.used();
+            let free = young.free_blocks_sorted();
+            let mut free_iter = free.iter().peekable();
+            let mut cursor = 0usize;
+            while cursor < used {
+                if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+                    continue;
+                }
+                if out.len() >= cap {
+                    break;
+                }
+                // SAFETY: `cursor < used`; the arena is mapped.
+                let obj_ptr = (base + cursor) as *mut u8;
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                let total = gen_object_total_size(h);
+                if total < HEADER_SIZE || cursor + total > used {
+                    break; // off the object grid; a partial answer beats a wrong one
+                }
+                let cid = h.class_id.as_u32();
+                // SAFETY: a walked young object with an in-bounds body.
+                unsafe {
+                    for_each_ref_slot(obj_ptr, h, |p, slot| {
+                        if p as usize == addr && out.len() < cap {
+                            out.push((obj_ptr as usize, cid, slot));
+                        }
+                    });
+                }
+                cursor += total;
+            }
+        }
+        out
+    }
+
     /// Returns `(what, span_base, span_size)`; `span_size` is 0 for the
     /// answers that are a region rather than a block.
     pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {

@@ -14617,7 +14617,13 @@ pub fn register_essential_natives_with_shims(
 
     // Win32-side filesystem init — noop in our VM (path canonicalization
     // and FS flags are built in Rust, not JNI).
-    registry.register("java/io/WinNTFileSystem", "initIDs", "()V", native_noop);
+    registry.register_with_kind(
+        "java/io/WinNTFileSystem",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     registry.register_with_kind(
         "java/io/UnixFileSystem",
         "initIDs",
@@ -14887,7 +14893,7 @@ pub fn register_essential_natives_with_shims(
     );
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessEnvironment",
         "environmentBlock",
         "()Ljava/lang/String;",
@@ -14902,6 +14908,7 @@ pub fn register_essential_natives_with_shims(
             block.push('\0');
             Ok(Some(Value::Object(Some(ctx.create_string(&block)))))
         },
+        NativeKind::Bridge,
     );
     // Executable/Method/Constructor accessors with the same synthetic layout.
     registry.register(
@@ -20338,7 +20345,7 @@ pub fn register_essential_natives_with_shims(
     // path instead of failing during resolver initialization.
     // `notifyAddrChange0()` drives the optional network-change listener —
     // see its own registration below for why it must NOT answer 0.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "init0",
         "()V",
@@ -20357,8 +20364,9 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "loadDNSconfig0",
         "()V",
@@ -20377,6 +20385,7 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // `notifyAddrChange0()` is NOT a passive query — it is a BLOCKING wait,
     // and `ResolverConfigurationImpl$AddressChangeListener.run()` is
@@ -20390,11 +20399,12 @@ pub fn register_essential_natives_with_shims(
     // notification mechanism" answer: the listener returns and the thread
     // exits. CratonVM's resolver configuration is read once at init0 and
     // never reloaded, so there is nothing for a listener to observe anyway.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "notifyAddrChange0",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(-1))),
+        NativeKind::Bridge,
     );
 
     // JNDI DNS uses PortConfig to select a UDP source port. These are native
