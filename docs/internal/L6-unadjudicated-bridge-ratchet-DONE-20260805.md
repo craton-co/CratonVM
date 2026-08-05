@@ -20,7 +20,7 @@ reclassify a single native.
 | `regression-suite/bridge-ratchet.sh` | the runner: self-test, boot the VM against a real JDK, take the census, gate it. |
 | `scripts/jdk-only-adjudicate.py` | extended with §7, the same block as text and via `--json` — **imported from the gate**, not reimplemented. |
 | `regression-suite/README.md` | a section on the gate: what it asserts, the exit codes, how to re-freeze. |
-| `.github/workflows/ci.yml` | the hermetic self-test in the **blocking** `jdk-only-blockers-selftest` job; the measured gate in the advisory `jdk-only` matrix. |
+| `.github/workflows/ci.yml` | **both halves blocking**: the hermetic self-test in `jdk-only-blockers-selftest`, the measured gate in `build-and-test`'s ubuntu leg beside `Synthetic-stub ratchet`. The advisory `jdk-only` matrix also runs it, as the multi-JDK/OS probe. |
 
 ## The decision the brief asked for
 

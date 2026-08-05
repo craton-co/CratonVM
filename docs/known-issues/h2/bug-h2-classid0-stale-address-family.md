@@ -70,6 +70,38 @@ title:
    still free) or an unrelated live class (block re-served);
 4. a bare `SIGSEGV` with `slot[rN]` reading eight zero words.
 
+### A fifth reproduction: Hibernate `SmokeTests#testQueryConcurrency` (2026-08-05)
+
+Added because this class is a **cheap, JIT-only reproduction** — ~15 s per
+attempt at `-Dcraton.smoke.forks=1` — and because it was until now filed under a
+throughput page that explicitly told triagers not to look for a crash here. That
+page is retired
+([`../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md));
+the throughput finding it was tracking is closed, and this is what is left.
+
+Twenty-six runs at `forks=1`, dev tip, JIT on, in two batches (10 then 16),
+produced **two distinct non-completions** — one of each shape:
+
+* `EXCEPTION_ACCESS_VIOLATION`, read of `0x0000000000000005`, in a compiled
+  frame under `PooledConnections.poll` /
+  `DriverManagerConnectionProvider.getConnection`; `rdi=0xFFFFFFFFFFFFFFFF` —
+  the KINDOF sentinel. **Zero GC cycles had run** (`0 moving cycle(s), 0
+  diverted`), and the report names
+  `unregistered-jit-frame-on-stack` as the last incomplete-coverage reason.
+* a SessionFactory that failed to build at all —
+  `PropertyNotFoundException: Could not locate getter method for property 'id'`
+  — preceded by a burst of
+  `gen_heap::read_slot: corrupt Value cell (out-of-range discriminant)`. The
+  payloads are String byte data read as a `Value` cell
+  (`raw0="0x006c6d782d6d6268"` is `"hbm-xml"`,
+  `raw0="0x0065646163736163"` is `"cascade"`).
+
+Eight `--nojit` runs of the same command were clean, 8 for 8, so the JIT is
+required. The zero-collection detail matters for this page's own open question:
+like the clone face, and unlike the old-gen face, there is **no evidence any
+collection freed anything** here — a wrong-object return or a stale VM-side
+cache entry remains as live an explanation as reclamation.
+
 ### The 2026-08-03 A/B, on a binary with the JIT confound removed
 
 `TestMVStoreCacheLoop`, one worker per arm, same host and window, `--Xmx 1g`,

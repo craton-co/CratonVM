@@ -72,14 +72,14 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | ~~`java/lang/invoke/VarHandle`~~ | ~~1~~ | ~~`Object`~~ | ~~`Z`~~ | **FIXED** |
   | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | ~~`java/util/HashMap`~~ | ~~2~~ | ~~`Int`~~ | ~~`[`~~ | **FIXED (L2, 2026-08-04)** |
-  | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
+  | ~~`java/lang/invoke/MemberName`~~ | ~~4~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L3, 2026-08-05)** |
   | ~~`java/util/Properties`~~ | ~~7~~ | ~~`Float`~~ | ~~`L`~~ | **FIXED** |
   | ~~`java/util/Properties`~~ | ~~6, 5~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
   | ~~`java/util/Properties`~~ | ~~2~~ | ~~`Object`~~ | ~~`I`~~ | **FIXED (L2, 2026-08-04)** |
   | ~~`java/util/Properties`~~ | ~~3~~ | ~~`Object`~~ | ~~`F`~~ | **FIXED (L2)** — never in this table: no probe called `new Properties(defaults)` until 2026-08-04 |
   | ~~`ClassLoaders$PlatformClassLoader`~~ | ~~0, 3, 4, 6~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L1, 2026-08-05)** |
   | ~~`ClassLoaders$AppClassLoader`~~ | ~~0, 3, 4, 6~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L1, 2026-08-05)** |
-  | `java/util/Scanner` | 3, 4 | `Int` | `L` | 2 each |
+  | ~~`java/util/Scanner`~~ | ~~3, 4~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED (L3, 2026-08-05)** — and three more slots on the same class that this table never listed |
   | `java/net/URI` | 5 | `Object` | `I` | 2 |
   | `java/net/URI` | 2 | `Int` | `L` | 2 |
   | `java/net/Proxy` | 0 | `Int` | `L` | 2 |
@@ -305,6 +305,55 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     its parent** to every caller that walks the chain
     (`builtin_loader_reachable`, `parent_namespace_id`, Tomcat's
     `while (j.getParent() != null)`).
+  * **`Scanner` and `MemberName` — FIXED 2026-08-05 (lane L3), and between them
+    they are two more instances of this record's own warning that the table is a
+    floor.**
+
+    `MemberName` slot 4 is **kind 3**, and the unusual sub-case where kind 3
+    needs no side table. `vmindex` is `@Injected` in HotSpot — the class file
+    declares no field for it — and index 4 is `method`, a `ResolvedMethodName`.
+    Four natives wrote an `Int(1)` "resolved" sentinel there
+    (`native_mhn_resolve`, `native_mhn_init`, `alloc_resolved_member_name`,
+    `lookup_reveal_direct`), and **the value never reached the object in any
+    layout**: `coerce_field_value_by_descriptor` maps an `Int` written to an `L`
+    slot to `Object(None)`, which is exactly the condition this census reports,
+    so the row is its own proof of inertness. Both vmindex readers already
+    answered 0. The sentinel is now written only on our fabricated layout, keyed
+    by name on the real class's `method` field, and `probes/L3MemberNameProbe`
+    is byte-identical pre-fix and post-fix in both modes. A doc comment on the
+    write called it "critical" because of a `SplitConstantPool`
+    `ConstantPoolException("Bad CP index: 0")`; whatever that was true of, it
+    cannot have been this write.
+
+    `Scanner` is **kind 2 for four slots and kind 3 for the fifth**, and the
+    writer was not where the lane brief said. `overlay-bt` named
+    `native_scanner_init_string` in `native-io/src/lib.rs` — a FIVE-slot model —
+    while the brief was written from a THREE-slot model in
+    `native-builtins/src/phases_early.rs` that is dead in every build
+    configuration (registered from `register_synthetic_overrides` at
+    `vm_init.rs:1426` and overwritten by `register_io_natives` at 1428; all 35
+    live `java/util/Scanner` registry entries name `native-io`). The dead copy
+    is deleted.
+
+    **Two of the five wrong writes were in this table; three were invisible.**
+    Against `javap`: model slot 0 (input `String`) landed on `buf`, a
+    `CharBuffer`; slot 1 (position) on `position`, right by coincidence; slot 2
+    (delimiter `Pattern`) on `matcher`. Slots 0 and 2 are reference-over-
+    reference — kind 5, which `overlay_write_is_destructive` cannot see. The
+    two rows that WERE visible were also lossy, not merely misplaced:
+    `useRadix(16)` was coerced to null, so `radix()` always answered 10 and
+    `nextInt()` on `"ff"` threw `InputMismatchException`. `position`,
+    `delimPattern`, `radix` and `closed` now resolve by name on the receiver;
+    the input text, which has no real counterpart, moved to an identity-keyed
+    side table.
+
+    A/B on the pre-fix binary, both probes × both modes, JDK 25, Azure Linux:
+    `Scanner` slots 3 and 4 go **1 → 0** each and `MemberName` slot 4 **7 → 0**,
+    with the benign `HashMap` slot-1 row byte-identical (1651 / 537 in both
+    arms) and no other row present in either. `probes/L3ScannerLayoutProbe` and
+    `probes/L3MemberNameProbe` are byte-identical to HotSpot 25 in `--real-jdk`
+    and `--jdk-only`; the Scanner probe fails on the pre-fix binary, which is
+    what makes it evidence rather than decoration.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
     single off-by-one against one layout.
 
@@ -513,8 +562,8 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | # | kind | tell | fix | status |
   |---|---|---|---|---|
   | 1 | synthetic slots written onto a real layout | the real class declares a field our model does not have | write the slots only when the layout is ours, keyed on a field name the real class declares | **`VarHandle` fixed** |
-  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7, 2, 3 and `HashMap` 2 fixed** (L2); `URI` open |
-  | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does | **`ClassLoaders` ×2 fixed** (L1, 2026-08-05) |
+  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup — or, as in `Scanner`, no lookup at all, just our model's index | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7, 2, 3 and `HashMap` 2 fixed** (L2); **`Scanner` 1/2/3/4 fixed** (L3); `URI` open |
+  | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does — or no storage at all, if the value never survived its own write | **`ClassLoaders` ×2 fixed** (L1, 2026-08-05); **`Scanner` slot 0 and `MemberName` slot 4 fixed** (L3, 2026-08-05) |
   | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | `Proxy` open |
 
   Kind 3 is the one that cannot be fixed by resolving harder: there is nowhere
