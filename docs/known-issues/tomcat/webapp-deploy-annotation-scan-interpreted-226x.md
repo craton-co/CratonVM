@@ -414,6 +414,57 @@ Both are answered by the same thing: a per-thread, epoch-validated resolved
 constant pool (`vm/src/runtime/interpreter/site_cache.rs`), behind
 `CRATONVM_JIT=field-site-cache` and `CRATONVM_JIT=method-site-cache`.
 
+#### What those two levers are worth (2026-08-04)
+
+Measured on an idle Windows box with `probes/SiteCacheCostProbe.java`, four
+interleaved passes with the arm order reversed on even passes. **This is the
+mechanism's price, not the annotation-scan number** — the probe is deliberately
+field-saturated, and the scan's field cluster is ~12% of its profile, so do not
+extrapolate the ratio. The scan number still has to be taken on the Azure host
+against real BCEL; that host was unreachable throughout this session.
+
+Structural check first — both levers demonstrably fire, which is the thing the
+retracted measurement above never established:
+
+```
+off:    field: hit=0         | method: hit=0
+field:  field: hit=12900001  | method: hit=0
+method: field: hit=0         | method: hit=900043
+both:   field: hit=12900001  | method: hit=900043
+```
+
+`--nojit`, ns/op, mean of the last two rounds across four passes:
+
+| benchmark | off | field-site-cache | method-site-cache | HotSpot `-Xint` |
+|---|---|---|---|---|
+| field-heavy | 43,630 | **21,170** (1.9–2.7x per pass) | 49,900 | ~270–440 |
+| mixed | 43,331 | **23,470** | 45,850 | ~425–520 |
+| native-call-heavy | 5,467 | 5,282 | 5,915 | ~400–480 |
+
+* **`field-site-cache` is worth ~1.9x on interpreted field-heavy code**, and the
+  ratio holds in every pass in both orders (1.94, 1.84, 2.69, 1.97). It cuts the
+  interpreter-vs-interpreter gap on this shape from ~100–160x to ~50–79x.
+* **`method-site-cache` measures nothing.** It removes real work — a
+  `resolution_cache` read lock, a hash probe and three `Arc<str>` clone/drop
+  pairs per invoke — but that work is small beside the `safe_native_call` funnel
+  a native invoke pays anyway (~450 ns/call here). The counter proves it fires
+  900k times and it still does not show. Kept, default-OFF, on the same footing
+  as the other measured-nothing levers: the waste is real, the payoff is not.
+
+In **default (JIT-on)** mode neither lever shows a reliable difference on this
+probe (field-heavy: off ~2,570, field ~2,466, both ~2,233 ns/op, inside the
+spread) — the JIT compiles the loop and never touches the interpreter's field
+path. That is consistent rather than contradictory: this workload is only
+interesting because the annotation scan is a case where **the JIT contributes
+nothing** (`--nojit` is *faster* there, measured above), so the scan sits in the
+first regime, not the second.
+
+Correctness: 28/28 regression suite green with the levers off and with both
+levers plus the loader arm on. Two dedicated vectors — `RFieldSiteCache` (291
+checks) and `RMethodSiteCache` (44) — target the silent failure modes
+specifically, since every way these caches can be wrong returns a plausible
+number rather than throwing.
+
 **Consequence for the exit criteria below: they are not reachable by tiering
 work.** ~240x against an interpreter that the JIT cannot help is a
 general-throughput problem. Anyone picking this up should either attack
