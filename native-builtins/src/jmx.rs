@@ -2426,7 +2426,60 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(owner)) => *owner,
                 _ => None,
             };
-            ctx.set_field_by_name(this, "exclusiveOwnerThread", Value::Object(owner));
+            // The field index is memoized per receiver class. `set_field_by_name`
+            // takes the class-manager read lock and walks the hierarchy comparing
+            // field-name strings on EVERY call, and this native runs twice per
+            // uncontended `ReentrantLock.lock()`/`unlock()` pair — measured at
+            // 821 ns per call against 7.9 ns for an ordinary Java call
+            // (`probes/AqsAttributionProbe.java`, quiet host).
+            //
+            // The index is a per-class constant: `exclusiveOwnerThread` is the
+            // only instance field `AbstractOwnableSynchronizer` declares, and
+            // `resolve_field_index_in_hierarchy` walks subclass -> super, so a
+            // given subclass resolves to the same slot for the life of that
+            // class. The memo is keyed on the receiver's class id and holds a
+            // few entries because the synchronizer classes in play are few
+            // (`ReentrantLock$NonfairSync`, `$FairSync`, the read/write-lock
+            // syncs, `ThreadPoolExecutor$Worker`) — a one-entry cache would
+            // thrash between a lock and a pool worker.
+            //
+            // A miss falls back to the resolving path, so an unexpected layout
+            // is slow rather than wrong, and an unknown name stays the silent
+            // no-op `set_field_by_name` already was. Class redefinition needs no
+            // invalidation: it allocates a NEW `ClassId`, so a stale entry can
+            // never be consulted for the redefined class.
+            const MEMO_SLOTS: usize = 8;
+            thread_local! {
+                static OWNER_FIELD_INDEX: std::cell::RefCell<[(u32, u32); MEMO_SLOTS]> =
+                    const { std::cell::RefCell::new([(u32::MAX, 0); MEMO_SLOTS]) };
+            }
+            let class_id = ctx.class_id_of_object(this);
+            let raw_cid = class_id.as_u32();
+            let cached = OWNER_FIELD_INDEX.with(|memo| {
+                memo.borrow()
+                    .iter()
+                    .find(|(cid, _)| *cid == raw_cid)
+                    .map(|(_, index)| *index as usize)
+            });
+            match cached {
+                Some(index) => ctx.set_field(this, index, Value::Object(owner)),
+                None => {
+                    if let Some(index) =
+                        ctx.resolve_field_index_by_class_id(class_id, "exclusiveOwnerThread")
+                    {
+                        OWNER_FIELD_INDEX.with(|memo| {
+                            let mut memo = memo.borrow_mut();
+                            // Take a free slot, else evict slot 0. The policy does
+                            // not need to be clever at this size, but the table
+                            // must not be able to grow without bound.
+                            let victim =
+                                memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                            memo[victim] = (raw_cid, index as u32);
+                        });
+                        ctx.set_field(this, index, Value::Object(owner));
+                    }
+                }
+            }
             ctx.record_jmx_owned_synchronizer(this, owner);
             Ok(None)
         },
