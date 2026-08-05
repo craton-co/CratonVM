@@ -1,8 +1,11 @@
-# A JIT-only regression makes Spring's `MergedAnnotations.from(..)` return null, failing configuration-class parsing across five Spring Boot classes
+# A JIT-only regression nulls a Spring annotation lookup, failing configuration-class parsing across six Spring Boot classes
 
-**Status: OPEN — bisected to a commit range 2026-08-05, mechanism NOT yet
-found.** One hypothesis has been tested and falsified; see below so nobody
-spends the afternoon on it twice.
+**Status: OPEN — first bad commit identified 2026-08-05 (`b68c3b319`),
+mechanism NOT yet found.** The commit is a TRIGGER, not the defect: it removes
+an over-conservative bail-list and so lets a large class of methods compile
+that never compiled before. Something in that newly-admitted set miscompiles.
+One hypothesis has been tested and falsified; see below so nobody spends the
+afternoon on it twice.
 
 ## Symptom
 
@@ -107,16 +110,79 @@ fails 40+, or the host has under ~10 GB free, throw the result away.** Check
 `free -g` and `/proc/loadavg` alongside every verdict — the reproducer script
 `/data/tmp/fixab.sh` records both on each line for exactly this reason.
 
+## The bisect, finished 2026-08-05 — and it runs on a LOCAL box
+
+The earlier note said this needed the Azure suite host. It does not. The whole
+failing slice is 139 jars and 170 MB; copied to `C:/craton/kafka-fixture` it
+runs the real class off the suite host entirely, and Windows gives a far
+**stronger** signal than Linux:
+
+| | `KafkaAutoConfigurationTests` |
+|---|---|
+| HotSpot 25.0.3+9, same local fixture | **53/53 PASS** |
+| CratonVM latest dev, JIT | **40–49 of 53 FAIL** |
+| CratonVM latest dev, `--nojit` | **53/53 PASS** |
+
+Same defect, not a lookalike: the local log carries
+`NullPointerException: Cannot invoke "MergedAnnotation.isPresent()" because
+"annotation" is null` and the same
+`Failed to parse configuration class [SslAutoConfiguration]`. (The Windows run
+ALSO surfaces `Proxy$Dispatch.invokeProxy: null Method arg` and Mockito
+"Could not modify all classes" — same family, a reference arriving null in
+compiled code.)
+
+**First bad commit: `b68c3b319`** — *fix(jit): the callee compile gate read an
+inherited method's bytecode against the SUBCLASS constant pool*. Its parent
+`41349f661` is **53/53 PASS**; `b68c3b319` itself fails. Found with
+`git bisect run`, path-limited to `vm jit native-builtins native-collections
+types`, over `9405271bd..ded183df8`, then confirmed against the parent.
+
+**It is a trigger, not the defect.** The commit is itself correct: the gate was
+passing the RECEIVER's class as the constant-pool owner while scanning an
+INHERITED method's bytecode, so pool indices resolved against the wrong class,
+the conservative `_ => return true` arm fired, and the method was permanently
+bail-listed. Fixing that lets a large class of inherited framework accessors
+compile for the first time. One of those newly-admitted methods miscompiles.
+That also explains the intensity gradient: **1** failing test at `b68c3b319`
+itself, **40–49** at dev tip, as later commits admit still more.
+
+So reverting `b68c3b319` would re-hide the bug and give back a real
+compile-coverage regression. The fix is to find the miscompile it exposed.
+
+## Measurement traps this class sets
+
+Anyone continuing needs all four, because each one produced a wrong answer here:
+
+1. **`grep -oE 'failed=[0-9]+'` also matches inside `containersFailed=N`.** A
+   container-level abort (`tests=0`, 49 ms, nothing ran) scored as "0
+   failures" — i.e. as a PASS — and sent a whole narrowing pass down a blind
+   alley. Parse the named fields, and treat `tests=0` or `containersFailed>0`
+   as INDETERMINATE, never as good.
+2. **One run does not decide anything.** A deny filter that read "0 failures"
+   once gave 45 and 46 on the next two runs. Baseline is 40–49 plus occasional
+   container aborts and occasional segfaults. Use N≥3.
+3. **The `CRATONVM_JIT_DENY` narrowing did not reproduce.** Denying
+   `org/springframework/util` looked like a clean fix on one sample; repeated,
+   it turns every run into a container abort — a different failure mode, not a
+   fix. No culprit class has been identified, and the earlier claim that one
+   had been is withdrawn.
+4. **A path-limited bisect can finger a merge.** This one first converged on
+   `eebd3c606`, a merge whose GOOD parent was the branch side; the change came
+   in from the dev side, and `gc/`, `classloading/` and `native-io/` were
+   outside the path filter entirely. Always open the merge and test the real
+   commits it brought in.
+
 ## Next steps
 
-1. On a quiet host, bisect inside `9405271bd..ded183df8` — the family is six
-   commits, so three builds settle it. Use `KafkaAutoConfigurationTests` with
-   **6 runs per candidate** (the rate is roughly 50%).
-2. With the commit known, instrument that path rather than guessing: the
-   symptom is a *reference-typed return arriving as null in compiled code*, so
-   compare what the bypass returns against what `invoke_or_native` would have
-   returned for the same site.
-3. `--nojit` is a clean workaround for anyone blocked on these five classes.
+1. Find the miscompiled method among those `b68c3b319` newly admits. The
+   commit adds `CRATONVM_DBG=callee-probe`, which tallies compile refusals by
+   reason — diff that tally across `b68c3b319^1` and `b68c3b319` to get the
+   exact set that changed from refused to compiled. That set, not the whole
+   program, is the search space.
+2. Then bisect WITHIN that set with `CRATONVM_JIT_DENY` (substring match on
+   `class.method`) or `CRATONVM_JIT_BISECT_ONLY` (class-name prefix allowlist),
+   at N≥3 runs per filter, scoring with the field-exact parser above.
+3. `--nojit` is a clean workaround for anyone blocked on these six classes.
 
 ## Affected classes
 
