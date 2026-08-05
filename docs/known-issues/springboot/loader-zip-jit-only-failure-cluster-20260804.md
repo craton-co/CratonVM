@@ -6,6 +6,13 @@ long base-offsets as 32-bit ints"), which landed after the binary this page was
 originally filed against. Verified below. Two members of the original table
 were **not** this bug and are re-scoped as separate open issues at the bottom.
 
+> **2026-08-05 re-verification — read this before acting on the two open items.**
+> Both are **NOT REPRODUCIBLE**, including on the pre-fix binary they were filed
+> against, and the second one's "JIT-only" framing is **falsified**. Details in
+> [Re-verification](#re-verification-2026-08-05). The page is deliberately NOT
+> retired: the failures were real when observed, and nothing here identifies a
+> fix for them.
+
 ## What it was
 
 `java.util.zip.ZipUtils.get16`/`get32` are how the JDK reads every little-endian
@@ -147,8 +154,26 @@ while a register home still holds a stale value — the coordinate-space family 
 and `…/jit/arrays-sort-long-osr-miscompile-FIXED.md` (whose fix,
 `14a2740859`, is already in this build and does not cover this).
 
-**Next step:** repeat those three levers 3× each on a quiet host before
-believing them, then narrow with `deny` inside the OSR set. A standalone
+**2026-08-05: this item is NOT REPRODUCIBLE and therefore cannot be narrowed.**
+11 runs on the pre-fix binary (3 at 2 g, 2 at 1 g, 6 pinned to 1/2/4 cores) all
+PASS — see [Re-verification](#re-verification-2026-08-05). Every lever below
+answers a question about a failure that no longer occurs, so running them now
+would produce a table of PASSes that means nothing. Do **not** read this as
+fixed: no fix is identified, no commit is attributed, and OSR still enters the
+method. What changed between then and now is unknown; the leading candidate is
+whatever the loaded host (load 30+) supplied that an idle one does not, and heap
+size and CPU count are not it.
+
+The one thing worth doing when it next appears: capture the failing run's full
+stderr *at that moment*, plus `CRATONVM_DBG=osr` and the host's load, before the
+window closes. This page's `deny=` verdicts were single runs taken during such a
+window and two of them (`canLoadFilesBiggerThan3Mb` and `constructSequenceStep2`
+each "PASS when denied") cannot both name a sole culprit — `deny` perturbs
+compile scheduling globally, so an unrepeated PASS from it is weak evidence.
+
+**Original next step, retained for whenever it reproduces:** repeat those three
+levers 3× each on a quiet host before believing them, then narrow with `deny`
+inside the OSR set. A standalone
 reproducer of just the append loop (`SbGrow.java`, in this session's scratch)
 did *not* reproduce — it timed out at 4 MiB on CratonVM and completed at 1 MiB,
 so the minimal case still needs finding. That timeout was measured while the
@@ -179,6 +204,83 @@ and must not be read as an exoneration:
 The OSR-fired column is the part that makes that a real negative rather than a
 vacuous one ([[reference_jit_regression_fixture_must_prove_it_compiles]]).
 
+## Re-verification 2026-08-05
+
+Azure Linux, 16 cores, **idle** (load ~1–2), JDK 25, real-JDK mode, `--Xmx 2g`
+unless stated. Two binaries:
+
+* **new** = `2572ea9afe` (current `dev`, 74 commits after this page was filed);
+* **old** = `fe886b08c` — *the code this page was measured against*. It is a
+  docs-only commit, so its code is identical to its parent.
+
+### Every class in the page's tables passes on current `dev`
+
+Three runs each, all `containersFailed=0`, and the test counts match the page's
+own numbers, so none of these is a vacuous zero-test run:
+
+| class | tests | result |
+|---|---|---|
+| `loader.tools.ImagePackagerTests` | 37 | PASS 3/3 |
+| `loader.tools.RepackagerTests` | 52 | PASS 3/3 |
+| `loader.jar.NestedJarFileTests` | 34 | PASS 3/3 |
+| `loader.jar.SecurityInfoTests` | 3 | PASS 3/3 |
+| `loader.zip.ZipContentTests` | 29 | PASS 3/3 |
+| `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | 1 | PASS 3/3 |
+
+### The control: neither open item reproduces on its own pre-fix binary
+
+A green only means something if the oracle can go red on the code that was
+failing. It cannot:
+
+| arm (binary **old** = `fe886b08c`) | runs | result |
+|---|---|---|
+| yaml, `--Xmx 2g`, idle | 3 | **all PASS** |
+| yaml, `--Xmx 1g` | 2 | **all PASS** |
+| yaml, pinned to 1 / 2 / 4 cores (`taskset`) | 6 | **all PASS** |
+| `ZipContentTests`, `--Xmx 2g` | 3 | **all PASS** |
+
+Heaps at or below 512m are not evidence either way: the test legitimately
+`OutOfMemoryError`s there, since it builds a 4 MiB document and then parses
+233 k entries out of it.
+
+**So current `dev` passing is not evidence of a fix.** 74 commits landed in
+between, but nothing here attributes the change to any of them — the failure is
+absent from the *before* binary too. GC pressure (via heap) and CPU starvation
+(via `taskset`) were both tried because the original measurements were taken on
+a host above load 30 and this one is idle; neither brought it back. Raising load
+on the host itself was deliberately not done — it would invalidate every other
+session's runs on this shared box.
+
+### It is not "masked by the tiering changes" either
+
+Four commits in the range change tier-up/OSR triggering, so the obvious
+hypothesis was that OSR simply no longer enters the test method. It does.
+`CRATONVM_DBG=osr` on **both** binaries lists the same sites:
+
+```
+enter java/util/Arrays.fill([BIIB)V entry_pc=10                     (x5 new, x6 old)
+enter OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb()V entry_pc=8
+enter snakeyaml BaseConstructor.constructSequenceStep2(...)  entry_pc=10
+enter YamlProcessor.lambda$buildFlattenedMap$0(...)          entry_pc=144 (x2)
+```
+
+That is the page's own census ("9 OSR entries … among them the test method
+itself and `java/util/Arrays.fill([BIIB)V`"). The OSR path is still compiled and
+still entered; the test just does not fail. A latent OSR miscompile is therefore
+**not excluded** — only unreproducible.
+
+### Harness correction — one that could have scored a red as green
+
+Both oracles decided PASS with `case "$res" in *failed=0*)`. That substring also
+occurs inside `containersFailed=0`, so a run that failed to even load its test
+class (`tests=0 … containersFailed=1 LOADFAIL`) reported **PASS**. Fixed to
+extract each field and to treat `tests=0` as a vacuous failure; the FAIL path
+was then confirmed to fire before any verdict above was trusted.
+
+The bug can only turn a red into a green, never the reverse, so this page's
+original FAIL observations stand unaffected — and its PASS rows all carry real
+test counts (37/37, 52/52, …), so none of them was a mis-scored load failure.
+
 ### 2. `loader/spring-boot-loader` `ZipContentTests` — heap, not headers
 
 On current `dev` it no longer corrupts: it dies with
@@ -196,7 +298,40 @@ under `CRATONVM_DBG=gc-overhead` on **both** arms at the same `--Xmx 2g`, so a
 live set that matches `--nojit` means the collector is not getting to garbage,
 while a genuinely larger live set means something is pinning.
 
-The first thing to run on it, though, is one env var:
+**2026-08-05: "JIT-only" is falsified, and the symptom is not the OOM.**
+Re-measured on current `dev`, whole class, `--Xmx 2g`:
+
+| arm | class-level runs | failures |
+|---|---|---|
+| JIT | 9 | **0** |
+| `--nojit` | 9 | **1** |
+
+The `--nojit` failure is `nestedZip64CanBeRead` — the very test this section
+names — and it is not an `OutOfMemoryError`:
+
+```
+java.io.IOException: Zip64 'End Of Central Directory Record' not found at
+position 8027398. Zip file is corrupt or includes prefixed bytes which are not
+supported with Zip64 files
+```
+
+A `--nojit` arm that fails at any rate at all disposes of "the JIT arm has a
+materially larger footprint": whatever this is, disabling the compiler does not
+prevent it. One observation is a rate of about 1-in-9, not a proof of
+JIT-independence, but it is enough to retire the footprint story as *stated*.
+
+The failure also needs the **whole class**. Run on its own,
+`nestedZip64CanBeRead` passed **40/40** — 10 reps each across
+{JIT, `--nojit`} × {old, new}. So the trigger is something the other 28 tests
+leave behind (temp files, accumulated heap, or shared static state), not a
+property of that test. Disk and memory were ruled out at the time of the
+failure: 15 G free on `/tmp`, 25 G RAM available.
+
+**Re-scoped:** a low-rate, whole-class-context flake in `nestedZip64CanBeRead`,
+present with the JIT off. Not a zip-header bug, and not (on this evidence) a JIT
+footprint bug.
+
+If the OOM spelling does come back, the first thing to run on it is one env var:
 `CRATONVM_JIT=getstatic-helper`. The mistyped-`J`-static family this page
 root-causes is still *structurally* open — `try_emit_inline_getstatic` picks its
 load width purely from the field **descriptor** and never checks that the slot's
