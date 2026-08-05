@@ -5651,12 +5651,22 @@ pub(crate) fn alloc_method_handle(
     // `GroovyBugError: argument array length and parameter array length should
     // be the same` when dispatching any instance call (e.g. Gradle/Groovy
     // SpringRepositoriesExtension). STATIC/CONSTRUCTOR/GETTER keep raw `desc`.
+    //
+    // A CONSTRUCTOR handle needs the mirror adjustment at the other end: the
+    // bytecode descriptor of `<init>` returns `V`, but `findConstructor` and
+    // `unreflectConstructor` hand back a handle whose type RETURNS THE CLASS —
+    // `(int)Bean`, not `(int)void`, which `probes/L3MemberNameProbe` diffs
+    // against the host JDK. `MH_DESC` keeps the raw `(...)V` for dispatch and
+    // the `invokeExact` arity check, exactly as for the receiver-prepend above.
     let recv_desc;
     let type_desc: &str = if (kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL)
         && !class.is_empty()
         && desc.starts_with('(')
     {
         recv_desc = format!("(L{};{}", class, &desc[1..]);
+        recv_desc.as_str()
+    } else if kind == MH_KIND_CONSTRUCTOR && !class.is_empty() && desc.ends_with(")V") {
+        recv_desc = format!("{}L{};", &desc[..desc.len() - 1], class);
         recv_desc.as_str()
     } else {
         desc
