@@ -555,13 +555,49 @@ plausible mechanism: the publish hook fires on object-RETURNING native calls,
 so a stretch of bytecode that allocates and then calls only void natives (or no
 native at all) never republishes.
 
-**Caveat on the reported pc, so nobody anchors on it.** `@pc=252` does not
-correspond to the `invokeinterface hasNext` at 203 in the javac disassembly of
-this build — 252 is `aload 4` before `awaitTermination`. Either the VM reports
-pcs in its own rewritten bytecode space (the arming rewriter shifts them) or the
-frame pc is read at a different moment than the dispatch. The *method* and the
-*receiver verdict* are the load-bearing parts; do not map this pc onto javap
-output without checking.
+### The `Iterator` was never the victim — the reported method name is an ARTIFACT
+
+Resolve the pc first, because it is what this whole page was named after.
+
+**The caller pc a dispatch failure reports is the POST-invoke pc**, i.e. the
+return address, not the call site. Three witnesses, three builds, all consistent:
+
+| witness | call site | reported pc | site + length |
+| --- | --- | --- | --- |
+| `TestMultiThread.testConcurrentUpdate` | `invokeinterface ExecutorService.shutdown()V` @247 | **252** | 247 + 5 |
+| `TestMultiThread.testConcurrentInsert` | `invokeinterface ExecutorService.shutdown()V` @192 | **197** | 192 + 5 |
+| `DriverManager.getConnection` | `invokevirtual Properties.put(…)` @16 | **19** | 16 + 3 |
+
+So the two H2 witnesses this family is named for did **not** fail in the
+`for (Future<Void> job : jobs)` loop. `@pc=252` is `aload 4` immediately after
+`executor.shutdown()`; `@pc=197` is `aload_3` immediately after the identical
+call in the sibling method. Both failing call sites are
+`invokeinterface java/util/concurrent/ExecutorService.shutdown()V`, and the
+victim is the **`executor` local** — slot 4 in `testConcurrentUpdate`, slot 3 in
+`testConcurrentInsert` — which is live from its assignment to the end of the
+method, not a loop temp.
+
+**Then the reported method name is wrong.** The call site names
+`shutdown()V`; the report says `java/lang/Object.hasNext()Z` (and
+`java/lang/Object.next()Ljava/lang/Object;` for the sibling). A `ClassId(0)`
+receiver explains the CLASS — `java.lang.Object` is class id 0 — but nothing
+about a zeroed receiver renames `shutdown` to `hasNext`. All three of
+`shutdown()V`, `hasNext()Z` and `next()Ljava/lang/Object;` are
+`invokeinterface` with `count=1`, and `hasNext`/`next` are what the loop
+earlier in the same method dispatches, so an interface call-site cache that
+mixes entries when the receiver class id is 0 produces exactly this. That is a
+second, separate defect and it is not established here — but it is why the
+`java/lang/Object.put(...)` witness in `DriverManager.getConnection` reported
+the RIGHT name: that one is an `invokevirtual`.
+
+Two consequences worth stating plainly:
+
+* **the old page name — and three sessions of reasoning about a synthetic
+  iterator local held only by a parked frame — rests on that artifact.** The
+  actual victim is an ordinary, long-lived local of the running method;
+* the `blocked=false` in the original 2026-08-02 receiver dump was right and
+  should have been believed: the thread is not parked when it trips, and
+  `in_blocked_region=false` in the 2026-08-05 provenance line says so again.
 
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
