@@ -67,7 +67,7 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
   | class | slot | writes | real desc | n |
   |---|---:|---|---|---:|
-  | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
+  | ~~`java/util/HashMap`~~ | ~~1~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED 2026-08-05** — 8,342 → 0, the largest row in this table |
   | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
   | ~~`java/lang/invoke/VarHandle`~~ | ~~1~~ | ~~`Object`~~ | ~~`Z`~~ | **FIXED** |
   | ~~`java/lang/invoke/VarHandle`~~ | ~~0~~ | ~~`Int`~~ | ~~`L`~~ | **FIXED** |
@@ -105,9 +105,47 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   > named under `Properties` below are attributed to L2, each A/B'd on the
   > same workload against the pre-fix binary.
 
-  * The **`HashMap` family is the known-benign case** the hunter suppresses by
-    default — coercion-to-null lands the real bytecode in the null-initialised
-    state it expects. It dominates by volume and says nothing.
+  * ~~The **`HashMap` family is the known-benign case**~~ — **half true, and
+    the half that was false was the expensive half. FIXED 2026-08-05.**
+    Coercion-to-null does land the real bytecode in the null-initialised state
+    it expects, which is why slot 1 (`AbstractMap.values`) was harmless in
+    OUTCOME. What that reasoning hid is the slot NEXT to it: the same
+    fabricated model puts the bucket array in slot 0, `AbstractMap.keySet` —
+    reference over reference, so no census could ever report it, and no
+    coercion made it benign.
+
+    `probes/MapModelSlotProbe` reads the field reflectively under
+    `--add-opens java.base/java.util=ALL-UNNAMED` and settled it against
+    HotSpot 25.0.3+9:
+
+    | | HotSpot | CratonVM (pre-fix) |
+    |---|---|---|
+    | `keySet` on a fresh/filled/copied/sized map | `null` | `ARRAY[Object]` |
+    | after `keySet()` was called | `HashMap$KeySet` | still `ARRAY[Object]` |
+    | `values` | `null` | `null` (the coercion — genuinely benign) |
+
+    The second row is the failure mode: real `HashMap.keySet()` is
+    `if (ks == null) ks = new KeySet(); return ks`, so a non-null bucket array
+    short-circuits the lazy init and hands the caller an `Object[]` where a
+    `Set` is required. It never faulted because the natives shadow every
+    reader — the same conditional safety `VarHandle` had, and item 3/7 is in
+    the business of removing that shadow.
+
+    Fixed in `fix/map-model-slots-on-real-layout-20260805`: `map_buckets_slot`
+    and `map_size_slot` answer "where does THIS receiver keep its table / its
+    count", and read and write both go through them, so they cannot drift. The
+    slot-1 row went 8,342 → 0, `keySet` is `null` on every probe row, the
+    `test_classes` corpus is byte-identical in `Compatible` mode, and
+    `bench/HashMapOnly` at n=5M shows no regression (median 2956 → 2940 ms,
+    min 2872 → 2575) because the change also removes a by-NAME class lookup
+    per size access.
+
+    **The lesson generalises past this row.** "Benign by coercion" is a claim
+    about one slot's value kind, and it was used to wave off a whole family;
+    the adjacent slot in the same model had no coercion to make it benign and
+    no instrument that could see it. When a model is written over a real
+    layout, ask what EVERY slot of the model lands on — `javap -p` and a
+    reflective probe, not the census.
   * **`VarHandle` — FIXED 2026-08-04, and it was the worst of the set.** It
     mismatched in *both* directions on adjacent slots (`Int` over a reference at
     0, an `Object` over a `boolean` at 1). The frames say why that mattered:
