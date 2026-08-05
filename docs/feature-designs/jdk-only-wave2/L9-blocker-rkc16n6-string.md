@@ -72,8 +72,25 @@ implementation, in three separate ways, and no test asked.
 * **`--jdk-only` census**: zero `native-shadows-bytecode` violations for
   `java/lang/String`, from 12; the registry goes from 80 `String` rows to 26.
 * **The matrix moved 57 -> 37 divergences: 20 fixed, 0 regressed**, both modes
-  byte-identical to each other.
+  byte-identical to each other. The two follow-up fixes below took it to
+  **21** (37 -> 21: 16 fixed, **0 regressed**, and no still-divergent row
+  changed value — a count alone cannot see a row *worsen*).
 * **`Compatible` byte-for-byte over `test_classes`**: 9 of 9 identical.
+
+## What is left, and what each remaining row costs
+
+The 21 residual matrix rows are not 21 problems. They are four:
+
+| group | rows | cause |
+|---|---:|---|
+| A | **13** | `msg=null` on out-of-bounds exceptions. The *class* is right (F4); only the message text is missing. This is [`preconditions-ignores-the-exception-formatter`](../../known-issues/preconditions-ignores-the-exception-formatter.md), still open. One fix, 13 rows. |
+| B | 4 | regex message text, plus `replaceAll` with a bad group reference not throwing at all |
+| C | 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null") vs our own text. A VM-wide feature, not a `String` defect. |
+| D | 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
+
+Group A is the only one whose fix is scoped to this lane, and it is the largest.
+Group C is deliberately out of scope: it is `NullPointerException` message
+synthesis for the whole VM, not anything `String` does.
 
 ## Three defects the removal surfaced
 
