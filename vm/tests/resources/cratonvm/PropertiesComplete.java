@@ -230,6 +230,17 @@ public class PropertiesComplete {
     }
 
     // ---- Test 28: Properties.load with spaces ----
+    //
+    // `java.util.Properties.load` strips whitespace BEFORE the key, around the
+    // separator, and after the key — but NOT after the value: everything from
+    // the first non-whitespace value character to the end of the line is the
+    // value, trailing spaces included (java.util.Properties javadoc, "the
+    // characters following the key up to the end of the line"). So `  key1  =
+    // value1  ` yields the value `"value1  "`, not `"value1"`.
+    //
+    // This test asserted `"value1".equals(v1)` and expected 1. Run under a real
+    // JDK 25 it returns 0 — the expectation, not the VM, was wrong. Assert the
+    // whole documented rule instead: leading trim, no trailing trim.
     public static int testPropertiesLoadSpaces() {
         String content = "  key1  =  value1  \nkey2=value2\n";
         ByteArrayInputStream bais = new ByteArrayInputStream(content.getBytes());
@@ -241,7 +252,7 @@ public class PropertiesComplete {
         }
         String v1 = props.getProperty("key1");
         String v2 = props.getProperty("key2");
-        return ("value1".equals(v1) && "value2".equals(v2)) ? 1 : 0;
+        return ("value1  ".equals(v1) && "value2".equals(v2)) ? 1 : 0;
     }
 
     // ---- Test 29: System.getenv returns value for known env var ----

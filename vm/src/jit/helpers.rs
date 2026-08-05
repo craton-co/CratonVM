@@ -10945,7 +10945,10 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     // roots and the nested helper preserves normal Java dispatch semantics.
     let jit_args = [receiver.as_ptr() as i64, index as i64];
     let vm_ptr = vm as *const _ as i64;
-    let _guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+    let _guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+        &*compiled,
+        Some(thread.frames.len()),
+    );
     let bits = if compiled.needs_context() {
         compiled.try_call_with_context(vm_ptr, &jit_args)
     } else {

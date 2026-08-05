@@ -3259,7 +3259,9 @@ pub(super) fn execute_instruction(
                             || obj_class_name == "java/lang/Object";
                         if is_classloader_target && obj_is_bare_object {
                             if let Some(loader_obj) =
-                                cratonvm_native_builtins::classloader::peek_app_loader()
+                                cratonvm_native_builtins::classloader::peek_app_loader(
+                                    shared.vm_identity,
+                                )
                             {
                                 tracing::debug!(
                                     target: "cratonvm::interp::checkcast",

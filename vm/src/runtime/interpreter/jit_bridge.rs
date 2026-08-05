@@ -1622,7 +1622,10 @@ pub(super) fn try_osr(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = {
         let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                &*compiled,
+                Some(thread.frames.len()),
+            );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
             // was validated; `plan` is the proof, obtained from
@@ -6460,7 +6463,10 @@ pub(super) fn execute_jit_call(
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
-                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    &*compiled,
+                    Some(thread.frames.len()),
+                );
             unsafe {
                 if needs_heap {
                     compiled.try_call_with_context(vm_ptr, args_slice)
@@ -6482,7 +6488,10 @@ pub(super) fn execute_jit_call(
         let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
         let jit_result = {
             let _jit_root_guard =
-                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    &*compiled,
+                    Some(thread.frames.len()),
+                );
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if needs_heap {
                     // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
@@ -6994,7 +7003,10 @@ pub(super) fn execute_jit_call_decoded(
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
-                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    &*compiled,
+                    Some(thread.frames.len()),
+                );
             unsafe {
                 if needs_heap {
                     compiled.try_call_with_context(vm_ptr, args_jit)
@@ -7016,7 +7028,10 @@ pub(super) fn execute_jit_call_decoded(
         let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
         let jit_result = {
             let _jit_root_guard =
-                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+                    &*compiled,
+                    Some(thread.frames.len()),
+                );
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // SAFETY: see the fast-path SAFETY note above.
                 unsafe {

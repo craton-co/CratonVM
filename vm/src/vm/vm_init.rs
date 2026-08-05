@@ -1334,13 +1334,17 @@ impl SharedVm {
         let concurrent_gc_state = std::sync::Arc::new(cratonvm_gc::ConcurrentGcState::new());
         heap.enable_concurrent_gc(concurrent_satb.clone(), concurrent_gc_state.clone());
 
-        // Reset singleton classloader instances from any previous VM
+        // Reset the classloader side-tables that are still process-wide.
+        //
+        // NOTE what is deliberately NOT here any more: the built-in loader
+        // singletons and the `System.getenv()`/`getProperties()` singletons.
+        // Clearing those from `Vm::new` assumed VMs are created strictly in
+        // sequence; a Rust test binary runs `#[test]`s on several threads, so
+        // this call was wiping cells that a *concurrently live* VM was using —
+        // after which the two VMs traded heap objects and the reader segfaulted.
+        // They are keyed by `vm_identity` now (a fresh VM starts with no row)
+        // and dropped in `release_vm_native_state`.
         cratonvm_native_builtins::classloader::reset_loader_singletons();
-        // Reset cached System.getenv()/getProperties() singletons too, so a new
-        // VM never returns a stale ObjectRef from a previous instance.
-        cratonvm_native_builtins::lang_system::reset_system_singletons();
-        // Reset the ClassValue memoization cache (BUG-W) for the same reason.
-        cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let __boot_t2 = std::time::Instant::now();
         let bootstrap_phase = bootstrap_phase
@@ -1474,6 +1478,23 @@ impl SharedVm {
                     },
                 );
                 native_methods.set_category(__prev);
+                // The legacy monitor-backed `ReentrantLock` / `Lock` /
+                // `Condition` / `Semaphore` natives.
+                //
+                // Real AQS became the default because the synthetic
+                // lock/condition bridge deadlocks the blocking-queue producer/
+                // consumer pattern, so `register_concurrent_natives` skips them
+                // unless `CRATONVM_SYNTHETIC_AQS=1`. That reasoning is entirely
+                // about real-JDK mode: it needs `AbstractQueuedSynchronizer`
+                // bytecode to defer to. Synthetic mode has none, so the skip
+                // left `new Semaphore(3)` and `new ReentrantLock()` raising
+                // `UnsatisfiedLinkError` — 14 `JucComplete` corpus tests,
+                // invisible for as long as the corpus was dark. Runtime-gated
+                // on `use_synthetic_jdk`, not on the Cargo feature, so a
+                // feature-enabled binary running real-JDK mode is unaffected.
+                cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(
+                    &mut native_methods,
+                );
             } else {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field
@@ -7580,6 +7601,119 @@ impl Vm {
         )
     }
 
+    // ----- Failure diagnostics ----------------------------------------------
+
+    /// Render a thrown `Throwable` as `<binary class name>: <detailMessage>`.
+    ///
+    /// [`MethodCallFailed::ExceptionThrown`] carries only an [`ObjectRef`], so
+    /// its `Debug`/`Display` can print no more than a heap address. That is
+    /// unusable for a caller that has to group hundreds of failures by cause —
+    /// the extended interpreter corpus reported 175 of its 214 failures as an
+    /// undifferentiated `Err(ExceptionThrown(ObjectRef { .. }))` until this
+    /// existed. Resolving the class and the detail message needs the heap and
+    /// the class manager, which only the VM has; hence a method here rather
+    /// than a richer `Display` on the error type.
+    ///
+    /// Best-effort and non-throwing: it reads fields directly instead of
+    /// calling `toString()`, so it cannot recurse into further exceptions and
+    /// is safe to call from a test assertion path. An unresolvable class
+    /// renders as `<unknown class>` and a missing/undecodable message is
+    /// omitted.
+    pub fn describe_exception(&self, obj: ObjectRef) -> String {
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let name = {
+            let cm = self.shared.classes.class_manager.read();
+            cm.get_class(class_id)
+                .map(|c| c.name.replace('/', "."))
+                .unwrap_or_else(|| "<unknown class>".to_string())
+        };
+        match self.exception_detail_message(obj) {
+            Some(msg) => format!("{name}: {msg}"),
+            None => name,
+        }
+    }
+
+    /// Read the detail message off `obj`.
+    ///
+    /// Two layouts have to be handled, which is why this is not a one-line
+    /// field read. Real-JDK `java.lang.Throwable` declares `detailMessage` by
+    /// name, so the hierarchy walk finds it. CratonVM's synthetic
+    /// `java/lang/Throwable` (`class_manager`'s `instance_fields(2)`) names its
+    /// slots `_f0`/`_f1` — message and cause — and real-JDK bootstrap metadata
+    /// can render Throwable's first slots opaquely the same way. For those,
+    /// fall back to scanning the Throwable's own slots for the first value
+    /// that decodes as a `java.lang.String`.
+    ///
+    /// Deliberately does not guess a fixed slot number: the message is slot 0
+    /// in the synthetic layout and slot 1 in the real one (slot 0 there is
+    /// `backtrace`), and picking wrong renders an unrelated object as the
+    /// message. Reading the value and requiring it to be a decodable String
+    /// answers that without encoding either layout.
+    fn exception_detail_message(&self, obj: ObjectRef) -> Option<String> {
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let (named, throwable_slots) = {
+            let cm = self.shared.classes.class_manager.read();
+            let mut walk = Some(class_id);
+            let mut named = None;
+            let mut throwable_slots = None;
+            while let Some(cid) = walk {
+                let Some(cls) = cm.get_class(cid) else { break };
+                let mut instance = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        continue;
+                    }
+                    if &*f.name == "detailMessage" && named.is_none() {
+                        named = Some(cls.first_field_index + instance);
+                    }
+                    instance += 1;
+                }
+                if &*cls.name == "java/lang/Throwable" {
+                    throwable_slots = Some((cls.first_field_index, instance));
+                }
+                walk = cls.superclass;
+            }
+            (named, throwable_slots)
+        };
+
+        let read_string = |index: usize| match self.shared.mem.heap.get_field(obj, index) {
+            Value::Object(Some(s)) => super::vm_object::read_java_string(&self.shared.mem.heap, s),
+            _ => None,
+        };
+
+        if let Some(index) = named {
+            if let Some(text) = read_string(index) {
+                return Some(text);
+            }
+        }
+        let (base, count) = throwable_slots?;
+        (base..base + count).find_map(read_string)
+    }
+
+    /// Render any [`MethodCallFailed`] for a human.
+    ///
+    /// `InternalError` delegates to the error's own `Display` (already
+    /// self-describing); `ExceptionThrown` goes through
+    /// [`Self::describe_exception`] instead of printing a bare pointer.
+    pub fn describe_failure(&self, err: &MethodCallFailed) -> String {
+        match err {
+            MethodCallFailed::InternalError(e) => format!("internal: {e}"),
+            MethodCallFailed::ExceptionThrown(obj) => {
+                format!("threw {}", self.describe_exception(*obj))
+            }
+        }
+    }
+
+    /// Render a whole [`MethodCallResult`] — the shape a test assertion wants
+    /// when the call did not produce what it expected.
+    pub fn describe_result(&self, result: &MethodCallResult) -> String {
+        match result {
+            Ok(Some(v)) => format!("returned {v:?}"),
+            Ok(None) => "returned void".to_string(),
+            Err(e) => self.describe_failure(e),
+        }
+    }
+
     // ----- Finalization (M19) ------------------------------------------------
 
     /// Run pending finalizers: dequeue objects from the finalizer thread and
@@ -7817,6 +7951,28 @@ impl std::fmt::Debug for Vm {
 pub fn release_vm_native_state(vm_identity: usize) {
     cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
     cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
+    // The built-in app/platform `ClassLoader` singletons. Same reasoning as the
+    // SecurityManager row above: raw heap `ObjectRef`s that must not outlive
+    // the heap, and must never be visible to a VM that reuses the identity.
+    cratonvm_native_builtins::classloader::forget_vm_loader_singletons(vm_identity);
+    // The annotation-proxy cache, its per-proxy child roots, and the
+    // last-created-proxy interfaces array. Keyed by `ClassId`, which every VM
+    // mints from zero, so a surviving row is not merely a leak — it is a
+    // wrong-heap hit for the next VM.
+    cratonvm_native_builtins::lang_class::forget_vm_annotation_proxies(vm_identity);
+    // The cached `System.getenv()` map and `System.getProperties()` object.
+    cratonvm_native_builtins::lang_system::forget_vm_system_singletons(vm_identity);
+    // The `java.lang.ClassValue` memoization cache (BUG-W). Its key is a pair
+    // of 32-bit identity hashes, which two live VMs collide on readily.
+    cratonvm_native_builtins::phases_late::forget_vm_classvalue_cache(vm_identity);
+    // Which thread owns each live `ScopedValue` binding.
+    cratonvm_native_builtins::jdk25_concurrency::forget_vm_scoped_value_owners(vm_identity);
+    // The synthetic `ReentrantLock` / `ReentrantReadWriteLock` state tables,
+    // keyed by `(vm_identity, identity_hash)`.
+    cratonvm_native_builtins::forget_vm_lock_state(vm_identity);
+    // The `Class.getName()` / simple / canonical / package name memos, keyed
+    // by `(vm_identity, class_id)`.
+    cratonvm_native_builtins::lang_class::forget_vm_class_name_caches(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the
