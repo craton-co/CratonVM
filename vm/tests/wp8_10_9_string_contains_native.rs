@@ -303,3 +303,46 @@ Intrinsic replaceFirst(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n
 Intrinsic transform(Ljava/util/function/Function;)Ljava/lang/Object;\n\
 Intrinsic valueOf(I)Ljava/lang/String;\n\
 Intrinsic valueOf(Ljava/lang/Object;)Ljava/lang/String;";
+
+
+/// The surviving JIT `StringLatin1.toLowerCase` direct bind is legal only
+/// because that triple is a registered `NativeKind::Intrinsic`. Pin it.
+///
+/// The forced-native `java/lang/String` record asked for BOTH `toLowerCase`
+/// ladders to be deleted. One was: `String.toLowerCase(Ljava/util/Locale;)`
+/// was the third copy of the policy -- `check_override` forced that name, the
+/// warm gate refused it, and the JIT bound it, so one method had three
+/// answers depending on where it was called from.
+///
+/// This one is different in a way that matters and is easy to lose: its triple
+/// really is registered `Intrinsic`, so baking a direct call to it is contract
+/// 1.4's reviewed exception rather than a native shadowing bytecode. It also
+/// accelerates the real `String.toLowerCase(Locale)` bytecode instead of
+/// standing in front of it, and its input is Latin-1 by construction, so it
+/// cannot reach the unpaired-surrogate cases that made the `String`-level
+/// native diverge from HotSpot.
+///
+/// `jit/src/lib.rs` matches that triple by NAME and cannot check its kind. So
+/// re-tagging the native `Bridge` -- including by omission, the ambient
+/// category being what it is -- would silently turn the bind into a 1.4
+/// violation observable ONLY from compiled frames, which is the hardest place
+/// to notice one. This test is the check the JIT cannot make.
+#[test]
+fn the_jit_latin1_lower_ladder_binds_a_reviewed_intrinsic() {
+    let shared = shared();
+    let kind = shared.natives.native_methods.kind_of(
+        "java/lang/StringLatin1",
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+    );
+    assert_eq!(
+        kind,
+        Some(cratonvm_native_api::NativeKind::Intrinsic),
+        "java/lang/StringLatin1.toLowerCase(String,byte[],Locale) is {kind:?}, and \
+         `jit/src/lib.rs` bakes a direct CALL to it by name. Only an `Intrinsic` may stand \
+         in front of concrete bytecode (contract 1.4); as a `Bridge` this bind becomes a \
+         violation that only compiled frames can observe. Either restore the kind or delete \
+         the ladder -- do not leave them disagreeing, which is exactly the state the \
+         forced-native `String` record was filed about."
+    );
+}
