@@ -5742,6 +5742,55 @@ mod tests {
         );
     }
 
+    /// A heap-backed buffer whose `capacity` claims more room than its backing
+    /// array actually has must not report bytes it did not move.
+    ///
+    /// The engine's heap arms used to copy one element at a time and let
+    /// `get_array_element`/`set_array_element`'s own guards drop whatever fell
+    /// past the array end — while still returning the full requested count. The
+    /// read side then padded the tail with zeros and handed them to rustls as
+    /// plaintext; the write side reported `data.len()` bytes produced into a
+    /// buffer that had only taken some of them. Both are silent corruption in
+    /// exactly the direction a caller cannot detect. The bulk intrinsics that
+    /// replaced those loops bounds-check the whole range up front, so the count
+    /// is now the truth. This test injects the overrun the old code hid.
+    #[test]
+    fn bb_heap_arms_report_only_the_bytes_that_fit() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        // 4-byte array, but the buffer's metadata claims 16 bytes of capacity.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        for i in 0..4 {
+            ctx.set_array_element(arr, i, Value::Int((10 + i) as i32));
+        }
+        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8);
+        ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
+        ctx.set_field_by_name(bb, "position", Value::Int(0));
+        ctx.set_field_by_name(bb, "limit", Value::Int(16));
+        ctx.set_field_by_name(bb, "capacity", Value::Int(16));
+        ctx.set_field_by_name(bb, "offset", Value::Int(0));
+
+        let mut out = Vec::new();
+        let n = bb_read_into(&mut ctx, bb, &mut out, 64);
+        assert_eq!(n, 4, "only the 4 real bytes exist; 16 was the buffer's lie");
+        assert_eq!(out, vec![10, 11, 12, 13], "no zero padding past the array");
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position").as_int(),
+            Some(4),
+            "position advances by what was actually read, not by the claim"
+        );
+
+        // Write side: 8 bytes offered into 4 bytes of real room.
+        ctx.set_field_by_name(bb, "position", Value::Int(0));
+        let put = bb_write_from(&mut ctx, bb, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(put, 4, "must report the 4 that landed, not all 8");
+        assert_eq!(ctx.get_array_element(arr, 3).as_int(), Some(4));
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position").as_int(),
+            Some(4),
+            "position advances by the bytes stored"
+        );
+    }
+
     /// A shape we cannot resolve must move zero bytes (and not panic).
     #[test]
     fn bb_view_unresolved_moves_zero_bytes() {
@@ -7558,9 +7607,22 @@ fn bb_bytes_range(
         return Vec::new();
     }
     match v.backing {
-        BbBacking::Heap { arr, off } => (from..to)
-            .map(|i| ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8)
-            .collect(),
+        // PERF (testssl-testpost bulk TLS): one `get_array_element` per BYTE is
+        // a virtual dispatch plus a `Value` box each time, and this is the
+        // engine's application-data path — every byte Tomcat's JSSE connector
+        // wraps or unwraps passes through here, twice (app buffer -> net buffer
+        // and back). `read_byte_array_into` is the same read as a single
+        // `copy_nonoverlapping` against the array payload. It also CLAMPS to the
+        // array length instead of relying on `get_array_element`'s per-element
+        // bounds guard, so a `to` past the array end now shortens the result
+        // (matching what the `Direct` arm already does) rather than padding it
+        // with zeros the caller would treat as real bytes.
+        BbBacking::Heap { arr, off } => {
+            let mut buf = vec![0u8; to - from];
+            let n = ctx.read_byte_array_into(arr, off + from, &mut buf);
+            buf.truncate(n);
+            buf
+        }
         BbBacking::Direct { addr } => {
             let end = to.min(v.cap);
             if end <= from {
@@ -7588,11 +7650,24 @@ fn bb_put_bytes(
     data: &[u8],
 ) -> usize {
     match v.backing {
+        // PERF: the write-side mirror of `bb_bytes_range`'s heap arm — one bulk
+        // copy instead of one virtual `set_array_element` per byte.
+        //
+        // The bulk intrinsic is all-or-nothing on a range that overruns the
+        // array, so clamp to what actually fits and report the clamped count.
+        // The old loop let `set_array_element`'s own guard drop the overrunning
+        // tail and then returned `data.len()` regardless — i.e. it claimed bytes
+        // that were never stored. Clamping keeps the caller making progress (a
+        // 0 return would stall `bb_write_from`'s producer) while the count it
+        // gets back is now true.
         BbBacking::Heap { arr, off } => {
-            for (k, b) in data.iter().enumerate() {
-                ctx.set_array_element(arr, off + at + k, Value::Int(*b as i8 as i32));
+            let start = off + at;
+            let room = ctx.array_length(arr).saturating_sub(start);
+            let n = room.min(data.len());
+            if n == 0 || !ctx.write_byte_array_from(arr, start, &data[..n]) {
+                return 0;
             }
-            data.len()
+            n
         }
         BbBacking::Direct { addr } => {
             let end = (at + data.len()).min(v.cap);

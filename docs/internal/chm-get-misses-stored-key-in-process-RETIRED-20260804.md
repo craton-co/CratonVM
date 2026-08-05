@@ -212,6 +212,17 @@ Earlier, on Azure release builds at the branch point,
 `wp4_6_chm_basic --include-ignored` was 6/6 with committed fixtures and 6/6
 with `build.rs`-compiled ones.
 
+**Not confirmed: the release profile on the FINAL code.** The Azure box became
+unusable partway through (sshd timing out during banner exchange under load,
+then dropping every session long enough to build; with no other login session
+open, `systemd-logind` SIGTERMs any detached build the moment ssh exits). The
+6/6 release runs above predate the two follow-up corrections to this change —
+the element-vs-unit span and the `ObjectKind::Array` guard — so everything
+measured on the final tree is debug-profile. Nothing here is profile-sensitive
+in principle (no JIT surface, no timing), but that is an argument, not a
+measurement. Re-run `cargo test --release -p cratonvm-vm --lib --test
+wp4_6_chm_basic` on a working Linux host to close it.
+
 ## What to carry forward
 
 * **A comparator that cannot read its operands must say so.** `Option<bool>`

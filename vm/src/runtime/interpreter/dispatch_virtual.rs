@@ -2753,11 +2753,12 @@ pub(super) fn execute_invokevirtual_cached(
                 frame_idx,
                 thread,
             )?;
-            invoke_cached_native_callback(
+            invoke_cached_native_callback_leaf_aware(
                 shared,
                 thread,
                 frame_idx,
                 callback,
+                native_id,
                 &args,
                 &method_descriptor,
             )?;

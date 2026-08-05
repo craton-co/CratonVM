@@ -127,7 +127,7 @@ whatever `CycleBreaker` is doing for this particular flush.
 
 This repo has one directly analogous, previously-diagnosed bug in the same
 package family:
-[`hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md`](../../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md),
+[`hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md`](../../hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md),
 where a dispatch-heavy loop over many distinct, moderately-called methods hit
 CratonVM's per-call JIT tier-up tax and was **~3-4x faster under `--nojit`**.
 Given `CycleBreaker`'s DFS also fans out across several distinct methods

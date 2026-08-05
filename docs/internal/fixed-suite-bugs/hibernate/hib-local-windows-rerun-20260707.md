@@ -95,7 +95,7 @@ bug (below) during fixture setup. `rerun.sh`'s status computation doesn't check
   → later evolved through a dispatch-heavy timeout and a
   `DomainParameterXref`/`LinkedHashMap.removeEldestEntry` NSME. Both follow-up
   notes are now retired after the 2026-07-08 Azure `dev` recheck: see
-  [hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md](../hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md)
+  [hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md](../../hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md)
   and
   [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](../hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md).
 - **`type.temporal.LocalDateTimeTest` / `OffsetTimeTest`**: the 2026-07-05

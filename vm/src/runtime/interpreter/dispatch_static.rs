@@ -1270,11 +1270,12 @@ pub(super) fn execute_invokestatic_cached(
                 frame_idx,
                 thread,
             )?;
-            invoke_cached_native_callback(
+            invoke_cached_native_callback_leaf_aware(
                 shared,
                 thread,
                 frame_idx,
                 callback,
+                native_id,
                 &args,
                 &method_descriptor,
             )?;
@@ -1303,8 +1304,15 @@ pub(super) fn execute_invokestatic_cached(
             // `safe_native_call` (arg pinning, panic catch, JNI exception
             // drain), and `AbstractQueuedSynchronizer.acquire` spins up to 255
             // rounds before it parks, so that overhead lands on every lock and
-            // condition handoff in the VM — see
-            // `docs/known-issues/vm/aqs-thread-handoff-latency-20260803.md`.
+            // condition handoff in the VM.
+            //
+            // The "255 spin rounds" rationale is the ORIGINAL one and it did
+            // not survive: measuring the *uncontended* path — which never
+            // spins — showed the same cost, so the spin was never the story
+            // (`docs/known-issues/vm/uncontended-reentrantlock-pair-is-mostly-unattributed-20260805.md`).
+            // The change is kept because the narrower reason is still true:
+            // this call site's whole body is empty, so any dispatch cost at
+            // all is pure waste.
             //
             // There is nothing to pop (no params, no receiver) and nothing to
             // push (`()V`), so the entire call is the hint below plus the pc

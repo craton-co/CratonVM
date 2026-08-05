@@ -1010,6 +1010,17 @@ pub enum RuntimeError {
     #[error("MatchException: {message}")]
     MatchException { message: String },
 
+    /// `java.util.regex.PatternSyntaxException` — a regular expression did not
+    /// compile. A subclass of `IllegalArgumentException`, but it must be thrown
+    /// as the concrete type: validation code catches it specifically, and the
+    /// alternative a native has when its own engine rejects a pattern is to
+    /// fall back to a *literal* match and return a plausible wrong answer.
+    /// That is exactly what `String.matches` / `replaceAll` / `replaceFirst`
+    /// did until 2026-08-04 — `"Hello, World".matches("[")` returned `false`
+    /// where HotSpot throws.
+    #[error("PatternSyntaxException: {message}")]
+    PatternSyntaxException { message: String },
+
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
 }
