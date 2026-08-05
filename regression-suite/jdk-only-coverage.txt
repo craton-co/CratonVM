@@ -128,6 +128,39 @@ Recorded here so nobody reads a green run as blanket closure.
   P2 "Headful AWT"
       Out of scope by closure rule 5 (headless).
 
+Covered OUTSIDE this corpus, by the strict-corpus probe gate
+-----------------------------------------------------------
+scripts/jdk-only-strict-probes.sh runs probes/JdkOnly*Probe on three arms —
+real HotSpot, `--real-jdk`, `--jdk-only` — against one image and one set of
+class files, and diffs the two CratonVM transcripts against the HotSpot one.
+It is a different instrument from this suite and answers a different question:
+this suite asserts invariants a vector states about itself, the gate asserts
+that CratonVM's whole transcript is what HotSpot printed. A wrong VALUE that
+still satisfies every assertion — `FileChannel.size()` returning 0, a provider
+list with an extra entry — is invisible here and loud there.
+
+It also carries the two fixtures a determinism-bound suite cannot ship, which
+is what closes limitation 1 below and covers surfaces no vector reaches:
+
+  * probes/jdkonly_jni_probe.c, BUILT AT RUN TIME by the gate against
+    $JAVA_HOME/include, so there is no committed per-platform binary to go
+    stale. Eight families: the primitive/long/double call ABI, string
+    conversion, primitive-array commit-vs-abort, object arrays, field access,
+    a native->Java upcall, ThrowNew propagation, and one method bound by
+    JNI_OnLoad/RegisterNatives whose C symbol is DELIBERATELY unrelated to its
+    Java name, so a VM that only resolves by mangled symbol fails that one and
+    nothing else.
+  * probes/JdkOnlyProbeAgent.java, jarred with a Premain-Class manifest and
+    passed as `-javaagent:` to all three arms. It records whether premain ran,
+    whether its ClassFileTransformer saw the probe's own main class being
+    defined, and whether retransformation is supported.
+
+  Also covered there and NOWHERE in this corpus: virtual threads (grep confirms
+  no RJdk* vector names ofVirtual/startVirtualThread/isVirtual),
+  ProcessBuilder's redirect surface as VALUES rather than shapes, and a PKCS12
+  keystore round-trip. Both of the last two found open defects on their first
+  run — see docs/known-issues/vm/.
+
 Known limitations of the corpus itself
 --------------------------------------
 These are honest gaps, not oversights. Do not paper over them.
@@ -139,9 +172,12 @@ These are honest gaps, not oversights. Do not paper over them.
    argument checks). It does NOT ship a hand-written .so/.dll exercising
    RegisterNatives, local/global references, thread attach/detach or critical
    arrays: this suite has no C toolchain step, and a compiled artefact would be
-   per-platform, which is exactly the nondeterminism the suite forbids. Closing
-   the "JNI and native binding" row fully needs a separate, toolchain-aware
-   fixture outside regression-suite/.
+   per-platform, which is exactly the nondeterminism the suite forbids.
+   RESOLVED OUTSIDE THIS SUITE, 2026-08-05: the toolchain-aware fixture this
+   paragraph asks for is probes/jdkonly_jni_probe.c, compiled per run by
+   scripts/jdk-only-strict-probes.sh — see the section above. The limitation
+   stands for `regression-suite/` itself and always will; the row is no longer
+   uncovered by the project.
 
 2. Named-module launch (-m <module>/<class>).
    RJdkModule resolves a real named module with --module-path + --add-modules
