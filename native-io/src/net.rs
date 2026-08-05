@@ -1687,6 +1687,18 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // The guard's scope now ends before any call that can re-enter the
     // registry. Cloning the handle first is cheap: every variant is an `Arc`
     // or a unit.
+    //
+    // FOUND TWICE, INDEPENDENTLY, THE SAME DAY, with the same mechanism and the
+    // same fix. The other diagnosis came from the VM's own watchdog rather than
+    // gdb — `--stack-dump-on-timeout=45` inside `timeout 90`, 6 hangs in 25
+    // runs, all six frame dumps identical (accept thread last in `Net.poll`,
+    // main thread last in `Net.socket0`) — and it carries the A/B this comment
+    // does not: 12 interleaved waves of 10 concurrent probes, **44/120 hangs
+    // before, 0/120 after**. It also establishes that THIS FIX ALONE IS NOT
+    // SUFFICIENT: with only the guard release, the same harness still scored
+    // 10/60. What reaches zero is this plus the EINTR arm in `net_poll_raw`
+    // below, which landed separately on 2026-08-02 for an unrelated symptom.
+    // See docs/known-issues/bounded-socket-operations-hang-about-one-run-in-five.md.
     let target = {
         let map = net_sockets().read();
         match map.get(&fd) {
@@ -3037,7 +3049,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         r.register(cls, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
         r.register(cls, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     }
-    r.register(
+    r.register_with_kind(
         "sun/nio/ch/SocketDispatcher",
         "close0",
         "(I)V",
@@ -3047,6 +3059,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             }
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     r.register(
         "sun/nio/ch/SocketDispatcher",
@@ -3260,31 +3273,67 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // registries and FileDescriptorTable-owned DatagramSockets, keeping
         // the capability probe and each getter/setter aligned with the actual
         // socket on which Java requested the option.
-        r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
+        r.register_with_kind(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
-        });
+        }, NativeKind::Bridge);
         // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
         // is plain Java returning true — so unlike the keepalive family below these
         // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
         // They used to accept the request and drop it on the floor.
-        r.register(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
+        r.register_with_kind(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
             #[cfg(target_os = "windows")]
             { return Ok(Some(Value::Int(i32::from(win_ext_opt_get(ctx, args, ExtOpt::DontFragment)? != 0)))); }
             #[cfg(not(target_os = "windows"))]
             { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        });
-        r.register(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
+        }, NativeKind::Bridge);
+        r.register_with_kind(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
             #[cfg(target_os = "windows")]
             { win_ext_opt_set(ctx, args, ExtOpt::DontFragment)?; return Ok(None); }
             #[cfg(not(target_os = "windows"))]
             { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        });
-        r.register(wso, "getTcpKeepAliveProbes0", "(I)I", windows_keepalive_get_probes);
-        r.register(wso, "getTcpKeepAliveTime0", "(I)I", windows_keepalive_get_time);
-        r.register(wso, "getTcpKeepAliveIntvl0", "(I)I", windows_keepalive_get_intvl);
-        r.register(wso, "setTcpKeepAliveProbes0", "(II)V", windows_keepalive_set_probes);
-        r.register(wso, "setTcpKeepAliveTime0", "(II)V", windows_keepalive_set_time);
-        r.register(wso, "setTcpKeepAliveIntvl0", "(II)V", windows_keepalive_set_intvl);
+        }, NativeKind::Bridge);
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveProbes0",
+            "(I)I",
+            windows_keepalive_get_probes,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveTime0",
+            "(I)I",
+            windows_keepalive_get_time,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "getTcpKeepAliveIntvl0",
+            "(I)I",
+            windows_keepalive_get_intvl,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveProbes0",
+            "(II)V",
+            windows_keepalive_set_probes,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveTime0",
+            "(II)V",
+            windows_keepalive_set_time,
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setTcpKeepAliveIntvl0",
+            "(II)V",
+            windows_keepalive_set_intvl,
+            NativeKind::Bridge,
+        );
     }
 
     // Linux analogue of the `WindowsSocketOptions` block above (HIB-linux

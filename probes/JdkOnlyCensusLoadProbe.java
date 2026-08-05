@@ -216,7 +216,14 @@ public class JdkOnlyCensusLoadProbe {
                  InputStream in = openWithTimeout(cc, port)) {
                 byte[] b = new byte[8];
                 int n = in.read(b);
-                System.out.println("net port=" + port + " read=" + n
+                // The port is EPHEMERAL and must not be printed: it differs
+                // between every pair of runs, so a transcript carrying it can
+                // never be diffed against a control. This line read `port=` +
+                // the number until 2026-08-05, which is why this probe was
+                // believed byte-identical to HotSpot while diffing on every
+                // single run. Assert its shape instead.
+                System.out.println("net portAssigned=" + (port > 0 && port <= 65535)
+                        + " read=" + n
                         + " local=" + InetAddress.getLoopbackAddress().getHostAddress());
             }
             t.join(2000);

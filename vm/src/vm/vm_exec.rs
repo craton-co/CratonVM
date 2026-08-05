@@ -18557,7 +18557,22 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             _ => {}
         }
     }
-    // Element not found вЂ” return null/default.
+    // Element not found — return null/default. This is the last stop for every
+    // "annotation member reads back as null" report (Byte Buddy's
+    // `AnnotationDescription$ForLoadedAnnotation.getValue` NPEs on it, Spring's
+    // `AnnotationsScanner` treats the annotation as absent), so name the
+    // annotation and the member when the dispatch trace is on.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() {
+        let type_desc = match shared.mem.heap.get_field(proxy, 0) {
+            Value::Object(Some(s)) => {
+                super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        eprintln!(
+            "[ANN-PROXY-MISS] type={type_desc} member={method_name} elements={n} -> null"
+        );
+    }
     Ok(Some(Value::Object(None)))
 }
 

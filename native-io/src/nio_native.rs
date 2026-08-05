@@ -28,7 +28,7 @@
 //!     IOException.
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -858,17 +858,53 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 // state their kind at their own call sites (L5, 2026-08-05); the block below is
 // split so that statement is true per row rather than per function.
 //
-// The other 53 keep the ambient category. Registering the same natives under
-// all three platform class names is deliberate robustness, but only one of the
-// three is ever the ACC_NATIVE declarer on a given image, so the other two are
-// not adjudicated by a census taken on this one. Per-row table and the
-// descriptor mismatches it turned up:
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// CORRECTED 2026-08-05 by a second census taken against a **Windows** JDK
+// 25.0.4+7 image (CratonVM adjudicates an image it cannot run on, so this is
+// one command, not a Windows machine). L5 assumed the two non-Unix spellings
+// were "the same natives on their own image" and left them inherited. Two
+// thirds of that was wrong:
+//
+//   * `sun/nio/ch/FileDispatcherImpl` is the leaf on BOTH images. On Windows it
+//     declares the syscall surface itself (22 ACC_NATIVE methods); on Linux it
+//     inherits it from `UnixFileDispatcherImpl`. Either way it is an
+//     ACC_NATIVE target, so it states its kind.
+//   * `sun/nio/ch/WindowsFileDispatcherImpl` **exists on neither image.** The
+//     Windows JDK calls its class `FileDispatcherImpl` too. All 28 rows under
+//     that spelling are dead on every JDK 25 platform — they are not stated,
+//     and they are deletion candidates for the stub-removal wave.
+//
+// Per-row table: docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+/// The leaf dispatcher class, present on every JDK 25 image.
+pub(crate) const FD_LEAF: &str = "sun/nio/ch/FileDispatcherImpl";
+/// The Unix-image declarer. Absent from a Windows image.
+pub(crate) const FD_UNIX: &str = "sun/nio/ch/UnixFileDispatcherImpl";
+/// A spelling no JDK 25 image has, kept only because a future JDK might.
+pub(crate) const FD_WINDOWS: &str = "sun/nio/ch/WindowsFileDispatcherImpl";
+
+/// Register one dispatcher native under all three platform spellings, stating
+/// `NativeKind::Bridge` on exactly the ones `backed` names — the spellings a
+/// JDK 25 image declares that method `ACC_NATIVE` on. The others keep the
+/// ambient category, so the census can go on reporting them as unadjudicated.
+pub(crate) fn register_fd_native(
+    r: &mut NativeMethodRegistry,
+    name: &str,
+    desc: &str,
+    cb: NativeCallback,
+    backed: &[&str],
+) {
+    for cls in [FD_LEAF, FD_UNIX, FD_WINDOWS] {
+        if backed.contains(&cls) {
+            r.register_with_kind(cls, name, desc, cb, NativeKind::Bridge);
+        } else {
+            r.register(cls, name, desc, cb);
+        }
+    }
+}
+
 /// Register `sun/nio/ch/*` natives for real-JDK boot. Idempotent: the
 /// registry's `register` replaces a previous entry at the same key,
 /// so it's safe to call after other NIO-related registrars.
 pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
-    use cratonvm_native_api::NativeKind;
     let __prev_cat = r.current_category();
     r.set_category(NativeKind::Bridge);
     // --- FileDispatcherImpl (Unix class name; Windows uses
@@ -876,14 +912,18 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // parent class or in a companion). Register on all three names
     // for robustness — the registry lookup uses (class, name, desc). ---
     // Which of the three names actually declares these natives is decided by
-    // the image, not by this file, and the census (JDK 25, Linux, 2026-08-05)
-    // says: `UnixFileDispatcherImpl` declares 14 of them ACC_NATIVE;
-    // `FileDispatcherImpl` (`extends UnixFileDispatcherImpl` on this image)
-    // declares only `init0` itself and inherits the rest;
-    // `WindowsFileDispatcherImpl` is absent from a Unix image altogether. So
-    // the 14 are stated `Bridge` on the class that declares them, and the same
-    // 14 are still registered under the other two names — those rows are
-    // robustness aliases, not adjudicated bridges, and stay ambient.
+    // the image, not by this file. Measured against JDK 25.0.4+7 for
+    // linux-x64 AND windows-x64 (2026-08-05):
+    //
+    //   `UnixFileDispatcherImpl`     linux only   — declares 17 ACC_NATIVE
+    //   `FileDispatcherImpl`         both images  — inherits them on linux,
+    //                                               declares 22 on windows
+    //   `WindowsFileDispatcherImpl`  NEITHER      — the Windows JDK names its
+    //                                               class `FileDispatcherImpl`
+    //
+    // So `backed` below is the list of spellings some JDK 25 image declares
+    // that method `ACC_NATIVE` on; those state their kind, the rest stay
+    // ambient. Registering all three is still deliberate robustness.
     const FD_ACC_NATIVE: &[(&str, &str, NativeCallback)] = &[
         ("read0", "(Ljava/io/FileDescriptor;JI)I", native_fd_read0),
         ("pread0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pread0),
@@ -931,24 +971,17 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
             native_fd_setdirect0,
         ),
     ];
-    const FD_DECLARER: &str = "sun/nio/ch/UnixFileDispatcherImpl";
-    const FD_ALIASES: [&str; 2] = [
-        "sun/nio/ch/FileDispatcherImpl",
-        "sun/nio/ch/WindowsFileDispatcherImpl",
-    ];
-
+    // Both real spellings back every entry of `FD_ACC_NATIVE`.
     for (name, desc, cb) in FD_ACC_NATIVE {
-        r.register_with_kind(FD_DECLARER, name, desc, *cb, NativeKind::Bridge);
+        register_fd_native(r, name, desc, *cb, &[FD_LEAF, FD_UNIX]);
     }
-    for cls in FD_ALIASES {
-        for (name, desc, cb) in FD_ACC_NATIVE {
-            r.register(cls, name, desc, *cb);
-        }
-    }
-    for cls in [FD_DECLARER, FD_ALIASES[0], FD_ALIASES[1]] {
-        for (name, desc, cb) in FD_UNADJUDICATED {
-            r.register(cls, name, desc, *cb);
-        }
+    // Of the rest, only the Windows leaf declares anything: `preClose0` is
+    // nowhere, and the other five are the Windows signatures (`setDirect0`
+    // really does take a `CharBuffer` there; on Unix it takes only the
+    // descriptor — see `register_nio_setdirect_unix` below).
+    for (name, desc, cb) in FD_UNADJUDICATED {
+        let backed: &[&str] = if *name == "preClose0" { &[] } else { &[FD_LEAF] };
+        register_fd_native(r, name, desc, *cb, backed);
     }
     // Real JDK 25 declares `FileDispatcherImpl.init0()` (confirmed via javap),
     // not `init()` -- that name doesn't exist on this class at all. The
@@ -956,18 +989,29 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // unregistered, so any bytecode path that loads `FileDispatcherImpl` (e.g.
     // `ManagementFactory.getPlatformMBeanServer()` on Linux) hit
     // `UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.init0()V`. This is
-    // the one native the leaf class declares itself; the other two names
-    // inherit or lack it, so only the leaf states its kind.
+    // the one native the leaf class declares itself on Linux; `init0` is not
+    // on `UnixFileDispatcherImpl` and `WindowsFileDispatcherImpl` does not
+    // exist, so only the leaf states its kind.
+    register_fd_native(r, "init0", "()V", native_nt_init, &[FD_LEAF]);
+    // `setDirect0` on a Unix image takes ONLY the descriptor — the
+    // `CharBuffer` overload registered above is the Windows signature. Without
+    // this entry `UnixFileDispatcherImpl.setDirect0(fd)` is unregistered, so
+    // `FileChannel.open(.., ExtendedOpenOption.DIRECT)` reaches
+    // `setDirectIO` and dies on `UnsatisfiedLinkError` instead of being told
+    // direct I/O is unavailable. `-1` is that answer, and it is what the
+    // existing handler returns.
+    // Registered ONLY on the declarer. `setDirectIO` issues an `invokestatic`
+    // against `UnixFileDispatcherImpl`, so that is the one binding that can be
+    // reached — and adding the leaf spelling would put a row in the census that
+    // the (single-class) image adjudication scores as an unbacked `Bridge`,
+    // which is precisely what L6's ratchet exists to refuse.
     r.register_with_kind(
-        "sun/nio/ch/FileDispatcherImpl",
-        "init0",
-        "()V",
-        native_nt_init,
+        FD_UNIX,
+        "setDirect0",
+        "(Ljava/io/FileDescriptor;)I",
+        native_fd_setdirect0,
         NativeKind::Bridge,
     );
-    for cls in [FD_DECLARER, FD_ALIASES[1]] {
-        r.register(cls, "init0", "()V", native_nt_init);
-    }
 
     r.register_with_kind(
         "java/io/FileCleanable",
