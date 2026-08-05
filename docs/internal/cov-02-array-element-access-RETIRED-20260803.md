@@ -4,7 +4,7 @@
 `IrBuilder::build` arm and a lowering, and the measured refusal count for all
 seven is **zero**. The brief this replaces was
 `docs/known-issues/c2/cov-02-array-element-access.md`, now archived at
-`docs/known-issues/c2/archive/cov-02-array-element-access.md`.
+`../known-issues/c2/cov-02-array-element-access.md`.
 
 ## What the lane claimed, and what was true
 

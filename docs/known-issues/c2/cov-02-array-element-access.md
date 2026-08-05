@@ -2,8 +2,8 @@
 
 **Status:** not started. **Independent of every other lane.**
 **Owns:** the `0x2e` / `0x32` / `0x33` / `0x34` / `0x54` / `0x5a` / `0xbe` arms
-of `IrBuilder::build`'s opcode match in `jit/src/ir.rs`, and their lowering in
-`jit/src/ir_lower.rs`. It does **not** own the existing `0x30` / `0x31` /
+of `IrBuilder::build`'s opcode match in `../../../jit/src/ir.rs`, and their lowering in
+`../../../jit/src/ir_lower.rs`. It does **not** own the existing `0x30` / `0x31` /
 `0x51` / `0x52` arms except to read them.
 
 ## The finding
@@ -57,9 +57,9 @@ Say the answers out loud in the PR, because the single-pass backend answers
 all three and any divergence is a wrong-code bug rather than a slow one:
 
 1. **The bounds check.** Does the IR path emit one, and if a `cov-*` lane
-   later wants it elided, what proves the index in range? `jit/src/x64/bce.rs`
+   later wants it elided, what proves the index in range? `../../../jit/src/x64/bce.rs`
    is the single-pass answer and is not reusable as-is.
-2. **The null check.** Same question, and `jit/src/x64/null_check_elim.rs` is
+2. **The null check.** Same question, and `../../../jit/src/x64/null_check_elim.rs` is
    the single-pass dataflow.
 3. **`aaload` is a reference load.** The result is a root at every safepoint
    after it. `aastore` is deliberately *not* in this lane's scope for the
@@ -71,7 +71,7 @@ all three and any divergence is a wrong-code bug rather than a slow one:
 * `CRATONVM_DBG=ir-compiles` before/after on `AutoConfigurationSorterTests`
   (43 of the 77 events are there): `no lowering for opcode 0xbe` to zero,
   `optimizing backend produced a body` up.
-* `jit/tests/ir_vs_singlepass.rs` gains a case per arm — same method, both
+* `../../../jit/tests/ir_vs_singlepass.rs` gains a case per arm — same method, both
   backends, same answer, **including the exception cases**: a negative index,
   an index at `length`, and a null array must produce the same exception with
   the same bci from both backends.
@@ -92,7 +92,7 @@ than leaving the next reader to infer it from an absence.
 
 ## Ownership note
 
-Shares `jit/src/ir.rs`'s opcode match with `cov-01`, `cov-03` and `cov-04`.
+Shares `../../../jit/src/ir.rs`'s opcode match with `cov-01`, `cov-03` and `cov-04`.
 Disjoint arms, one 365 KB file — rebase daily, land increments.
 
 Both this lane and `cov-04` **closed 2026-08-03**, in that order. Measured on

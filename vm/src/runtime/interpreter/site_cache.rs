@@ -67,6 +67,21 @@ const SLOTS: usize = 1024;
 struct Site<T> {
     class_id: ClassId,
     cp_index: u16,
+    /// The two epochs as of the resolution that produced `value`. Held
+    /// **per entry** rather than once for the whole table.
+    ///
+    /// The obvious design — one epoch pair on the table, wiped when either
+    /// moves — is a performance trap, and a measured one. `class_definition_epoch`
+    /// advances on *every class definition*, so during VM start-up and any
+    /// class-loading burst it moves constantly; a table-wide wipe then walks all
+    /// [`SLOTS`] entries on nearly every field access. Six regression vectors
+    /// that never reach steady state (~500 ms each, dominated by boot) were
+    /// uniformly SLOWER with the cache on, which is what exposed it.
+    ///
+    /// Per-entry epochs make an epoch change cost nothing: stale entries simply
+    /// miss, one at a time, and are replaced in place. The comparison is two
+    /// `u64`s already on the same cache line as the tag.
+    epochs: (u64, u64),
     value: T,
 }
 
@@ -78,19 +93,11 @@ struct Site<T> {
 pub struct SiteCache<T> {
     /// Lazily allocated. `None` in a slot means empty.
     slots: Option<Box<[Option<Site<T>>]>>,
-    /// `class_definition_epoch()` as of the last revalidation.
-    epoch: u64,
-    /// `resolution_epoch()` as of the last revalidation.
-    resolution_epoch: u64,
 }
 
 impl<T> SiteCache<T> {
     pub fn new() -> Self {
-        Self {
-            slots: None,
-            epoch: 0,
-            resolution_epoch: 0,
-        }
+        Self { slots: None }
     }
 
     /// Direct-mapped slot index. Fibonacci-hash the pair and take the HIGH
@@ -112,28 +119,14 @@ impl<T> SiteCache<T> {
         )
     }
 
-    /// Revalidate against the three global signals, wiping the table if any
-    /// moved. Returns `false` when the cache must not be used at all.
-    #[inline]
-    fn revalidate(&mut self) -> bool {
-        if cratonvm_classloading::any_class_redefined() {
-            // Latched off for the rest of the process — release the memory too.
-            self.slots = None;
-            return false;
-        }
-        let (now, now_res) = Self::epochs_now();
-        if now != self.epoch || now_res != self.resolution_epoch {
-            self.epoch = now;
-            self.resolution_epoch = now_res;
-            self.clear();
-        }
-        true
-    }
-
     /// Look up a site. Returns a borrow so the caller clones only what it needs.
+    ///
+    /// Every check here is O(1): the redefine latch, one array index, and four
+    /// integer compares against the entry's own tag and epochs. Nothing scans
+    /// or clears the table — see [`Site::epochs`] for why that matters.
     #[inline]
     pub fn get(&mut self, class_id: ClassId, cp_index: u16) -> Option<&T> {
-        if !self.revalidate() {
+        if cratonvm_classloading::any_class_redefined() {
             return None;
         }
         let idx = Self::slot_of(class_id, cp_index);
@@ -141,11 +134,13 @@ impl<T> SiteCache<T> {
         // BOTH halves of the key, always. A direct-mapped table with a partial
         // tag check answers one site with another site's value, and every
         // consumer here treats that answer as authoritative.
-        if site.class_id == class_id && site.cp_index == cp_index {
-            Some(&site.value)
-        } else {
-            None
+        if site.class_id != class_id || site.cp_index != cp_index {
+            return None;
         }
+        if site.epochs != Self::epochs_now() {
+            return None;
+        }
+        Some(&site.value)
     }
 
     /// Publish a resolved site.
@@ -154,15 +149,16 @@ impl<T> SiteCache<T> {
     /// the resolution that produced `value`. If either counter has moved since,
     /// the answer may already describe superseded state, so the insert is
     /// dropped rather than published: this thread would otherwise serve a stale
-    /// answer for as long as the epochs then stayed put. Snapshotting at insert
-    /// time instead would swallow exactly that race.
+    /// answer until the epochs next moved. Snapshotting at insert time instead
+    /// would swallow exactly that race.
     #[inline]
     pub fn put(&mut self, class_id: ClassId, cp_index: u16, epochs_at_entry: (u64, u64), value: T) {
-        if !self.revalidate() {
+        if cratonvm_classloading::any_class_redefined() {
+            // Latched off for the rest of the process — release the memory too.
+            self.slots = None;
             return;
         }
-        // `revalidate` has just set both fields to the live values.
-        if epochs_at_entry != (self.epoch, self.resolution_epoch) {
+        if epochs_at_entry != Self::epochs_now() {
             return;
         }
         let idx = Self::slot_of(class_id, cp_index);
@@ -172,6 +168,7 @@ impl<T> SiteCache<T> {
         slots[idx] = Some(Site {
             class_id,
             cp_index,
+            epochs: epochs_at_entry,
             value,
         });
     }
@@ -202,13 +199,7 @@ impl<T> Default for SiteCache<T> {
 
 impl<T> std::fmt::Debug for SiteCache<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SiteCache({} live, epoch={}/{})",
-            self.live(),
-            self.epoch,
-            self.resolution_epoch
-        )
+        write!(f, "SiteCache({} slots filled)", self.live())
     }
 }
 

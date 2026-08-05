@@ -3,14 +3,17 @@
 **Status:** OPEN (2026-07-23; re-diagnosed 2026-07-28). Not closable by
 incremental tuning — see "What closure actually requires".
 
-**2026-08-04 note:** this same test method also hits a *different*, fatal
-symptom on current dev — a stale-pointer receiver crash that kills the whole
-suite process, unrelated to the throughput gap this doc tracks. See
-[`smoketests-stale-pointer-nosuchmethod-crash-20260804.md`](smoketests-stale-pointer-nosuchmethod-crash-20260804.md)
-(a witness of the already-tracked, still-open DoHead Layer-1 register-invisible-root
-family, not a new mechanism). Do not conflate the two when triaging future
-`SmokeTests` failures: this doc is throughput (120s timeout under load), the
-other is a one-shot fatal crash from GC/JIT root-precision.
+**2026-08-04 note:** this same test method produced a one-shot fatal
+stale-receiver crash in a single run, unrelated to the throughput gap this doc
+tracks. That page is now retired — see
+[`../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md):
+its DoHead Layer-1 attribution is refuted by its own log, the blocked-thread
+root path it actually names is now checked in the cycle that would break it,
+and the generic stale-address family it belongs to lives on
+[`../h2/bug-h2-classid0-stale-address-family.md`](../h2/bug-h2-classid0-stale-address-family.md).
+Do not conflate the two when triaging future `SmokeTests` failures: THIS doc is
+the throughput failure (120 s timeout under load), and it is what all 30 of that
+page's re-runs actually hit, on dev tip and on the crashing build alike.
 
 `org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency` runs 50 forks x
 400 iterations (20 000 transactions, 3 HQL queries each) on a 5-thread pool. It

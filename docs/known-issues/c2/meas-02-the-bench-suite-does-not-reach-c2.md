@@ -1,8 +1,8 @@
 # MEAS-02 — the CPU benchmark suite issues seven C2 requests and gets two bodies
 
 **Status:** not started. **Blocks nothing; invalidates a lot.**
-**Owns:** `regression-suite/perf/` (the gate, its baseline TSV and its phase
-list) and `bench/`. Not `jit/`.
+**Owns:** `../../../regression-suite/perf` (the gate, its baseline TSV and its phase
+list) and `../../../bench`. Not `../../../jit`.
 
 ## The measurement
 

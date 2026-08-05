@@ -1,7 +1,7 @@
 # MEAS-02 — the bench suite does not reach C2 — RETIRED 2026-08-03
 
 The brief is at
-[`docs/known-issues/c2/archive/meas-02-the-bench-suite-does-not-reach-c2.md`](../known-issues/c2/archive/meas-02-the-bench-suite-does-not-reach-c2.md).
+[`../known-issues/c2/meas-02-the-bench-suite-does-not-reach-c2.md`](../known-issues/c2/meas-02-the-bench-suite-does-not-reach-c2.md).
 It owned `regression-suite/perf/` and `bench/`, and it asked for three things:
 record the optimizing tier's reach in the gate's own results, add a C2-reach
 column to the coverage survey, and characterise one candidate workload —
