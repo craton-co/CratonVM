@@ -7405,6 +7405,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let our_weak = Arc::downgrade(&shared);
         set_process_vm(&shared);
 
         let _raw = attach_foreign_thread(&shared, false, None);
@@ -7415,6 +7416,16 @@ mod tests {
         });
         let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
+
+        // `ForeignCallGuard::enter` resolves the process-global cell (see its
+        // `process_vm()` call), which `PROCESS_VM_TEST_LOCK` does not protect --
+        // `Vm::new` republishes it from test sites that never take this lock.
+        // A theft here sends the blocked-region LEAVE to another VM's barrier
+        // and ours stays at 1: `left: 1, right: 0` on "outermost call must
+        // leave the blocked region", 1 of 30 full-suite runs.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
 
         {
             // Outermost call → leave blocked region, counted mutator.
