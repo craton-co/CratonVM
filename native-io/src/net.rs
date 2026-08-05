@@ -1663,16 +1663,48 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("poll: FileDescriptor has no fd id"))?;
-    let stream = {
+    // Classify under the read lock, then RELEASE it before doing anything that
+    // waits. `return net_poll_listener(...)` from inside the guard's scope
+    // evaluates the call FIRST and drops `map` only afterwards, so the listener
+    // park ran for its whole timeout while still holding a read guard on
+    // `net_sockets()` — and `net_poll_listener`'s loop re-acquires that same
+    // `RwLock` on every slice via `net_listener_still_registered`.
+    //
+    // `parking_lot::RwLock` is writer-preferring: once a writer is queued, a
+    // new `read()` blocks. So a concurrent `Net.socket0` (which takes the write
+    // lock through `register_handle`) queues behind this thread's outstanding
+    // read guard, and this thread's NEXT read blocks behind that writer. Same
+    // thread, two read guards, a writer in between: nothing can make progress
+    // and the deadline in the loop is never reached, so a bound of 4 seconds
+    // becomes forever.
+    //
+    // That is [`docs/known-issues/bounded-socket-operations-hang-about-one-run-in-five.md`],
+    // reproduced 6 times in 25 runs, and the watchdog frame dump was identical
+    // in all six: accept thread last in `Net.poll` -> the park, main thread last
+    // in `Net.socket()` -> `Net.socket0`. It needs `socket0` to land in the
+    // window between the two reads, which is why it is intermittent rather than
+    // constant, and why it does not depend on the socket timeout being wrong.
+    enum PollTarget {
+        Stream(Arc<TcpStream>),
+        Listener(Arc<Mutex<TcpListener>>),
+        Neither,
+    }
+    let target = {
         let map = net_sockets().read();
         match map.get(&fd) {
-            Some(NetSocketHandle::Stream(stream)) => Arc::clone(stream),
+            Some(NetSocketHandle::Stream(stream)) => PollTarget::Stream(Arc::clone(stream)),
             Some(NetSocketHandle::Listener(listener)) => {
-                let listener = Arc::clone(listener);
-                return net_poll_listener(ctx, &listener, fd, events, timeout_millis);
+                PollTarget::Listener(Arc::clone(listener))
             }
-            _ => return Ok(Some(Value::Int(0))),
+            _ => PollTarget::Neither,
         }
+    };
+    let stream = match target {
+        PollTarget::Stream(stream) => stream,
+        PollTarget::Listener(listener) => {
+            return net_poll_listener(ctx, &listener, fd, events, timeout_millis)
+        }
+        PollTarget::Neither => return Ok(Some(Value::Int(0))),
     };
     let timeout = if timeout_millis < 0 {
         -1
