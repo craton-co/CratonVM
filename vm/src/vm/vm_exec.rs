@@ -23111,13 +23111,26 @@ fn invoke_on_class_shared_inner(
                 // docs/known-issues/h2/
                 // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                    crate::memory::reclaim_guard::report_reclaimed_receiver(
+                    let addr = recv.as_ptr() as usize;
+                    if crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
-                        recv.as_ptr() as usize,
+                        addr,
                         "invoke dispatch",
                         &format!("{class_name}.{method_name}{descriptor}"),
                         class_id.as_u32(),
-                    );
+                    ) {
+                        // The free-list verdict fired, so this receiver really
+                        // is reclaimed memory. Say where it stood in THIS
+                        // thread's own root bookkeeping — the collector cannot
+                        // answer that about a peer, and it is the question the
+                        // 2026-08-05 `DriverManager.getConnection` witness
+                        // leaves open.
+                        crate::memory::reclaim_guard::report_root_slice_provenance(
+                            thread,
+                            addr,
+                            "invoke dispatch",
+                        );
+                    }
                 }
                 // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
                 // to bare `java/lang/Object` is the stale-ObjectRef family's
