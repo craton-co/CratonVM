@@ -82,7 +82,12 @@ own class id**, bounded by the receiver's allocated slot count.
 now uses:
 
 * slot 0 (`MAP_FIELD_BUCKETS`) always — every other native map op reads it, and
-  the native surface stays the authoritative `HashMap` implementation;
+  the native surface stays the authoritative `HashMap` implementation.
+  **Superseded 2026-08-05**: that second store is what put a bucket array in
+  `AbstractMap.keySet`, and the follow-up lane
+  (`fix/map-model-slots-on-real-layout-20260805`) removed it by teaching the
+  readers to ask `map_buckets_slot` instead. This bullet describes L2's
+  intermediate state, not the tree;
 * the receiver's real `table` when that is a different slot;
 * the legacy `Int(capacity)` at slot 2 **only when the receiver has no `table`
   field at all**, which is what "our fabricated layout" means.
@@ -169,14 +174,22 @@ recorded in the evidence file. One divergence it did fix, in a second commit:
 
 ### Still open, deliberately
 
-* **L4 gap 3.** `native_props_init`'s `Object(None)` over `loadFactor` is fixed
-  but its absence is verified by unit test, not by the census: the hunter still
-  cannot see a null written over a primitive. Widening it is L4's lane and
-  L4's re-measurement.
-* **Same-kind wrong-slot writes remain invisible** (L4 gap 2). Slot 0 on a real
-  `HashMap` is `AbstractMap.keySet`, and we store the bucket array there
-  deliberately; no instrument in the tree reports that, and this change does not
-  add one.
+* ~~**L4 gap 3.**~~ **CLOSED by L4, 2026-08-05.** The hunter now flags
+  `Object(_)` over a primitive, and re-running the census on the dev tip shows
+  no `Properties` slot-3 row — so step 3 is census-verified, not just
+  unit-tested. L4's own commit names this write as gap 3's measured instance.
+* ~~**Same-kind wrong-slot writes remain invisible** (L4 gap 2)~~ — **the
+  `HashMap` half is FIXED, 2026-08-05**, in
+  `fix/map-model-slots-on-real-layout-20260805`. It needed an instrument no
+  census can provide: `probes/MapModelSlotProbe` reads `AbstractMap.keySet`
+  reflectively under `--add-opens` and showed `keySet=ARRAY[Object]` on every
+  CratonVM map where HotSpot has `null` — including after `keySet()` was
+  called, where the JDK caches a `HashMap$KeySet`. `map_buckets_slot` /
+  `map_size_slot` now address both model slots on the receiver's own layout;
+  the `HashMap` slot-1 census row went 8,342 → 0 and `keySet` is null on every
+  row. The general statement still stands for classes nobody has looked at:
+  a same-kind wrong-slot access has no per-access tell, and L4's shadow-layout
+  diff reports the disagreement without saying what the slot holds.
 
 ### Verified on
 

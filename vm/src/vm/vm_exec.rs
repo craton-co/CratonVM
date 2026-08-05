@@ -13819,6 +13819,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         self.shared.system_properties.write().remove(&normalized)
     }
 
+    #[track_caller]
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         // Prefer the real class if it can be loaded — `ensure_synthetic_class`
         // returns the existing id when the name is already registered, so a
@@ -13866,6 +13867,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     /// out of the returned `VmError`: the classifier is the authority on
     /// *which* refusal this is, and matching on an error's shape would make
     /// this mapping quietly wrong the day a third refusal is added.
+    #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
         name: &str,

@@ -191,8 +191,63 @@ impl From<ClassIdentityError> for MethodCallFailed {
     /// Lets a migrated native write `ctx.try_ensure_synthetic_class(n, f)?`
     /// in any function returning `MethodCallResult`, with no intermediate
     /// mapping — which is what makes the ~40 call-site migration mechanical.
+    ///
+    /// **This produces the UNCATCHABLE form.** `MethodCallFailed::InternalError`
+    /// is documented as "not catchable by Java code — aborts execution
+    /// entirely", which is the right shape for a VM invariant and the wrong one
+    /// for a policy refusal: contract §5 asks for "the specification-appropriate
+    /// `ClassNotFoundException` / `NoClassDefFoundError`", and an abort is
+    /// neither. A native that can reach a live heap should call
+    /// [`refusal_to_java_failure`] instead; this impl remains for the `?`
+    /// ergonomics and as the fallback when the throwable itself cannot be built.
     fn from(err: ClassIdentityError) -> Self {
         MethodCallFailed::InternalError(err.into())
+    }
+}
+
+/// Turn a [`ClassIdentityError`] into a **catchable Java** failure.
+///
+/// The `From` impl above yields `MethodCallFailed::InternalError`, which the
+/// exception model defines as uncatchable and fatal. That is wrong for both of
+/// these refusals: each is a linkage-level answer the program is entitled to
+/// see and handle, and contract §5 names the exceptions by type.
+///
+/// * [`ClassIdentityError::Refused`] → `NoClassDefFoundError`, message = the
+///   requested internal (slash-form) name. Same shape and same message form as
+///   the VM-side `runtime::exceptions::raise_no_class_def_found`, so a refusal
+///   reaching Java from a native and one reaching it from constant-pool
+///   resolution are indistinguishable to a `catch` block — which they should
+///   be, since they mean the same thing.
+/// * [`ClassIdentityError::AmbiguousName`] → `IncompatibleClassChangeError`,
+///   message = the full explanation. This is the family HotSpot uses for
+///   loader-constraint violations, which is the same disease.
+///
+/// If the throwable cannot be constructed — no real bytes for it, or the heap
+/// is exhausted — this falls back to the uncatchable form rather than
+/// pretending the fabrication succeeded. The class name survives either way,
+/// which is the part an operator needs.
+pub fn refusal_to_java_failure(
+    ctx: &mut dyn crate::registry::NativeContext,
+    err: ClassIdentityError,
+) -> MethodCallFailed {
+    let (exception, message) = match &err {
+        ClassIdentityError::AmbiguousName { .. } => {
+            ("java/lang/IncompatibleClassChangeError", err.to_string())
+        }
+        ClassIdentityError::Refused { name, .. } => {
+            ("java/lang/NoClassDefFoundError", name.clone())
+        }
+    };
+    let message = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        exception,
+        "(Ljava/lang/String;)V",
+        &[cratonvm_types::Value::Object(Some(message))],
+    ) {
+        Ok(Some(cratonvm_types::Value::Object(Some(throwable)))) => {
+            MethodCallFailed::ExceptionThrown(throwable)
+        }
+        _ => MethodCallFailed::from(err),
     }
 }
 
