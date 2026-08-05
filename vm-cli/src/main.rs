@@ -4154,6 +4154,22 @@ fn run() -> Result<()> {
             "[cratonvm] interpreter intrinsic dispatches: {}",
             cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
         );
+        // Compiled code's own funnel bypass. Reported beside the interpreter's
+        // counter because the two answer the same question for different
+        // execution tiers, and the JIT half is the one that was missing: a
+        // compiled loop's calls do not reach the interpreter's inline cache, so
+        // a run whose first number moves and whose second stays at zero has NOT
+        // been sped up where it is hot. See `jit::helpers::LEAF_NATIVE_HITS`.
+        eprintln!(
+            "[cratonvm] compiled leaf-native dispatches: {}",
+            cratonvm_vm::jit::helpers::leaf_native_hit_count()
+        );
+        // A zero above is ambiguous — "nothing here is a leaf" and "every site
+        // was refused for a reason nobody intended" look identical — so the
+        // fill-time refusal reasons are reported alongside it.
+        for (reason, count) in cratonvm_vm::jit::helpers::leaf_native_refusals() {
+            eprintln!("[cratonvm]   leaf sites refused, {reason}: {count}");
+        }
     }
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown

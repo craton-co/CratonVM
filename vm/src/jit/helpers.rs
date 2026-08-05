@@ -7466,6 +7466,261 @@ fn admit_jit_fast_native_resolved(
     Some((callback, id))
 }
 
+/// Leaf-native fast-path hits from compiled code, reported on shutdown by
+/// `CRATONVM_DBG=intrinsic-stats` beside the interpreter's own counter.
+///
+/// This exists for the same reason that one does, and the reason is worth
+/// restating: **timings cannot tell "the fast path was never installed" from
+/// "it was installed and is no faster."** Two earlier attempts at the
+/// interpreter's `Thread.currentThread` bypass were inert, and only a counter
+/// showed it. A JIT-side path has one extra way to be silently inert — the
+/// site cache can resolve to `None` and cache the refusal forever — so the
+/// number this prints is the acceptance criterion, not the ns/op.
+static LEAF_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Leaf-native dispatches served from compiled code this run.
+pub fn leaf_native_hit_count() -> u64 {
+    LEAF_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Call sites `resolve_leaf_native_site` declined, and why.
+///
+/// A hit count of zero has two very different explanations — "nothing on this
+/// workload is a leaf" and "every site was refused for a reason I did not
+/// intend" — and only the second is a bug. Rather than rebuild the VM to find
+/// out (a release build here is ~15 minutes), the refusal reason is recorded at
+/// fill time, which runs once per site and never on the dispatch path.
+///
+/// `CRATONVM_DBG=intrinsic-stats` prints the tally. The strings are `&'static`
+/// reason tags, not formatted messages, so nothing allocates unless the flag
+/// asked for the dump.
+mod leaf_refusal {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One counter per refusal reason, in the order they are tested.
+    pub(super) static COUNTS: [AtomicU64; 7] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub(super) const REASONS: [&str; 7] = [
+        "invoke-kind not virtual/interface/static, or receiver not a heap object",
+        "method name is special-cased by invoke_or_native",
+        "receiver class unavailable",
+        "capability-classified triple",
+        "no native registered for the triple",
+        "registered but does not claim leaf",
+        "SyntheticStub / policy refused",
+    ];
+
+    #[inline]
+    pub(super) fn note(reason: usize) -> Option<super::LeafNativeDispatchCache> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// [`note`] for the dispatch-side bails, which return "not served here"
+    /// rather than "no cache entry".
+    #[inline]
+    pub(super) fn note_and_decline(reason: usize) -> Option<i64> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub(super) fn report() -> Vec<(&'static str, u64)> {
+        REASONS
+            .iter()
+            .zip(COUNTS.iter())
+            .map(|(r, c)| (*r, c.load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+}
+
+/// Per-reason tally of JIT call sites the leaf fast path declined. Cold; read
+/// once on shutdown by `CRATONVM_DBG=intrinsic-stats`.
+pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
+    leaf_refusal::report()
+}
+
+/// Does `invoke_or_native` special-case this method name BEFORE it reaches its
+/// generic "find the registered native" step?
+///
+/// `vm_exec::invoke_or_native` opens with a cascade of hand-written gates —
+/// `MethodHandle.type()`, the `invoke`/`invokeExact`/`invokeBasic` family, the
+/// `AnnotationProxy` retarget, `ClassLoader`'s resource + `loadClass` bridges,
+/// `setDefaultAssertionStatus`, the Spring Boot loader's jar shims, the
+/// `ToIntFunction.apply` SAM bridges — each of which can route a call somewhere
+/// other than the registry slot for its own triple. The leaf fast path skips
+/// that entire cascade, so it must not be installed for a site the cascade
+/// would have claimed.
+///
+/// The list is keyed on the **method name** alone, deliberately over-broad: it
+/// is consulted once per call site at cache-fill time, and refusing one extra
+/// name costs a fast path nobody has asked for while a missed name would be a
+/// miscompile. Nothing in the leaf set (field reads, field writes, atomics,
+/// `Math`, `System.nanoTime`, `Thread.currentThread`) is anywhere near it.
+///
+/// Pinned by `leaf_native_sites_avoid_invoke_or_native_special_cases` below: if
+/// a future registration marks one of these names leaf, that test fails rather
+/// than the VM silently taking a different call.
+fn leaf_site_name_is_special_cased(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "type"
+            | "invoke"
+            | "invokeExact"
+            | "invokeBasic"
+            | "apply"
+            | "loadClass"
+            | "setDefaultAssertionStatus"
+            | "getResource"
+            | "getResources"
+            | "getResourceAsStream"
+            | "isMultiRelease"
+            | "getJarEntry"
+            | "getRealName"
+            | "getCertificates"
+            | "getCodeSigners"
+            | "getEntry"
+            | "bufferEndsWithSignatureSuffix"
+            | "<init>"
+            | "<clinit>"
+    )
+}
+
+/// Resolve a JIT call site to a leaf native, or refuse.
+///
+/// Cold: called once per `(vm, call site)` and again only when the native
+/// registry's generation moves. Everything expensive — the registry hash, the
+/// policy round trip, the class-manager read for a virtual receiver's name —
+/// lives here and not on the dispatch path.
+///
+/// Refuses (returns `None`, cached as a negative) when any of these hold, and
+/// each refusal is a semantic obligation the fast path could not otherwise
+/// discharge:
+///
+/// * the invoke kind is `invokespecial` — a super-call resolves by walking from
+///   the CP class to the declaring class (`invoke_special_shared`), which is not
+///   what this cache's single-slot lookup answers;
+/// * the method name is one `invoke_or_native` special-cases (see above);
+/// * no native is registered for the triple, or its slot does not claim leaf;
+/// * the slot is a `SyntheticStub` — those are subject to the
+///   `real_protected_stub_class` / `has_real` yield-to-bytecode arbitration in
+///   `invoke_or_native`, which this path does not reproduce;
+/// * a capability policy is installed — `check_native_dispatch_capability` runs
+///   at the funnel's dispatch site, and skipping the funnel would skip the gate;
+/// * `admit_jit_fast_native_resolved` declines (`--jdk-only` §1.3).
+fn resolve_leaf_native_site(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    receiver_class_id: Option<ClassId>,
+) -> Option<LeafNativeDispatchCache> {
+    if !matches!(info.invoke_kind, 0 | 2 | 3) {
+        return leaf_refusal::note(0);
+    }
+    if leaf_site_name_is_special_cased(info.method_name) {
+        return leaf_refusal::note(1);
+    }
+    // Static sites resolve on the constant-pool owner; virtual/interface sites
+    // resolve on the receiver's runtime class, which is the only authority on
+    // which override actually runs.
+    let (lookup_class, guard) = match info.invoke_kind {
+        3 => (info.class_name.to_string(), None),
+        _ => {
+            let Some(cid) = receiver_class_id else {
+                return leaf_refusal::note(2);
+            };
+            let Some(name) = vm
+                .classes
+                .class_manager
+                .try_read()
+                .and_then(|cm| cm.get_class(cid).map(|class| class.name.to_string()))
+            else {
+                return leaf_refusal::note(2);
+            };
+            (name, Some(cid.as_u32()))
+        }
+    };
+    // The capability gate (`vm_exec::check_native_dispatch_capability`) runs at
+    // the funnel's dispatch site, so a path that skips the funnel must not skip
+    // a gate that could have said no — or, in Permissive mode, could have
+    // recorded an audit entry.
+    //
+    // The condition is `classify_native`, NOT "is a policy installed": a policy
+    // is ALWAYS installed (`vm_init` calls `set_capabilities` unconditionally,
+    // defaulting to Permissive, so that `capability_audit` can report), and an
+    // earlier cut of this function gated on its mere presence — which made the
+    // whole fast path inert in every configuration. That was caught by
+    // `LEAF_NATIVE_HITS` reading 0 on a run whose ns/op had not moved, which is
+    // exactly the failure mode that counter exists for; the timings alone said
+    // "no faster", not "never ran".
+    //
+    // `classify_native` is a pure function of `(class, method)` and is the FIRST
+    // thing the dispatch-site gate consults: when it answers `None`, that gate
+    // returns `Ok(())` in every mode without touching the policy or the audit
+    // log. So refusing the sensitive triples here is exactly equivalent, and no
+    // leaf native is one — the classified set is process spawn, library load,
+    // `Unsafe`, Panama, file and socket I/O, none of which could satisfy the
+    // leaf contract in the first place.
+    if cratonvm_native_api::capability::classify_native(&lookup_class, info.method_name).is_some() {
+        return leaf_refusal::note(3);
+    }
+    let Some(id) = vm
+        .natives
+        .native_methods
+        .resolve_id(&lookup_class, info.method_name, info.descriptor)
+    else {
+        return leaf_refusal::note(4);
+    };
+    // `Thread.currentThread()` is served from the thread mirror instead of the
+    // registered body — see `LeafNativeKind::ThreadCurrentThread` — so it is
+    // recognised here rather than claimed at registration. Everything else
+    // about the resolution is identical, deliberately: the site is only
+    // installed if the native is registered AND policy admits it, so
+    // `--jdk-only` and the capability gate above still decide.
+    let kind = if info.invoke_kind == 3
+        && lookup_class == "java/lang/Thread"
+        && info.method_name == "currentThread"
+        && info.descriptor == "()Ljava/lang/Thread;"
+    {
+        LeafNativeKind::ThreadCurrentThread
+    } else if vm.natives.native_methods.is_leaf_id(id) {
+        LeafNativeKind::Callback
+    } else {
+        return leaf_refusal::note(5);
+    };
+    if vm.natives.native_methods.kind_of_id(id)
+        == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+    {
+        return leaf_refusal::note(6);
+    }
+    let Some(callback) = vm.natives.native_methods.callback_of(id) else {
+        return leaf_refusal::note(6);
+    };
+    let Some((callback, native_id)) = admit_jit_fast_native_resolved(
+        vm,
+        &lookup_class,
+        info.method_name,
+        info.descriptor,
+        callback,
+        Some(id),
+    ) else {
+        return leaf_refusal::note(6);
+    };
+    Some(LeafNativeDispatchCache {
+        kind,
+        callback,
+        native_id,
+        receiver_class_id: guard,
+    })
+}
+
 /// Count one native dispatch on a JIT fast-path edge (§4 census).
 ///
 /// One `Option` test plus one relaxed `fetch_add` on an id resolved at
@@ -7544,6 +7799,63 @@ struct IntegerNativeDispatchCache {
     native_id: Option<cratonvm_native_api::NativeMethodId>,
 }
 
+/// A JIT call site resolved to a **leaf** native — see
+/// [`cratonvm_native_api::NativeMethodRegistry::set_leaf`].
+///
+/// This is the compiled-code half of the funnel bypass the interpreter already
+/// has for `Thread.onSpinWait` / `Thread.currentThread`. Measured on
+/// `probes/NativeShapeProbe.java`, a no-argument static native from compiled
+/// code cost ~560 ns against ~8 ns for an ordinary Java call, and essentially
+/// none of it was the native's own body: it was `jit_invoke_dispatch`'s tail
+/// (`invoke_or_native`, a ~27-gate string cascade ending in a three-string
+/// registry hash) plus `safe_native_call`'s GC bookkeeping. This entry removes
+/// both — the cascade at cache-fill time, the funnel via
+/// `safe_native_call_leaf`.
+/// What a resolved leaf site actually does on a hit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafNativeKind {
+    /// Call the registered callback through `safe_native_call_leaf`.
+    Callback,
+    /// `Thread.currentThread()` — answered from `thread.java_thread_obj`
+    /// WITHOUT calling the native at all, exactly as the interpreter's inline
+    /// cache does (`dispatch_static.rs`, `InterpIntrinsic::ThreadCurrentThread`).
+    ///
+    /// It cannot be an ordinary leaf, because its registered body
+    /// (`native_thread_current_thread` → `NativeContext::current_thread_object`)
+    /// **allocates** when this thread's mirror has not been built yet — it
+    /// loads `java/lang/Thread`, allocates the mirror, builds the field holder
+    /// and the thread group. That is a real violation of leaf contract item 1,
+    /// so the claim is not made at registration; the site instead serves only
+    /// the warm case and falls through to the ordinary dispatcher (which runs
+    /// that allocating slow path) when the mirror is absent.
+    ///
+    /// Worth its own arm because of how often the JDK calls it: **twice per
+    /// uncontended `ReentrantLock.lock()`/`unlock()` pair**, censused with
+    /// `--dump-native-registry` in `probes/LockNativeCensusProbe.java`, plus
+    /// every AQS ownership check and every thread-local lookup. The interpreter
+    /// took it from 306 ns to 136 ns; compiled code was still paying 564 ns
+    /// because none of the compiled loop's calls reach the interpreter's cache.
+    ThreadCurrentThread,
+}
+
+#[derive(Clone, Copy)]
+struct LeafNativeDispatchCache {
+    kind: LeafNativeKind,
+    callback: cratonvm_native_api::NativeCallback,
+    /// §4 census handle — see [`NativeDispatchCache::native_id`].
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
+    /// Exact receiver class id this entry is valid for, or `None` for an
+    /// `invokestatic` site (no receiver to guard).
+    ///
+    /// A virtual/interface site is resolved on the RECEIVER's runtime class,
+    /// not on `info.class_name` (the constant-pool owner), for the same reason
+    /// [`NativeDispatchCache`] is keyed that way: an interface method resolves
+    /// to whatever the receiver overrides. The guard is re-tested on every hit
+    /// so a site that goes polymorphic falls out to the generic dispatcher
+    /// rather than calling the wrong body.
+    receiver_class_id: Option<u32>,
+}
+
 // Thread-local map from [`JitSiteKey`] -> cached JIT entry.
 // Using a thread-local avoids synchronization on the hot path.
 // T10.9.B: FxHashMap — pointer values are internal; this is touched on every
@@ -7564,6 +7876,15 @@ thread_local! {
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     static INTEGER_NATIVE_DISPATCH_CACHE:
         std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, Option<IntegerNativeDispatchCache>>>
+        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Leaf-native resolution per JIT call site — see
+    /// [`LeafNativeDispatchCache`]. `None` is a cached refusal ("this site is
+    /// not a leaf native"), which is what keeps the ~27-gate `invoke_or_native`
+    /// probe off every OTHER site's steady state; it is keyed on the registry
+    /// generation stored beside it so a lazy `register_*` pass that appears
+    /// later is still seen.
+    static LEAF_NATIVE_DISPATCH_CACHE:
+        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, (u32, Option<LeafNativeDispatchCache>)>>
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// Real `java/lang/Integer` class discovered from the first ordinary
     /// `valueOf` result in each VM, as `(vm_identity, class id)`. A different
@@ -8116,6 +8437,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 }
             }
         }
+    }
+    // Leaf-native fast path. Placed here — after the exact-receiver object
+    // native cache above, before the Integer cache and the whole compile /
+    // virtual-dispatch machinery below — because a leaf native is by definition
+    // a call with nothing to compile and nothing to dispatch: a field read, an
+    // atomic, or a constant. Everything after this point is per-call work that
+    // such a site was paying for no reason. See `LeafNativeDispatchCache`.
+    if let Some(result) = try_jit_leaf_native_dispatch(vm, info, info_key, args_slice) {
+        return result;
     }
     if !class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
         let cached =
@@ -8833,6 +9163,119 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         );
     }
     ret
+}
+
+/// The leaf-native fast path for compiled code, probed once per
+/// `jit_invoke_dispatch` before any of the compile/dispatch machinery runs.
+///
+/// `Some(ret)` means the call was fully served here; `None` means this site is
+/// not a leaf native and the caller must continue down its ordinary route.
+///
+/// # Why this is safe to take instead of `invoke_or_native`
+///
+/// `resolve_leaf_native_site` (which runs once per site) is where every
+/// obligation is discharged: the invoke kind, the `invoke_or_native` special
+/// cases, the `SyntheticStub` arbitration, the capability policy and the
+/// `--jdk-only` admission. What is left on this path is the receiver-class
+/// guard — re-tested on every hit so a site that goes polymorphic drops out —
+/// and the call itself.
+///
+/// # Redefinition
+///
+/// The entry is discarded when the target class has been redefined, on the
+/// same terms as the Integer cache below it, and re-resolved when the native
+/// registry's generation moves (so a lazily-registered native, or one whose
+/// re-registration dropped the leaf claim, is picked up rather than memoized
+/// wrong — the failure the `NativeCallSite` doc calls out for `OnceLock`).
+///
+/// SAFETY: `args_slice` is the JIT caller's own stack buffer, already forwarded
+/// by `forward_jit_reference_args` in the caller.
+unsafe fn try_jit_leaf_native_dispatch(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    args_slice: &[i64],
+) -> Option<i64> {
+    // Every bail below is counted, including these pre-resolution ones. An
+    // uncounted `return None` here is what made the first cut of this path
+    // unexplainable: `AtomicInteger.get` showed neither a hit nor a refusal,
+    // because it was arriving at `jit_invoke_virtual_mic` — a different entry
+    // point — and never reaching this function at all.
+    if !matches!(info.invoke_kind, 0 | 2 | 3) {
+        return leaf_refusal::note_and_decline(0);
+    }
+    // The receiver's runtime class both selects the override to resolve and
+    // guards a warm entry. A static site has neither.
+    let receiver_class_id = if info.invoke_kind == 3 {
+        None
+    } else {
+        let raw = *args_slice.first()? as u64;
+        if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+            return leaf_refusal::note_and_decline(0);
+        }
+        match vm.mem.heap.is_object_address(raw as usize) {
+            Some(obj) => Some(vm.mem.heap.class_id_of(obj)),
+            None => return leaf_refusal::note(0).map(|_| 0),
+        }
+    };
+
+    let generation = vm.natives.native_methods.generation();
+    let cached = LEAF_NATIVE_DISPATCH_CACHE.with(|cache| cache.borrow().get(&info_key).copied());
+    let entry = match cached {
+        Some((gen, entry)) if gen == generation => entry,
+        _ => {
+            let resolved = resolve_leaf_native_site(vm, info, receiver_class_id);
+            LEAF_NATIVE_DISPATCH_CACHE.with(|cache| {
+                cache.borrow_mut().insert(info_key, (generation, resolved));
+            });
+            resolved
+        }
+    };
+    let entry = entry?;
+    // Re-check the receiver guard on every hit: the entry was resolved against
+    // one runtime class, and this site may since have seen another.
+    if entry.receiver_class_id != receiver_class_id.map(|cid| cid.as_u32()) {
+        return None;
+    }
+    if class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
+        return None;
+    }
+    if let Some(cid) = receiver_class_id {
+        if class_was_redefined(vm, cid) {
+            return None;
+        }
+    }
+
+    let (thread, _guard) = jit_thread_mut()?;
+    if entry.kind == LeafNativeKind::ThreadCurrentThread {
+        // The mirror is a per-thread GC root the collector remaps, and handing
+        // it to the caller roots it again with no allocation in between. When
+        // it does not exist yet, fall through: the ordinary dispatcher runs
+        // `current_thread_object`'s allocating slow path that builds it.
+        let obj = thread.java_thread_obj?;
+        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count_jit_native_dispatch(vm, entry.native_id);
+        // Object-return handoff root, same contract as every other JIT native
+        // fast path (see `jit_integer_value_of_direct`).
+        thread.native_pending_return = Some(obj);
+        return Some(obj.as_ptr() as i64);
+    }
+    let values = decode_dispatch_values(vm, info, args_slice);
+    LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_jit_native_dispatch(vm, entry.native_id);
+    let result = match crate::vm::safe_native_call_leaf(vm, thread, entry.callback, &values) {
+        Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(v)) => v as i64,
+        Some(Value::Long(v)) => v,
+        Some(Value::Float(f)) => f.to_bits() as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        Some(_) => 0,
+    })
 }
 
 /// Try to compile a callee method from a JitInvokeInfo.
@@ -10431,6 +10874,30 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let receiver_raw = args_slice[0];
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
 
+    // Leaf-native fast path — the invokevirtual/invokeinterface half.
+    //
+    // This entry point, not `jit_invoke_dispatch`, is where compiled virtual
+    // calls arrive: the x64 backend emits `jit_invoke_virtual_mic` for them and
+    // reserves the generic dispatcher for static/special sites and bailouts.
+    // Hooking only the dispatcher left every *instance* leaf native — the whole
+    // `AtomicInteger`/`AtomicLong` accessor set, i.e. item 2 of the AQS doc —
+    // still paying the full funnel, with the site never even reaching
+    // `resolve_leaf_native_site` to be counted as a refusal. `AtomicInteger.get`
+    // measured 1026 ns before and 926 ns after the dispatcher-only version:
+    // unchanged, while `Math.abs` (static, same mechanism) went 330 -> 84.
+    //
+    // Placed immediately after `forward_jit_reference_args` so the receiver this
+    // reads is the post-SATB-flush address, and before the MIC/PIC machinery,
+    // which a native leaf has no use for — there is no compiled callee to cache.
+    if let Some(result) = try_jit_leaf_native_dispatch(
+        vm,
+        info,
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+        args_slice,
+    ) {
+        return result;
+    }
+
     // WS1 (kafka JIT throughput): the `Value` decode is deferred. The MIC-hit
     // fast path dispatches straight off the raw `args_slice` and never
     // materializes `Value`s; only the lambda, register-overflow-bailout and
@@ -11628,6 +12095,106 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Leaf natives: the set, and the one thing that could make skipping
+    // `invoke_or_native` wrong
+    // -----------------------------------------------------------------------
+
+    /// Populate a registry the way `vm_init` does for **real-JDK mode**, so the
+    /// leaf set under test is the one a real run has rather than a hand-written
+    /// list.
+    ///
+    /// `register_essential_natives_with_shims` and not `register_builtins`,
+    /// deliberately: the latter is `#[cfg(feature = "synthetic-jdk")]`-gated in
+    /// `native-builtins` and degrades to a no-op shim
+    /// (`vm/src/native/builtins.rs`) without it, so a test built on it would
+    /// pass vacuously — an empty registry has no non-conforming leaf — in
+    /// exactly the configuration it was meant to cover. This entry point is
+    /// ungated and is the one every `--java-home` run takes, which is also the
+    /// mode the probes measure.
+    fn registry_with_builtins() -> cratonvm_native_api::NativeMethodRegistry {
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
+        cratonvm_native_builtins::register_essential_natives(&mut r);
+        r
+    }
+
+    /// The leaf fast path skips `vm_exec::invoke_or_native` entirely, and that
+    /// function opens with a cascade of hand-written gates that can route a
+    /// call somewhere OTHER than its own registry slot. If a triple is ever
+    /// marked leaf whose method name that cascade claims, compiled code would
+    /// silently start taking a different call than the interpreter — a
+    /// miscompile with no symptom at the registration site.
+    ///
+    /// `leaf_site_name_is_special_cased` is the fill-time refusal that prevents
+    /// it. This pins the two together: the actual boot-time leaf set, against
+    /// the actual predicate.
+    #[test]
+    fn leaf_native_sites_avoid_invoke_or_native_special_cases() {
+        let registry = registry_with_builtins();
+        let leaves = registry.leaf_registrations();
+
+        // Floor, not just "none are bad": a refactor that silently stopped
+        // applying `set_leaf` would leave this test green and vacuous while
+        // every leaf quietly went back to paying the funnel.
+        assert!(
+            leaves.len() >= 20,
+            "expected the boot leaf set to be populated, got {} entries: {:?}",
+            leaves.len(),
+            leaves
+        );
+
+        for (class, method, descriptor) in &leaves {
+            assert!(
+                !leaf_site_name_is_special_cased(method),
+                "{class}.{method}{descriptor} is registered as a leaf, but \
+                 `invoke_or_native` special-cases the method name `{method}` \
+                 before it reaches the registry — the JIT leaf fast path would \
+                 take a different call than the interpreter. Either drop the \
+                 leaf claim or remove the special case."
+            );
+        }
+    }
+
+    /// The leaf set is an audited list, so it is worth stating what is on it —
+    /// and, more importantly, what is deliberately NOT. The CAS / fetch-add
+    /// members of the atomics go through the monitor table's per-object CAS
+    /// lock, which is a lock this thread can be made to wait on; contract
+    /// item 2 excludes exactly that, so they must stay on the funnel.
+    #[test]
+    fn the_leaf_set_holds_the_accessors_and_not_the_locking_atomics() {
+        let registry = registry_with_builtins();
+        let is_leaf = |class: &str, method: &str, descriptor: &str| {
+            registry
+                .resolve_id(class, method, descriptor)
+                .is_some_and(|id| registry.is_leaf_id(id))
+        };
+
+        let ai = "java/util/concurrent/atomic/AtomicInteger";
+        assert!(is_leaf(ai, "get", "()I"), "AtomicInteger.get is a leaf");
+        assert!(is_leaf(ai, "set", "(I)V"), "AtomicInteger.set is a leaf");
+        assert!(is_leaf("java/lang/System", "nanoTime", "()J"));
+        assert!(is_leaf("java/lang/Math", "abs", "(I)I"));
+
+        assert!(
+            !is_leaf(ai, "compareAndSet", "(II)Z"),
+            "compareAndSet takes the CAS lock — it must not claim the leaf contract"
+        );
+        assert!(
+            !is_leaf(ai, "getAndIncrement", "()I"),
+            "getAndIncrement goes through atomic_fetch_add_int — not a leaf"
+        );
+        assert!(
+            !is_leaf(ai, "toString", "()Ljava/lang/String;"),
+            "toString allocates a String — not a leaf"
+        );
+        assert!(
+            !is_leaf("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
+            "currentThread's registered body allocates the mirror on first call; \
+             the JIT serves it through LeafNativeKind::ThreadCurrentThread, which \
+             falls through to the ordinary dispatcher instead of claiming leaf"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
