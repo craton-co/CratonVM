@@ -266,6 +266,74 @@ the VM, and the suites that would catch a regression in it (Spring Boot,
 Tomcat) run on the Linux host, not here. Recorded so the next person starts
 from the measurement instead of from the original document's premise.
 
+## The end-to-end A/B, and what it can and cannot resolve
+
+`scripts/ab-native-funnel.ps1`, A-B-B-A interleaved over three rounds,
+minimum of the last pass per rung, base = `origin/dev`:
+
+| rung | base | fix | ratio |
+|---|---|---|---|
+| NATIVE static, no arg -> OBJ: `currentThread` | 364.0 | **10.5** | **34.7x** |
+| NATIVE static, no arg -> long: `nanoTime` | 342.1 | 164.0 | 2.09x |
+| NATIVE static, OBJ arg -> int: `identityHashCode` | 533.7 | 273.6 | 1.95x |
+| INTRINSIC recv: `String.length()` | 844.4 | 547.3 | 1.54x |
+| INTRINSIC static: `Math.abs(int)` | 230.1 | 204.8 | 1.12x |
+| NATIVE recv, no arg: `AtomicInteger.get` | 690.0 | 696.0 | 0.99x |
+| NATIVE recv, prim args: `Atomic.CAS` | 872.7 | 944.9 | 0.92x |
+| interpreter-answered `Thread.onSpinWait` (control) | 4.8 | 4.9 | 0.98x |
+| no call (control) | 0.8 | 0.7 | 1.14x |
+
+**Only the `currentThread` row is a measurement.** Everything else on this
+table is noise, and saying so is the honest reading rather than a hedge:
+
+* The host was running other builds throughout. Between this run and a
+  two-round run twenty minutes earlier, `nanoTime`'s base moved 257 → 342 ns
+  and its ratio 1.44x → 2.09x. A control rung moved 1.00x → 1.14x.
+* `String.length()` at 1.54x is the tell. It is an interpreter intrinsic that
+  this branch does not touch at all, so a 1.5x "improvement" on it is the
+  measurement's own noise floor — which means every other sub-2x row is inside
+  it too.
+* The two `AtomicInteger` rungs reading *slower* are the same noise with the
+  opposite sign. They are also where the change is expected to be least
+  visible: at ~900 ns per call the whole funnel is now ~40 ns, so even
+  deleting it entirely would move them ~4 %.
+
+This is exactly why the two claims this document does make are backed by
+**in-process** measurements instead — `with_cell_ab` and
+`funnel_cost_breakdown`, both of which run their arms in one process against
+one VM — and why the third is backed by a counter rather than a clock.
+
+## Test-suite state, and the four instances of one trap
+
+`cargo test --release` on this branch:
+
+| crate | result |
+|---|---|
+| `cratonvm-vm --lib` | 2387 passed, **2 failed** |
+| `cratonvm-jit` | 1942 passed, **1 failed** |
+| `cratonvm-native-api`, `cratonvm-types` | pass, except `doc_citation_paths` |
+
+Every failure is pre-existing and each was **checked**, not assumed:
+
+* `jni_function_table_extended_to_234` and `jni_nio_slots_not_stub` — already
+  diagnosed on 2026-08-01 in commit `dca43a8c3` ("slot 233 folds with the stub,
+  so stop asserting it does not"), which sits on the unmerged branch
+  `fix/locale-tostring-shadow-20260801`.
+* `ir_lower::tests::a_wide_field_read_refuses_without_the_sentinel_disambiguator`
+  — verified pre-existing by reverting `jit/src/lib.rs` to `origin/dev` and
+  re-running: it fails identically. Its two `extern "C"` fakes both compile to
+  `xor eax,eax; ret`.
+* `doc_citation_paths` — red on `dev`. This branch **reduces** one of its two
+  failures from 37 flagged lines to 28; the remaining 28, and all four dead
+  `array-class-defining-loader.md` citations, are untouched pre-existing ones.
+
+Three of those four are the same trap, and it is worth naming because it is
+invisible in source: **`/OPT:ICF` folds functions with identical machine code,
+so distinct `fn` items are not distinct addresses.** It broke two JNI tests, one
+IR test, and the first cut of this branch's own leaf tests. Any assertion of the
+form `assert_ne!(fn_a as usize, fn_b as usize)` is unassertable unless the two
+bodies differ.
+
 ## What landed
 
 * `vm/src/threading/thread_state.rs` — `with_cell` borrows instead of cloning.
