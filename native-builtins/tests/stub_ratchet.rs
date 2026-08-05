@@ -16,11 +16,16 @@
 //!                   short-circuits. These shadow correct real bytecode and
 //!                   are the removal target.
 //!
-//! This test builds the **default native registry the way the VM does** (via
-//! the public `register_essential_natives` entrypoint — the same function
-//! `vm/src/vm/vm_init.rs` calls unconditionally on the real-JDK boot path),
-//! censuses how many registrations are tagged `SyntheticStub`, and asserts the
-//! count has not RISEN above a frozen [`BASELINE_SYNTHETIC_STUBS`] constant.
+//! This test builds the **default native registry the way the VM does** — all
+//! six registration passes `vm/src/vm/vm_init.rs` runs on the real-JDK boot
+//! path, in its order, behind its `set_drop_real_layout_synthetic` flag (see
+//! [`register_boot_path`]) — censuses how many registrations are tagged
+//! `SyntheticStub`, and asserts the count has not RISEN above a frozen
+//! [`BASELINE_SYNTHETIC_STUBS`] constant.
+//!
+//! Until 2026-08-05 it ran `register_essential_natives` and nothing else, under
+//! that same claim, and so measured about four fifths of the registry. The
+//! number it reported was 165 where the boot registry holds 549.
 //!
 //! It is a *ratchet*: a change that ADDS a synthetic stub pushes the count over
 //! the baseline and fails CI; a change that REMOVES one is welcome and only
@@ -37,7 +42,8 @@ use cratonvm_native_builtins::register_essential_natives;
 use cratonvm_types::compat::CompatibilityMode;
 
 /// Frozen upper bound on the number of `SyntheticStub`-tagged registrations in
-/// the default (real-JDK / `register_essential_natives`) registry.
+/// the default (real-JDK) **boot** registry — all six passes, not just
+/// `register_essential_natives`. See [`register_boot_path`].
 ///
 /// This is the exact current observed count. The ratchet has zero slack: adding
 /// one synthetic stub fails, while removing one requires lowering the baseline
@@ -82,34 +88,150 @@ use cratonvm_types::compat::CompatibilityMode;
 /// be suspicious of is a `SyntheticStub` quietly becoming a `Bridge`, which
 /// lowers this number while changing nothing — and which is exactly the shape
 /// L6's unadjudicated-`Bridge` ratchet is being built to catch.
-const BASELINE_SYNTHETIC_STUBS: usize = 165;
+///
+/// # 165 → 549, 2026-08-05 — a scope fix, not 384 new stubs
+///
+/// **Nothing was added.** The census stopped measuring `register_essential_natives`
+/// alone and started running the boot sequence the VM actually installs, which
+/// is 2,279 registrations wider. The 384 extra `SyntheticStub` rows were always
+/// in the shipped registry; this gate simply could not see them.
+///
+/// The bug was found by disagreement, which is the useful part: L7's retag moved
+/// 364 registrations `Bridge` → `SyntheticStub`, L6's `bridge-ratchet.sh`
+/// counted every one (it censuses a *running VM*), and this gate did not move by
+/// a single row. Two ratchets over one VM, 364 apart. Whenever two gates over
+/// the same object disagree, at least one is measuring the wrong object.
+///
+/// **This is the number to compare against `bridge-ratchet.sh` from now on.**
+/// If they diverge again, suspect the scope of one of them before suspecting
+/// the code.
+const BASELINE_SYNTHETIC_STUBS: usize = 549;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
 const SLACK: usize = 0;
 
-/// Build the default native registry exactly as the VM's real-JDK boot path
-/// does, and return `(synthetic_stub_count, total_registrations)`.
+/// Run the registration passes the default (`cfg(not(feature =
+/// "synthetic-jdk"))`) boot path in `vm/src/vm/vm_init.rs` runs, in its order.
 ///
-/// We deliberately use the *public* registration entrypoint rather than poking
-/// at registry internals so this test exercises the same surface the VM ships.
-/// `register_essential_natives` is the unconditional real-JDK registrar (see
-/// `vm/src/vm/vm_init.rs`); the synthetic-override block is feature-gated
-/// (`synthetic-jdk`, off by default) and intentionally NOT counted here — the
-/// ratchet guards the default build.
+/// # This function is the fix for a blind spot, not a refactor
+///
+/// It used to be `register_essential_natives` and nothing else, under a doc
+/// comment claiming it built "the default native registry exactly as the VM's
+/// real-JDK boot path does". That was false, and the gap was large: `vm_init`
+/// also installs `register_concurrent_natives`, `register_forkjoin_quiescence`,
+/// `register_stamped_lock_natives`, `register_io_natives` and
+/// `register_collections_natives`, none of which this census could see.
+///
+/// Measured 2026-08-05: retagging four `native-collections` registrars moved
+/// **364** registrations from `Bridge` to `SyntheticStub`, L6's
+/// `bridge-ratchet.sh` (which takes its census from a running VM) counted every
+/// one of them — and this gate did not move by a single row. Two ratchets over
+/// the same VM, disagreeing by 364, because one of them was looking at a
+/// fraction of the registry.
+///
+/// # What is still not counted, and why that is acceptable
+///
+/// * The handful of individual `native_methods.register(...)` calls that
+///   `vm_init` makes inline between the passes (e.g. `LinkedBlockingQueue
+///   .drainTo`). They live in `cratonvm-vm`, which this crate cannot depend on
+///   — the dependency runs the other way. They are `Bridge`, and a
+///   `SyntheticStub` added there would slip past; if that ever matters, the
+///   gate has to move to `vm/tests/`.
+/// * The `#[cfg(feature = "synthetic-jdk")]` arm, deliberately: the ratchet
+///   guards the shipped `cratonvm-cli` build, which does not enable it.
+///
+/// `ShimSelection::ALL` where the VM computes a selection from a classpath
+/// probe — the widest set, which is the right choice for an upper-bound gate
+/// and is what `register_essential_natives` itself passes.
+fn register_boot_path(registry: &mut NativeMethodRegistry) {
+    // Load-bearing and first, exactly as in `vm_init`: it drops the synthetic
+    // `java/util/StringJoiner` natives whose fake 5-field layout corrupts the
+    // real 7-field object. Setting it after a pass would leave them in.
+    registry.set_drop_real_layout_synthetic(true);
+    cratonvm_native_builtins::register_essential_natives_with_shims(
+        registry,
+        cratonvm_native_builtins::app_shims::ShimSelection::ALL,
+    );
+    cratonvm_native_builtins::register_concurrent_natives(registry);
+    // MUST follow `register_concurrent_natives` — same last-write-wins ordering
+    // constraint `vm_init` documents at its call site.
+    cratonvm_native_builtins::register_forkjoin_quiescence(registry);
+    cratonvm_native_builtins::register_stamped_lock_natives(registry);
+    cratonvm_native_io::register_io_natives(registry);
+    cratonvm_native_collections::register_collections_natives(registry);
+}
+
+/// Every `(class, method, descriptor, kind)` row the boot path leaves in the
+/// registry, owned so the borrow of the registry can end.
+///
+/// `dump_registrations()` is the registry's public census API: one row per
+/// surviving registration, in registration order.
+fn census_rows() -> Vec<(String, String, String, NativeKind)> {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    registry
+        .dump_registrations()
+        .into_iter()
+        .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
+        .collect()
+}
+
+/// Build the default native registry the way the VM's real-JDK boot path does,
+/// and return `(synthetic_stub_count, total_registrations)`.
 fn census() -> (usize, usize) {
+    let rows = census_rows();
+    let synthetic = rows
+        .iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .count();
+    (synthetic, rows.len())
+}
+
+/// The old, essentials-only census, kept for exactly one purpose: to assert
+/// that [`census`] is a strict superset of it.
+///
+/// Without this, a future edit that quietly narrowed `register_boot_path` back
+/// to one pass would lower the count, look like an improvement, and re-open the
+/// blind spot this pair exists to close.
+fn essentials_only_census() -> (usize, usize) {
     let mut registry = NativeMethodRegistry::new();
     register_essential_natives(&mut registry);
-
-    // `dump_registrations()` is the registry's public census API: it yields one
-    // `(class, method, descriptor, NativeKind)` row per registration, in
-    // registration order. Count the `SyntheticStub` rows.
     let rows = registry.dump_registrations();
     let synthetic = rows
         .iter()
         .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
         .count();
     (synthetic, rows.len())
+}
+
+/// The census must cover strictly more than `register_essential_natives` alone.
+///
+/// This is the guard on the guard. The number it protects is not arbitrary: on
+/// 2026-08-05 the boot registry held 364 more `SyntheticStub` rows than the
+/// essentials registry, all of them in `native-collections`, and this gate was
+/// blind to every one.
+#[test]
+fn census_covers_more_than_the_essentials_registrar() {
+    let (boot_stubs, boot_total) = census();
+    let (ess_stubs, ess_total) = essentials_only_census();
+
+    println!(
+        "stub-ratchet(scope): boot {boot_stubs} stubs / {boot_total} rows vs \
+         essentials-only {ess_stubs} / {ess_total} \
+         (delta {} stubs, {} rows)",
+        boot_stubs - ess_stubs,
+        boot_total - ess_total,
+    );
+
+    assert!(
+        boot_total > ess_total && boot_stubs > ess_stubs,
+        "the boot census ({boot_stubs} stubs / {boot_total} rows) is no larger than \
+         `register_essential_natives` alone ({ess_stubs} / {ess_total}). Either a \
+         registration pass was dropped from `register_boot_path`, or the passes it \
+         adds have stopped registering anything — both re-open the blind spot that \
+         let 364 SyntheticStub rows sit outside this gate until 2026-08-05."
+    );
 }
 
 /// THE GATE: the synthetic-stub count must not exceed the frozen baseline.
@@ -156,7 +278,11 @@ fn essential_registry_is_populated() {
     // `total` above 100 and the ratchet green with far fewer stubs. This floor
     // sits well below the live count (9,320 as of 2026-07-30) so ordinary
     // churn does not trip it, but a collapse of the surface does.
-    const MIN_TOTAL_REGISTRATIONS: usize = 8_000;
+    // Raised 8,000 -> 11,000 on 2026-08-05 with the census scope. Against the
+    // 11,649-row boot registry the old floor would not have noticed losing the
+    // whole of `register_collections_natives` (2,279 rows) — the exact failure
+    // this test exists to detect. Keep it within ~5% of the live total.
+    const MIN_TOTAL_REGISTRATIONS: usize = 11_000;
     assert!(
         total >= MIN_TOTAL_REGISTRATIONS,
         "register_essential_natives produced only {total} registrations, below the \
@@ -185,7 +311,7 @@ fn essential_registry_is_populated() {
 //
 // The same zero-stub invariant is asserted against a hand-built synthetic mix
 // in `native-api/tests/jdk_only_registry.rs`; here it is asserted against the
-// real boot-path registrar, which is the one that has 165 stubs in it.
+// real boot-path registrar, which is the one that has 549 stubs in it.
 // ---------------------------------------------------------------------------
 
 /// Vacuity floor for the *strict* registry, mirroring `MIN_TOTAL_REGISTRATIONS`
@@ -198,36 +324,58 @@ fn essential_registry_is_populated() {
 /// registry ever drops under it, `set_compatibility_mode` is refusing far more
 /// than the stubs, and "zero synthetic stubs" would be true only because the
 /// registry is empty.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 7_500;
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_500;
 
 /// Build the default native registry the way `--jdk-only` does: set the
-/// VM-scoped strict policy *first*, then run the same public
-/// `register_essential_natives` entrypoint `vm/src/vm/vm_init.rs` calls on the
-/// real-JDK boot path.
+/// VM-scoped strict policy *first*, then run the same boot sequence
+/// `vm/src/vm/vm_init.rs` runs (see [`register_boot_path`]).
 ///
 /// Ordering is load-bearing and mirrors contract §8: a mode set *after*
 /// registration would leave every stub already in the table and make this whole
 /// section pass for the wrong reason.
 ///
-/// Returns `(synthetic_stub_count, total_registrations, refused_registrations)`.
-fn strict_census() -> (usize, usize, usize) {
+/// Returns `(synthetic_stub_count, total_registrations, refused_triples)`. The
+/// refusals are returned as triples, not a count: a triple registered by two
+/// passes is refused twice, so the count alone cannot be compared against
+/// surviving rows — see `strict_registry_drops_only_the_stubs`.
+fn strict_census() -> (usize, usize, Vec<(String, String, String)>) {
     let mut registry = NativeMethodRegistry::new();
     registry.set_compatibility_mode(CompatibilityMode::JdkOnly);
-    register_essential_natives(&mut registry);
+    // The same full boot sequence the compatibility census runs (see
+    // `register_boot_path`), not `register_essential_natives` alone — otherwise
+    // "strict mode refuses N registrations" is a count over a fraction of the
+    // registry, and the number this prints is not the number an operator sees
+    // in `--jdk-only-report`.
+    register_boot_path(&mut registry);
 
     let rows = registry.dump_registrations();
     let synthetic = rows
         .iter()
         .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
         .count();
-    (synthetic, rows.len(), registry.refused_registrations().len())
+    let total = rows.len();
+    drop(rows);
+    let refused = registry
+        .refused_registrations()
+        .iter()
+        .filter_map(|v| match v {
+            cratonvm_types::error::JdkOnlyViolation::SyntheticNativeRegistered {
+                class,
+                method,
+                descriptor,
+                ..
+            } => Some((class.clone(), method.clone(), descriptor.clone())),
+            _ => None,
+        })
+        .collect();
+    (synthetic, total, refused)
 }
 
 /// Acceptance criterion (contract §11): **the final native registry in strict
 /// mode contains zero `SyntheticStub` entries.**
 ///
 /// This passes *today*, and it is worth being precise about why: not because
-/// the 165 stubs are gone, but because `register()` refuses them at the door
+/// the 549 stubs are gone, but because `register()` refuses them at the door
 /// under `JdkOnly`. That is exactly the property CI's zero-stub census asserts
 /// against a booted VM, so it is worth pinning here too — it is the cheap,
 /// hermetic version of the same check, with no JDK image and no subprocess.
@@ -241,7 +389,8 @@ fn strict_registry_has_zero_synthetic_stubs() {
 
     println!(
         "stub-ratchet(strict): {strict_stubs} SyntheticStub registrations out of \
-         {strict_total} total; {refused} registrations refused by JdkOnly"
+         {strict_total} total; {} registrations refused by JdkOnly",
+        refused.len()
     );
 
     assert_eq!(
@@ -286,14 +435,20 @@ fn strict_registry_has_zero_synthetic_stubs() {
 /// `alias_class` call, which is churn, not regression.
 #[test]
 fn strict_registry_drops_only_the_stubs() {
-    let (compat_stubs, compat_total) = census();
-    let (_strict_stubs, strict_total, refused) = strict_census();
+    let compat_rows = census_rows();
+    let compat_total = compat_rows.len();
+    let compat_stubs = compat_rows
+        .iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .count();
+    let (_strict_stubs, strict_total, refused_triples) = strict_census();
 
     let dropped = compat_total.saturating_sub(strict_total);
 
     println!(
         "stub-ratchet(strict): compatible {compat_total} rows ({compat_stubs} stubs) \
-         -> strict {strict_total} rows; {dropped} rows dropped, {refused} refusals recorded"
+         -> strict {strict_total} rows; {dropped} rows dropped, {} refusals recorded",
+        refused_triples.len()
     );
 
     assert!(
@@ -311,13 +466,55 @@ fn strict_registry_drops_only_the_stubs() {
          the strict policy."
     );
 
-    assert!(
-        refused <= compat_stubs,
-        "{refused} registrations were refused but compatible mode only has \
-         {compat_stubs} SyntheticStub rows. A refusal with no corresponding stub \
-         means JdkOnly is rejecting a Bridge or an Intrinsic — SyntheticStub is the \
-         only kind it may reject (contract §4)."
-    );
+    // The property is CONTAINMENT, not a count comparison. `refused <=
+    // compat_stubs` was the old form and it is wrong once the census runs the
+    // real boot sequence: a triple registered by two passes — which the boot
+    // path does deliberately, `register_forkjoin_quiescence` overriding
+    // `register_concurrent_natives` by last-write-wins — yields ONE surviving
+    // row in compatible mode and TWO refusals in strict. On 2026-08-05 that read
+    // 598 refusals against 549 stub rows and failed a gate that was measuring
+    // nothing wrong.
+    //
+    // THE THIRD BOUND WAS DELETED ON 2026-08-05, DELIBERATELY. Do not re-add it
+    // without reading this.
+    //
+    // It asserted `refused <= compat_stubs`, justified as "a refusal with no
+    // corresponding stub means JdkOnly is rejecting a Bridge or an Intrinsic".
+    // The property is real — contract §4 — but it is **not observable from a
+    // differential census**, and the boot-path scope fix made that impossible to
+    // ignore. Three independent reasons, each measured:
+    //
+    //  1. **Refusal is per-ATTEMPT; the registry is per-TRIPLE.** A triple
+    //     registered by two passes yields ONE surviving compat row and TWO
+    //     refusals, so the counts are not comparable at all — 598 refusals
+    //     against 549 stub rows here, with nothing wrong.
+    //  2. **Compatible mode has drop rules of its own, and they run AFTER the
+    //     JdkOnly refusal in `register()`.** `drop_real_layout_synthetic` (which
+    //     `vm_init` sets, and which this census now mirrors) drops every
+    //     `java/util/EnumSet` native outright, so strict *records* a refusal for
+    //     `EnumSet.noneOf` while compat holds no row for it — neither surviving
+    //     nor overwritten. Both behaviours are correct.
+    //  3. **A triple can be registered with two different kinds.**
+    //     `java/nio/ByteBuffer.allocate(I)` is registered `SyntheticStub` by one
+    //     pass and non-stub by another, so it is simultaneously refused (the
+    //     stub attempt) and present in the strict registry (the other one).
+    //     Even "a refused triple is absent from the strict registry" is false.
+    //
+    // Reasons 2 and 3 are not fixable by a cleverer query: the registry does not
+    // retain the kind of every attempt, only of survivors plus one level of
+    // `overwrote`. A gate that cannot mean what it claims is decoration, and
+    // this feature has shipped three of those already — so it goes, rather than
+    // being weakened until it passes.
+    //
+    // The property is enforced where it belongs: structurally in `register()`,
+    // which refuses on `!current_category.allowed_in(JdkOnly)` and so can refuse
+    // no other kind by construction, and hermetically in
+    // `native-api/tests/jdk_only_registry.rs`, which asserts it against a
+    // hand-built kind mix where no drop rule can confound the answer.
+    //
+    // The two bounds above survive because both are counts over survivors on
+    // both sides, which duplicate registration and compat-side drops cannot
+    // skew in the direction they assert.
 
     assert!(
         strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS,
@@ -330,23 +527,23 @@ fn strict_registry_drops_only_the_stubs() {
 /// THE END-STATE GATE, deliberately `#[ignore]`d.
 ///
 /// [`strict_registry_has_zero_synthetic_stubs`] passes today for a weak reason:
-/// `register()` refuses the stubs at the door. The 165 registrations still
+/// `register()` refuses the stubs at the door. The 549 registrations still
 /// exist in `native-builtins/src/`, still run on every boot, and are still what
 /// an ordinary `--real-jdk` run dispatches into. **Refused is not retired.**
 ///
 /// This test asserts the strong property — strict mode has *nothing to refuse*
 /// — and stays ignored until all three of the following have landed:
 ///
-/// 1. **Reclassify or delete the 165 `SyntheticStub` registrations** in
+/// 1. **Reclassify or delete the 549 `SyntheticStub` registrations** in
 ///    `native-builtins/src/`, subsystem by subsystem: each one becomes a real
 ///    `Bridge`/`Intrinsic` because it genuinely crosses a VM boundary, or it
 ///    goes away so the real JDK bytecode runs. This is explicitly *not* wave 1
 ///    work (contract §8: "do not edit `native-builtins/src/lib.rs`; the
-///    165-stub reclassification is a separate wave with its own
+///    549-stub reclassification is a separate wave with its own
 ///    subsystem-per-PR discipline").
 /// 2. **Drive [`BASELINE_SYNTHETIC_STUBS`] to 0 in the same change** that
 ///    removes the last one. The ratchet is slack-free by design; leaving the
-///    baseline at 165 after the stubs are gone would silently re-admit 165 new
+///    baseline at 549 after the stubs are gone would silently re-admit 549 new
 ///    ones.
 /// 3. **Un-ignore this test** (delete the `#[ignore]`) so the zero is held,
 ///    and promote the CI `jdk-only` job from advisory to blocking, which is the
@@ -355,9 +552,10 @@ fn strict_registry_drops_only_the_stubs() {
 /// Until then it is run on demand:
 /// `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --ignored --nocapture`
 #[test]
-#[ignore = "wave 1 is measurement: the 165 stubs are refused at registration, not yet retired"]
+#[ignore = "wave 1 is measurement: the 549 stubs are refused at registration, not yet retired"]
 fn strict_mode_refuses_nothing() {
     let (_strict_stubs, _strict_total, refused) = strict_census();
+    let refused = refused.len();
 
     assert_eq!(
         refused, 0,
