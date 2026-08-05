@@ -11200,12 +11200,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11226,12 +11234,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11256,12 +11272,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11285,12 +11299,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11314,13 +11326,13 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            if from < 0 || size < 0 || from + size > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+            // Overflow-safe: `from + size` can wrap for large arguments, which
+            // is why the JDK's own message prints the addition unevaluated.
+            if from < 0 || size < 0 || (from as i64 + size as i64) > length as i64 {
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {from} + {size}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -36995,7 +37007,17 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/util/FormatterClosedException",
         "java/util/NoSuchElementException",
         "java/text/ParseException",
-        "java/util/regex/PatternSyntaxException",
+        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+        // list. It is the one exception here that OVERRIDES `getMessage()`:
+        // the JDK builds a three-line report ("Unclosed character class near
+        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+        // fields and never sets `Throwable.detailMessage`. A blanket
+        // `getMessage` bridge in front of that override returns the null
+        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+        // where HotSpot gives the full report. Its real constructor is
+        // `(String,String,int)V`, which is not among the `<init>` shapes
+        // registered here either, so every bridge this loop would add is
+        // either dead or actively wrong. Removed 2026-08-05.
         "java/util/InputMismatchException",
         "java/io/IOException",
         "java/io/FileNotFoundException",
