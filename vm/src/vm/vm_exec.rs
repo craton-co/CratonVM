@@ -3846,11 +3846,11 @@ impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
-    /// See `update_root_snapshot` (`vm/src/runtime/interpreter.rs`) for why the
-    /// operand-stack-sourced roots are filtered against `heap.is_object_address`:
-    /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
-    /// roots without heap validation (its file is restricted from edits), and
-    /// the resulting bogus addresses crash the GC at the next mark/move.
+    /// Operand-stack-sourced roots are filtered against `heap.is_heap_addr`
+    /// (alignment + arena containment) — the SAME screen `scan_local_objects`
+    /// applies to locals, and deliberately not the strict `is_object_address`
+    /// header probe. See `scan_frame_roots` in
+    /// `runtime/interpreter/gc_and_alloc.rs` for the full rationale.
     pub(crate) fn deposit_root_snapshot(&mut self) {
         // A thread that is about to PARK cannot consult its per-thread JIT memo
         // caches, but this deposit publishes them as GC roots — so any entry
@@ -3958,7 +3958,11 @@ impl<'a> NativeContextImpl<'a> {
                 let added = snapshot.split_off(before);
                 for o in added {
                     let addr = o.as_ptr() as usize;
-                    if self.shared.mem.heap.is_object_address(addr).is_some() {
+                    // `is_heap_addr`, not `is_object_address` — see
+                    // `scan_frame_roots`. This deposit is the collector's ONLY
+                    // view of the thread once it blocks, so a root dropped here
+                    // is an object reclaimed under a live frame slot.
+                    if self.shared.mem.heap.is_heap_addr(addr).is_some() {
                         snapshot.push(o);
                     }
                 }
@@ -4004,6 +4008,11 @@ impl<'a> NativeContextImpl<'a> {
             let mut origins = self.thread.gc_block_state.slot_origins.lock();
             origins.clear();
             for (fi, fr) in self.thread.frames.iter().enumerate() {
+                // Recorded per slot, not applied as a filter: every slot is
+                // still tracked and written back, but the fold's invariant
+                // check needs to know which of them the collector was actually
+                // obliged to keep. See `SlotOrigin::live`.
+                let live_mask = fr.live_locals_mask_here();
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
@@ -4011,6 +4020,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: li as u32,
                             is_stack: false,
+                            live: li >= 64 || live_mask & (1u64 << li) != 0,
                             orig: a,
                             cur: a,
                         });
@@ -4023,6 +4033,7 @@ impl<'a> NativeContextImpl<'a> {
                             frame: fi as u32,
                             idx: si as u32,
                             is_stack: true,
+                            live: true,
                             orig: a,
                             cur: a,
                         });
@@ -4176,6 +4187,74 @@ impl<'a> NativeContextImpl<'a> {
             });
         }
 
+        // DIAGNOSTIC (CRATONVM_DBG_BLOCKGC) — the deposit-side precondition of
+        // the blocked-frame stale-receiver family, checked WITHOUT needing the
+        // rare collection to land in the window.
+        //
+        // This snapshot is the ONLY view a cross-thread collector has of this
+        // thread while it is blocked. So a frame slot that decodes as
+        // `Value::Object(Some(_))`, is LIVE at this frame's pc, and is not in
+        // the snapshot, is an object the collector will not know to keep — and
+        // the owner will read it again on wake. `slot_origins` (recorded just
+        // above) cannot rescue it either: that tracker advances `cur` through
+        // each cycle's pointer map, and an object nothing rooted is never IN a
+        // pointer map.
+        //
+        // What can differ: this walk decodes a slot with `to_value()`, while
+        // the two publishing scans additionally consult the parallel kind
+        // marks (`Frame::local_kinds`, `ValueStack::kinds`) and skip a slot
+        // marked `long`/`double`, so the moving collector cannot relocate a
+        // pointer-shaped primitive. A slot whose kind mark and whose value tag
+        // DISAGREE therefore falls between the two, and is published by
+        // neither. Non-zero output here names that slot.
+        if blockgc_dbg() && raise_blocked_flag {
+            let published: rustc_hash::FxHashSet<usize> =
+                snapshot.iter().map(|r| r.as_ptr() as usize).collect();
+            let heap = &self.shared.mem.heap;
+            let mut gaps = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                let live_mask = fr.live_locals_mask_here();
+                let mut report = |what: &str, idx: usize, a: usize| {
+                    if published.contains(&a) || heap.is_heap_addr(a).is_none() {
+                        return;
+                    }
+                    gaps += 1;
+                    if gaps <= 8 {
+                        eprintln!(
+                            "[blockgc] UNPUBLISHED-LIVE-SLOT tid={} frame#{fi} {}.{} pc={} \
+                             {what}[{idx}] 0x{a:x} — a live object frame slot the blocking \
+                             deposit did not publish as a root",
+                            self.thread.thread_id.0,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.pc,
+                        );
+                    }
+                };
+                for li in 0..fr.locals_len() {
+                    if li < 64 && live_mask & (1u64 << li) == 0 {
+                        continue;
+                    }
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        report("local", li, o.as_ptr() as usize);
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        report("stack", si, o.as_ptr() as usize);
+                    }
+                }
+            }
+            if gaps > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} frames={} snapshot={} UNPUBLISHED-LIVE-SLOTS={}",
+                    self.thread.thread_id.0,
+                    self.thread.frames.len(),
+                    snapshot.len(),
+                    gaps,
+                );
+            }
+        }
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
         // thread can read where THIS thread is parked (cross-thread
