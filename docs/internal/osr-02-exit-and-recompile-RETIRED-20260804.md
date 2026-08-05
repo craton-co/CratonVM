@@ -382,6 +382,23 @@ and a run with no exits at all), and `spent-counter` is the opposite: a shape
 that must be **green**, pinning correction 3 so the over-strict rule cannot come
 back.
 
+### Verified on Linux, after the fact
+
+The merge that landed §8 (`988c1dee8`) says the Azure host was unreachable and
+its release arm was outstanding. It has since run, on a `dev` newer than that
+merge (`2572ea9afe`), and both halves are green there:
+
+| | |
+|---|---|
+| release build | `rc=0` |
+| comparator self-test | 8/8 |
+| frame differential | `OsrFrameProbe.kernel(I)J bci=7` — 20 000 ground-truth arrivals, 5 exits, advances **0..6**, `ok` |
+| exit differential | six arms byte-identical to HotSpot; `exit-test` and `exit-after-1` 88 entered / 86 exited, `exit-after-7` 87 / 85, **every exit at a true loop boundary**, both cross-check rows zero |
+
+So the caveat in that merge message is discharged; it is left in place because
+rewriting a pushed merge to make a claim look better is the opposite of the
+point.
+
 ### End to end, with the defect injected
 
 The comparison was run against a VM carrying the same injected defect as §2
