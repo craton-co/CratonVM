@@ -57,59 +57,77 @@ on this shared box it is often the only trustworthy one.
   memory-heavy rows more — so ratios, not absolute times, are the durable
   content across host re-provisionings.
 
-### Current table (all seven rows re-measured 2026-08-04)
+### Current table (all seven rows re-measured 2026-08-05)
 
-`dev` @ `12b8cbdea`, Azure EPYC bench host, JDK 25.0.3 both sides, `-Xmx8g`
+`dev` @ `ded183df8`, Azure EPYC bench host, JDK 25.0.3 both sides, `-Xmx8g`
 both sides, one phase per fresh process pinned to cpu 13, arms **alternated
 with the order flipped on alternate pairs**, 9 pairs per phase, no sample
 discarded, checksum verified against HotSpot on every single run (zero
-mismatches across all 126 runs). 1-minute load average 2.3–4.1 throughout —
-above the gate's own 2.0 ceiling, so the ratios are the durable content and
-the absolutes are this host on this day.
+mismatches). The window was opened only after the 1-minute load fell below 2.5
+**and** no other `cratonvm` process was pinned to the measuring core — the
+second check matters because two benchmarks timesharing one core is invisible
+in a load average, which is the trap this file's own methodology section
+warns about. Load ran 1.9–3.7 across the series.
 
 | Benchmark                         | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
 |-----------------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)               | 1,860 ms  | 3,641 ms  | 1.96x     | 0.4% | 2.44x |
-| Fibonacci(44)                     | 1,493 ms  | 8,612 ms  | 5.77x     | 1.8% | 2.79x |
-| Sieve (100K × 20,000)             | 2,412 ms  | 15,680 ms | 6.50x     | 0.4% | 2.28x |
-| Matrix 1280×1280                  | 2,124 ms  | 2,111 ms  | **0.99x** | 0.3% | 2.93x |
-| HashMap (10M put/get, isolated)   | 995 ms    | 2,060 ms  | 2.07x     | 0.4% | **1.75x** |
-| String/Regex (100K, isolated)     | 51 ms     | 285 ms    | 5.59x     | 1.1% | **7.7x** |
-| Binary Trees (depth 18, isolated) | 177 ms    | 1,690 ms  | 9.55x     | 7.6% | 8.34x |
+| Arithmetic (2B ops)               | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
+| Fibonacci(44)                     | 1,444 ms  | 8,503 ms  | 5.89x     | 3.5% | 2.79x |
+| Sieve (100K × 20,000)             | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
+| Matrix 1280×1280                  | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
+| HashMap (10M put/get, isolated)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | **1.75x** |
+| String/Regex (100K, isolated)     | 51 ms     | 274 ms    | 5.37x     | 1.1% | **7.7x** |
+| Binary Trees (depth 18, isolated) | 177 ms    | 1,674 ms  | 9.46x     | 0.4% | 8.34x |
 
 This replaces the 2026-07-18 table, whose rows were taken across four separate
-sessions on a host that has since been re-provisioned, and three of which this
+sessions on a host that has since been re-provisioned and three of which this
 document already flagged as unverified. Every row above comes from **one**
-interleaved series, so the rows are comparable to each other for the first
-time.
+interleaved series, so the rows are comparable to each other.
 
-**Sieve is a live regression that landed 2026-08-03 and is not the steady
-state.** The phase measured **2,350 ms** — faster than HotSpot — on the
-immediately preceding build. One method is the whole difference:
-`CratonBench.sieve([ZI)I` is admitted to the optimizing (C2/IR) pipeline on
-both builds, but only the newer one *produces a body* for it; before, it fell
-through to the single-pass backend. The IR body is **6.4x slower than the C1
-body it replaced**:
+**Two rows are at parity with HotSpot C2**: Matrix and Sieve.
 
-| build | sieve, 5 interleaved pairs | C2 reach for the phase |
-|---|---|---|
-| before (`cov-02` base) | 2,462 / 2,487 / 2,324 / 2,461 / 2,474 ms | 2 requests, 1 admitted, **0 bodies** |
-| after (`cov-02` arrays) | 15,949 / 15,805 / 15,662 / 15,922 / 15,823 ms | 2 requests, 1 admitted, **1 body** |
+### † Sieve: HotSpot is bimodal on this phase
 
-Checksums are identical on both, so this is throughput and not correctness. It
-is the case `docs/known-issues/c2/ir-coverage-survey-20260803.md` warns about
-in as many words — *"it does not say lowering these opcodes makes anything
-faster"* — arriving on the day the arms landed. Read the per-phase reach in any
-gate run's `manifest.tsv` (`ir_reach_<phase>`) before attributing a
-CratonBench delta to the optimizing tier; that record is what made this a
-one-step diagnosis.
+The Sieve row's HotSpot figure is the median of **18** samples pooled from two
+independent series, and the pooling is a correction rather than a convenience.
 
-**Fibonacci is NOT a `cov-*` regression.** Interleaved against the same
+HotSpot on this phase lands in one of two modes and nothing between them:
+
+| mode | n | median |
+|---|---:|---:|
+| fast | 10 | 2,369 ms |
+| slow | 8 | 2,739 ms |
+
+A 9-sample median therefore reports whichever mode won the coin toss: one
+series read **2,386 ms**, the next read **2,734 ms**, on an unchanged binary
+and an unchanged JDK. CratonVM's own 18 samples over the same runs are
+unimodal (2,276–2,498 ms, CV 2.3%).
+
+Pooled, the two are 2,376 against 2,402 — parity. Quoting the cleanest single
+series would have given **0.87x**, i.e. CratonVM 14% *faster* than HotSpot, and
+that number is an artefact of which mode the median fell in. Parity is what the
+data supports. **Do not re-derive this row from a single 9-sample run.**
+
+### Sieve was 6.50x yesterday
+
+That was a live regression, not a measurement problem, and it is fixed.
+`CratonBench.sieve([ZI)I` had begun receiving a body from the optimizing
+(C2/IR) tier where it previously fell through to the single-pass backend, which
+*vectorises* its `boolean[]` loops; the IR body was 6.4x slower than the C1
+body it replaced (2,462 ms → 15,823 ms, checksums identical). Fixed
+2026-08-04: the optimizing tier's admission chain now declines a method whose
+loops the single-pass backend would lower better, and the seven classes of
+lowering that backend has and the IR tier lacks are enumerated in
+`jit/src/x64/single_pass_only.rs` rather than discovered one regression at a
+time. Detail:
+[`docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`](docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md).
+
+**Fibonacci is not that, and is still unexplained.** Interleaved against a
 pre-`cov-02` control it measured 8,393–8,572 ms against the merged tree's
-8,402–8,533 ms — identical. Its distance from the July 4,790 ms figure predates
-all of this work and is unattributed.
+8,402–8,533 — identical — so its distance from the July 4,790 ms figure
+predates all of the `cov-*` work and is unattributed.
 
-Row notes (historical, from the table this replaced):
+Row notes (historical, from the table this replaced):Row notes (historical, from the table this replaced):
 
 - **RETRACTED 2026-07-30: the HashMap regression this table used to record
   (`22,077 ms`, `21.2x`, "CONFIRMED and bounded to `a36b9d121..e57f0bc7d`")
