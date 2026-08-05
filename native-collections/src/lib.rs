@@ -5599,21 +5599,19 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         }
         _ => None,
     };
-    // Secondary: a map that our natives never initialised but whose model slot
-    // an OLDER path populated — chiefly a fabricated backing that was later
-    // rebound to a real class. Costs one field read on the miss path only, and
-    // `buckets_slot == MAP_FIELD_BUCKETS` (the fabricated case) short-circuits
-    // it because the primary already read exactly that slot.
-    let hashtable_layout = uses_native_hashtable_layout(ctx, this);
-    let buckets = buckets_primary.or_else(|| {
-        if hashtable_layout || buckets_slot == MAP_FIELD_BUCKETS {
-            return None;
-        }
-        match ctx.get_field(this, MAP_FIELD_BUCKETS) {
-            Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
-            _ => None,
-        }
-    });
+    // No slot-0 secondary. A first cut kept one, for "a map some older path
+    // populated at the model slot", and the widened census answered that
+    // empirically: 50 reads across the probe set, every one of them returning
+    // `Int(0)` — an unset `AbstractMap.keySet` — and never an array. It was a
+    // read of the wrong field that could not succeed, so it is gone; the one
+    // writer of a bucket table is `publish_map_table`, which writes exactly
+    // the slot `map_buckets_slot` reads.
+    // `uses_native_hashtable_layout` is no longer consulted here: it existed to
+    // stop the slot-0 secondary from firing on a `Hashtable` (whose slot 0 IS
+    // its `table`, so the secondary would have re-read the primary). With the
+    // secondary gone, `map_buckets_slot` already answers 0 for that family for
+    // the right reason.
+    let buckets = buckets_primary;
     // Read the entry count from the slot the receiver declares for it — the
     // same question `set_map_size` asks, through the same function, so the two
     // cannot drift. See [`map_size_slot`].
