@@ -934,7 +934,6 @@ pub const INVENTORY: &[E] = &[
     // the single call site that reads both.
     E { group: Group::REAL, token: "annotations", on_key: Some("CRATONVM_REAL_ANNOTATIONS"), off_key: Some("CRATONVM_SYNTHETIC_ANNOTATIONS"), off_word: None },
     E { group: Group::REAL, token: "aqs", on_key: Some("CRATONVM_REAL_AQS"), off_key: Some("CRATONVM_SYNTHETIC_AQS"), off_word: None },
-    E { group: Group::REAL, token: "buffered-writer", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_BUFFERED_WRITER"), off_word: None },
     E { group: Group::REAL, token: "dsa", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_DSA"), off_word: None },
     E { group: Group::REAL, token: "ec", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EC"), off_word: None },
     E { group: Group::REAL, token: "eqe", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EQE"), off_word: None },
