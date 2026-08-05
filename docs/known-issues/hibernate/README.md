@@ -265,13 +265,27 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   page: it is the `ClassId(0)` family, now recorded as a fifth reproduction on
   `../h2/bug-h2-classid0-stale-address-family.md`.
 
-- **`OffsetDateTimeTest`** — SIGSEGV during JUnit discovery (`ReflectionUtils.findMethods`
-  / `LifecycleMethodUtils`), before any test body runs. Fault address `0x0E` (near-null)
-  with **zero GC cycles** having occurred in-process — explicitly ruled out as a witness
-  of the `ClassId(0)` stale-pointer family (see that doc's own two checks). Likely a JIT
-  codegen null-check bug in compiled reflection-heavy code. Single occurrence, not yet
-  confirmed deterministic. See
-  `offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805.md`.
+- ~~`OffsetDateTimeTest` — SIGSEGV during JUnit discovery~~ — **FIXED 2026-08-05**,
+  retired to
+  `../../internal/fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`.
+  Not the JIT codegen null-check bug the open page guessed: the null check is
+  emitted and it *passes* — the faulting register held `1`, and `1 + 0xC` is the
+  `0x0D`/`0x0E` fault address, an `int` delivered where an `Annotation[]` belongs.
+  The per-thread JIT dispatch memos are keyed on a `JitInvokeInfo` **address**, and
+  those boxes are freed with their `CompiledMethod`, so a recycled address let one
+  call site serve another's resolution — `NATIVE_SITE_CACHE` calling the previous
+  site's native (the SIGSEGV) and `VIRTUAL_TARGET_CACHE` resolving against the
+  previous site's class (`NoSuchMethodError: java.lang.Object.annotationType()`).
+  Four of the eight site-keyed memos were revalidated by neither trigger.
+  Reproduced at 20–45 % in ~2 s per run with `DiscoveryProbe` (discovery only —
+  note `@@DISCOVERED tests=0 containers=1` is the PASS signal for this
+  class-template, on HotSpot too); 0/60 after the fix against 7/20 on the pre-fix
+  binary, interleaved. The class now runs `found=488 ok=324 aborted=164`,
+  **byte-identical to a real-HotSpot control**, and is recorded in
+  `apps/hib-suite-runner/known-benign-aborts.tsv` alongside its three temporal
+  siblings. An unrelated API-fidelity defect fixed on the way —
+  `Class.getDeclaredAnnotations()` and every `getAnnotationsByType` built
+  `[Ljava.lang.Object;` arrays — is measured in that page as **not** the cause.
 
 - ~~`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT~~
   — **FIXED 2026-08-04**, retired to

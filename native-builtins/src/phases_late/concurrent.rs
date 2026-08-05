@@ -6599,11 +6599,12 @@ pub(crate) fn register_wp4_8_continuation_support(r: &mut NativeMethodRegistry) 
     //
     // Return false so newVirtualThread() falls back to BoundVirtualThread
     // (carrier-bound, no Continuation stack-switch required).
-    r.register(
+    r.register_with_kind(
         "jdk/internal/vm/ContinuationSupport",
         "isSupported0",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+        cratonvm_native_api::NativeKind::Bridge,
     );
     r.set_category(__prev_cat);
 }
@@ -6616,24 +6617,24 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
     // registerNatives() — JDK 25 calls this from <clinit> of VirtualThread.
     // Keep it as a no-op so the static initializer doesn't hit
     // UnsatisfiedLinkError and force a downstream class-init failure.
-    r.register(vt, "registerNatives", "()V", |_ctx, _args| Ok(None));
+    r.register_with_kind(vt, "registerNatives", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
 
     // JVMTI notification natives — called from the VirtualThread state
     // machine. They are pure JVMTI hooks; cratonvm doesn't have a JVMTI
     // agent attached to the virtual-thread mount/unmount lifecycle, so
     // no-ops are spec-correct.
-    r.register(vt, "notifyJvmtiStart", "()V", |_ctx, _args| Ok(None));
-    r.register(vt, "notifyJvmtiEnd", "()V", |_ctx, _args| Ok(None));
-    r.register(vt, "notifyJvmtiMount", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(vt, "notifyJvmtiUnmount", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(vt, "notifyJvmtiDisableSuspend", "(Z)V", |_ctx, _args| {
+    r.register_with_kind(vt, "notifyJvmtiStart", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(vt, "notifyJvmtiEnd", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(vt, "notifyJvmtiMount", "(Z)V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(vt, "notifyJvmtiUnmount", "(Z)V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(vt, "notifyJvmtiDisableSuspend", "(Z)V", |_ctx, _args| {
         Ok(None)
-    });
+    }, cratonvm_native_api::NativeKind::Bridge);
 
     // postPinnedEvent(String) — JFR pinned-event reporter. Funnel into the
     // existing cratonvm JFR pinned-thread emitter so pin reports surface
     // even when the JDK records them rather than our `Thread.sleep` shim.
-    r.register(
+    r.register_with_kind(
         vt,
         "postPinnedEvent",
         "(Ljava/lang/String;)V",
@@ -6661,6 +6662,7 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
             ctx.emit_virtual_thread_pinned_jfr(reason_static);
             Ok(None)
         },
+        cratonvm_native_api::NativeKind::Bridge,
     );
 
     // takeVirtualThreadListToUnblock — the JDK's unblocker service thread
@@ -6678,7 +6680,7 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
     // not wait for this thread to reach an interpreter safepoint. No object
     // refs are held across the sleep, so `end_blocking_region` needs no fixup
     // list.
-    r.register(
+    r.register_with_kind(
         vt,
         "takeVirtualThreadListToUnblock",
         "()Ljava/lang/VirtualThread;",
@@ -6688,6 +6690,7 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
             ctx.end_blocking_region();
             Ok(Some(Value::Object(None)))
         },
+        cratonvm_native_api::NativeKind::Bridge,
     );
     r.set_category(__prev_cat);
 }
@@ -6946,7 +6949,7 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
 
     // pin() — increment pin count on the continuation AND on the live
     // JvmThread so that any subsequent sleep/park emits `VirtualThreadPinned`.
-    r.register(cls, "pin", "()V", |ctx, args| {
+    r.register_with_kind(cls, "pin", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cur = match ctx.get_field(this, NEW15_CONT_PIN) {
             Value::Int(i) => i,
@@ -6955,10 +6958,10 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, NEW15_CONT_PIN, Value::Int(cur.saturating_add(1)));
         ctx.vt_pin("Continuation.pin");
         Ok(None)
-    });
+    }, cratonvm_native_api::NativeKind::Bridge);
 
     // unpin()
-    r.register(cls, "unpin", "()V", |ctx, args| {
+    r.register_with_kind(cls, "unpin", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cur = match ctx.get_field(this, NEW15_CONT_PIN) {
             Value::Int(i) => i,
@@ -6968,7 +6971,7 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, NEW15_CONT_PIN, Value::Int(next));
         ctx.vt_unpin();
         Ok(None)
-    });
+    }, cratonvm_native_api::NativeKind::Bridge);
 
     // isPinned()Z — static in the real JDK; both forms register.
     r.register(
