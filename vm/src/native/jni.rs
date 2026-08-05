@@ -5541,15 +5541,27 @@ extern "C" fn jni_register_natives(
         return JNI_OK;
     }
 
-    // Resolve the class name from the JClass mirror
+    // A `JClass` in this table IS a `ClassId` — that is what `FindClass`
+    // returns (`class_id.as_u32() as JClass`) and what GetSuperclass,
+    // IsAssignableFrom, GetFieldID, CallStaticXxxMethod and a dozen others
+    // decode with `ClassId::new(clazz as u32)`.
+    //
+    // This function decoded it as an OBJECT HANDLE instead, which is the one
+    // convention `FindClass` never produces. Every odd-numbered ClassId took
+    // the global-ref branch of `jobject_to_obj` and logged "handle 0x2cb not
+    // found in global ref table"; every even one failed the heap-address
+    // check. Either way `class_name` was None and RegisterNatives returned
+    // JNI_ERR — so the ENTIRE RegisterNatives path was dead for the canonical
+    // `FindClass` + `RegisterNatives` idiom that every JNI_OnLoad uses. It was
+    // invisible because the library still loads, the symbol-bound natives
+    // still resolve by name, and only the methods a library binds
+    // exclusively through RegisterNatives raise UnsatisfiedLinkError.
     let class_name = with_shared_vm(|shared| {
-        let oref = jobject_to_obj(clazz)?;
-        let class_id = shared.mem.heap.class_id_of(oref);
         shared
             .classes
             .class_manager
             .read()
-            .get_class(class_id)
+            .get_class(ClassId::new(clazz as u32))
             .map(|c| c.name.clone())
     })
     .flatten();
@@ -5583,9 +5595,13 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
     // Resolve the class name and remove all registered natives for it.
     // Since JNI_NATIVE_METHODS is keyed by hash, we need the class name
     // to reconstruct the keys. If we can't resolve the class, best-effort no-op.
+    //
+    // `JClass` is a `ClassId` here, matching `jni_register_natives` above and
+    // the rest of the table. Decoding it as an object handle made this a
+    // permanent no-op for anything `FindClass` returned, which paired with the
+    // same defect in RegisterNatives: neither half of the pair worked.
     let class_info = with_shared_vm(|shared| {
-        let oref = jobject_to_obj(clazz)?;
-        let class_id = shared.mem.heap.class_id_of(oref);
+        let class_id = ClassId::new(clazz as u32);
         shared
             .classes
             .class_manager

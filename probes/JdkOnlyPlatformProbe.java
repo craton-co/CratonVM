@@ -514,42 +514,42 @@ public class JdkOnlyPlatformProbe {
             failed++;
             return;
         }
+        // Accumulate, and print in a finally. Each call below exercises a
+        // DIFFERENT JNI family, so one unbound method must not erase the
+        // verdict on the ten before it: when the `$`-mangling defect was fixed,
+        // the failure moved from the first family to the last, and a section
+        // that printed only on full success could not show that the nine in
+        // between had started working.
+        StringBuilder sb = new StringBuilder("jni mapped=").append(mapped);
         try {
-            // Each of these exercises a different JNI family: the primitive
-            // call ABI, string conversion, primitive-array access, object-array
-            // access, field access, an upcall into Java, and exception
-            // propagation from native back to the caller.
-            int sum = JniProbe.add(40, 2);
-            long wide = JniProbe.mulLong(0x7fffffffL, 3L);
-            double dbl = JniProbe.scale(1.5, 4);
-            String rev = JniProbe.reverse("craton");
+            sb.append(" add=").append(JniProbe.add(40, 2));
+            sb.append(" mul=").append(JniProbe.mulLong(0x7fffffffL, 3L));
+            sb.append(" scale=").append(JniProbe.scale(1.5, 4));
+            sb.append(" rev=").append(JniProbe.reverse("craton"));
             int[] arr = {1, 2, 3, 4, 5};
-            int arrSum = JniProbe.sumInts(arr);
+            sb.append(" arrSum=").append(JniProbe.sumInts(arr));
+            sb.append(" abortKept=").append(Arrays.toString(arr));
             JniProbe.doubleInts(arr);
-            String joined = JniProbe.joinStrings(new String[]{"a", "b", "c"});
+            sb.append(" doubled=").append(Arrays.toString(arr));
+            sb.append(" join=").append(JniProbe.joinStrings(new String[]{"a", "b", "c"}));
             JniProbe holder = new JniProbe();
             holder.value = 7;
-            int fieldRead = JniProbe.readValue(holder);
+            sb.append(" field=").append(JniProbe.readValue(holder));
             JniProbe.writeValue(holder, 21);
-            int upcall = JniProbe.callBackTriple(9);
-            String thrown;
+            sb.append("->").append(holder.value);
+            sb.append(" upcall=").append(JniProbe.callBackTriple(9));
             try {
                 JniProbe.throwIse("from-native");
-                thrown = "<no-throw>";
+                sb.append(" throw=<no-throw>");
             } catch (IllegalStateException e) {
-                thrown = "ISE:" + e.getMessage();
+                sb.append(" throw=ISE:").append(e.getMessage());
             }
-            boolean registered = JniProbe.registeredNative(5) == 50;
-            System.out.println("jni mapped=" + mapped + " add=" + sum + " mul=" + wide
-                    + " scale=" + dbl + " rev=" + rev
-                    + " arrSum=" + arrSum + " doubled=" + Arrays.toString(arr)
-                    + " join=" + joined
-                    + " field=" + fieldRead + "->" + holder.value
-                    + " upcall=" + upcall + " throw=" + thrown
-                    + " registered=" + registered);
+            sb.append(" registered=").append(JniProbe.registeredNative(5) == 50);
         } catch (UnsatisfiedLinkError e) {
-            System.out.println("jni mapped=" + mapped + " unsatisfied=" + e.getMessage());
+            sb.append(" unsatisfied=").append(e.getMessage());
             failed++;
+        } finally {
+            System.out.println(sb);
         }
     }
 
