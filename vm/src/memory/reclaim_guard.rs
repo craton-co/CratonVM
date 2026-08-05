@@ -179,9 +179,25 @@ pub(crate) fn report_reclaimed_receiver(
     // `sweep_zero_lookup` below it is unconditional — so it answers on the
     // first occurrence instead of only on a re-run that was armed in advance
     // (and armed with a flag that changes which young collector runs).
-    if let Some((base, size, cycle, seq)) = cratonvm_gc::gen_heap::young_freed_lookup(addr) {
+    if let Some((base, size, cycle, seq, xt)) = cratonvm_gc::gen_heap::young_freed_lookup(addr) {
         static Y: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if Y.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_REPORTS {
+            // H2-CID0 (2026-08-05): the coverage of the sweep that freed THIS
+            // span, captured while that sweep ran. `xt_unclassified > 0` means
+            // it marked from a root set that provably omitted a still-RUNNING
+            // peer's JIT-frame oops, and the non-moving sweep then freed on
+            // `GC_FLAG_MARKED` alone — which is this defect, stated as a
+            // measurement rather than a hypothesis.
+            //
+            // `xt_passes = 0` is a THIRD reading, not a quiet version of zero
+            // unclassified: the take-over is gated on an `any_thread_in_jit()`
+            // hint, so zero passes means the scan never looked at all.
+            let (verdict, passes, taken, unclassified) = match xt {
+                Some((0, _, _)) => ("NEVER-LOOKED", 0, 0, 0),
+                Some((p, t, 0)) => ("complete", p, t, 0),
+                Some((p, t, u)) => ("INCOMPLETE", p, t, u),
+                None => ("not-captured", 0, 0, 0),
+            };
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 obj = format!("{addr:#x}"),
@@ -192,9 +208,15 @@ pub(crate) fn report_reclaimed_receiver(
                 interior_off = addr - base,
                 sweep_cycle = cycle,
                 free_seq = seq,
+                root_coverage = verdict,
+                xt_passes = passes,
+                xt_taken_over = taken,
+                xt_unclassified = unclassified,
                 "receiver is inside a YOUNG span the non-moving sweep zeroed and returned to \
                  the free list. The span is coalesced, so `freed_span` bounds the victim \
-                 rather than naming it.",
+                 rather than naming it. `root_coverage` is that sweep's cross-thread \
+                 coverage: INCOMPLETE means it freed on `GC_FLAG_MARKED` while a running \
+                 peer's JIT frames were in no root set.",
             );
         }
     }
