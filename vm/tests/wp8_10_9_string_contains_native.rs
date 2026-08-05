@@ -211,3 +211,138 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
         );
     }
 }
+
+
+/// The EXACT set of `java/lang/String` registrations that survive into a
+/// real-JDK registry -- two-sided, so the set cannot drift in either direction
+/// without somebody adjudicating the change.
+///
+/// # Why a two-sided pin, and not the two one-sided ones above
+///
+/// The tests above check that a named list is absent and another named list is
+/// present. Both passed while the drop was silently deleting **four**
+/// registrations nobody had thought to name:
+///
+/// * `checkBoundsBeginEnd` / `checkBoundsOffCount` -- the F4 workaround for a
+///   generic `Preconditions` override that throws the wrong exception class.
+///   Without them `"Hello, World".substring(-1)` raised
+///   `ArrayIndexOutOfBoundsException`, which `catch
+///   (StringIndexOutOfBoundsException)` does not catch;
+/// * `<init>(Ljava/lang/StringBuilder;)V` and its `AbstractStringBuilder`
+///   sibling -- DF05. Without them `new String(sb)`, for a builder holding
+///   seven characters, returned four: the real ctor's `Arrays.copyOfRange`
+///   reads this VM's `char[]`-backed builder one byte at a time. Silent
+///   content corruption, no exception anywhere.
+///
+/// Every one of those had a comment at its registration site saying exactly
+/// what breaks without it. A category-wide drop invalidates all such comments
+/// at once, and a test that only knows the names its author remembered cannot
+/// see that. This one fails on any triple entering or leaving the set, so
+/// "should this survive?" has to be answered rather than assumed.
+///
+/// Updating this list is expected when a `java/lang/String` native is added or
+/// retired. Updating it *without* deciding which side of contract 1.4 the
+/// triple falls on is the failure it exists to prevent.
+#[test]
+fn the_surviving_string_registration_set_is_exactly_this() {
+    let shared = shared();
+    let registry = &shared.natives.native_methods;
+    let mut actual: Vec<String> = registry
+        .dump_registrations()
+        .into_iter()
+        .filter(|(class, _, _, _)| *class == "java/lang/String")
+        .map(|(_, name, descriptor, kind)| format!("{kind:?} {name}{descriptor}"))
+        .collect();
+    actual.sort();
+    actual.dedup();
+    let rendered = actual.join("\n");
+
+    let expected = EXPECTED_SURVIVING_STRING_REGISTRATIONS.trim();
+    assert_eq!(
+        rendered.trim(),
+        expected,
+        "\nThe set of `java/lang/String` natives surviving into a real-JDK registry changed.\n\
+         \n\
+         A triple that DISAPPEARED is now handed to the real bytecode. Before accepting that, \
+         read the comment at its registration site: four of these exist because the \
+         bytecode's premise does not hold on this VM, and dropping them produced a wrong \
+         exception class and, in one case, silently corrupted string content.\n\
+         \n\
+         A triple that APPEARED is a native standing in front of real bytecode (contract \
+         1.4). It needs a review against `probes/StringPolicyMatrixProbe` and \
+         `register_with_kind(.., Intrinsic)` at its own site -- not an entry here.\n"
+    );
+}
+
+/// One line per surviving registration, `Kind name+descriptor`, sorted.
+const EXPECTED_SURVIVING_STRING_REGISTRATIONS: &str = "\
+Bridge intern()Ljava/lang/String;\n\
+Intrinsic <init>(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V\n\
+Intrinsic <init>(Ljava/lang/StringBuilder;)V\n\
+Intrinsic chars()Ljava/util/stream/IntStream;\n\
+Intrinsic checkBoundsBeginEnd(III)V\n\
+Intrinsic checkBoundsOffCount(III)I\n\
+Intrinsic codePointAt(I)I\n\
+Intrinsic codePointCount(II)I\n\
+Intrinsic codePoints()Ljava/util/stream/IntStream;\n\
+Intrinsic format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic format(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic formatted([Ljava/lang/Object;)Ljava/lang/String;\n\
+Intrinsic hashCode()I\n\
+Intrinsic indent(I)Ljava/lang/String;\n\
+Intrinsic isBlank()Z\n\
+Intrinsic lines()Ljava/util/stream/Stream;\n\
+Intrinsic matches(Ljava/lang/String;)Z\n\
+Intrinsic offsetByCodePoints(II)I\n\
+Intrinsic regionMatches(ILjava/lang/String;II)Z\n\
+Intrinsic regionMatches(ZILjava/lang/String;II)Z\n\
+Intrinsic repeat(I)Ljava/lang/String;\n\
+Intrinsic replace(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;\n\
+Intrinsic replaceAll(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\
+Intrinsic replaceFirst(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\
+Intrinsic transform(Ljava/util/function/Function;)Ljava/lang/Object;\n\
+Intrinsic valueOf(I)Ljava/lang/String;\n\
+Intrinsic valueOf(Ljava/lang/Object;)Ljava/lang/String;";
+
+
+/// The surviving JIT `StringLatin1.toLowerCase` direct bind is legal only
+/// because that triple is a registered `NativeKind::Intrinsic`. Pin it.
+///
+/// The forced-native `java/lang/String` record asked for BOTH `toLowerCase`
+/// ladders to be deleted. One was: `String.toLowerCase(Ljava/util/Locale;)`
+/// was the third copy of the policy -- `check_override` forced that name, the
+/// warm gate refused it, and the JIT bound it, so one method had three
+/// answers depending on where it was called from.
+///
+/// This one is different in a way that matters and is easy to lose: its triple
+/// really is registered `Intrinsic`, so baking a direct call to it is contract
+/// 1.4's reviewed exception rather than a native shadowing bytecode. It also
+/// accelerates the real `String.toLowerCase(Locale)` bytecode instead of
+/// standing in front of it, and its input is Latin-1 by construction, so it
+/// cannot reach the unpaired-surrogate cases that made the `String`-level
+/// native diverge from HotSpot.
+///
+/// `jit/src/lib.rs` matches that triple by NAME and cannot check its kind. So
+/// re-tagging the native `Bridge` -- including by omission, the ambient
+/// category being what it is -- would silently turn the bind into a 1.4
+/// violation observable ONLY from compiled frames, which is the hardest place
+/// to notice one. This test is the check the JIT cannot make.
+#[test]
+fn the_jit_latin1_lower_ladder_binds_a_reviewed_intrinsic() {
+    let shared = shared();
+    let kind = shared.natives.native_methods.kind_of(
+        "java/lang/StringLatin1",
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+    );
+    assert_eq!(
+        kind,
+        Some(cratonvm_native_api::NativeKind::Intrinsic),
+        "java/lang/StringLatin1.toLowerCase(String,byte[],Locale) is {kind:?}, and \
+         `jit/src/lib.rs` bakes a direct CALL to it by name. Only an `Intrinsic` may stand \
+         in front of concrete bytecode (contract 1.4); as a `Bridge` this bind becomes a \
+         violation that only compiled frames can observe. Either restore the kind or delete \
+         the ladder -- do not leave them disagreeing, which is exactly the state the \
+         forced-native `String` record was filed about."
+    );
+}

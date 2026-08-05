@@ -18,29 +18,37 @@ as ceremony.
 
 ## 1. Status of the published numbers
 
-> **Re-measured 2026-08-04.** All seven CPU rows were re-taken in ONE
-> interleaved series on `dev` @ `12b8cbdea` — §2's isolation, pinning,
+> **Re-measured 2026-08-05.** All seven CPU rows were re-taken in ONE
+> interleaved series on `dev` @ `ded183df8` — §2's isolation, pinning,
 > alternating-arm and no-discard rules, 9 pairs per phase, checksum verified
-> against HotSpot on all 126 runs, zero mismatches. They are no longer the
-> four-sessions-across-a-re-provisioned-host set this section was written
-> about, and the rows are comparable **to each other** for the first time.
+> against HotSpot on every run, zero mismatches. The window opened only once
+> the 1-minute load fell below 2.5 **and** no other `cratonvm` process was
+> pinned to the measuring core; §2.3's co-pinned-competitor check is the one a
+> load average cannot make for you. Load ran 1.9–3.7 across the series.
 >
-> **They are still not gate-certified.** The 1-minute load average was 2.3–4.1
-> and the gate refuses above 2.0, so `reliability-gate.sh` would not sign this
-> run off. Ratios are the durable content; absolute times are this host on
-> this day.
+> This is the first set that is both re-measured under the protocol and taken
+> in a quiet window. It is still not `reliability-gate.sh`-certified — that
+> gate's ceiling is 2.0 and the series drifted above it — so ratios remain the
+> durable content and absolutes are this host on this day.
 
-| Row | Ratio vs JDK 25 C2 (2026-08-04) | CratonVM CV | was | Status |
+| Row | Ratio vs JDK 25 C2 (2026-08-05) | CratonVM CV | was | Status |
 |---|---|---|---|---|
-| Arithmetic (2B ops) | 1.96x | 0.4% | 2.44x | re-measured, not gate-certified |
-| Fibonacci(44) | 5.77x | 1.8% | 2.79x | re-measured; distance from the July figure is unattributed and is **not** `cov-*` (checked against a control) |
-| Sieve (100K x 20,000) | 6.50x | 0.4% | 2.28x | re-measured; **live regression**, attributed to one method the optimizing tier began lowering on 2026-08-03 |
-| Matrix 1280x1280 | **0.99x** | 0.3% | 2.93x | re-measured — parity with C2 |
-| HashMap (10M put/get) | 2.07x | 0.4% | 1.75x | re-measured; the July row this replaced had itself replaced a RETRACTED one |
-| String/Regex (100K) | 5.59x | 1.1% | 7.7x | re-measured — the first honest number for this row since the session that produced 7.7x was discredited |
-| Binary Trees (depth 18) | 9.55x | 7.6% | 8.34x | re-measured; the only row whose CV exceeds the gate's 5% ceiling |
+| Arithmetic (2B ops) | 1.95x | 0.2% | 2.44x | re-measured in a quiet window |
+| Fibonacci(44) | 5.89x | 3.5% | 2.79x | re-measured; distance from the July figure is unattributed and is **not** `cov-*` (checked against a control) |
+| Sieve (100K x 20,000) | **0.99x** | 2.3% | 2.28x | re-measured — **parity**; the 6.50x of 2026-08-04 was a live regression, fixed |
+| Matrix 1280x1280 | **0.99x** | 0.2% | 2.93x | re-measured — parity with C2 |
+| HashMap (10M put/get) | 2.07x | 0.8% | 1.75x | re-measured; the July row this replaced had itself replaced a RETRACTED one |
+| String/Regex (100K) | 5.37x | 1.1% | 7.7x | re-measured — the first quiet-window number for this row since the session that produced 7.7x was discredited |
+| Binary Trees (depth 18) | 9.46x | 0.4% | 8.34x | re-measured; CV fell from 7.6% to 0.4% once the window was quiet |
 
-The two rows below are why this section existed, and both are now superseded by
+**One row's HotSpot arm is bimodal and must not be re-derived from a single
+run.** On Sieve, HotSpot lands either at ~2,369 ms or ~2,739 ms with nothing
+between; a 9-sample median reports whichever mode won. Two consecutive series
+on an unchanged binary read 2,386 ms and 2,734 ms. The table's figure is the
+median of 18 pooled samples. CratonVM's own samples on that phase are
+unimodal. See BENCHMARK.md.
+
+The two rows below are why this section existedThe two rows below are why this section existed, and both are now superseded by
 the series above. They are kept because the *failure modes* they record are the
 reason every check in the reliability gate exists:
 
