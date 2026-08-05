@@ -5,7 +5,7 @@
 | **Status** | ✅ RESOLVED 2026-08-05. Root-caused, fixed, and re-baselined. Retired from `docs/known-issues/`. |
 | **Area** | `vm/tests/interpreter_tests.rs` (the `CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1` corpus) |
 | **Original symptom** | Opting in yielded `710 passed; 214 failed` serially, and `STATUS_ACCESS_VIOLATION` / SIGSEGV in the default parallel run. |
-| **Now** | `924 passed; 0 failed` serially, and no crash in a full-parallel run, with 16 measured synthetic-library gaps pinned in `KNOWN_SYNTHETIC_JDK_GAPS`. |
+| **Now** | `924 passed; 0 failed` serially, and no crash in a full-parallel run, against two pinned lists: 5 real synthetic-library gaps and 11 order-dependent failures. |
 
 ## What the original triage got wrong
 
@@ -143,14 +143,27 @@ Both live in `require_extended_interpreter_tests`:
    unbuildable source stages nothing — which is how the corpus stayed dark
    until `f715d1367`, printing a green `924 passed` that had run none of it.
 
-## The pinned baseline
+## The pinned baseline — and why it is two lists
 
-`KNOWN_SYNTHETIC_JDK_GAPS` in `vm/tests/interpreter_tests.rs` lists the 16
-remaining `(class, method)` pairs, each verified against real JDK 25. It is a
+The 16 remaining `(class, method)` pairs were each verified against real JDK 25,
+and then verified a second way: **run alone** in a fresh process, via
+`--exact <test>`. Eleven of them PASS that way. They are not missing features —
+the feature works when nothing else has run first — so they moved to
+`KNOWN_ORDER_DEPENDENT` and are tracked as the non-fatal tail of the very
+VM-lifecycle defect this document is about
+(`docs/known-issues/corpus-is-order-dependent-20260805.md`).
+
+That leaves **5** genuine gaps in `KNOWN_SYNTHETIC_JDK_GAPS`, all in the
+`java.lang.reflect.Proxy` / annotation-proxy surface
+(`docs/known-issues/synthetic-jdk-class-library-gaps-20260802.md`). It is a
 **two-way** gate: an unlisted mismatch fails the run, and a listed pair that
-starts passing also fails the run, telling you to delete the entry. See
-`docs/known-issues/synthetic-jdk-class-library-gaps-20260802.md` for what is
-still open and why.
+starts passing also fails the run, telling you to delete the entry.
+`KNOWN_ORDER_DEPENDENT` deliberately does not trip on an unexpected pass,
+because execution order decides it.
+
+The second check is the transferable part. "Fails in the suite" and "is a
+missing feature" are different claims, and eleven of sixteen entries here were
+the first without being the second.
 
 ## Reproducing (current)
 
