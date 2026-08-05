@@ -177,10 +177,23 @@ defined through two independent custom loaders. Base and fix outputs are
 identical in both modes. Both census probes' stdout is identical between the
 arms apart from an ephemeral port number.
 
-`cargo test -p cratonvm-native-builtins --lib`, default features **and**
-`--features synthetic-jdk`. Both configurations are required: the constructor
-natives are registered only under `synthetic-jdk`, so one alone does not
-exercise them.
+`cargo test --release -p cratonvm-native-builtins --lib` at the merge commit
+`203ea6e9a`, in **both** feature configurations — 3,264 default and 3,439 with
+`--features synthetic-jdk`, 0 failed in each. Both configurations are required:
+the constructor natives are registered only under `synthetic-jdk`, so one alone
+does not exercise them. Also green in debug on Windows and on Azure Linux
+(3,269 default).
+
+> A note for whoever runs this gate next. On dev **after** this lane merged,
+> `net_phase_e::tests::re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout`
+> is RED. It is not L1's: the test is green at `a12b0200c` (dev immediately
+> before this merge) AND at `203ea6e9a` (this merge), and L1 touches no line of
+> `net_phase_e.rs`. It went red when the `InetAddress` hostName work landed
+> afterwards — that change makes `getByAddress` carry no hostName on purpose
+> ("an absent hostName must be a genuine `null`, not an empty String", which is
+> what HotSpot does), and the test still asserts the old pair. Its owner's
+> oracle to update, not this lane's; rewriting someone else's assertion to
+> match their new implementation is how a divergence gets frozen.
 
 The layout predicate is shown to FAIL: a test injects the real JDK's own
 private field names and asserts the answer flips. An inert predicate is the
