@@ -5189,6 +5189,44 @@ impl NativeMethodRegistry {
                         "submit",
                         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
                     )
+                    // `awaitQuiescence` was in the interpreter's
+                    // `is_forkjoin_native_override` list but NOT here, so the
+                    // registration was dropped and the interpreter's "force the
+                    // native" had no native to force: the call fell through to
+                    // real bytecode and answered "quiescent" immediately while
+                    // an `execute(Runnable)` daemon thread was still running.
+                    // A `--dump-native-registry` census (no awaitQuiescence
+                    // row) plus a probe observing `execute(slow);
+                    // awaitQuiescence()` with ran=0 where HotSpot reports
+                    // ran=1 is what surfaced it. The two lists must agree
+                    // entry-for-entry — a name present in only one of them is
+                    // silently inert.
+                    | ("awaitQuiescence", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    // BULK SUBMISSION — see the matching block in
+                    // `is_forkjoin_native_override`. `invokeAll(Collection)` is
+                    // the overload Weld's `ConcurrentBeanDeployer` calls and was
+                    // on neither list, which failed the entire hibernate
+                    // `org.hibernate.orm.test.cdi.*` cluster. `invokeAny` was
+                    // uncovered too and failed SILENTLY (ran the callables,
+                    // returned null); `lazySubmit` threw like invokeAll.
+                    | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/List;")
+                    | (
+                        "invokeAll",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/util/List;",
+                    )
+                    | (
+                        "invokeAllUninterruptibly",
+                        "(Ljava/util/Collection;)Ljava/util/List;",
+                    )
+                    | ("invokeAny", "(Ljava/util/Collection;)Ljava/lang/Object;")
+                    | (
+                        "invokeAny",
+                        "(Ljava/util/Collection;JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+                    )
+                    | (
+                        "lazySubmit",
+                        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
             );
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
@@ -5230,6 +5268,10 @@ impl NativeMethodRegistry {
                     | ("isCancelled", "()Z")
                     | ("cancel", "(Z)Z")
                     | ("complete", "(Ljava/lang/Object;)V")
+                    // Reads the throwable the side table records for an
+                    // abnormally completed task, so it cannot disagree with
+                    // join()/get() about whether the task failed.
+                    | ("getException", "()Ljava/lang/Throwable;")
             );
         if real_forkjoinpool_enabled()
             && matches!(
