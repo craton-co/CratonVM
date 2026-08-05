@@ -357,6 +357,41 @@ pub(crate) fn report_root_slice_provenance(
         .last()
         .map(|f| format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc))
         .unwrap_or_else(|| "<no frame>".to_string());
+    // Where the address sits in the frames, and why a root scan might have
+    // skipped it. `kind` is the `local_kinds` mark (LONG/DOUBLE => skipped
+    // outright); `live` is the per-bci liveness bit the same scan filters on.
+    let mut holder = String::from("<not found in frames>");
+    'outer: for (fi, fr) in thread.frames.iter().enumerate() {
+        let mask = fr.live_locals_mask_here();
+        for li in 0..fr.locals_len() {
+            if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                if o.as_ptr() as usize == addr {
+                    holder = format!(
+                        "frame#{fi} {}.{} pc={} local[{li}] kind={} live={}",
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                        fr.local_kind_at(li),
+                        li >= 64 || mask & (1u64 << li) != 0,
+                    );
+                    break 'outer;
+                }
+            }
+        }
+        for si in 0..fr.stack.len() {
+            if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                if o.as_ptr() as usize == addr {
+                    holder = format!(
+                        "frame#{fi} {}.{} pc={} stack[{si}]",
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                    );
+                    break 'outer;
+                }
+            }
+        }
+    }
     let (publish_cc, publish_pc) = last_root_publish();
     tracing::error!(
         target: "cratonvm::gc::guard",
@@ -371,6 +406,7 @@ pub(crate) fn report_root_slice_provenance(
         last_publish_at_collection = publish_cc,
         collections_now = collections_now,
         last_publish_pc = publish_pc,
+        holder = %holder,
         in_blocked_region = blocked,
         frames = thread.frames.len(),
         top_frame = %top,
