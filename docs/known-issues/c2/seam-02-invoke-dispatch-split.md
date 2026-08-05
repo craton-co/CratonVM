@@ -1,13 +1,13 @@
 # SEAM-02 — split the interpreter dispatch files (24,474 + 26,049 lines)
 
-**Status:** not started. **Owns:** `vm/src/runtime/interpreter.rs`,
+**Status:** not started. **Owns:** `../../../vm/src/runtime/interpreter.rs`,
 `vm/src/runtime/interpreter/*`. **Independent of `seam-01`** — different crate,
 no shared file.
 
 ## Why
 
-`vm/src/runtime/interpreter/invoke.rs` is 24,474 lines and
-`vm/src/runtime/interpreter.rs` is 26,049. Costs observed this campaign, all
+`../../../vm/src/runtime/interpreter/invoke.rs` is 24,474 lines and
+`../../../vm/src/runtime/interpreter.rs` is 26,049. Costs observed this campaign, all
 specific:
 
 * The JVMTI delivery lane's handover census said "~15 call sites in
@@ -44,7 +44,7 @@ second-door bug exploited.
 ## How to do it without breaking anything
 
 Pure moves, one seam per commit, `vm` suite green at each step. Note that
-`vm/src/lib.rs` is `#![deny(deprecated)]`, so a move that makes a deprecated
+`../../../vm/src/lib.rs` is `#![deny(deprecated)]`, so a move that makes a deprecated
 call newly visible fails the build rather than warning — that is a feature
 here, but it will surprise you once.
 

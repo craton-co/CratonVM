@@ -3,7 +3,7 @@
 
 //! Phase 50-54 native method registrations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
@@ -12094,15 +12094,63 @@ fn p52_hex_val(b: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // java.net.InetSocketAddress — holder-shaped synthetic
 // ---------------------------------------------------------------------------
+/// `InetSocketAddress`'s `checkPort` — the JDK rejects a port outside
+/// `[0, 65535]` with `IllegalArgumentException` from EVERY constructor
+/// (`InetSocketAddressHolder` runs it before storing anything). Ours accepted
+/// any `int` silently, so `new InetSocketAddress(-1)` produced a socket address
+/// with a negative port instead of failing where the caller could see it — and
+/// a bind through it then failed much later with an unrelated OS error.
+fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    if !(0..=0xFFFF).contains(&port) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("port out of range:{port}"),
+        }
+        .into());
+    }
+    Ok(port)
+}
+
 fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) {
-    let holder =
-        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
-    ctx.set_field(holder, 0, host);
-    ctx.set_field(holder, 1, addr);
-    ctx.set_field(holder, 2, Value::Int(port));
-    ctx.set_field(this, 0, Value::Object(Some(holder)));
-    ctx.set_field(this, 1, Value::Int(port));
-    ctx.set_field(this, 2, addr);
+    // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
+    // (and on a cold VM also loads + initialises the holder class), so `this`,
+    // `host` and `addr` can all relocate across it. Writing them back through
+    // the pre-call locals stored a VACATED from-space reference into the
+    // holder's `addr` slot, which read back as **null** while `isUnresolved()`
+    // still answered false — the exact pair that let `ServerSocket.bind` walk
+    // past its own unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`
+    // (`addr.isLinkLocalAddress()`).
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let host_h = match host {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let addr_h = match addr {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let holder = alloc_concurrent_synthetic(
+        &mut *scope,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    );
+    let holder_h = scope.root(holder);
+    let host_cur = match &host_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => host,
+    };
+    let addr_cur = match &addr_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => addr,
+    };
+    let holder_cur = scope.get(&holder_h);
+    scope.set_field(holder_cur, 0, host_cur);
+    scope.set_field(holder_cur, 1, addr_cur);
+    scope.set_field(holder_cur, 2, Value::Int(port));
+    let this_cur = scope.get(&this_h);
+    scope.set_field(this_cur, 0, Value::Object(Some(holder_cur)));
+    scope.set_field(this_cur, 1, Value::Int(port));
+    scope.set_field(this_cur, 2, addr_cur);
 }
 
 fn p52_isa_host_from_addr(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Value {
@@ -12147,27 +12195,74 @@ fn p52_isa_host_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
             }
         }
         Value::Object(None) => {}
-        other => return other,
+        // A PRIMITIVE in slot 0. This native is registered as
+        // `()Ljava/lang/String;`, so returning it hands bytecode about to
+        // `areturn`/`checkcast` a String an `Int` — unsound, and the same
+        // descriptor hazard `lang_misc::enum_constant_name` documents. A
+        // zeroed or out-of-range slot decodes as `Value::Int(0)`, so this arm
+        // is reachable on any receiver this family did not construct.
+        _ => {}
     }
     Value::Object(Some(ctx.create_string("0.0.0.0")))
 }
 
 fn p52_isa_port_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    // Same bound as `p52_isa_addr_value`: a real-layout `InetSocketAddress` has
+    // ONE field, so the legacy slot-1 fallback is an out-of-range read there.
+    // Reading it back as the port produced a plausible-looking small integer
+    // from whatever the zeroed slot decodes to.
+    let legacy_port = |ctx: &mut dyn NativeContext| {
+        if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                v @ Value::Int(_) | v @ Value::Long(_) => v,
+                _ => Value::Int(0),
+            }
+        } else {
+            Value::Int(0)
+        }
+    };
     match ctx.get_field(this, 0) {
         Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => {
             match ctx.get_field(holder, 2) {
                 v @ Value::Int(_) | v @ Value::Long(_) => v,
-                _ => ctx.get_field(this, 1),
+                _ => legacy_port(ctx),
             }
         }
-        _ => ctx.get_field(this, 1),
+        _ => legacy_port(ctx),
     }
 }
 
+/// The `addr` an `InetSocketAddress` carries, or `Object(None)`.
+///
+/// The legacy-layout fallback (slot 2) must never manufacture a NON-null answer
+/// out of a slot that cannot hold an address. A real-layout `InetSocketAddress`
+/// declares exactly ONE instance field (`holder`), so slot 2 is out of range,
+/// and an out-of-range/zeroed read decodes as `Value::Int(0)` — which is not
+/// `Object(None)`, so `isUnresolved()` answered **false** while `getAddress()`
+/// answered **null**. `ServerSocket.bind` tests exactly that pair:
+///
+/// ```java
+/// if (epoint.isUnresolved()) throw new SocketException("Unresolved address");
+/// impl.bind(epoint.getAddress(), epoint.getPort());
+/// ```
+///
+/// so the disagreement is what let a null address past the guard and two frames
+/// on into `sun.nio.ch.Net.bind`'s `addr.isLinkLocalAddress()`. Any non-reference
+/// result now reads as unresolved, which is both truthful and a far better
+/// diagnostic (`SocketException` at the guard, not an NPE inside the JDK).
 fn p52_isa_addr_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match ctx.get_field(this, 0) {
-        Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => ctx.get_field(holder, 1),
-        _ => ctx.get_field(this, 2),
+        Value::Object(Some(holder)) if p52_is_isa_holder(ctx, holder) => {
+            match ctx.get_field(holder, 1) {
+                v @ Value::Object(_) => v,
+                _ => Value::Object(None),
+            }
+        }
+        _ if ctx.object_num_fields(this) > 2 => match ctx.get_field(this, 2) {
+            v @ Value::Object(_) => v,
+            _ => Value::Object(None),
+        },
+        _ => Value::Object(None),
     }
 }
 
@@ -12177,21 +12272,42 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     let isa = "java/net/InetSocketAddress";
     r.register(isa, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let port = args[1].as_int().unwrap_or(0);
+        let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
         // `new InetSocketAddress(port)` delegates to the `(InetAddress, int)`
         // constructor with a null address. The JDK substitutes the resolved
         // wildcard address rather than creating an unresolved socket address.
         // Keeping this null made `getAddress()` return null and caused
         // RecordableServerHttpRequestTests.getRemoteAddress() to NPE.
-        let addr = crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0");
-        let host = p52_isa_host_from_addr(ctx, addr);
-        p52_isa_set(ctx, this, host, Value::Object(Some(addr)), port);
+        //
+        // Cross-call GC-safety: `alloc_inet_address_external` and
+        // `p52_isa_host_from_addr` both allocate — on a cold VM the first also
+        // initialises the whole `java.net.InetAddress` hierarchy — so `this`
+        // and `addr` are rooted across them. Without this the FIRST
+        // `new InetSocketAddress(0)` of a GC-stressed run answered
+        // `getAddress() == null`, which is how `new ServerSocket(0)` reached
+        // `Net.bind` with a null address.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let addr =
+            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0");
+        let addr_h = scope.root(addr);
+        let addr_cur = scope.get(&addr_h);
+        let host = p52_isa_host_from_addr(&mut *scope, addr_cur);
+        let this_cur = scope.get(&this_h);
+        let addr_cur = scope.get(&addr_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            host,
+            Value::Object(Some(addr_cur)),
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
-        let port = args[2].as_int().unwrap_or(0);
+        let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
         // Real JDK resolves the hostname via `InetAddress.getByName(host)`
         // here, falling back to an unresolved address only on
         // UnknownHostException. Leaving `addr` unconditionally null made
@@ -12203,15 +12319,29 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         // string), which in turn NPE'd `RemoteCIDRValve.isAllowed` on any
         // Tomcat context configured with that valve (e.g. the examples
         // webapp's `META-INF/context.xml`).
-        let host_str = ctx.read_string(host).unwrap_or_default();
-        let addr = crate::net_phase_e::resolve_host_external(&host_str)
-            .map(|ip| {
-                Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
-                    ctx, &host_str, &ip,
-                )))
-            })
-            .unwrap_or(Value::Object(None));
-        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
+        // Cross-call GC-safety: `alloc_inet_address_external` allocates, so
+        // `this` and the host String are rooted across it.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let host_h = scope.root(host);
+        let host_str = scope.read_string(host).unwrap_or_default();
+        let addr = match crate::net_phase_e::resolve_host_external(&host_str) {
+            Some(ip) => Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+                &mut *scope,
+                &host_str,
+                &ip,
+            ))),
+            None => Value::Object(None),
+        };
+        let this_cur = scope.get(&this_h);
+        let host_cur = scope.get(&host_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            Value::Object(Some(host_cur)),
+            addr,
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -12220,13 +12350,38 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         // substitutes InetAddress.anyLocalAddress(). Tomcat's NioEndpoint
         // relies on that for an unspecified bind address; rejecting it here
         // leaves the connector FAILED before it can allocate an ephemeral port.
+        //
+        // The port is validated BEFORE the wildcard is materialised: the JDK
+        // runs `checkPort` inside the holder constructor, so an out-of-range
+        // port throws `IllegalArgumentException` and no address is resolved.
+        let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
+        // Cross-call GC-safety: the wildcard branch allocates (and initialises
+        // the InetAddress hierarchy on a cold VM), so `this` is rooted across
+        // it. This constructor is the one `ServerSocket(int, int, InetAddress)`
+        // uses with a null `bindAddr`, and it is where `new ServerSocket(0)`
+        // acquired the null address that NPE'd `sun.nio.ch.Net.bind`.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
         let addr = match args.get(1) {
             Some(Value::Object(Some(addr))) => *addr,
-            _ => crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0"),
+            _ => crate::net_phase_e::alloc_inet_address_external(
+                &mut *scope,
+                "0.0.0.0",
+                "0.0.0.0",
+            ),
         };
-        let port = args[2].as_int().unwrap_or(0);
-        let host_val = p52_isa_host_from_addr(ctx, addr);
-        p52_isa_set(ctx, this, host_val, Value::Object(Some(addr)), port);
+        let addr_h = scope.root(addr);
+        let addr_cur = scope.get(&addr_h);
+        let host_val = p52_isa_host_from_addr(&mut *scope, addr_cur);
+        let this_cur = scope.get(&this_h);
+        let addr_cur = scope.get(&addr_h);
+        p52_isa_set(
+            &mut *scope,
+            this_cur,
+            host_val,
+            Value::Object(Some(addr_cur)),
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -12235,16 +12390,22 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         "(Ljava/lang/String;I)Ljava/net/InetSocketAddress;",
         |ctx, args| {
             let host = obj_arg(args, 0)?;
-            let port = args[1].as_int().unwrap_or(0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
+            let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
+            // Cross-call GC-safety: the allocation below can move `host`.
+            let mut scope = NativeHandleScope::new(ctx);
+            let host_h = scope.root(host);
+            let obj = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 3);
+            let obj_h = scope.root(obj);
+            let obj_cur = scope.get(&obj_h);
+            let host_cur = scope.get(&host_h);
             p52_isa_set(
-                ctx,
-                obj,
-                Value::Object(Some(host)),
+                &mut *scope,
+                obj_cur,
+                Value::Object(Some(host_cur)),
                 Value::Object(None),
                 port,
             );
-            Ok(Some(Value::Object(Some(obj))))
+            Ok(Some(Value::Object(Some(scope.get(&obj_h)))))
         },
     );
     r.register(isa, "getHostName", "()Ljava/lang/String;", |ctx, args| {
@@ -12285,7 +12446,30 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             "0.0.0.0".to_string()
         };
         let port = p52_isa_port_value(ctx, this).as_int().unwrap_or(0);
-        let s = ctx.create_string(&format!("{host_str}:{port}"));
+        // HotSpot renders `InetSocketAddressHolder.toString()`:
+        //   unresolved → `hostname + "/<unresolved>"`
+        //   resolved   → `addr.toString()`, i.e. `hostName + "/" + ip`, with an
+        //                Inet6Address's numeric part bracketed
+        // and then appends `":" + port`. We used to emit a bare `host:port`,
+        // which loses the `/`-separated address entirely and — worse — makes an
+        // UNRESOLVED address print exactly like a resolved one, so a log line
+        // could not distinguish `createUnresolved("h", 80)` from a real
+        // endpoint. Reference: `probes/ServerSocketNullInetAddressProbe.java`,
+        // diffed against HotSpot 25.0.3+9.
+        let rendered = match p52_isa_addr_value(ctx, this) {
+            Value::Object(Some(addr)) => {
+                let (h, ip) = crate::net_phase_e::inet_addr_resolve_external(ctx, addr)
+                    .unwrap_or_else(|| (host_str.clone(), host_str.clone()));
+                let ip_part = if ip.contains(':') {
+                    format!("[{ip}]")
+                } else {
+                    ip
+                };
+                format!("{h}/{ip_part}")
+            }
+            _ => format!("{host_str}/<unresolved>"),
+        };
+        let s = ctx.create_string(&format!("{rendered}:{port}"));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(isa, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {

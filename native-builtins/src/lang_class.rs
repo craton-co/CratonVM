@@ -4,7 +4,8 @@
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
 use cratonvm_native_api::{
-    AnnotationData, FieldMetadata, MethodMetadata, NativeContext, TypeArgAnnotations,
+    AnnotationData, FieldMetadata, MethodMetadata, NativeContext, NativeHandleScope,
+    TypeArgAnnotations,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -16661,11 +16662,29 @@ pub(crate) fn native_class_get_enum_constants(
     // `ConfigException: Invalid value PLAINTEXT for configuration
     // security.inter.broker.protocol: String must be one of: `).
     let len = ctx.array_length(src_arr);
-    let out = ctx.new_ref_array(class_id, len);
+    // Cross-call GC-safety (2026-08-04): `new_ref_array` ALLOCATES, and a
+    // moving young collection there relocates `$VALUES`. Reading the source
+    // elements back through the pre-allocation `src_arr` then walks a vacated
+    // from-space array and copies nulls, so `getEnumConstants()` handed back a
+    // correctly-SIZED array of nulls — and `Enum.valueOf`, which scans it,
+    // threw `IllegalArgumentException: No enum constant <NAME>` for a constant
+    // that plainly exists. Reproduced under `CRATONVM_GC=stress=65536` as
+    // `jdk/internal/util/OperatingSystem.<clinit>` → `valueOf("WINDOWS")`
+    // failing inside `sun/nio/ch/Net.<clinit>`, which made `new ServerSocket(0)`
+    // die with `ExceptionInInitializerError` under `CRATONVM_REAL=net-sockets`
+    // (see serversocket-bind-null-inetaddress-net-sockets, 2026-08-03).
+    // Root both arrays and re-read them around every allocating call.
+    let mut scope = NativeHandleScope::new(ctx);
+    let src_h = scope.root(src_arr);
+    let out_arr = scope.new_ref_array(class_id, len);
+    let out_h = scope.root(out_arr);
     for i in 0..len {
-        let v = ctx.get_array_element(src_arr, i);
-        ctx.set_array_element(out, i, v);
+        let src_cur = scope.get(&src_h);
+        let v = scope.get_array_element(src_cur, i);
+        let out_cur = scope.get(&out_h);
+        scope.set_array_element(out_cur, i, v);
     }
+    let out = scope.get(&out_h);
     Ok(Some(Value::Object(Some(out))))
 }
 

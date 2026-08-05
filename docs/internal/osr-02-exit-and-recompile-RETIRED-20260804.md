@@ -3,7 +3,7 @@
 Branches `fix/c2-osr02-exit-differential-20260804` and — for §8, the literal
 frame comparison — `fix/c2-osr02-frame-comparator-20260804`. Both merged to
 `dev` and pushed.
-Retires `docs/known-issues/c2/archive/osr-02-exit-and-recompile.md` and closes
+Retires `../known-issues/c2/osr-02-exit-and-recompile.md` and closes
 `docs/feature-designs/jit-osr-exit-and-recompile.md`.
 
 The lane's first two items landed 2026-08-03 (`4bec5efca`) and its own closeout

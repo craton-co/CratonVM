@@ -66,8 +66,16 @@ fn classpath_dir() -> Option<PathBuf> {
     })
 }
 
+// Un-ignored 2026-08-04. The `#[ignore]` this carried pointed at
+// `serversocket-bind-null-inetaddress-net-sockets-20260803`: under
+// `CRATONVM_REAL=net-sockets` + GC stress, `new ServerSocket(0)` (line 28 of
+// the fixture) NPE'd inside `sun.nio.ch.Net.bind` because the wildcard
+// `InetAddress` arrived null. Root cause was two cross-call GC-safety defects
+// — the `InetSocketAddress`/`InetAddress` construction path in native-builtins
+// losing its own freshly-allocated objects across a cold class load, and
+// `Class.getEnumConstants()` copying out of a relocated `$VALUES`. Both are
+// fixed; the assertions below are unchanged from when they were written.
 #[test]
-#[ignore = "ServerSocket.bind passes a null InetAddress into Net.bind under CRATONVM_REAL=net-sockets; see docs/known-issues/vm/serversocket-bind-null-inetaddress-net-sockets-20260803.md"]
 fn nio_selector_selected_keys_survives_gc_stress() {
     let Some(bin) = cratonvm_binary() else {
         eprintln!("[nio_selector_build_set_gc] cratonvm binary not found; skipping");

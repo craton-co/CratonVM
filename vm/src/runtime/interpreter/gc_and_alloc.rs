@@ -393,17 +393,16 @@ pub(super) fn stw_take_over_and_wait(
                 let sb = xt_roots.len();
                 frame.stack.scan_object_refs(xt_roots, &shared.mem.heap);
                 if xt_roots.len() > sb {
-                    // Operand-stack candidates are validated strictly, exactly
-                    // like the deposit path (`scan_frame_roots`): a pointer-
-                    // shaped primitive long must not become a root.
+                    // Operand-stack candidates are screened exactly like the
+                    // deposit path (`scan_frame_roots`) — `is_heap_addr`, so a
+                    // pointer-shaped primitive long cannot become a root while
+                    // a young / mid-init object still can. The strict
+                    // `is_object_address` probe used here until 2026-08-04
+                    // dropped the second population, and this peer is FROZEN:
+                    // whatever its frames hold, only this scan can speak for.
                     let added = xt_roots.split_off(sb);
                     for o in added {
-                        if shared
-                            .mem
-                            .heap
-                            .is_object_address(o.as_ptr() as usize)
-                            .is_some()
-                        {
+                        if shared.mem.heap.is_heap_addr(o.as_ptr() as usize).is_some() {
                             xt_roots.push(o);
                         }
                     }
@@ -3371,18 +3370,21 @@ pub(super) fn gc_alloc_array(
 /// Update the thread's root snapshot with current frame ObjectRefs.
 /// Called at safepoints and before blocking operations.
 ///
-/// **Spring Boot SEGV fix (2026-05-16):** `ValueStack::scan_object_refs`
-/// still reports every `CompactTag::Long` operand-stack slot whose bits
-/// happen to look like an aligned pointer as a heap root, without consulting
-/// the heap. That mirrors the bug already removed from
-/// `Frame::scan_local_objects` (see frame.rs) but the operand-stack file is
-/// restricted from edits. Filter the freshly-scanned operand-stack roots
-/// against `heap.is_object_address` so a primitive `long` carrying e.g. a
-/// file size, hash code, or jboss-modules-internal token can no longer
-/// poison the root set and cause a `0xC0000005` SEGV when the GC later
-/// dereferences it. Locals (already cleaned), `native_pin_roots`, and
-/// `native_pending_return` come from validated paths and are appended
-/// after the filter.
+/// **Spring Boot SEGV fix (2026-05-16), as it stands today:** the
+/// freshly-scanned operand-stack roots are screened before they join the
+/// snapshot, because `ValueStack::scan_object_refs` used to report every
+/// `CompactTag::Long` slot whose bits looked like an aligned pointer as a
+/// heap root without consulting the heap — a primitive `long` carrying a file
+/// size or a jboss-modules token then poisoned the root set and SEGV'd the GC.
+///
+/// The screen is `heap.is_heap_addr` (alignment + arena containment), which is
+/// what kills that population. It was `is_object_address` until 2026-08-04;
+/// that is a strictly stronger probe and it also dropped GENUINE roots — see
+/// `scan_frame_roots` for why, and for the two in-tree fixes the strict
+/// version was silently reverting. Locals (screened the same way inside
+/// `Frame::scan_local_objects`), `native_pin_roots`, and
+/// `native_pending_return` come from validated paths and are appended after
+/// the filter.
 /// DBG (CRATONVM_DBG_ROOTSNAP): instrumentation for the per-native-call root
 /// snapshot cost. Confirms/quantifies whether `update_root_snapshot` is the
 /// embedded-server deployment hotspot (O(stack-depth) full-frame scan + the
@@ -3447,6 +3449,34 @@ static ROOTSNAP_MISS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// per-frame body of `update_root_snapshot`'s loop, factored out so the opt-in
 /// root-snapshot cache can scan a single frame into a cache entry as well as
 /// into the live snapshot. Behaviour is byte-identical to the inline loop.
+///
+/// The operand-stack post-filter is `is_heap_addr` (alignment + arena
+/// containment), NOT the strict `is_object_address` header probe, and the two
+/// are not interchangeable here:
+///
+/// * `is_object_address` rejects a young / mid-init object whose header it
+///   cannot yet vouch for. `Frame::scan_local_objects` has always used the
+///   loose screen for exactly that reason (see its comment naming the
+///   BouncyCastle `EC5Util.getCurve` local), and `ValueStack::scan_object_refs`
+///   was changed to root a genuine object slot unconditionally with the same
+///   argument — "the prior code dropped such roots (use-after-free risk for
+///   newly allocated objects) — the regression this fixes". Re-applying the
+///   strict probe over its output put that regression straight back, on the
+///   operand-stack half only.
+/// * It also discarded the JNI long-as-jobject smuggle roots that
+///   `scan_object_refs` validates with `is_heap_addr` precisely because the
+///   strict probe rejects them (interior offsets, mid-init) — the WildFly
+///   `jboss-modules` SEGV that comment records.
+///
+/// The filter's original justification — that `scan_object_refs` "treats
+/// pointer-shaped `Long` bits as roots without heap validation" — is no longer
+/// true: that scan is kind-gated (`KIND_LONG`/`KIND_DOUBLE` slots are never
+/// rooted through the object branch) and heap-validates the smuggle branch.
+/// What remains is a loose root reaching the collector, which BOTH generations
+/// already screen with an exact object-base oracle before writing anything
+/// through it — `young_object_starts` membership in `forward_object`, and
+/// `walk_objects`-derived `walked_bases` in `old_gen_gc`. Over-retention for
+/// one cycle is the whole cost; a dropped root is a use-after-free.
 #[inline]
 pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
     frame.scan_local_objects(out, heap);
@@ -3458,7 +3488,7 @@ pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &c
         for read in before..len {
             let o = out[read];
             // Cast: object/code pointer to integer address
-            if heap.is_object_address(o.as_ptr() as usize).is_some() {
+            if heap.is_heap_addr(o.as_ptr() as usize).is_some() {
                 out[write] = o;
                 write += 1;
             }
@@ -3747,13 +3777,10 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 let mut write = before;
                 for read in before..len {
                     let o = snapshot[read];
+                    // `is_heap_addr`, not `is_object_address` — see
+                    // `scan_frame_roots`, whose body this loop duplicates.
                     // Cast: object/code pointer to integer address
-                    if shared
-                        .mem
-                        .heap
-                        .is_object_address(o.as_ptr() as usize)
-                        .is_some()
-                    {
+                    if shared.mem.heap.is_heap_addr(o.as_ptr() as usize).is_some() {
                         snapshot[write] = o;
                         write += 1;
                     }
@@ -5104,5 +5131,88 @@ pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
             tracing::debug!("[G1] last-ditch full cycle timed out — proceeding to OOM");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod root_snapshot_screen_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::runtime::frame::Frame;
+    use crate::vm::SharedVm;
+    use cratonvm_types::ClassId;
+
+    /// The operand-stack half of a frame's root scan must not be screened
+    /// more strictly than the locals half.
+    ///
+    /// `Frame::scan_local_objects` screens a local with `is_heap_addr`
+    /// (alignment + arena containment) on purpose: `is_object_address` is a
+    /// full header probe and rejects a young / mid-init object whose header it
+    /// cannot yet vouch for, and dropping such a root reclaims a
+    /// still-referenced object. `ValueStack::scan_object_refs` was changed for
+    /// the same reason. `scan_frame_roots` then re-screened only that scan's
+    /// output with the strict probe, which put both fixes back — invisibly,
+    /// because the two screens agree on every HEALTHY object.
+    ///
+    /// So the test builds an address where they provably disagree, asserts the
+    /// disagreement (a vacuous pass is the failure mode that matters here),
+    /// and then asserts the scan keeps it from BOTH slot kinds.
+    #[test]
+    fn operand_stack_roots_use_the_same_screen_as_locals() {
+        let shared = SharedVm::new(VmConfig::default());
+        let heap = &shared.mem.heap;
+
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as usize;
+        assert!(
+            heap.is_object_address(addr).is_some(),
+            "a freshly allocated object must pass the strict probe — otherwise \
+             the disagreement asserted below would not be the one this test means"
+        );
+
+        // Make the strict probe reject it while arena containment still holds:
+        // an out-of-range `ObjectKind` discriminant is exactly what
+        // `is_object_address` screens for, and is what a mid-init or
+        // conservatively-reached address looks like to it.
+        // SAFETY: `addr` is a live object header in a mapped arena; the kind
+        // tag is a single byte at a fixed in-bounds header offset.
+        unsafe {
+            *((addr + cratonvm_types::OBJECT_KIND_OFFSET) as *mut u8) = 0xEE;
+        }
+        assert!(
+            heap.is_object_address(addr).is_none(),
+            "precondition: the strict probe must now reject this address"
+        );
+        assert!(
+            heap.is_heap_addr(addr).is_some(),
+            "precondition: arena containment must still accept it"
+        );
+
+        // `aload_0; return` — local 0 is live at pc 0, so the per-bci liveness
+        // mask keeps it and the two slot kinds are directly comparable.
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x2a, 0xb1],
+            vec![],
+            8,
+            4,
+            &[],
+        );
+        frame.set_local(0, Value::Object(Some(obj)));
+        frame.stack.push(Value::Object(Some(obj))).unwrap();
+
+        let mut roots = Vec::new();
+        scan_frame_roots(&frame, &mut roots, heap);
+        let hits = roots.iter().filter(|r| r.as_ptr() as usize == addr).count();
+        assert_eq!(
+            hits, 2,
+            "both the local and the operand-stack slot must be rooted; {hits} of 2 \
+             survived, so the operand-stack post-filter is dropping a root the \
+             locals scan keeps"
+        );
     }
 }

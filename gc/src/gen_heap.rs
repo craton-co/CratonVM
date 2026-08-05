@@ -4362,6 +4362,19 @@ impl GenerationalHeap {
         None
     }
 
+    /// `[base, base + capacity)` of the INACTIVE young semispace — the arena
+    /// the last moving cycle evacuated and zeroed.
+    ///
+    /// The same answer [`Self::reclaimed_hole_at`] gives from its `young_to`
+    /// arm, hoisted so a caller with many addresses to test (the
+    /// blocked-thread root audit) pays one lock rather than three per
+    /// address. A live object is never in here.
+    pub fn young_inactive_semispace_range(&self) -> (usize, usize) {
+        let to = self.young_to.lock();
+        let base = to.base_ptr() as usize;
+        (base, base + to.capacity())
+    }
+
     /// Access the old generation directly (for concurrent sweep).
     /// Returns a lock guard.
     pub fn old_gen_lock(&self) -> parking_lot::MutexGuard<'_, OldGen> {
