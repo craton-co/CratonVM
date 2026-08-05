@@ -172,7 +172,45 @@ on the fabricated layout too instead of falling into the general path.
 
 ## Suite delta
 
-<!-- FILLED IN AFTER THE RUNS COMPLETE -->
+`cargo test -p cratonvm-vm --no-fail-fast`, debug profile, Windows, both arms
+at merge base `d81e220b3`, `JAVA_HOME` = jdk-25.0.3.9 so `build.rs` staged
+fresh fixtures:
+
+| | passed | failed |
+|---|---|---|
+| `origin/dev` | 3992 | 9 |
+| with fix | 4001 | 8 |
+
+`+9` passing is exactly the four un-`#[ignore]`d CHM tests plus the four new
+`vm_exec` unit tests, plus one net swap in the failing set.
+
+**Seven failures are shared by both arms** and none is touched by this change:
+`t9b_inline_constant_native_census` (328 registrations vs a ceiling of 327, all
+in `native-builtins`/`native-io`), `custom_loader_metadata_is_reclaimed_{with,
+without}_jit`, `arena_segment_allocator_default_methods_dispatch_to_native`,
+`ir_exception_stub_stamps_this_methods_throw_bci`, `real_fjp_path`,
+`stackwalker_log4j_deep_repeated_walks_finish_under_jit`.
+
+**The three that differ are all `cratonvm`-binary-spawning probes, and the
+difference is the binary, not the code.** `vthread_probe_regression`'s
+`cratonvm_binary()` prefers `target/release` over `target/debug`: the baseline
+worktree still held a **release** binary from a previous session, the fix
+worktree held only the debug binary this session built. Re-run with
+`CRATONVM_BIN` pinned to each arm's *debug* binary, `vthread_probe_10000_all_
+increment` **times out at 60s on both arms** — 3/3 each. The two that failed
+only on the baseline (`cov06_array_allocation_end_to_end`,
+`ir_athrow_method_is_entered_through_dispatch`) spawn a binary the same way and
+are the same artefact in the other direction. Pin `CRATONVM_BIN` before reading
+any arm-to-arm delta in these four suites.
+
+Also green: `cargo test -p cratonvm-native-collections -p cratonvm-native-api
+--lib` (273 + 94), and the real-JDK CLI arm — `cratonvm --java-home <jdk-25>
+-cp … cratonvm.ChmMain` prints `pre-resize=1 basic=1 resize=1 mutation=1
+clear=1`, i.e. the arm that already passed is unchanged.
+
+Earlier, on Azure release builds at the branch point,
+`wp4_6_chm_basic --include-ignored` was 6/6 with committed fixtures and 6/6
+with `build.rs`-compiled ones.
 
 ## What to carry forward
 
@@ -191,3 +229,7 @@ on the fabricated layout too instead of falling into the general path.
 * **A committed fallback `.class` is a second, unreviewed copy of the test.**
   When it disagrees with the `.java` beside it, every conclusion drawn from a
   run without `javac` is about a program nobody read.
+* **A binary-spawning probe compares worktrees, not commits.** Four suites here
+  pick `target/release` over `target/debug` and will happily measure a binary
+  from a different session and a different branch. Pin `CRATONVM_BIN`, or the
+  A/B is between two build profiles.
