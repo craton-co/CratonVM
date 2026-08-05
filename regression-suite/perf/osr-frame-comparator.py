@@ -35,7 +35,10 @@ TWO ASSERTIONS, because one is not enough.
 
 (1) MONOTONICITY.  For each `(key, bci)` site, map every record of the run under
 test to its index in the ground-truth sequence by EXACT frame equality, and
-require that index sequence to be strictly increasing.
+require that index sequence to be strictly increasing — with one exception, and
+it is not a loophole: an `E` names the SAME program point as the `A` before it
+(the arrival and the entry it leads to are recorded in one call), so an entry
+may match the index already consumed and does not advance the trajectory.
 
   * a frame matching NO ground-truth frame is a state the program can never be
     in — a corrupted local, however dead, since the comparison does not care
@@ -45,32 +48,48 @@ require that index sequence to be strictly increasing.
 
 (2) ADVANCE.  For each entry/exit pair, `index(X) - index(E)` is how many
 iterations the compiled body committed, derived from the un-compiled run's own
-trajectory rather than from anything the JIT claims. `--min-advance` is the
-floor it must meet.
+trajectory rather than from anything the JIT claims. It must never be negative
+(the resume may not be BEHIND the entry), and **at least one** pair must reach
+`--min-advance`.
 
-Assertion (2) exists because a synthetic fixture walked straight through (1).
-Compiled iterations produce no arrival records, so "entered at frame 5, ran to
-12, resumed at 5" — the historical `jit-osr-bail-reruns-loop-iterations` defect
-— and "entered at 5 and advanced nothing" are the same index sequence, both
-strictly increasing. Only the entry record separates them.
+At least one, not every one, and the reason is measured rather than assumed:
+`emit_osr_exit_after_trigger`'s counter is **per compiled method, not per
+entry**, so once `CRATONVM_OSR_EXIT_AFTER=N` reaches have happened, every
+LATER entry into that artifact bails on its first header reach — an advance of
+0, and correct, because there "reject" and "transfer" coincide. Requiring every
+pair to advance reported a clean run as a replay. The floor still bites where it
+matters: a systematic replay drives every pair to 0, including the first.
 
-`--min-advance 0` is correct for the unconditional-at-header trigger
-(`CRATONVM_OSR_EXIT_TEST`), which bails at iteration 0 where "reject" and
-"transfer" coincide. Under `CRATONVM_OSR_EXIT_AFTER=N` with `N >= 2` it must be
-at least 1. A GAP between an exit and the next arrival is not an error at all —
-that gap IS the OSR.
+WHAT THIS DOES NOT PROVE, stated plainly.  A single advance-0 exit is
+indistinguishable, FROM FRAMES ALONE, from "the body ran seven iterations and
+resumed where it started" — because if the body really advanced nothing,
+resuming at the entry frame is right. Whether the body ran is a question about
+behaviour, and it is the BEHAVIOURAL half (`osr-exit-differential.sh`, the
+per-execution counter) that answers it. The two halves are complementary and
+neither subsumes the other:
 
-AMBIGUITY, stated rather than hidden.  The index is well defined only when
-frames at a site are distinct, which holds for any loop with a monotone
-induction variable and fails for one whose state repeats. When a frame matches
-several ground-truth indices this takes the smallest one greater than the
-previous match — the reading that makes progress — and REPORTS the site as
-ambiguous, because on such a site "strictly increasing" is a weaker claim than
-it looks.
+    frame comparator   a resumed frame that is not on the trajectory AT ALL —
+                       a corrupted local, whether or not anything reads it
+    behavioural        the loop body ran more times than the program says
+
+A GAP between an exit and the next arrival is not an error at all — that gap IS
+the OSR.
+
+AMBIGUITY: NOT JUDGED, rather than judged badly.  The index is well defined only
+when a site's ground-truth frames are DISTINCT. That holds for a loop with a
+monotone induction variable and no reference locals, and fails as soon as the
+method is called twice, or its header state repeats. On such a site "which
+iteration is this frame" has no answer, so a verdict there would be noise —
+`skip*`, reported and excluded, not silently guessed.
+
+`probes/OsrFrameProbe.java` is the shape that IS injective: one call, one loop,
+a strictly monotone induction variable, primitive locals only. Because sites can
+be skipped, the run FAILS when nothing was judged — a comparator that judged no
+site must not report success.
 
 Usage:
     osr-frame-comparator.py <ground-truth.err> <under-test.err>
-                            [--min-advance N] [--verbose]
+                            [--only SUBSTR] [--min-advance N] [--verbose]
 """
 
 import collections
@@ -118,6 +137,11 @@ def main():
         i = argv.index("--min-advance")
         min_advance = int(argv[i + 1])
         del argv[i:i + 2]
+    only = None
+    if "--only" in argv:
+        i = argv.index("--only")
+        only = argv[i + 1]
+        del argv[i:i + 2]
     args = [a for a in argv if not a.startswith("--")]
     verbose = "--verbose" in argv
     if len(args) != 2:
@@ -148,10 +172,13 @@ def main():
 
     failures = []
     ambiguous_sites = []
+    judged_with_exits = 0
     print(f"{'site':<52} {'truth':>7} {'test':>6} {'exits':>6} {'gap':>6} "
           f"{'advance':>9}  verdict")
     for site in sorted(test_sites):
         key, bci = site
+        if only is not None and only not in key:
+            continue
         truth = truth_sites.get(site, {}).get("A", [])
         seq = test_sites[site]["seq"]
         n_exits = len(test_sites[site]["X"])
@@ -165,9 +192,14 @@ def main():
         where = collections.defaultdict(list)
         for i, f in enumerate(truth):
             where[f].append(i)
+        # NOT JUDGED when the ground truth is not injective: the index has no
+        # answer there, so any verdict would be noise. Reported, never guessed.
         ambiguous = any(len(v) > 1 for v in where.values())
         if ambiguous:
             ambiguous_sites.append(f"{key} bci={bci}")
+            print(f"{key+' bci='+bci:<52} {len(truth):>7} {len(seq):>6} "
+                  f"{n_exits:>6} {'-':>6} {'-':>9}  skip*")
+            continue
 
         prev = -1
         gaps = 0
@@ -176,7 +208,23 @@ def main():
         open_entry = None
         advances = []
         for pos, (kind, frame) in enumerate(seq):
-            cands = [i for i in where.get(frame, []) if i > prev]
+            # An `E` names the SAME program point as the `A` that precedes it:
+            # `try_osr_with_backoff` records the arrival and then, in the same
+            # call, the entry it is about to take. So an entry may match the
+            # index already consumed — it does not advance the trajectory, it
+            # marks where compiled code takes over. Requiring `> prev` for it
+            # reported "an iteration executed a second time" on a clean run,
+            # which is how this was found.
+            # `E` names the same program point as the `A` before it, and `X`
+            # may land on the entry's own index: an advance-0 bail is the
+            # correct shape once the per-METHOD forced-exit counter is spent.
+            if kind == "E":
+                floor = prev
+            elif kind == "X" and open_entry is not None:
+                floor = open_entry
+            else:
+                floor = prev + 1
+            cands = [i for i in where.get(frame, []) if i >= floor]
             if not cands:
                 if frame in where:
                     failures.append(
@@ -200,21 +248,27 @@ def main():
             # to zero and slips past assertion 1 entirely.
             if kind == "E":
                 open_entry = i
-            elif kind == "X" and open_entry is not None:
-                advance = i - open_entry
-                advances.append(advance)
-                if advance < min_advance:
-                    failures.append(
-                        f"{key} bci={bci}: record {pos} — the body entered at "
-                        f"ground-truth index {open_entry} and resumed at {i}, an "
-                        f"advance of {advance} (< --min-advance {min_advance}). The "
-                        f"compiled body ran and the resume did not account for it: "
-                        f"every iteration it committed will execute a second time"
-                    )
-                    site_failed = True
+                # …and for the same reason it does not consume an index.
+                continue
+            if kind == "X" and open_entry is not None:
+                advances.append(i - open_entry)
                 open_entry = None
             prev = i
-        verdict = "FAIL" if site_failed else ("ok*" if ambiguous else "ok")
+        # At least one pair must show the compiled body carrying advanced state
+        # into the resume. Every pair at 0 is what a systematic replay looks
+        # like; a single 0 is the spent-counter bail and is correct.
+        if not site_failed and advances and max(advances) < min_advance:
+            failures.append(
+                f"{key} bci={bci}: {len(advances)} entry/exit pair(s), and NOT ONE "
+                f"advanced by {min_advance} or more (max {max(advances)}). Either the "
+                f"forced-exit lever never let the body run, or every resume landed "
+                f"back on its own entry frame — which after a body that ran is the "
+                f"replay this comparison exists for"
+            )
+            site_failed = True
+        verdict = "FAIL" if site_failed else "ok"
+        if not site_failed and n_exits:
+            judged_with_exits += 1
         adv = "-" if not advances else (
             f"{min(advances)}..{max(advances)}" if min(advances) != max(advances)
             else str(advances[0]))
@@ -227,10 +281,22 @@ def main():
         print(f"NOTE: {site[0]} bci={site[1]} hit the per-site record cap; frames past "
               f"it are UNKNOWN, not unmatched.")
     if ambiguous_sites:
-        print("NOTE: ok* — these sites have repeating frames, so the arrival index is not "
-              "uniquely determined and 'strictly increasing' is a weaker claim there:")
+        print("NOTE: skip* — these sites' ground-truth frames repeat, so 'which iteration "
+              "is this' has no answer and they are NOT judged:")
         for s in ambiguous_sites:
             print(f"        {s}")
+
+    # A comparator that judged nothing must not report success. With sites
+    # skippable, that is a reachable state and not a hypothetical.
+    if judged_with_exits == 0 and not failures:
+        print()
+        print("FAIL: no site was both judged and carried an OSR exit.", file=sys.stderr)
+        print("  Every site with exits had a non-injective ground truth, so nothing was",
+              file=sys.stderr)
+        print("  compared. Use a probe whose loop-header frame is unique per iteration",
+              file=sys.stderr)
+        print("  (probes/OsrFrameProbe.java), or narrow with --only.", file=sys.stderr)
+        return 1
 
     print()
     if failures:
@@ -241,7 +307,7 @@ def main():
     print(f"OSR frame comparator: every frame the run under test resumed on, and every "
           f"back-edge frame it reached,")
     print(f"matched an un-compiled run's frame at a strictly later iteration. "
-          f"{exits} resumed frame(s) checked.")
+          f"{judged_with_exits} judged site(s) carried exits.")
     return 0
 
 
@@ -274,10 +340,20 @@ def selftest():
         # Entered at 5, compiled ran to 12, resumed at 12. The correct shape.
         "clean": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 12, 144)
                   + arrivals(13, 20), 0),
-        # Entered at 5, compiled ran to 12, resumed at 5: every iteration since
-        # entry executes a second time.
+        # Every entry/exit pair advances 0: no resume ever carried state the
+        # compiled body advanced. A systematic replay looks exactly like this.
         "replay": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 5, 25)
                    + arrivals(6, 20), 1),
+        # One pair advances 7 and a later one advances 0 — the LEGITIMATE shape,
+        # because the forced-exit counter is per compiled method: once spent,
+        # every later entry bails on its first header reach. Requiring every
+        # pair to advance reported this as a replay.
+        "spent-counter": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 12, 144)
+                          + arrivals(13, 15) + rec("E", 0, 15, 225)
+                          + rec("X", 0, 15, 225) + arrivals(16, 20), 0),
+        # …and the resume may never be BEHIND its entry.
+        "resume-behind-entry": (arrivals(0, 5) + rec("E", 0, 5, 25)
+                                + rec("X", 0, 3, 9) + arrivals(6, 20), 1),
         # Right iteration, wrong accumulator — a state the program cannot be
         # in. This is the case the BEHAVIOURAL differential cannot see when the
         # slot is never read again.

@@ -37,12 +37,15 @@
 set -uo pipefail
 
 EXE=""
-N=4000
+N=60000
 AFTER=7
 BACKEDGE=200
 KEEP=""
 TIMEOUT=900
-CLASS="OsrExitDifferentialProbe"
+CLASS="OsrFrameProbe"
+# Only this site is judged: the comparator needs an INJECTIVE ground truth and
+# only the kernel has one. See osr-frame-comparator.py.
+ONLY="OsrFrameProbe.kernel"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,7 +62,7 @@ done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-SRC="$REPO/probes/OsrExitDifferentialProbe.java"
+SRC="$REPO/probes/OsrFrameProbe.java"
 [[ -f "$SRC" ]] || { echo "osr-frame-differential.sh: $SRC is missing" >&2; exit 2; }
 
 JAVAC="$(command -v javac || true)"
@@ -78,17 +81,19 @@ fi
 echo "osr-frame differential — n=$N, exit-after=$AFTER, osr-backedge=$BACKEDGE" >&2
 echo "  running truth (--nojit)" >&2
 timeout "$TIMEOUT" env \
+  CRATONVM_QUIET_DEPRECATIONS=1 \
   "CRATONVM_DBG_OSR_FRAME_TRACE=$CLASS" \
-  "$EXE" --nojit -cp "$WORK/classes" OsrExitDifferentialProbe "$N" \
+  "$EXE" --nojit -cp "$WORK/classes" OsrFrameProbe "$N" \
   > "$WORK/truth.out" 2> "$WORK/truth.err"
 truth_rc=$?
 
 echo "  running test (OSR + forced exit)" >&2
 timeout "$TIMEOUT" env \
+  CRATONVM_QUIET_DEPRECATIONS=1 \
   "CRATONVM_DBG_OSR_FRAME_TRACE=$CLASS" \
   "CRATONVM_OSR_EXIT_AFTER=$AFTER" \
   "CRATONVM_TIER_OSR_BACKEDGE=$BACKEDGE" \
-  "$EXE" -cp "$WORK/classes" OsrExitDifferentialProbe "$N" \
+  "$EXE" -cp "$WORK/classes" OsrFrameProbe "$N" \
   > "$WORK/test.out" 2> "$WORK/test.err"
 test_rc=$?
 
@@ -123,7 +128,7 @@ echo
 # `--min-advance 1`: the run under test uses CRATONVM_OSR_EXIT_AFTER=$AFTER, so
 # the compiled body is meant to advance the frame before bailing. Zero would be
 # correct only for the unconditional-at-header trigger.
-python3 "$HERE/osr-frame-comparator.py" --min-advance 1 \
+python3 "$HERE/osr-frame-comparator.py" --min-advance 1 --only "$ONLY" \
     "$WORK/truth.err" "$WORK/test.err" || fail=1
 
 echo

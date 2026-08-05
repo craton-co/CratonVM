@@ -147,17 +147,95 @@ static TRUNCATED: AtomicU64 = AtomicU64::new(0);
 /// entry contract reads (`Frame::get_local_tag` exists "for JIT/OSR interop"),
 /// so what this compares is what OSR itself acts on rather than a re-derived
 /// view of it.
+/// One slot, as `tag:word` — except for a **reference**, which renders as
+/// `tag:null` or `tag:ref`.
+///
+/// A reference slot holds a raw heap address, and addresses are not stable
+/// across processes. The comparison this feeds runs two separate runs of one
+/// program, so rendering the pointer would make every frame containing any
+/// object reference compare unequal — which is exactly what happened the first
+/// time this was run: `report(Ljava/lang/String;J)V` failed with
+/// `L=4:0000020ef1b11330,…` against a ground truth holding a different address
+/// for the same `String`.
+///
+/// Dropping the identity is the honest trade, and it is a real loss, stated
+/// here rather than in a comment nobody reads: **a reference retargeted to a
+/// different non-null object is invisible to this comparison.** Null-vs-non-null
+/// still shows, which is the shape a mis-seeded or clobbered reference usually
+/// takes (the recorded OSR dead-local defects surfaced as null/garbage
+/// pointers). A comparison that catches every integral and FP divergence exactly
+/// and reference *nullness* is worth more than one that is red on every frame.
+fn slot(tag: u8, word: u64) -> String {
+    match tag {
+        cratonvm_types::VTAG_OBJECT => {
+            if word == 0 {
+                format!("{tag:x}:null")
+            } else {
+                format!("{tag:x}:ref")
+            }
+        }
+        cratonvm_types::VTAG_NULL => format!("{tag:x}:null"),
+        _ => format!("{tag:x}:{word:016x}"),
+    }
+}
+
+/// Is local slot `i` nothing but the reserved upper half of a category-2 value?
+///
+/// A `long`/`double` at slot `N` reserves `N+1`, and **`lload N` reads the full
+/// value from `N`** — the reserved slot is never read. The two arms disagree
+/// about what is in it, legitimately and by design: the interpreter's own
+/// `lstore` leaves the tag `LONG` there, while the OSR-exit transfer writes the
+/// snapshot's `Undefined` through `fv_to_value` as `Int(0)`. `deopt_resume.rs`
+/// argues that at length and calls it "the correct two-slot JVM layout".
+///
+/// Comparing it anyway made every resumed frame differ from every ground-truth
+/// frame — the first real run of this comparator failed on exactly that, in a
+/// slot the JVM guarantees nobody reads. Excluding it is what keeps the
+/// comparison sensitive to the slots that matter.
+/// Which local slots are nothing but the reserved upper half of a category-2
+/// value, as a forward scan.
+///
+/// It has to be a forward scan, not a look-behind at slot `i-1`. The
+/// interpreter leaves the tag `LONG` in the reserved slot itself, so
+/// "slot `i-1` is tagged `LONG` ⇒ `i` is a high half" **cascades**: `acc`'s
+/// reserved slot marks the next real local as reserved too, and so on down the
+/// frame. That is not a hypothetical — it swallowed `mix` on the first run,
+/// which is how the rule got written this way.
+///
+/// A base is a `LONG`/`DOUBLE` slot that is not itself already claimed.
+fn cat2_high_halves(frame: &Frame) -> Vec<bool> {
+    let n = frame.locals_len();
+    let mut hi = vec![false; n];
+    let mut i = 0;
+    while i < n {
+        if !hi[i]
+            && matches!(
+                frame.get_local_tag(i),
+                cratonvm_types::VTAG_LONG | cratonvm_types::VTAG_DOUBLE
+            )
+            && i + 1 < n
+        {
+            hi[i + 1] = true;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    hi
+}
+
 fn render(frame: &Frame) -> (String, String) {
+    let hi = cat2_high_halves(frame);
     let mut locals = String::new();
     for i in 0..frame.locals_len() {
         if i > 0 {
             locals.push(',');
         }
-        locals.push_str(&format!(
-            "{:x}:{:016x}",
-            frame.get_local_tag(i),
-            frame.get_local_raw(i)
-        ));
+        if hi[i] {
+            locals.push_str("hi");
+            continue;
+        }
+        locals.push_str(&slot(frame.get_local_tag(i), frame.get_local_raw(i)));
     }
     let (words, tags) = frame.stack.snapshot_raw();
     let mut stack = String::new();
@@ -165,11 +243,7 @@ fn render(frame: &Frame) -> (String, String) {
         if i > 0 {
             stack.push(',');
         }
-        stack.push_str(&format!(
-            "{:x}:{:016x}",
-            tags.get(i).copied().unwrap_or(0),
-            w
-        ));
+        stack.push_str(&slot(tags.get(i).copied().unwrap_or(0), *w));
     }
     (locals, stack)
 }
