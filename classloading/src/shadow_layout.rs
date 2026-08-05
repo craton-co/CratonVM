@@ -830,15 +830,26 @@ mod production_model_order_tests {
                 ],
             ),
         ];
+        // Accumulate rather than assert per case. A `for` loop of `assert_eq!`
+        // stops at the first wrong class, so reverting the whole table to the
+        // pre-fix models reports ONE row and says nothing about the other eight
+        // — which makes the test look far stronger than it is when it is used
+        // (as it was) as the non-vacuity check for a family-wide fix.
+        let mut wrong: Vec<String> = Vec::new();
         for (class, want) in cases {
             let got = instance_names(class);
-            assert_eq!(
-                got.iter().map(String::as_str).collect::<Vec<_>>(),
-                *want,
-                "{class}'s fabricated model must match the real JDK declaration \
-                 order (javap -p --module java.base {})",
-                class.replace('/', ".")
-            );
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            if got != *want {
+                wrong.push(format!("  {class}\n    model: {got:?}\n    real:  {want:?}"));
+            }
         }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} fabricated models disagree with the real JDK declaration \
+             order (javap -p --module java.base <class>):\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
     }
 }
