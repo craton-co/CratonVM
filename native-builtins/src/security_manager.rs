@@ -974,16 +974,29 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
             let group = ctx.read_native_pin(pin_base, group);
             let name = Value::Object(Some(name));
 
-            ctx.set_field_by_name(group, "name", name.clone());
+            // By NAME only. This used to write the same fields a second time by
+            // raw index (0..3) under an `object_num_fields >= 4` guard, against
+            // the legacy synthetic order — and that order is transposed twice
+            // over against a real image, so the raw pass put the name `String`
+            // in `parent`, nulled `name`, set `maxPriority` to 0 and `daemon`
+            // to true. It ran AFTER the by-name writes, so it won: on a real
+            // image `getRootGroup()` handed back a group whose `getName()` was
+            // null and whose `getParent()` was a `String`.
+            //
+            // The guard it sat behind is the one this tree keeps re-learning:
+            // `object_num_fields >= 4` stops an out-of-range write, not a
+            // wrong-field one. A named write resolves on the receiver's own
+            // class and is right on either layout, so the raw pass had nothing
+            // to add even when its order was right.
+            //
+            // The `destroyed` write went with it: JDK 21+ `ThreadGroup` has no
+            // such field and neither does the fabricated model, so
+            // `set_field_by_name` was silently doing nothing and nothing reads
+            // it back.
+            ctx.set_field_by_name(group, "name", name);
             ctx.set_field_by_name(group, "parent", Value::Object(None));
-            ctx.set_field_by_name(group, "destroyed", Value::Int(0));
             ctx.set_field_by_name(group, "maxPriority", Value::Int(10));
-            if ctx.object_num_fields(group) >= 4 {
-                ctx.set_field(group, 0, name);
-                ctx.set_field(group, 1, Value::Object(None));
-                ctx.set_field(group, 2, Value::Int(0));
-                ctx.set_field(group, 3, Value::Int(10));
-            }
+            ctx.set_field_by_name(group, "daemon", Value::Int(0));
             ctx.unpin_native_roots(pin_base);
             Ok(Some(Value::Object(Some(group))))
         },

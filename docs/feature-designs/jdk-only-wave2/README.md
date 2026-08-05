@@ -29,7 +29,7 @@ can work on what, simultaneously, without colliding.**
 | [L1](L1-classloader-side-table.md) **DONE 2026-08-05** | Move the four VM-internal loader fields out of the object | `native-builtins/src/classloader.rs`, `classloader_real.rs` | — | M |
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs` | — | S |
-| [L4](L4-overlay-detector-blind-spots.md) | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only) | — | M |
+| [L4](L4-overlay-detector-blind-spots.md) **DONE 2026-08-05** | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only), `classloading/src/shadow_layout.rs` | — | M |
 | [L5](L5-nativekind-native-io.md) | `register_with_kind` migration, `native-io` first | `native-io/src/*.rs` | — | M |
 | [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux) | `regression-suite/`, `scripts/` | — | S |
 | [L7](L7-ensure-synthetic-class-migration.md) | Make fabrication refusable, migrate the 3 live callers | `classloading/src/class_manager.rs` + callers | — | M |
@@ -122,13 +122,16 @@ above looks paranoid.
   three `ClassLoader` REFERENCE slots were safe because they "are already
   written by name too" — but the by-name write and the index write land on
   DIFFERENT fields (`name` is slot 1, and the index write put the parent
-  ClassLoader there). `overlay_write_is_destructive` only flags cross-type-class
+  ClassLoader there). The value-tag predicate only flags cross-type-class
   coercions, so zero of it appeared in any census.
   `classloader_parent` was returning the platform loader's own name String as
   its parent, and nothing measured it until a behavioural probe was diffed
   against the host JDK. **Read the writer against `javap` of the real class;
-  the census is a floor, and for reference-into-reference it is a floor of
-  zero.**
+  the census is a floor, and for reference-into-reference it was a floor of
+  zero.** *(Corrected 2026-08-05: L4's shadow-layout diff compares our model
+  against the image by NAME and found 23 such slots on its first run. The floor
+  is zero only where the model slot is anonymous — `_fN`, which asserts
+  nothing.)*
 
 ## Definition of done (contract §11)
 
@@ -159,9 +162,11 @@ the three standing probes plus the new `probes/MapLayoutMatrixProbe`: 6
 classes / 15 slots before, 5 / 12 after — not comparable to the 24 above, see
 the evidence record for why. `Compatible` corpus byte-identical.
 
-Two things that block a clean read of item 2's remaining rows, both L4's:
+~~Two things that block a clean read of item 2's remaining rows, both L4's:
 a null written over a primitive is still invisible to the hunter, and a
-same-kind wrong-slot write always was. **Every count in item 2 is a floor.**
+same-kind wrong-slot write always was.~~ **Both closed 2026-08-05 — see the L4
+update below.** Every count in item 2 is still a floor, now because three probes
+are not Spring Boot rather than because the instrument is half-blind.
 
 **Update, 2026-08-05 — L1 landed.** The eight `ClassLoaders` census rows are
 gone (slots 0/3/4/6 on each built-in loader → 0), A/B'd against the pre-fix
@@ -186,6 +191,35 @@ comment. Item 7 is still blocked on L10.
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
 so `kind_stated` is no longer `false` on all 11,909 rows.
+
+**Update, 2026-08-05 — L4 landed, and item 2's work list roughly quadrupled.**
+The census goes from **4 distinct sites to 135** on the same three probes in
+both modes, with every pre-fix row preserved at its count. Reads are
+instrumented (70 read sites where there were none), `Object(None)` over a
+primitive is flagged (two new write rows the pre-fix binary is silent on), and
+the same-kind wrong-slot case is covered by a **shadow-layout diff**:
+`synthetic_stub_fields` is the model the natives were written against, so when
+the class also has real bytes the two layouts are diffed once at define time and
+every disagreeing index reported.
+
+That diff found **23 slots across 12 classes where our model names a different
+field than the image declares** (152 disagreeing slots in all, across 73 of the
+156 modelled classes the probes reach) — the kind-5 family this README's own lesson
+below calls "a floor of zero". `java/lang/ThreadGroup` has both `name`/`parent`
+and `daemon`/`maxPriority` **transposed**; `java/lang/Thread` slot 5 writes a
+`ClassLoader` over `holder`; `ProtectionDomain`, `CodeSource`, the buffered
+IO wrappers and `java/lang/reflect/{Field,Method,Constructor}` are all in the
+list. None is fixed — each is its own change with its own A/B, and the list is
+the lane's output. L4 also settled L3 step 3 in passing: `Scanner`'s model is
+`instance_fields(5)`, and slots 3/4 are the real `delimPattern` /
+`hasNextPattern`.
+
+**The lesson below needs one correction, not a rewrite.** "For
+reference-into-reference the census is a floor of zero" was true of a detector
+that only compared value tags. Comparing our *model* against the image by NAME
+is a different signal and it finds them. What stays unfindable is the case where
+the model slot is anonymous (`_fN`) — there the model asserts nothing. Naming
+more of `synthetic_stub_fields` is what shrinks that, and it is the follow-up.
 
 **Update, 2026-08-05 — L6 landed; the `NativeKind` work is now measurable.**
 `regression-suite/bridge-ratchet.sh` + `scripts/jdk-only-bridge-ratchet.py`
