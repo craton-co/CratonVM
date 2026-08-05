@@ -207,13 +207,18 @@ pub mod harness_exit_shim {
     ///
     /// Only the SEH crash path reads this now; see the module header
     /// for why `atexit` must not, and for how weak the signal is.
-    pub const EXPECTED_PANIC_COUNT: usize = 37;
+    pub const EXPECTED_PANIC_COUNT: usize = 38;
 
     /// Only the true `#[should_panic]` attributes that the
     /// source-drift regression test counts. Kept separate from
     /// [`EXPECTED_PANIC_COUNT`] so the numbers have clear
     /// provenance.
-    pub const SHOULD_PANIC_ATTR_COUNT: usize = 28;
+    ///
+    /// 28 -> 29 on 2026-08-05: `site_cache_mode_rejects_an_unknown_spelling`
+    /// pins that `CRATONVM_JIT_SITE_CACHE` panics on a value it does not
+    /// recognise rather than silently falling back to the default. Both
+    /// constants move together; the ambient half is unchanged.
+    pub const SHOULD_PANIC_ATTR_COUNT: usize = 29;
 
     // Windows ExitProcess(u32) — unconditional process termination.
     // Calling this bypasses any further CRT teardown that would
