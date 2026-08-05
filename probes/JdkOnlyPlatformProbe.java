@@ -338,9 +338,22 @@ public class JdkOnlyPlatformProbe {
             sv.join(20_000);
 
             // A per-task executor with enough tasks to force carrier reuse.
+            //
+            // NOT try-with-resources, deliberately. `ExecutorService.close()`
+            // is `shutdown()` followed by `awaitTermination(1, DAYS)` in a
+            // loop, i.e. an UNBOUNDED blocking call, and this probe's own
+            // first rule is that every blocking call is bounded. Written with
+            // try-with-resources it hung for 300 seconds and was killed,
+            // taking the `agent` and `jni` sections with it and reporting a
+            // truncated transcript. Written this way the same defect is a
+            // VALUE — `terminated=false` against HotSpot's `true` — which
+            // diffs, names itself, and lets the rest of the probe run.
+            // See docs/known-issues/vm/concurrenthashmap-newkeyset-returns-a-plain-hashset-20260805.md
             AtomicInteger completed = new AtomicInteger();
             int sum = 0;
-            try (ExecutorService es = Executors.newVirtualThreadPerTaskExecutor()) {
+            ExecutorService es = Executors.newVirtualThreadPerTaskExecutor();
+            boolean terminated;
+            try {
                 List<Future<Integer>> fs = new ArrayList<>();
                 for (int i = 0; i < 256; i++) {
                     final int k = i;
@@ -350,6 +363,10 @@ public class JdkOnlyPlatformProbe {
                     }));
                 }
                 for (Future<Integer> f : fs) sum += f.get(30, TimeUnit.SECONDS);
+            } finally {
+                es.shutdown();
+                terminated = es.awaitTermination(30, TimeUnit.SECONDS);
+                if (!terminated) es.shutdownNow();
             }
 
             // Blocking inside a virtual thread must unmount, not deadlock the
@@ -402,6 +419,7 @@ public class JdkOnlyPlatformProbe {
             System.out.println("vthreads join=" + joined + " isVirtual=" + sawVirtual[0]
                     + "/" + sawVirtual[1] + " name=" + name[0] + " latched=" + latched
                     + " completed=" + completed.get() + " sum=" + sum
+                    + " terminated=" + terminated
                     + " handoffs=" + handoffs.get() + " allJoined=" + allJoined
                     + " pinned=" + pinnedRan[0] + "/" + pinnedJoined
                     + " tl=" + tlOk.get() + " mainPlatform=" + platformIsNotVirtual);

@@ -203,15 +203,20 @@ for probe in $PROBE_LIST; do
   #   * `WARNING: ...`            the JDK launcher's own warnings (the
   #                               restricted-method notice that System.load
   #                               triggers on HotSpot and not on CratonVM)
+  #   * an empty line             HotSpot's restricted-method notice ends with
+  #                               one, so dropping the WARNINGs and keeping the
+  #                               blank would leave a diff that is purely an
+  #                               artefact of the filter above
   #
-  # No probe prints a line in any of those shapes, so nothing a probe says can
-  # be filtered by accident. The count of dropped lines is REPORTED per arm: a
-  # normalizer that suddenly starts eating output shows up as a number, not as
-  # a silent pass.
+  # No probe prints a line in any of those shapes — every probe line begins
+  # with its section name — so nothing a probe says can be filtered by
+  # accident. The count of dropped lines is REPORTED per arm: a normalizer
+  # that suddenly starts eating output shows up as a number, not as a silent
+  # pass.
   for a in hotspot real strict; do
     raw="$OUT/logs/$probe.$a.txt"
     sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$raw" | tr -d '\r' > "$OUT/logs/$probe.$a.plain"
-    grep -avE '^\[cratonvm\]|cratonvm_[a-z_]+::|^WARNING: ' \
+    grep -avE '^\[cratonvm\]|cratonvm_[a-z_]+::|^WARNING: |^[[:space:]]*$' \
         "$OUT/logs/$probe.$a.plain" > "$OUT/logs/$probe.$a.norm"
     kept=$(wc -l < "$OUT/logs/$probe.$a.norm")
     total=$(wc -l < "$OUT/logs/$probe.$a.plain")
