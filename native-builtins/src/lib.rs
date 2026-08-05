@@ -12773,8 +12773,13 @@ pub fn register_essential_natives_with_shims(
                 ctx.set_field(url, 3, Value::Object(Some(path_str))); // file
                 ctx.set_field(url, 6, Value::Object(Some(path_str))); // path
                 let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
-                ctx.set_field(cs, 0, Value::Object(Some(url)));
-                ctx.set_field(cs, 1, Value::Object(None));
+                // BY NAME. These were raw slots 0 and 1; slot 0 is `location`
+                // on both layouts, but slot 1 is `signers` on a real
+                // `CodeSource` and only `certs` in the fabricated model — the
+                // constructor-order mistake this file already records one
+                // instance of, four lines below, for `ProtectionDomain`.
+                ctx.set_field_by_name(cs, "location", Value::Object(Some(url)));
+                ctx.set_field_by_name(cs, "certs", Value::Object(None));
                 Value::Object(Some(cs))
             } else {
                 Value::Object(None)
