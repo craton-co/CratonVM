@@ -205,3 +205,24 @@ function, no `register_with_kind` call site touched). The two defects in
 The lane retires with its instrument permanent and its thesis confirmed: of the
 seven defects here, exactly **zero** were introduced by `--jdk-only`. Every one
 was already wrong in Compatible mode and had simply never been executed.
+
+## The gate's first run against `dev` found an eighth — and this one IS strict-only
+
+Merging `origin/dev` at the end of this lane brought L3–L7 with it, and the
+gate immediately went from "two probes byte-identical in both modes" to **nine
+sections failing under `--jdk-only` and zero under `--real-jdk`**:
+[record](../known-issues/jdk-only/strict-boot-refuses-five-classes-the-corpus-needs-20260805.md).
+Five classes are being refused that the corpus needs, `java/util/HashMap$KeyItr`
+among them — which is on the path of any `for (K k : map.keySet())`.
+
+That is the lane's whole argument delivered in one run, and it is worth stating
+plainly: **this regression would have sat on `dev` behind a green build.** No
+unit test covers it, the `--real-jdk` suites are unaffected, and every existing
+step of the advisory `jdk-only` job still passes — because a class the loader
+*refuses* is not a class it *fabricates*, so a zero-fabrication census and a
+nine-section outage are the same number.
+
+It also revises this document's own claim by one word. Seven of the eight
+defects were pre-existing Compatible-mode bugs; the eighth is a real
+strict-only regression, introduced today, by a sibling lane. Criterion 6 is not
+only where the old defects are — it is where the new ones arrive.
