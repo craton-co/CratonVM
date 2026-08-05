@@ -1023,6 +1023,14 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             maybe_concurrent_gc(shared, thread);
             // Run any pending finalizers
             run_finalizers(shared, thread);
+            // ...and any pending Cleaner actions. Until 2026-08-05 this was
+            // called ONLY from the forced `System.gc()` path, so a cleanable
+            // whose referent died during an ordinary allocation-triggered
+            // collection stayed queued indefinitely — its native memory (a
+            // direct `ByteBuffer`'s backing block, a mapped region, a file
+            // descriptor) held until something happened to call `System.gc()`.
+            // Both are cheap no-ops when nothing is pending.
+            run_cleaner_actions(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
             let mut counted_os_tids: Vec<u32> = Vec::new();
@@ -1147,6 +1155,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 maybe_concurrent_gc(shared, thread);
                 // Run any pending finalizers
                 run_finalizers(shared, thread);
+                // ...and any pending Cleaner actions — see the single-threaded
+                // arm above for why an allocation-triggered GC must do this
+                // too, not only the forced `System.gc()` path.
+                run_cleaner_actions(shared, thread);
             } else {
                 // Another thread is already doing GC — just participate
                 safepoint_check(shared, thread);
@@ -1684,11 +1696,35 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     run_cleaner_actions(shared, thread);
 }
 
+/// True for the real-JDK `jdk.internal.ref.Cleaner` (and its 8u/16+ alias
+/// `sun.misc.Cleaner`) — a `PhantomReference` subclass whose cleanup runs
+/// through `clean()`, NOT through a `ReferenceQueue`.
+///
+/// Kept separate from the synthetic `java/lang/ref/Cleaner$Cleanable` shape
+/// deliberately: the two have incompatible field layouts. The synthetic
+/// Cleanable is `{action, cleaned, index}`, so slot 0 is the Runnable and
+/// slot 1 is the idempotency flag; a JDK `Cleaner` inherits `Reference`'s
+/// `{referent, queue, next, discovered}` and keeps its Runnable in a
+/// separate `thunk` field. Reading slot 0/1 on the wrong one either loses
+/// the action or writes an `Int` sentinel over an object-typed field.
+fn is_jdk_cleaner_class(shared: &SharedVm, class_id: ClassId) -> bool {
+    let cm = shared.classes.class_manager.read();
+    matches!(
+        cm.get_class(class_id).map(|c| &*c.name),
+        Some("jdk/internal/ref/Cleaner") | Some("sun/misc/Cleaner")
+    )
+}
+
 /// Drain pending Cleaner actions and invoke their Runnable.run() method.
 ///
 /// Each entry is the address of a `java/lang/ref/Cleaner$Cleanable`
 /// synthetic. Field 0 holds the Runnable action; field 1 is the cleaned
 /// flag (idempotency guard, also set by user-triggered Cleanable.clean()).
+///
+/// A real-JDK `jdk.internal.ref.Cleaner` can also arrive here (routed by
+/// `process_references_after_gc` instead of being enqueued onto its
+/// reader-less `dummyQueue`); it has a completely different layout and is
+/// handled by invoking its own `clean()`.
 ///
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
@@ -1753,6 +1789,29 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        // Real-JDK `jdk.internal.ref.Cleaner`: invoke its own `clean()`, which
+        // is what the JDK's ReferenceHandler thread does for exactly this
+        // class. `clean()` unlinks the Cleaner from the static `Cleaner.first`
+        // list and only then runs the thunk, so it is idempotent by
+        // construction (`remove` returns false the second time) and it also
+        // stops the now-fired Cleaner from leaking in that static list. This
+        // MUST come before the slot-0/slot-1 reads below: on a `Cleaner` those
+        // slots are the inherited `Reference.referent` / `Reference.queue`,
+        // not the synthetic Cleanable's action/cleaned pair, so the generic
+        // path would both miss the real thunk and stamp `Int(1)` over an
+        // object-typed field.
+        if is_jdk_cleaner_class(shared, shared.mem.heap.class_id_of(cleanable)) {
+            // Errors are swallowed per the Cleaner contract, as below.
+            let _ = crate::vm::invoke_shared(
+                shared,
+                thread,
+                "jdk/internal/ref/Cleaner",
+                "clean",
+                "()V",
+                &[Value::Object(Some(cleanable))],
+            );
+            continue;
+        }
         // Idempotency: skip if user code already invoked clean().
         let already = matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1),);
         if already {
@@ -2225,6 +2284,42 @@ pub(super) fn process_references_after_gc(
                     actual_q,
                 );
             }
+            continue;
+        }
+        // A real-JDK `jdk.internal.ref.Cleaner` is RUN, not enqueued.
+        //
+        // `Cleaner` is a `PhantomReference` subclass, so its
+        // `super(referent, dummyQueue)` reaches the `PhantomReference.<init>`
+        // native and it is discovered as an ordinary phantom (confirmed with
+        // `CRATONVM_DBG_REFDISC=1`: one `type=Phantom class=jdk/internal/ref/
+        // Cleaner` per `ByteBuffer.allocateDirect`, every one of them naming
+        // the same shared queue). That queue is `Cleaner.dummyQueue`, which by
+        // design has no reader — in the real JDK the `ReferenceHandler` thread
+        // never enqueues a `Cleaner` at all: it special-cases
+        // `instanceof Cleaner` and calls `clean()` instead. CratonVM has no
+        // ReferenceHandler, so the reference was discovered, cleared and
+        // enqueued onto a queue nobody polls, and the thunk
+        // (`DirectByteBuffer$Deallocator`, i.e. `Unsafe.freeMemory` +
+        // `Bits.unreserveMemory`) never ran. Direct memory was therefore a
+        // one-way budget: a program that allocated and dropped direct buffers
+        // died once it had allocated `MaxDirectMemorySize` in TOTAL, however
+        // little was live (`probes/DirectBufProbe`: OOM at 128 x 8 MiB against
+        // a 1 GiB cap, HotSpot completes 400).
+        //
+        // This is the exact seam the JDK special-cases, and doing it here —
+        // rather than re-typing the reference at construction, which is what
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md` proposed —
+        // matters: `ReferenceType::Cleaner` entries live in `cleaner_refs`,
+        // and only `weak_phantom_active_pairs` (weak + phantom) gets its
+        // referent slot nulled by `weakref_null_referents_pre_gc`. A JDK
+        // `Cleaner` holds its referent in slot 0 AND is strongly reachable
+        // from the static `Cleaner.first` list, so re-typing it would have
+        // made the buffer permanently reachable and reclaimed even less.
+        // Leaving it a phantom keeps the nulling, the clearing and the
+        // liveness rules exactly as they already are, and only redirects the
+        // final hand-off.
+        if is_jdk_cleaner_class(shared, shared.mem.heap.class_id_of(ref_obj)) {
+            shared.mem.cleaner_thread.submit_action(actual_ref);
             continue;
         }
         // Push onto queue's linked list head (field 0 = head, field 1 = size).

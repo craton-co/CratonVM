@@ -1,6 +1,32 @@
 # `Preconditions.checkFromToIndex` ignores its exception formatter and always throws `ArrayIndexOutOfBoundsException`
 
-**Status:** OPEN.
+**Status:** OPEN — but **defect 2 below is FIXED** (2026-08-05).
+
+**Update 2026-08-05.** All five `jdk/internal/util/Preconditions` overrides in
+`native-builtins/src/lib.rs` now throw plain `IndexOutOfBoundsException`
+instead of `ArrayIndexOutOfBoundsException`. That is defect 2 ("the fallback
+class is wrong even with no formatter") closed. It was surfaced from the other
+end: `ByteBufferBulkProbe`'s new `absDirectPastLimit` case, where a DIRECT
+`ByteBuffer`'s absolute `get(int)` correctly bails to real `DirectByteBuffer`
+bytecode and lands on `Buffer.checkIndex` → `Preconditions.checkIndex`. See
+`fixed-suite-bugs/bytebuffer-jdk-contract-divergences-20260731-FIXED.md`.
+
+**Defect 1 — the formatter is discarded — is still open, and is currently
+unobservable.** `Preconditions.<clinit>` is registered as `native_noop` (a
+deliberate bootstrap-ordering measure, with its own comment at the
+registration site), so the `SIOOBE_FORMATTER` / `AIOOBE_FORMATTER` statics are
+never built and every caller passes `null`. The JDK's own answer for a null
+formatter is exactly what these now throw. Honouring the formatter therefore
+cannot be done by "invoke the `BiFunction`" alone: it needs the formatters to
+exist, i.e. un-suppressing that `<clinit>` or synthesising them. **That is the
+real remaining work, and "What must change" below understates it.**
+
+The F4 `String` workaround is consequently still load-bearing and was NOT
+removed. Verified after the change: `StringUtf16HashProbe` and
+`StringPolicyMatrixProbe` are byte-identical between the pre- and post-fix
+binaries — `String` callers go through F4 and never reach `Preconditions`, so
+rows 31-35 / 83-88 / 292-293 still get the correct
+`StringIndexOutOfBoundsException` class.
 
 **Supersedes** `string-substring-bounds-throw-arrayindexoutofbounds.md`, filed
 2026-08-04, **which was wrong about the cause and wrong about the blame.** That

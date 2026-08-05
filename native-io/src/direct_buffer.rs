@@ -299,6 +299,60 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
 // Allocation core
 // ---------------------------------------------------------------------------
 
+/// [`dbb_allocate`] with the JDK's own collect-and-retry on a reservation
+/// failure, for the callers that have a `NativeContext` to collect with.
+///
+/// `java.nio.Bits.reserveMemory` does exactly this: when the direct-memory
+/// budget is exhausted it runs `System.gc()` and retries rather than throwing
+/// on the first miss, precisely because a dropped-but-uncollected direct
+/// buffer's memory is only released once its `Cleaner` runs. CratonVM had no
+/// equivalent anywhere on this path, and — critically — *nothing else would
+/// ever trigger the collection*: a direct-buffer workload allocates ~100 bytes
+/// of Java heap per buffer, so it can exhaust a 1 GiB direct budget without
+/// ever pushing the heap hard enough to cause an allocation-triggered GC. The
+/// forced GC here also runs pending cleaner actions
+/// (`force_gc_from_native` → `run_cleaner_actions`), which is what actually
+/// refunds the reservation.
+///
+/// Three rounds, matching the JDK's bounded retry. Each is a full collection,
+/// so this is only reached on the failure path; a workload whose live set
+/// genuinely exceeds the cap pays three GCs once and then gets its
+/// `OutOfMemoryError`, exactly as before.
+///
+/// Note the reservation the retry is waiting on is refunded from a Java-side
+/// `Deallocator.run()` invoked *by* `force_gc`, so the retry must re-read the
+/// accounting after the GC returns rather than caching anything across it.
+fn dbb_allocate_collecting(
+    ctx: &mut dyn NativeContext,
+    size: i64,
+) -> Result<u64, MethodCallFailed> {
+    match dbb_allocate(size) {
+        Ok(addr) => return Ok(addr),
+        Err(e) if !is_reservation_failure(size) => return Err(e),
+        Err(_) => {}
+    }
+    for _ in 0..3 {
+        ctx.force_gc();
+        match dbb_allocate(size) {
+            Ok(addr) => return Ok(addr),
+            Err(e) if !is_reservation_failure(size) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    dbb_allocate(size)
+}
+
+/// Would a reservation of `size` still fail against the current budget?
+///
+/// Distinguishes "over the direct-memory cap" (worth collecting for — a
+/// `Cleaner` may still refund it) from every other `dbb_allocate` failure
+/// (negative size, unrepresentable layout, the system allocator itself
+/// returning null), which no amount of collecting can change.
+fn is_reservation_failure(size: i64) -> bool {
+    let b = bits();
+    size > 0 && b.reserved.load(Ordering::Acquire).saturating_add(size) > b.max.load(Ordering::Relaxed)
+}
+
 /// Allocate `size` bytes for a new DirectByteBuffer.  Tries the pool
 /// first, then falls back to the system allocator.  All addresses
 /// returned are 8-byte aligned (sufficient for any primitive type used
@@ -551,12 +605,28 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
 /// "size" (the raw byte count to reserve) and "cap" (the capacity
 /// reported back to the user, sometimes inflated to a page boundary).
 /// Our accounting only cares about `size`.
-fn bits_reserve_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn bits_reserve_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = arg_long(args, 0);
     if size < 0 {
         return Err(oom(format!("negative reserveMemory: {size}")));
     }
-    try_reserve(size)?;
+    // Same collect-and-retry as `dbb_allocate_collecting`, and for the same
+    // reason: the real `java.nio.Bits.reserveMemory` runs `System.gc()` and
+    // retries before giving up, because the budget it is checking is only
+    // refunded when a dropped buffer's `Cleaner` runs. (This native is only
+    // reached in synthetic mode — in real-JDK mode the JDK's own `Bits`
+    // bytecode wins, since this triple is not in
+    // `force_native_over_real_jdk_bytecode` — but the two paths should not
+    // differ in whether they collect.)
+    if try_reserve(size).is_err() {
+        for _ in 0..3 {
+            ctx.force_gc();
+            if try_reserve(size).is_ok() {
+                return Ok(None);
+            }
+        }
+        try_reserve(size)?;
+    }
     Ok(None)
 }
 
@@ -586,7 +656,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let addr = dbb_allocate(cap)?;
+    let addr = dbb_allocate_collecting(ctx, cap)?;
     let cleaner_id = if cap > 0 {
         register_cleaner(addr, cap)
     } else {
@@ -805,11 +875,22 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// `jdk.internal.misc.Unsafe.allocateMemory(long size) -> long` —
 /// records the (addr, size) so `freeMemory(addr)` can reclaim it
-/// accurately. JVM users who go via `ByteBuffer.allocateDirect` use
-/// `dbb_allocate_direct0` above and don't touch this path.
-fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// accurately.
+///
+/// In REAL-JDK mode this is also the direct-buffer allocation path, despite
+/// what the sentence below used to claim: `java.nio.Bits.reserveMemory` is
+/// not in `force_native_over_real_jdk_bytecode`, so the JDK's own `Bits`
+/// bytecode runs and our `bits_reserve_memory` never fires — the only place
+/// our accounting is consulted for a `ByteBuffer.allocateDirect` is the
+/// `allocateMemory0` the real `DirectByteBuffer(int)` constructor calls right
+/// here. That is why the collect-and-retry lives on this path: without it the
+/// first over-budget request threw, with no collection ever attempted (the
+/// measured `OutOfMemoryError: Direct buffer memory: tried 8388608, used
+/// 1073741824, max 1073741824` came from exactly this call, reported against
+/// `DirectByteBuffer.<init>`). Synthetic mode uses `dbb_allocate_direct0`.
+fn unsafe_allocate_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = unsafe_long_arg(args);
-    let addr = dbb_allocate(size)?;
+    let addr = dbb_allocate_collecting(ctx, size)?;
     if addr != 0 {
         record_unsafe_alloc(addr, size);
     }

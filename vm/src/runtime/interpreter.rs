@@ -281,6 +281,20 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     }
 }
 
+/// Cached `CRATONVM_DBG_REFDISC` gate: trace every `discover_reference` with
+/// the reference object's CLASS NAME. The numeric `ref_type` cannot tell an
+/// ordinary `PhantomReference` from a `jdk.internal.ref.Cleaner` (the latter
+/// is a subclass, so its `super(referent, dummyQueue)` arrives with the same
+/// phantom tag) — which is exactly the question
+/// `direct-bytebuffers-are-never-reclaimed-20260805.md` needed answered
+/// before its Cleaner routing could be written.
+#[inline]
+pub fn dbg_refdisc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFDISC").is_some())
+}
+
 /// Cached `CRATONVM_DBG_NO_CLEANERS` gate (bc math-ec 0x4 bisect): skip ONLY
 /// `run_cleaner_actions` + `run_finalizers` (the Java invokes on queued —
 /// possibly stale — addresses), keeping `process_references_after_gc` live.

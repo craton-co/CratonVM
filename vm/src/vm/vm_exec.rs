@@ -11060,6 +11060,23 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let ref_addr = reference_obj.as_ptr() as usize;
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
+        // processor is told about, not just its type tag. Asked for by
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md`: "find where a
+        // real-JDK `jdk.internal.ref.Cleaner` is actually discovered", which
+        // the numeric `ref_type` alone cannot answer — a `Cleaner` reaches
+        // here as a PHANTOM (it is a `PhantomReference` subclass, and its
+        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
+        // native), so the tag says "2" for both an ordinary phantom and a
+        // cleaner.
+        if crate::runtime::interpreter::dbg_refdisc_enabled() {
+            let cn = self
+                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[refdisc] type={rt:?} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
+            );
+        }
         self.shared.mem.ref_processor.lock().discover_reference(
             rt,
             ref_addr,

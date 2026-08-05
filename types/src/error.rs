@@ -850,6 +850,24 @@ pub enum RuntimeError {
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
     ArrayIndexOutOfBoundsException { index: i32 },
 
+    /// `java.lang.IndexOutOfBoundsException` — the PLAIN superclass, for the
+    /// APIs whose spec names it rather than one of the array/string
+    /// subclasses. `java.nio.Buffer`'s absolute accessors and the
+    /// `ByteBuffer` bulk `get`/`put` forms are the motivating case: they
+    /// check an index against a *buffer's* limit, not an array's length, and
+    /// the JDK throws exactly `IndexOutOfBoundsException` there.
+    ///
+    /// Throwing `ArrayIndexOutOfBoundsException` instead is *nearly* harmless
+    /// — it is a subclass, so every `catch (IndexOutOfBoundsException)`
+    /// still matches — which is why it survived as a documented-benign
+    /// divergence for a while. It is not free, though: a differential that
+    /// compares thrown exception *types* against HotSpot can never go green,
+    /// and `catch (ArrayIndexOutOfBoundsException)` around a buffer operation
+    /// matches here while missing on a real JVM. See
+    /// fixed-suite-bugs/bytebuffer-jdk-contract-divergences-20260731-FIXED.md.
+    #[error("IndexOutOfBoundsException: index {index}")]
+    IndexOutOfBoundsException { index: i32 },
+
     #[error("ArithmeticException: {message}")]
     ArithmeticException { message: String },
 
@@ -1074,6 +1092,9 @@ impl RuntimeError {
             }
             RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
                 ("java/lang/ArrayIndexOutOfBoundsException", None)
+            }
+            RuntimeError::IndexOutOfBoundsException { index: _ } => {
+                ("java/lang/IndexOutOfBoundsException", None)
             }
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))

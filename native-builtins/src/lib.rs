@@ -11075,6 +11075,27 @@ pub fn register_essential_natives_with_shims(
     // very bottom of bootstrap — before `java.lang.invoke` is usable — so
     // running the real <clinit> there would be a bootstrap-ordering hazard for
     // no behavioural gain. Suppressing it is therefore spec-neutral here.
+    //
+    // EXCEPTION CLASS (2026-08-05): every one of the overrides below used to
+    // throw `ArrayIndexOutOfBoundsException`. The real
+    // `Preconditions.outOfBounds` asks the `oobef` formatter first and, when
+    // it is absent, throws plain `IndexOutOfBoundsException` — never the
+    // array subclass. Suppressing `<clinit>` above means the formatter
+    // statics are null for every caller here, so the JDK's null-formatter
+    // answer is the whole of the observable behaviour, and it is
+    // `IndexOutOfBoundsException`. Getting this wrong in the *subclass*
+    // direction is what breaks a `catch`: `catch (IndexOutOfBoundsException)`
+    // matched either way, but code catching the specific sibling did not.
+    // Surfaced by `ByteBufferBulkProbe`'s `absDirectPastLimit` case, where a
+    // DIRECT receiver's absolute `get(int)` correctly bails to real
+    // `DirectByteBuffer` bytecode and lands on `Buffer.checkIndex` →
+    // `Preconditions.checkIndex(i, limit, IOOBE_FORMATTER)`.
+    //
+    // This is HALF of `known-issues/preconditions-ignores-the-exception-
+    // formatter.md`: the fallback class is now right, but the formatter is
+    // still discarded. That half is currently unobservable (the statics are
+    // null), and making it observable means un-suppressing the `<clinit>`
+    // this comment explains cannot safely run — see that doc.
     registry.register(
         "jdk/internal/util/Preconditions",
         "<clinit>",
@@ -11096,10 +11117,8 @@ pub fn register_essential_natives_with_shims(
             };
             if index < 0 || index >= length {
                 Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
+                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index }
+                        .into(),
                 )
             } else {
                 Ok(Some(Value::Int(index)))
@@ -11122,10 +11141,8 @@ pub fn register_essential_natives_with_shims(
             };
             if index < 0 || index >= length {
                 Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
+                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index }
+                        .into(),
                 )
             } else {
                 Ok(Some(Value::Int(index)))
@@ -11152,10 +11169,8 @@ pub fn register_essential_natives_with_shims(
             };
             if from < 0 || from > to || to > length {
                 Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
+                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
+                        .into(),
                 )
             } else {
                 Ok(Some(Value::Int(from)))
@@ -11181,10 +11196,8 @@ pub fn register_essential_natives_with_shims(
             };
             if from < 0 || from > to || to > length {
                 Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
+                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
+                        .into(),
                 )
             } else {
                 Ok(Some(Value::Int(from)))
@@ -11211,10 +11224,8 @@ pub fn register_essential_natives_with_shims(
             };
             if from < 0 || size < 0 || from + size > length {
                 Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
+                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
+                        .into(),
                 )
             } else {
                 Ok(Some(Value::Int(from)))
