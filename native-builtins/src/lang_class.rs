@@ -12893,8 +12893,19 @@ fn build_class_annotation_array(
         .iter()
         .filter(|a| annotation_type_loadable_near(ctx, a, Some(queried_class_id)))
         .collect();
+    // Component is `java/lang/annotation/Annotation`, exactly as
+    // `build_method_annotation_array` and `build_annotation_array_for` already
+    // use — NOT `ClassId::new(0)`. A reference array carries its component class
+    // id in `ObjectHeader.class_id`, so `ClassId::new(0)` made every
+    // `Class.getDeclaredAnnotations()` / `Class.getAnnotations()` result report
+    // `[Ljava.lang.Object;` where HotSpot reports
+    // `[Ljava.lang.annotation.Annotation;` — and, because that same header word
+    // is what a virtual/interface dispatch reads to name the receiver's class,
+    // an `annotationType()` reached through the array surfaced as
+    // `NoSuchMethodError: java.lang.Object.annotationType()`.
+    let comp = annotation_component_class_id(ctx);
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
-    build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
+    build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
     })
 }
@@ -12933,14 +12944,17 @@ pub(crate) fn native_class_get_declared_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            // Even the degenerate result is an `Annotation[]`, not an `Object[]`.
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -12969,14 +12983,17 @@ pub(crate) fn native_class_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            // Even the degenerate result is an `Annotation[]`, not an `Object[]`.
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -13329,9 +13346,13 @@ fn class_annotations_by_type_impl(
         }
     }
 
+    // `getAnnotationsByType(Class<A>)` is declared to return `A[]`, so the array
+    // component is the QUERIED annotation type — not `java/lang/Object`, which
+    // made `Base.class.getAnnotationsByType(Tag.class).getClass().getName()`
+    // report `[Ljava.lang.Object;` where HotSpot reports `[LTag;`.
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+    let arr = build_mirror_array_comp(ctx, ann_class_id, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -13405,9 +13426,10 @@ pub(crate) fn native_method_get_annotations_by_type(
     let matching =
         directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
+    // `A[]`, same as the Class-holder sibling above.
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = annotation_container_loader(ctx, class_id);
-    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+    let arr = build_mirror_array_comp(ctx, ann_class_id, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -13494,14 +13516,16 @@ pub(crate) fn native_field_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let (class_id, field_name) = match field_class_and_name(ctx, this) {
         Some(v) => v,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -13586,14 +13610,16 @@ pub(crate) fn native_method_get_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let (class_id, method_name, method_desc) = match method_class_name_desc(ctx, this) {
         Some(v) => v,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
