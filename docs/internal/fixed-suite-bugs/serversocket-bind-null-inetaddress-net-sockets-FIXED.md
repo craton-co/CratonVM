@@ -216,8 +216,9 @@ warmed away and the test passes vacuously.
   with both fields set, so this is a wide, separate change; it is NOT a residual
   of this bug. It is the only remaining difference in the probe's
   `InetSocketAddress.toString()` lines, and it is filed on its own as
-  `docs/known-issues/vm/inetaddress-tostring-keeps-a-hostname-for-literal-addresses-20260804.md`
-  rather than left implicit here.
+  `inetaddress-tostring-hostname-literal-addresses-FIXED.md` rather than left
+  implicit here — and FIXED there on 2026-08-05, which removed exactly these
+  five lines from this probe's diff.
 
 After the fix, the probe's whole diff against HotSpot under
 `CRATONVM_GC=stress=65536` is **10 lines, all three bullets above and nothing

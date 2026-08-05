@@ -12167,6 +12167,21 @@ fn p52_isa_host_from_addr(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Value
     Value::Object(None)
 }
 
+/// The numeric address text of an `InetAddress`, which is what
+/// `InetSocketAddress.equals`/`hashCode` must key on — `InetAddress.equals` is
+/// defined purely over the address bytes, so two mirrors of `127.0.0.1` are
+/// equal no matter what hostName either of them remembers.
+///
+/// Falls back to the empty string for anything this family did not build; two
+/// such objects then compare equal on address, which is the same answer the
+/// old host-text comparison gave them.
+fn p52_isa_addr_ip(ctx: &mut dyn NativeContext, addr: ObjectRef) -> String {
+    match crate::net_phase_e::inet_addr_resolve_external(ctx, addr) {
+        Some((_, ip)) => ip,
+        None => String::new(),
+    }
+}
+
 fn p52_is_isa_holder(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(obj);
     matches!(
@@ -12325,8 +12340,16 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this_h = scope.root(this);
         let host_h = scope.root(host);
         let host_str = scope.read_string(host).unwrap_or_default();
+        // The ADDRESS remembers a name only when one was supplied: HotSpot's
+        // `new InetSocketAddress("127.0.0.1", p).toString()` is `/127.0.0.1:p`
+        // (the address it resolved has no hostName), while `("localhost", p)`
+        // is `localhost/127.0.0.1:p`. The outer `InetSocketAddress`'s own
+        // `hostname` slot is left as the caller's text either way — every
+        // observable of it (`getHostName`/`getHostString`) agrees with HotSpot
+        // for both spellings, since HotSpot answers those from the address when
+        // its own field is null.
         let addr = match crate::net_phase_e::resolve_host_external(&host_str) {
-            Some(ip) => Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+            Some(ip) => Value::Object(Some(crate::net_phase_e::alloc_inet_address_for_input(
                 &mut *scope,
                 &host_str,
                 &ip,
@@ -12480,14 +12503,42 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             if p1 != p2 {
                 return Ok(Some(Value::Int(0)));
             }
-            let eq = match (
-                p52_isa_host_value(ctx, this),
-                p52_isa_host_value(ctx, *other),
-            ) {
-                (Value::Object(Some(a)), Value::Object(Some(b))) => {
-                    ctx.read_string(a).unwrap_or_default() == ctx.read_string(b).unwrap_or_default()
+            // The JDK compares the ADDRESS when both sides have one, and only
+            // falls back to the hostname for UNRESOLVED addresses:
+            //
+            //   if (addr != null)      return addr.equals(that.addr);
+            //   else if (hostname != null)
+            //                          return that.addr == null
+            //                                 && hostname.equalsIgnoreCase(that.hostname);
+            //   else                   return that.addr == null && that.hostname == null;
+            //
+            // Comparing the host TEXT instead made
+            // `new InetSocketAddress(getByName("127.0.0.1"), p)` unequal to
+            // `new InetSocketAddress(getByName("localhost"), p)` — the same
+            // endpoint, spelled two ways — so any `Set<SocketAddress>` or
+            // `Map<SocketAddress, …>` keyed by peer identity could hold both.
+            // The hostname fallback is `equalsIgnoreCase`, because DNS names
+            // are case-insensitive.
+            let a1 = p52_isa_addr_value(ctx, this);
+            let a2 = p52_isa_addr_value(ctx, *other);
+            let eq = match (a1, a2) {
+                (Value::Object(Some(x)), Value::Object(Some(y))) => {
+                    p52_isa_addr_ip(ctx, x) == p52_isa_addr_ip(ctx, y)
                 }
-                _ => false,
+                // Exactly one side resolved: the JDK's `addr.equals(null)` is
+                // false, and its unresolved branch demands `that.addr == null`.
+                (Value::Object(Some(_)), _) | (_, Value::Object(Some(_))) => false,
+                // Both unresolved — compare the hostnames case-insensitively.
+                _ => match (
+                    p52_isa_host_value(ctx, this),
+                    p52_isa_host_value(ctx, *other),
+                ) {
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => ctx
+                        .read_string(a)
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case(&ctx.read_string(b).unwrap_or_default()),
+                    _ => false,
+                },
             };
             Ok(Some(Value::Int(if eq { 1 } else { 0 })))
         } else {
@@ -12497,17 +12548,25 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     r.register(isa, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = p52_isa_port_value(ctx, this).as_int().unwrap_or(0);
-        let h: i32 = if let Value::Object(Some(s)) = p52_isa_host_value(ctx, this) {
-            let st = ctx.read_string(s).unwrap_or_default();
-            let mut hash: i32 = 0;
-            for ch in st.chars() {
-                hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
-            }
-            hash
-        } else {
-            0
+        // Must agree with `equals` directly above: it compares the ADDRESS when
+        // one exists, so hashing the host TEXT would give two equal endpoints
+        // (`127.0.0.1` and `localhost`) different hashes — the classic broken
+        // pair that loses entries in a HashMap. Hash the same thing `equals`
+        // compares: the numeric address, falling back to the hostname only for
+        // the unresolved case, lower-cased because that comparison is
+        // case-insensitive.
+        let key = match p52_isa_addr_value(ctx, this) {
+            Value::Object(Some(addr)) => p52_isa_addr_ip(ctx, addr),
+            _ => match p52_isa_host_value(ctx, this) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().to_ascii_lowercase(),
+                _ => String::new(),
+            },
         };
-        Ok(Some(Value::Int(h ^ port)))
+        let mut hash: i32 = 0;
+        for ch in key.chars() {
+            hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        Ok(Some(Value::Int(hash ^ port)))
     });
     r.register(
         "java/net/SocketAddress",
@@ -17181,7 +17240,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 // instance slot 0 (the typed `holder` reference field) is what
                 // poisoned real-JDK InetAddress bytecode dispatch.
                 let addr =
-                    crate::net_phase_e::alloc_inet_address_external(ctx, &host_str, &host_str);
+                    crate::net_phase_e::alloc_inet_address_for_input(ctx, &host_str, &host_str);
                 Ok(Some(Value::Object(Some(addr))))
             } else {
                 Ok(Some(Value::Object(None)))
@@ -20551,14 +20610,26 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Layout-aware: side table → real-JDK `holder` → legacy slot 0.
-        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            Some((h, _)) => h,
-            None => match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            },
+        //
+        // A mirror that carries NO hostName stores the empty string (see
+        // `net_phase_e::NO_HOST_NAME`); this accessor must then answer the
+        // numeric text, never "". HotSpot arrives at the same place by trying a
+        // reverse lookup and falling back to `getHostAddress()`. This
+        // duplicates `net_phase_e::inet_addr_host_name_value` because both
+        // registrations exist and either may win the last-writer-wins registry
+        // slot — they must not disagree.
+        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some((h, i)) => (h, i),
+            None => {
+                let h = match ctx.get_field(this, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                (h, String::new())
+            }
         };
-        Ok(Some(Value::Object(Some(ctx.create_string(&host)))))
+        let answer = if host.is_empty() { ip } else { host };
+        Ok(Some(Value::Object(Some(ctx.create_string(&answer)))))
     });
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
