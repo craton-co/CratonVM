@@ -5670,8 +5670,8 @@ impl NativeMethodRegistry {
         // LEAF: record the callback address if this triple is declared leaf
         // (`crate::leaf::LEAF_NATIVES`). Done here — at the registration, where
         // the triple and the callback are both in hand — because that is where
-        // the property belongs: `docs/known-issues/vm/native-call-funnel-is-the-
-        // per-call-floor-20260803.md` asks for the funnel bypass to generalise
+        // the property belongs: `native-call-funnel-per-call-floor-RETIRED-
+        // 20260804.md` asks for the funnel bypass to generalise
         // as a class whose "predicate wants to live on the registration (a
         // `NativeKind`-adjacent flag), not in a growing `match` in
         // `helpers.rs`". Every dispatch route reads it from one place —

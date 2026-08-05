@@ -4154,11 +4154,14 @@ fn run() -> Result<()> {
         // interpreter-side bypass reads as "landed" while being inert for
         // every compiled call — which is exactly what happened to the
         // `Thread.currentThread` fix. See `jit::helpers::JIT_FUNNEL_BYPASS_HITS`
-        // and docs/known-issues/vm/native-call-funnel-is-the-per-call-floor.
-        let (sp_sites, ir_sites) = cratonvm_jit::thread_current_thread_bound_sites();
+        // and native-call-funnel-per-call-floor-RETIRED-20260804.md.
+        let (sp_sites, ir_sites, osr_sites) = cratonvm_jit::thread_current_thread_bound_sites();
+        let (sp_seen, ir_seen) = cratonvm_jit::static_sites_seen();
         eprintln!(
             "[cratonvm] compiled-code native-funnel bypasses: {} \
-             (Thread.currentThread sites bound: single-pass {sp_sites}, IR {ir_sites})",
+             (Thread.currentThread sites bound per compile door: \
+             single-pass {sp_sites}/{sp_seen}, IR {ir_sites}/{ir_seen}, OSR {osr_sites}; \
+             the two denominators are invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
         );
         // LEAF natives (`cratonvm_native_api::leaf`). The violation count is

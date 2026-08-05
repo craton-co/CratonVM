@@ -29,13 +29,22 @@ param(
     [string]$ClassPath = 'out'
 )
 
+# `& 'name.exe'` searches PATH, not the working directory, so a bare file name
+# fails with CommandNotFoundException. Resolve both arms to absolute paths up
+# front rather than making the caller remember `.\`.
+$Base = (Resolve-Path $Base).Path
+$Fix = (Resolve-Path $Fix).Path
+
 function Invoke-Probe {
     param([string]$Exe)
     $raw = & $Exe --java-home $JdkHome -cp $ClassPath NativeShapeProbe 2>&1 | Out-String
     $result = @{}
     foreach ($line in $raw -split "`r?`n") {
-        # "<label padded to 46> <p1> <p2> <p3> <p4>"
-        if ($line -match '^(\S.{0,44}\S)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$') {
+        # "<label> <p1> <p2> <p3> <p4>". The label is PADDED to 46 but not
+        # truncated to it — two rungs are longer — so match it non-greedily
+        # rather than with a width, or those rungs silently vanish from the
+        # comparison table.
+        if ($line -match '^(.*?\S)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$') {
             $label = $Matches[1].Trim()
             if ($label -eq 'rung') { continue }
             $last = [double](($Matches[5]) -replace ',', '.')

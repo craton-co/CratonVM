@@ -25,7 +25,7 @@
 //!
 //! ## Why this is a registration property and not a `match`
 //!
-//! `docs/known-issues/vm/native-call-funnel-is-the-per-call-floor-20260803.md`
+//! `native-call-funnel-per-call-floor-RETIRED-20260804.md`
 //! asks for the bypass to generalise "as a *class* of leaf natives rather
 //! than another hand-written case… That predicate wants to live on the
 //! registration (a `NativeKind`-adjacent flag), not in a growing `match` in
@@ -47,6 +47,26 @@
 //! non-leaf and costs one relaxed load, a shift and a test; only a set bit
 //! consults the exact table, and only a genuine leaf (or a rare false
 //! positive) ever gets that far.
+//!
+//! ## Identical code folding — the one sharp edge of keying on the address
+//!
+//! Two Rust `fn` items with **identical machine code** may share a single
+//! address: the MSVC linker folds them (`/OPT:ICF`, on by default in release),
+//! and other linkers have the same feature. Distinct `fn` items are therefore
+//! *not* a guarantee of distinct addresses.
+//!
+//! For this module that means marking a leaf callback also marks every other
+//! callback the linker folded with it. It is not hypothetical — it is how
+//! `leaf_native_tests` first failed, with three same-bodied test natives
+//! collapsing into one address.
+//!
+//! It is not a live hazard for [`LEAF_NATIVES`] as it stands (both entries
+//! read a clock; nothing else in the registry compiles to the same bytes), and
+//! it cannot be one for a *correctly* chosen entry: a native folded with a
+//! leaf has byte-identical code, so it does byte-identically nothing
+//! dangerous. It becomes a hazard the moment an entry is added whose body is a
+//! trivial constant-return — the shape hundreds of registered stubs share. Do
+//! not add one, and if you must, the audit below is what will catch it.
 //!
 //! ## The audit
 //!

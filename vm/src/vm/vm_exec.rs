@@ -23669,7 +23669,7 @@ impl Drop for JniImplicitFrameGuard {
 
 /// Where the native funnel's fixed per-call cost actually goes.
 ///
-/// `docs/known-issues/vm/native-call-funnel-is-the-per-call-floor-20260803.md`
+/// `native-call-funnel-per-call-floor-RETIRED-20260804.md`
 /// measured the funnel at ~180-330 ns for zero arguments and then said so
 /// itself: *"Nobody has profiled it; this document asserts where the time is,
 /// not which line."* This module is the answer to that. It drives
@@ -23869,9 +23869,40 @@ mod leaf_native_tests {
         Arc::new(SharedVm::new(VmConfig::default()))
     }
 
-    /// A well-behaved leaf: no ctx contact, primitive return.
-    fn leafy(_ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+    /// Three well-behaved leaves, one per test, **with deliberately different
+    /// bodies**.
+    ///
+    /// Separate functions because `leaf::mark` is process-global and libtest
+    /// runs these concurrently: one shared callback marked by one test would
+    /// be already-marked when another asserted it was not.
+    ///
+    /// Different *return values* because separate `fn` items are **not enough
+    /// to guarantee separate addresses**. The MSVC linker's identical COMDAT
+    /// folding (`/OPT:ICF`, on by default in release) merges functions with
+    /// identical machine code, so three byte-identical bodies collapse to one
+    /// address and marking any of them marks all three. That is not a
+    /// hypothetical — it is how this test first failed, and it is a real
+    /// property of keying the leaf class on the callback ADDRESS. See the
+    /// identical-code-folding note in `cratonvm_native_api::leaf`.
+    fn leafy_unmarked(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _a: &[Value],
+    ) -> MethodCallResult {
         Ok(Some(Value::Long(7)))
+    }
+
+    fn leafy_marked(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _a: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Long(11)))
+    }
+
+    fn leafy_audited(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _a: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Long(13)))
     }
 
     /// A native that LIES about being a leaf: it allocates and hands the
@@ -23883,31 +23914,34 @@ mod leaf_native_tests {
 
     #[test]
     fn an_unmarked_callback_is_not_routed_to_the_leaf_path() {
-        let before = leaf_native_dispatch_count();
         let shared = shared();
         let mut thread = JvmThread::new(ThreadId(0), "leaf-route");
-        let cb: NativeCallback = leafy;
+        let cb: NativeCallback = leafy_unmarked;
         assert_eq!(
             safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
             Some(Value::Long(7))
         );
-        assert_eq!(
-            leaf_native_dispatch_count(),
-            before,
-            "a callback that was never marked leaf must take the full funnel"
+        // Asserted on the ROUTING PREDICATE, not on the global dispatch
+        // counter. The counter is process-wide and any concurrently-running
+        // test that boots a VM and touches `System.nanoTime` moves it, so
+        // `assert_eq!(count, before)` would be a race dressed up as a
+        // regression check.
+        assert!(
+            !cratonvm_native_api::leaf::is_leaf_callback(cb as usize),
+            "a callback that was never marked leaf must not be classified leaf"
         );
     }
 
     #[test]
     fn a_marked_callback_takes_the_funnel_free_path() {
-        let cb: NativeCallback = leafy;
+        let cb: NativeCallback = leafy_marked;
         cratonvm_native_api::leaf::mark(cb as usize);
         let before = leaf_native_dispatch_count();
         let shared = shared();
         let mut thread = JvmThread::new(ThreadId(0), "leaf-route-marked");
         assert_eq!(
             safe_native_call(&shared, &mut thread, cb, &[]).unwrap(),
-            Some(Value::Long(7)),
+            Some(Value::Long(11)),
             "the leaf path must deliver the native's own result unchanged"
         );
         assert!(
@@ -23931,7 +23965,7 @@ mod leaf_native_tests {
         let mut thread = JvmThread::new(ThreadId(0), "leaf-audit-injection");
 
         let clean_before = leaf_audit_violation_count();
-        let cb: NativeCallback = leafy;
+        let cb: NativeCallback = leafy_audited;
         let _ = leaf_audit_dispatch(&shared, &mut thread, cb, &[]);
         assert_eq!(
             leaf_audit_violation_count(),

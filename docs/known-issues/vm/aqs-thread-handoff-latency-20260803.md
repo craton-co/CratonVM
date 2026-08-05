@@ -8,16 +8,27 @@
 | **Owns** | the residue of the retired `websocket-async-send-interframe-latency` doc |
 | **Real owner of the fix** | the per-call dispatch floor — see *Where this actually belongs* |
 
-> **CORRECTED TWICE. Read
-> [`native-call-funnel-is-the-per-call-floor`](native-call-funnel-is-the-per-call-floor-20260803.md)
-> first — it supersedes the causal claim below.** Revision 2 argued the gap was
+> **CORRECTED THREE TIMES. Read
+> `native-call-funnel-per-call-floor-RETIRED-20260804.md` (in the internal
+> records) first — it supersedes the causal claim below.** Revision 2 argued
+> the gap was
 > "16 Java calls at a 431 ns per-call floor". Both halves were wrong: an
 > ordinary Java call converges to **8.4 ns** (the 431 ns was a single
 > unconverged warm-up pass), and the real cost is the **five NATIVE calls** an
 > uncontended lock/unlock makes — censused exactly:
 > `Thread.currentThread()` x2, `setExclusiveOwnerThread` x2,
-> `Unsafe.compareAndSetInt` x1 — each entering a ~330-810 ns funnel. The
-> measurement table below stands; the explanation under it does not.
+> `Unsafe.compareAndSetInt` x1.
+>
+> **Revision 3 (2026-08-04)** corrects the third claim, the one this document
+> inherited from that one: that each of the five entered a "~330-810 ns
+> funnel". The funnel was finally profiled and it is ~110 ns, of which ~80 ns
+> was two `Arc` refcount pairs in `thread_state::record_transition` — now
+> removed, which takes ~33 ns off *every* native call in the VM. The remainder
+> of the 330-810 ns is the JIT's native **dispatch**, not the funnel. Two of
+> the five calls (`Thread.currentThread()`) are now answered from compiled code
+> in ~9 ns, measured 35x on that rung.
+>
+> The measurement table below stands; the explanation under it does not.
 
 > **This document's first revision was wrong**, and is corrected below. It
 > blamed `AbstractQueuedSynchronizer.acquire`'s pre-park spin (up to 255

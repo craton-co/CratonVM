@@ -622,6 +622,55 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `Thread.currentThread()` thin direct call — the JIT half
+                    // of the funnel bypass the interpreter already has
+                    // (`InterpIntrinsic::ThreadCurrentThread`). A statically
+                    // bound NATIVE callee, so exactly like `Integer.valueOf`
+                    // below the eager callee compile can never succeed, and
+                    // every call paid `jit_invoke_dispatch` →
+                    // `vm_exec::invoke_or_native`, which re-resolves the callee
+                    // BY NAME and only then enters the funnel. The JDK calls it
+                    // twice per uncontended `ReentrantLock` lock/unlock pair.
+                    // See `jit::helpers::jit_thread_current_thread_direct` and
+                    // native-call-funnel-per-call-floor-RETIRED-20260804.md.
+                    //
+                    // Binding it in all THREE compile doors is the whole lesson
+                    // of that document. A version bound only in
+                    // `jit::try_compile`'s two ladders was completely inert:
+                    // `CRATONVM_INTRINSIC_STATS=1` reported 0 bypasses across a
+                    // loop that made 8,000,000 calls — and 0 invokestatic sites
+                    // even EXAMINED by either of those ladders — because a hot
+                    // loop is compiled HERE, by the OSR door, which reaches
+                    // `x64::compile_with_param_slots` directly and carries its
+                    // own copy of the ladder. No timing could have shown that:
+                    // a 0 % change and a fast path that was never installed
+                    // produce the same table.
+                    if invoke_kind == 3
+                        && target_class == "java/lang/Thread"
+                        && mn == "currentThread"
+                        && desc == "()Ljava/lang/Thread;"
+                    {
+                        // Address taken directly, for the same reason the
+                        // `Integer.valueOf` bind below states: `build_helpers`
+                        // registers the jit-crate atomic only AFTER this
+                        // construction block, so reading it here would give 0
+                        // on the first OSR compile in a process.
+                        let entry = crate::jit::helpers::jit_thread_current_thread_direct
+                            as *const () as usize;
+                        cratonvm_jit::THREAD_CURRENT_THREAD_SITES_OSR
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     // `Integer.valueOf(I)` thin direct call — statically bound
                     // NATIVE callee, so the eager callee compile below can never
                     // succeed and the generic dispatch round trip is pure fixed
