@@ -7466,6 +7466,88 @@ fn admit_jit_fast_native_resolved(
     Some((callback, id))
 }
 
+/// Leaf-native fast-path hits from compiled code, reported on shutdown by
+/// `CRATONVM_DBG=intrinsic-stats` beside the interpreter's own counter.
+///
+/// This exists for the same reason that one does, and the reason is worth
+/// restating: **timings cannot tell "the fast path was never installed" from
+/// "it was installed and is no faster."** Two earlier attempts at the
+/// interpreter's `Thread.currentThread` bypass were inert, and only a counter
+/// showed it. A JIT-side path has one extra way to be silently inert — the
+/// site cache can resolve to `None` and cache the refusal forever — so the
+/// number this prints is the acceptance criterion, not the ns/op.
+static LEAF_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Leaf-native dispatches served from compiled code this run.
+pub fn leaf_native_hit_count() -> u64 {
+    LEAF_NATIVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Call sites `resolve_leaf_native_site` declined, and why.
+///
+/// A hit count of zero has two very different explanations — "nothing on this
+/// workload is a leaf" and "every site was refused for a reason I did not
+/// intend" — and only the second is a bug. Rather than rebuild the VM to find
+/// out (a release build here is ~15 minutes), the refusal reason is recorded at
+/// fill time, which runs once per site and never on the dispatch path.
+///
+/// `CRATONVM_DBG=intrinsic-stats` prints the tally. The strings are `&'static`
+/// reason tags, not formatted messages, so nothing allocates unless the flag
+/// asked for the dump.
+mod leaf_refusal {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One counter per refusal reason, in the order they are tested.
+    pub(super) static COUNTS: [AtomicU64; 7] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub(super) const REASONS: [&str; 7] = [
+        "invoke-kind not virtual/interface/static, or receiver not a heap object",
+        "method name is special-cased by invoke_or_native",
+        "receiver class unavailable",
+        "capability-classified triple",
+        "no native registered for the triple",
+        "registered but does not claim leaf",
+        "SyntheticStub / policy refused",
+    ];
+
+    #[inline]
+    pub(super) fn note(reason: usize) -> Option<super::LeafNativeDispatchCache> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// [`note`] for the dispatch-side bails, which return "not served here"
+    /// rather than "no cache entry".
+    #[inline]
+    pub(super) fn note_and_decline(reason: usize) -> Option<i64> {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub(super) fn report() -> Vec<(&'static str, u64)> {
+        REASONS
+            .iter()
+            .zip(COUNTS.iter())
+            .map(|(r, c)| (*r, c.load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+}
+
+/// Per-reason tally of JIT call sites the leaf fast path declined. Cold; read
+/// once on shutdown by `CRATONVM_DBG=intrinsic-stats`.
+pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
+    leaf_refusal::report()
+}
+
 /// Does `invoke_or_native` special-case this method name BEFORE it reaches its
 /// generic "find the registered native" step?
 ///
@@ -7540,16 +7622,10 @@ fn resolve_leaf_native_site(
     receiver_class_id: Option<ClassId>,
 ) -> Option<LeafNativeDispatchCache> {
     if !matches!(info.invoke_kind, 0 | 2 | 3) {
-        return None;
+        return leaf_refusal::note(0);
     }
     if leaf_site_name_is_special_cased(info.method_name) {
-        return None;
-    }
-    // A capability policy turns every native dispatch into a gated one. The
-    // gate lives at the funnel's call site, so a path that does not enter the
-    // funnel must not exist while one is installed.
-    if vm.natives.native_methods.capabilities().is_some() {
-        return None;
+        return leaf_refusal::note(1);
     }
     // Static sites resolve on the constant-pool owner; virtual/interface sites
     // resolve on the receiver's runtime class, which is the only authority on
@@ -7557,20 +7633,51 @@ fn resolve_leaf_native_site(
     let (lookup_class, guard) = match info.invoke_kind {
         3 => (info.class_name.to_string(), None),
         _ => {
-            let cid = receiver_class_id?;
-            let name = vm
+            let Some(cid) = receiver_class_id else {
+                return leaf_refusal::note(2);
+            };
+            let Some(name) = vm
                 .classes
                 .class_manager
-                .try_read()?
-                .get_class(cid)
-                .map(|class| class.name.to_string())?;
+                .try_read()
+                .and_then(|cm| cm.get_class(cid).map(|class| class.name.to_string()))
+            else {
+                return leaf_refusal::note(2);
+            };
             (name, Some(cid.as_u32()))
         }
     };
-    let id = vm
+    // The capability gate (`vm_exec::check_native_dispatch_capability`) runs at
+    // the funnel's dispatch site, so a path that skips the funnel must not skip
+    // a gate that could have said no — or, in Permissive mode, could have
+    // recorded an audit entry.
+    //
+    // The condition is `classify_native`, NOT "is a policy installed": a policy
+    // is ALWAYS installed (`vm_init` calls `set_capabilities` unconditionally,
+    // defaulting to Permissive, so that `capability_audit` can report), and an
+    // earlier cut of this function gated on its mere presence — which made the
+    // whole fast path inert in every configuration. That was caught by
+    // `LEAF_NATIVE_HITS` reading 0 on a run whose ns/op had not moved, which is
+    // exactly the failure mode that counter exists for; the timings alone said
+    // "no faster", not "never ran".
+    //
+    // `classify_native` is a pure function of `(class, method)` and is the FIRST
+    // thing the dispatch-site gate consults: when it answers `None`, that gate
+    // returns `Ok(())` in every mode without touching the policy or the audit
+    // log. So refusing the sensitive triples here is exactly equivalent, and no
+    // leaf native is one — the classified set is process spawn, library load,
+    // `Unsafe`, Panama, file and socket I/O, none of which could satisfy the
+    // leaf contract in the first place.
+    if cratonvm_native_api::capability::classify_native(&lookup_class, info.method_name).is_some() {
+        return leaf_refusal::note(3);
+    }
+    let Some(id) = vm
         .natives
         .native_methods
-        .resolve_id(&lookup_class, info.method_name, info.descriptor)?;
+        .resolve_id(&lookup_class, info.method_name, info.descriptor)
+    else {
+        return leaf_refusal::note(4);
+    };
     // `Thread.currentThread()` is served from the thread mirror instead of the
     // registered body — see `LeafNativeKind::ThreadCurrentThread` — so it is
     // recognised here rather than claimed at registration. Everything else
@@ -7586,22 +7693,26 @@ fn resolve_leaf_native_site(
     } else if vm.natives.native_methods.is_leaf_id(id) {
         LeafNativeKind::Callback
     } else {
-        return None;
+        return leaf_refusal::note(5);
     };
     if vm.natives.native_methods.kind_of_id(id)
         == Some(cratonvm_native_api::NativeKind::SyntheticStub)
     {
-        return None;
+        return leaf_refusal::note(6);
     }
-    let callback = vm.natives.native_methods.callback_of(id)?;
-    let (callback, native_id) = admit_jit_fast_native_resolved(
+    let Some(callback) = vm.natives.native_methods.callback_of(id) else {
+        return leaf_refusal::note(6);
+    };
+    let Some((callback, native_id)) = admit_jit_fast_native_resolved(
         vm,
         &lookup_class,
         info.method_name,
         info.descriptor,
         callback,
         Some(id),
-    )?;
+    ) else {
+        return leaf_refusal::note(6);
+    };
     Some(LeafNativeDispatchCache {
         kind,
         callback,
@@ -9085,8 +9196,13 @@ unsafe fn try_jit_leaf_native_dispatch(
     info_key: JitSiteKey,
     args_slice: &[i64],
 ) -> Option<i64> {
+    // Every bail below is counted, including these pre-resolution ones. An
+    // uncounted `return None` here is what made the first cut of this path
+    // unexplainable: `AtomicInteger.get` showed neither a hit nor a refusal,
+    // because it was arriving at `jit_invoke_virtual_mic` — a different entry
+    // point — and never reaching this function at all.
     if !matches!(info.invoke_kind, 0 | 2 | 3) {
-        return None;
+        return leaf_refusal::note_and_decline(0);
     }
     // The receiver's runtime class both selects the override to resolve and
     // guards a warm entry. A static site has neither.
@@ -9095,9 +9211,12 @@ unsafe fn try_jit_leaf_native_dispatch(
     } else {
         let raw = *args_slice.first()? as u64;
         if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
-            return None;
+            return leaf_refusal::note_and_decline(0);
         }
-        Some(vm.mem.heap.class_id_of(vm.mem.heap.is_object_address(raw as usize)?))
+        match vm.mem.heap.is_object_address(raw as usize) {
+            Some(obj) => Some(vm.mem.heap.class_id_of(obj)),
+            None => return leaf_refusal::note(0).map(|_| 0),
+        }
     };
 
     let generation = vm.natives.native_methods.generation();
@@ -9134,6 +9253,7 @@ unsafe fn try_jit_leaf_native_dispatch(
         // it does not exist yet, fall through: the ordinary dispatcher runs
         // `current_thread_object`'s allocating slow path that builds it.
         let obj = thread.java_thread_obj?;
+        LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         count_jit_native_dispatch(vm, entry.native_id);
         // Object-return handoff root, same contract as every other JIT native
         // fast path (see `jit_integer_value_of_direct`).
@@ -9141,6 +9261,7 @@ unsafe fn try_jit_leaf_native_dispatch(
         return Some(obj.as_ptr() as i64);
     }
     let values = decode_dispatch_values(vm, info, args_slice);
+    LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     count_jit_native_dispatch(vm, entry.native_id);
     let result = match crate::vm::safe_native_call_leaf(vm, thread, entry.callback, &values) {
         Ok(value) => crate::vm::coerce_native_return(value, info.descriptor),
@@ -10752,6 +10873,30 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
     let receiver_raw = args_slice[0];
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
+
+    // Leaf-native fast path — the invokevirtual/invokeinterface half.
+    //
+    // This entry point, not `jit_invoke_dispatch`, is where compiled virtual
+    // calls arrive: the x64 backend emits `jit_invoke_virtual_mic` for them and
+    // reserves the generic dispatcher for static/special sites and bailouts.
+    // Hooking only the dispatcher left every *instance* leaf native — the whole
+    // `AtomicInteger`/`AtomicLong` accessor set, i.e. item 2 of the AQS doc —
+    // still paying the full funnel, with the site never even reaching
+    // `resolve_leaf_native_site` to be counted as a refusal. `AtomicInteger.get`
+    // measured 1026 ns before and 926 ns after the dispatcher-only version:
+    // unchanged, while `Math.abs` (static, same mechanism) went 330 -> 84.
+    //
+    // Placed immediately after `forward_jit_reference_args` so the receiver this
+    // reads is the post-SATB-flush address, and before the MIC/PIC machinery,
+    // which a native leaf has no use for — there is no compiled callee to cache.
+    if let Some(result) = try_jit_leaf_native_dispatch(
+        vm,
+        info,
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+        args_slice,
+    ) {
+        return result;
+    }
 
     // WS1 (kafka JIT throughput): the `Value` decode is deferred. The MIC-hit
     // fast path dispatches straight off the raw `args_slice` and never

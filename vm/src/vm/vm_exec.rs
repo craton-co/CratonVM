@@ -1681,7 +1681,7 @@ pub(crate) fn safe_native_call_prevalidated_objects(
 ///   other native does and the JIT's post-invoke drain sees what it expects.
 ///
 /// Measured effect: `probes/NativeShapeProbe.java`, and
-/// `docs/internal/native-call-funnel-is-the-per-call-floor-20260803.md`.
+/// `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
 pub(crate) fn safe_native_call_leaf(
     shared: &SharedVm,
     thread: &mut JvmThread,

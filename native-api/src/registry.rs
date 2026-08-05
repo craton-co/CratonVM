@@ -4907,7 +4907,7 @@ impl NativeMethodRegistry {
     /// arithmetic: the bodies for which the funnel's ~180-330 ns of pinning,
     /// STW probing, thread-state transitions and unwind bookkeeping is the
     /// entire cost of the call. Measured on `probes/NativeShapeProbe.java`;
-    /// see `docs/internal/native-call-funnel-is-the-per-call-floor-20260803.md`.
+    /// see `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
     ///
     /// The claim rides on the **callback**, not on the triple: it is captured
     /// into the slot by `register()` alongside the category, so a later phase
