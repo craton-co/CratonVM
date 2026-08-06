@@ -100,7 +100,18 @@ cold-path/warm-path split for a later change to rediscover.
 | `vm/src/runtime/interpreter/native_override.rs` | **the ninth**: `force_native_over_real_jdk_bytecode`'s receiver-blind arm |
 
 `threadpool_executor_has_real_workers` and the
-`THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` census constant went with them.
+`THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` census constant went with them — and
+so did `CRATONVM_DBG_TPE_SHAPE` and `probes/L10ShapeInstrumentControlProbe`,
+the flag L10 added to measure the predicate and the negative control that made
+its `false` branch fire. An instrument for a decision the VM no longer makes
+can only ever print nothing, which is the same silence-is-not-zero trap the
+flag was designed around; L10's readings are kept in its own record.
+
+**The native itself is NOT deleted, and must not be.** Strict mode declines to
+ADMIT a native, it does not remove it, and the `--features synthetic-jdk` build
+still registers and runs `native_es_execute` — that is the only build where the
+real `execute()` bytecode this stand-in exists for is absent. Two wave-2
+records that said it "can go away entirely" were corrected in place by L10.
 
 ### 5. One generalisation, deliberately
 
