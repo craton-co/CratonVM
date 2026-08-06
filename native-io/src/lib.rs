@@ -7383,10 +7383,8 @@ fn buffer_index_out_of_bounds() -> MethodCallFailed {
 /// `Preconditions` through `Objects`, whose `null` formatter puts that text on
 /// the exception.
 fn buffer_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), MethodCallFailed> {
-    let bad = from < 0
-        || size < 0
-        || length < 0
-        || i64::from(from) + i64::from(size) > i64::from(length);
+    let bad =
+        from < 0 || size < 0 || length < 0 || i64::from(from) + i64::from(size) > i64::from(length);
     if !bad {
         return Ok(());
     }

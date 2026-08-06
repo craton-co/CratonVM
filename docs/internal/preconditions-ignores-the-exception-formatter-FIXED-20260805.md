@@ -212,30 +212,43 @@ with `Preconditions.checkFromToIndex(start, end, count, SIOOBE_FORMATTER)`.
 
 ## Verification
 
-`probes/PreconditionsFormatterProbe` prints class **and** message for 50 rows
-across four domains and is diffed against HotSpot 25.
+`probes/PreconditionsFormatterProbe` prints class **and** message for 58 rows
+across five domains and is diffed against HotSpot 25: **54 / 58 identical**,
+the four exceptions being the two separate defects filed below.
 
-| | before | after |
-|---|---|---|
-| rows identical to HotSpot | — | **46 / 50** |
-| the eight rows the old record named | 0/8 | **8/8** |
-| `Objects.check*` (null formatter) | 0/8 | **8/8** |
-| NIO buffer rows | 6/18 | **16/18** |
-
-The eight rows the old record named as the acceptance test —
+The eight rows the record named as its acceptance test —
 `substring1(PLAIN,-1)`, `substring1(PLAIN,len+1)`, `substring2(PLAIN,3,2)`,
 `substring2(PLAIN,-1,3)`, `substring2(PLAIN,0,len+1)`,
 `substring2(PLAIN,MIN,MAX)`, `new String(utf8,-1,2,"UTF-8")` and
-`new String(utf8,0,999,"UTF-8")` — match HotSpot exactly on both halves.
+`new String(utf8,0,999,"UTF-8")` — match HotSpot exactly on both halves, as do
+all eight `Objects.check*` rows (the null-formatter case, defect 2) and 16 of
+the 18 NIO buffer rows.
 
-Also green: `cargo test -p cratonvm-native-builtins --lib` (3273),
-`-p cratonvm-native-io --lib` (380), `-p cratonvm-types --lib` (492),
-`-p cratonvm-vm --test wp8_10_9_string_contains_native` (6).
+`probes/ByteBufferBulkProbe` — one FNV-1a checksum over every byte produced and
+every exception type thrown — goes from `2662755913314845620` to
+**`7040159201000546794`, byte-identical to HotSpot**.
+
+`probes/StringPolicyMatrixProbe` sits at **8 divergences from HotSpot**, none
+of them a bounds or exception-class row: 4 regex, 3 HotSpot helpful-NPE
+messages, 1 `"US-ASCII"` decoding as Latin-1. Those are the same 8 the
+`String`-policy lane left, so this change fixed rows and regressed none.
+
+Suites, all 0 failures:
+
+| | |
+|---|---|
+| `cargo test -p cratonvm-native-builtins --lib` | 3277 |
+| `… --features synthetic-jdk` | 3452 |
+| `cargo test -p cratonvm-vm --lib` | 2411 |
+| `… --features synthetic-jdk` (the blocking gate) | 3928 |
+| `cargo test -p cratonvm-native-io --lib` | 390 |
+| `cargo test -p cratonvm-types --lib` | 492 |
+| `cargo test -p cratonvm-vm --test wp8_10_9_string_contains_native` | 6 |
 
 ## What is deliberately NOT fixed here
 
-Four rows still diverge. Both are separate defects that this probe found rather
-than residues of this one, and both are filed:
+Four rows still diverge, in two pairs. Both are separate defects that this
+probe found rather than residues of this one, and both are filed:
 
 * `CharBuffer.wrap(String).subSequence(-1, 2)` does not throw at all — it
   returns an empty/oversized buffer.

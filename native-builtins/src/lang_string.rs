@@ -2611,9 +2611,11 @@ pub(crate) fn native_sb_code_point_at(
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // `AbstractStringBuilder.codePointAt` also delegates to
         // `String.checkIndex`, so it carries the same text.
-        return Err(
-            cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(
+            index_i32,
+            chars.len() as i32,
+        )
+        .into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -4793,9 +4795,11 @@ pub(crate) fn native_string_code_point_at(
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // Message as well as class: the real `codePointAt` reaches
         // `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`.
-        return Err(
-            cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(
+            index_i32,
+            chars.len() as i32,
+        )
+        .into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -7730,7 +7734,10 @@ mod tests {
     /// Classifying only the first shape would report `other-failed` for the
     /// second, so a test asserting `"sioobe"` would fail on a *correct* answer
     /// and — worse — a test asserting anything else would pass on a wrong one.
-    fn err_kind(ctx: &dyn NativeContext, e: &cratonvm_types::error::MethodCallFailed) -> &'static str {
+    fn err_kind(
+        ctx: &dyn NativeContext,
+        e: &cratonvm_types::error::MethodCallFailed,
+    ) -> &'static str {
         match e {
             cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(re),

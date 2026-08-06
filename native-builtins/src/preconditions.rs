@@ -33,7 +33,8 @@
 //! `ArrayIndexOutOfBoundsException` is a *subclass* of the
 //! `IndexOutOfBoundsException` an `Objects.check*`/NIO caller is promised, so
 //! `catch (IndexOutOfBoundsException)` still worked but nothing narrower did.
-//! See `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+//! See
+//! `docs/internal/preconditions-ignores-the-exception-formatter-FIXED-20260805.md`.
 //!
 //! # Why these are natives at all
 //!
@@ -74,7 +75,9 @@
 //! `invokedynamic` anywhere.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{out_of_bounds_message, MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{
+    out_of_bounds_message, MethodCallFailed, MethodCallResult, RuntimeError,
+};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Which `Preconditions` check failed. Selects both the `checkKind` string the
@@ -181,7 +184,10 @@ fn int_arg(args: &[Value], index: usize) -> i32 {
 /// Identity, not class name: all three are instances of the *same* anonymous
 /// class (the one `outOfBoundsExceptionFormatter` returns), so only the static
 /// field they came from tells them apart.
-fn known_formatter_class(ctx: &mut dyn NativeContext, formatter: ObjectRef) -> Option<&'static str> {
+fn known_formatter_class(
+    ctx: &mut dyn NativeContext,
+    formatter: ObjectRef,
+) -> Option<&'static str> {
     let class_id = ctx.class_id_by_name("jdk/internal/util/Preconditions")?;
     for (field, exception_class) in KNOWN_FORMATTERS {
         let Some(index) = ctx.static_field_index_by_name(class_id, field) else {
@@ -422,12 +428,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // throw.
     registry.register(class, "checkIndex", "(II)I", check_index);
     registry.register(class, "checkFromToIndex", "(III)I", check_from_to_index);
-    registry.register(
-        class,
-        "checkFromIndexSize",
-        "(III)I",
-        check_from_index_size,
-    );
+    registry.register(class, "checkFromIndexSize", "(III)I", check_from_index_size);
 }
 
 #[cfg(test)]
@@ -533,7 +534,10 @@ mod tests {
         for (name, descriptor) in [
             ("checkIndex", "(IILjava/util/function/BiFunction;)I"),
             ("checkFromToIndex", "(IIILjava/util/function/BiFunction;)I"),
-            ("checkFromIndexSize", "(IIILjava/util/function/BiFunction;)I"),
+            (
+                "checkFromIndexSize",
+                "(IIILjava/util/function/BiFunction;)I",
+            ),
             ("checkIndex", "(II)I"),
             ("checkFromToIndex", "(III)I"),
             ("checkFromIndexSize", "(III)I"),

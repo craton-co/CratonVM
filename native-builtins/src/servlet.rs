@@ -2894,10 +2894,8 @@ fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 /// subclass satisfies the wide catch and breaks every narrower one, which is
 /// the direction that changes behaviour.
 fn s2_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), MethodCallFailed> {
-    let bad = from < 0
-        || size < 0
-        || length < 0
-        || i64::from(from) + i64::from(size) > i64::from(length);
+    let bad =
+        from < 0 || size < 0 || length < 0 || i64::from(from) + i64::from(size) > i64::from(length);
     if !bad {
         return Ok(());
     }
@@ -2938,10 +2936,7 @@ fn s2_bb_check_abs(
     width: i32,
 ) -> Result<(), MethodCallFailed> {
     let limit = s2_bb_limit(ctx, buf);
-    let ok = index >= 0
-        && index
-            .checked_add(width)
-            .map_or(false, |end| end <= limit);
+    let ok = index >= 0 && index.checked_add(width).map_or(false, |end| end <= limit);
     if ok {
         Ok(())
     } else {
