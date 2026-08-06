@@ -1,5 +1,11 @@
 # `ObjectHeader` shrink — what is achievable, what it is worth, and what blocks the rest
 
+> **LANDED 2026-08-06 — `HEADER_SIZE = 24`.** This document planned the shrink;
+> §6 was its handoff list and it was accurate. Two items it did NOT name are
+> recorded in §9 below, both of which would have been silent corruption, and
+> both of which were found by tests rather than by reading. The 16-byte target
+> in §3 remains blocked for exactly the reasons given there.
+
 *Session slug: `header-shrink`. Written against `arch/wave1-integration-20260726` merged at
 `bfddf0fbc73d03c4dbfff9bbc172d09021ad5f8d` (`HEADER_SIZE = 32`, `MARK_WORD_OFFSET = 24`
 confirmed on the merged tree). Scope of edits: `types/src/heap_types.rs`,
@@ -481,3 +487,199 @@ deliberately left alone (§6.7).
   release-compiled-out `debug_assert`. The JIT's unrounded `new_cursor = aligned +
   total_size` continues to agree with `Tlab::alloc_initialized`'s rounded footprint for
   the same reason.
+
+---
+
+## 9. What landing it actually took (2026-08-06)
+
+§6's handoff list was accurate and complete for the *mechanical* surface. Two
+consequences were not on it, and neither is mechanical.
+
+### 9.1 Old-gen compaction SLIDES — the forward destroys lock state before the copy
+
+§4.3 states the ordering contract for a **copying** collector: copy first, then
+clobber the source. `OldGen::compact_region` is not one. It computes forwarding
+addresses in Phase 1, rewrites references in Phase 2, and only slides the
+objects in Phase 3 — so the write that says "forwarded" lands on the source
+*before* the copy that would have carried its mark word to the destination.
+
+Under the fold that destroys, for every live old-gen object: a thin lock's owner
+and recursion count, and — worse — an `INFLATED` word's single strong
+`Arc<Monitor>` reference, leaving the slid survivor with no monitor and the
+`Arc` leaked. Silent, and only observable later as a monitor that has forgotten
+its owner.
+
+Fixed by widening `live_objects` from `(src, size, dest)` to
+`(src, size, dest, saved_mark)`: Phase 1 snapshots the mark word before
+installing the forward, Phase 3 restores it after the copy. The restore also
+*is* the "clear the forwarding slot" step the old code did by nulling the field,
+so the two obligations collapse into one store.
+
+**Any other sliding or in-place-forwarding path added later inherits this.** The
+rule is: if you install a forward on an object you have not yet copied, you owe
+its mark word a snapshot.
+
+### 9.2 G1's forwarding CAS was a zero test, and zero is now a legal state
+
+§4.3 flagged `g1.rs:444` as "the single largest correctness item" and it was
+right, though not quite for the stated reason. The site aliases the forwarding
+slot as an `AtomicUsize` and CASes `0 -> new_addr`, using **zero** as "not
+forwarded".
+
+The mark word's unforwarded value is not zero — it is `NEUTRAL` (which happens
+to be 0), `THIN_LOCKED`, or `INFLATED` (which are not). So a naive port would
+have:
+
+* failed to forward **any locked object**, forever, because the CAS expected 0;
+* and on the evacuation-failure arm, installed a forward *over* an `INFLATED`
+  word — writing a relocation address into bits a monitor pointer occupies.
+
+It is now a tagged CAS against the word observed at entry, with the loser arm
+decoding defensively rather than assuming a lost race means "forwarded". The
+destination's mark word is stored from that same pre-copy snapshot instead of a
+fresh load, so a racing worker's forward cannot be stamped onto the copy.
+
+### 9.3 Two tripwires fired; both were re-derived, not relaxed
+
+* **`disp.rs`** asserted that a legacy object with six fields addresses past
+  127, i.e. that the field accessors can never narrow to disp8. At 24 the sixth
+  field is at 120 and *does* fit. The bound moved to seven fields (136). This is
+  the tripwire working exactly as designed.
+* **The vector gate** proved element-zero 16-byte alignment on a 16-aligned base
+  only because `HEADER_SIZE` was a multiple of 16. At 24 it is not, so element
+  zero is no longer provably 16-aligned. **This costs nothing today** — x86 uses
+  `MOVDQU`, and `PROVEN_OBJECT_ALIGNMENT` is 8 so a 16-aligned base is never
+  actually proven — but a strict-alignment ISA would have to start
+  `HEADER_SIZE % 16` bytes into the array. §5 audited object *alignment* and
+  correctly found it 8 everywhere; it did not consider that the header's own
+  size was carrying a 16-alignment property for the data area. Note it before
+  attempting §3.
+
+### 9.4 Fixtures that restated the layout
+
+§6.5 named one (`jit/tests/intrinsic_arrays_ops.rs`) and it had already been
+converted. Three more were found the hard way:
+
+* `jit/src/x64/tests.rs::fake_object_ref_cell` read `o[4]` with the comment
+  "HEADER_SIZE == 32 == 4 * 8, so the cell is word 4". At 24 it read the wrong
+  word and the assertion compared two unrelated values.
+* `g1.rs::evacuation_failure_self_forwards_does_not_drop` sized its heap fill by
+  a literal object count. At 40 bytes per node the same count fits in ONE of the
+  two regions, so "zero free regions for to-space" quietly became "one free
+  region", and the test then asserted that a **successful** collection freed
+  nothing.
+* `vec_emit`'s expected-byte arrays and `compact_header`'s `bytes_saved`
+  (production code, not a test) baked the header as a constant.
+
+All four are now derived from `cratonvm_types::HEADER_SIZE`.
+
+### 9.5 Measured
+
+`Node{Node,Node}`: **48 -> 40 bytes**, confirmed in the emitted inline TLAB bump
+(`lea rax,[r11+30h]` -> `lea rax,[r11+28h]`). Collection counts on
+`CratonBench bintrees` fall in exactly the size ratio — 18 -> 15 at `-Xmx700m`
+and 12 -> 10 at `-Xmx1g`, both 40/48 — which is an independent confirmation that
+the allocation *rate in bytes* dropped by a sixth. All seven phase checksums
+identical; correct 3/3 at 1g, 700m and 512m on both arms, with moving-young
+relocating every cycle.
+
+5,889 tests pass across the four crates (types 505, gc 979, jit 1964, vm 2441).
+
+**Throughput is flat**, which is what §5.1 predicted and should not be dressed
+up. Measured twice: once at host load 6-12, and again after the box rebooted
+at load 0.3 (13 interleaved pairs per phase, per-process user CPU,
+`arithmetic` as the negative control since it allocates nothing and therefore
+cannot move).
+
+| phase | load 6-12 | idle |
+|---|---:|---:|
+| arithmetic *(control)* | 0.983x | **1.003x** |
+| bintrees | 0.988x | **0.994x** |
+| hashmap | 1.014x | **1.010x** |
+| fib / sieve / matrix / stringregex | 1.000 / 1.008 / 0.996 / 1.000 | — |
+
+The idle run corrects the first: **bintrees is flat, not a small regression.**
+The 0.988x was load artefact — visible in the control moving the same
+direction by the same amount — and the "40-byte objects straddle cache lines
+more often than 48-byte ones" story invented to explain it was explaining
+nothing. Ranges overlap (fix 1.55-1.63, base 1.50-1.60). Only hashmap is
+outside noise, at ~1%, and only that one reproduces across both runs.
+
+So the deliverable is **footprint, not speed**: 8 bytes off every object, and
+a sixth fewer collections at a given heap (18 -> 15 at `-Xmx700m`). Anyone
+hoping this moves a 9x row should read §5.1 again.
+
+### 9.6 The snapshot is correct, and I could not build an oracle for it
+
+§4.3 rates a mistake here as "silent monitor corruption ... the one place where
+a mistake is silent rather than a crash". Two probes were written to catch it
+and **neither can**, which is worth recording as loudly as the fix.
+
+* **v1** — 8 threads, contended monitors, allocation inside the critical
+  section, `-Xmx256m`. Green. **Vacuous**: `minor=88` but
+  `moving_young cycles=0` and `major=0`. Every one of those collections was a
+  non-moving sweep, which forwards nothing.
+* **v2** — same, plus a 60k-element retained set with the lock targets
+  interleaved and `System.gc()` called from *inside* the synchronized block, so
+  compaction runs while monitors are held. `major=36`. Green on both arms.
+* **The positive control** — the same binary with the Phase 3 mark-word restore
+  deleted, i.e. exactly the bug — is **also green**, `major=36`, exact counts,
+  no failures.
+
+The reason is `MonitorTable` (`vm/src/threading/monitor.rs`): inflated monitors
+are indexed in a sharded `FxHashMap<usize, Arc<Monitor>>` keyed by object
+address, with its own `remap_after_gc`. **The mark word is a cache over that
+table, not the sole owner of the monitor.** Clobbering it loses the fast path;
+`enter` re-finds the monitor through the table and mutual exclusion holds, and
+the `Arc` does not drop because the table holds a reference too.
+
+So the honest severity is lower than §4.3 states — for *inflated* monitors. It
+is not zero: a thin lock's owner/recursion has no side table, and a live object
+left with a stale `FORWARDED` word answers `is_forwarded()` true forever, which
+a young collector would read as "already copied". Keep the snapshot; it costs
+one store per slid object.
+
+**But do not read the green suites as evidence that the fold is safe.** Nothing
+available here can distinguish the fix from its absence. That is the reason to
+put this branch through a real concurrent suite (Spring Boot / Tomcat) before
+landing it, rather than on unit tests and a benchmark.
+
+### 9.7 Validated against real Spring Boot, both arms
+
+§9.6 says the local probes cannot tell this fix from a broken version of it.
+That was the blocker on landing, so the branch was put through a real
+concurrent suite before merge: **374 test classes, both arms, one process per
+class**, from the eight modules that actually thread, allocate and do I/O
+(webmvc, web-server, webflux, jdbc, http-client, devtools, actuator, health).
+
+| | base (dev) | fix (24-byte header) |
+|---|---:|---:|
+| PASS | 363 | **364** |
+| FAIL | 2 | 2 |
+| HANG | 1 | 0 |
+| VACUOUS | 8 | 8 |
+| tests executed | 3,029 | **3,057** |
+
+**No class is red on fix and green on base** — the only direction that would
+indicate a regression. Both asymmetries went the other way and both resolved as
+pre-existing, at 5 reps per arm:
+
+* `JettyClientHttpRequestFactoryBuilderTests` (base FAIL, fix PASS) — 5/5 PASS
+  on both arms. A flake.
+* `HttpComponentsClientHttpConnectorBuilderTests` (base HANG, fix FAIL) — red
+  5/5 on both arms (base 4 FAIL + 1 HANG, fix 5 FAIL). A pre-existing failure
+  that alternates between FAIL and HANG; the single-run difference was that
+  alternation, not the arms.
+
+`WebFluxManagementChildContextConfigurationIntegrationTests` fails on both arms
+and is likewise pre-existing.
+
+One harness note worth keeping: the 8 `VACUOUS` rows are `Abstract*Tests` base
+classes with no runnable methods, symmetric across arms — but `sbrun.sh` scores
+`tests=0` as **PASS**, so they have to be extracted and reclassified. That is
+the `containersFailed=0` substring trap in another guise: a suite oracle that
+reports a class which never ran as green.
+
+This does not prove the fold is sound — nothing available here can — but it is
+the first thing run against it that would plausibly have caught it, and it is
+clean.

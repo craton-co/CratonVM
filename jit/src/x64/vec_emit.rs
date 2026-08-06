@@ -1781,10 +1781,10 @@ mod tests {
             0x48, 0x8D, 0x43, 0x08,             // lea  rax, [rbx + 8]
             0x48, 0x3B, 0xC6,                   // cmp  rax, rsi
             0x0F, 0x8F, 0x20, 0x00, 0x00, 0x00, // jg   epilogue (+32)
-            0xC5, 0x7E, 0x6F, 0x44, 0x99, 0x20, // vmovdqu ymm8, [rcx + rbx*4 + 32]
-            0xC5, 0x7E, 0x6F, 0x4C, 0x9A, 0x20, // vmovdqu ymm9, [rdx + rbx*4 + 32]
+            0xC5, 0x7E, 0x6F, 0x44, 0x99, HDR8, // vmovdqu ymm8, [rcx + rbx*4 + HEADER_SIZE]
+            0xC5, 0x7E, 0x6F, 0x4C, 0x9A, HDR8, // vmovdqu ymm9, [rdx + rbx*4 + HEADER_SIZE]
             0xC4, 0x41, 0x3D, 0xFE, 0xC1,       // vpaddd  ymm8, ymm8, ymm9
-            0xC5, 0x7E, 0x7F, 0x44, 0x9F, 0x20, // vmovdqu [rdi + rbx*4 + 32], ymm8
+            0xC5, 0x7E, 0x7F, 0x44, 0x9F, HDR8, // vmovdqu [rdi + rbx*4 + HEADER_SIZE], ymm8
             0x48, 0x83, 0xC3, 0x08,             // add  rbx, 8
             0xE9, 0xD3, 0xFF, 0xFF, 0xFF,       // jmp  loop_head (-45)
             // epilogue:
@@ -2057,6 +2057,12 @@ mod tests {
         );
     }
 
+    /// The array data area begins at `HEADER_SIZE`, so every element access
+    /// encodes that as its displacement byte. Naming it keeps these fixtures
+    /// from having to be re-derived by hand each time the header moves — as
+    /// they did on 2026-08-06 when it went 32 -> 24.
+    const HDR8: u8 = cratonvm_types::HEADER_SIZE as u8;
+
     #[test]
     fn double_lanes_use_the_66_prefixed_forms() {
         let plan = plan_for(MemKind::Double, 4, Vec::new());
@@ -2064,7 +2070,7 @@ mod tests {
         let code = emit(&plan, &shape).expect("double element-wise emits");
         // VMOVUPD ymm8, [rcx+rbx*8+32] is C5 7D 10 44 D9 20 (pp = 66, VEX.R = 0).
         assert!(
-            contains(&code.code, &[0xC5, 0x7D, 0x10, 0x44, 0xD9, 0x20]),
+            contains(&code.code, &[0xC5, 0x7D, 0x10, 0x44, 0xD9, HDR8]),
             "vmovupd with an 8-byte SIB scale"
         );
         // VADDPD ymm8, ymm8, ymm9 is C4 41 3D 58 C1.
@@ -2078,7 +2084,7 @@ mod tests {
         let code = emit(&plan, &shape).expect("float element-wise emits");
         // VMOVUPS ymm8, [rcx+rbx*4+32] is C5 7C 10 44 99 20 (pp = 00, VEX.R = 0).
         assert!(
-            contains(&code.code, &[0xC5, 0x7C, 0x10, 0x44, 0x99, 0x20]),
+            contains(&code.code, &[0xC5, 0x7C, 0x10, 0x44, 0x99, HDR8]),
             "vmovups"
         );
         // VADDPS ymm8, ymm8, ymm9 is C4 41 3C 58 C1.

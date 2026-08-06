@@ -1,7 +1,7 @@
 # COV-07 — retired 2026-08-04: `athrow` gets a real IR lowering
 
 Branch `fix/c2-cov07-athrow-20260804`, merged to `dev` and pushed. Retires
-[`docs/known-issues/c2/cov-07-athrow.md`](../known-issues/c2/cov-07-athrow.md).
+[`docs/known-issues/c2/cov-07-athrow.md`](../feature-designs/c2/cov-07-athrow.md).
 
 **The lane proceeded — this was not "keep the refusal."** The brief hedged
 that question deliberately (asked for the reasoning to be written down either

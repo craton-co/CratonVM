@@ -1,10 +1,50 @@
 # The `cratonvm/synthetic/Process` cluster, adjudicated — and its class lies about its own supertype
 
-**Status:** OPEN — adjudicated and measured 2026-08-06, closing the largest open
-item of [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md).
-Two findings: the `Bridge` tag on 37 rows is wrong by the contract's own
-definition, and the receiver class is **not** a subtype of `java.lang.Process`
-in the one place the VM does not check for itself.
+**Status:** the supertype lie is **FIXED** 2026-08-06; the `Bridge`-tag
+adjudication stays OPEN as a reclassification item. Adjudicated and measured the
+same day, closing the largest open item of
+[`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md).
+
+## FIXED: the supertype inconsistency
+
+`fabricate_class` now gives `cratonvm/synthetic/Process` a real
+`java.lang.Process` superclass, beside the two SSL socket-stream arms that exist
+for the identical reason (a caller storing the result in a supertype-typed local
+hit a `ClassCastException`). `spawn_and_wrap` loads `java.lang.Process` first,
+because the arm resolves through `get_loaded_class_id`, which answers only for an
+already-loaded class — without that the fabrication falls back to `Object` and
+the inconsistency returns silently.
+
+```
+before  chain=cratonvm.synthetic.Process -> java.lang.Object                          CONSISTENT=false
+after   chain=cratonvm.synthetic.Process -> java.lang.Process -> java.lang.Object      CONSISTENT=true
+HotSpot chain=java.lang.ProcessImpl      -> java.lang.Process -> java.lang.Object      CONSISTENT=true
+```
+
+Two properties this had to preserve, both verified rather than reasoned about:
+
+* **The natives still win for this receiver.** Dispatch probes the registry from
+  the receiver's own class name first and both names are registered, so
+  inheriting `Process`'s concrete bytecode does not change which body runs —
+  `UserProcessInterceptProbe` stays byte-identical to HotSpot, and
+  `process.rs::is_vm_process` keys on this same name.
+* **`java.lang.Process` being abstract costs nothing.** The synthetic class is
+  concrete and is allocated directly by a native, never through `new`, so no
+  instantiability check consults the super.
+
+A real subprocess still works under `--real-jdk` and `--jdk-only`, now reporting
+`processSuper=java.lang.Process` in both.
+
+**A flake in the probe surfaced during this, and it was mine.**
+`Process.onExit()`'s default is `CompletableFuture.supplyAsync(this::waitForInternal)`
+— it calls the subclass on a pool thread, so whether it has bumped the call
+counters by print time is an unbounded race. It showed up once as HotSpot
+reporting `concrete.count.exitValue=2` against `1` on twelve other runs, which
+reads exactly like a regression in whatever change is under test. The counters are
+now snapshotted before that rung and the source carries the ordering requirement.
+8/8 paired runs byte-identical afterwards.
+
+## STILL OPEN: the `Bridge` tag on the 37 rows
 
 ## The verdict on the tag
 
@@ -98,13 +138,12 @@ The two records are the same registration seen from its two receivers.
 
 ## What would close this
 
-1. **Give `spawn_and_wrap` a receiver that really extends `java.lang.Process`.**
-   That fixes the supertype lie, makes the `getSuperclass()` walk agree with
-   `isAssignableFrom`, lets the abstract-method registrations be reached by
-   ordinary inheritance, and is the precondition for retagging. `toHandle()`'s
-   existing note is the precedent: it stopped fabricating
-   `java/lang/ProcessHandle` and built a real `ProcessHandleImpl` instead, for
-   the same class of reason.
+1. ~~**Give `spawn_and_wrap` a receiver that really extends
+   `java.lang.Process`.**~~ **DONE** — see the FIXED section above. Note what it
+   did *not* buy: the abstract-method registrations are now reachable by ordinary
+   inheritance, but the class is still fabricated, so §5 is still violated under
+   `--jdk-only` and the retag is still blocked on giving strict mode a real
+   `java.lang.Process` subclass to return rather than a better-parented fake.
 2. **Then retag the 37 to `SyntheticStub`** and let §5 refuse them, measuring
    `--jdk-only` subprocess spawning before and after. Expect `stub_ratchet`'s
    `BASELINE_SYNTHETIC_STUBS` and the `CRATONVM_NO_STUBS` drop list to move by
@@ -113,7 +152,7 @@ The two records are the same registration seen from its two receivers.
    three workloads report zero fabrications and none of them spawns anything, so
    the number is true and narrower than it reads.
 
-Deliberately not attempted here: step 1 changes what `ProcessBuilder.start()`
-returns, on a path WildFly, the Spring suites and the process-handle family all
-depend on, and it wants its own change with a real-subprocess differential
-rather than riding along with a measurement.
+Steps 2 and 3 are deliberately not attempted: retagging changes what
+`--jdk-only` admits on a path WildFly, the Spring suites and the process-handle
+family all depend on, and it wants its own change with a real-subprocess
+differential in strict mode.

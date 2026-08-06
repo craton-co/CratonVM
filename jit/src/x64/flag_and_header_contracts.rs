@@ -461,7 +461,9 @@ fn inline_tlab_header_writes_stay_inside_the_header() {
         ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
         ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
-        ("forwarding_ptr", cratonvm_types::FORWARDING_PTR_OFFSET, 8),
+        // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
+        // the mark word; there is no separate field, and the emitter no longer
+        // writes one.
         ("mark_word", cratonvm_types::MARK_WORD_OFFSET, 8),
     ] {
         assert!(
@@ -830,7 +832,9 @@ fn every_header_field_is_dword_addressable() {
         ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
         ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
-        ("forwarding_ptr", cratonvm_types::FORWARDING_PTR_OFFSET, 8),
+        // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
+        // the mark word; there is no separate field, and the emitter no longer
+        // writes one.
         ("mark_word", cratonvm_types::MARK_WORD_OFFSET, 8),
     ] {
         assert_eq!(

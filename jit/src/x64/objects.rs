@@ -921,21 +921,17 @@ impl Compiler {
                     << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
             );
         }
-        // The opt-out also retains the older defensive forwarding_ptr and
-        // mark_word stores. The default path gets their required zero values
-        // from the refill invariant; neither field is subsequently published
-        // with a non-zero initialization value.
+        // The opt-out also retains the older defensive mark_word stores. The
+        // default path gets their required zero values from the refill
+        // invariant; the field is not subsequently published with a non-zero
+        // initialization value.
+        //
+        // The two `forwarding_ptr` stores that used to lead this block are gone
+        // with the field itself (the 32 -> 24 header shrink). Zeroing the mark
+        // word is now doing BOTH jobs — `MARK_NEUTRAL` is 0 and so is
+        // "not forwarded" — which is why this block still covers 8 bytes and
+        // not 16.
         if !zero_elision {
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::FORWARDING_PTR_OFFSET as i32,
-                0,
-            );
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
-                0,
-            );
             self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
             self.emit_mov_dword_mem_disp32_imm32(
                 R11,
