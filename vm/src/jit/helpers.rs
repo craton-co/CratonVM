@@ -2818,6 +2818,26 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     let Some((thread, _guard)) = jit_thread_mut() else {
         return i64::MIN;
     };
+    // `CRATONVM_DBG_CALLEE_DEOPT=1` — every servicing of a compiled callee's
+    // `i64::MIN`.
+    //
+    // The inline cascade decides "the callee trapped" by comparing the raw
+    // return register against `i64::MIN`. For a callee whose descriptor returns
+    // VOID there is no return value, so whatever the callee's last helper call
+    // left in RAX is what gets compared — and a false positive here does not
+    // merely waste a helper call: `handle_compiled_callee_deopt_sentinel`
+    // DRAINS the thread's whole pending-signal record. Whether that fires at
+    // all, and for which callee, is not otherwise observable.
+    if crate::runtime::env_cache::jit_callee_deopt_dbg() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seen = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seen < 40 || seen.is_power_of_two() {
+            eprintln!(
+                "[CALLEE_DEOPT] #{seen} {}.{}{} num_args={n} ret={}",
+                info.class_name, info.method_name, info.descriptor, info.return_type as char,
+            );
+        }
+    }
     // The receiver's class id, for the callee-exception-table probe. `Object`
     // arg 0 is the receiver for every invoke kind the inline cascade emits
     // (virtual/interface); a non-object or absent arg 0 simply misses the

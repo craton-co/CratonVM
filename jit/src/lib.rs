@@ -12848,6 +12848,32 @@ pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
     Some((n, label))
 }
 
+/// How the direct-entry arms should treat a compiled callee's raw return
+/// register — see `emit_inline_callee_deopt_check`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpIcDeoptCheck {
+    /// Compare against `i64::MIN` at every direct-entry call (the default).
+    On,
+    /// Emit no comparison at all.
+    Off,
+    /// Emit it except where the callee's descriptor returns `void`, which is
+    /// exactly where the compared register holds no return value.
+    SkipVoid,
+}
+
+/// `CRATONVM_JIT_SP_IC_DEOPT_CHECK` = `0` | `void` | anything else (default).
+pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
+    use std::sync::OnceLock;
+    static G: OnceLock<SpIcDeoptCheck> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_IC_DEOPT_CHECK").as_deref() {
+            Ok("0") => SpIcDeoptCheck::Off,
+            Ok("void") => SpIcDeoptCheck::SkipVoid,
+            _ => SpIcDeoptCheck::On,
+        }
+    })
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     // A raw JIT-to-JIT call produces a callee frame with no `JitEntryGuard`, so
     // it is not reachable from the entry chain: the active-RBP mirror points at
