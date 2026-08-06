@@ -1,7 +1,7 @@
 /**
  * Where exactly does `+` lose an unpaired surrogate?
  *
- * `docs/known-issues/string-concat-loses-unpaired-surrogates.md` located the
+ * `string-concat-loses-unpaired-surrogates-FIXED-20260805.md` located the
  * loss in `execute_string_concat`, which accumulated into a Rust `String`. But
  * "concatenation" is three separate paths into that accumulator, and a fix to
  * one says nothing about the other two:

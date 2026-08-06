@@ -717,7 +717,7 @@ function Get-EffectiveClassTimeoutSec {
     # instead report a correctness failure -- `08-02 HANG 300.140s`, and the
     # 2026-07-22 severe-slowdown page before it. It is not stuck. With the
     # recycled-`JitInvokeInfo` dispatch aliasing fixed (`383e7f5cf`, see
-    # docs/internal/fixed-suite-bugs/springboot/jacksonautoconfigurationtests-disabledcondition-npe-FIXED-20260805.md)
+    # fixed-suite-bugs/springboot/jacksonautoconfigurationtests-disabledcondition-npe-FIXED-20260805.md)
     # it runs to natural completion with all 162 tests, 0 failed, 0
     # containersFailed: 336s and 343s on the Azure host at load average ~30,
     # 308s on Windows. That is 11-15x the HotSpot baseline (22.4s) and simply

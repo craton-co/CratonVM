@@ -8,7 +8,7 @@ retired, and what is still open.
 Consolidated from `pgo-01-call-site-evidence-gap.md` and
 `pgo-02-guarded-inlining.md` (both retired 2026-08-03; pgo-02's residuals
 closed 2026-08-04 — see
-[`docs/internal/pgo-02-guarded-inlining-RETIRED-20260804.md`](../internal/pgo-02-guarded-inlining-RETIRED-20260804.md)),
+`pgo-02-guarded-inlining-RETIRED-20260804.md`),
 plus the design doc this supersedes (`docs/jit/profile-guided-inlining.md`).
 
 **Status 2026-08-04.** Interpreted `invokestatic`/`invokespecial` feed

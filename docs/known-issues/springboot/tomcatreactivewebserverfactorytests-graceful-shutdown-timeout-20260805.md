@@ -21,7 +21,7 @@ logged as `WARN`, not thrown — these look like Tomcat's `StringManager`
 probing for an optional `ListResourceBundle`-shaped method on a plain
 `java/util/HashMap`-typed message-source object and gracefully falling
 back when it's absent, matching the pattern in the already-fixed
-`docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-J-resourcebundle-native-shadows-subclass.md` /
+`fixed-suite-bugs/CRATONVM_BUGS/BUG-J-resourcebundle-native-shadows-subclass.md` /
 `BUG-L-resourcebundle-locale-resolution.md` family. Not confirmed to be
 related to the test failure (a caught, logged warning, not the exception
 that failed the test) — flagged in case it recurs as a hard failure

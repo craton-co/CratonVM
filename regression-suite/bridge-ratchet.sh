@@ -4,7 +4,7 @@
 #
 # bridge-ratchet.sh — THE L6 GATE, run where a JDK exists.
 #
-# See docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md (the lane
+# See L6-unadjudicated-bridge-ratchet-DONE-20260805.md (the lane
 # brief, retired 2026-08-05 when this landed) and
 # docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md.
 #

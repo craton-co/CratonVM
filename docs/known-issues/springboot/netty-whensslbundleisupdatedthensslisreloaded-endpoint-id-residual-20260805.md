@@ -23,14 +23,14 @@ hostname/cert mismatch in the ordinary sense.
 
 Endpoint identification on the `SSLEngine` client lane did not exist at
 all before
-[`docs/internal/fixed-suite-bugs/tomcat/testsecurity2018-endpoint-identification-never-enforced-FIXED.md`](../../internal/fixed-suite-bugs/tomcat/testsecurity2018-endpoint-identification-never-enforced-FIXED.md)
+`fixed-suite-bugs/tomcat/testsecurity2018-endpoint-identification-never-enforced-FIXED.md`
 (fixed 2026-08-03) — it was a silent no-op, so this exact class of failure
 was structurally impossible before that date. This test's failure is
 therefore a **residual gap exposed by that fix**, not a pre-existing bug
 that regressed.
 
 It was already noticed once, in passing, in
-[`docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`](../../internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md)
+`fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`
 (2026-08-04 A/B verification table): *"Its one real failure,
 `whenSslBundleIsUpdatedThenSslIsReloaded`, is identical in both arms and is
 a separate pre-existing endpoint-identification issue."* — but never given

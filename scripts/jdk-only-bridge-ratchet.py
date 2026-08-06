@@ -15,7 +15,7 @@ Modelled on `native-builtins/tests/stub_ratchet.rs`: an exact baseline with
 
 ## Which of the two hosting options this is, and why
 
-`docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md` (the lane brief,
+`L6-unadjudicated-bridge-ratchet-DONE-20260805.md` (the lane brief,
 retired when this landed) offers two, and asks that the choice be stated here:
 
 * **Regression-suite gate (CHOSEN).** The census needs a real JDK image at

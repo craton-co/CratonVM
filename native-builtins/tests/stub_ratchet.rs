@@ -105,7 +105,23 @@ use cratonvm_types::compat::CompatibilityMode;
 /// **This is the number to compare against `bridge-ratchet.sh` from now on.**
 /// If they diverge again, suspect the scope of one of them before suspecting
 /// the code.
-const BASELINE_SYNTHETIC_STUBS: usize = 549;
+///
+/// # 549 -> 554, 2026-08-05 (catching up with `14145d874`)
+///
+/// Five, and the change that made them is explicit about why:
+/// `fix(jdk-only): the five duplicate registrations that outlived L7 R1's
+/// retag` moved `ArrayList.subList`, `Collections.unmodifiableList` and
+/// `{List,Set,Map}.copyOf` from the ambient `Bridge` to `SyntheticStub`, so
+/// `--jdk-only` drops them and `java.base`'s own bytecode runs. It re-froze
+/// L6's Bridge ratchet for the same five (9,705 -> 9,697) and did not re-freeze
+/// this one, so `dev` has been failing this gate since — verified by running it
+/// on a pristine `5efaa521c`, not inferred.
+///
+/// The direction is the same as the 157 -> 165 move above and wants the same
+/// reading: **no new fake was added.** Five registrations that were mis-tagged
+/// `Bridge` are now counted where they always belonged, and the real
+/// improvement is on the other gate, which fell by eight.
+const BASELINE_SYNTHETIC_STUBS: usize = 554;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
