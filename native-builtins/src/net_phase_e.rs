@@ -6362,6 +6362,63 @@ impl HttpDeadlineSocket for StreamOwned<ClientConnection, TcpStream> {
     }
 }
 
+impl HttpDeadlineSocket for StreamOwned<ClientConnection, GcBlockingSocket<TcpStream>> {
+    fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.get_ref().set_read_timeout(timeout)
+    }
+}
+
+/// A socket whose every blocking operation is bracketed by the GC's
+/// blocked-region marking, so a stop-the-world pause that starts while this
+/// thread is parked in `recv`/`send` does not wait for a safepoint the thread
+/// cannot reach until the peer answers.
+///
+/// **The wrapper is on the SOCKET on purpose.** `rustls` interleaves socket
+/// I/O (`read_tls`, `write_tls`, and `complete_io` beneath `write_all` /
+/// `flush` / `Read`) with protocol work (`process_new_packets`), and the
+/// protocol work is where the Java upcalls happen —
+/// `JavaKeyManagerResolver::resolve` calling `chooseClientAlias` to pick the
+/// client certificate. A GC-blocked thread must not run bytecode, so the
+/// region has to cover the syscalls and stop there. Marking the syscall itself
+/// is the only placement where no caller can widen it by accident; the same
+/// argument that put `EintrIo` on the socket rather than at each call site.
+///
+/// See `t27_tls::gc_blocked_syscall` for the hang this fixes.
+pub(crate) struct GcBlockingSocket<S> {
+    inner: S,
+}
+
+impl<S> GcBlockingSocket<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+
+    /// The underlying socket, for the non-blocking calls (`set_read_timeout`
+    /// and friends) that must NOT open a region.
+    fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: Read> Read for GcBlockingSocket<S> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        self.inner.read(buffer)
+    }
+}
+
+impl<S: Write> Write for GcBlockingSocket<S> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        self.inner.flush()
+    }
+}
+
 /// Re-arms the operating-system receive timeout before every response read so
 /// a peer that drips bytes cannot extend a request deadline indefinitely.
 struct HttpDeadlineReader<S> {
@@ -6503,7 +6560,13 @@ fn http_exchange_rustls(
     body: &[u8],
     deadline: Instant,
 ) -> std::io::Result<HttpResponse> {
-    let tcp = http_connect_with_deadline(host, port, deadline)?;
+    // `connect` blocks for up to the caller's whole remaining deadline, and
+    // this path — unlike the plain-HTTP one — has no blocking region around
+    // the exchange (see `t27_tls::gc_blocked_syscall`), so it gets its own.
+    let tcp = {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        http_connect_with_deadline(host, port, deadline)?
+    };
     tcp.set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
     tcp.set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
     let server_name = ServerName::try_from(host.to_owned()).map_err(|e| {
@@ -6514,7 +6577,12 @@ fn http_exchange_rustls(
     })?;
     let conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS init: {e}")))?;
-    let mut tls: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
+    // `GcBlockingSocket` marks this thread GC-blocked around each syscall and
+    // only around each syscall, so `process_new_packets` below — which is
+    // where `JavaKeyManagerResolver` runs Java to choose the client
+    // certificate — executes as a normal mutator. See its doc comment.
+    let mut tls: StreamOwned<ClientConnection, GcBlockingSocket<TcpStream>> =
+        StreamOwned::new(conn, GcBlockingSocket::new(tcp));
     // Every socket op below goes through `EintrIo`. A blocking `recv` on a
     // socket that carries `SO_RCVTIMEO` — which the two `set_*_timeout` calls
     // in this loop install on purpose, to keep the caller's deadline honest —
@@ -6527,6 +6595,7 @@ fn http_exchange_rustls(
     while tls.conn.is_handshaking() {
         if tls.conn.wants_write() {
             tls.sock
+                .get_ref()
                 .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
             tls.conn
                 .write_tls(&mut EintrIo::new(&mut tls.sock))
@@ -6539,6 +6608,7 @@ fn http_exchange_rustls(
         }
         if tls.conn.wants_read() {
             tls.sock
+                .get_ref()
                 .set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
             let count = tls
                 .conn
@@ -6562,6 +6632,7 @@ fn http_exchange_rustls(
     }
     let request = http_build_request(method, host, port, path, headers, body, 443);
     tls.sock
+        .get_ref()
         .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
     // `write_all` is left bare on purpose: `std`'s default impl already
     // reissues on `Interrupted` AND advances past the bytes it did place, which
