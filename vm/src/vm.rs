@@ -31935,6 +31935,26 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn zz_diag_logger() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let name = create_java_string(&shared, "MyLogger");
+        let logger = call_native(&shared, &mut thread, "java/util/logging/Logger", "getLogger",
+            "(Ljava/lang/String;)Ljava/util/logging/Logger;", &[Value::Object(Some(name))]).unwrap().unwrap();
+        eprintln!("DIAG logger={logger:?}");
+        if let Value::Object(Some(l)) = logger {
+            let cid = shared.mem.heap.class_id_of(l);
+            eprintln!("DIAG class_id={cid:?} nfields={}", shared.mem.heap.num_fields(l));
+            for i in 0..shared.mem.heap.num_fields(l).min(8) {
+                eprintln!("DIAG slot{i}={:?}", shared.mem.heap.get_field(l, i));
+            }
+            let n = call_native(&shared, &mut thread, "java/util/logging/Logger", "getName",
+                "()Ljava/lang/String;", &[Value::Object(Some(l))]);
+            eprintln!("DIAG getName={n:?}");
+        }
+    }
+
+    #[test]
     fn logger_get_and_info() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34665,19 +34685,45 @@ mod tests {
         assert_eq!(v2, Value::Int(99));
     }
 
+    /// `Array.newInstance` allocates for a real component type, and REFUSES a
+    /// null one.
+    ///
+    /// This test read `Array.newInstance(null, 5) creates a 5-element reference
+    /// array` until 2026-08-06, and that was the defect rather than the
+    /// contract: `ce20bdd20` measured Temurin 25 and HotSpot dereferences the
+    /// `Class` argument, so a null component type is a `NullPointerException`
+    /// with a null message — it does not quietly become `Object[]`. Asserting
+    /// the old behaviour froze a fabricated value in place, which is exactly
+    /// what the fix removed.
+    ///
+    /// Both halves are here on purpose. A test that only checked the refusal
+    /// would pass against a `newInstance` that refuses everything.
     #[test]
     fn reflect_array_new_instance() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Array.newInstance(null, 5) creates a 5-element reference array
+        // The positive case. `int.class` comes from `Class.getPrimitiveClass`,
+        // the way the JDK itself constructs a primitive mirror — primitives are
+        // not loadable through `Class.forName`.
+        let type_name = create_java_string(&shared, "int");
+        let int_cls = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(type_name))],
+        )
+        .unwrap()
+        .unwrap();
         let arr = call_native(
             &shared,
             &mut thread,
             "java/lang/reflect/Array",
             "newInstance",
             "(Ljava/lang/Class;I)Ljava/lang/Object;",
-            &[Value::Object(None), Value::Int(5)],
+            &[int_cls, Value::Int(5)],
         )
         .unwrap()
         .unwrap();
@@ -34685,7 +34731,6 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected array"),
         };
-
         let len = call_native(
             &shared,
             &mut thread,
@@ -34697,6 +34742,27 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(len, Value::Int(5));
+
+        // The refusal, and it must be the JDK's: NPE, and `getMessage()` null.
+        let err = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Array",
+            "newInstance",
+            "(Ljava/lang/Class;I)Ljava/lang/Object;",
+            &[Value::Object(None), Value::Int(5)],
+        )
+        .expect_err("a null component type must not allocate anything");
+        assert!(
+            matches!(
+                err,
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { message: None }
+                ))
+            ),
+            "HotSpot dereferences the Class argument: NullPointerException with \
+             no detail message, not an Object[5] — got {err:?}"
+        );
     }
 
     // ========================================================================
