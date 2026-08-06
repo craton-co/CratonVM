@@ -104,6 +104,37 @@ Eliminations, so the next person does not redo them:
   confirms nor rules that out. This is the most promising next thread.
 
 
+## 2026-08-05 FINAL: three failures deep, each one uncovering the next
+
+This page has now been through three distinct causes for the same test. Each
+fix moved the failure later:
+
+| | failure | status |
+|---|---|---|
+| 1 | `OutOfMemoryError` in javac at a 4 GiB heap | gone on current `dev` (plausibly the 2026-08-04 `defrag-promote` change) |
+| 2 | `ArrayIndexOutOfBoundsException` in `CharBuffer.putBuffer` | **FIXED** — heap CharBuffer carried `address = -1`; see below |
+| 3 | `ClassCastException` in javac's `Resolve.staticKind` | **OPEN**, and it is the current failure |
+
+Failure 3, measured on the fixed binary (`rc=0`, 3222 s, `aioobe=0`, so the
+test now runs to completion rather than dying in `BaseFileManager.decode`):
+
+```
+An exception has occurred in the compiler (25.0.3)
+java.lang.ClassCastException: com.sun.tools.javac.code.Symbol$MethodSymbol
+    cannot be cast to com.sun.tools.javac.comp.Resolve$ReferenceLookupResult$StaticKind
+  at com.sun.tools.javac.comp.Resolve$ReferenceLookupResult.staticKind(Resolve.java:3317)
+  at com.sun.tools.javac.comp.Resolve$ReferenceLookupResult.<init>(Resolve.java:3301)
+  at com.sun.tools.javac.comp.Resolve.resolveMemberReference(Resolve.java:3173)
+```
+
+`StaticKind` is a nested **enum**; a `MethodSymbol` reaching a cast to it is
+type confusion on CratonVM, not a javac bug (HotSpot compiles the same sources).
+That is the next thing to chase, and it is a *correctness* defect, not
+throughput or footprint. Whoever picks it up should start by reducing it the
+way failure 2 was reduced — a standalone probe around a method reference whose
+resolution goes through `ReferenceLookupResult`, rather than the 55-minute
+Spring run.
+
 ## 2026-08-05 UPDATE: on current `dev` this is no longer a heap failure
 
 Re-run against `dev` of 2026-08-05 (+882 commits), the test **no longer OOMs at
