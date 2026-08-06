@@ -1218,9 +1218,9 @@ pub fn run_load_time_transform_chain(
         // `ClassLoader.defineClass`, which carries its own receiver; this arm
         // is only reached if one is ever routed through the built-in delegation
         // chain, and the system loader is the closest true answer.
-        ClassLoaderId::UserDefined(_) => Some(
-            cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx),
-        ),
+        ClassLoaderId::UserDefined(_) => {
+            Some(cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx))
+        }
     };
     run_chain_over_bytes(
         ctx,
@@ -2462,7 +2462,10 @@ mod tests {
             "com/app/AbstractBase",
             &["com/app/Api", "java/io/Serializable"],
         );
-        assert_eq!(class_file_this_class(&bytes).as_deref(), Some("com/app/Impl"));
+        assert_eq!(
+            class_file_this_class(&bytes).as_deref(),
+            Some("com/app/Impl")
+        );
         assert_eq!(
             class_file_supertypes(&bytes),
             vec![

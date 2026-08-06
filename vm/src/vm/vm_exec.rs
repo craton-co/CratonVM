@@ -7814,9 +7814,8 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             && !name.is_empty()
             && crate::runtime::instrument::transformers_armed(self.shared.vm_identity)
         {
-            transformed = crate::runtime::instrument::run_load_time_transform_chain(
-                self, name, cl_id, bytes,
-            );
+            transformed =
+                crate::runtime::instrument::run_load_time_transform_chain(self, name, cl_id, bytes);
             &transformed[..]
         } else {
             bytes

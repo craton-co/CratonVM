@@ -4842,7 +4842,12 @@ impl ClassManager {
     /// transformer chain; this hands the result to the load that will ask for
     /// it. A second stage for the same name overwrites the first — the last
     /// transform wins, which is the only ordering a single load can observe.
-    pub fn stage_transformed_class(&mut self, name: &str, bytes: Vec<u8>, loader_id: ClassLoaderId) {
+    pub fn stage_transformed_class(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        loader_id: ClassLoaderId,
+    ) {
         self.pending_transformed_classes
             .insert(name.to_string(), (bytes.into(), loader_id));
     }

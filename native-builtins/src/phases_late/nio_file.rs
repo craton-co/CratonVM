@@ -15566,9 +15566,7 @@ pub(crate) fn read_named_attributes(
         let key = ctx.create_string(name);
         let key_pin = ctx.pin_native_root(key);
         let value: Value = match name {
-            "lastModifiedTime" => {
-                Value::Object(Some(filetime_alloc(ctx, facts.modified_millis)))
-            }
+            "lastModifiedTime" => Value::Object(Some(filetime_alloc(ctx, facts.modified_millis))),
             "lastAccessTime" => Value::Object(Some(filetime_alloc(ctx, facts.access_millis))),
             "creationTime" => Value::Object(Some(filetime_alloc(ctx, facts.creation_millis))),
             "ctime" => Value::Object(Some(filetime_alloc(ctx, facts.ctime_millis))),
@@ -15584,10 +15582,8 @@ pub(crate) fn read_named_attributes(
                 if facts.dev == 0 && facts.ino == 0 {
                     Value::Object(None)
                 } else {
-                    let s = ctx.create_string(&format!(
-                        "(dev={:x},ino={})",
-                        facts.dev as u64, facts.ino
-                    ));
+                    let s = ctx
+                        .create_string(&format!("(dev={:x},ino={})", facts.dev as u64, facts.ino));
                     Value::Object(Some(s))
                 }
             }
@@ -15658,9 +15654,7 @@ pub(crate) fn read_named_attributes(
 
 #[cfg(test)]
 mod named_attribute_tests {
-    use super::{
-        attribute_names_for_view, split_attribute_spec, supported_attribute_view_names,
-    };
+    use super::{attribute_names_for_view, split_attribute_spec, supported_attribute_view_names};
 
     /// `Files` treats a spec with no colon as the `basic` view. Getting this
     /// wrong turns `readAttributes(p, "size")` into a request for a view named

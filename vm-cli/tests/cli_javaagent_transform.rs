@@ -120,7 +120,10 @@ fn javaagent_transformer_rewrite_reaches_the_defined_class() {
 #[test]
 fn javaagent_transformer_receives_a_non_null_loader_for_a_classpath_class() {
     let (stdout, stderr, status) = run_with_agent();
-    assert!(status.success(), "cratonvm exited with {status:?}\n{stderr}");
+    assert!(
+        status.success(),
+        "cratonvm exited with {status:?}\n{stderr}"
+    );
     assert!(
         stdout.contains("agent offered XformTarget loaderNull=false"),
         "a classpath class was offered with a null ClassLoader; agents read that \
