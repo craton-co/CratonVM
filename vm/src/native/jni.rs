@@ -8794,16 +8794,44 @@ mod tests {
     // Session 44: JNI Completeness — new function tests
     // -----------------------------------------------------------------------
 
+    /// Slot 233 (`GetModule`, JNI 9+) is wired to its implementation.
+    ///
+    /// ASSERTS EQUALITY WITH THE TARGET, NOT INEQUALITY WITH THE STUB, and the
+    /// difference is not stylistic. `assert_ne!(table[233], jni_stub as usize)`
+    /// is what this test used to say, and it fails in release builds — not
+    /// because the slot is unwired (it is assigned exactly once, from
+    /// `jni_get_module`, in `build_function_table`), but because
+    /// **`jni_get_module` and `jni_stub` resolve to the SAME ADDRESS**. Both
+    /// are `extern "C"` functions that return a constant 0 and touch none of
+    /// their arguments, and nothing obliges the toolchain to keep two such
+    /// functions at distinct addresses: MSVC's `/OPT:ICF` folds identical code,
+    /// and the release profile's `lto = "fat"` + `codegen-units = 1` gives it
+    /// the whole program to fold across. Measured: both sides printed
+    /// `140702574873248`.
+    ///
+    /// So the old assertion asked a question with no answer in this binary.
+    /// "Is slot 233 the real GetModule or the generic stub?" is undecidable by
+    /// address when the real GetModule *is* a stub in all but name — and it
+    /// would stay undecidable by behaviour too, since both return 0. What IS
+    /// decidable, and is the invariant worth policing, is that the slot names
+    /// `jni_get_module`. That holds whether or not the linker folds.
+    ///
+    /// The failure was release-only and CI runs `cargo test -p cratonvm-vm
+    /// --lib` in debug, which is why it never showed up there.
     #[test]
     fn jni_function_table_extended_to_234() {
         let env = get_jni_env();
-        // Table must have at least 234 slots.
-        // We check that slot 233 (GetModule) is not a null pointer.
+        // The table is `[usize; JNI_FUNCTION_COUNT]`, so reading slot 233 at
+        // all requires the table to be at least 234 entries long.
+        assert_eq!(
+            JNI_FUNCTION_COUNT, 234,
+            "the table must still have a slot 233 to wire"
+        );
         let func_ptr = unsafe { *(*env).add(233) };
-        let stub_ptr = jni_stub as *const () as usize;
-        assert_ne!(
-            func_ptr, stub_ptr,
-            "slot 233 (GetModule) should not be stub"
+        assert_eq!(
+            func_ptr,
+            jni_get_module as *const () as usize,
+            "slot 233 must dispatch to GetModule"
         );
     }
 
@@ -9074,9 +9102,15 @@ mod tests {
             stub_ptr,
             "slot 232 (GetObjectRefType)"
         );
-        assert_ne!(
+        // Slot 233 is checked by NAME, not by "is not the stub". `GetModule`
+        // returns a constant 0 and so is foldable with `jni_stub` by the
+        // linker — see `jni_function_table_extended_to_234` for the full
+        // reasoning and the measurement. The four slots above have bodies that
+        // do real work, so nothing folds them and `assert_ne!` remains a
+        // meaningful question for them.
+        assert_eq!(
             unsafe { *(*env).add(233) },
-            stub_ptr,
+            jni_get_module as *const () as usize,
             "slot 233 (GetModule)"
         );
     }
@@ -9094,6 +9128,15 @@ mod tests {
     #[test]
     fn jni_count_non_stub_functions() {
         // Verify that we have at least 165 non-stub functions (was ~129, now ~165+).
+        //
+        // This count is a LOWER BOUND and can legitimately read lower in
+        // release than in debug: any wired function whose body is identical to
+        // `jni_stub` (returns a constant 0, ignores its arguments) may be
+        // folded onto the stub's address by `/OPT:ICF` and counted here as a
+        // stub. `GetModule` is exactly such a function — see
+        // `jni_function_table_extended_to_234`. The assertion is `>=`, so
+        // folding can only make it stricter, never falsely green; if it ever
+        // trips, check whether a slot was un-wired before assuming folding.
         let env = get_jni_env();
         let stub_ptr = jni_stub as *const () as usize;
         let mut non_stub_count = 0;

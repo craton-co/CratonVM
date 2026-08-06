@@ -199,7 +199,7 @@ fn sweep_anchor_stride() -> usize {
 /// `live` is `cursor - free_list`, the metric the trigger actually uses.
 fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: usize, non_moving: bool) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
+    if !*ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
         return;
     }
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1335,6 +1335,13 @@ impl Drop for GenerationalHeap {
 /// Old generation: non-moving free-list allocator with mark-sweep.
 /// Card table: tracks old→young cross-generation references.
 pub struct GenerationalHeap {
+    /// Compact-layout domain of the VM that owns this heap. See
+    /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
+    /// allocating against another domain's registry entry would give the object
+    /// a foreign shape. Defaults to the first domain, so an untold heap behaves
+    /// as it did before domains existed.
+    layout_domain: std::sync::atomic::AtomicU32,
+
     /// Young generation from-space (allocation target).
     young_from: Mutex<Arena>,
     /// Young generation to-space (GC copy target).
@@ -1535,6 +1542,17 @@ unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
 impl GenerationalHeap {
+    /// Bind this heap to its VM's compact-layout domain.
+    pub fn set_layout_domain(&self, domain: u32) {
+        self.layout_domain
+            .store(domain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// This heap's compact-layout domain.
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a new generational heap with default sizes.
     pub fn new() -> Self {
         Self::with_sizes(DEFAULT_YOUNG_SEMI_SIZE, DEFAULT_OLD_GEN_SIZE)
@@ -1590,6 +1608,9 @@ impl GenerationalHeap {
         };
 
         let heap = Self {
+            layout_domain: std::sync::atomic::AtomicU32::new(
+                cratonvm_types::FIRST_LAYOUT_DOMAIN,
+            ),
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
@@ -1802,7 +1823,7 @@ impl GenerationalHeap {
         // `plan_object_alloc` also picks the compact reference-field layout when
         // enabled (smaller `total_size`, `array_length` = body bytes,
         // `GC_FLAG_COMPACT`).
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
             .unwrap_or_else(|| {
                 eprintln!(
                     "FATAL: object size overflow in gen_heap alloc_object \
@@ -1885,7 +1906,7 @@ impl GenerationalHeap {
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
@@ -2228,7 +2249,7 @@ impl GenerationalHeap {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
         // near-`usize::MAX` field count can't wrap past the checked multiply.
         // `plan_object_alloc` also selects the compact reference-field layout.
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
         let init = |ptr: *mut u8| {
             let mut header = ObjectHeader::new(
@@ -2451,7 +2472,7 @@ impl GenerationalHeap {
         class_id: ClassId,
         num_fields: usize,
     ) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
@@ -2494,7 +2515,7 @@ impl GenerationalHeap {
         // spill: arm the boundary-GC pressure flag (advisability-gated; one
         // extra old-gen lock per 2048-object batch, not per allocation).
         self.note_young_spill_pressure();
-        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(class_id, num_fields)
+        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
         else {
             return Vec::new();
         };
@@ -12220,7 +12241,7 @@ impl GenerationalHeap {
         // Opt-in: the allocating call chain. Release builds carry line tables,
         // so this names the exact panicking-allocator caller — i.e. which
         // native / VM-internal path could not tolerate a GC-and-retry.
-        if std::env::var_os("CRATONVM_DBG_OOM_BT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOM_BT").is_some() {
             eprintln!(
                 "FATAL-OOM backtrace:\n{}",
                 std::backtrace::Backtrace::force_capture()
@@ -15001,10 +15022,14 @@ fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 ///
 /// `None` only on size overflow.
 #[inline]
-fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
+fn plan_object_alloc(
+    layout_domain: u32,
+    class_id: ClassId,
+    num_fields: usize,
+) -> Option<(usize, u32, u8)> {
     if compact_ref_fields_enabled() {
         if let Some(body_size) =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields)
+            cratonvm_types::compact_object_body_size(layout_domain, class_id.as_u32(), num_fields)
         {
             let total = HEADER_SIZE.checked_add(body_size)?;
             let body_size = u32::try_from(body_size).ok()?;

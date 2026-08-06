@@ -1394,6 +1394,13 @@ const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 /// [`GcResult::pointer_map`] is therefore empty (no remapping needed), which
 /// is exactly correct for a non-compacting collector.
 pub struct ZgcRealHeap {
+    /// Compact-layout domain of the VM that owns this heap. See
+    /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
+    /// allocating against another domain's registry entry would give the object
+    /// a foreign shape. Defaults to the first domain, so an untold heap behaves
+    /// as it did before domains existed.
+    layout_domain: std::sync::atomic::AtomicU32,
+
     /// Backing storage for all objects.
     arena: Mutex<Arena>,
     /// Base address of every live allocation, in allocation order. Rebuilt
@@ -1455,6 +1462,17 @@ unsafe impl Send for ZgcRealHeap {}
 unsafe impl Sync for ZgcRealHeap {}
 
 impl ZgcRealHeap {
+    /// Bind this heap to its VM's compact-layout domain.
+    pub fn set_layout_domain(&self, domain: u32) {
+        self.layout_domain
+            .store(domain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// This heap's compact-layout domain.
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a heap with the default capacity ([`ZGC_REAL_DEFAULT_HEAP`]).
     pub fn new() -> Self {
         Self::with_capacity(ZGC_REAL_DEFAULT_HEAP)
@@ -1938,7 +1956,11 @@ impl Default for ZgcRealHeap {
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let compact_body =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+            cratonvm_types::compact_object_body_size(
+            self.layout_domain(),
+            class_id.as_u32(),
+            num_fields,
+        );
         let fields_size = compact_body.unwrap_or_else(|| {
             num_fields
                 .checked_mul(SLOT_SIZE)

@@ -1023,6 +1023,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             maybe_concurrent_gc(shared, thread);
             // Run any pending finalizers
             run_finalizers(shared, thread);
+            // ...and any pending Cleaner actions. Until 2026-08-05 this was
+            // called ONLY from the forced `System.gc()` path, so a cleanable
+            // whose referent died during an ordinary allocation-triggered
+            // collection stayed queued indefinitely — its native memory (a
+            // direct `ByteBuffer`'s backing block, a mapped region, a file
+            // descriptor) held until something happened to call `System.gc()`.
+            // `run_finalizers` was already called from here; this is the
+            // missing half of that symmetry, and lead 2 of
+            // `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
+            // Both are cheap no-ops when nothing is pending.
+            run_cleaner_actions(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
             let mut counted_os_tids: Vec<u32> = Vec::new();
@@ -1147,6 +1158,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 maybe_concurrent_gc(shared, thread);
                 // Run any pending finalizers
                 run_finalizers(shared, thread);
+                // ...and any pending Cleaner actions — see the single-threaded
+                // arm above for why an allocation-triggered GC must do this
+                // too, not only the forced `System.gc()` path.
+                run_cleaner_actions(shared, thread);
             } else {
                 // Another thread is already doing GC — just participate
                 safepoint_check(shared, thread);
@@ -1713,7 +1728,12 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
     // shared.mem.cleaner_thread by process_references_after_gc.
-    run_cleaner_actions(shared, thread);
+    //
+    // FORCED variant: this is the last-ditch reclaim behind
+    // `Bits.reserveMemory` (and `System.gc()`). Deferring here is not a
+    // deferral at all -- the caller throws `OutOfMemoryError: Direct buffer
+    // memory` the moment we return without freeing anything.
+    run_cleaner_actions_forced(shared, thread);
 }
 
 /// Drain pending Cleaner actions and invoke their Runnable.run() method.
@@ -1722,12 +1742,20 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// synthetic. Field 0 holds the Runnable action; field 1 is the cleaned
 /// flag (idempotency guard, also set by user-triggered Cleanable.clean()).
 ///
+/// A real-JDK `jdk.internal.ref.Cleaner` also arrives here — the reference
+/// processor emits it as an action rather than enqueuing it onto its
+/// reader-less `dummyQueue` (see `ReferenceEntry::runs_cleaner`). It has a
+/// completely different layout and is handled by invoking its own `clean()`.
+///
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
-pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+fn run_cleaner_actions_impl(shared: &SharedVm, thread: &mut JvmThread, force: bool) {
     // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
     if no_refproc() || no_cleaners() {
         return;
+    }
+    if dm_dbg_enabled() {
+        DM_CLEANER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     // Re-entrancy safety: if a JIT helper currently holds the `&mut JvmThread`
     // (we were reached via `jit_invoke_dispatch` → `bail_to_interpreter` →
@@ -1737,7 +1765,22 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     // exposed by real-bytecode RAF's FileCleanable cleanups). Leave the actions
     // queued; they are GC-relocated (`update_after_gc`) and run at the next
     // top-level (non-JIT) safepoint.
-    if crate::jit::helpers::is_jit_thread_set() {
+    if !force && crate::jit::helpers::is_jit_thread_set() {
+        if dm_dbg_enabled() {
+            let n = DM_CLEANER_JIT_BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // ALWAYS print when something is actually queued: a silent bail with
+            // a non-empty backlog is precisely the case worth seeing, and the
+            // %200 rate limit hid it at the one moment that mattered.
+            if n % 200 == 1 || shared.mem.cleaner_thread.pending_count() > 0 {
+                eprintln!(
+                    "[dm] run_cleaner_actions BLOCKED jit_thread_set: blocked={} pending={} calls={} thread={:?}",
+                    n,
+                    shared.mem.cleaner_thread.pending_count(),
+                    DM_CLEANER_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                    std::thread::current().id()
+                );
+            }
+        }
         return;
     }
     // S-bytebuddy r3 — independent recursion guard for cleaner-action
@@ -1782,6 +1825,31 @@ pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     let _cleaner_depth_guard = CleanerDepthGuard;
 
     let addrs = shared.mem.cleaner_thread.drain_actions();
+    if dm_dbg_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if addrs.is_empty() {
+            let e = DM_CLEANER_EMPTY.fetch_add(1, Relaxed) + 1;
+            if e % 500 == 1 {
+                eprintln!(
+                    "[dm] run_cleaner_actions DRAIN empty x{} (calls={} jit_blocked={} cum_drained={})",
+                    e,
+                    DM_CLEANER_CALLS.load(Relaxed),
+                    DM_CLEANER_JIT_BLOCKED.load(Relaxed),
+                    DM_CLEANER_DRAINED.load(Relaxed)
+                );
+            }
+        } else {
+            let d = DM_CLEANER_DRAINED.fetch_add(addrs.len() as u64, Relaxed) + addrs.len() as u64;
+            eprintln!(
+                "[dm] run_cleaner_actions DRAIN n={} cum_drained={} calls={} jit_blocked={} thread={:?}",
+                addrs.len(),
+                d,
+                DM_CLEANER_CALLS.load(Relaxed),
+                DM_CLEANER_JIT_BLOCKED.load(Relaxed),
+                std::thread::current().id()
+            );
+        }
+    }
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
@@ -5370,4 +5438,76 @@ mod root_snapshot_screen_tests {
              locals scan keeps"
         );
     }
+}
+
+/// DBG (CRATONVM_DBG_DM): trace every stage of the direct-memory
+/// reclamation chain -- Cleaner discovery, action emission, the drain, and
+/// `Bits.reserveMemory`'s reclaim-and-retry. Default-off; when unset this is
+/// one cached `OnceLock` read, NOT a per-call `runtime_var_os` (that takes
+/// the process-env lock, and this sits on the post-GC path).
+pub(super) fn dm_dbg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DM").is_some())
+}
+
+/// `run_cleaner_actions` entries that got past the exclusion switches.
+static DM_CLEANER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ...of those, the ones that bailed because a JIT borrow was live.
+static DM_CLEANER_JIT_BLOCKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// ...the ones that reached the drain and found nothing queued.
+static DM_CLEANER_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cleaner actions actually run.
+static DM_CLEANER_DRAINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain pending Cleaner actions, deferring if a JIT borrow is live.
+///
+/// This is the ordinary-GC entry point (`maybe_gc`). It keeps the original
+/// conservative behaviour: `maybe_gc` is reachable through
+/// `jit_invoke_dispatch` -> `bail_to_interpreter` -> interpreter, and there the
+/// interpreter's `&mut JvmThread` is itself fabricated from the JIT TLS, so a
+/// cleaner's `run()` re-entering JIT would be a genuine *sibling* aliasing
+/// borrow. That is the shape behind the avrora `FileCleanable` crash the guard
+/// was added for. Actions left queued here are GC-relocated by
+/// `update_after_gc` and run at the next non-JIT safepoint.
+pub(super) fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    run_cleaner_actions_impl(shared, thread, false);
+}
+
+/// Drain pending Cleaner actions even when a JIT borrow is live.
+///
+/// Called ONLY from `force_gc_from_native`, i.e. from inside a native method
+/// invocation, where `thread` is the native dispatcher's own legitimate
+/// `&mut JvmThread` rather than one derived from `jit_thread_mut`.
+///
+/// Deferring on that path is useless: its callers -- `System.gc()` and
+/// `Bits.reserveMemory`'s reclaim-and-retry -- have no later safepoint to wait
+/// for. `Bits.reserveMemory` throws `OutOfMemoryError: Direct buffer memory` as
+/// soon as this returns having freed nothing. Measured on H2's
+/// `org.h2.test.store.TestMVStore`: 156 cleaner actions queued and every drain
+/// attempt refused, because the allocating thread is a `FileStore` writer-pool
+/// worker running compiled code, so the guard held every time it mattered.
+///
+/// Running them is made safe the same way the interpreter re-enters JIT from a
+/// bail: `set_jit_thread` opens a nested scope, so the cleaner's `run()` gets a
+/// *child reborrow* of `thread` rather than an aliasing sibling, and
+/// `restore_jit_thread` re-installs the outer level on the way out.
+pub(super) fn run_cleaner_actions_forced(shared: &SharedVm, thread: &mut JvmThread) {
+    // RAII so an unwinding cleaner action cannot leave the outer JIT level
+    // un-restored.
+    struct NestedJitScope(Option<crate::jit::helpers::JitThreadScope>);
+    impl Drop for NestedJitScope {
+        fn drop(&mut self) {
+            if let Some(scope) = self.0.take() {
+                crate::jit::helpers::restore_jit_thread(scope);
+            }
+        }
+    }
+    let _scope = NestedJitScope(if crate::jit::helpers::is_jit_thread_set() {
+        Some(crate::jit::helpers::set_jit_thread(thread))
+    } else {
+        None
+    });
+    run_cleaner_actions_impl(shared, thread, true);
 }

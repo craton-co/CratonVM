@@ -2512,7 +2512,7 @@ fn jboss_logger_level_filter() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            std::env::var("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER").as_deref(),
+            cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER").as_deref(),
             Ok("0")
         )
     })

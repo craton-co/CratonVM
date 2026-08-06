@@ -116,6 +116,21 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   The class's `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) is untouched
   and not in question.
 
+  **A fifth, unrelated defect was found and FIXED 2026-08-06** — distinct from
+  all four GC old-gen defects above (nothing to do with the collector): 3 of
+  the 132 parameterized methods (`enhancedSequenceGenerator`,
+  `enhancedTableGenerator`, `incrementGenerator`) threw
+  `ServiceConfigurationError` / `AbstractMethodError` on
+  `net/bytebuddy/utility/Invoker.invoke`, because the JIT's cache-miss dispatch
+  resolver (`invoke_or_native` in `vm/src/vm/vm_exec.rs`) had no equivalent of
+  the interpreter's `is_proxy_dispatch` check — a JDK dynamic-proxy receiver
+  compiled by the JIT fell through to ordinary vtable resolution instead of
+  being forwarded to its `InvocationHandler`, once ByteBuddy's
+  `JavaDispatcher$Dispatcher$ForNonStaticMethod.invoke` tiered up. Fixed with a
+  literal-class-name check mirroring the pre-existing `AnnotationProxy` case
+  in the same function. Full write-up:
+  `../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`.
+
 - **`bulkid.OracleInlineMutationStrategyIdTest` — stale binary, not a
   regression; already faster on current `dev`.** This class is a long-known,
   already-documented timeout-marginal residual (see the `GROUP BY` cluster
@@ -263,7 +278,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   Futures, so an `HqlLexer.<clinit>` NPE makes it report `ok=1` in 15 s having
   executed nothing. The ~1-in-13 crash seen while measuring is **not** this
   page: it is the `ClassId(0)` family, now recorded as a fifth reproduction on
-  `../h2/bug-h2-classid0-stale-address-family.md`.
+  `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 
 - ~~`OffsetDateTimeTest` — SIGSEGV during JUnit discovery~~ — **FIXED 2026-08-05**,
   retired to

@@ -154,6 +154,17 @@ const GC_THRESHOLD_PERCENT: usize = 75;
 /// Allocation happens linearly in from-space. During GC, live objects are
 /// copied to to-space, then the spaces are swapped.
 pub struct Heap {
+    /// Compact-layout domain of the VM that owns this heap.
+    ///
+    /// `class_id` is a per-`ClassStore` index, so it does not identify a class
+    /// in the process-global layout registry. Allocating against another
+    /// domain's entry gives the object a foreign shape and corrupts every field
+    /// access it will ever see. Defaults to the FIRST domain, so a heap nobody
+    /// tells behaves exactly as it did before domains existed — and a heap told
+    /// the wrong value merely loses compact layouts (tagged slots carry their
+    /// own type), it does not corrupt.
+    layout_domain: std::sync::atomic::AtomicU32,
+
     from_space: Mutex<Arena>,
     to_space: Mutex<Arena>,
     next_hash_code: AtomicI32,
@@ -246,6 +257,20 @@ unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
 
 impl Heap {
+    /// Bind this heap to its VM's compact-layout domain. Call once, as early as
+    /// possible in VM construction: allocations made before it land on tagged
+    /// slots, which is safe but larger.
+    pub fn set_layout_domain(&self, domain: u32) {
+        self.layout_domain
+            .store(domain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// This heap's compact-layout domain. See [`Self::set_layout_domain`].
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a new heap with default capacity (4 MB per semi-space).
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_SEMI_SPACE_SIZE * 2)
@@ -264,6 +289,9 @@ impl Heap {
         let topo = numa::global_topology();
         let num_numa_nodes = topo.num_nodes.max(1);
         Self {
+            layout_domain: std::sync::atomic::AtomicU32::new(
+                cratonvm_types::FIRST_LAYOUT_DOMAIN,
+            ),
             from_space: Mutex::new(Arena::new(half)),
             to_space: Mutex::new(Arena::new(half)),
             next_hash_code: AtomicI32::new(1),
@@ -347,7 +375,11 @@ impl Heap {
     /// # Panics
     /// Panics if `num_fields * SLOT_SIZE` overflows.
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let compact_body = cratonvm_types::compact_object_body_size(
+            self.layout_domain(),
+            class_id.as_u32(),
+            num_fields,
+        );
         let fields_size = compact_body.unwrap_or_else(|| {
             num_fields
                 .checked_mul(SLOT_SIZE)
@@ -455,7 +487,11 @@ impl Heap {
 
     /// Like `alloc_object`, but returns `None` instead of panicking on overflow.
     pub fn alloc_object_checked(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let compact_body = cratonvm_types::compact_object_body_size(
+            self.layout_domain(),
+            class_id.as_u32(),
+            num_fields,
+        );
         let fields_size = compact_body.or_else(|| num_fields.checked_mul(SLOT_SIZE))?;
         let total_size = HEADER_SIZE.checked_add(fields_size)?;
         // See `alloc_zeroed` for the NUMA hint rationale.

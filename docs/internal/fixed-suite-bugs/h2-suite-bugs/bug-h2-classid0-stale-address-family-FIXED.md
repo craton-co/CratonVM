@@ -9,21 +9,49 @@
 > name states only what is actually measured.
 
 ## Status
-**OPEN.** One defect, four faces, two of them measured to opposite verdicts on
-the same question. What is fixed, what is measured, and what is left:
+**FIXED 2026-08-06** — `fix/compactvalue-object-provenance-20260806`, merged to
+`dev` as `b50da356e`.
 
-* **Fixed and merged.** An old-gen mark gap (`old_gen_gc`'s root seed had no
-  resolution at all for an INTERIOR conservative root), and separately a JIT
-  miscompile that bound an `invokevirtual` to the compiled entry of its
-  CONSTANT-POOL-resolved method with no receiver guard. The second is not a GC
-  bug at all and is written up in
-  `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`.
-  It mattered here twice over: it made this family's only reproduction
-  (`TestMultiThread`) fail 100 % of runs in 2-9 s so nothing could be measured,
-  and a wrong-object return is **indistinguishable at the reader** from a stale
-  reference, so it is a live alternative explanation for every occurrence
-  recorded before `12769bb23c`.
-* **Still open.** The family reproduces on the fixed binary, on both faces.
+**Root cause: `CompactValue`'s SUB_OBJECT encoders never recorded into the
+provenance bitmap its own decoders consult**, so the encoder could mint a
+reference slot the decoder refused. The refusal degrades the value to
+`Value::Long`, which takes `LKIND_LONG`, and `Frame::scan_local_objects` skips
+LONG slots by design — so the root is never published and the sweep reclaims a
+live object. The full derivation, the four encoders, and the measurement that
+named it are in **[ROOT CAUSE (2026-08-06)](#root-cause-2026-08-06-a-sub_object-slot-the-encoder-minted-and-the-decoder-refused)**
+below. Everything above and below that section is the hunt as it was recorded,
+left intact because several of its measurements are load-bearing negatives.
+
+**Validation.** `TestMultiThread` x20 on the fixed binary: **zero degradations
+and zero `"result" is null`**, against a baseline of 6-in-32 on the immediately
+preceding binary (p ~ 0.016 on its own). Ten clean passes; the other ten were
+`TimeoutException` on a host at load 20-90 with 8000 logged-in users, every one
+degradation-free, and the passing runs were *faster* than baseline (456-947 s
+vs 689-1249 s), so the added recording on the GC relocation path costs nothing
+measurable. Gates on the merged tree: `cratonvm-types` 493/0, `cratonvm-gc`
+974/0, `cratonvm-vm` 2420/0.
+
+**Residual, stated honestly.** Only one of this page's faces (`"result" is
+null`) was frequent enough to measure directly. The `ClassId(0)` dispatch-miss
+face and the `The database has been closed` face did not occur in the 32-run
+baseline either, so 0-in-20 does not by itself retire them — what retires them
+is that the mechanism explains every recorded witness, including the ones this
+page could never reconcile (`in_published_snapshot=false` on a RUNNING mutator
+whose top frame holds the address, with `ROOT_IN_DEAD_SPANS=0` and
+`SWEEP_LIVENESS hits=0`). If a `ClassId(0)` receiver reappears in
+`TestMultiThread`, reopen this page rather than starting a new one, and check
+`object_degradation_count()` first.
+
+**Earlier fixes that landed under this page and remain valid.** An old-gen mark
+gap (`old_gen_gc`'s root seed had no resolution for an INTERIOR conservative
+root), and separately a JIT miscompile that bound an `invokevirtual` to the
+compiled entry of its CONSTANT-POOL-resolved method with no receiver guard
+(`../jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`). The second is
+not a GC bug at all, and it mattered here twice over: it made this family's only
+reproduction fail 100% of runs in 2-9 s so nothing could be measured, and a
+wrong-object return is **indistinguishable at the reader** from a stale
+reference — so it stays a live alternative explanation for every occurrence
+recorded before `12769bb23c`.
 
 ## Why this is one page
 
@@ -563,6 +591,65 @@ already documents, and the reason the memo can stay for its hot purpose.
 memo asks for a FULL rescan rather than an incremental band over a prefix
 nothing has verified.
 
+### The face that read the new fields (2026-08-06)
+
+`TestMultiThread`, `--Xmx 1g`, on the arm running the PRE-fix behaviour
+(`CRATONVM_JIT_UNREG_MEMO_GC_RESET=0 CRATONVM_JIT_UNREG_MEMO_HIWATER=0`):
+
+```text
+gc::guard: receiver points into RECLAIMED memory obj="0x2004a5f3ab8"
+     site="invoke dispatch" location=young from-space FREE BLOCK (reclaimed)
+     target_class=java/lang/Object.hasNext()Z
+gc::guard: …and NO live heap object holds this address in a decoded reference slot.
+gc::guard: …non-moving sweep zeroed … sweep_cycle=13 free_seq=957866
+     interior_off=1888 root_coverage="NEVER-LOOKED"
+     xt_passes=0 xt_taken_over=0 xt_unclassified=0
+gc::guard: in_published_snapshot=false published_roots=37
+     last_publish_at_collection=15 collections_now=16
+     holder=<not found in frames> in_blocked_region=false frames=4
+     top_frame=org/h2/test/db/TestMultiThread.testConcurrentInsert
+```
+
+**`root_coverage="NEVER-LOOKED"` with `xt_passes=0`.** The sweep that freed this
+block ran with no cross-thread take-over pass at all.
+`stw_takeover_should_scan` gates round 0 on `any_thread_in_jit()` and runs
+rounds >= 1 unconditionally, so zero passes means the barrier was satisfied at
+round 0 — every thread parked cooperatively and no round ever ran. This is
+exactly the reading the three-way encoding exists for: the pre-2026-08-05
+counter printed only when `peers > 0` and would have rendered this as silence.
+
+**It is a root-CAPTURE gap.** The thread published a fresh snapshot of 37 roots
+for this very collection and the victim address was not among them; because it
+parked cleanly nothing conservatively scanned its real stack.
+
+> **Off-by-one warning.** `last_publish_at_collection=15` against
+> `collections_now=16` looks like a one-collection-stale snapshot and is not.
+> `HeapStats::minor_gc_count` is "cycles **completed**" and increments at the
+> END of a cycle, so a thread publishing during collection 16's safepoint stamps
+> 15. That pair is what a correct, FRESH publish looks like. This page briefly
+> claimed staleness on the strength of it; do not rebuild that claim without
+> re-deriving the counter's semantics.
+
+That matches the memo defect's shape: the memo gates `scan_active_jit_frames`,
+which is what the publish path enumerates from, so a suppressed detection means
+that frame's oops never enter the published set.
+
+#### A/B status — NOT a validation
+
+Four concurrent arms, one variable, one binary. As of this writing:
+`fixON = 0 guard hits / 9 iterations`, `fixOFF = 1 / 7`. Fisher's exact
+p ~ 0.47. The OFF arm is simply reproducing at its historical ~1-in-8 rate and
+the ON arm has not run long enough to be distinguished from it. **Nothing here
+validates the fix.**
+
+#### Throughput, checked but not controlled
+
+The authoritative reset costs one band rescan per GC-authoritative root
+collection rather than per native call. No regression is apparent: launched
+together, the fix-ON arm completed **9** iterations to the fix-OFF arm's **7**
+(mean minor GCs/run 25.1 vs 30.3). The arms are not length-controlled and host
+load ranged 12-124, so this rules out a gross regression and nothing finer.
+
 ### A marking fail-open found while reading (2026-08-05)
 
 `compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`
@@ -884,6 +971,76 @@ first still failed (the `result is null` NPE, 40 s in), the second died of
 promotion still evacuates and the moving path still resets from-space; and the
 unbounded leak ends the run before much sweeping happens. So it is neither a
 clean negative nor soakable — do not read the first run as exoneration.
+
+### ROOT CAUSE (2026-08-06): a SUB_OBJECT slot the encoder minted and the decoder refused
+
+`CompactValue` NaN-boxes a reference as a `SUB_OBJECT` slot. Because a 64-bit
+`long` can carry the identical bit pattern, the *context-free* decoders
+(`CompactValue::to_value`, `crate::value::decode_value`) do not trust the tag
+alone: they ask `crate::value::object_ref_payload_is_known(payload)` -- a
+process-wide bitmap of every payload that has crossed a reference-construction
+boundary. An unknown payload is **degraded to `Value::Long`** and counted by
+`object_degradation_count()`.
+
+Only `ObjectRef::from_raw` / `from_raw_nonnull` recorded into that bitmap. The
+four *encoders* of a `SUB_OBJECT` payload did not:
+
+| encoder | who calls it |
+| --- | --- |
+| `CompactValue::object(raw)` | `local_slot_to_compact`, `RawSlot` bridge, SoA thaw |
+| `CompactValue::try_from_pointer(raw)` | `Frame::update_object_refs` (GC relocation) |
+| `CompactValue::update_object_ptr` | GC compaction scanner |
+| `CompactValue::update_object_ptr_unchecked` | GC compaction scanner (hot path) |
+
+So the encoder could mint a slot its own decoder refused. What follows is the
+whole family:
+
+1. a live reference lands in a frame slot through one of those encoders with a
+   payload the bitmap does not know;
+2. the next context-free decode returns `Value::Long`, and any `Value`-typed
+   store of that result marks `Frame::local_kinds[i] = LKIND_LONG`
+   (`ValueStack::kinds` for an operand-stack slot);
+3. `Frame::scan_local_objects` **skips LONG slots by design** -- the root is
+   never published. That is the measured `in_published_snapshot=false` on a
+   RUNNING mutator whose top frame holds the address, with
+   `ROOT_IN_DEAD_SPANS=0` and `SWEEP_LIVENESS hits=0`: nothing dropped the root,
+   the root was never handed over;
+4. the sweep reclaims the object. What the mutator reads back next depends on
+   what overwrote the span -- a zeroed span reads as `ClassId(0)` (class id 0 is
+   `java.lang.Object`), a span carrying free-list metadata fails
+   `is_object_address` and `coerce_value_for_return_validated` turns the
+   reference into **`null`**.
+
+`bytecode` never consults `local_kinds`, so step 2 is invisible from Java: the
+slot keeps loading and storing correctly right up to the moment the GC runs.
+
+**The evidence that named it.** `TestMultiThread` x32 on
+`cratonvm-h2cid0-slot-20260805`: the one-shot
+`CompactValue: first long<->object NaN-box collision degraded to Value::Long`
+line and the `"result" is null` failure face co-occur **perfectly** -- 6 runs
+with both, 26 runs with neither, and every remaining failure was a
+`TimeoutException` / `Timeout trying to lock table` on a host at load 90 (i.e.
+harness noise, and degradation-free). Two competing explanations were killed in
+the same campaign: `CRATONVM_DBG_ROOTSNAP_VERIFY` reported
+`miss_snapshots=0 missed_roots=0` over every snapshot of several runs, and the
+face still reproduced under `CRATONVM_ROOTSNAP_CACHE=0`, so the frozen-frame
+root-snapshot cache is exonerated.
+
+**Why it looked like three different bugs.** The `"result" is null` face is
+`Command.executeQuery`'s `ResultInterface result = query(maxrows);` -- a local
+assigned straight from a call return and used one bytecode later, so nothing
+about it is a GC *timing* window. It is the same slot corruption arriving
+through the return-value path.
+
+**The fix** records the payload inside all four encoders, so the invariant
+"anything the VM encoded as a reference decodes as a reference" holds by
+construction instead of by convention. Three sites
+(`Frame::update_object_refs` x2, `ValueStack::update_object_refs`) had already
+been hand-patched with a `ObjectRef::from_raw` round-trip whose comments state
+this exact mechanism -- three hand-patches of one invariant is the signal that
+the invariant belongs one level down. Those round-trips are now redundant and
+harmless. Regression test:
+`every_sub_object_encoder_records_decodable_provenance_cv`.
 
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
@@ -1318,13 +1475,13 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
 
 ## Related
 
-* `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
+* `../jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
   — the JIT miscompile that made this family's reproduction impossible, and the
   reason a wrong-object return has to be excluded before a stale reference is
   assumed. **Read this before attributing anything here to GC.**
 * `../../../gc/old-sweep-liveness.md` §7 — the interior-conservative-root fix,
   its counters and its negative control.
-* `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
+* `../h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
@@ -1448,7 +1605,7 @@ nothing, so a clean campaign is positive evidence rather than silence.
 
 A Hibernate witness of this family (`sql.exec.SmokeTests#testQueryConcurrency`,
 one occurrence) was filed as a separate page and has been retired into
-`../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`.
+`../hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`.
 Two things from it belong here, because they apply to any future occurrence:
 
 **`reclaimed_hole_at`'s verdict already names the collector — read it before

@@ -335,6 +335,9 @@ impl ReferenceProcessor {
         if let Some(entry) = self.phantom_refs.last_mut() {
             entry.runs_cleaner = true;
         }
+        if dm_dbg_enabled() {
+            DM_PC_DISCOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn discover_reference(
@@ -700,6 +703,31 @@ impl ReferenceProcessor {
             if entry.runs_cleaner && entry.enqueued && !entry.action_emitted {
                 entry.action_emitted = true;
                 cleaner_actions.push(entry.reference_obj);
+            }
+        }
+        if dm_dbg_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            // A `runs_cleaner` phantom that is NOT yet enqueued is one whose
+            // referent is STILL REACHABLE -- i.e. a direct buffer something in
+            // Java is still holding. That count answers lead 3 directly.
+            let retained = self
+                .phantom_refs
+                .iter()
+                .filter(|e| e.runs_cleaner && !e.enqueued)
+                .count();
+            let emitted = cleaner_actions.len();
+            let cum = DM_PC_EMITTED.fetch_add(emitted as u64, Relaxed) + emitted as u64;
+            let g = DM_REFPROC_ROUNDS.fetch_add(1, Relaxed) + 1;
+            if emitted > 0 || g % 50 == 0 {
+                eprintln!(
+                    "[dm] refproc round={} emitted={} cum_emitted={} discovered={} retained_live={} phantom_total={}",
+                    g,
+                    emitted,
+                    cum,
+                    DM_PC_DISCOVERED.load(Relaxed),
+                    retained,
+                    self.phantom_refs.len()
+                );
             }
         }
         self.stats.cleaner_refs_processed = cleaner_actions.len();
@@ -2756,3 +2784,17 @@ mod tests {
         assert_eq!(result.stats.phantom_refs_enqueued, 1);
     }
 }
+
+/// DBG (CRATONVM_DBG_DM) -- see `gc_and_alloc::dm_dbg_enabled`. Cached gate.
+fn dm_dbg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DM").is_some())
+}
+
+/// `jdk.internal.ref.Cleaner`s discovered as run-instead-of-enqueue phantoms.
+static DM_PC_DISCOVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cleaner actions emitted by reference processing.
+static DM_PC_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reference-processing rounds, for the periodic tally.
+static DM_REFPROC_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

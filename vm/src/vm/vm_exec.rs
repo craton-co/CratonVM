@@ -10976,6 +10976,24 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let ref_addr = reference_obj.as_ptr() as usize;
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
+        // processor is told about, not just its numeric type tag. The tag
+        // cannot distinguish an ordinary `PhantomReference` from a
+        // `jdk.internal.ref.Cleaner`, because a `Cleaner` IS a phantom: its
+        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
+        // native and arrives here as `2`. This is the instrument that answered
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md`'s open question
+        // ("find where a real-JDK `jdk.internal.ref.Cleaner` is actually
+        // discovered"), and it is placed BEFORE the type-4 branch below so it
+        // reports whichever wire value a given build's discovery site chose.
+        if crate::runtime::interpreter::dbg_refdisc_enabled() {
+            let cn = self
+                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[refdisc] wire={ref_type} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
+            );
+        }
         // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
         // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
@@ -12558,7 +12576,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // victim only sees a flag), so the only way to attribute one is to
         // record the producer. Kept permanently and env-gated for the same
         // reason CRATONVM_DBG_CCE_BT is.
-        if std::env::var_os("CRATONVM_DBG_INTERRUPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INTERRUPT").is_some() {
             eprintln!(
                 "CRATONVM_DBG_INTERRUPT: target_obj=0x{:x} target_tid={:?} by_tid={}",
                 thread_obj.as_ptr() as usize,
@@ -15176,6 +15194,58 @@ pub fn invoke_or_native(
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             note_annotation_proxy_cid(shared.mem.heap.class_id_of(recv).as_u32());
             return annotation_proxy_invoke_shared(shared, thread, recv, method_name, &args[1..]);
+        }
+    }
+
+    // Dynamic proxy dispatch (WP2.5): this is the JIT's cache-miss resolver
+    // for `invokevirtual`/`invokeinterface` (see `virtual_dispatch_target_for_receiver`
+    // in `vm/src/jit/helpers.rs`, which passes the RECEIVER's own runtime
+    // class as `class_name` here — not the constant-pool-declared class). A
+    // `java.lang.reflect.Proxy.newProxyInstance` receiver's runtime class is
+    // always the synthetic `java/lang/reflect/Proxy$Instance` (every proxy,
+    // regardless of interface set, currently lands on this single class —
+    // see `PROXY_INSTANCE_CLASS`'s doc comment in `vm/src/runtime/proxy.rs`),
+    // and that synthetic class has no real vtable/itable entries for the
+    // interfaces it implements. Without this check, normal resolution falls
+    // through and — for an interface method target — resolves straight to
+    // the interface's own ABSTRACT declaration, raising AbstractMethodError
+    // instead of forwarding to the `InvocationHandler`. Observed face:
+    // `net.bytebuddy.utility.dispatcher.JavaDispatcher$Dispatcher$ForNonStaticMethod.invoke`
+    // throwing `AbstractMethodError: method net/bytebuddy/utility/Invoker.invoke(...)
+    // has no Code attribute` once `JavaDispatcher`'s `invoke` tiers up to JIT
+    // (interpreted calls never hit this function — they route through
+    // `is_proxy_dispatch` in `execute_invoke_kind`,
+    // `vm/src/runtime/interpreter/invoke.rs`, which this mirrors).
+    //
+    // Keyed on the DISPATCH class (`effective_class`) exactly like the
+    // `AnnotationProxy` check above — a literal string compare, zero
+    // additional cost on every non-proxy dispatch — so a *static* call that
+    // merely takes a proxy instance as an ordinary argument is unaffected:
+    // its dispatch class is the static method's declaring class (resolved
+    // from the constant pool), never the receiver's runtime class, so it can
+    // never equal `Proxy$Instance` here.
+    if effective_class == crate::runtime::proxy::PROXY_INSTANCE_CLASS {
+        if let Some(Value::Object(Some(proxy_ref))) = args.first().copied() {
+            // Handle getClass() directly, like the interpreter's
+            // `is_proxy_dispatch` block — return the proxy's own class
+            // mirror rather than routing it through the handler.
+            if method_name == "getClass" && descriptor == "()Ljava/lang/Class;" {
+                let class_id = shared.mem.heap.class_id_of(proxy_ref);
+                let mirror = super::get_or_create_class_mirror(shared, class_id);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            return proxy_unbox_primitive_return(
+                shared,
+                descriptor,
+                proxy_invoke_handler_shared(
+                    shared,
+                    thread,
+                    proxy_ref,
+                    method_name,
+                    descriptor,
+                    &args[1..],
+                ),
+            );
         }
     }
 
@@ -25716,7 +25786,6 @@ mod tests {
     /// `docs/known-issues/vm/compact-layout-registry-is-process-global-20260805.md`
     /// — including two fixes that were tried and are NOT sufficient.
     #[test]
-    #[ignore = "documents an OPEN defect: the compact-layout registry is process-global but ClassIds are per-VM"]
     fn two_vms_must_not_share_a_compact_layout_for_the_same_class_id() {
         let vm_a = test_shared();
         let vm_b = test_shared();

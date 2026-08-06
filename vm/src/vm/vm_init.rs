@@ -1329,6 +1329,17 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+        // Bind the heap to THIS VM's compact-layout domain, here rather than
+        // later: the comment below is the reason — no object has been allocated
+        // and no class layout registered yet, so from this point on every
+        // allocation and every registration agree on who owns a `class_id`.
+        //
+        // `class_id` is a per-`ClassStore` index (`ClassId::new(classes.len())`)
+        // and the layout registry is process-global, so without this a second
+        // VM allocates its objects against the first VM's layouts and every
+        // field access on them is decoded with the wrong storage kinds and
+        // offsets.
+        heap.set_layout_domain(class_manager.class_store().layout_domain());
         let bootstrap_phase = BootstrapPhase::<Allocated>::begin();
 
         // --- Compressed oops -------------------------------------------------

@@ -388,8 +388,13 @@ fn emit_first_degradation_diag() {
     FIRST_DEGRADATION_DIAG.call_once(|| {
         eprintln!(
             "CompactValue: first long↔object NaN-box collision degraded to \
-             Value::Long (SUB_OBJECT-patterned primitive long reached a \
-             context-free decoder). Subsequent collisions are counted by \
+             Value::Long. The slot carries the SUB_OBJECT NaN-box pattern \
+             but its payload is not in the reference-provenance bitmap, which \
+             means EITHER a primitive long whose bits collide with the tag \
+             (harmless) OR a genuine reference whose payload was never \
+             recorded (NOT harmless: the degraded value takes LKIND_LONG, and \
+             Frame::scan_local_objects skips LONG slots, so the GC stops \
+             seeing the root). Subsequent collisions are counted by \
              object_degradation_count() but not logged."
         );
     });
@@ -514,6 +519,15 @@ impl CompactValue {
         if !object_payload_is_plausible(ptr) {
             Self::object_invalid_pointer(ptr);
         }
+        // A SUB_OBJECT slot is only decodable as a reference if its payload
+        // has crossed a reference-construction boundary in this process
+        // (`crate::value::object_ref_payload_is_known`). Encoding one here IS
+        // such a boundary: without this record, `to_value` / `decode_value`
+        // would later find the payload unknown and DEGRADE a live reference to
+        // `Value::Long` -- which also marks the slot `LKIND_LONG`, hiding it
+        // from `Frame::scan_local_objects`, so the GC reclaims a live object.
+        // See the module-level note above `object`.
+        crate::value::record_object_ref_payload((ptr & PAYLOAD_MASK) as *mut u8);
         Self(make_tagged(SUB_OBJECT, ptr & PAYLOAD_MASK))
     }
 
@@ -560,6 +574,15 @@ impl CompactValue {
         if !object_payload_is_plausible(ptr) {
             return None;
         }
+        // A SUB_OBJECT slot is only decodable as a reference if its payload
+        // has crossed a reference-construction boundary in this process
+        // (`crate::value::object_ref_payload_is_known`). Encoding one here IS
+        // such a boundary: without this record, `to_value` / `decode_value`
+        // would later find the payload unknown and DEGRADE a live reference to
+        // `Value::Long` -- which also marks the slot `LKIND_LONG`, hiding it
+        // from `Frame::scan_local_objects`, so the GC reclaims a live object.
+        // See the module-level note above `object`.
+        crate::value::record_object_ref_payload(ptr as *mut u8);
         Some(Self(make_tagged(SUB_OBJECT, ptr)))
     }
 
@@ -1217,6 +1240,15 @@ impl CompactValue {
         if !object_payload_is_plausible(new_ptr) {
             return Err(CompactValueError::InvalidObjectPointer { ptr: new_ptr });
         }
+        // A SUB_OBJECT slot is only decodable as a reference if its payload
+        // has crossed a reference-construction boundary in this process
+        // (`crate::value::object_ref_payload_is_known`). Encoding one here IS
+        // such a boundary: without this record, `to_value` / `decode_value`
+        // would later find the payload unknown and DEGRADE a live reference to
+        // `Value::Long` -- which also marks the slot `LKIND_LONG`, hiding it
+        // from `Frame::scan_local_objects`, so the GC reclaims a live object.
+        // See the module-level note above `object`.
+        crate::value::record_object_ref_payload((new_ptr & PAYLOAD_MASK) as *mut u8);
         self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
         Ok(())
     }
@@ -1251,6 +1283,15 @@ impl CompactValue {
                 "CompactValue::update_object_ptr_unchecked: pointer {:#x} is not a plausible heap object pointer",
                 new_ptr
             );
+                // A SUB_OBJECT slot is only decodable as a reference if its payload
+            // has crossed a reference-construction boundary in this process
+            // (`crate::value::object_ref_payload_is_known`). Encoding one here IS
+            // such a boundary: without this record, `to_value` / `decode_value`
+            // would later find the payload unknown and DEGRADE a live reference to
+            // `Value::Long` -- which also marks the slot `LKIND_LONG`, hiding it
+            // from `Frame::scan_local_objects`, so the GC reclaims a live object.
+            // See the module-level note above `object`.
+            crate::value::record_object_ref_payload((new_ptr & PAYLOAD_MASK) as *mut u8);
             self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
         }
     }
@@ -2844,6 +2885,73 @@ mod tests {
     /// the context-free `to_value`. `to_value_checked` with a heap predicate
     /// that rejects the address also degrades it back to the bit-exact long
     /// and counts the degradation.
+    /// Every SUB_OBJECT *encoder* must leave the payload decodable as a
+    /// reference by the context-free decoder.
+    ///
+    /// The provenance bitmap (`crate::value::object_ref_payload_is_known`) is
+    /// what `to_value` consults to tell a real reference from a primitive long
+    /// whose bits collide with the SUB_OBJECT NaN-box pattern. Before these
+    /// four encoders recorded, they could mint a slot their own decoder
+    /// refused: `to_value` degraded the live reference to `Value::Long`, the
+    /// interpreter then marked the local `LKIND_LONG`, and
+    /// `Frame::scan_local_objects` skips LONG slots -- so the young sweep
+    /// reclaimed an object a running frame still held. That is the
+    /// `ClassId(0)` / `"result" is null` family in
+    /// `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`; two
+    /// sites (`Frame::update_object_refs`, `ValueStack::update_object_refs`)
+    /// had already been hand-patched with a `ObjectRef::from_raw` round-trip
+    /// for exactly this reason, which is the symptom of a missing invariant
+    /// one level down.
+    ///
+    /// Addresses here are deliberately outside any test heap so the assertion
+    /// is about the ENCODER recording, not about some other test having
+    /// happened to touch the same 64-byte granule.
+    #[test]
+    fn every_sub_object_encoder_records_decodable_provenance_cv() {
+        let _guard = degrade_counter_test_lock();
+        let before = object_degradation_count();
+
+        // 1. `object(raw)` -- the raw-pointer constructor.
+        let a1 = 0x0000_5A5A_0001_0000u64;
+        assert!(
+            matches!(CompactValue::object(a1).to_value(), Value::Object(Some(o)) if o.as_ptr() as u64 == a1),
+            "object() minted a slot to_value() refuses",
+        );
+
+        // 2. `try_from_pointer(raw)` -- the fallible constructor.
+        let a2 = 0x0000_5A5A_0002_0000u64;
+        let cv2 = CompactValue::try_from_pointer(a2).expect("plausible payload");
+        assert!(
+            matches!(cv2.to_value(), Value::Object(Some(o)) if o.as_ptr() as u64 == a2),
+            "try_from_pointer() minted a slot to_value() refuses",
+        );
+
+        // 3. `update_object_ptr` -- the checked GC relocation writer.
+        let a3 = 0x0000_5A5A_0003_0000u64;
+        let mut cv3 = CompactValue::object(a1);
+        cv3.update_object_ptr(a3).expect("plausible payload");
+        assert!(
+            matches!(cv3.to_value(), Value::Object(Some(o)) if o.as_ptr() as u64 == a3),
+            "update_object_ptr() left a relocated reference undecodable",
+        );
+
+        // 4. `update_object_ptr_unchecked` -- the GC compaction hot path.
+        let a4 = 0x0000_5A5A_0004_0000u64;
+        let mut cv4 = CompactValue::object(a1);
+        cv4.update_object_ptr_unchecked(a4);
+        assert!(
+            matches!(cv4.to_value(), Value::Object(Some(o)) if o.as_ptr() as u64 == a4),
+            "update_object_ptr_unchecked() left a relocated reference undecodable",
+        );
+
+        // None of the eight decodes above may have counted a degradation.
+        assert_eq!(
+            object_degradation_count() - before,
+            0,
+            "an encoded reference degraded to Long",
+        );
+    }
+
     #[test]
     fn to_value_checked_degrades_fabricated_pointer_to_long() {
         let _guard = super::degrade_counter_test_lock();
