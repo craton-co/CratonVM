@@ -4357,7 +4357,9 @@ pub(crate) fn wrap_as_invocation_target_exception(
                 );
             };
             // Own the message so `re` is free again for the failure path below.
-            let message = message.map(str::to_string);
+            // `into_owned` covers both halves of the `Cow`: a borrowed message
+            // is copied out of `re`, a synthesised one is moved.
+            let message = message.map(|m| m.into_owned());
             let built = match &message {
                 Some(m) => {
                     let msg_obj = ctx.create_string(m);

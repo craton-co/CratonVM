@@ -53,5 +53,14 @@ case "$MOD" in
 esac
 
 CLS="$1"; shift
-cd "$MOD" && exec timeout "${HS_TO:-300}" /home/victor/jdk25/bin/java \
+# The Azure Linux host's JDK stays the default so existing invocations are
+# unchanged; `HS_JAVA` lets the same script point at a JDK installed somewhere
+# else. HotSpot IS the oracle for this suite, so it has to be runnable wherever
+# the comparison is being made.
+#
+# This is NOT enough to run the script on a Windows checkout: `CP` is joined
+# with `:`, which a Windows JVM reads as part of a drive letter rather than as a
+# separator, and the paths themselves are Git-Bash-style. Windows runs need
+# their own wrapper.
+cd "$MOD" && exec timeout "${HS_TO:-300}" "${HS_JAVA:-/home/victor/jdk25/bin/java}" \
   "${SPRING_JVM_ARGS[@]}" -Xshare:off "$@" -cp "$CP" KRun "$CLS"
