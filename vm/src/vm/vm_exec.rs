@@ -7489,6 +7489,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|bytes| bytes.to_vec())
     }
 
+    fn class_bytes_match_base(&self, class_id: ClassId, bytes: &[u8]) -> Option<bool> {
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_bytes_match_base(class_id, bytes)
+    }
+
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
         self.shared
             .classes

@@ -4,7 +4,7 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: the refused snapshot iterator and stream collector are fixed: HashMap$KeyItr/TreeSet$Itr fall back to a real Arrays$ArrayItr and the StreamCollector drain goes through Spliterators.iterator, retiring 17 sections. JdkOnlyPlatformProbe/*/vthreads stays baselined — it is the documented intermittent section and a first re-freeze landed on the rare run where the real arm matched, writing a baseline too tight to hold
+# note: PKCS12 setEntry fixed: JdkOnlyPlatformProbe security no longer diverges in either arm (p12=true)
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that
@@ -14,9 +14,7 @@ JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
 JdkOnlyBreadthProbe/strict/serialization
 JdkOnlyPlatformProbe/real/agent
 JdkOnlyPlatformProbe/real/jni
-JdkOnlyPlatformProbe/real/security
 JdkOnlyPlatformProbe/real/vthreads
 JdkOnlyPlatformProbe/strict/agent
 JdkOnlyPlatformProbe/strict/jni
-JdkOnlyPlatformProbe/strict/security
 JdkOnlyPlatformProbe/strict/vthreads

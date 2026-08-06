@@ -79,6 +79,99 @@ by the kernel on fault and again by the TLAB refill. `CompactHeader` exists
 (8-byte header) but pairs with 16-byte field slots, so `Node` would be 40 rather
 than 24 — it is not the answer here.
 
+## The JIT half: redundant stack traffic in inlined bodies
+
+The single-pass body emits pairs like this around the inlined `Node.<init>`:
+
+```
+ca7: mov [rbp-68h],rax
+cab: mov rax,[rbp-68h]     <- reload of the value already in rax
+caf: mov [rbp-80h],rax
+cb3: mov rax,[rbp-68h]     <- and the identical pair again
+cb7: mov [rbp-80h],rax
+```
+
+There is already a mechanism that removes exactly this — the `slot_mirror`
+reload elision in `x64/operand_stack.rs`, default ON. It did not fire because
+`try_emit_inline_site` **blanket-suppressed it for the whole duration of an
+inlined callee**, on the grounds that the callee's internal joins are invisible
+to the position rule (the main loop only invalidates at OUTER-method branch
+targets).
+
+The callee's joins are not actually invisible: `try_emit_inline_body` already
+computes `callee_branch_targets` for its own merge-point check. Invalidating
+the mirror there — the same rule the main loop applies at an outer branch
+target — lets the mechanism stay live across inlined bodies.
+`perf/inline-slot-mirror-branchless-20260806` does exactly that, and **it is
+not worth merging.** Measured, both arms built from the same base:
+
+| | `bottomUpTree` |
+|---|---|
+| suppression on (dev) | 692 instructions, `len=3874` |
+| suppression off | **690 instructions**, `len=3866` |
+
+**Two instructions.** All seven phase checksums identical, so it is correct — it
+just does almost nothing, while changing codegen in the path whose earlier
+mirror defect made H2 open every database with a null `ACCESS_MODE_DATA` (see
+the incident note on the main loop's second invalidation site). Two instructions
+does not justify re-entering that. The branch is left unmerged on purpose.
+
+It recovers so little because of the mirror's own rule: it requires the
+**immediately preceding emitted instruction** to have touched the same slot
+(exact buffer-position equality).
+
+```
+ca7: mov [rbp-68h],rax
+cab: mov rax,[rbp-68h]     <- elided: -68h is the live mirror
+caf: mov [rbp-80h],rax     <- mirror now describes -80h instead
+cb3: mov rax,[rbp-68h]     <- NOT elided, and this is the common shape
+cb7: mov [rbp-80h],rax
+```
+
+Removing the rest needs a real value tracker — "which slot does this register
+currently hold", invalidated on writes to the slot, writes to the register,
+calls and joins — not a one-entry position-equality mirror. That is a separate
+piece of work in which **every emit site that writes a GPR has to be audited**,
+which is precisely how the H2 bug happened.
+
+## Where the 690 instructions actually go
+
+```
+register spill stores [rbp-2xx]   99
+operand shuffling                 84
+shadow push / reload              69
+calls                             21
+```
+
+That is why a peephole cannot close this gap: the body is dominated by
+machinery, not by shuffling.
+
+**The largest inline item is the register spill, and its layout contradicts its
+own comment.** The leaf-allocation path — taken for every leaf `Node`, half of
+the 68M — runs a full 15-GPR spill into the SavedRegisters region *before* the
+inline TLAB bump:
+
+```
+15b: jg 0x3e8                  <- depth > 0 leaves for the recursive path
+161: mov [rbp-8],r12
+165: mov [rbp-260h],rax        <- 15 GPR stores, inline, on the fast path
+...
+1c0: mov [rbp-2C8h],r15
+1c7: mov rax,4                 <- safepoint id
+1e8: jne 0x275                 <- guard; its slow path is the helper call
+1ee..270:                      <- inline TLAB bump
+```
+
+The only emitter of a 16-GPR spill in the tree is `x64/deopt_stubs.rs:1345`,
+whose own comment says it is placed so that "the guard `JB` **reaches here**
+with every GPR still holding its trapping-instant value" — i.e. it is meant to
+sit behind a taken guard, not ahead of one.
+
+**Start here.** It is the largest inline cost in the hottest method, it has a
+single emitter, and the comment and the emitted layout disagree. Confirm with a
+taken-branch count before concluding, because being wrong about this one is a
+deopt correctness bug, not a slow benchmark.
+
 ## Things that were tried and are NOT the answer
 
 - **Tiering.** `bottomUpTree` never reaches the optimizing tier at the default
@@ -94,9 +187,35 @@ than 24 — it is not the answer here.
   duplication, but **G1 is not the default backend** — `CRATONVM_GC_STATS` says
   `backend=generational`. The memset share did not move (1.80% → 2.21%).
 
+## A third JIT item, not yet taken
+
+The prologue fetches the thread pointer **twice** on an external entry and
+still calls the helper once on a self-entry:
+
+```
+40: call rax    <- get_current_thread, for the SHADOW thread slot
+...
+84: mov r10,[rbp]              <- self-entry proven: inherit from caller frame
+8b: mov rax,[r10-28h]          <- jit_thread_slot
+92: mov [rbp-28h],rax
+96: mov rax,[r10-18h]          <- stack_floor_slot
+```
+
+`emit_prologue`'s self-cache-inherit block copies `jit_thread_slot_off` and
+`stack_floor_slot_off` out of the caller's same-layout frame when a direct
+self-call is proven — but the shadow-stack fetch above it is unconditional and
+wants the *same* `*mut JvmThread`. On a self-recursive method that publishes
+(so the fetch is not NOP'd out), that CALL runs on every invocation —
+68M times in `bottomUpTree`.
+
+Not done here because the fetch's byte range is what
+`maybe_nop_out_shadow_fetch` erases, so splitting it into inherited and fetched
+paths means teaching the erase about both. Worth doing; it is prologue surgery,
+not a peephole.
+
 ## If you pick this up
 
-The two levers are structural and both are large:
+The two structural levers are large:
 
 1. **Make moving-young stop falling back** on multi-method JIT stacks. Unlocks
    the 11% already being paid, and turns the 8g collection from a ~410 ms

@@ -586,12 +586,40 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             let ob = original_class_bytes(ctx, class_id);
             eprintln!("[RETRANSFORM]   [{i}] {nm} original_bytes={}", ob.len());
         }
-        // Look up the original bytes via the application classpath
-        // resource finder using `<name>.class` — we always cache them
-        // under that path on define. For real hidden classes / proxy
-        // classes this fails and we fall back to an empty buffer; the
-        // transformer is still given a chance to swap in fresh bytes.
+        // The JVMTI retransformation base: the class-bytes cache first (the
+        // only source that knows dynamically-defined, hidden and
+        // agent-redefined classes), then `<name>.class` off the classpath if
+        // the cache's soft cap evicted it.
         let original = original_class_bytes(ctx, class_id);
+        // No trustworthy base, no retransformation.
+        //
+        // `original_class_bytes` returns empty for three reasons — the byte
+        // cache evicted the class and no classpath resource matched, the
+        // resource that matched defines a different class, or it is not a
+        // parseable class file — and its own contract says an empty result
+        // "makes `native_retransform_classes0` skip the class, which is the
+        // safe outcome". It did not: the chain below ran anyway and every
+        // registered transformer was handed a **zero-length `byte[]`** as the
+        // class file. ASM's `ClassReader` reads the header off that array
+        // unconditionally, so Mockito's inline mock maker surfaced the skip as
+        // `java.lang.ArrayIndexOutOfBoundsException` thrown from inside mock
+        // creation — a face that reads like a broken agent rather than a cache
+        // miss, and one this VM has been seen producing
+        // (`infinispan-configurationbuilder-retransform-verify-20260805`).
+        //
+        // JVMTI has no notion of retransforming from nothing: a transformer's
+        // `classfileBuffer` is defined to be the class file bytes. Skipping
+        // leaves the class as it is — the mock silently fails to intercept,
+        // which is what the previous behaviour achieved anyway, minus the
+        // spurious exception.
+        if original.is_empty() {
+            tracing::warn!(
+                "retransformClasses0: no retransformation base for `{}`; skipping \
+                 (see the preceding diagnostic for which of the three reasons applied)",
+                ctx.class_name_of_id(class_id).unwrap_or_default(),
+            );
+            continue;
+        }
         // `retransformClasses` starts from the original class file.  Keep the
         // live method metadata in that same state while Java transformers run:
         // Byte Buddy combines the supplied bytes with reflection over
@@ -603,11 +631,9 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // final transformed swap below still has the required JVMTI base for a
         // future retransformation.  Both swaps preserve class identity and do
         // not run initializers.
-        if !original.is_empty() {
-            if let Err(msg) = ctx.retransform_class(class_id, &original) {
-                tracing::warn!("retransformClasses0: could not restore original bytes: {msg}");
-                continue;
-            }
+        if let Err(msg) = ctx.retransform_class(class_id, &original) {
+            tracing::warn!("retransformClasses0: could not restore original bytes: {msg}");
+            continue;
         }
         let final_bytes = run_transformer_chain(
             ctx,
@@ -1069,6 +1095,25 @@ fn run_chain_over_bytes(
     if rust_chain.is_empty() {
         return initial_bytes.to_vec();
     }
+    // A transformer's `classfileBuffer` is defined by JVMTI to be the class
+    // file bytes; there is no "transform from nothing". Handing a registered
+    // transformer a zero-length `byte[]` is not a no-op — ASM's `ClassReader`
+    // reads the header off it unconditionally, so ByteBuddy raises
+    // `ArrayIndexOutOfBoundsException` and Mockito's inline mock maker
+    // re-throws it from inside mock creation, where it reads as a broken agent
+    // rather than the missing retransformation base it actually is.
+    //
+    // This is the funnel, not just the `retransformClasses0` caller: every path
+    // that reaches a Java transformer — retransform, redefine, and the
+    // load-time hook — goes through here, so the invariant holds even if a
+    // future caller forgets it.
+    if initial_bytes.is_empty() {
+        tracing::debug!(
+            "transformer chain: no class file bytes to transform for `{class_name_str}`; \
+             skipping the chain rather than presenting an empty buffer"
+        );
+        return Vec::new();
+    }
     // Resolve constants used on every iteration once.
     //
     // All three live across `alloc_byte_array` and the `transform` call below,
@@ -1267,47 +1312,130 @@ fn original_class_bytes(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<u8> {
     // define_class_with_options call). This is the only path that finds
     // dynamically-defined / hidden / agent-redefined classes; the
     // classpath find_resource path only sees on-disk class files.
-    if let Some(bytes) = ctx.class_bytes(class_id) {
-        if !bytes.is_empty() {
-            return bytes;
-        }
-    }
+    let cached = ctx.class_bytes(class_id).filter(|b| !b.is_empty());
     let name = match ctx.class_name_of_id(class_id) {
         Some(n) => n,
-        None => return Vec::new(),
+        None => {
+            tracing::debug!("retransform: class id {class_id:?} has no name; skipping");
+            return Vec::new();
+        }
     };
     let resource = format!("{name}.class");
-    let fallback = ctx.find_resource(&resource).unwrap_or_default();
-    if fallback.is_empty() {
-        tracing::debug!(
-            "retransform: no original bytes for `{name}` \
-             (class_bytes_cache miss and no `{resource}` on the classpath); skipping"
-        );
-        return Vec::new();
-    }
-    match class_file_this_class(&fallback) {
-        Some(found) if found == name => {
-            tracing::debug!(
-                "retransform: `{name}` bytes came from the classpath, not the \
-                 class_bytes_cache (16 MiB FIFO cap — likely evicted)"
-            );
-            fallback
+    // Only consulted when the cache missed — `find_resource` walks jars.
+    let fallback = if cached.is_some() {
+        None
+    } else {
+        ctx.find_resource(&resource).filter(|b| !b.is_empty())
+    };
+    // `None` when the VM recorded no fingerprint for this class (synthetic
+    // stub), which the adjudicator reads as "cannot tell" rather than "wrong".
+    let fallback_matches_base = fallback
+        .as_deref()
+        .and_then(|bytes| ctx.class_bytes_match_base(class_id, bytes));
+
+    match adjudicate_retransform_base(&name, cached, fallback, fallback_matches_base) {
+        Ok(bytes) => bytes,
+        Err(refusal) => {
+            refusal.log(&name, &resource);
+            Vec::new()
         }
-        Some(found) => {
-            tracing::warn!(
+    }
+}
+
+/// Why a class has no usable JVMTI retransformation base.
+///
+/// Split out from [`original_class_bytes`] so the policy can be exercised
+/// without a `NativeContext`: every arm here is a decision about bytes, and the
+/// only reason it used to be untestable was that it was interleaved with four
+/// trait calls.
+#[derive(Debug, PartialEq, Eq)]
+enum RetransformBaseRefusal {
+    /// Cache evicted and no `<name>.class` anywhere on the classpath.
+    NotFound,
+    /// The classpath resource parses, but defines some other class (a shaded
+    /// jar, or a second loader's copy under a different package).
+    DefinesOtherClass(String),
+    /// The classpath resource defines the right *name* but is not the class
+    /// file this class was defined from — a different build. See
+    /// `ClassManager::class_bytes_base_digest`.
+    DifferentBuild(usize),
+    /// The classpath resource is not a parseable class file at all.
+    Unparseable,
+}
+
+impl RetransformBaseRefusal {
+    fn log(&self, name: &str, resource: &str) {
+        match self {
+            RetransformBaseRefusal::NotFound => tracing::debug!(
+                "retransform: no original bytes for `{name}` \
+                 (class_bytes_cache miss and no `{resource}` on the classpath); skipping"
+            ),
+            RetransformBaseRefusal::DefinesOtherClass(found) => tracing::warn!(
                 "retransform: refusing to seed `{name}` from classpath resource \
                  `{resource}` — those bytes define `{found}`. Seeding the \
                  transformer chain with a different class would install a wrong \
                  class body. Skipping this retransform."
-            );
-            Vec::new()
-        }
-        None => {
-            tracing::warn!(
+            ),
+            RetransformBaseRefusal::DifferentBuild(len) => tracing::warn!(
+                "retransform: refusing to seed `{name}` from classpath resource \
+                 `{resource}` — those {len} bytes are a different build of `{name}` \
+                 than the one this class was defined from. The class was almost \
+                 certainly defined by a loader that does not resolve to the \
+                 application classpath. Skipping this retransform."
+            ),
+            RetransformBaseRefusal::Unparseable => tracing::warn!(
                 "retransform: refusing to seed `{name}` from classpath resource \
                  `{resource}` — not a parseable class file. Skipping."
+            ),
+        }
+    }
+}
+
+/// Decide what a `retransformClasses` call may use as its base for `name`.
+///
+/// * `cached` — the class-bytes cache entry, when it survived eviction. This is
+///   the authoritative answer and needs no adjudication: it *is* what the class
+///   was defined from.
+/// * `fallback` — `<name>.class` re-read off the classpath because the cache
+///   missed. `find_resource` searches bootstrap → extension → application and
+///   never consults the class's defining loader, so these bytes are a guess.
+/// * `fallback_matches_base` — whether `fallback` fingerprint-matches the class
+///   file this class was actually defined from. `None` = the VM recorded no
+///   fingerprint and cannot tell.
+///
+/// The `Some(false)` arm is the one the name check could not make. A shaded jar
+/// under a *different* package is caught by `this_class`; **a different build of
+/// the same class is not**, and Spring Boot's test infrastructure produces that
+/// state routinely by defining classes through `ModifiedClassPathClassLoader` /
+/// `FilteredClassLoader` / per-test `URLClassLoader`s while a different version
+/// of the same coordinate sits on the application classpath. Weaving build A's
+/// method bodies and installing them over live build B is a silently wrong class
+/// definition — exactly what the `DefinesOtherClass` arm already exists to
+/// prevent, with a quieter face.
+fn adjudicate_retransform_base(
+    name: &str,
+    cached: Option<Vec<u8>>,
+    fallback: Option<Vec<u8>>,
+    fallback_matches_base: Option<bool>,
+) -> Result<Vec<u8>, RetransformBaseRefusal> {
+    if let Some(bytes) = cached {
+        return Ok(bytes);
+    }
+    let Some(fallback) = fallback else {
+        return Err(RetransformBaseRefusal::NotFound);
+    };
+    match class_file_this_class(&fallback) {
+        None => Err(RetransformBaseRefusal::Unparseable),
+        Some(found) if found != name => Err(RetransformBaseRefusal::DefinesOtherClass(found)),
+        Some(_) => {
+            if fallback_matches_base == Some(false) {
+                return Err(RetransformBaseRefusal::DifferentBuild(fallback.len()));
+            }
+            tracing::debug!(
+                "retransform: `{name}` bytes came from the classpath, not the \
+                 class_bytes_cache (16 MiB FIFO cap — likely evicted)"
             );
-            Vec::new()
+            Ok(fallback)
         }
     }
 }
@@ -2518,6 +2646,120 @@ mod tests {
             found, wanted,
             "a shadowed resource must not be mistaken for the requested class"
         );
+    }
+
+    // ---- Retransformation base adjudication --------------------------------
+    //
+    // `adjudicate_retransform_base` is the whole policy `original_class_bytes`
+    // applies once it has gathered its four inputs. Driving it directly is the
+    // only way to test the version-skew arm: producing the state for real needs
+    // two builds of one class, a user-defined loader, and 16 MiB of class bytes
+    // loaded in between to evict the cache.
+
+    /// A class file that is a *different build of the same class*: same
+    /// `this_class`, different bytes. Achieved by appending a trailing
+    /// attribute-shaped tail, which `class_file_this_class` (a header-only
+    /// walker) neither reads nor cares about — which is precisely why the name
+    /// check cannot tell the two apart.
+    fn other_build_of(name: &str) -> Vec<u8> {
+        let mut b = minimal_class_file(name);
+        b.extend_from_slice(&[0u8; 32]);
+        b
+    }
+
+    #[test]
+    fn retransform_base_prefers_the_cached_bytes() {
+        let cached = minimal_class_file("com/foo/Bar");
+        let got = adjudicate_retransform_base(
+            "com/foo/Bar",
+            Some(cached.clone()),
+            // A fallback is never even consulted when the cache hit — including
+            // its digest verdict, which here says "wrong".
+            Some(other_build_of("com/foo/Bar")),
+            Some(false),
+        );
+        assert_eq!(got.as_deref(), Ok(&cached[..]));
+    }
+
+    #[test]
+    fn retransform_base_accepts_a_matching_classpath_fallback() {
+        let bytes = minimal_class_file("com/foo/Bar");
+        let got =
+            adjudicate_retransform_base("com/foo/Bar", None, Some(bytes.clone()), Some(true));
+        assert_eq!(got.as_deref(), Ok(&bytes[..]));
+    }
+
+    #[test]
+    fn retransform_base_accepts_a_fallback_the_vm_cannot_adjudicate() {
+        // `None` = no fingerprint recorded (synthetic stub). Unchanged from the
+        // pre-fingerprint behaviour: the name check is all we have, so use it.
+        let bytes = minimal_class_file("com/foo/Bar");
+        let got = adjudicate_retransform_base("com/foo/Bar", None, Some(bytes.clone()), None);
+        assert_eq!(got.as_deref(), Ok(&bytes[..]));
+    }
+
+    #[test]
+    fn retransform_base_refuses_a_different_build_of_the_same_class() {
+        // THE REGRESSION. Before the fingerprint check these bytes were
+        // accepted — `this_class` says `com/foo/Bar` and that was the entire
+        // test — and the transformer wove a class body that was then installed
+        // over a live class it did not come from. The state arises whenever a
+        // class is defined through a loader that does not resolve to the
+        // application classpath (Spring Boot's `ModifiedClassPathClassLoader`,
+        // `FilteredClassLoader`, per-test `URLClassLoader`s) while a different
+        // build of the same coordinate sits on that classpath, and the 16 MiB
+        // class-bytes cache has since evicted the real base.
+        let got = adjudicate_retransform_base(
+            "com/foo/Bar",
+            None,
+            Some(other_build_of("com/foo/Bar")),
+            Some(false),
+        );
+        assert_eq!(
+            got,
+            Err(RetransformBaseRefusal::DifferentBuild(
+                other_build_of("com/foo/Bar").len()
+            )),
+            "a same-named class file from a different build must not seed a retransform"
+        );
+    }
+
+    #[test]
+    fn retransform_base_refuses_a_resource_defining_another_class() {
+        let got = adjudicate_retransform_base(
+            "com/foo/Bar",
+            None,
+            Some(minimal_class_file("shaded/com/foo/Bar")),
+            Some(true),
+        );
+        assert_eq!(
+            got,
+            Err(RetransformBaseRefusal::DefinesOtherClass(
+                "shaded/com/foo/Bar".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn retransform_base_refuses_an_unparseable_resource() {
+        let got = adjudicate_retransform_base(
+            "com/foo/Bar",
+            None,
+            Some(b"PK\x03\x04 this is a jar, not a class".to_vec()),
+            None,
+        );
+        assert_eq!(got, Err(RetransformBaseRefusal::Unparseable));
+    }
+
+    #[test]
+    fn retransform_base_refuses_when_nothing_was_found() {
+        // The arm that used to be a silent `Vec::new()` the CALLER then handed
+        // to every registered transformer as a zero-length `byte[]`. Nothing
+        // here can prove the caller now skips — `run_transformer_chain`'s own
+        // empty-buffer guard does that — but the refusal must at least be
+        // distinguishable from "here are your bytes".
+        let got = adjudicate_retransform_base("com/foo/Bar", None, None, None);
+        assert_eq!(got, Err(RetransformBaseRefusal::NotFound));
     }
 
     // -----------------------------------------------------------------------
