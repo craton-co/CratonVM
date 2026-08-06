@@ -16,6 +16,55 @@ now publishes the policy), §12 (all three documentation gaps are closed) and
 §13 (three of five stale doc paths remain, and the count is per-occurrence not
 per-path).
 
+## 2026-08-06 status
+
+Five sections touched. Two audits produced verdicts, one section produced a
+real defect, one had a stale prescription still live in the code, and one
+record's own count was 39% low.
+
+* **§9 — a DEFECT, fixed.** The record frames this as "replace the name lists
+  with `NativeKind`", a wave-2 refactor. Underneath it was a live bug: the call
+  site open-coded `reflection && string_builder && path`, which is
+  `redefine_immune_forced_native` **minus five arms** — `jfr`,
+  `bc_crypto_math`, `stamped_lock`, the `FileHandler` group and
+  `synthetic_collection`. A redefined `java/util/HashMap` reaching it ran real
+  JDK bytecode against a CratonVM synthetic object. Collapsed onto the
+  aggregate.
+  Also: the record says "the three `redefine_immune_*` predicates". There are
+  **seven**, and this site named three of them.
+  The gate that exists to catch exactly this (`layout_immunity_is_not_open_coded`)
+  could not see it: it `include_str!`s `native_override.rs` and polices one
+  file, while the aggregators are `pub(super)` and every sibling can name an
+  arm. It now scans the siblings. That is a **fifth** staleness mode for that
+  gate, after the four its own comment lists.
+* **§5 — the retraction never reached the code.** This page retracted the
+  policy-qualified-memo prescription on 2026-08-04, but the marker in
+  `jit-api/src/lib.rs` still carried it verbatim, so the next reader would have
+  implemented it. Marker rewritten. Re-verified: the function takes three
+  `&str`, and its body is **2,230 lines** (`native_override.rs` 2406–4636), not
+  the ~1,400 the marker claimed.
+* **§3 — the unaudited half is now a verdict, not an unknown.** Both functions
+  walked arm by arm. `jit_invoke_dispatch` (`helpers.rs` 8788–9696) and
+  `jit_invoke_virtual_mic` (11377–12383) route **every** native exit through
+  `admit_jit_fast_native{,_resolved}` and count it — except
+  `matcher_native_callback_uncached` (11729), the residual already named here.
+  No new gap. §3 item 1 can be read as closed apart from that one leaf.
+* **§10 — verified NOT a live defect.** Both hard-coded `compat_native_wins =
+  true` sites are faithful to the pre-§7 behaviour they replaced:
+  `resolve_native_dispatch_wave1` uses the flag only to choose between "site
+  preferred bytecode" and the kind-based ladder, and neither site ever
+  preferred bytecode. The `NativeShadowsBytecode` observation these sites need
+  is still recorded, by the `Bridge if bytecode_available` arm. Genuinely a
+  deferred cleanup contingent on unifying the two forced-native lists, as the
+  record says — not something running wrong today.
+* **§11 — the count is stale and low.** Filed as 217 disjuncts over ~2,650
+  lines (17595–20244). Measured 2026-08-06: **302** disjuncts, 19668–22292. The
+  item is unchanged in kind, but anyone scoping the deletion from this page
+  would plan against a number 39% too small.
+
+**Still open and untouched by this pass:** §1, §2, §4, §6, §7, §8, and the bulk
+of §11. §3's Matcher-leaf residual is unchanged.
+
 ## 2026-08-04 status
 
 * **§5 — RETRACTED.** Its premise does not hold: the memo is mode-independent.

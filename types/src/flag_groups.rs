@@ -931,6 +931,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "mirror-pin-young-defer", on_key: None, off_key: Some("CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER"), off_word: None },
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
+    // Resolving the innermost JIT frame's own method from the direct CALL that
+    // built it, instead of giving up whenever that method is not the chain
+    // entry's. Presence-parsed opt-out, so `=0` still disables it and
+    // `off_word` must stay `None`.
+    E { group: Group::GC, token: "innermost-callee-resolve", on_key: None, off_key: Some("CRATONVM_GC_NO_CALLEE_RESOLVE"), off_word: None },
     E { group: Group::GC, token: "old-interior-pins", on_key: None, off_key: Some("CRATONVM_GC_NO_OLD_INTERIOR_PINS"), off_word: None },
     E { group: Group::GC, token: "oldgen-coalesce", on_key: None, off_key: Some("CRATONVM_NO_OLDGEN_COALESCE"), off_word: None },
     E { group: Group::GC, token: "oldgen-compact", on_key: Some("CRATONVM_OLDGEN_COMPACT"), off_key: None, off_word: None },
