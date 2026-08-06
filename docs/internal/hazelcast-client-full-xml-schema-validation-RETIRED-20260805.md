@@ -165,14 +165,41 @@ evidence.
   came back verdict-less during a load-100 window and were re-run at load ~15;
   the blanks fell on both arms, so they were host noise, not a signal.
 
-### Attribution warning for the residual sweep
+### The residual sweep, and what it does NOT show
 
-The 2026-08-05 full-suite table records 39 FAIL / 4 HANG / 2 CRASH, and many of
-those classes pass on a binary carrying this fix. **That table is not a control
-for this change.** It was produced by a binary that predates several
+All 42 classes the 2026-08-05 full suite scored FAIL / CRASH / BOTH-FAIL were
+re-run on a binary carrying this fix, and 39 of them passed. **That number is
+not this commit's.** The 08-05 table was produced by a binary predating several
 intervening fixes — the recycled-`JitInvokeInfo` family (`383e7f5cf`,
 `9d0636e73`) and the annotation-`Class`-element cluster among them — so a flip
-against it attributes to "everything since 08-05", not to this commit. The only
-valid baseline is a binary carrying every one of those and lacking only the
-void-return write.
+against it attributes to "everything since 08-05".
+
+Re-run against the real control (`/tmp/cvm-hzic4`: every one of those fixes,
+lacking only the void-return write):
+
+| | pre-fix | fixed |
+|---|---|---|
+| PASS | 39 | 41 |
+| FAIL | 2 | 1 |
+| no verdict | 1 | 0 |
+
+**The only class that differs between the two arms is
+`HazelcastAutoConfigurationClientTests`** — `tests=0` on pre-fix, 12/12 on
+fixed.
+
+The three cells that needed a second pass, all re-run paired at load ~6:
+
+* `RabbitAutoConfigurationTests` — PASS 78/78 on both. Its first verdict-less
+  POST result was the load-90 window, not a regression.
+* `ConfigurationPropertySourcesTests` — PASS 11/11 on the fixed binary; the
+  pre-fix binary produced no verdict on either attempt, so this one is
+  unscoreable rather than an improvement. Counted as neither.
+* `NettyReactiveWebServerFactoryTests` — FAIL on both, and its failure MODE
+  varies between runs (`tests=36 failed=1` once, `tests=0 containersFailed=1`
+  the next). Red on both arms either way: a separate residual.
+
+So this change closes the class the page named. The defect it removes is
+VM-wide and latent in every void method the optimizing tier compiles, but this
+42-class sample does not demonstrate a second victim — do not cite it as if it
+did.
 

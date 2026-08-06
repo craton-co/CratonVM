@@ -237,6 +237,15 @@ thread_local! {
     static UNREG_JIT_MEMO: std::cell::Cell<UnregMemo> =
         const { std::cell::Cell::new(UnregMemo::new()) };
 
+    /// H2-CID0 (2026-08-06) — is the NEXT unregistered-frame scan on this thread
+    /// one a collector will actually consume?
+    ///
+    /// Set by `invalidate_scan_cache_for_gc` (the four GC-authoritative sites)
+    /// and cleared by the scan that follows. Only the audit reads it, and only
+    /// to attribute a suppression to the path where suppression is a defect
+    /// rather than the intended optimisation.
+    static UNREG_JIT_AUTHORITATIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
 
 }
 
@@ -1207,6 +1216,10 @@ pub fn note_jit_boundary() {
 #[inline]
 pub fn invalidate_scan_cache_for_gc() {
     note_jit_boundary();
+    // Mark the following scan as one a collector will consume, so the audit can
+    // attribute a suppression to the path where it is a defect. Set even when
+    // the reset is disabled — that is exactly the arm whose count we want.
+    UNREG_JIT_AUTHORITATIVE.with(|c| c.set(true));
     if unreg_memo_gc_reset_enabled() {
         UNREG_JIT_MEMO.with(|c| c.set(UnregMemo::new()));
     }
@@ -1266,6 +1279,17 @@ pub static UNREG_MEMO_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 /// Times the memo short-circuited a scan at all (the audit's denominator — a
 /// zero numerator is only meaningful beside a non-zero denominator).
 pub static UNREG_MEMO_SHORTCIRCUITS: AtomicUsize = AtomicUsize::new(0);
+/// H2-CID0 (2026-08-06) — suppressions on a scan a collector CONSUMES.
+///
+/// The number that judges the fix. Total suppressions are dominated by
+/// ordinary per-native-call snapshots, which the memo is supposed to
+/// short-circuit and which no collector marks from; a suppression there is the
+/// optimisation working. A suppression HERE is a live JIT frame's oops missing
+/// from the root set a collection is about to use.
+///
+/// Expected exactly 0 with the authoritative reset enabled, and that is a
+/// measurement of "impossible by construction", not a restatement of it.
+pub static UNREG_MEMO_SUPPRESSED_AUTHORITATIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// `CRATONVM_DBG_UNREG_MEMO_AUDIT=1` — verify the memo instead of trusting it.
 ///
@@ -2914,6 +2938,9 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                 d
             });
             let already_clean = decision == UnregScan::AlreadyClean;
+            // Consume the authoritative marker: this scan is the one the
+            // preceding `invalidate_scan_cache_for_gc` was announcing.
+            let authoritative = UNREG_JIT_AUTHORITATIVE.with(|c| c.replace(false));
             if already_clean && dbg_unreg_memo_audit() {
                 // Pure observer: scan the range the memo just vouched for and
                 // count the disagreement. Marks nothing, decides nothing.
@@ -2921,6 +2948,11 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                 let high = current_thread_stack_high();
                 if high > search_lo && native_stack_has_jit_frame(search_lo, high).is_some() {
                     UNREG_MEMO_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                    if authoritative {
+                        // A live JIT frame's oops are missing from a root set a
+                        // collection is about to mark from. This is the defect.
+                        UNREG_MEMO_SUPPRESSED_AUTHORITATIVE.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             if !already_clean {

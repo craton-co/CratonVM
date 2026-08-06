@@ -255,10 +255,15 @@ it fails identically on a pristine `origin/dev` worktree at the same tip
 (`Logger.getName` returns a non-string). Recorded here rather than left for the
 next person to bisect.
 
-Two Windows-only test failures that WERE fixed here, both pre-existing on dev
+Two Windows-only test failures were fixed on the way, both pre-existing on dev
 and both the same shape — a source-witness test searching LF needles in a CRLF
 checkout: `lang_class.rs`'s `the_populator_writes_no_raw_slot_indices` and
-`native_override.rs`'s `layout_immunity_is_not_open_coded`.
+`native_override.rs`'s `layout_immunity_is_not_open_coded`. **A third session
+fixed the identical pair the same day** (`include_str!(..).replace("\r\n",
+"\n")`, same two files), so the landed change is theirs and this branch carries
+none of it. Three independent sessions on 2026-08-05 hit CRLF-sensitive source
+witnesses and buffer bounds checks — that clustering is itself a signal about
+where this repo's untested seams are.
 
 ## What is deliberately NOT fixed here
 

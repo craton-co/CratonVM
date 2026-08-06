@@ -23543,19 +23543,21 @@ mod protection_domain_layout_tests {
     /// damage — an ordering dependency invisible at the call site.
     #[test]
     fn the_populator_writes_no_raw_slot_indices() {
-        // Normalise line endings before searching. The needles below are
-        // LF-shaped, and this file is checked out with CRLF on Windows — where
-        // `find("\n}\n")` matched nothing and this test panicked with
-        // "function body must terminate" for every Windows contributor,
-        // reporting a source-layout problem that did not exist.
+        // The `\r` strip is load-bearing, not tidiness. `include_str!` embeds
+        // the file's RAW bytes, and this repository is checked out with CRLF on
+        // Windows (`core.autocrlf=true`). A `}` line is then `\r\n}\r\n`, so the
+        // `"\n}\n"` terminator below matches NOTHING: the `.expect` fired and
+        // this test failed with "function body must terminate" — a false
+        // failure that says nothing about the invariant it polices, on every
+        // Windows checkout. Normalise once so the gate asks the same question
+        // on CRLF and LF. Same fix, same reason, as `jit::ir_lower`'s
+        // `declared_op_variants` and `vm::runtime::env_cache`'s flags scan.
         let src = include_str!("lang_class.rs").replace("\r\n", "\n");
         let start = src
             .find("pub(crate) fn populate_protection_domain_fields")
             .expect("populate_protection_domain_fields must exist");
         let body = &src[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("function body must terminate");
+        let end = body.find("\n}\n").expect("function body must terminate");
         let body = &body[..end];
         assert!(
             body.contains("set_field_by_name(pd, \"codesource\""),
