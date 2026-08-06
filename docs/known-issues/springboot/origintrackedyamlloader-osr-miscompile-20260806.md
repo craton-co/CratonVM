@@ -3,8 +3,8 @@
 **Status: OPEN, and NOT REPRODUCIBLE.** No fix, no attribution, no commit.
 
 Split out of `loader-zip-jit-only-failure-cluster-20260804.md` on 2026-08-06,
-which is otherwise closed and now lives at
-[`internal/fixed-suite-bugs/springboot/loader-zip-jit-only-failure-cluster-FIXED-20260806.md`](../../internal/fixed-suite-bugs/springboot/loader-zip-jit-only-failure-cluster-FIXED-20260806.md).
+which is otherwise closed and retired to the internal tree as
+`fixed-suite-bugs/springboot/loader-zip-jit-only-failure-cluster-FIXED-20260806.md`.
 That page's other three items are fixed; dragging them along made this one look
 like part of a solved cluster when it is the only thing still open.
 
@@ -52,8 +52,8 @@ do. `CRATONVM_JIT_LOCAL_REGS=<n>` now truncates that pool on any host:
 
 And `CRATONVM_DBG_OSR_SEED_COLLISION=1`, which checks both OSR entry-seed
 invariants over the published metadata and is verified to go red on a real
-miscompile
-([`osr-seed-invariants-instrumented-20260806`](../../internal/fixed-suite-bugs/jit/osr-seed-invariants-instrumented-20260806.md)):
+miscompile (internal:
+`fixed-suite-bugs/jit/osr-seed-invariants-instrumented-20260806.md`):
 
 * **1038 takeable OSR entries across 234 methods, zero violations** of either
   invariant, at 7 registers and at 3.
