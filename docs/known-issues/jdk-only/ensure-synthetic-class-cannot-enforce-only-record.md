@@ -130,7 +130,11 @@ error.
 > iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
 > own iterator, which reads only the `Object[]` it was given. All six sections
 > are fixed; see
-> `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`. The rule is
+> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
+> (retired from this directory 2026-08-06, once its fifth class — the
+> `System.Logger` one, which had taken out every `ObjectInputStream`
+> construction — landed on a real `jdk.internal.logger.SimpleConsoleLogger`).
+> The rule is
 > narrower than "delegates vs reads its own fields": what matters is whether
 > SOME real class exists whose fields we can legitimately fill, not whether the
 > obvious one can.

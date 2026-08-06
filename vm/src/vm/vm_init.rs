@@ -5645,6 +5645,11 @@ pub struct JdkOnlyRefusalCounts {
     /// each of these into an `interpreter_bytecode_preferred` instead. Distinct
     /// triples appear in sink 2 tagged `bridge-ran-over-bytecode`. It is
     /// deliberately excluded from [`Self::total`], which counts refusals.
+    ///
+    /// **The one field here that is a FLOOR rather than exact.** Discovering a
+    /// shadow costs a hierarchy walk, so the walk stops once the triple is
+    /// recorded and stops entirely once sink 2 saturates — see
+    /// `crate::vm::jdk_only_native_shadow_unenforced`. Quote it as "at least".
     pub interpreter_shadow_unenforced: u64,
 }
 

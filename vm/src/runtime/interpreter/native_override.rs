@@ -6973,10 +6973,13 @@ pub(super) fn resolve_step1_native(
     //   named blocker families.
     let strict_bridge = policy.is_jdk_only() && kind == cratonvm_native_api::NativeKind::Bridge;
     let enforce = strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow();
-    // When the shadow is only being observed, the walk is worth doing exactly
-    // once per triple: the sink dedups, so a second walk buys nothing. When it
-    // is being enforced the answer is a dispatch input and must be current, so
-    // the walk runs every time.
+    // When the shadow is only being observed, the walk is worth doing at most
+    // once per triple — the sink dedups, so a second walk buys nothing — and
+    // not at all once the sink saturates, since it can no longer learn a new
+    // one. That is what makes `interpreter_shadow_unenforced` a floor rather
+    // than an exact count, stated where it is read. When the shadow is being
+    // ENFORCED the answer is a dispatch input and must be current, so the walk
+    // runs every time.
     let ask = strict_bridge
         && (enforce
             || !crate::vm::jdk_only_shadow_already_observed(

@@ -215,6 +215,10 @@ static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
 /// bytecode", and they are opposite facts about the same triple. Folding them
 /// would make `interpreter_bytecode_preferred` report shadows it did not
 /// prevent, which is the exact blindness this pair exists to remove.
+///
+/// **A floor, not an exact count**, unlike every other counter in this file —
+/// see [`jdk_only_native_shadow_unenforced`] for why, and say "floor" wherever
+/// it is quoted.
 static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -276,8 +280,22 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
     JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Exact number of times a `Bridge` dispatched in front of concrete bytecode
-/// under `JdkOnly` — §1.4's shadow observed but not enforced.
+/// How many times a `Bridge` dispatched in front of concrete bytecode under
+/// `JdkOnly` — §1.4's shadow observed but not enforced.
+///
+/// **A FLOOR, not an exact count**, and the one counter here that is. Finding a
+/// shadow costs a class-manager read lock and a hierarchy walk, so step 1 only
+/// pays it while the answer can still teach something: once a triple is in the
+/// observation sink the walk is skipped, and once the sink SATURATES (256 rows,
+/// shared with `interpreter_bytecode_preferred`'s) it is skipped for every
+/// triple and this stops advancing. A workload that saturates the sink — the
+/// three strict probes all do — has more shadows than this reports, and the
+/// `bridge-ran-over-bytecode` rows in `violations[]` are the identities.
+///
+/// The alternative, walking on every strict `Bridge` dispatch forever to keep
+/// the number exact, buys an exact count of something already known to be large
+/// and pays for it on the hottest path in strict mode. The identities are what
+/// the migration needs; the magnitude only has to be non-zero.
 ///
 /// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
 /// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
