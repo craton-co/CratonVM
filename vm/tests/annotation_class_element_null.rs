@@ -184,8 +184,27 @@ fn unresolvable_contained_annotation_type_never_surfaces_as_a_null_type() {
         return;
     };
     assert!(
-        stdout.contains("GONE-SUMMARY: nullTypes=0"),
-        "an unresolvable contained annotation type surfaced with a null \
-         annotationType().\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        stdout.contains("GONE-SUMMARY: nullTypes=0 nonAnnotations=0"),
+        "an unresolvable annotation type surfaced with a null annotationType(), \
+         or as an element that is not a java.lang.annotation.Annotation.\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Name the directly-applied case (`AcpGoneSolo`, added 2026-08-06). The
+    // summary above is a sum: it read `nullTypes=0` for months while that shape
+    // was broken, because nothing exercised it.
+    //
+    // There the annotation admission filter resolved the type name through
+    // `load_class`, which FABRICATES a stand-in for a name on no classpath — so
+    // the filter could essentially never say "unresolvable", and
+    // `getDeclaredAnnotations()` returned a `Proxy` over a non-interface: an
+    // element that is not an `Annotation` at all. Byte Buddy casts every
+    // element to `Annotation`, so Mockito's inline mock maker could not modify
+    // the class, and for a FINAL class (nothing to subclass) `mock()` failed
+    // outright — `org.infinispan.query.remote.client.impl.QueryRequest` and its
+    // `@org.jboss.marshalling.Externalize`.
+    assert!(
+        stdout.contains("AcpGoneSolo.getDeclaredAnnotations()"),
+        "the probe never reached the directly-applied case, so the summary \
+         proves nothing about it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }

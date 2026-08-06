@@ -73,6 +73,23 @@ public class MockManyProbe {
                 fail++;
                 Throwable c = t.getCause() != null ? t.getCause() : t;
                 System.out.println("FAIL " + name + " -> " + c);
+                // `MockitoException` composes its report lazily and several of
+                // its constructors leave `getMessage()` null, so the line above
+                // can render as a bare class name with nothing after the colon
+                // — which says only "Mockito was unhappy". Print the whole
+                // chain and the top frames; failures are rare enough in a sweep
+                // that the volume is not a problem, and without this a run has
+                // to be repeated by hand just to learn what it already knew.
+                for (Throwable e = t; e != null; e = e.getCause()) {
+                    System.out.println("       " + e.getClass().getName() + ": " + e.getMessage());
+                    StackTraceElement[] frames = e.getStackTrace();
+                    for (int i = 0; i < Math.min(frames.length, 12); i++) {
+                        System.out.println("         at " + frames[i]);
+                    }
+                    if (e.getCause() == e) {
+                        break;
+                    }
+                }
             }
         }
         System.out.println("SUMMARY ok=" + ok + " skip=" + skip + " fail=" + fail);
