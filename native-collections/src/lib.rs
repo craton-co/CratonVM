@@ -3793,11 +3793,12 @@ fn try_delegate_real_collection(
 /// to ask the backing itself. A genuinely empty backing answers 0 either way,
 /// which is why the fallback is safe to take on 0 rather than needing a
 /// separate "unreadable" signal.
-fn unmod_view_size(al_state_size: i32, backing_size: impl FnOnce() -> Option<i32>) -> i32 {
-    if al_state_size > 0 {
-        return al_state_size;
-    }
-    backing_size().unwrap_or(al_state_size).max(0)
+fn unmod_view_size(al_state_data: Option<ObjectRef>, al_state_size: i32) -> Option<i32> {
+    // The DATA slot, not the size, is the readability signal. A size of 0 is
+    // ambiguous — it is what `al_state` reports both for a genuinely empty
+    // array-backed list and for a backing it could not read at all — and
+    // conflating those is the whole defect.
+    al_state_data.map(|_| al_state_size.max(0))
 }
 
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
@@ -3965,14 +3966,13 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // any List shape works. `unmod_receiver_backing` is `None` for a plain
         // ArrayList, so the virtual call cannot come back here forever: the
         // innermost backing takes the normal path below.
-        let al_size = al_state(ctx, b).1;
-        let n = unmod_view_size(al_size, || match ctx.invoke_virtual(b, "size", "()I", &[]) {
-            Ok(Some(Value::Int(v))) => Some(v),
-            _ => None,
-        });
-        if index < 0 || index >= n {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        let (data, al_size) = al_state(ctx, b);
+        if let Some(n) = unmod_view_size(data, al_size) {
+            if index < 0 || index >= n {
+                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            }
         }
+        // Unreadable backing: stand aside, exactly as `native_unmod_get` does.
         return ctx.invoke_virtual(b, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)]);
     }
     // `Collections$SingletonList` keeps its one element in a field, not in an
@@ -45539,16 +45539,19 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             // `Collections.unmodifiableList(..).get(i)` --
             // `--dump-native-registry` names it
             // `cratonvm/internal/UnmodifiableList.get`.
-            let al_size = al_state(ctx, backing).1;
-            let n = unmod_view_size(al_size, || {
-                match ctx.invoke_virtual(backing, "size", "()I", &[]) {
-                    Ok(Some(Value::Int(v))) => Some(v),
-                    _ => None,
+            let (data, al_size) = al_state(ctx, backing);
+            if let Some(n) = unmod_view_size(data, al_size) {
+                if *index < 0 || *index >= n {
+                    return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
                 }
-            });
-            if *index < 0 || *index >= n {
-                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
             }
+            // `None` = `al_state` could not read this backing. STAND ASIDE and
+            // let `unmod_delegate` below bounds-check: the backing's own `get`
+            // does it correctly and throws the JDK's own exception for its
+            // shape. Asking the backing for its `size()` here instead would
+            // cost a full VM dispatch on EVERY get -- two per element for the
+            // `for (i..n) list.get(i)` loop that is the common shape -- for a
+            // check the delegate is about to do anyway.
         }
     }
     unmod_delegate(ctx, args, "get", "(I)Ljava/lang/Object;")
@@ -52332,29 +52335,29 @@ mod tests {
     use super::*;
 
     /// `Collections.unmodifiableList(x).get(i)` bounds-checked against
-    /// `al_state`, which reports 0 for any backing that is not
-    /// `elementData`-shaped -- so a view over a LinkedList or an
-    /// `Arrays$ArrayList` threw AIOOBE on a VALID index while iterating fine.
+    /// `al_state`'s SIZE, which is 0 both for a genuinely empty array-backed
+    /// list and for a backing it could not read at all -- so a view over a
+    /// LinkedList or an `Arrays$ArrayList` threw AIOOBE on a VALID index while
+    /// iterating fine. The DATA slot is the readability signal, not the size.
     /// That destroyed the real failure inside Spring's
     /// `SummaryGeneratingListener.getFailures().get(0)` and failed both
     /// `AotIntegrationTests` end-to-end tests.
     #[test]
-    fn unmod_view_size_falls_back_when_al_state_cannot_read_the_backing() {
-        // The bug: al_state says 0, the backing really has 2.
-        assert_eq!(unmod_view_size(0, || Some(2)), 2);
-        // A readable ArrayList-shaped backing is trusted directly, no call.
-        assert_eq!(
-            unmod_view_size(3, || panic!("must not ask the backing when al_state read it")),
-            3
-        );
-        // Genuinely empty: both agree, and the fallback is harmless.
-        assert_eq!(unmod_view_size(0, || Some(0)), 0);
-        // Backing cannot answer either -- stay at 0 rather than inventing a
-        // size, so `get` still refuses rather than reading out of bounds.
-        assert_eq!(unmod_view_size(0, || None), 0);
-        // A negative answer from either source can never widen the bounds.
-        assert_eq!(unmod_view_size(0, || Some(-1)), 0);
-        assert_eq!(unmod_view_size(-5, || Some(4)), 4);
+    fn unmod_view_size_stands_aside_when_al_state_cannot_read_the_backing() {
+        // A readable array-backed list: pre-check with the size it reported.
+        let data = Some(unsafe { ObjectRef::from_raw(0x1000 as *mut u8) });
+        assert_eq!(unmod_view_size(data, 3), Some(3));
+        // Readable AND genuinely empty -- still a pre-check, so `List.of()`
+        // keeps throwing the AIOOBE that HotSpot throws for it.
+        assert_eq!(unmod_view_size(data, 0), Some(0));
+        // THE BUG: no data slot means al_state could not read the backing, and
+        // its 0 is "cannot tell", not "empty". Pre-check must stand aside so
+        // the delegate answers -- returning Some(0) here is what rejected
+        // `unmodifiableList(new LinkedList<>(List.of("x","y"))).get(0)`.
+        assert_eq!(unmod_view_size(None, 0), None);
+        assert_eq!(unmod_view_size(None, 7), None);
+        // A negative size can never widen the bounds.
+        assert_eq!(unmod_view_size(data, -5), Some(0));
     }
 
     #[allow(unused_imports)]
