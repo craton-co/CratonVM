@@ -3340,6 +3340,7 @@ impl SharedVm {
                 native_libraries: parking_lot::Mutex::new(Vec::new()),
                 upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
                 jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
+                jni_native_methods: crate::native::jni::JniNativeMethodTable::default(),
             },
 
             threads: crate::vm::realms::ThreadRealm {
