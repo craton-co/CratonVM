@@ -31,6 +31,19 @@ method, so `--jdk-only` admits every one of them on a claim nobody has checked.
 >   `bridge` + 367 `synthetic-stub`) against the file's 1,350, and the image
 >   declares `ACC_NATIVE` on **exactly zero** of them — re-measured per row, not
 >   inherited. A statement lane still has nothing to do there.
+> * **Its stated blocker is measured inert.** This file gives "214 of the
+>   registrations are on abstract interface methods that decide dispatch for
+>   every *user* subclass" as the reason the crate cannot be reclassified. A
+>   probe that hands the VM `AbstractCollection`/`AbstractSet`/`AbstractList`/
+>   `AbstractMap` subclasses in a layout nothing models gets **byte-identical
+>   answers to HotSpot on all 42 observables** — and the census shows the natives
+>   *ran* (`AbstractCollection.contains` 8x, `AbstractSet.hashCode` 1x) rather
+>   than deferring. This family has the foreign-layout fallback. Also: **10**
+>   such rows are registered in real-JDK mode, not 97 or 214 — those are source
+>   grep counts. See
+>   [`abstract-collection-natives-are-inert-for-foreign-layouts.md`](abstract-collection-natives-are-inert-for-foreign-layouts.md),
+>   which also states the generalisable test: does the native ask the receiver,
+>   or index into a layout it assumes?
 >
 > **Still open from this file:** nothing in its own file ownership. The 83
 > tree-wide adjudicable rows it lists are gone (0 remain); what is left is
