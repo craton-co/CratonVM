@@ -12,6 +12,63 @@ can work on what, simultaneously, without colliding.**
 
 ---
 
+## The end state is two modes, and it is a rename
+
+**This governs every lane. Read it before deleting anything.**
+
+There are three modes today — `--features synthetic-jdk`, `--real-jdk`
+(`Compatible`) and `--jdk-only` (strict). There will be two, and they arrive by
+**renaming**, not by purging:
+
+| today | becomes | means |
+|---|---|---|
+| `--jdk-only` | **`--real-jdk`** | real JDK bytecode is authoritative; no synthetic stub is admitted |
+| `--real-jdk` (`Compatible`) | **`--synthetic-jdk`** | real JDK image, plus the Rust natives that make apps work today |
+| `--features synthetic-jdk` | folds into `--synthetic-jdk` | |
+
+**The rule that follows, and it is not negotiable: no synthetic method that is
+used by either surviving mode may be removed.** A wave that ends with
+`--jdk-only` renamed to `--real-jdk` must not have taken anything out of the
+mode that gets renamed to `--synthetic-jdk`. Strict mode declines to **admit** a
+native — at registration, by `NativeKind` — and that is the entire mechanism.
+Deleting the Rust function is not an implementation of "strict refuses it"; it
+is a different, larger change that also breaks the other mode.
+
+So every lane's deletions have to be sorted into two buckets, and the sorting is
+the work:
+
+* **Policy artefacts — delete.** Hard-coded name lists, per-dispatch-path copies
+  of one decision, `matches!` chains, `compat_native_wins = true`. They answer
+  "who wins dispatch", and `resolve_dispatch` should answer it from
+  `NativeKind` + `Method::code()` instead. Item 3's `String` lists and item 7's
+  eight-plus-one sites are this bucket.
+* **Implementations — keep.** The natives themselves. If one is wrong in
+  `Compatible` mode, fix it. If it must not run under strict policy, tag it
+  `SyntheticStub`. "Unreachable in strict mode" is never a reason to delete it,
+  because it is reachable in the other one.
+
+Two records already say the wrong thing under this rule and are corrected in
+place: the evidence record's *"`native_es_execute` can go away entirely"* and
+L11's step 5. What goes away is its **admission**, not the function.
+
+### The axis this rule is NOT about
+
+`set_drop_real_layout_synthetic` is a **correctness** gate, not a mode gate, and
+the two get conflated. It answers "the real class is loaded, and this synthetic
+surface writes a layout that corrupts it" — `StringJoiner`, `Cleaner`,
+`ReferenceQueue`, `Permissions`, `LinkedBlockingDeque`, the legacy regex
+natives, `ScheduledThreadPoolExecutor`, and as of 2026-08-06 the `Executors`
+pool factories. Those are dropped wherever real bytecode exists, in **every**
+mode that loads a real image, and they were dropped there before `--jdk-only`
+existed. They are not "synthetic methods used in `--synthetic-jdk`" being
+removed; they are synthetic methods that were **breaking** the mode, and the
+build that genuinely has no real bytecode (`--features synthetic-jdk`) never
+sets the flag and keeps every one of them.
+
+If a lane wants to drop a native in `Compatible` mode, it must say which axis it
+is on, and show the corruption on the correctness axis. Saying "strict does not
+need it" is the policy axis and is not sufficient.
+
 ## Start here
 
 1. Read the contract's §1.3, §1.4, §5, §7 and §11. Every lane is judged against
@@ -37,12 +94,12 @@ can work on what, simultaneously, without colliding.**
 | L7 (`L7-ensure-synthetic-class-migration-RETIRED-20260805.md`) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
 | L8 (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
-| [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
-| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
+| L10 (`L10-blocker-threadpool-init-DONE-20260806.md`) **DONE 2026-08-06** | ~~**Blocker.** Real `ThreadPoolExecutor` field init~~ — real-JDK mode registers **no** `Executors` pool factory, so the real bytecode constructs every executor. Owned `native-collections/src/lib.rs` and **did not touch it**: the defect was one arm of `NativeMethodRegistry::register` | ~~`native-collections/src/lib.rs`~~ → `native-api/src/registry.rs` | — | L |
+| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04**; item 7 **unblocked 2026-08-06** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, ~~L10~~ | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**Every lane is done.** (L1–L8 landed; L9 is closed. L10 is the
-remaining blocker, and L11/L12 are gated behind it.)
+**Every lane is done.** (L1–L8 landed; L9 is closed; L10 landed 2026-08-06 and
+with it the last blocker. L11's item 7 and L12 are no longer gated on anything.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -51,7 +108,7 @@ exist:
 
 | Pair | Collides on | Resolution |
 |---|---|---|
-| L2 ↔ L10 | `native-collections/src/lib.rs` | **Resolved:** L2 landed 2026-08-04; L10 rebases onto it. |
+| L2 ↔ L10 | `native-collections/src/lib.rs` | **Moot.** L2 landed 2026-08-04; L10 landed 2026-08-06 without editing that file at all — the defect turned out to be in `native-api/src/registry.rs`. The conflict this row was written to manage never arose, which is the second time this wave a lane's owned-file claim did not survive contact with the code (L3's was the first). |
 | L4 ↔ L11 | `vm/src/vm/vm_exec.rs` | L4 owns the overlay hunter (~line 3070–3200); L11 owns dispatch (~14700, ~22700). Disjoint regions in one file — coordinate, do not both `git add -A`. |
 | L3 ↔ L12 | `lang_invoke.rs` | **Resolved:** L3 landed 2026-08-05; L12 rebases onto it. |
 | L3 ↔ L5 | `native-io/src/lib.rs` | **Resolved the same way.** L3 had to take this file — the Scanner writer was there, not in `phases_early.rs` — but it touched only the `Scanner` natives and the delimiter regex cache, no `register*` call site. |
@@ -86,6 +143,9 @@ Standing commands:
 CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home $JDK -cp probes JdkOnlyCensusLoadProbe
 # who wrote it (Rust frame + file:line; the Java frames mislead)
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=ClassName cratonvm ...
+# the ThreadPoolExecutor receiver-shape predicate, one line per call.
+# Universally-true is TWO claims: no `real=false` AND at least one `real=true`.
+CRATONVM_DBG_TPE_SHAPE=1 cratonvm --jdk-only --java-home $JDK -cp probes L10ThreadPoolInitProbe 2>&1 | grep tpe-shape | sort | uniq -c
 # native adjudication
 cratonvm --real-jdk --java-home $JDK --explain-jdk-only --dump-native-registry c.json -cp probes JdkOnlyCensusLoadProbe
 python3 scripts/jdk-only-adjudicate.py c.json     # section 7 is the ratchet's block
@@ -107,10 +167,23 @@ above looks paranoid.
   (stops an out-of-range write, not a wrong-field one). **Identify a layout by a
   field NAME the real class declares** — `vform`, `scheme`, `protocol`, `type` —
   never by count.
-* **A number in a record is a claim, not a measurement.** Five were wrong:
+* **A number in a record is a claim, not a measurement.** Six were wrong:
   "about 8,000" registrations (11,909), "1,195 mis-tagged" (10,084), "52 call
   sites" (3 fire), "costs every inline-cached call" (zero), "sweep four crates"
-  (24 named slots). Take the census before sizing anything.
+  (24 named slots), and L10's own verification bullet, "`cargo test --release -p
+  cratonvm-native-collections --lib` (94 tests)" — it is 105, and the lane never
+  edited that crate. Take the census before sizing anything.
+* **An absent instrument reads exactly like a satisfied one.** L10's first A-arm
+  reading was `true=0 false=0`, which says "these dispatch sites are dead" — a
+  tidy finding, and wrong: the binary was linked before the flag existed. Print
+  the successes as well as the failures, and confirm the instrument is IN the
+  binary before believing a zero from it.
+* **A brief can over-report a lane as easily as under-report it.** L10 was given
+  a 55k-line file to own and a list of null fields to go fix. The file was never
+  touched and the fields had been initialised for four weeks; the defect was one
+  `matches!` arm in a different crate. Run the probes against the pre-fix binary
+  *before* planning the lane — the brief is a hypothesis about where the code
+  is, and it is the cheapest thing to test.
 * **The Java stack does not name the native writer.** The `ClassLoaders` rows
   show `BufferedWriter.initialBufferSize()`. Use `overlay-bt`.
 * **A comment can describe control flow the code does not have.** §7 step 3
@@ -373,3 +446,64 @@ printed its ephemeral port (so it diverged from HotSpot on every run while
 being documented as byte-identical), and the new probe used try-with-resources
 on an executor — an unbounded `close()` — breaking the probe rules it was
 written to. A gate whose first catch is its own instrument is working.
+
+**Update, 2026-08-06 — L10 landed, and with it the last blocker.** Real-JDK mode
+registers **zero** `java/util/concurrent/Executors` pool factories (8 → 0;
+registry 11,876 → 11,868), so the real `Executors` bytecode constructs every
+executor and CratonVM cannot mint one the real `<init>` did not build.
+`probes/L10ThreadPoolInitProbe` — 62 lines, three guards the evidence record
+demanded — is byte-identical to HotSpot 25 in **both** modes, and the new
+`CRATONVM_DBG_TPE_SHAPE` reports the receiver-shape predicate `true` 62/62 and
+38/38 with **zero** `false` across both workloads in both modes. L11's item 7 is
+unblocked; the retired lane doc is
+`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
+
+**That last reading is identical on the pre-L10 binary, and saying so is the
+point.** The predicate already answered `true` for the receivers those workloads
+produce. L10 changed its *domain*, not its answer: real-JDK mode no longer has a
+code path that constructs an executor, so there is no input it can be false for.
+A lane that had stopped at `false=0` would have satisfied step 3 by the wrong
+route — concluding a property is universal because the sampled inputs satisfied
+it — and the eight sites cannot be deleted on that evidence.
+
+Five things worth carrying, and the first two are corrections to *this*
+document:
+
+* **A brief can over-report its lane as easily as under-report it.** The
+  conflict matrix and the lane table both gave L10
+  `native-collections/src/lib.rs` — *whole file*, 55k lines, "treat whole-file
+  ownership as the unit". **The file was not touched.** The defect was one
+  `matches!` arm in `native-api/src/registry.rs`, and the `ctl`/`mainLock`/
+  `workers`/`workQueue` "family" the brief said to go find had been initialised
+  since 2026-07-10. The measurement that would have caught this — run the probes
+  against the pre-fix binary first — took ten minutes and was worth a lane's
+  worth of planning. L1 and L3 found their briefs under-reported; this is the
+  same lesson from the other side, and the general form is: **the brief is a
+  hypothesis about where the code is, and it is the first thing to test.**
+* **A green transcript is not the property this lane owed.** The census probe's
+  `concurrent` section — named in the lane doc as its headline signal, and as
+  "a genuine new signal" — was byte-identical to HotSpot **before** the change.
+  What was actually broken was invisible to it: the construction path kept two
+  fallbacks that write a two-slot shape onto a real-layout object and return it
+  as if `<init>` had succeeded, which made the predicate the eight dispatch
+  sites consult *conditionally* true. "Conditionally true" is what blocks
+  deleting them, and no transcript can see the difference.
+* **Registration beats dispatch, again.** Same shape as item 3's outcome: the
+  fix is one arm of `NativeMethodRegistry::register`, invisible to every
+  dispatch path at once, where a dispatch-side policy has to be restated per
+  path and was already copied eight times here.
+* **An absent instrument and a satisfied predicate produce the same silence.**
+  The first A-arm reading was `true=0 false=0` on the pre-fix binary — which
+  reads as "these sites are dead" and would have been a tidy, wrong finding. The
+  binary predated the flag. A third build was needed for a real A/B. This is why
+  the flag prints successes as well as failures, and the rule generalises:
+  **check the instrument is in the binary before reading a zero out of it.**
+* **A zero from an instrument is a statement about the workload, not about the
+  code.** The real A/B, once it existed, showed the predicate answering `true`
+  on every call *before* L10 as well as after. The lane is still necessary — the
+  fallback that produces a false receiver was real, these two workloads just
+  never took it — but "we measured `false=0`" was never the evidence it looked
+  like. **A universal claim needs an argument about reachability; a counter only
+  ever samples.** Pair every such reading with a negative control that makes the
+  other branch fire (`probes/L10ShapeInstrumentControlProbe` does it with
+  `Unsafe.allocateInstance`), or the zero is unfalsifiable.

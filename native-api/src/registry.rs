@@ -5578,11 +5578,68 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
+        // `java.util.concurrent.Executors` bytecode builds every executor.
+        //
+        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
+        // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
+        // factories were the ones still fabricating. What they did was subtler
+        // than a two-slot stub and is worth stating, because the obvious reading
+        // of the code says they were already fine:
+        //
+        //   `alloc_concurrent_synthetic(.., "java/util/concurrent/ThreadPoolExecutor", 2)`
+        //   followed by `initialize_real_thread_pool_executor`, which
+        //   `invoke_special`s the real `ThreadPoolExecutor.<init>`.
+        //
+        // On the happy path that does produce a genuinely real executor — which
+        // is why the fixed/cached transcripts already matched HotSpot. But it
+        // keeps TWO fallbacks (`stpe_legacy_slot_init`, taken when the
+        // `BlockingQueue` or the `TimeUnit` constant cannot be built) that write
+        // the historical two-slot shape onto a real-layout object and return it
+        // as if construction had succeeded. A fallback that silently hands back a
+        // half-constructed executor is exactly the state the eight
+        // `ThreadPoolExecutor.execute` receiver-shape dispatch sites exist to
+        // detect, so leaving it in place would keep the predicate they consult
+        // conditionally true — and "conditionally true" is what blocks deleting
+        // them (L11).
+        //
+        // And one of the three was observably wrong, not just fragile:
+        // `newSingleThreadExecutor()` returned a bare `ThreadPoolExecutor`, where
+        // the real JDK returns `Executors$AutoShutdownDelegatedExecutorService`
+        // wrapping one. Every `instanceof ThreadPoolExecutor` a caller writes
+        // flipped, and the pool was reconfigurable when the JDK guarantees it is
+        // not. Measured against HotSpot 25 by `probes/L10ThreadPoolInitProbe`:
+        // `single.class` and `single.isTpe` were the ONLY two divergent lines out
+        // of 62 in both `--real-jdk` and `--jdk-only`.
+        //
+        // Dropping is the whole fix, and it is a registration-time decision on
+        // purpose — the L11/item-3 precedent
+        // (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`)
+        // is that a policy expressed at dispatch has to be restated once per
+        // dispatch path, while a policy expressed here is invisible to all of
+        // them at once. With no native, `Executors.newFixedThreadPool` et al. run
+        // their own bytecode — `new ThreadPoolExecutor(...)`, or for the single-
+        // thread case the delegating wrapper — so a factory-built executor is
+        // real by CONSTRUCTION rather than by a fallback that happened not to be
+        // taken. `newSingleThreadExecutor(ThreadFactory)` was never registered
+        // and has always run that real path, which is what made this safe to do
+        // rather than merely desirable.
+        //
+        // Scoped to the pool factories by NAME. `Executors.callable`,
+        // `defaultThreadFactory`, `privilegedThreadFactory` and the
+        // `unconfigurable*` wrappers are not fabrications and keep whatever
+        // registration they have; and the synthetic-JDK build never sets this
+        // flag, so its own two-slot executor model is untouched.
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/Executors"
             && matches!(
                 method_name,
-                "newScheduledThreadPool" | "newSingleThreadScheduledExecutor"
+                "newScheduledThreadPool"
+                    | "newSingleThreadScheduledExecutor"
+                    | "newFixedThreadPool"
+                    | "newCachedThreadPool"
+                    | "newSingleThreadExecutor"
             )
         {
             return;
@@ -7838,6 +7895,113 @@ mod tests {
         assert!(registry.callback_of(bogus).is_none());
         assert!(registry.kind_of_id(bogus).is_none());
         assert!(registry.triple_of(bogus).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // JDK-only wave 2, L10 — real `ThreadPoolExecutor` field initialisation
+    // -----------------------------------------------------------------------
+
+    /// Every `Executors` pool factory, and the descriptor CratonVM registered
+    /// it under before the L10 drop.
+    const EXECUTOR_POOL_FACTORIES: &[(&str, &str)] = &[
+        (
+            "newFixedThreadPool",
+            "(I)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newSingleThreadExecutor",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newScheduledThreadPool",
+            "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+        (
+            "newSingleThreadScheduledExecutor",
+            "()Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+    ];
+
+    /// In real-JDK mode no `Executors` pool factory may be registered: the real
+    /// `java.util.concurrent.Executors` bytecode has to build every executor,
+    /// so a factory-made pool is genuinely `<init>`-constructed by construction
+    /// rather than by a fallback that happened not to be taken.
+    ///
+    /// That is what unblocks L11. The eight `ThreadPoolExecutor.execute`
+    /// receiver-shape dispatch sites exist to detect an executor CratonVM
+    /// fabricated; they are deletable only once no such executor can exist, and
+    /// a native here is the only thing that could make one.
+    ///
+    /// Asserted in BOTH directions. Without the `drop_real_layout_synthetic ==
+    /// false` half this test passes on a registry that refuses the triples
+    /// unconditionally — which would break the synthetic-JDK build, whose
+    /// two-slot executor model is exactly what those natives are for, while
+    /// this test went on reading green.
+    #[test]
+    fn real_jdk_mode_registers_no_executors_pool_factory() {
+        let exec = "java/util/concurrent/Executors";
+
+        let mut compatible = NativeMethodRegistry::new();
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            compatible.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                compatible.find(exec, name, descriptor).is_some(),
+                "synthetic-JDK mode must KEEP Executors.{name}{descriptor}: it is the \
+                 only implementation there, and dropping it would leave the synthetic \
+                 two-slot executor model with no factory at all"
+            );
+        }
+
+        let mut real = NativeMethodRegistry::new();
+        real.set_drop_real_layout_synthetic(true);
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            real.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                real.find(exec, name, descriptor).is_none(),
+                "real-JDK mode still registers Executors.{name}{descriptor}. A native here \
+                 can hand back an executor the real `<init>` never ran on, which is the \
+                 receiver shape the eight `ThreadPoolExecutor.execute` dispatch sites exist \
+                 to detect — and while one can exist, those sites cannot be deleted (L11)."
+            );
+        }
+
+        // Negative control: the drop is scoped to the pool factories by name.
+        // `callable`/`defaultThreadFactory`/`unconfigurable*` fabricate no
+        // executor and must be unaffected, or a future widening of the
+        // `matches!` arm would take them out silently.
+        for (name, descriptor) in [
+            (
+                "callable",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Callable;",
+            ),
+            (
+                "defaultThreadFactory",
+                "()Ljava/util/concurrent/ThreadFactory;",
+            ),
+            (
+                "unconfigurableExecutorService",
+                "(Ljava/util/concurrent/ExecutorService;)Ljava/util/concurrent/ExecutorService;",
+            ),
+        ] {
+            real.register(exec, name, descriptor, dummy_native);
+            assert!(
+                real.find(exec, name, descriptor).is_some(),
+                "the L10 drop must not reach Executors.{name}{descriptor} — it builds no \
+                 executor of its own"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
