@@ -769,7 +769,7 @@ pub(crate) fn cb_write_hb(
     ctx.set_field_by_name(buf, "address", Value::Long(16));
 }
 
-/// Re-assert `java.nio.Buffer.address` after an indexed `CB_FIELD_MARK` write.
+/// Write `java.nio.Buffer.address` for a freshly-allocated HEAP CharBuffer.
 ///
 /// `CB_FIELD_MARK` is slot 4, and on a real-JDK `java/nio/CharBuffer` the
 /// hierarchy-wide field order is Buffer's `mark`(0) `position`(1) `limit`(2)
@@ -786,10 +786,39 @@ pub(crate) fn cb_write_hb(
 /// Measured 2026-08-05: `flip()` alone took a freshly allocated CharBuffer
 /// from address=16 to address=-1, which is why `put(char[])`, `get(char[])`
 /// and `put(String)` all worked while only `put(CharBuffer)` threw.
+/// AUDIT 2026-08-05, second pass: the flat `address = 16` this used to write
+/// is only right for a buffer whose `offset` is 0. A real `HeapCharBuffer` sets
+/// `address = ARRAY_CHAR_BASE_OFFSET + offset * 2`, so a SLICE carries a larger
+/// address, and a direct buffer carries a real native pointer that must never
+/// be synthesised at all. Freshly-allocated heap buffers therefore go through
+/// [`cb_write_heap_address`] (which honours `offset`), and mutators go through
+/// [`cb_set_mark`] (which preserves whatever the object already carries).
 #[inline]
-pub(crate) fn cb_reassert_address(ctx: &mut dyn NativeContext, buf: ObjectRef) {
+pub(crate) fn cb_write_heap_address(ctx: &mut dyn NativeContext, buf: ObjectRef, offset: i32) {
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-    ctx.set_field_by_name(buf, "address", Value::Long(16));
+    ctx.set_field_by_name(
+        buf,
+        "address",
+        Value::Long(16 + (offset as i64) * 2),
+    );
+}
+
+/// Write `mark` on a CharBuffer without destroying `address`.
+///
+/// The indexed slot has to stay for synthetic mode (where the by-name fields do
+/// not exist), so save the real `address` across it and put it back. Save and
+/// restore rather than recompute: this is called on buffers CratonVM did not
+/// allocate, including slices (`address = base + offset * 2`) and direct
+/// buffers (`address` is a genuine native pointer). On a synthetic buffer the
+/// read yields a non-`Long` and nothing is restored.
+#[inline]
+pub(crate) fn cb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
+    let saved_address = ctx.get_field_by_name(buf, "address");
+    ctx.set_field(buf, CB_FIELD_MARK, Value::Int(v));
+    ctx.set_field_by_name(buf, "mark", Value::Int(v));
+    if let Value::Long(_) = saved_address {
+        ctx.set_field_by_name(buf, "address", saved_address);
+    }
 }
 
 /// Read the backing char[] from a CharBuffer, honouring both the
@@ -1205,7 +1234,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
             ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(new_lim));
             ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
-            cb_reassert_address(ctx, buf);
+            cb_write_heap_address(ctx, buf, cur_off);
             Ok(Some(Value::Object(Some(buf))))
         },
     );
@@ -1297,8 +1326,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         };
         ctx.set_field(this, CB_FIELD_LIMIT, Value::Int(pos));
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
-        ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
-        cb_reassert_address(ctx, this);
+        cb_set_mark(ctx, this, -1);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "clear", "()Ljava/nio/CharBuffer;", |ctx, args| {
@@ -1309,15 +1337,13 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         };
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
         ctx.set_field(this, CB_FIELD_LIMIT, Value::Int(cap));
-        ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
-        cb_reassert_address(ctx, this);
+        cb_set_mark(ctx, this, -1);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "rewind", "()Ljava/nio/CharBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
-        ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
-        cb_reassert_address(ctx, this);
+        cb_set_mark(ctx, this, -1);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "remaining", "()I", |ctx, args| {
