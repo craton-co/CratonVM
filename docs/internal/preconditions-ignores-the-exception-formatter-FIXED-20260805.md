@@ -271,13 +271,14 @@ Four rows still diverge, in two pairs. Both are separate defects that this
 probe found rather than residues of this one, and both are filed:
 
 * `CharBuffer.wrap(String).subSequence(-1, 2)` does not throw at all — it
-  returns an empty/oversized buffer.
-  `CharBuffer.wrap(CharSequence)` builds a *synthetic* 5-field
-  `java/nio/CharBuffer` rather than a `StringCharBuffer`, so the real
-  `subSequence` bytecode (which would reach `Buffer.checkIndex` and therefore
-  `Preconditions`) never sees a usable `limit`. That is a CharBuffer-layout
-  gap, not a formatter gap →
-  [`charbuffer-wrap-string-subsequence-does-not-bounds-check.md`](../known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md).
+  returns an empty/oversized buffer. **FIXED 2026-08-06**, taking this probe to
+  2 divergences of 58 →
+  [`charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md`](charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md).
+  The diagnosis written here was wrong, and that record says so: the real
+  `subSequence` bytecode was never reached because `CharBuffer.wrap` was a
+  native stamping the ABSTRACT `java/nio/CharBuffer`, and the `limit` was
+  perfectly readable the whole time. Deleting that native — not fixing a
+  layout — was the fix.
 * An out-of-range array load and `System.arraycopy` produce
   `ArrayIndexOutOfBoundsException` with a null message where HotSpot has
   `"Index 9 out of bounds for length 4"`. `RuntimeError::ArrayIndexOutOfBoundsException`
