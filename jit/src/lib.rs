@@ -13261,7 +13261,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // Flyway HSQLDB path "is running interpreted" in a run where it had been
     // JIT-eligible for four days, and looked for the stall in the wrong place.
     // The real defect was `383e7f5cf`. See
-    // `docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
+    // `fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
     //
     // If a package ever needs to be force-interpreted again, do it through the
     // bisect levers below (which `compile_gate::admit` applies at all three
@@ -14415,7 +14415,7 @@ fn try_compile_inner(
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
         // widens the set of methods that happens to — is written up in
-        // `docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`
+        // `docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing

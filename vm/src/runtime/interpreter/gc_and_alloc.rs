@@ -1230,7 +1230,7 @@ pub(crate) fn create_string_or_oom(
 /// Identical escalation ladder — the only difference is that the source is a
 /// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
 /// allocated `String`. String concatenation builds its result this way; see
-/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+/// `string-concat-loses-unpaired-surrogates-FIXED-20260805.md`.
 pub(crate) fn create_string_from_units_or_oom(
     shared: &SharedVm,
     thread: &mut JvmThread,

@@ -1694,7 +1694,7 @@ pub(crate) fn safe_native_call_prevalidated_objects(
 ///   other native does and the JIT's post-invoke drain sees what it expects.
 ///
 /// Measured effect: `probes/NativeShapeProbe.java`, and
-/// `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+/// `native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
 pub(crate) fn safe_native_call_leaf(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -5834,7 +5834,7 @@ fn array_element_type_of(shared: &SharedVm, object: ObjectRef) -> Option<ArrayEl
 /// as a coder is what made `compact_java_strings_equal` answer "not equal" for
 /// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
 /// every String key the same map had just stored
-/// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+/// (`chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
 /// So when the positional probe does not describe a String, resolve `value`
 /// and `coder` by NAME off the receiver's own class before giving up.
 fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
@@ -20852,7 +20852,7 @@ fn invoke_on_class_shared_inner(
                         // `NativeMethodRegistry::register`'s real-JDK drop —
                         // and a shape that must lose to real bytecode is simply
                         // not registered. See
-                        // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
+                        // `forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
                         //
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
@@ -24644,7 +24644,7 @@ mod tests {
     /// read its slot 1 (the cached hash) as a coder, reject the value, and
     /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
     /// String-keyed CHM missed every key it held
-    /// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    /// (`chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     #[test]
     fn equal_strings_compare_equal_in_the_embedded_string_layout() {
         let shared = test_shared();

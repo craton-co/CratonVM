@@ -7617,7 +7617,7 @@ static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
 /// removable from a run in one flag.
 ///
 /// See
-/// `docs/internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+/// `fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -7734,7 +7734,7 @@ pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
 /// JIT and 0 times under `--nojit`, `StreamSupport.stream(spliterator, false)`
 /// handing back the spliterator, `Proxy$Dispatch.invokeProxy` reached with a
 /// null `Method`. See
-/// `docs/internal/fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-FIXED.md`.
+/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-FIXED.md`.
 ///
 /// The lever is kept rather than deleted with the defect: this divergence is
 /// not a one-off — it reappears whenever a registration or a cascade gate

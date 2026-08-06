@@ -3,7 +3,7 @@
 **Status: OPEN — not reproduced on Windows. Split out 2026-08-05 from
 `cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-20260805`,
 whose other two items are fixed and retired
-(`docs/internal/fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`).**
+(`fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`).**
 
 ## Symptom
 

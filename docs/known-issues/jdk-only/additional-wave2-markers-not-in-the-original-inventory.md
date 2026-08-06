@@ -111,7 +111,7 @@ What this changes:
   shadowing natives yielding to real bytecode in one 3.4-second run. That is §7
   step 3, the hottest jdk-only path in the VM by three orders of magnitude, and
   it is where the
-  [thread-start defect](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md)
+  thread-start defect (`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`)
   lived. Effort spent here is worth more than effort spent on any of the zeroes.
 
 Fourth measurement in a row to contradict one of these records, and the first to
@@ -260,7 +260,7 @@ The seven, verified 2026-07-31:
 
 Two of the seven are in the `String` family, which makes the JIT a **third**
 location for the forced-native `String` policy documented in
-[the forced-native `String` policy, FIXED 2026-08-04](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
+the forced-native `String` policy, FIXED 2026-08-04 (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
 Be precise about which: 10204 is `java/lang/String` itself and `toLowerCase` is
 one of the 21 names on `check_override`'s positive list *and* is excluded by
 `force_native_over_real_jdk_bytecode`'s seven-pair whitelist — three paths,

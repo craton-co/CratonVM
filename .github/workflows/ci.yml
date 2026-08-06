@@ -126,7 +126,7 @@ jobs:
       # Contract 1.5 defines a `Bridge` by its `ACC_NATIVE` target; 10,069 of the
       # 10,842 `Bridge` registrations have none, every one of them inherited its
       # kind from an ambient `set_category`, and this is what stops that number
-      # rising. See docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
+      # rising. See L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
       #
       # WHY HERE AND NOT ONLY IN THE ADVISORY `jdk-only` JOB. That job is
       # advisory for two documented reasons — wave 1 is measurement, and the
@@ -927,7 +927,7 @@ jobs:
           fi
 
       # THE BRIDGE RATCHET
-      # (docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+      # (L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
       #
       # Contract §1.5 defines a `Bridge` by its `ACC_NATIVE` target. 10,069 of
       # the 10,842 `Bridge` registrations have none, every one of them inherited

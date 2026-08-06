@@ -3,7 +3,7 @@
 **Status: OPEN — REGRESSED 2026-08-05.** Previously root-caused and fixed
 2026-07-27, on branch `fix/tomcat-stw-takeover-20260726`. Filed 2026-07-26
 while verifying
-[`tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`](../../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md).
+`tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md` (`fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`).
 
 ## Regression note (2026-08-05)
 
