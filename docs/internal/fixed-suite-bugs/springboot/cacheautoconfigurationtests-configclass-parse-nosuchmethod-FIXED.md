@@ -174,14 +174,19 @@ default, which is the point.
 
 ## Residuals — NOT closed by this fix
 
-1. **The page's item 3, the Infinispan verifier rejection.** `retransformClasses0`
-   rejecting ByteBuddy's `ConfigurationBuilder.simpleCache` for "stack overflow
-   during verification" at offset 27 **never reproduced on Windows**, at any
-   commit tested, including the pre-836631dcc anchors that are contemporary with
-   the Azure run the page was written from. All 59 tests pass here, so the
-   `mock(ConfigurationBuilder.class)` retransform succeeds. Filed separately as
-   `docs/known-issues/springboot/infinispan-configurationbuilder-retransform-verify-20260805.md`
-   with the diagnostics needed to settle it the next time it appears.
+1. ~~**The page's item 3, the Infinispan verifier rejection.**~~ **CLOSED
+   2026-08-06** — see
+   [`infinispan-configurationbuilder-retransform-verify-FIXED.md`](infinispan-configurationbuilder-retransform-verify-FIXED.md).
+   `retransformClasses0` rejecting ByteBuddy's
+   `ConfigurationBuilder.simpleCache` for "stack overflow during verification"
+   at offset 27 **never reproduced on Windows**, at any commit tested, including
+   the pre-836631dcc anchors that are contemporary with the Azure run the page
+   was written from. All 59 tests pass here, so the
+   `mock(ConfigurationBuilder.class)` retransform succeeds. It did not need a
+   second sighting in the end: the reported offset pins the rejected class
+   file's `max_stack` at exactly 4, and ByteBuddy's floor for that woven body is
+   6, so the bytes verified were not the bytes ByteBuddy produced — the same
+   corruption window `383e7f5cf` closed, on this same test class.
 
 2. **29 `SyntheticStub` natives dispatched while the real JDK bytecode for the
    same method is loaded** — `StreamSupport.stream` (1 922 calls, a registration

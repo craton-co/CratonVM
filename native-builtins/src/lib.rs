@@ -242,7 +242,7 @@ fn native_output_stream_writer_write_chars(
     let arr_len = ctx.array_length(chars) as i32;
     let end = off.checked_add(len).unwrap_or(i32::MAX);
     if off < 0 || len < 0 || end > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
+        return Err(RuntimeError::aioobe_index_only(end).into());
     }
     if len == 0 {
         return Ok(None);
@@ -5597,7 +5597,7 @@ fn native_heap_byte_buffer_init_array_offset_len(
         } else {
             limit64.min(i32::MAX as i64) as i32
         };
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     let limit = limit64 as i32;
     let segment = args.get(4).copied().unwrap_or(Value::Object(None));
@@ -15705,20 +15705,20 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        // Same encapsulation gate the typed `setAccessible` natives apply --
-        // this shorthand variant must not become a way around it.
-        if flag != 0 {
-            if let Err(msg) =
-                lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
-            {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: msg,
-                    }
-                    .into(),
-                );
-            }
-        }
+        // The full JEP 403 gate, not just the `ClassLoader.defineClass` edge.
+        //
+        // This registration is the LAST writer for
+        // `{Field,Method,Constructor,AccessibleObject}.setAccessible(Z)V` in
+        // `register_essential_natives_with_shims`, and the registry is
+        // last-writer-wins, so it silently replaced the module-checking
+        // `lang_class::native_field_set_accessible` registered ~1150 lines
+        // above. Real-JDK mode ran this body and nothing else: every
+        // `setAccessible(true)` into `java.base` succeeded, where HotSpot 25
+        // throws `InaccessibleObjectException`
+        // (`probes/ThreadGroupLayoutProbe.java`, the `ref *` lines). Calling
+        // the shared gate is what makes the duplicate harmless instead of
+        // load-bearing.
+        lang_class::enforce_set_accessible_gate(ctx, this, flag, "member")?;
         ctx.set_field_by_name(this, "override", Value::Int(flag));
         Ok(None)
     }
@@ -17731,9 +17731,11 @@ pub fn register_essential_natives_with_shims(
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let dest_len = ctx.array_length(dest) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: if off < 0 { off } else { off.wrapping_add(len) },
-                }
+                return Err(RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into());
             }
             let pos_idx = ctx
@@ -20631,12 +20633,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         };
         let total = ctx.array_length(arr);
         if from > to || to > total {
-            return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: to as i32,
-                }
-                .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(to as i32).into());
         }
         let len = to - from;
         let mut hex = String::with_capacity(len * 2);
@@ -32116,8 +32113,12 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         // StringCharBuffer. Honor the JDK layout instead of treating the null
         // hb as an error (Netty cookie decoding uses
         // `CharBuffer.wrap(String,start,end).charAt(0)`).
+        // `&mut` rather than `&dyn`: the wrapped `str` is any `CharSequence`,
+        // and reading a non-`String` one needs a virtual `toString()`. See
+        // `charset_buffers::read_wrapped_char_sequence` — without it every
+        // `CharBuffer.wrap(charChunk)` reads back empty.
         fn string_cb_state(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
         ) -> Option<(Vec<u16>, i32, i32, i32)> {
             let cid = ctx.class_id_of_object(this);
@@ -32129,7 +32130,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => return None,
             };
-            let text = ctx.read_string(str_obj)?;
+            let text = crate::phases_late::charset_buffers::read_wrapped_char_sequence(
+                ctx, str_obj,
+            );
             let pos = match ctx.get_field_by_name(this, "position") {
                 Value::Int(v) => v,
                 _ => match ctx.get_field(this, 1) {
@@ -32151,8 +32154,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((text.encode_utf16().collect(), pos, lim, off))
         }
 
+        #[allow(dead_code)]
         fn string_cb_char_at(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
             absolute_index: i32,
         ) -> Option<Value> {
@@ -32483,7 +32487,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     .ok_or(RuntimeError::IllegalStateException {
                         message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
                     })?;
-                    let _ = lim;
+                    // `ByteBufferAsCharBuffer.subSequence` opens with
+                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
+                    // `lim` was read and then explicitly discarded here, so the
+                    // range was never checked: `subSequence(0, 99)` on a
+                    // six-char view decoded 93 code units from past the end of
+                    // the underlying `byte[]` and handed them back as content.
+                    // Same defect, same day, as `CharBuffer.subSequence` —
+                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
+                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
+                        return Err(RuntimeError::ioobe(
+                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                                i64::from(start),
+                                i64::from(end),
+                                i64::from(lim.saturating_sub(pos)),
+                            ),
+                        )
+                        .into());
+                    }
                     let n = (end - start).max(0) as usize;
                     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
                     for i in 0..n {
@@ -37501,15 +37522,24 @@ fn native_arraylist_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> i32 {
 fn native_arraylist_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let len = native_arraylist_size(ctx, this);
-    let mut cursor = match args.get(1) {
-        Some(Value::Int(v)) => *v,
+    // Three registrations share this body: `listIterator()`, `iterator()` and
+    // `listIterator(I)`. Only the last one has an index, and it must be
+    // REJECTED when out of range, not clamped into it —
+    // `ArrayList.rangeCheckForAdd` throws the plain
+    // `IndexOutOfBoundsException` with the comma wording ("Index: 5, Size: 2"),
+    // measured on Temurin 25. Clamping returned an iterator positioned at
+    // `size` instead, so a caller that expected the throw silently got an
+    // exhausted iterator. The no-arg forms pass no argument, hence the test on
+    // presence rather than on value.
+    let cursor = match args.get(1) {
+        Some(Value::Int(v)) => {
+            if *v < 0 || *v > len {
+                return Err(RuntimeError::ioobe(format!("Index: {v}, Size: {len}")).into());
+            }
+            *v
+        }
         _ => 0,
     };
-    if cursor < 0 {
-        cursor = 0;
-    } else if cursor > len {
-        cursor = len;
-    }
 
     let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5);
     let (cursor_slot, last_ret_slot, expected_slot, parent_list_slot, child_list_slot) =
@@ -38373,19 +38403,51 @@ fn reflect_array_arg(
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "Array argument is null".to_string(),
-            }
-            .into())
+            // HotSpot's `Reflection::array_get` starts with a null check that
+            // throws a plain, message-less NullPointerException — not an
+            // IllegalArgumentException, which is what a `catch (NPE)` around a
+            // reflective array read expects.
+            return Err(RuntimeError::NullPointerException { message: None }.into());
         }
     };
     if !ctx.object_is_array(arr) {
         return Err(RuntimeError::IllegalArgumentException {
-            message: "Array argument is not an array".to_string(),
+            // HotSpot's exact wording ("Argument is not an array"), which is
+            // what `Array.get("hello", 0)` prints.
+            message: "Argument is not an array".to_string(),
         }
         .into());
     }
     Ok(arr)
+}
+
+/// `java.lang.reflect.Array`'s index argument, bounds-checked.
+///
+/// Until 2026-08-06 every accessor below did `*v as usize` and passed it
+/// straight to the heap, which answers an out-of-range read with a default
+/// value and drops an out-of-range write — so `Array.get(new int[4], 9)`
+/// returned `0` and `Array.set(new int[4], 9, v)` silently did nothing, where
+/// HotSpot throws. A negative index was worse: it became a huge `usize`.
+///
+/// The thrown AIOOBE deliberately carries **no** detail message. That is not
+/// an unfinished migration — HotSpot's `Reflection::array_get` raises the
+/// exception with no text, so `Array.get(new int[4], 9).getMessage()` is null
+/// there while a plain `a[9]` in bytecode says "Index 9 out of bounds for
+/// length 4". `probes/PreconditionsFormatterProbe`'s "reflective access" rows
+/// pin both halves.
+fn reflect_array_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    args: &[Value],
+) -> Result<usize, MethodCallFailed> {
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if idx < 0 || i64::from(idx) >= ctx.array_length(arr) as i64 {
+        return Err(RuntimeError::aioobe_no_message(idx).into());
+    }
+    Ok(idx as usize)
 }
 
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -38396,10 +38458,7 @@ fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let elem = ctx.heap_element_type_of(arr);
     let val = ctx.get_array_element(arr, idx);
     // Box primitives with the correct wrapper type for the array component.
@@ -38564,10 +38623,7 @@ fn unbox_for_array_set(
 
 fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let raw = args.get(2).cloned().unwrap_or(Value::Object(None));
     // If the target array is a primitive array, unbox the wrapper Object
     // into the matching primitive Value before writing.  For reference
@@ -38580,19 +38636,13 @@ fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn native_array_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
     ctx.set_array_element(arr, idx, val);
     Ok(None)
@@ -38600,19 +38650,13 @@ fn native_array_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn native_array_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let val = args.get(2).cloned().unwrap_or(Value::Long(0));
     ctx.set_array_element(arr, idx, val);
     Ok(None)
@@ -38620,19 +38664,13 @@ fn native_array_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_array_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let val = args.get(2).cloned().unwrap_or(Value::Float(0.0));
     ctx.set_array_element(arr, idx, val);
     Ok(None)
@@ -38640,19 +38678,13 @@ fn native_array_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn native_array_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     Ok(Some(ctx.get_array_element(arr, idx)))
 }
 
 fn native_array_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let idx = reflect_array_index(&*ctx, arr, args)?;
     let val = args.get(2).cloned().unwrap_or(Value::Double(0.0));
     ctx.set_array_element(arr, idx, val);
     Ok(None)
@@ -38714,8 +38746,18 @@ fn array_new_instance_for_component(
 }
 
 fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `.max(0)` CLAMPED a negative length and returned an empty array, so
+    // `Array.newInstance(int.class, -1)` handed back an `int[0]` where HotSpot
+    // throws. Measured on Temurin 25: `NegativeArraySizeException` whose detail
+    // message is the size alone, with no prose — the same text `new int[-1]`
+    // produces, which is why the variant builds it from the payload rather than
+    // taking a string. Same shape as the missing bounds check on the accessors:
+    // an out-of-range argument silently accepted.
     let len = match args.get(1) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
+        Some(Value::Int(v)) if *v < 0 => {
+            return Err(RuntimeError::NegativeArraySizeException { size: *v }.into());
+        }
+        Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
     let (comp_name, component_id) = array_new_instance_component(ctx, args.first());

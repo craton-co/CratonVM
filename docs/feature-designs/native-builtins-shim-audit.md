@@ -80,6 +80,7 @@ These are the ones where a wrong answer is a wrong *program*.
 | `equals`, `hashCode`, `toString` | `java/lang/Record` | S | yes | yes — the real `java.lang.Record` leaves all three **abstract** (JLS 8.10.3), so there is no bytecode to shadow | ✅ confirmed correct |
 | `equals`, `hashCode`, `toString`, `clone` | `java/lang/Object` | ES / S | yes, universally | yes — `hashCode` uses `ctx.identity_hash_code` (stable across relocation, unlike a raw address) and `toString` calls `hashCode()` **virtually**, so a receiver that overrides it is rendered with its own value | ✅ confirmed correct — this is the fallback the refusals above depend on |
 | `toString` | `java/nio/CharBuffer` | ES | yes | yes — remaining chars from the receiver's own backing store | ✅ |
+| `toString` | `java/util/prefs/AbstractPreferences` | S | **yes** — every `Preferences` subclass that does not override it, including user ones | **was NO** — rendered `Preferences[<slot 1>]`, a hardcoded slot index that is not a node name on a foreign subclass, and not the JDK's text on any receiver | ✅ **FIXED — the JDK's own formula through virtual accessors** (`phases_late/beans_jndi.rs`), see *Fix 5* |
 | `hashCode` | `java/util/AbstractSet` | — | yes — `TreeSet`, `LinkedHashSet`, `EnumSet`, `Collections$UnmodifiableSet` and user subclasses all inherit it | **suspect** — points at `native_hs_hash_code`, a `HashSet`-layout reader, where the real answer is the sum of element hashes | ❌ **CROSS-CRATE** — `native-collections/src/lib.rs:10499`, see *Cross-crate 1* |
 | `toArray` ×2, `contains` | `java/util/AbstractCollection` | — | yes — every Collection that does not override them | **suspect** — `native_al_*`, ArrayList-layout readers | ❌ **CROSS-CRATE** — `native-collections/src/lib.rs:3235`, `:3246`, `:3252` |
 
@@ -109,7 +110,8 @@ re-derived.
 | `java/util/concurrent/ForkJoinTask` | 19 | ES + S | `RecursiveTask`/`RecursiveAction`/user subclasses inherit |
 | `java/util/TimeZone`, `java/time/ZoneId` | 23 | ES + S | |
 | `java/util/concurrent/AbstractExecutorService` | 4 | ES | `submit` ×3 + `invokeAny`; inherited by `ThreadPoolExecutor`, `ScheduledThreadPoolExecutor`, `ForkJoinPool` and third-party executors |
-| `java/security/Policy`, `java/lang/reflect/AccessibleObject`/`Executable`, `java/io/Filter*Stream`, `javax/net/*SocketFactory`, `java/net/URLConnection`/`ProxySelector`/`SocketAddress`, `java/util/prefs/*`, AQS/AOS, `java/util/EnumSet`, `java/security/MessageDigestSpi`, `java/nio/Buffer`, `java/nio/channels/SelectableChannel` | ~90 | mixed | no identity/equality methods among them |
+| `java/security/Policy`, `java/lang/reflect/AccessibleObject`/`Executable`, `java/io/Filter*Stream`, `javax/net/*SocketFactory`, `java/net/URLConnection`/`ProxySelector`/`SocketAddress`, AQS/AOS, `java/util/EnumSet`, `java/security/MessageDigestSpi`, `java/nio/Buffer`, `java/nio/channels/SelectableChannel` | ~90 | mixed | no identity/equality methods among them |
+| `java/util/prefs/*` | ~30 | S | **moved OUT of the row above on 2026-08-06**: it carried `toString`, so "no identity/equality methods among them" was wrong when written. Now a Tier-1 row, fixed. |
 
 ### Tier 3 — interfaces (≈950 registrations, LOW risk, and why)
 
@@ -293,6 +295,134 @@ fallback the fixes depend on — gating it would forbid the fix), and
 are registered through loops over a class-name list rather than string literals,
 so a static enumeration of them is not trustworthy enough to freeze. All of them
 appear in the census table above with an explicit verdict.
+
+### Fix 5 — `AbstractPreferences.toString` rendered a slot index, and had nothing better to render (MEDIUM)
+
+Caught by the gate from *Fix 4*, not by this census — the census had put
+`java/util/prefs/*` in the "no identity/equality methods among them" catch-all,
+which was simply wrong: `register_p72_preferences` registers `toString` on both
+`java/util/prefs/Preferences` and `java/util/prefs/AbstractPreferences`. The
+latter is an inheritance-intercepting base, so the shim answered for every
+`Preferences` subclass that does not override `toString`.
+
+It rendered `Preferences[<slot 1>]`. Two things wrong with that, in order of
+severity: slot 1 is this VM's own synthetic "name" field, which on a foreign
+subclass is some other field or none at all; and even on our own node it is not
+what a `Preferences` renders. Real `AbstractPreferences.toString` is
+
+```java
+(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()
+```
+
+The shim could not have produced that, because neither accessor could answer:
+
+* `isUserNode()` **was not registered at all**, and could not have been —
+  `userRoot()` and `systemRoot()` both called `p72_alloc_prefs` and returned
+  objects that differed in no observable way.
+* `absolutePath()` returned slot 1, i.e. the same string as `name()`. A child
+  of the root answered `alpha` where the spec says `/alpha`, and a root
+  answered `""` where the spec says `/`. The comment on `parent()` directly
+  below it already observed that "`absolutePath()`-style upward walks
+  terminated immediately" — that walk had never been written.
+
+So the fix is three parts, and the first two are what make the third possible:
+slot 5 carries user-vs-system (set by the four static factories, inherited by
+`node()` children); `isUserNode()` is registered against it; `absolutePath()`
+walks the parent chain. `toString` is then the JDK's formula composed through
+**virtual** calls to those two, so a subclass that overrides either is rendered
+with ITS answer — which is what earns the allowlist row in
+`shim_inheritance_guard.rs` rather than a waiver.
+`abstract_preferences_to_string_composes_from_virtual_accessors` pins the two
+accessors the row's justification depends on, so a later edit cannot delete one
+and leave the row asserting something untrue.
+
+Measured against HotSpot 25 (`PrefsProbe`, 13 printed values): **eleven of
+thirteen** matched after this fix. The two that did not are the subject of
+*Fix 6*, and they are recorded here rather than rounded off, because the first
+draft of this paragraph claimed all thirteen and was wrong.
+
+### Fix 6 — `node()` treated a whole path as one node name, and `AbstractPreferences` was not subclassable (MEDIUM)
+
+The two residuals *Fix 5* left open, and they are one change because the second
+is what makes the first testable.
+
+**`node(path)` resolved a single name.** `node("x/y/z")` produced ONE node
+literally called `x/y/z`. `absolutePath()` happened to render the same text —
+one segment that contains slashes — so a probe that only checked the path saw
+nothing wrong. `name()` answered `x/y/z` where HotSpot answers `z`,
+`nodeExists("x")` was false immediately after creating `x/y/z`, and
+`parent()` skipped two levels. None of the four malformed shapes the JDK
+rejects were rejected. It now walks the path:
+
+* a leading `/` resolves from the root of this node's tree, not from this node;
+* `""` names this node and `"/"` names the root;
+* an empty segment is `IllegalArgumentException`, with the JDK's own two
+  messages — `"Path ends with slash"` when it is the last segment,
+  `"Consecutive slashes in path"` otherwise;
+* a segment longer than `MAX_NAME_LENGTH` (80) is refused, and 80 itself is
+  legal.
+
+`nodeExists` walks the same grammar with a lookup-only step, because the two
+must agree; and both now raise `IllegalStateException` on a removed node, with
+`nodeExists("")` the one query a removed node still answers (`!removed`) rather
+than throwing, exactly as the JDK splits it.
+
+The single-segment get-or-create is lifted out of the old closure into
+`p72_prefs_child_or_create` so the walk reuses it rather than duplicating the
+pinning discipline — every step allocates, and each live reference is carried
+across it through `pin_native_root`/`read_native_pin`.
+
+**`AbstractPreferences(AbstractPreferences, String)` is registered**, so
+`class X extends AbstractPreferences` is constructible. It was not, and that
+is why *Fix 5* could only assert its central claim — "a subclass overrides an
+accessor and the rendering follows it" — at the registry level: a subclass
+could not be built to test it. Constructor validation is the real one, message
+for message (`Root name '…' must be ""`, `Name '…' contains '/'`,
+`Illegal name: empty string`). Its slot-5 answer follows the real definition of
+`isUserNode()`, which is `root == Preferences.userRoot()`: a node that roots
+ITSELF is not in the user tree, so it renders "System" — measured, not assumed,
+and the same reason the no-arg constructor's default flipped to 0.
+
+`java/util/prefs/AbstractPreferences` needed its own `instance_fields(6)` row
+for the same reason `Preferences` did; a subclass allocated through the new
+constructor has to have the slots the constructor writes.
+
+Measured against HotSpot 25: `PrefsPathProbe`'s 18 values — path splitting,
+parent chain, `nodeExists` at every level, node memoisation identity, absolute
+resolution, all five `IllegalArgumentException` texts, and three subclass
+shapes including one that overrides only `absolutePath`/`isUserNode` — are
+**identical**, and `PrefsProbe` is now 13 of 13. The path grammar also has
+hermetic coverage (`prefs_path_tests`), which asserts that a name of exactly 80
+characters is legal rather than only that 81 is refused.
+
+## Residual 5 — `Preferences.userRoot()` returns a FRESH tree on every call
+
+Found while measuring *Fix 6*; **not fixed here**, and it is the more serious
+of the two remaining. `userRoot()`/`systemRoot()` allocate a new node per call
+instead of answering a per-VM singleton, so the idiomatic
+write-here-read-there pattern loses data with no exception:
+
+| | HotSpot 25 | CratonVM `--synthetic-jdk` |
+|---|---|---|
+| `userRoot() == userRoot()` | `true` | `false` |
+| `userRoot().put("k","v")` then `userRoot().get("k","MISSING")` | `v` | **`MISSING`** |
+| `userRoot().node("n1")` then `userRoot().nodeExists("n1")` | `true` | **`false`** |
+
+This is the shape this repository keeps filing: the call succeeds, nothing
+throws, and the state is gone. It also means real `isUserNode()`'s definition
+(`root == Preferences.userRoot()`) could never have been implemented literally
+here — the slot-5 flag *Fix 5* added is the model that works without a
+singleton, and it stays correct once one exists.
+
+The fix has an established shape in this crate: hold the two roots in a
+VM-scoped side table keyed by `ctx.vm_identity()`, registered through
+`register_var_handle_root` / read back through `read_var_handle_root`, which is
+the documented remedy for a raw `ObjectRef` singleton going stale after a
+moving collection (the `ASYNC_POOL` shape). `userNodeForPackage` /
+`systemNodeForPackage` then become a `node()` walk of the package path under
+the right root, which is what they are in the JDK — today they are four
+identical calls to the same allocator and ignore their `Class` argument
+entirely.
 
 ## Handed-over item 1 — `ensure_synthetic_class` must become fallible: BLOCKED, cross-crate
 

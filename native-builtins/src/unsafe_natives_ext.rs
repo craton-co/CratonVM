@@ -3959,10 +3959,7 @@ pub(crate) fn native_unsafe_copy_memory(
                 }
             }
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: dest_offset as i32,
-                }
-                .into(),
+                cratonvm_types::error::RuntimeError::aioobe_index_only(dest_offset as i32).into(),
             );
         }
         // Legacy slot-by-slot copy for object-field (non-array) targets only.
@@ -4025,10 +4022,7 @@ pub(crate) fn native_unsafe_set_memory(
                 return Ok(None);
             }
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: offset as i32,
-                }
-                .into(),
+                cratonvm_types::error::RuntimeError::aioobe_index_only(offset as i32).into(),
             );
         }
         // Object-field (non-array) target: bounded slot fill. `bytes` is capped

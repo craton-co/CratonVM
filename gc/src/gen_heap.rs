@@ -951,6 +951,29 @@ fn watchref_dbg() -> bool {
     gc_flags().dbg_watchref
 }
 
+thread_local! {
+    /// Phase marks recorded by the MOVING (Cheney) young cycle for the current
+    /// collection, drained by `collect_garbage_inner`'s pause timer.
+    ///
+    /// A thread-local rather than a value threaded through the cycle because
+    /// that function has many exit paths (young-skip backstops, the non-moving
+    /// diversion, promotion-OOM bailouts); a returned value would report only
+    /// the one that falls through, which is not the interesting case.
+    static MOVING_PHASE_MARKS: std::cell::RefCell<Vec<(&'static str, u128)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record one moving-young phase duration. Only ever called when
+/// `CRATONVM_DBG=gcpause` is on.
+fn moving_phase_marks_push(name: &'static str, ms: u128) {
+    MOVING_PHASE_MARKS.with(|m| m.borrow_mut().push((name, ms)));
+}
+
+/// Take and clear this thread's moving-young phase marks.
+fn moving_phase_marks_take() -> Vec<(&'static str, u128)> {
+    MOVING_PHASE_MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
 /// DBG (`CRATONVM_DBG_PROMO_SEED`): report how many of THIS cycle's young→old
 /// promotion destinations the in-place old sweep seeded its mark from, and how
 /// many `old_gen_mark_candidate_plausible` rejected. A nonzero rejection count
@@ -4996,8 +5019,20 @@ impl GenerationalHeap {
             fn drop(&mut self) {
                 if let Some(t0) = self.0 {
                     let ms = t0.elapsed().as_millis();
+                    // Drain unconditionally: marks from a fast cycle must not
+                    // survive to be reported against the next slow one.
+                    let marks = moving_phase_marks_take();
                     if ms >= 100 {
-                        eprintln!("[gcpause] collection took {ms}ms");
+                        if marks.is_empty() {
+                            eprintln!("[gcpause] collection took {ms}ms");
+                        } else {
+                            let detail = marks
+                                .iter()
+                                .map(|(n, d)| format!("{n}={d}ms"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("[gcpause] collection took {ms}ms  {detail}");
+                        }
                     }
                 }
             }
@@ -5853,15 +5888,42 @@ impl GenerationalHeap {
         // old gen; popped by the alternating Cheney scan below.
         let mut promoted_worklist: Vec<*mut u8> = Vec::new();
 
+        // Phase timing for the MOVING (Cheney) young cycle, on the same
+        // `CRATONVM_DBG=gcpause` flag that already reports the total.
+        //
+        // `gcphase` instruments `sweep_young_non_moving` ONLY, so a workload
+        // that never diverts to the non-moving sweep reports a slow collection
+        // with no breakdown at all. That is exactly the state the OAuth2
+        // 500 ms read-timeout investigation hit: `[gcpause] collection took
+        // 566ms` with `gcphase` completely silent, because this arm ran
+        // instead. Printed only when the cycle is already slow, so the steady
+        // state pays two `Instant::now()` calls and nothing else.
+        // Marks go to a thread-local that `collect_garbage_inner`'s existing
+        // pause timer drains on drop, so the breakdown survives every exit path
+        // this function has rather than only the one that falls through.
+        let mv_phase_on = gc_flags().dbg_gcpause;
+        let mut mv_last = std::time::Instant::now();
+        macro_rules! mv_phase {
+            ($name:expr) => {
+                if mv_phase_on {
+                    let now = std::time::Instant::now();
+                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
+                    mv_last = now;
+                }
+            };
+        }
+
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
         Self::scan_dirty_cards(card_table, &old_gen, &young_from, &mut extra_roots);
+        mv_phase!("scan_dirty_cards");
         // Card marking is a fast path only. A missed barrier must retain an
         // object for one extra collection, never reclaim a reachable child.
         if Self::full_old_rset_scan_enabled() {
             Self::scan_all_old_to_young(&old_gen, &young_from, &mut extra_roots);
         }
+        mv_phase!("full_old_rset_scan");
 
         // Phase 1: Forward all root objects
         for root in roots.iter_mut() {
@@ -5884,6 +5946,8 @@ impl GenerationalHeap {
             // space in young_to or old_gen and copied a valid object there.
             *root = unsafe { ObjectRef::from_raw(new_ptr) };
         }
+
+        mv_phase!("root_forward");
 
         // Phase 1a: forward the overlay-backed collections' Rust-side edges.
         //
@@ -5938,6 +6002,8 @@ impl GenerationalHeap {
         // exactly one cycle (the promoting one) and the cycle after the dirty-
         // card fixup forgets it.
         let mut deferred_dirty_cards: Vec<usize> = Vec::new();
+
+        mv_phase!("overlay_forward");
 
         // Phase 1b: Forward old→young references from dirty cards
         // Ref arrays use compact 8-byte pointers; object fields use 16-byte Value.
@@ -6045,6 +6111,8 @@ impl GenerationalHeap {
                 }
             }
         }
+
+        mv_phase!("card_root_forward");
 
         // Phase 2 + 2b: Combined Cheney scan and promoted object scan.
         //
@@ -6228,6 +6296,8 @@ impl GenerationalHeap {
                 break;
             }
         }
+
+        mv_phase!("cheney_drain");
 
         // Phase 2.5: Resurrect dead finalizable objects — forward any
         // unreachable finalizable objects so finalize() can access them.
@@ -11670,20 +11740,27 @@ impl GenerationalHeap {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                 let stretch_hi = if resynced { cursor } else { used };
-                let mut w = stretch_lo & !7;
-                while w + 8 <= stretch_hi {
-                    // SAFETY: `[base+w, base+w+8)` is mapped from-space memory.
-                    let word = unsafe { *((base + w) as *const u64) } as usize;
-                    if walked_bases.binary_search(&word).is_ok() {
-                        // SAFETY: `word` is a verified old-gen object BASE;
-                        // its header is valid and mutable for marking.
-                        let ref_header = unsafe { &mut *(word as *mut ObjectHeader) };
+                let mut mark_if_old_base = |candidate: usize| {
+                    if walked_bases.binary_search(&candidate).is_ok() {
+                        // SAFETY: `candidate` is a verified old-gen object
+                        // BASE; its header is valid and mutable for marking.
+                        let ref_header = unsafe { &mut *(candidate as *mut ObjectHeader) };
                         if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
                             ref_header.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(word as *mut u8);
+                            worklist.push(candidate as *mut u8);
                         }
                     }
-                    w += 8;
+                };
+                // SAFETY: `[base+stretch_lo, base+stretch_hi)` is mapped
+                // from-space memory.
+                unsafe {
+                    for_each_conservative_ref_slot(
+                        base,
+                        stretch_lo,
+                        stretch_hi,
+                        cratonvm_types::narrow_oop::narrow_oops_enabled(),
+                        |_slot, _width, value| mark_if_old_base(value),
+                    );
                 }
                 if resynced {
                     continue;
@@ -11859,16 +11936,48 @@ impl GenerationalHeap {
         // address. (A primitive that happens to equal a moved object's old
         // address would be corrupted — vanishingly unlikely — whereas an
         // unrewritten real reference is a certain use-after-free.)
+        // The mark-phase counterpart of this scan is in
+        // `mark_young_to_old_refs`; both have to agree about slot WIDTH or the
+        // pair leaves dangling refs behind. See gc/src/compressed_oops.rs,
+        // hole 2: with narrow oops on, an 8-byte read spans two 4-byte
+        // reference slots, so no relocated address is ever recognised and
+        // every reference in an unparseable stretch is left pointing at the
+        // old, now-evacuated address.
+        //
+        // A narrow rewrite only fires when the DECODED value is a key in
+        // `compact_map` — i.e. the exact old base of an object this cycle
+        // actually moved — and writes back the re-encoded new base at the same
+        // width it read. `encode` returns 0 for anything outside the
+        // compressible range, so a slot is only ever rewritten to a value that
+        // round-trips; the guard keeps a non-encodable destination from
+        // silently becoming a null.
+        let narrow = cratonvm_types::narrow_oop::narrow_oops_enabled();
         let rewrite_stretch_conservatively = |lo: usize, hi: usize| {
-            let mut w = lo & !7;
-            while w + 8 <= hi {
-                // SAFETY: `[base+lo, base+hi)` is mapped from-space memory.
-                let cell = (base + w) as *mut u64;
-                let word = unsafe { *cell } as usize;
-                if let Some(&new_addr) = compact_map.get(&word) {
-                    unsafe { *cell = new_addr as u64 };
-                }
-                w += 8;
+            // SAFETY: `[base+lo, base+hi)` is mapped from-space memory, and
+            // each `slot` handed back is a location this scan just read.
+            unsafe {
+                for_each_conservative_ref_slot(base, lo, hi, narrow, |slot, width, value| {
+                    let Some(&new_addr) = compact_map.get(&value) else {
+                        return;
+                    };
+                    if width == 8 {
+                        *(slot as *mut u64) = new_addr as u64;
+                    } else {
+                        // Re-encode at the width it was read. `encode` returns
+                        // 0 for an address outside the compressible range, and
+                        // writing that would turn a live reference into null —
+                        // so leave the slot alone instead. A destination
+                        // outside the range cannot happen for a young-to-old
+                        // move inside the configured heap; the guard is here so
+                        // that if it ever does, the failure is a stale
+                        // reference the next cycle can still see rather than a
+                        // silent null.
+                        let re = cratonvm_types::narrow_oop::encode(new_addr as u64);
+                        if re != 0 {
+                            *(slot as *mut u32) = re;
+                        }
+                    }
+                });
             }
         };
         while cursor < used {
@@ -14856,6 +14965,58 @@ fn parallel_sweep_walk(
 /// the function large enough that LLVM declined to inline it, so every object in
 /// the walk paid a real call. The diagnostics now live in `#[cold]` helpers and
 /// this is `#[inline]`.
+/// Visit every aligned value in `[base+lo, base+hi)` that a **conservative**
+/// scan of an unparseable young-from stretch must treat as a possible
+/// reference, at every width a reference can occupy.
+///
+/// `visit(slot_addr, width, value)`:
+///   * `width == 8` — the raw 64-bit word, the historical behaviour.
+///   * `width == 4` — an aligned 32-bit half DECODED as a narrow oop. Only
+///     produced when compressed oops are on, and never for a zero (null) slot.
+///
+/// Both widths are visited rather than one or the other. Only reference FIELDS
+/// and reference ARRAY ELEMENTS are narrowed, so an unparseable stretch can
+/// still hold full-width pointers (legacy 16-byte `Value` cells, internal
+/// pointers) alongside narrow ones. Over-visiting is safe here by construction:
+/// every caller filters the value against a set of known object bases before
+/// acting on it.
+///
+/// The mark walk (`mark_young_to_old_refs`) and the rewrite walk
+/// (`fixup_young_old_refs`) MUST agree about width — a slot marked at one width
+/// and rewritten at another leaves a dangling reference — so they share this.
+/// See gc/src/compressed_oops.rs, hole 2: before this existed both scanned
+/// 8-byte words only, so with narrow oops on, a pair of adjacent 4-byte
+/// references never matched anything, marks were missed (premature
+/// reclamation) and refs to moved objects were left unrewritten (dangling).
+///
+/// # Safety
+/// `[base+lo, base+hi)` must be mapped, readable memory.
+unsafe fn for_each_conservative_ref_slot(
+    base: usize,
+    lo: usize,
+    hi: usize,
+    narrow: bool,
+    mut visit: impl FnMut(usize, usize, usize),
+) {
+    let mut w = lo & !7;
+    while w + 8 <= hi {
+        let addr = base + w;
+        // SAFETY: caller guarantees `[base+lo, base+hi)` is mapped.
+        visit(addr, 8, unsafe { *(addr as *const u64) } as usize);
+        if narrow {
+            for half in 0..2 {
+                let slot = addr + half * 4;
+                // SAFETY: within the same mapped 8 bytes.
+                let encoded = unsafe { *(slot as *const u32) };
+                if encoded != 0 {
+                    visit(slot, 4, cratonvm_types::narrow_oop::decode(encoded) as usize);
+                }
+            }
+        }
+        w += 8;
+    }
+}
+
 #[inline]
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     // GCAUD-3 (2026-08-01) — the "not a real object" backstop, hoisted.
@@ -20629,5 +20790,155 @@ mod tests {
         for (index, object) in roots.iter().copied().enumerate() {
             assert_eq!(heap.get_field(object, 0), Value::Int(index as i32));
         }
+    }
+}
+
+// ===========================================================================
+// Conservative reference scanning under compressed oops (compressed_oops.rs
+// hole 2)
+// ===========================================================================
+
+/// `for_each_conservative_ref_slot` is the shared width contract between the
+/// mark walk and the rewrite walk. These pin the property the fix exists for:
+/// with narrow oops on, a pair of adjacent 4-byte references is INVISIBLE to an
+/// 8-byte word scan, so the fallback that is supposed to save an unparseable
+/// stretch saved nothing.
+#[cfg(test)]
+mod conservative_narrow_scan_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The narrow-oop base/shift are process-global, so these tests serialise
+    /// against each other and restore the disabled state on the way out.
+    static NARROW_CFG: Mutex<()> = Mutex::new(());
+
+    const BASE: u64 = 0x2000_0000;
+    const SHIFT: usize = 3;
+
+    /// Collect `(slot_offset_from_base, width, value)` over a buffer.
+    fn scan(buf: &[u64], narrow: bool) -> Vec<(usize, usize, usize)> {
+        let base = buf.as_ptr() as usize;
+        let mut out = Vec::new();
+        // SAFETY: the whole slice is mapped, and `hi` is its byte length.
+        unsafe {
+            for_each_conservative_ref_slot(base, 0, buf.len() * 8, narrow, |slot, w, v| {
+                out.push((slot - base, w, v));
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn a_narrow_oop_pair_is_invisible_to_the_word_scan_and_visible_with_narrow_on() {
+        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
+
+        let a = BASE + (0x100 << SHIFT);
+        let b = BASE + (0x200 << SHIFT);
+        let (ea, eb) = (
+            cratonvm_types::narrow_oop::encode(a),
+            cratonvm_types::narrow_oop::encode(b),
+        );
+        assert_ne!(ea, 0, "test address must be encodable");
+        assert_ne!(eb, 0, "test address must be encodable");
+        // Two 4-byte references packed into one 8-byte word, little-endian.
+        let buf = vec![(ea as u64) | ((eb as u64) << 32)];
+
+        let wide = scan(&buf, false);
+        assert_eq!(wide.len(), 1, "one 8-byte word");
+        assert!(
+            !wide.iter().any(|&(_, _, v)| v == a as usize || v == b as usize),
+            "THE BUG: the 8-byte word spans both references and equals neither: {:#x}",
+            wide[0].2
+        );
+
+        let narrow = scan(&buf, true);
+        let values: Vec<usize> = narrow.iter().map(|&(_, _, v)| v).collect();
+        assert!(values.contains(&(a as usize)), "first narrow oop decoded");
+        assert!(values.contains(&(b as usize)), "second narrow oop decoded");
+        // The widths and offsets have to be right for the rewrite walk to write
+        // back at the width it read.
+        assert!(narrow.contains(&(0, 4, a as usize)), "{:x?}", narrow);
+        assert!(narrow.contains(&(4, 4, b as usize)), "{:x?}", narrow);
+
+        cratonvm_types::narrow_oop::disable_for_test();
+    }
+
+    #[test]
+    fn full_width_pointers_are_still_scanned_when_narrow_is_on() {
+        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
+
+        // A legacy 16-byte `Value` cell or an internal pointer is NOT narrowed,
+        // so turning narrow oops on must not stop the 8-byte scan from seeing
+        // it. Both widths, not one or the other.
+        let raw = 0xdead_beef_0000_1000u64;
+        let buf = vec![raw];
+        let got = scan(&buf, true);
+        assert!(
+            got.iter().any(|&(off, w, v)| off == 0 && w == 8 && v == raw as usize),
+            "the full-width word must still be visited: {:x?}",
+            got
+        );
+
+        cratonvm_types::narrow_oop::disable_for_test();
+    }
+
+    #[test]
+    fn null_halves_produce_no_narrow_candidate() {
+        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
+
+        // encode(0) is 0 and decode(0) is 0; a null slot must not be offered as
+        // a candidate address, or every zeroed word would decode to `base`.
+        let a = BASE + (0x100 << SHIFT);
+        let ea = cratonvm_types::narrow_oop::encode(a);
+        let buf = vec![ea as u64, 0u64];
+        let got = scan(&buf, true);
+        assert_eq!(
+            got.iter().filter(|&&(_, w, _)| w == 4).count(),
+            1,
+            "only the one non-null half is a candidate: {:x?}",
+            got
+        );
+        assert!(got.contains(&(0, 4, a as usize)));
+
+        cratonvm_types::narrow_oop::disable_for_test();
+    }
+
+    #[test]
+    fn narrow_off_visits_exactly_the_aligned_words() {
+        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
+        cratonvm_types::narrow_oop::disable_for_test();
+
+        let buf = vec![1u64, 2, 3, 4];
+        let got = scan(&buf, false);
+        assert_eq!(
+            got,
+            vec![(0, 8, 1), (8, 8, 2), (16, 8, 3), (24, 8, 4)],
+            "unchanged historical behaviour when the gate is off"
+        );
+    }
+
+    #[test]
+    fn a_relocated_narrow_reference_round_trips_through_encode() {
+        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
+
+        // What the rewrite walk does: decode, look the old base up, re-encode
+        // the new base at the SAME width. If that round trip were lossy the
+        // fallback would write a corrupt reference rather than a stale one.
+        for n in [1u64, 2, 0x100, 0xffff, 0x10_0000] {
+            let addr = BASE + (n << SHIFT);
+            let e = cratonvm_types::narrow_oop::encode(addr);
+            assert_ne!(e, 0, "{addr:#x} must be encodable");
+            assert_eq!(
+                cratonvm_types::narrow_oop::decode(e),
+                addr,
+                "{addr:#x} must round-trip"
+            );
+        }
+
+        cratonvm_types::narrow_oop::disable_for_test();
     }
 }

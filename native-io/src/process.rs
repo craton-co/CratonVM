@@ -1851,17 +1851,13 @@ fn pipe_io_err(err: impl std::fmt::Display) -> MethodCallFailed {
 fn pipe_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
     if off < 0 || len < 0 {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { len },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 { off } else { len }),
         )));
     }
     match (off as usize).checked_add(len as usize) {
         Some(end) if end <= arr_len => Ok(()),
         _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: off.saturating_add(len),
-            },
+            RuntimeError::aioobe_index_only(off.saturating_add(len)),
         ))),
     }
 }

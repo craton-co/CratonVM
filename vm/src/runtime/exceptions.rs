@@ -1445,9 +1445,10 @@ pub fn throw_runtime_error(
         }
     }
     if dbg_aioobe() {
-        if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &error {
+        if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &error {
             eprintln!(
-                "[AIOOBE-THROW] index={index} — full live Java thread stack ({} frames, deepest first):",
+                "[AIOOBE-THROW] index={index} message={} — full live Java thread stack ({} frames, deepest first):",
+                message.as_deref().unwrap_or("<none>"),
                 thread.frames.len()
             );
             for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
@@ -1696,7 +1697,7 @@ pub fn throw_runtime_error(
         return MethodCallFailed::InternalError(VmError::Runtime(error));
     };
 
-    match create_exception_object(shared, thread, class_name, message) {
+    match create_exception_object(shared, thread, class_name, message.as_deref()) {
         Ok(obj_ref) => {
             populate_pattern_syntax_fields(shared, obj_ref, &error);
             MethodCallFailed::ExceptionThrown(obj_ref)
@@ -2315,7 +2316,7 @@ mod tests {
     #[test]
     fn throw_array_index_out_of_bounds() {
         let mut vm = test_vm();
-        let error = RuntimeError::ArrayIndexOutOfBoundsException { index: 42 };
+        let error = RuntimeError::aioobe_index_only(42);
         let result = throw_runtime_error(&vm.shared, &mut vm.main_thread, error);
         assert!(matches!(
             result,
@@ -2520,11 +2521,27 @@ mod tests {
 
     #[test]
     fn runtime_error_array_index_carries_index() {
-        let error = RuntimeError::ArrayIndexOutOfBoundsException { index: -1 };
+        let error = RuntimeError::aioobe_index_only(-1);
         // Just verify the variant holds the data; we can't check Java object
         // creation without rt.jar but we can verify the Rust side
-        if let RuntimeError::ArrayIndexOutOfBoundsException { index } = error {
+        if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = error {
             assert_eq!(index, -1);
+            assert_eq!(
+                message, None,
+                "aioobe_index_only is the explicit \"cannot name the length\" \
+                 constructor — it must not invent a message"
+            );
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn runtime_error_array_index_carries_hotspot_message() {
+        let error = RuntimeError::aioobe(9, 4);
+        if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = error {
+            assert_eq!(index, 9);
+            assert_eq!(message.as_deref(), Some("Index 9 out of bounds for length 4"));
         } else {
             panic!("wrong variant");
         }

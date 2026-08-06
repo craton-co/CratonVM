@@ -23,6 +23,37 @@
 
 use super::x64::{LOCAL_REGS, LOCAL_XMMS};
 
+/// The GPR pool this allocator may colour Java locals into.
+///
+/// Normally the whole of [`LOCAL_REGS`], which is **7 registers on Windows**
+/// (`R12–R15, RBX, RSI, RDI`) and **5 on System V** (no `RSI`/`RDI`). That
+/// difference is not cosmetic: it is the stated mechanism behind a family of
+/// OSR miscompiles that reproduce only on Linux, because the smaller pool
+/// forces the coalescing the OSR dead-mask exists to handle. See
+/// `internal/fixed-suite-bugs/jit/arrays-sort-long-osr-miscompile-FIXED.md`.
+///
+/// `CRATONVM_JIT_LOCAL_REGS=<n>` truncates the pool to its first `n` entries,
+/// so a Windows host can be put under System V's register pressure — the one
+/// variable a Windows reproduction attempt otherwise cannot control, and the
+/// reason "it passed on Windows" has repeatedly had to be written off as a
+/// vacuous negative rather than an exoneration.
+///
+/// Unset (the default) returns the full slice, so every compile is
+/// byte-identical to a tree without this knob. A value above the pool size is
+/// clamped rather than rejected: the intent is always "at most this many".
+pub fn local_gpr_pool() -> &'static [u8] {
+    use std::sync::OnceLock;
+    static POOL_LEN: OnceLock<usize> = OnceLock::new();
+    let n = *POOL_LEN.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_REGS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.min(LOCAL_REGS.len()))
+            .unwrap_or(LOCAL_REGS.len())
+    });
+    &LOCAL_REGS[..n]
+}
+
 // Used only by the IR-level linear-scan allocator at the bottom of this file.
 use crate::bailout::{Bailout, BailoutReason, CompileResult};
 use crate::ir::{Graph, IrType, NodeId, Op, NO_NODE};
@@ -1624,7 +1655,7 @@ pub fn allocate_registers(
         num_params,
         &[],
         loops,
-        &LOCAL_REGS,
+        local_gpr_pool(),
         &LOCAL_XMMS,
         &[],
     )
@@ -1658,7 +1689,7 @@ pub fn allocate_registers_with_handlers(
         num_params,
         param_slots,
         loops,
-        &LOCAL_REGS,
+        local_gpr_pool(),
         &LOCAL_XMMS,
         handlers,
     )

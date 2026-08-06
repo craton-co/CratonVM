@@ -2497,12 +2497,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         } else {
             (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: bad_index,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(bad_index).into());
     }
     let buf = match buf {
         Some(b) => b,
@@ -6351,18 +6346,11 @@ pub(crate) fn native_string_utf16_get_chars(
         } else {
             (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(index).into());
     }
     let mut bytes = vec![0u8; count * 2];
     if ctx.read_byte_array_into(value, src_begin as usize * 2, &mut bytes) != bytes.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: src_begin,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(src_begin).into());
     }
     let units: Vec<u16> = bytes
         .chunks_exact(2)

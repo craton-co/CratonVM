@@ -3333,16 +3333,12 @@ pub(crate) fn cl_define_class_basic(
     // Safe integer handling: reject negative offset/length (i32 → usize)
     let offset = match args.get(3) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => 0,
     };
     let length = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => array_len,
     };
 
@@ -3357,7 +3353,7 @@ pub(crate) fn cl_define_class_basic(
             "[define_class] bounds violation: offset={offset} length={length} \
              array_len={array_len} (name={name_str})"
         );
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+        return Err(RuntimeError::aioobe_index_only(-1).into());
     }
 
     // Read bytes from the array.
@@ -3943,21 +3939,19 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 3) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (off as i32).max(0),
-            },
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4010,13 +4004,13 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 3) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_buffer_slice(ctx, bb, off, len).map_err(|msg| {
@@ -4090,21 +4084,19 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 5) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (off as i32).max(0),
-            },
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4353,9 +4345,9 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "Unsafe.defineClass({name_str}): offset/length out of bounds \
              (off={offset}, len={length}, array={array_len}) — throwing AIOOBE"
         );
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: offset.saturating_add(length).min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_index_only(
+            offset.saturating_add(length).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
@@ -4592,7 +4584,7 @@ pub fn cl_get_resource_essential(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// `NoSuchMethodError java/lang/String.findResource` and broke every
 /// `getSystemResource` caller (kafka-codec / hadoop-conf / hbase-conf
 /// regression-pool probes).
-fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+pub(crate) fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let mut cur = ctx.class_id_of_object(obj);
     for _ in 0..64 {
         match ctx.class_name_of_id(cur) {

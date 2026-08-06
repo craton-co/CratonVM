@@ -20,6 +20,11 @@
  *   readValue/writeValue  GetFieldID + Get/SetIntField on an instance
  *   callBackTriple        GetStaticMethodID + CallStaticIntMethod: native ->
  *                         Java re-entry
+ *   upcallThrow           the other half of that re-entry: when the Java method
+ *                         THROWS, the exception must be pending at the up-call's
+ *                         return so the native can see it -- a native that reads
+ *                         the return value with nothing pending cannot tell a
+ *                         thrown exception from a real 0
  *   throwIse              ThrowNew, and that a pending exception propagates to
  *                         the Java caller rather than being swallowed
  *   registeredNative      bound by JNI_OnLoad/RegisterNatives instead of by
@@ -177,6 +182,40 @@ JNIEXPORT void JNICALL FN(throwIse)(JNIEnv *env, jclass cls, jstring msg) {
     (*env)->ThrowNew(env, ise, m != NULL ? m : "");
     if (m != NULL) (*env)->ReleaseStringUTFChars(env, msg, m);
     (*env)->DeleteLocalRef(env, ise);
+}
+
+JNIEXPORT jstring JNICALL FN(upcallThrow)(JNIEnv *env, jclass cls, jint n) {
+    jmethodID mid;
+    jthrowable pending;
+    jclass iae;
+    const char *verdict;
+
+    mid = (*env)->GetStaticMethodID(env, cls, "boom", "(I)I");
+    if (mid == NULL) return (*env)->NewStringUTF(env, "no-mid");
+    (void) (*env)->CallStaticIntMethod(env, cls, mid, n);
+    if (!(*env)->ExceptionCheck(env)) {
+        return (*env)->NewStringUTF(env, "no-pending");
+    }
+    pending = (*env)->ExceptionOccurred(env);
+    (*env)->ExceptionClear(env);
+    if (pending == NULL) {
+        return (*env)->NewStringUTF(env, "pending-but-null");
+    }
+    iae = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+    if (iae != NULL && (*env)->IsInstanceOf(env, pending, iae)) {
+        verdict = "iae";
+    } else {
+        verdict = "other";
+    }
+    if (iae != NULL) (*env)->DeleteLocalRef(env, iae);
+    /* The clear above must have taken: this native returns normally, so a
+     * still-pending exception would surface in the CALLER rather than here. */
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->DeleteLocalRef(env, pending);
+        return (*env)->NewStringUTF(env, "not-cleared");
+    }
+    (*env)->DeleteLocalRef(env, pending);
+    return (*env)->NewStringUTF(env, verdict);
 }
 
 JNIEXPORT jint JNICALL FN(callBackTriple)(JNIEnv *env, jclass cls, jint n) {

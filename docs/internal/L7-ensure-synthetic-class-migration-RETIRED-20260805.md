@@ -310,6 +310,21 @@ would iterate an empty real table and return a **silently wrong** answer
 instead of a loud one. That is the collections reclassification wave
 (L10/L11), and it has to come first.
 
+> **Updated 2026-08-05.** The retagging argument above is still right, and
+> `HashSet.iterator()` was NOT retagged. But "cannot be fixed" was too strong,
+> and the four are fixed without L10/L11: the natives stay, and where the
+> policy refuses the fabricated iterator class they hand the snapshot back
+> through a real `Arrays$ArrayList`'s own iterator — which reads only the
+> `Object[]` it was handed, not a `table[]`. `StreamCollector` went the other
+> way and needed no `Consumer` at all (`Spliterators.iterator`). Details and
+> measurements in
+> `docs/known-issues/jdk-only/strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`.
+> Worth recording as a process note: this page's premise was derived by reading
+> the code, and a probe that measured it instead
+> (`probes/StrictIterPrimitivesProbe`) found the actual cause was different —
+> one site minting the class through the INFALLIBLE `alloc_synthetic`, which
+> made every other site's refusal order-dependent.
+
 The distinction is the whole content of R1: a factory whose product
 **delegates** to the collection it was handed (`Collections.unmodifiableMap`,
 `List.of`) can be retagged today, because the backing collection's natives

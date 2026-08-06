@@ -230,20 +230,33 @@ pub struct CachedBytecodeMethod {
     /// hit (cheap: a single generation-counter read plus a short allowlist).
     ///
     /// JDK-ONLY-WAVE2 (`docs/feature-designs/jdk-only-mode.md` §7): this cell
-    /// memoizes the *answer* of a ~1400-line hard-coded class-name/method-name
-    /// dispatcher (`force_native_over_real_jdk_bytecode` in
-    /// `vm/src/runtime/interpreter.rs`) whose whole purpose is to make a
-    /// registered native win over concrete real-JDK bytecode — the exact
-    /// inversion §1 rule 4 forbids under `JdkOnly`. The list is a wave-2
-    /// removal and must NOT be deleted this wave. What must change here: the
-    /// memoized `bool` has to become policy-qualified, because a `true`
-    /// memoized under `Compatible` is not a valid answer under `JdkOnly` and
-    /// this cell cannot tell the two apart. Simplest correct shape is to store
-    /// the `CompatibilityMode` alongside the bool (`OnceLock<(bool, u8)>`) and
-    /// re-derive on a mode mismatch; the mode is fixed per VM, so the compare
-    /// is free. Not done in wave 1 because the ~38 struct literals of this type
-    /// spell the field `std::sync::OnceLock::new()` and live in four crates
-    /// owned by four different agents.
+    /// memoizes the *answer* of a hard-coded class-name/method-name dispatcher
+    /// (`force_native_over_real_jdk_bytecode`, `vm/src/runtime/interpreter/
+    /// native_override.rs`) whose whole purpose is to make a registered native
+    /// win over concrete real-JDK bytecode — the exact inversion §1 rule 4
+    /// forbids under `JdkOnly`. The list is a wave-2 removal and must NOT be
+    /// deleted this wave.
+    ///
+    /// **This marker used to prescribe making the memo policy-qualified —
+    /// `OnceLock<(bool, u8)>`, re-derived on a mode mismatch — on the grounds
+    /// that "a `true` memoized under `Compatible` is not a valid answer under
+    /// `JdkOnly`". That prescription was wrong and was retracted 2026-08-04.
+    /// Do not implement it.** `force_native_over_real_jdk_bytecode(class_name,
+    /// method_name, method_descriptor)` takes those three arguments and nothing
+    /// else; re-checked against the current tree 2026-08-06, its 2,230-line
+    /// body reads no mode, no policy and no VM. The memo is mode-independent
+    /// and sound, and qualifying it would buy nothing.
+    ///
+    /// Policy is applied *downstream* of this cell, at dispatch — which is
+    /// where the real defect turned out to be. Chasing this marker instead of
+    /// the dispatch is why seven call sites reached
+    /// `intercept_force_registered_native{,_cached}` with no `dispatch_policy`,
+    /// no `resolve_native_dispatch_wave1` and no `record_invocation` until
+    /// 2026-08-04. They now route through `admit_forced_native`.
+    ///
+    /// What is left here is not a defect: when the list goes, so does this
+    /// cell. Until then it turns ~55 string comparisons per cached dispatch
+    /// into an O(1) read.
     pub force_native_cache: std::sync::OnceLock<bool>,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**

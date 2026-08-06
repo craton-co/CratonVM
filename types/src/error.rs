@@ -14,6 +14,7 @@
 //! that `VmError` carries, and because every crate that can raise one already
 //! depends on this module.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use thiserror::Error;
@@ -47,7 +48,6 @@ pub enum MethodCallFailed {
     /// A Java exception was thrown (can be caught by exception handlers).
     /// The `ObjectRef` points to the `Throwable` object on the heap.
     ExceptionThrown(ObjectRef),
-
 }
 
 impl fmt::Display for MethodCallFailed {
@@ -364,21 +364,21 @@ impl JdkOnlyViolation {
                 "put the real class on the class path, or drop the dependency that needs it",
                 "list every fabrication this run wanted with --dump-class-origins <FILE>",
             ],
-            JdkOnlyViolation::SyntheticNativeRegistered { .. } => &[
-                "reclassify the registration as a Bridge or a reviewed Intrinsic, or delete it",
-            ],
-            JdkOnlyViolation::SyntheticNativeInvocation { .. } => &[
-                "the real JDK implements this method; check why its bytes were not loaded",
-            ],
+            JdkOnlyViolation::SyntheticNativeRegistered { .. } => {
+                &["reclassify the registration as a Bridge or a reviewed Intrinsic, or delete it"]
+            }
+            JdkOnlyViolation::SyntheticNativeInvocation { .. } => {
+                &["the real JDK implements this method; check why its bytes were not loaded"]
+            }
             JdkOnlyViolation::MissingNative { .. } => {
                 &["implement the method as a NativeKind::Bridge and register it at VM init"]
             }
-            JdkOnlyViolation::NativeShadowsBytecode { .. } => &[
-                "unregister the native, or have it reviewed and reclassified as an Intrinsic",
-            ],
-            JdkOnlyViolation::MissingBootClass { .. } => &[
-                "point --jdk-home at a complete JDK runtime image (one with lib/modules)",
-            ],
+            JdkOnlyViolation::NativeShadowsBytecode { .. } => {
+                &["unregister the native, or have it reviewed and reclassified as an Intrinsic"]
+            }
+            JdkOnlyViolation::MissingBootClass { .. } => {
+                &["point --jdk-home at a complete JDK runtime image (one with lib/modules)"]
+            }
             JdkOnlyViolation::MissingImplementation { .. } => &[
                 "the resolved method is abstract or bodiless; check the dispatch that reached it",
             ],
@@ -421,9 +421,7 @@ impl JdkOnlyViolation {
                 method,
                 descriptor,
                 native_kind,
-            } => format!(
-                "{native_kind} native shadows bytecode of {class}.{method}{descriptor}"
-            ),
+            } => format!("{native_kind} native shadows bytecode of {class}.{method}{descriptor}"),
             JdkOnlyViolation::MissingBootClass {
                 class,
                 searched_image,
@@ -576,7 +574,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(
                     &mut out,
                     &mut first,
@@ -592,7 +595,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "call_site", call_site.as_deref());
             }
             JdkOnlyViolation::MissingNative {
@@ -603,7 +611,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "module", module.as_deref());
             }
             JdkOnlyViolation::NativeShadowsBytecode {
@@ -614,7 +627,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "native_kind", Some(*native_kind));
             }
             JdkOnlyViolation::MissingBootClass {
@@ -636,7 +654,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
             }
         }
         out.push('}');
@@ -697,7 +720,9 @@ fn is_absolute_path(token: &str) -> bool {
     let bytes = token.as_bytes();
     match bytes {
         [b'/', ..] | [b'\\', ..] => true,
-        [drive, b':', sep, ..] if drive.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\') => {
+        [drive, b':', sep, ..]
+            if drive.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\') =>
+        {
             true
         }
         _ => false,
@@ -847,8 +872,23 @@ pub enum RuntimeError {
     #[error("NullPointerException{}", format_optional_message(.message))]
     NullPointerException { message: Option<String> },
 
+    /// `message` carries HotSpot's exact text, and there are two shapes of
+    /// it: an array access says "Index 9 out of bounds for length 4" (the same
+    /// wording `Preconditions.checkIndex` produces, hence
+    /// [`out_of_bounds_message::check_index`]), and `System.arraycopy` says
+    /// "arraycopy: last source index 9 out of bounds for int[4]" (see
+    /// [`arraycopy_message`]). It was absent until 2026-08-06, which is why
+    /// every AIOOBE this VM threw from the interpreter had a null message
+    /// while the JIT tier's own bounds check already carried one — the two
+    /// tiers disagreed about the same array access.
+    ///
+    /// `None` is not "unknown": it is the deliberate answer for a call site
+    /// that cannot name the length (a native holding an index and nothing
+    /// else) and for `java.lang.reflect.Array`, whose out-of-bounds throw has
+    /// a null message on HotSpot too. Build it with the `aioobe*` constructors
+    /// below rather than by hand, so the wording stays in one place.
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
-    ArrayIndexOutOfBoundsException { index: i32 },
+    ArrayIndexOutOfBoundsException { index: i32, message: Option<String> },
     /// Plain `java.lang.IndexOutOfBoundsException` -- the SUPERCLASS of the
     /// Array/String variants above, and not interchangeable with them.
     ///
@@ -886,10 +926,7 @@ pub enum RuntimeError {
     /// nothing but that. Build it with the `sioobe_*` constructors below rather
     /// than by hand, so the wording stays in one place.
     #[error("StringIndexOutOfBoundsException: index {index}")]
-    StringIndexOutOfBoundsException {
-        index: i32,
-        message: Option<String>,
-    },
+    StringIndexOutOfBoundsException { index: i32, message: Option<String> },
 
     #[error("ClassNotFoundException: {class_name}")]
     ClassNotFoundException { class_name: String },
@@ -1103,6 +1140,96 @@ pub mod out_of_bounds_message {
     }
 }
 
+/// `System.arraycopy`'s exception wordings, reproduced from HotSpot's
+/// `TypeArrayKlass::copy_array` / `ObjArrayKlass::copy_array`.
+///
+/// `arraycopy` does not use [`out_of_bounds_message`] at all: it names the
+/// array's *type* and *length* and says which of the five arguments failed,
+/// because an index alone cannot distinguish "your source ran out" from "your
+/// destination did". The five out-of-bounds shapes below become
+/// `ArrayIndexOutOfBoundsException`s; the three type shapes become
+/// `ArrayStoreException`s, and live here so both halves of one JDK method's
+/// contract stay together.
+///
+/// `ty` is the element-type name HotSpot's `type2name_tab` prints — `"int"`,
+/// `"byte"`, `"boolean"`, `"char"`, `"short"`, `"long"`, `"float"`,
+/// `"double"` — or the literal `"object array"` for any reference array,
+/// which is why the rendered text reads `object array[4]` and not
+/// `java.lang.String[4]`. Use [`element_type_name`] rather than spelling one
+/// out at a call site.
+///
+/// The two `last_*` shapes print `pos + length` **unsigned** (`%u` in
+/// HotSpot), which is what makes an overflowing `pos + length` render as a
+/// huge positive number instead of a negative one.
+pub mod arraycopy_message {
+    use crate::ArrayElementType;
+
+    /// HotSpot's `type2name_tab` entry for an array's element type, which is
+    /// the token every message below interpolates before `[len]`.
+    ///
+    /// Every reference array collapses to the single literal `"object array"`
+    /// — HotSpot's `ObjArrayKlass::copy_array` never prints the component
+    /// class — so `String[]`, `Object[]` and `int[][]` all render alike.
+    pub fn element_type_name(element_type: ArrayElementType) -> &'static str {
+        match element_type {
+            ArrayElementType::Boolean => "boolean",
+            ArrayElementType::Char => "char",
+            ArrayElementType::Float => "float",
+            ArrayElementType::Double => "double",
+            ArrayElementType::Byte => "byte",
+            ArrayElementType::Short => "short",
+            ArrayElementType::Int => "int",
+            ArrayElementType::Long => "long",
+            ArrayElementType::Reference => "object array",
+        }
+    }
+
+    /// `srcPos < 0`.
+    pub fn source_index(src_pos: i32, ty: &str, src_len: i32) -> String {
+        format!("arraycopy: source index {src_pos} out of bounds for {ty}[{src_len}]")
+    }
+
+    /// `destPos < 0` — reached only once `srcPos` has been cleared.
+    pub fn destination_index(dest_pos: i32, ty: &str, dest_len: i32) -> String {
+        format!("arraycopy: destination index {dest_pos} out of bounds for {ty}[{dest_len}]")
+    }
+
+    /// `length < 0` — reached only once both positions have been cleared.
+    /// The one shape that names no array.
+    pub fn negative_length(length: i32) -> String {
+        format!("arraycopy: length {length} is negative")
+    }
+
+    /// `srcPos + length > src.length`, printed unsigned.
+    pub fn last_source_index(src_pos: i32, length: i32, ty: &str, src_len: i32) -> String {
+        let last = (src_pos as u32).wrapping_add(length as u32);
+        format!("arraycopy: last source index {last} out of bounds for {ty}[{src_len}]")
+    }
+
+    /// `destPos + length > dest.length`, printed unsigned.
+    pub fn last_destination_index(dest_pos: i32, length: i32, ty: &str, dest_len: i32) -> String {
+        let last = (dest_pos as u32).wrapping_add(length as u32);
+        format!("arraycopy: last destination index {last} out of bounds for {ty}[{dest_len}]")
+    }
+
+    /// `src` is not an array at all (an `ArrayStoreException`, not an AIOOBE).
+    pub fn source_not_an_array(class_name: &str) -> String {
+        format!("arraycopy: source type {class_name} is not an array")
+    }
+
+    /// `dest` is not an array at all (an `ArrayStoreException`).
+    pub fn destination_not_an_array(class_name: &str) -> String {
+        format!("arraycopy: destination type {class_name} is not an array")
+    }
+
+    /// Both are arrays but their element types differ (an
+    /// `ArrayStoreException`). HotSpot renders each side as `{ty}[]`, so a
+    /// reference array reads `object array[]`.
+    pub fn type_mismatch(src_ty: &str, dest_ty: &str) -> String {
+        format!("arraycopy: type mismatch: can not copy {src_ty}[] into {dest_ty}[]")
+    }
+}
+
 impl RuntimeError {
     /// `StringIndexOutOfBoundsException` with HotSpot's `checkIndex` wording.
     ///
@@ -1178,6 +1305,70 @@ impl RuntimeError {
         }
     }
 
+    /// An out-of-bounds **array access**: HotSpot's
+    /// `InterpreterRuntime::throw_ArrayIndexOutOfBoundsException` wording,
+    /// which is character-for-character `Preconditions.checkIndex`'s.
+    ///
+    /// This is the one every `aaload`/`aastore`/`iaload`/… reaches, in both
+    /// the interpreter and the JIT, so both tiers must call it rather than
+    /// formatting their own copy.
+    pub fn aioobe(index: i32, length: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(out_of_bounds_message::check_index(
+                i64::from(index),
+                i64::from(length),
+            )),
+        }
+    }
+
+    /// An AIOOBE carrying a message that is not the array-access shape —
+    /// `System.arraycopy`'s five (see [`arraycopy_message`]), and
+    /// `java.util.Arrays`' `"Array index out of range: N"`.
+    ///
+    /// `index` stays the machine-readable operand; the message is what
+    /// `getMessage()` returns.
+    pub fn aioobe_with_message(index: i32, message: impl Into<String>) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(message.into()),
+        }
+    }
+
+    /// An AIOOBE whose call site knows the index but not the array's length,
+    /// so it cannot build HotSpot's array-access text.
+    ///
+    /// It gets the JDK's own `ArrayIndexOutOfBoundsException(int)` wording,
+    /// `"Array index out of range: N"` — which is what a `java.util.Arrays`
+    /// range check produces on HotSpot, and what the great majority of the
+    /// natives migrated in 2026-08-06 are standing in for. It is exact for
+    /// what is known rather than a guess at what is not.
+    ///
+    /// Prefer [`RuntimeError::aioobe`] wherever the length is reachable; an
+    /// array access must never come through here, because HotSpot's wording
+    /// for one names the length.
+    pub fn aioobe_index_only(index: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(format!("Array index out of range: {index}")),
+        }
+    }
+
+    /// An AIOOBE with a deliberately **null** `getMessage()`.
+    ///
+    /// Not an unfinished migration: HotSpot's `java.lang.reflect.Array`
+    /// accessors raise the exception with no text at all, so
+    /// `Array.get(new int[4], 9).getMessage()` is null there while a plain
+    /// `a[9]` in bytecode says "Index 9 out of bounds for length 4". Use this
+    /// only where a HotSpot control shows a null message; use
+    /// [`RuntimeError::aioobe_index_only`] otherwise.
+    pub fn aioobe_no_message(index: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: None,
+        }
+    }
+
     /// The Java throwable this error materialises as: `(internal class name,
     /// detail message)`, or `None` when it has no Java counterpart
     /// ([`RuntimeError::NotImplemented`], which must stay an internal error).
@@ -1197,7 +1388,35 @@ impl RuntimeError {
     /// needed — which is how `Method.invoke` came to propagate a native
     /// `UnsupportedOperationException` raw instead of wrapping it (H2
     /// `TestMVStore.testIterate`).
-    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<&str>)> {
+    /// The detail message for a variant that carries a payload but no `String`
+    /// to borrow, so it has to be built.
+    ///
+    /// Every other variant either owns a message the table below borrows, or
+    /// genuinely has none. `NegativeArraySizeException` owns its payload as an
+    /// `i32` and the table dropped it, so `getMessage()` came back **null**
+    /// where HotSpot has text.
+    ///
+    /// `ArrayIndexOutOfBoundsException` was in the same position until
+    /// 2026-08-06, and was answered here with the JDK's
+    /// `ArrayIndexOutOfBoundsException(int)` wording, `"Array index out of
+    /// range: N"`. That is right for a site that knows only an index, and
+    /// wrong for the two that matter most: an array access says "Index 9 out
+    /// of bounds for length 4", and `java.lang.reflect.Array` says nothing at
+    /// all. Answering here made the choice unavailable to the call site, so
+    /// the variant carries its own `message` now and the three
+    /// `RuntimeError::aioobe*` constructors pick the wording — including
+    /// [`RuntimeError::aioobe_index_only`], which is this text, still the
+    /// right default for a native that holds an index and nothing else.
+    fn synthesised_detail_message(&self) -> Option<String> {
+        match self {
+            // HotSpot's message is the size alone, with no prose (`new int[-1]`
+            // reports `-1`).
+            RuntimeError::NegativeArraySizeException { size } => Some(size.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<Cow<'_, str>>)> {
         let pair = match self {
             RuntimeError::NullPointerException { message } => (
                 "java/lang/NullPointerException",
@@ -1217,15 +1436,22 @@ impl RuntimeError {
             RuntimeError::ArithmeticException { message } => {
                 ("java/lang/ArithmeticException", Some(message.as_str()))
             }
-            RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
-                ("java/lang/ArrayIndexOutOfBoundsException", None)
-            }
+            // The variant now carries its own message, so this arm borrows
+            // like every other one and `synthesised_detail_message` no longer
+            // answers for it. `None` here means the no-arg constructor and a
+            // null `getMessage()` — which is what HotSpot's
+            // `java.lang.reflect.Array` accessors produce.
+            RuntimeError::ArrayIndexOutOfBoundsException { message, .. } => (
+                "java/lang/ArrayIndexOutOfBoundsException",
+                message.as_deref(),
+            ),
             RuntimeError::IndexOutOfBoundsException { message } => {
                 ("java/lang/IndexOutOfBoundsException", message.as_deref())
             }
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))
             }
+            // As above: the message is synthesised from `size`, not absent.
             RuntimeError::NegativeArraySizeException { size: _ } => {
                 ("java/lang/NegativeArraySizeException", None)
             }
@@ -1271,8 +1497,12 @@ impl RuntimeError {
             RuntimeError::IllegalArgumentException { message } => {
                 ("java/lang/IllegalArgumentException", Some(message.as_str()))
             }
-            RuntimeError::IOException { message } => ("java/io/IOException", Some(message.as_str())),
-            RuntimeError::EOFException { message } => ("java/io/EOFException", Some(message.as_str())),
+            RuntimeError::IOException { message } => {
+                ("java/io/IOException", Some(message.as_str()))
+            }
+            RuntimeError::EOFException { message } => {
+                ("java/io/EOFException", Some(message.as_str()))
+            }
             RuntimeError::UnknownHostException { message } => {
                 ("java/net/UnknownHostException", Some(message.as_str()))
             }
@@ -1356,13 +1586,151 @@ impl RuntimeError {
             }
             RuntimeError::NotImplemented { feature: _ } => return None,
         };
-        Some(pair)
+        let (class_name, borrowed) = pair;
+        // A synthesised message wins over the table's `None`. The two are
+        // mutually exclusive by construction — `synthesised_detail_message`
+        // answers only for variants whose arm above has nothing to borrow — and
+        // `or_else` keeps it that way if a third such variant is ever added:
+        // the borrowed message stays authoritative wherever one exists.
+        let message = self
+            .synthesised_detail_message()
+            .map(Cow::Owned)
+            .or_else(|| borrowed.map(Cow::Borrowed));
+        Some((class_name, message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- as_java_throwable detail messages --
+
+    /// The two variants that carry an `i32` payload used to convert with a
+    /// `None` message, so every VM-thrown AIOOBE reached Java as
+    /// `java.lang.ArrayIndexOutOfBoundsException: null`. That is a behavioural
+    /// divergence for anything reading `getMessage()`, and it is what made a
+    /// Spring AOT failure undiagnosable.
+    ///
+    /// Expected text measured on HotSpot (Temurin jdk-25.0.3+9).
+    #[test]
+    fn payload_carrying_variants_synthesise_hotspots_message() {
+        let err = RuntimeError::aioobe_index_only(7);
+        let (cls, msg) = err.as_java_throwable().expect("AIOOBE is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        // `new ArrayIndexOutOfBoundsException(7)` on HotSpot — the wording for
+        // a site that knows the index and not the length. An array access
+        // takes `aioobe` and says something else; see the test below.
+        assert_eq!(msg.as_deref(), Some("Array index out of range: 7"));
+
+        let (cls, msg) = RuntimeError::NegativeArraySizeException { size: -1 }
+            .as_java_throwable()
+            .expect("NegativeArraySizeException is a Java throwable");
+        assert_eq!(cls, "java/lang/NegativeArraySizeException");
+        // `new int[-1]` on HotSpot: the size alone, no prose.
+        assert_eq!(msg.as_deref(), Some("-1"));
+    }
+
+    /// `None` must keep meaning "construct with the no-arg constructor, so
+    /// `getMessage()` is null". Several variants depend on that distinction and
+    /// the synthesising path must not have blurred it.
+    #[test]
+    fn variants_with_no_message_still_convert_to_none() {
+        for err in [
+            RuntimeError::StackOverflowError,
+            RuntimeError::InterruptedException,
+            RuntimeError::BufferUnderflowException,
+            RuntimeError::BufferOverflowException,
+            RuntimeError::ReadOnlyBufferException,
+            RuntimeError::ConcurrentModificationException,
+        ] {
+            let (_, msg) = err.as_java_throwable().expect("is a Java throwable");
+            assert!(msg.is_none(), "{err:?} must have a null detail message");
+        }
+
+        // The empty-string markers are "no message" too, not an empty one.
+        // Bound to a `let` because the returned `Cow` borrows from the error.
+        let npe = RuntimeError::NullPointerException {
+            message: Some(String::new()),
+        };
+        let (_, msg) = npe.as_java_throwable().unwrap();
+        assert!(
+            msg.is_none(),
+            "an empty NPE marker means getMessage() == null"
+        );
+
+        let uoe = RuntimeError::UnsupportedOperationException {
+            message: String::new(),
+        };
+        let (_, msg) = uoe.as_java_throwable().unwrap();
+        assert!(
+            msg.is_none(),
+            "an empty UOE message means getMessage() == null"
+        );
+    }
+
+    /// A variant that owns a message is still BORROWED, not copied — the `Cow`
+    /// exists so only the two synthesising variants pay for an allocation.
+    #[test]
+    fn owned_messages_are_borrowed_not_copied() {
+        let err = RuntimeError::IllegalStateException {
+            message: "boom".to_string(),
+        };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Borrowed("boom"))));
+
+        // The AIOOBE variant owns its message since 2026-08-06, so it
+        // borrows like the rest. `NegativeArraySizeException` is now the only
+        // variant that still has to build one.
+        let err = RuntimeError::aioobe(9, 4);
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(
+            msg,
+            Some(Cow::Borrowed("Index 9 out of bounds for length 4"))
+        ));
+
+        let err = RuntimeError::NegativeArraySizeException { size: -1 };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Owned(_))));
+    }
+
+    /// The three wordings are three different HotSpot behaviours, not three
+    /// spellings of one. A single blanket message for the variant — which is
+    /// what `synthesised_detail_message` used to do — cannot be right for all
+    /// three at once, and that is why the call site chooses.
+    #[test]
+    fn the_three_aioobe_constructors_do_not_agree() {
+        let access = RuntimeError::aioobe(9, 4);
+        let index_only = RuntimeError::aioobe_index_only(9);
+        let reflective = RuntimeError::aioobe_no_message(9);
+        assert_eq!(
+            access.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            Some("Index 9 out of bounds for length 4")
+        );
+        assert_eq!(
+            index_only
+                .as_java_throwable()
+                .and_then(|(_, m)| m)
+                .as_deref(),
+            Some("Array index out of range: 9")
+        );
+        assert_eq!(
+            reflective
+                .as_java_throwable()
+                .and_then(|(_, m)| m)
+                .as_deref(),
+            None
+        );
+    }
+
+    /// `NotImplemented` is a VM gap, not something Java can catch.
+    #[test]
+    fn not_implemented_is_not_a_java_throwable() {
+        let err = RuntimeError::NotImplemented {
+            feature: "whatever".to_string(),
+        };
+        assert!(err.as_java_throwable().is_none());
+    }
 
     // -- VmError Display tests --
 
@@ -1556,8 +1924,115 @@ mod tests {
 
     #[test]
     fn runtime_error_array_index_out_of_bounds() {
-        let err = RuntimeError::ArrayIndexOutOfBoundsException { index: -1 };
+        let err = RuntimeError::aioobe_no_message(-1);
         assert_eq!(format!("{err}"), "ArrayIndexOutOfBoundsException: index -1");
+        assert_eq!(
+            err.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            None,
+            "aioobe_no_message must produce a message-less throwable, i.e. the \
+             no-arg constructor — HotSpot's reflect.Array behaviour"
+        );
+    }
+
+    #[test]
+    fn aioobe_carries_hotspots_array_access_wording() {
+        let err = RuntimeError::aioobe(9, 4);
+        let (cls, msg) = err.as_java_throwable().expect("is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        assert_eq!(msg.as_deref(), Some("Index 9 out of bounds for length 4"));
+        // The array-access wording IS `Preconditions.checkIndex`'s; if these
+        // two ever diverge, one of them has been rewritten by hand.
+        assert_eq!(
+            out_of_bounds_message::check_index(9, 4),
+            "Index 9 out of bounds for length 4"
+        );
+    }
+
+    #[test]
+    fn aioobe_negative_index_still_names_the_length() {
+        // HotSpot prints the negative index verbatim rather than clamping.
+        let err = RuntimeError::aioobe(-1, 4);
+        assert_eq!(
+            err.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            Some("Index -1 out of bounds for length 4")
+        );
+    }
+
+    #[test]
+    fn arraycopy_wordings_match_hotspot() {
+        use arraycopy_message as ac;
+        assert_eq!(
+            ac::last_source_index(0, 9, "int", 4),
+            "arraycopy: last source index 9 out of bounds for int[4]"
+        );
+        assert_eq!(
+            ac::last_destination_index(0, 9, "char", 4),
+            "arraycopy: last destination index 9 out of bounds for char[4]"
+        );
+        assert_eq!(
+            ac::source_index(-1, "short", 4),
+            "arraycopy: source index -1 out of bounds for short[4]"
+        );
+        assert_eq!(
+            ac::destination_index(-1, "float", 4),
+            "arraycopy: destination index -1 out of bounds for float[4]"
+        );
+        assert_eq!(ac::negative_length(-1), "arraycopy: length -1 is negative");
+        // A reference array is "object array", never its own class name.
+        assert_eq!(
+            ac::last_source_index(0, 9, "object array", 4),
+            "arraycopy: last source index 9 out of bounds for object array[4]"
+        );
+        assert_eq!(
+            ac::type_mismatch("int", "object array"),
+            "arraycopy: type mismatch: can not copy int[] into object array[]"
+        );
+        assert_eq!(
+            ac::source_not_an_array("java.lang.String"),
+            "arraycopy: source type java.lang.String is not an array"
+        );
+    }
+
+    #[test]
+    fn arraycopy_element_type_names_are_hotspots() {
+        use arraycopy_message::element_type_name as name;
+        assert_eq!(name(crate::ArrayElementType::Int), "int");
+        assert_eq!(name(crate::ArrayElementType::Boolean), "boolean");
+        assert_eq!(name(crate::ArrayElementType::Char), "char");
+        assert_eq!(name(crate::ArrayElementType::Byte), "byte");
+        assert_eq!(name(crate::ArrayElementType::Short), "short");
+        assert_eq!(name(crate::ArrayElementType::Long), "long");
+        assert_eq!(name(crate::ArrayElementType::Float), "float");
+        assert_eq!(name(crate::ArrayElementType::Double), "double");
+        // Not "java.lang.String", not "Object" — HotSpot prints this literal
+        // for every reference array, including an array of arrays.
+        assert_eq!(name(crate::ArrayElementType::Reference), "object array");
+    }
+
+    #[test]
+    fn arraycopy_last_index_is_printed_unsigned() {
+        // HotSpot formats `pos + length` with `%u`, so an addition that
+        // overflows `int` renders as a large positive number. Printing it
+        // signed would produce a negative "last index", which no HotSpot
+        // message ever shows.
+        assert_eq!(
+            arraycopy_message::last_source_index(i32::MAX, 1, "int", 4),
+            "arraycopy: last source index 2147483648 out of bounds for int[4]"
+        );
+    }
+
+    #[test]
+    fn arraycopy_message_carries_through_to_the_throwable() {
+        let err = RuntimeError::aioobe_with_message(
+            9,
+            arraycopy_message::last_source_index(0, 9, "int", 4),
+        );
+        let (cls, msg) = err.as_java_throwable().expect("is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        assert_eq!(
+            msg.as_deref(),
+            Some("arraycopy: last source index 9 out of bounds for int[4]")
+        );
     }
 
     #[test]
@@ -1994,12 +2469,14 @@ mod tests {
             let last = lines[lines.len() - 1].trim();
             let penultimate = lines[lines.len() - 2].trim();
             assert_eq!(
-                penultimate, REMEDIATION_FALLBACK,
+                penultimate,
+                REMEDIATION_FALLBACK,
                 "{}: fallback is not the penultimate line\n{rendered}",
                 v.kind()
             );
             assert_eq!(
-                last, REMEDIATION_CAPTURE,
+                last,
+                REMEDIATION_CAPTURE,
                 "{}: capture hint is not the last line\n{rendered}",
                 v.kind()
             );
@@ -2038,9 +2515,15 @@ mod tests {
             module: Some("java.base".into()),
         };
         let rendered = v.render(None, true);
-        assert!(rendered.contains("feature version: <unknown>"), "{rendered}");
+        assert!(
+            rendered.contains("feature version: <unknown>"),
+            "{rendered}"
+        );
         // The module the reporter *did* know is still named.
-        assert!(rendered.contains("module:          java.base"), "{rendered}");
+        assert!(
+            rendered.contains("module:          java.base"),
+            "{rendered}"
+        );
     }
 
     /// The three absolute forms leak the layout of the machine the run happened
@@ -2094,7 +2577,9 @@ mod tests {
         let quiet = boot.render(Some(25), false);
         assert!(!quiet.contains("/opt/jdk-25"), "{quiet}");
         assert!(quiet.contains(REDACTED), "{quiet}");
-        assert!(boot.render(Some(25), true).contains("/opt/jdk-25/lib/modules"));
+        assert!(boot
+            .render(Some(25), true)
+            .contains("/opt/jdk-25/lib/modules"));
 
         // `#[track_caller]` provenance is workspace-relative: redacting it
         // would delete the only actionable fact in the report.
@@ -2215,9 +2700,8 @@ mod tests {
 
     #[test]
     fn vm_error_invalid_configuration_display() {
-        let err = VmError::InvalidConfiguration(
-            "--jdk-only conflicts with --synthetic-jdk".to_string(),
-        );
+        let err =
+            VmError::InvalidConfiguration("--jdk-only conflicts with --synthetic-jdk".to_string());
         assert_eq!(
             format!("{err}"),
             "invalid configuration: --jdk-only conflicts with --synthetic-jdk"
