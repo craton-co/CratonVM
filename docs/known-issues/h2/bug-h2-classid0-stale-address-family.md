@@ -76,7 +76,7 @@ Added because this class is a **cheap, JIT-only reproduction** — ~15 s per
 attempt at `-Dcraton.smoke.forks=1` — and because it was until now filed under a
 throughput page that explicitly told triagers not to look for a crash here. That
 page is retired
-([`../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md));
+(`fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`);
 the throughput finding it was tracking is closed, and this is what is left.
 
 Twenty-six runs at `forks=1`, dev tip, JIT on, in two batches (10 then 16),
@@ -273,6 +273,11 @@ which such a copy is ever *read*.
 
 ### The decisive run: `UNCLASSIFIED` is NOT always zero (2026-08-05)
 
+> **Superseded the same day — see *The dose-response that falsified it* below.**
+> The measurement in this section is real; the inference drawn from it is not.
+> Unclassified peers turn out to be neither necessary nor sufficient for the
+> face.
+
 *Where that leaves the residual* below asks for exactly one thing: "the decisive
 run is one that ends in a `cannot be cast` with these lines above it." Here it
 is. `TestMVStoreCacheLoop`, `--Xmx 512m`, `CRATONVM_GC=-moving-young`, JIT on,
@@ -313,6 +318,90 @@ is a direct observation of the defect the interior-root fix removes, firing in a
 run that then produced the family's symptom. It is one contributor, not the
 whole family — `LIVE_REFERRERS=0` says the rest of the dropped set was
 genuinely unreferenced.
+
+### The dose-response that falsified it (2026-08-05)
+
+The section above made cross-thread coverage the prime suspect off a single
+correlation. `CRATONVM_XT_PEER_DEADLINE_MS` makes that testable without a
+rebuild: it is the deadline a signalled peer has to reach the take-over handler,
+and missing it is what produces `STATE_CANCELLED` — the unclassified reading.
+Three arms, same binary, same class (`TestMultiThread`), same `--Xmx 1g`, same
+host, one variable:
+
+| arm | deadline | unclassified peers | faces |
+|-----|----------|--------------------|-------|
+| XD1 | 1 ms     | **45**, 20 cycles  | **0** |
+| HH1 | 20 ms (default) | 0             | 0     |
+| XD3 | 3000 ms  | **0** (whole run)  | **1** |
+
+The arm with forty-five unclassified peers produced no failure; the arm with
+none produced one. **Unclassified peers are neither necessary nor sufficient for
+this face.** Do not restore that hypothesis without new evidence.
+
+#### The silence that produced the wrong reading
+
+`vm-cli/src/main.rs` printed the `xt_peer_scan:` summary only `if peers > 0`. So
+a run that *failed* printed nothing — and nothing looks like the reassuring
+answer while actually covering three others: the scan ran and found nothing, the
+scan never ran, the feature is off. `gc_quiescence::XT_PASSES_LAST_CYCLE`
+documents this exact trap one level down ("`taken_over=0 unclassified=0` means
+'never looked', not 'looked and found nothing' … they must not share an
+encoding"), and the process summary simply did not follow it. It is now
+unconditional and carries `taken_over=`, `helper_windows=` and `enabled=`.
+
+### The holder verdict, and what it retires (2026-08-05)
+
+The page has been asking which object still holds the stale reference. The
+answer, from `live_holders_of` on the unconditional guard path — a walk of old
+gen plus the live young arena, decoding through each object's own
+`for_each_ref_slot` rather than comparing raw words:
+
+```text
+gc::guard: receiver points into RECLAIMED memory …
+     obj="0x200498491e8" site="invoke dispatch"
+     location=young TO-space (the inactive semispace) span="0x20042400000+0x0"
+gc::guard: …and NO live heap object holds this address in a decoded reference
+     slot. The holder is therefore a frame local, a register, or a native side
+     table — not a heap field.
+gc::guard: receiver is inside a YOUNG span the non-moving sweep zeroed and
+     returned to the free list … sweep_cycle=0 free_seq=2420 interior_off=26320
+```
+
+Two things follow, and both correct earlier entries on this page.
+
+**The `TO-space` label is an artifact, not a finding.** `span=…+0x0` — the
+extent is zero. Young collections in these runs are essentially never moving
+(`decision histogram: moving=1 non_moving=38`), so the inactive semispace is
+empty and an address "in" it is really in the region the non-moving sweep freed,
+which the very next line says outright. Every reading built on that label — in
+particular "the reference survived un-rewritten, it was not unrooted", i.e. a
+*remap* gap — rests on a label the collector prints regardless. The authoritative
+line is the sweep one, and this is a **mark** gap.
+
+**Heap-side referrer scanning was never going to answer.** The holder is a stack
+slot, a register, or a native side table. That retires `LIVE_REFERRERS=0` as
+evidence of anything: it asks whether a *heap object* points at a doomed block,
+and the answer here is that none ever did.
+
+#### The asymmetry that lets this happen
+
+Every coverage-incompleteness signal in this collector downgrades **relocation**
+— `mark_moving_young_coverage_incomplete_because` and the `[moving-young]
+fallback #N` warnings, whose reasons in the failing run are
+`unregistered-jit-frame-on-stack`, `innermost-rbp-belongs-to-unguarded-callee`
+and `compiled-frame-oop-not-published`. **None of them downgrades
+reclamation.** `xt_cycle_coverage()` has exactly one caller in the tree: a
+`CRATONVM_DBG_SWEEP_REFERRERS`-gated printer. So the collector can know its root
+set omitted a running thread's frames and still free on `GC_FLAG_MARKED` alone —
+and the non-moving sweep, which incompleteness *selects*, is the path that
+frees.
+
+The guard now reports the coverage of the sweep that freed the specific span,
+captured while that sweep ran: `root_coverage=complete` / `INCOMPLETE` /
+`NEVER-LOOKED`, with `xt_passes` / `xt_taken_over` / `xt_unclassified` beside it.
+`NEVER-LOOKED` is a distinct reading on purpose — the take-over is gated on an
+`any_thread_in_jit()` hint, so zero passes means the scan never looked, which is
+the opposite conclusion from zero unclassified peers.
 
 ### A marking fail-open found while reading (2026-08-05)
 
@@ -610,6 +699,31 @@ Two consequences worth stating plainly:
 * the `blocked=false` in the original 2026-08-02 receiver dump was right and
   should have been believed: the thread is not parked when it trips, and
   `in_blocked_region=false` in the 2026-08-05 provenance line says so again.
+
+### Two more `TestMultiThread` faces worth counting, and one arm that cannot be soaked
+
+Faces seen on the 2026-08-05 campaigns beyond the four this page lists. Neither
+is established as this family; both are recorded so a future campaign counts
+them instead of dismissing them as application flakiness:
+
+* `General error: "java.lang.NullPointerException: Cannot invoke
+  ""org.h2.result.ResultInterface.isLazy()"" because ""result"" is null"` — a
+  reference field reading NULL. Note that a field read off a ZEROED object
+  returns 0, which decodes as `null`, so this is a plausible face of the same
+  defect one step downstream of `ClassId(0)`;
+* `The database has been closed` mid-run with 26 live connections. H2 closes a
+  database when its last session unregisters, so this is what losing an entry
+  from `Database.userSessions` looks like from the outside.
+
+**`CRATONVM_DBG_NO_NONMOVING_RECLAIM=1` cannot settle them.** The intent was a
+clean discriminator — with the non-moving sweep's dead spans neither zeroed nor
+published, a reference the root scan missed keeps its original header, so the
+failure should vanish if it really is reclamation. Two runs at `--Xmx 3g`: the
+first still failed (the `result is null` NPE, 40 s in), the second died of
+`OutOfMemoryError`. The flag defers only the NON-MOVING sweep, so selective
+promotion still evacuates and the moving path still resets from-space; and the
+unbounded leak ends the run before much sweeping happens. So it is neither a
+clean negative nor soakable — do not read the first run as exoneration.
 
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 

@@ -11481,7 +11481,7 @@ pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
 //
 //     UnsatisfiedLinkError: java/io/UnixFileSystem.getBooleanAttributes0(Ljava/io/File;)I
 //
-// (docs/internal/fixed-suite-bugs/springboot/
+// (fixed-suite-bugs/springboot/
 // unixfilesystem-getbooleanattributes0-missing-native-20260804-FIXED.md).
 // The `java/io/File` natives normally hide this, because `File.exists` /
 // `isFile` / `isDirectory` ARE forced overrides — but only until some test

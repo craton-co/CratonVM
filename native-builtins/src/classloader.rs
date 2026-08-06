@@ -11981,4 +11981,73 @@ mod classloader_tests {
         let flags = lk_member_access_flags(&ctx, mirror, "inherited", false);
         assert_eq!(flags, Some(ACC_PUBLIC));
     }
+
+    /// `MockNativeContext::resolve_field_index_by_class_id` now falls back to
+    /// `ClassManager::synthetic_stub_fields`, the same table the VM resolves a
+    /// name against for a class with no real bytes.
+    ///
+    /// Before this, the mock answered `None` for every field of every modelled
+    /// class that had no hand-written `mock_*_field_slot` helper — i.e. "no such
+    /// field" about fields the VM does resolve. Any predicate of the form
+    /// *"does this class declare <a field only the REAL JDK class has>"* was
+    /// therefore **unfalsifiable** under the mock: it could only ever answer
+    /// one way, and a test of it passed vacuously.
+    /// [`cl_has_synthetic_layout`] is exactly that shape.
+    ///
+    /// Both directions are asserted, because a fallback that answered `Some`
+    /// for *everything* would be just as useless as one that answered `None`.
+    #[test]
+    fn resolve_by_class_id_sees_the_fabricated_model() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/security/ProtectionDomain")
+            .expect("mock ensure_class_initialized must succeed");
+
+        // The model's real JDK declaration order, pinned in
+        // `classloading/src/shadow_layout.rs`. A modelled class with no
+        // hand-written mock table is the case this fallback exists for.
+        for (name, want) in [
+            ("codesource", 0usize),
+            ("classloader", 1),
+            ("principals", 2),
+            ("permissions", 3),
+        ] {
+            assert_eq!(
+                ctx.resolve_field_index_by_class_id(cid, name),
+                Some(want),
+                "ProtectionDomain.{name} must resolve to its modelled slot"
+            );
+        }
+
+        // A name the class does not declare still answers `None`, so the
+        // predicate can still be falsified in the negative direction.
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(cid, "parallelLockMap"),
+            None
+        );
+        assert_eq!(ctx.resolve_field_index_by_class_id(cid, "nosuchfield"), None);
+    }
+
+    /// The fallback is the TAIL of the chain, not the head.
+    ///
+    /// `mock_jdk_field_slot` is a deliberately arbitrary shared name->slot
+    /// namespace for the `Field`/`Method`/`Constructor`/`MemberName` mirrors,
+    /// and it disagrees with the fabricated model on every one of those names.
+    /// It has to keep winning here because it wins in `get_field_by_name` /
+    /// `set_field_by_name`: a reader and a writer that resolve the same name to
+    /// different slots is worse than either mapping being "wrong". Putting the
+    /// model first makes `create_method_object` write `modifiers` to one slot
+    /// and `method_modifiers_value` read it from another — measured, three
+    /// tests red.
+    #[test]
+    fn the_hand_written_namespace_still_wins_for_the_reflect_mirrors() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/lang/reflect/Field")
+            .expect("mock ensure_class_initialized must succeed");
+        // `mock_jdk_field_slot`'s answer, not the model's (which puts `clazz`
+        // at 2, behind `override` and `accessCheckCache`).
+        assert_eq!(ctx.resolve_field_index_by_class_id(cid, "clazz"), Some(0));
+        assert_eq!(ctx.resolve_field_index_by_class_id(cid, "name"), Some(1));
+    }
 }

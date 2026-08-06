@@ -17,7 +17,7 @@
 //! mode; the assertion was taken in the other one.
 //!
 //! On 2026-08-04 the forced-native `java/lang/String` policy was removed
-//! (`docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
+//! (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
 //! Contract §1.4 — real class bytes are authoritative — is now enforced where
 //! it can be enforced once for every dispatch path: `NativeMethodRegistry::
 //! register` drops every `java/lang/String` `Bridge` in real-JDK mode, so the
