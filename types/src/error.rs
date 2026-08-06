@@ -1494,9 +1494,23 @@ impl RuntimeError {
                 "java/lang/reflect/InaccessibleObjectException",
                 Some(message.as_str()),
             ),
-            RuntimeError::IllegalArgumentException { message } => {
-                ("java/lang/IllegalArgumentException", Some(message.as_str()))
-            }
+            RuntimeError::IllegalArgumentException { message } => (
+                "java/lang/IllegalArgumentException",
+                // Empty = "no message", the same marker `UnsupportedOperation`
+                // Exception uses above and for the same reason: the variant
+                // holds a `String`, so a site that needs a null `getMessage()`
+                // cannot pass `None`. `Array.set(new int[4], 0, null)` is one --
+                // HotSpot reaches `new IllegalArgumentException()` with no
+                // argument there. No site produces a deliberate empty IAE
+                // message (checked across the workspace), so the marker is
+                // unambiguous; `Some("")` would build the exception with a
+                // non-null empty string instead.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             RuntimeError::IOException { message } => {
                 ("java/io/IOException", Some(message.as_str()))
             }
@@ -1667,6 +1681,20 @@ mod tests {
             msg.is_none(),
             "an empty UOE message means getMessage() == null"
         );
+
+        // `Array.set(new int[4], 0, null)` on HotSpot: an IllegalArgumentException
+        // with a null message, not an empty one.
+        let iae = RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        };
+        let (_, msg) = iae.as_java_throwable().unwrap();
+        assert!(msg.is_none(), "an empty IAE message means getMessage() == null");
+
+        let iae = RuntimeError::IllegalArgumentException {
+            message: "argument type mismatch".to_string(),
+        };
+        let (_, msg) = iae.as_java_throwable().unwrap();
+        assert_eq!(msg.as_deref(), Some("argument type mismatch"));
     }
 
     /// A variant that owns a message is still BORROWED, not copied — the `Cow`
