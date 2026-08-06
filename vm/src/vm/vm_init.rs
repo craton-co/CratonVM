@@ -4669,6 +4669,7 @@ impl SharedVm {
             jit_inline_cache_natives: cratonvm_jit::jdk_only_ic_native_refusals(),
             jit_fastpath_admissions: crate::jit::helpers::jdk_only_jit_fastpath_refusals(),
             interpreter_bytecode_preferred: crate::vm::jdk_only_native_shadow_attempts(),
+            interpreter_shadow_unenforced: crate::vm::jdk_only_native_shadow_unenforced(),
         }
     }
 
@@ -4689,7 +4690,8 @@ impl SharedVm {
     ///   },
     ///   "refusals": {
     ///     "jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
-    ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0
+    ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0,
+    ///     "interpreter_shadow_unenforced": 0
     ///   }
     /// }
     /// ```
@@ -4964,8 +4966,15 @@ impl SharedVm {
             refusals.jit_fastpath_admissions
         ));
         out.push_str(&format!(
-            "    \"interpreter_bytecode_preferred\": {}\n",
+            "    \"interpreter_bytecode_preferred\": {},\n",
             refusals.interpreter_bytecode_preferred
+        ));
+        // §1.4 observed-but-not-enforced. Additive field: a reader that does
+        // not know it still parses the object, and one that does gets the half
+        // of §1.4 the report could not previously see at all.
+        out.push_str(&format!(
+            "    \"interpreter_shadow_unenforced\": {}\n",
+            refusals.interpreter_shadow_unenforced
         ));
         out.push_str("  }\n}\n");
 
@@ -5633,6 +5642,22 @@ pub struct JdkOnlyRefusalCounts {
     /// over a registered non-intrinsic native. Distinct triples appear in
     /// sink 2; this count is exact and uncapped.
     pub interpreter_bytecode_preferred: u64,
+    /// Times a registered `Bridge` stood in front of concrete bytecode at
+    /// `try_stackless_invoke` step 1 and **ran anyway** — §1.4 observed but not
+    /// enforced. The one field in this struct that counts something strict
+    /// policy did NOT stop, and it is here rather than in `counts` because it
+    /// is the same event class as its siblings measured on the other side.
+    ///
+    /// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement turns
+    /// each of these into an `interpreter_bytecode_preferred` instead. Distinct
+    /// triples appear in sink 2 tagged `bridge-ran-over-bytecode`. It is
+    /// deliberately excluded from [`Self::total`], which counts refusals.
+    ///
+    /// **The one field here that is a FLOOR rather than exact.** Discovering a
+    /// shadow costs a hierarchy walk, so the walk stops once the triple is
+    /// recorded and stops entirely once sink 2 saturates — see
+    /// `crate::vm::jdk_only_native_shadow_unenforced`. Quote it as "at least".
+    pub interpreter_shadow_unenforced: u64,
 }
 
 impl JdkOnlyRefusalCounts {

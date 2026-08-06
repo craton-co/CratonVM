@@ -74,7 +74,11 @@ def find(obj, key, path="d"):
                 print(f"  {key} = {v}   (at {path})")
             find(v, key, path + "." + k)
 for k in ("jit_direct_native_binds", "jit_inline_cache_natives",
-          "jit_fastpath_admissions", "interpreter_bytecode_preferred"):
+          "jit_fastpath_admissions", "interpreter_bytecode_preferred",
+          # Not a refusal: the §1.4 shadows step 1 OBSERVED and let run. It
+          # rides in the same block because a list of what strict mode stopped,
+          # with no line for what it saw and did not stop, reads as zero.
+          "interpreter_shadow_unenforced"):
     find(d, k)
 PY
 done
