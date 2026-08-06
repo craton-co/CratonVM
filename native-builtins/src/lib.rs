@@ -32354,10 +32354,26 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     _ => 0,
                 },
             };
-            // address / byte_offset — the JDK uses `bb.offset()` + 2*index.
-            let bb_off = match ctx.get_field_by_name(bb_obj, "offset") {
-                Value::Int(v) => v,
-                _ => 0,
+            // Byte index of the view's element 0 inside `bb.hb`.
+            //
+            // The JDK's own answer is the view's `address`: every accessor on
+            // `ByteBufferAsCharBuffer*` computes `(i << 1) + address`, and the
+            // ctor seeds `address` to the SOURCE buffer's address plus its
+            // position at the moment the view was made. So the view's element 0
+            // is at `address - ARRAY_BYTE_BASE_OFFSET` bytes into `hb`, which
+            // folds in both the source's array-base `offset` AND its position.
+            //
+            // Reading `bb.offset` instead — what this did — drops the source's
+            // position: `bb.position(4).asCharBuffer().get(0)` decoded byte 0
+            // rather than byte 4. It also goes stale, because the source's
+            // position moves after the view is taken and the view must not
+            // follow it.
+            let bb_off = match ctx.get_field_by_name(this, "address") {
+                Value::Long(addr) if addr >= 16 => (addr - 16) as i32,
+                _ => match ctx.get_field_by_name(bb_obj, "offset") {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
             };
             // Class name suffix tells us endianness: `B` = big-endian,
             // `L` = little-endian.
