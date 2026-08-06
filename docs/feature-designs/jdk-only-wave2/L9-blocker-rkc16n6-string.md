@@ -115,9 +115,9 @@ first looked like it had to be, and did not:
   correct now, and keeping the native would have frozen the real bug in place
   where nothing reached it.
 * `String.substring` out-of-range threw `ArrayIndexOutOfBoundsException`
-  instead of `StringIndexOutOfBoundsException`. **The `String` half is FIXED
-  2026-08-05**
-  ([record](../../known-issues/preconditions-ignores-the-exception-formatter.md)
+  instead of `StringIndexOutOfBoundsException`. **FIXED 2026-08-05, both
+  halves**
+  ([record](../../internal/preconditions-ignores-the-exception-formatter-FIXED-20260805.md)
   — which supersedes the original `string-substring-bounds-…` record, that
   having named the wrong subsystem: the fault is `Preconditions` ignoring its
   exception-formatter argument, not anything `substring` does).
@@ -127,10 +127,16 @@ first looked like it had to be, and did not:
   `Preconditions` and came back `ArrayIndexOutOfBoundsException` while
   `charAt(12)` came back `StringIndexOutOfBoundsException`. The matrix could not
   show that, because those rows already differed on message text.
-  `String.checkIndex` is now a third F4 native, and every SIOOBE carries
-  HotSpot's exact message. What is still open is the non-`String` half: NIO's
-  callers of `Preconditions` still get `ArrayIndexOutOfBoundsException` where
-  the JDK throws `IndexOutOfBoundsException`.
+
+  The first fix bypassed it: `String.checkIndex` became a third F4 native
+  alongside `checkBoundsBeginEnd`/`checkBoundsOffCount`, and every SIOOBE
+  gained HotSpot's exact message. The second went at the cause — the override
+  now invokes the `BiFunction` formatter it was handed — so **all three
+  bypasses are retired**, which is what proves it. That also closed the
+  non-`String` half a bypass could never reach: `Objects.check*` and every NIO
+  buffer range check funnelling through it now raise
+  `IndexOutOfBoundsException`, not the `ArrayIndexOutOfBoundsException`
+  *subclass* they used to.
 * `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
   (record (`string-concat-loses-unpaired-surrogates-FIXED-20260805.md`)).
   `execute_string_concat` accumulated into a Rust `String`, which cannot

@@ -1166,6 +1166,12 @@ pub(crate) fn native_string_char_at(
     let char_count = if is_utf16 { raw_len / 2 } else { raw_len };
 
     if index < 0 || index >= char_count as i32 {
+        // `String.charAt` reaches `Preconditions.checkIndex(index, length,
+        // SIOOBE_FORMATTER)` in the real JDK, so it owes the caller that
+        // formatter's message as well as its class. This native stands in for
+        // the whole chain — including from the interpreter's inline-cache
+        // intrinsic table, which is why only the FIRST out-of-range `charAt`
+        // at a call site used to carry a message and every later one did not.
         return Err(
             cratonvm_types::error::RuntimeError::sioobe_index(index, char_count as i32).into(),
         );
@@ -2600,6 +2606,9 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if index < 0 || index >= count {
+        // Message as well as class: `AbstractStringBuilder.charAt` delegates
+        // to `String.checkIndex` → `Preconditions.checkIndex(index, count,
+        // SIOOBE_FORMATTER)`.
         return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
     let buf = buf.unwrap();
@@ -2638,7 +2647,13 @@ pub(crate) fn native_sb_code_point_at(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
+        // `AbstractStringBuilder.codePointAt` also delegates to
+        // `String.checkIndex`, so it carries the same text.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(
+            index_i32,
+            chars.len() as i32,
+        )
+        .into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -3308,14 +3323,37 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => return Ok(Some(Value::Object(None))),
     };
     let start = match args.get(1) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    let start = std::cmp::min(start, chars.len());
-    let result = String::from_utf16_lossy(&chars[start..]);
+    let count = chars.len() as i32;
+    // `substring(start)` is `substring(start, count)`, and the real body's
+    // first statement is `Preconditions.checkFromToIndex(start, end, count,
+    // SIOOBE_FORMATTER)`. Clamping instead — which this used to do — turned
+    // `sb.substring(-1)` into the whole sequence and `sb.substring(99)` into
+    // "": a silent wrong answer where the caller asked for an exception.
+    if let Some(failure) = sb_check_from_to_index(start, count, count) {
+        return Err(failure);
+    }
+    let result = String::from_utf16_lossy(&chars[start as usize..]);
     let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
+}
+
+/// `Preconditions.checkFromToIndex(start, end, count, SIOOBE_FORMATTER)` — the
+/// range check `AbstractStringBuilder.substring`/`subSequence` open with.
+///
+/// Returns the failure to raise, or `None` when the range is valid.
+fn sb_check_from_to_index(
+    start: i32,
+    end: i32,
+    count: i32,
+) -> Option<cratonvm_types::error::MethodCallFailed> {
+    if start >= 0 && start <= end && end <= count {
+        return None;
+    }
+    Some(cratonvm_types::error::RuntimeError::sioobe_range(start, end, count).into())
 }
 
 /// substring(int, int) — substring [start, end)
@@ -3328,18 +3366,22 @@ pub(crate) fn native_sb_substring_range(
         _ => return Ok(Some(Value::Object(None))),
     };
     let start = match args.get(1) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let end = match args.get(2) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    let start = std::cmp::min(start, chars.len());
-    let end = std::cmp::min(end, chars.len());
-    let end = std::cmp::max(start, end);
-    let result = String::from_utf16_lossy(&chars[start..end]);
+    let count = chars.len() as i32;
+    // See `native_sb_substring`: the real body checks the range before doing
+    // anything, so `sb.substring(3, 2)` is a `StringIndexOutOfBoundsException`
+    // and not the empty string this used to clamp it into.
+    if let Some(failure) = sb_check_from_to_index(start, end, count) {
+        return Err(failure);
+    }
+    let result = String::from_utf16_lossy(&chars[start as usize..end as usize]);
     let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
@@ -4793,7 +4835,13 @@ pub(crate) fn native_string_code_point_at(
     let s = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = s.encode_utf16().collect();
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
+        // Message as well as class: the real `codePointAt` reaches
+        // `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(
+            index_i32,
+            chars.len() as i32,
+        )
+        .into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -6332,10 +6380,12 @@ pub(crate) fn native_string_utf16_get_chars(
 }
 
 // ---------------------------------------------------------------------------
-// F4: String.checkBoundsBeginEnd / checkBoundsOffCount native overrides
+// String bounds-check helpers
 // ---------------------------------------------------------------------------
 //
-// In OpenJDK 25, both helpers delegate to `Preconditions`:
+// In OpenJDK 25, `String`'s two package-private bounds helpers delegate to
+// `Preconditions`, handing it the `SIOOBE_FORMATTER` that makes the thrown
+// class a `StringIndexOutOfBoundsException`:
 //
 //   static void checkBoundsBeginEnd(int begin, int end, int length) {
 //       Preconditions.checkFromToIndex(begin, end, length, Preconditions.SIOOBE_FORMATTER);
@@ -6344,102 +6394,29 @@ pub(crate) fn native_string_utf16_get_chars(
 //       return Preconditions.checkFromIndexSize(offset, count, length, Preconditions.SIOOBE_FORMATTER);
 //   }
 //
-// The `SIOOBE_FORMATTER` is a `BiFunction<String, List<Number>, StringIndexOutOfBoundsException>`
-// that ensures a *StringIndexOutOfBoundsException* (subclass of IndexOutOfBoundsException) is
-// thrown — never an `ArrayIndexOutOfBoundsException`.
+// CratonVM used to intercept **both helpers** with SIOOBE-correct natives (the
+// "F4" workaround, written for a BouncyCastle `PKCS12$Mappings` AIOOBE
+// blocker), because the generic `Preconditions` override underneath discarded
+// that formatter and threw `ArrayIndexOutOfBoundsException` for everyone. That
+// bypassed the whole `Preconditions` chain for `String`-domain callers while
+// leaving every other caller — NIO buffer slicing via `Objects.checkFromToIndex`
+// — on the still-wrong generic path.
 //
-// Our existing `jdk/internal/util/Preconditions.checkFromToIndex(IIILjava/util/function/BiFunction;)I`
-// override (registered from `lib.rs`) ignores the `BiFunction` argument and unconditionally
-// throws `ArrayIndexOutOfBoundsException`. That is wrong for any String-related caller and
-// surfaced as the BouncyCastle `PKCS12$Mappings` AIOOBE blocker (F4): one of the BC
-// algorithm-key parsing paths (e.g. `String.indexOf(int, int, int)` on a `KeyStore.PKCS12`
-// alias key without a `.` separator, or a `String(byte[], int, int, Charset)` ctor with
-// `offset=count=0` on an edge case) bottoms out in `checkBoundsBeginEnd` / `checkBoundsOffCount`,
-// which then dispatches to the broken Preconditions stub.
-//
-// Fix: intercept the two String helpers directly with a SIOOBE-correct native. This bypasses
-// the entire Preconditions chain for every String-domain caller (substring, indexOf(I,I,I),
-// String byte[]/char[]/codePoints[] ctors, getChars, getBytes, …). Callers outside String
-// (e.g. NIO buffer slicing) still hit the unchanged Preconditions natives, which is correct
-// for them.
+// `native-builtins/src/preconditions.rs` now honours the formatter, so the
+// bytecode above produces the right class on its own and the two interceptors
+// are gone. If a `String` bounds failure ever reports
+// `ArrayIndexOutOfBoundsException` again, that module — not this one — is where
+// the regression is.
 //
 // Reference: JDK 25 `java/lang/String.java` and `jdk/internal/util/Preconditions.java`.
 
-/// `static void java.lang.String.checkIndex(int index, int length)`
-///
-/// F4's third member, added 2026-08-05. `String.charAt` -> `StringLatin1
-/// .charAt` -> `StringLatin1.checkIndex` -> `String.checkIndex` ->
-/// `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`, and the generic
-/// `Preconditions` override underneath discards the formatter and throws
-/// `ArrayIndexOutOfBoundsException`. Measured, not assumed:
-///
-/// ```text
-///                 HotSpot                              CratonVM before this
-///   charAt(-1)    SIOOBE "Index -1 out of bounds..."   ArrayIndexOutOfBounds, msg=null
-///   charAt(12)    SIOOBE "Index 12 out of bounds..."   SIOOBE, msg=null
-/// ```
-///
-/// The negative case got the WRONG CLASS -- `catch
-/// (StringIndexOutOfBoundsException)` misses an AIOOBE, so that is a
-/// control-flow defect, not a message defect. The two cases diverged because
-/// only one of them reached `Preconditions`.
-///
-/// Same bypass shape, same rationale and the same load-bearing
-/// `register_with_kind(.., Intrinsic)` as its two siblings below. It goes away
-/// when `Preconditions` honours its formatter -- see
-/// `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
-pub(crate) fn native_string_check_index(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let index = match args.first() {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let length = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    if index < 0 || index >= length {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, length).into());
-    }
-    Ok(None)
-}
-
-/// `static void java.lang.String.checkBoundsBeginEnd(int begin, int end, int length)`
-///
-/// Spec: throws `StringIndexOutOfBoundsException` iff
-/// `begin < 0 || begin > end || end > length`.
-pub(crate) fn native_string_check_bounds_begin_end(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let begin = match args.first() {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let end = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let length = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    if begin < 0 || begin > end || end > length {
-        // HotSpot's `Preconditions.checkFromToIndex` wording, verbatim.
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, length).into());
-    }
-    Ok(None)
-}
-
-/// Shared bounds check backing `String.checkBoundsOffCount` and the
-/// `String(char[], int, int)` constructor native below (both must agree —
-/// the real constructor calls `checkBoundsOffCount` internally). Spec:
-/// bad iff `offset < 0 || count < 0 || offset > length - count`
-/// (overflow-safe form: `offset + count > length`). Returns `Some(index)`
-/// (the offending arg, matching the JDK's SIOOBE message convention) when
-/// bad, `None` when the range is valid.
+/// Shared bounds check backing the `String(char[], int, int)` constructor
+/// native and `getChars` below, both of which must agree with the real
+/// `String.checkBoundsOffCount` they stand in for. Spec: bad iff
+/// `offset < 0 || count < 0 || offset > length - count` (overflow-safe form:
+/// `offset + count > length`). Returns `Some(index)` (the offending arg,
+/// matching the JDK's SIOOBE message convention) when bad, `None` when the
+/// range is valid.
 fn bounds_off_count_violation(offset: i32, count: i32, length: i32) -> Option<i32> {
     let bad_size =
         offset < 0 || count < 0 || length < 0 || (offset as i64 + count as i64) > length as i64;
@@ -6448,35 +6425,6 @@ fn bounds_off_count_violation(offset: i32, count: i32, length: i32) -> Option<i3
     } else {
         None
     }
-}
-
-/// `static int java.lang.String.checkBoundsOffCount(int offset, int count, int length)`
-///
-/// Spec: throws `StringIndexOutOfBoundsException` iff
-/// `offset < 0 || count < 0 || offset > length - count` (with overflow-safe form
-/// `offset + count > length` taking care to avoid signed overflow). Returns
-/// `offset` on success.
-pub(crate) fn native_string_check_bounds_off_count(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let offset = match args.first() {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let count = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let length = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    if bounds_off_count_violation(offset, count, length).is_some() {
-        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
-    }
-    Ok(Some(Value::Int(offset)))
 }
 
 // ---------------------------------------------------------------------------
@@ -6603,54 +6551,21 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
         native_string_utf16_get_chars,
     );
 
-    // F4: replace the JDK 25 implementation of String.checkBoundsBeginEnd and
-    // String.checkBoundsOffCount with SIOOBE-correct natives. See the comment
-    // block above for full rationale. This registration runs from
-    // `lib.rs::register_natives` AFTER the generic `Preconditions.checkFromToIndex`
-    // / `checkFromIndexSize` overrides that throw `ArrayIndexOutOfBoundsException`,
-    // and bypasses them entirely for every String-domain caller — substring(II),
-    // indexOf(I,I,I), String(byte[],int,int[,Charset]) ctors, getChars(II[CI),
-    // getBytes(II[BI), …
+    // `java/lang/String.checkBoundsBeginEnd(III)V` and `checkBoundsOffCount(III)I`
+    // used to be registered here as `Intrinsic` (the "F4" workaround). They are
+    // gone deliberately: they existed only to route `String`-domain bounds
+    // failures around a generic `Preconditions` override that threw
+    // `ArrayIndexOutOfBoundsException` for every caller, and
+    // `native-builtins/src/preconditions.rs` now honours the `SIOOBE_FORMATTER`
+    // those helpers pass, so the real bytecode produces
+    // `StringIndexOutOfBoundsException` by itself. Retiring them is the test
+    // that the underlying fix works, and it also fixes the callers F4 could
+    // never reach (NIO buffer slicing, via `Objects.checkFromToIndex`).
     //
-    // `register_with_kind(.., Intrinsic)` is LOAD-BEARING, and this is the
-    // second time these two have been deleted by accident. Every other
-    // `java/lang/String` `Bridge` is dropped in real-JDK mode by
-    // `NativeMethodRegistry::register` (contract §1.4, the forced-native
-    // `String` policy's replacement). These two are `Bridge` by the ambient
-    // category here, so that drop took them — and F4 came straight back:
-    // `"Hello, World".substring(-1)` threw `ArrayIndexOutOfBoundsException`
-    // instead of `StringIndexOutOfBoundsException`, because the generic
-    // `Preconditions` override underneath is exactly what F4 exists to bypass.
-    // `catch (StringIndexOutOfBoundsException)` does not catch an AIOOBE, so
-    // this is a control-flow change, not a message change.
-    //
-    // They ARE §1.4-reviewed intrinsics in the strict sense: the native is not
-    // a faster stand-in for the bytecode, it is the CORRECT answer where the
-    // bytecode's dependency (`Preconditions.checkFromToIndex` honouring
-    // `SIOOBE_FORMATTER`) is not implemented. Fixing that override is what
-    // would let these go — see
-    // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
-    registry.register_with_kind(
-        "java/lang/String",
-        "checkIndex",
-        "(II)V",
-        native_string_check_index,
-        cratonvm_native_api::NativeKind::Intrinsic,
-    );
-    registry.register_with_kind(
-        "java/lang/String",
-        "checkBoundsBeginEnd",
-        "(III)V",
-        native_string_check_bounds_begin_end,
-        cratonvm_native_api::NativeKind::Intrinsic,
-    );
-    registry.register_with_kind(
-        "java/lang/String",
-        "checkBoundsOffCount",
-        "(III)I",
-        native_string_check_bounds_off_count,
-        cratonvm_native_api::NativeKind::Intrinsic,
-    );
+    // Do not re-add them as a `Bridge`: every `java/lang/String` `Bridge` is
+    // dropped in real-JDK mode by `NativeMethodRegistry::register` (contract
+    // §1.4), which is how F4 silently regressed twice. The two-sided pin in
+    // `vm/tests/wp8_10_9_string_contains_native.rs` is what catches that now.
 
     // PERF: String(char[]) / String(char[], int, int) constructor
     // intrinsics — bulk Latin1-fits scan + copy in Rust instead of the
@@ -7889,11 +7804,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F4: String.checkBoundsBeginEnd / checkBoundsOffCount — must throw
-    // StringIndexOutOfBoundsException, never ArrayIndexOutOfBoundsException.
+    // String bounds checks — must report StringIndexOutOfBoundsException,
+    // never ArrayIndexOutOfBoundsException. The two are siblings, so
+    // `catch (StringIndexOutOfBoundsException)` does not see an AIOOBE.
     // -----------------------------------------------------------------------
 
-    fn err_kind(e: &cratonvm_types::error::MethodCallFailed) -> &'static str {
+    /// Name the exception class a native raised, whichever of the two shapes
+    /// it used.
+    ///
+    /// A native can fail two ways and the class matters in both: a
+    /// `RuntimeError` the VM maps to a class later, or an already-materialised
+    /// throwable (`ExceptionThrown`), which is what
+    /// `crate::preconditions::throw_out_of_bounds` produces when it has to
+    /// build the class an application-supplied exception formatter asked for.
+    /// Classifying only the first shape would report `other-failed` for the
+    /// second, so a test asserting `"sioobe"` would fail on a *correct* answer
+    /// and — worse — a test asserting anything else would pass on a wrong one.
+    fn err_kind(
+        ctx: &dyn NativeContext,
+        e: &cratonvm_types::error::MethodCallFailed,
+    ) -> &'static str {
         match e {
             cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(re),
@@ -7904,133 +7834,71 @@ mod tests {
                 cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { .. } => {
                     "aioobe"
                 }
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { .. } => "ioobe",
                 _ => "other-runtime",
             },
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
+                let class_id = ctx.class_id_of_object(*obj);
+                match ctx.class_name_of_id(class_id).unwrap_or_default().as_str() {
+                    "java/lang/StringIndexOutOfBoundsException" => "sioobe",
+                    "java/lang/ArrayIndexOutOfBoundsException" => "aioobe",
+                    "java/lang/IndexOutOfBoundsException" => "ioobe",
+                    _ => "other-thrown",
+                }
+            }
             _ => "other-failed",
         }
     }
 
     #[test]
-    fn f4_check_bounds_begin_end_in_range_returns_void() {
-        let mut ctx = mock_ctx();
-        let r = native_string_check_bounds_begin_end(
-            &mut ctx,
-            &[Value::Int(0), Value::Int(3), Value::Int(5)],
-        )
-        .unwrap();
-        assert_eq!(r, None); // void return
+    fn bounds_off_count_accepts_an_in_range_window() {
+        assert_eq!(bounds_off_count_violation(2, 3, 10), None);
+        // Empty-string edge case: BC `PKCS12$Mappings` reaches this during
+        // `Provider.put` for keys whose substring extraction falls into a
+        // zero-length window.
+        assert_eq!(bounds_off_count_violation(0, 0, 0), None);
+        assert_eq!(bounds_off_count_violation(0, 10, 10), None);
     }
 
     #[test]
-    fn f4_check_bounds_begin_end_zero_zero_zero_is_valid() {
-        // Empty-string edge case used by BC PKCS12$Mappings during Provider.put
-        // for keys whose substring extraction falls into a 0-length window.
-        let mut ctx = mock_ctx();
-        let r = native_string_check_bounds_begin_end(
-            &mut ctx,
-            &[Value::Int(0), Value::Int(0), Value::Int(0)],
-        )
-        .unwrap();
-        assert_eq!(r, None);
+    fn bounds_off_count_names_the_offending_argument() {
+        // The JDK's SIOOBE message convention: `offset` when it is the bad
+        // one, otherwise `count`.
+        assert_eq!(bounds_off_count_violation(-1, 2, 5), Some(-1));
+        assert_eq!(bounds_off_count_violation(0, -2, 5), Some(-2));
+        assert_eq!(bounds_off_count_violation(0, 6, 5), Some(6));
     }
 
     #[test]
-    fn f4_check_bounds_begin_end_negative_begin_throws_sioobe() {
-        let mut ctx = mock_ctx();
-        let err = native_string_check_bounds_begin_end(
-            &mut ctx,
-            &[Value::Int(-1), Value::Int(2), Value::Int(5)],
-        )
-        .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe", "must be SIOOBE not AIOOBE");
+    fn bounds_off_count_widens_before_adding() {
+        // (offset=i32::MAX, count=1, length=i32::MAX) is out of bounds; without
+        // the i64 widening the sum wraps negative and slips past the check.
+        assert_eq!(bounds_off_count_violation(i32::MAX, 1, i32::MAX), Some(1));
     }
 
+    /// The inverse of the old `f4_check_bounds_natives_registered_on_string`.
+    ///
+    /// `String.checkBoundsBeginEnd` / `checkBoundsOffCount` are no longer
+    /// intercepted: their real bytecode hands `Preconditions` the
+    /// `SIOOBE_FORMATTER`, and `crate::preconditions` honours it. Re-adding an
+    /// interceptor here would mean the underlying override had regressed —
+    /// fix that instead, because a native here reaches only the `String`
+    /// callers and leaves NIO's on the generic path.
     #[test]
-    fn f4_check_bounds_begin_end_begin_greater_than_end_throws_sioobe() {
-        let mut ctx = mock_ctx();
-        let err = native_string_check_bounds_begin_end(
-            &mut ctx,
-            &[Value::Int(3), Value::Int(2), Value::Int(5)],
-        )
-        .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
-    }
-
-    #[test]
-    fn f4_check_bounds_begin_end_end_greater_than_length_throws_sioobe() {
-        let mut ctx = mock_ctx();
-        let err = native_string_check_bounds_begin_end(
-            &mut ctx,
-            &[Value::Int(0), Value::Int(10), Value::Int(5)],
-        )
-        .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
-    }
-
-    #[test]
-    fn f4_check_bounds_off_count_in_range_returns_offset() {
-        let mut ctx = mock_ctx();
-        let r = native_string_check_bounds_off_count(
-            &mut ctx,
-            &[Value::Int(2), Value::Int(3), Value::Int(10)],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(r, Value::Int(2));
-    }
-
-    #[test]
-    fn f4_check_bounds_off_count_zero_zero_zero_is_valid() {
-        let mut ctx = mock_ctx();
-        let r = native_string_check_bounds_off_count(
-            &mut ctx,
-            &[Value::Int(0), Value::Int(0), Value::Int(0)],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(r, Value::Int(0));
-    }
-
-    #[test]
-    fn f4_check_bounds_off_count_negative_offset_throws_sioobe() {
-        let mut ctx = mock_ctx();
-        let err = native_string_check_bounds_off_count(
-            &mut ctx,
-            &[Value::Int(-1), Value::Int(2), Value::Int(5)],
-        )
-        .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
-    }
-
-    #[test]
-    fn f4_check_bounds_off_count_offset_plus_count_overflow_throws_sioobe() {
-        // Overflow guard: offset + count must not silently overflow i32.
-        // (offset=i32::MAX, count=1, length=i32::MAX) is out-of-bounds; without
-        // i64 widening this would wrap to negative and slip past the check.
-        let mut ctx = mock_ctx();
-        let err = native_string_check_bounds_off_count(
-            &mut ctx,
-            &[Value::Int(i32::MAX), Value::Int(1), Value::Int(i32::MAX)],
-        )
-        .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
-    }
-
-    #[test]
-    fn f4_check_bounds_natives_registered_on_string() {
+    fn string_bounds_helpers_are_left_to_their_bytecode() {
         let mut registry = NativeMethodRegistry::new();
         register_string_utf16_natives(&mut registry);
         assert!(
             registry
                 .find("java/lang/String", "checkBoundsBeginEnd", "(III)V")
-                .is_some(),
-            "checkBoundsBeginEnd must be registered to bypass broken Preconditions stub"
+                .is_none(),
+            "checkBoundsBeginEnd is the real bytecode's job now — see crate::preconditions"
         );
         assert!(
             registry
                 .find("java/lang/String", "checkBoundsOffCount", "(III)I")
-                .is_some(),
-            "checkBoundsOffCount must be registered to bypass broken Preconditions stub"
+                .is_none(),
+            "checkBoundsOffCount is the real bytecode's job now — see crate::preconditions"
         );
     }
 
@@ -8043,7 +7911,7 @@ mod tests {
         let s = ctx.create_string("hi");
         let err = native_string_code_point_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(-1)])
             .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
     }
 
     #[test]
@@ -8052,7 +7920,7 @@ mod tests {
         let s = ctx.create_string("hi");
         let err = native_string_code_point_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(99)])
             .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
     }
 
     // -----------------------------------------------------------------------
@@ -8155,7 +8023,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "aioobe");
     }
 
     #[test]
@@ -8175,7 +8043,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "aioobe");
         // The out-of-bounds store must NOT have silently written anything past
         // the array; in-range slots remain at their zero default.
         for i in 0..ctx.array_length(dst) {
@@ -8200,7 +8068,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&err), "sioobe");
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
     }
 
     #[test]

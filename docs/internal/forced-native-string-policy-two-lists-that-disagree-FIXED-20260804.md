@@ -204,8 +204,12 @@ carried a comment at their own site stating exactly what breaks without them:
   `StringIndexOutOfBoundsException`. Dropping them put
   `"Hello, World".substring(-1)` back on the wrong class, which
   `catch (StringIndexOutOfBoundsException)` does not catch. Filed as
-  [`preconditions-ignores-the-exception-formatter.md`](../known-issues/preconditions-ignores-the-exception-formatter.md),
-  which supersedes the earlier, wrong record.
+  `preconditions-ignores-the-exception-formatter.md`, which supersedes the
+  earlier, wrong record — and **fixed 2026-08-05**
+  ([record](preconditions-ignores-the-exception-formatter-FIXED-20260805.md)):
+  the override now honours the formatter, so both F4 registrations were
+  retired. `EXPECTED_SURVIVING_STRING_REGISTRATIONS` no longer lists them; the
+  inverse assertion lives in `native-builtins/src/lang_string.rs`.
 * **DF05** -- `String(StringBuilder)` and `String(AbstractStringBuilder, Void)`.
   The real ctor does `Arrays.copyOfRange` over the builder's `byte[]`; this
   VM's builders are `char[]`-backed. A builder holding seven characters came
@@ -285,8 +289,8 @@ read** — so the registration was deleted rather than kept.
 **2. `String.substring` out-of-range throws `ArrayIndexOutOfBoundsException`** —
 **superseded; see the correction above.** This was a regression of this change,
 not a pre-existing defect, and it is fixed. The underlying `Preconditions`
-defect it exposed is real and open:
-[filed](../known-issues/preconditions-ignores-the-exception-formatter.md).
+defect it exposed was real, and is **also fixed as of 2026-08-05**:
+[record](preconditions-ignores-the-exception-formatter-FIXED-20260805.md).
 `charAt(-1)` is the control: its bytecode reaches the right class, so this is
 `substring`'s bounds check specifically. The two are siblings under
 `IndexOutOfBoundsException`, so `catch (IndexOutOfBoundsException)` is
