@@ -131,7 +131,32 @@ use cratonvm_types::compat::CompatibilityMode;
 /// method is ordinary bytecode in `java.base`, so deleting the registration is
 /// the whole fix. This is the direction the gate exists to encourage: one
 /// fewer fake, and the count follows.
-const BASELINE_SYNTHETIC_STUBS: usize = 553;
+///
+/// # 553 -> 555, 2026-08-06 (JDK-only wave 2, the ThreadPoolExecutor retirement)
+///
+/// Two, and they are the same shape as the 157 -> 165 move: **no new fake was
+/// added.** `native_es_execute` — registered on both
+/// `java/util/concurrent/ExecutorService.execute(Runnable)` and
+/// `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)` — was inheriting
+/// the ambient `Bridge`, and it is not a bridge to anything: it is a
+/// compatibility stand-in for CratonVM's synthetic 2-field
+/// `Executors.new*ThreadPool()` receiver shape, which real `execute()` bytecode
+/// would NPE on.
+///
+/// The retag is the load-bearing half of a change that DELETED code: eight
+/// hand-written "does this receiver's `workers` field hold an object?" probes
+/// across four files in `vm`, plus the ninth, receiver-blind
+/// `force_native_over_real_jdk_bytecode` arm they existed to override. With the
+/// native tagged `SyntheticStub` and `ThreadPoolExecutor` on
+/// `real_protected_stub_class_common`'s allow-list, the one centralised
+/// arbitration yields it to the real `execute()` body class-scoped, for every
+/// receiver — and under `--jdk-only` both registrations are refused outright,
+/// which is what the strict count above already shows (604 refusals, up 2).
+///
+/// This is what "wave 1 is measurement" buys: the count rises because the
+/// census finally sees a fake it had mislabelled, at the moment that fake stops
+/// being reachable on a real-JDK image.
+const BASELINE_SYNTHETIC_STUBS: usize = 555;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
