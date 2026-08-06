@@ -2504,6 +2504,39 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // `ConcurrentHashMap$KeySetView` — the object `newKeySet()` / `keySet(V)`
+    // hands back is a real KeySetView over a native-backed ConcurrentHashMap,
+    // whose entries live in CratonVM's segmented layout rather than the `table`
+    // field. Every method listed here has a real body that reads `table`
+    // directly (`add` via `putVal`, `iterator`/`forEach`/`spliterator` via a
+    // `Traverser`, `hashCode`/`equals` via the iterator), so it must run the
+    // native instead. The methods NOT listed are the ones `CollectionView`
+    // declares in terms of `map` or `iterator()` — `size`/`isEmpty`/`clear`/
+    // `toArray`/`toString`/`containsAll`/`removeAll`/`retainAll`; their real
+    // bodies are correct once these are native, and forcing them here would
+    // also capture `ValuesView`/`EntrySetView`, which share that declaring
+    // class but not these semantics. See the retired
+    // `concurrenthashmap-newkeyset-returns-a-plain-hashset` write-up.
+    if class_name == "java/util/concurrent/ConcurrentHashMap$KeySetView"
+        && matches!(
+            method_name,
+            "add"
+                | "addAll"
+                | "remove"
+                | "contains"
+                | "iterator"
+                | "forEach"
+                | "spliterator"
+                | "stream"
+                | "hashCode"
+                | "equals"
+                | "removeIf"
+                | "getMappedValue"
+                | "getMap"
+        )
+    {
+        return true;
+    }
     // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
     // entries in a segmented native layout, so the real JDK `writeObject`
     // (which walks the always-null `table`) serialised every CHM as empty and
