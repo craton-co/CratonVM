@@ -8374,6 +8374,27 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
+    // one of these intrinsics reaches `emit_load_string_value_ptr`
+    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
+    // `String.value` reference field. That emitter is NOT gated on
+    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
+    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
+    // the adjacent coder/hash field and dereferences the result - a
+    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
+    // indexOf / hashCode / equals / compareTo.
+    //
+    // Refusing the intrinsic here is the unblock that module's header
+    // prescribes: it costs throughput (the calls fall back to native
+    // dispatch) and costs nothing when the gate is off, which is the default.
+    // The real fix is a narrow arm in that emitter, mirroring
+    // `emit_narrow_ref_aload_regs`. This does NOT make `-XX:+UseCompressedOops`
+    // sound on its own - hole 2 (the conservative 8-byte-word rescan in
+    // `gen_heap`'s `mark_young_to_old_refs` / `rewrite_stretch_conservatively`)
+    // is still open, and `enable_for_live_heap` still warns.
+    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+        return None;
+    }
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
@@ -10396,7 +10417,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -10488,7 +10509,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -13261,7 +13282,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // Flyway HSQLDB path "is running interpreted" in a run where it had been
     // JIT-eligible for four days, and looked for the stall in the wrong place.
     // The real defect was `383e7f5cf`. See
-    // `docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
+    // `fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
     //
     // If a package ever needs to be force-interpreted again, do it through the
     // bisect levers below (which `compile_gate::admit` applies at all three
@@ -14415,7 +14436,7 @@ fn try_compile_inner(
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
         // widens the set of methods that happens to — is written up in
-        // `docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`
+        // `docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing

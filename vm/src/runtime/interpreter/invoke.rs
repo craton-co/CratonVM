@@ -329,7 +329,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (docs/known-issues/c2/archive/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (docs/known-issues/c2/pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs

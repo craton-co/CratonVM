@@ -281,6 +281,65 @@ pub fn layout_replace_guard(class_id: u32) -> (*const u32, u32) {
     )
 }
 
+/// Owner of each registered `class_id` slot: which VM's `ClassStore` published
+/// the layout there. See [`register_class_layout`] for why the registry needs
+/// one at all.
+static CLASS_LAYOUT_OWNERS: RwLock<Vec<u32>> = RwLock::new(Vec::new());
+
+/// Domain 0 is the first `ClassStore` created in the process, which is the only
+/// one a single-VM embedding ever has — so it, and every heap that has not been
+/// told otherwise, keeps the pre-domain behaviour exactly.
+pub const FIRST_LAYOUT_DOMAIN: u32 = 0;
+
+/// Hands each `ClassStore` a distinct layout domain.
+static NEXT_LAYOUT_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Allocate the next layout domain. Called once per `ClassStore`.
+pub fn next_layout_domain() -> u32 {
+    NEXT_LAYOUT_DOMAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which domain owns `class_id`'s registered layout, if any.
+///
+/// PERF: this sits on the ALLOCATION path (`compact_object_body_size`), so the
+/// single-domain case must not pay for a lock. While only one `ClassStore` has
+/// ever existed no slot can be contested, and the answer is decided by one
+/// relaxed load — which is also the only case a production embedding, with its
+/// one VM per process, ever reaches. The `RwLock` read is taken only once a
+/// second VM exists and ownership can actually differ.
+#[inline]
+fn layout_owner(class_id: u32) -> Option<u32> {
+    if NEXT_LAYOUT_DOMAIN.load(std::sync::atomic::Ordering::Relaxed) <= 1 {
+        return None;
+    }
+    layout_owner_slow(class_id)
+}
+
+#[cold]
+fn layout_owner_slow(class_id: u32) -> Option<u32> {
+    CLASS_LAYOUT_OWNERS
+        .read()
+        .unwrap()
+        .get(class_id as usize)
+        .copied()
+        .filter(|&d| d != NO_LAYOUT_OWNER)
+}
+
+/// Sentinel for "no layout registered here". Real domains start at 0, so the
+/// empty marker has to be a value `next_layout_domain` cannot return.
+const NO_LAYOUT_OWNER: u32 = u32::MAX;
+
+/// Registrations refused because another domain already owns the slot.
+/// Diagnostic only: a non-zero value means some class fell back to tagged
+/// slots, which is correct but larger and slower.
+static FOREIGN_LAYOUT_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many registrations were refused as belonging to another domain.
+pub fn foreign_layout_refusals() -> u64 {
+    FOREIGN_LAYOUT_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current layout-registry generation (see [`LAYOUT_GENERATION`]).
 #[inline]
 pub fn layout_generation() -> u64 {
@@ -288,7 +347,38 @@ pub fn layout_generation() -> u64 {
 }
 
 /// Register (or replace, on redefine) the compact layout for a class.
-pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
+///
+/// `domain` names the `ClassStore` publishing this layout. It exists because
+/// `class_id` alone does NOT identify a class in this process: `ClassStore`
+/// issues `ClassId::new(self.classes.len())`, a per-VM index that every VM
+/// restarts from 0, while this registry is process-global. Two live VMs that
+/// each define a one-field class therefore land on one entry, and before
+/// domains were tracked the second overwrote the first — after which both
+/// decoded their objects through the other's storage kinds and offsets
+/// (`Float(3.25)` read back as `Int(1078984704)`: the same four bytes, wrong
+/// kind).
+///
+/// A slot owned by ANOTHER domain is left alone and the caller's class simply
+/// goes without a compact layout — `alloc_object` then allocates it with tagged
+/// slots, which carry their own type and are always correct. Refusing to
+/// publish is only half the fix; see [`compact_object_body_size`], which must
+/// also refuse to ALLOCATE against a slot it does not own, because the lookup
+/// is what is ambiguous.
+pub fn register_class_layout(domain: u32, class_id: u32, layout: Arc<CompactLayout>) {
+    if let Some(owner) = layout_owner(class_id) {
+        if owner != domain {
+            FOREIGN_LAYOUT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+    {
+        let mut owners = CLASS_LAYOUT_OWNERS.write().unwrap();
+        let idx = class_id as usize;
+        if idx >= owners.len() {
+            owners.resize(idx + 1, NO_LAYOUT_OWNER);
+        }
+        owners[idx] = domain;
+    }
     let idx = class_id as usize;
     assert!(
         idx < MAX_DENSE_CLASS_LAYOUTS,
@@ -339,6 +429,14 @@ pub fn unregister_class_layout(class_id: u32) {
     let Ok(index) = usize::try_from(class_id) else {
         return;
     };
+    // Release ownership too, or the slot stays reserved to a domain whose class
+    // is gone and no other VM could ever use it.
+    {
+        let mut owners = CLASS_LAYOUT_OWNERS.write().unwrap();
+        if let Some(slot) = owners.get_mut(index) {
+            *slot = NO_LAYOUT_OWNER;
+        }
+    }
     {
         // O(this class's versions), not O(every registered version): see
         // `CLASS_LAYOUT_VERSION_KEYS`. Versions lock first, matching
@@ -770,9 +868,24 @@ pub fn compact_field_storage(
 /// this one predicate, so an object can never be marked compact with a partial
 /// or stale class recipe.
 #[inline]
-pub fn compact_object_body_size(class_id: u32, field_count: usize) -> Option<usize> {
+pub fn compact_object_body_size(
+    domain: u32,
+    class_id: u32,
+    field_count: usize,
+) -> Option<usize> {
     if !compact_ref_fields_enabled() {
         return None;
+    }
+    // Never allocate against another domain's layout. `class_id` is a per-VM
+    // index (see `register_class_layout`), so a slot registered by a different
+    // `ClassStore` describes a DIFFERENT class that merely shares the number.
+    // Answering `None` here costs this class its compact representation and
+    // nothing else: the object is allocated with tagged slots, which carry
+    // their own type. Answering with the foreign layout corrupts every field
+    // access the object will ever see.
+    match layout_owner(class_id) {
+        Some(owner) if owner != domain => return None,
+        _ => {}
     }
     with_current_class_layout(class_id, |layout| {
         (layout.field_count() == field_count).then_some(layout.body_size as usize)
@@ -934,6 +1047,9 @@ pub fn clear_class_layouts() {
     CLASS_LAYOUTS.write().unwrap().clear();
     CLASS_LAYOUT_VERSIONS.write().clear();
     CLASS_LAYOUT_VERSION_KEYS.write().clear();
+    // Ownership is part of the registry: leaving it behind would reserve every
+    // just-cleared slot to its old domain and silently deny re-registration.
+    CLASS_LAYOUT_OWNERS.write().unwrap().clear();
     // The per-thread `class_layout_for_fields` cache is validated against
     // `layout_generation()`, so bump it here: without this, a test that clears
     // the registry and re-registers could be served a pre-clear entry from
@@ -1313,7 +1429,7 @@ mod tests {
             ref_offsets: vec![0],
             body_size: 8,
         });
-        register_class_layout(7, layout.clone());
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 7, layout.clone());
         assert!(class_layout(0).is_none());
         let got = class_layout(7).expect("registered");
         assert_eq!(got.body_size, 8);
@@ -1327,7 +1443,7 @@ mod tests {
             ref_offsets: vec![0, 8],
             body_size: 16,
         });
-        register_class_layout(7, layout2);
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 7, layout2);
         assert_eq!(class_layout(7).unwrap().body_size, 16);
         assert_eq!(class_layout_for_fields(7, 1).unwrap().body_size, 8);
         assert_eq!(class_layout_for_fields(7, 2).unwrap().body_size, 16);
@@ -1358,11 +1474,11 @@ mod tests {
     fn version_cache_sees_replacement() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(21, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 21, one_ref_layout(8));
         // Warm the cache.
         assert_eq!(class_layout_for_fields(21, 1).unwrap().body_size, 8);
         // Replace with a different layout at the same field count.
-        register_class_layout(21, one_ref_layout(24));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 21, one_ref_layout(24));
         assert_eq!(
             class_layout_for_fields(21, 1).unwrap().body_size,
             24,
@@ -1378,7 +1494,7 @@ mod tests {
         clear_class_layouts();
         // Warm a negative entry.
         assert!(class_layout_for_fields(22, 1).is_none());
-        register_class_layout(22, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 22, one_ref_layout(8));
         assert!(
             class_layout_for_fields(22, 1).is_some(),
             "cached negative lookup hid a later registration"
@@ -1392,7 +1508,7 @@ mod tests {
     fn version_cache_sees_unregister() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(23, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 23, one_ref_layout(8));
         assert!(class_layout_for_fields(23, 1).is_some());
         unregister_class_layout(23);
         assert!(
@@ -1408,7 +1524,7 @@ mod tests {
     fn version_cache_sees_clear() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(24, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 24, one_ref_layout(8));
         assert!(class_layout_for_fields(24, 1).is_some());
         clear_class_layouts();
         assert!(
@@ -1427,7 +1543,7 @@ mod tests {
         // 20 distinct classes > VERSION_CACHE_LEN (8), so entries get evicted
         // and re-resolved; each body_size encodes its class id.
         for cid in 30..50u32 {
-            register_class_layout(cid, one_ref_layout(cid * 8));
+            register_class_layout(FIRST_LAYOUT_DOMAIN, cid, one_ref_layout(cid * 8));
         }
         let mut handles = Vec::new();
         for _ in 0..4 {
@@ -1459,7 +1575,7 @@ mod tests {
     fn with_class_layout_matches_owning_accessor() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(60, one_ref_layout(40));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 60, one_ref_layout(40));
         // First call is a cache miss (installs), second is a hit.
         for pass in 0..2 {
             assert_eq!(
@@ -1490,9 +1606,9 @@ mod tests {
     fn with_class_layout_sees_replacement_and_unregister() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(62, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 62, one_ref_layout(8));
         assert_eq!(with_class_layout(62, 1, |l| l.body_size), Some(8));
-        register_class_layout(62, one_ref_layout(24));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 62, one_ref_layout(24));
         assert_eq!(
             with_class_layout(62, 1, |l| l.body_size),
             Some(24),
@@ -1511,8 +1627,8 @@ mod tests {
     fn current_layout_cache_invalidates_without_reusing_historical_recipe() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(70, one_ref_layout(8));
-        assert_eq!(compact_object_body_size(70, 1), Some(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 70, one_ref_layout(8));
+        assert_eq!(compact_object_body_size(FIRST_LAYOUT_DOMAIN, 70, 1), Some(8));
         assert_eq!(
             with_current_class_layout(70, |layout| layout.body_size),
             Some(8)
@@ -1528,14 +1644,14 @@ mod tests {
             ref_offsets: vec![0, 8],
             body_size: 16,
         });
-        register_class_layout(70, grown);
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 70, grown);
 
         assert_eq!(
-            compact_object_body_size(70, 1),
+            compact_object_body_size(FIRST_LAYOUT_DOMAIN, 70, 1),
             None,
             "allocation must not resurrect the historical one-field layout"
         );
-        assert_eq!(compact_object_body_size(70, 2), Some(16));
+        assert_eq!(compact_object_body_size(FIRST_LAYOUT_DOMAIN, 70, 2), Some(16));
         assert_eq!(
             with_current_class_layout(70, |layout| layout.body_size),
             Some(16)
@@ -1548,7 +1664,7 @@ mod tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
         assert!(with_current_class_layout(71, |_| ()).is_none());
-        register_class_layout(71, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 71, one_ref_layout(8));
         assert_eq!(
             with_current_class_layout(71, |layout| layout.body_size),
             Some(8)
@@ -1571,8 +1687,8 @@ mod tests {
     fn with_class_layout_is_reentrant() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
-        register_class_layout(63, one_ref_layout(8));
-        register_class_layout(64, one_ref_layout(16));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 63, one_ref_layout(8));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 64, one_ref_layout(16));
         // Warm both so the nested lookups exercise the hit path.
         assert_eq!(class_layout_for_fields(63, 1).unwrap().body_size, 8);
         assert_eq!(class_layout_for_fields(64, 1).unwrap().body_size, 16);
@@ -1592,7 +1708,7 @@ mod tests {
         // A nested lookup for a class that is NOT cached cannot install (the
         // outer shared borrow blocks it), so it falls through to the registry.
         // It must still return the right answer.
-        register_class_layout(65, one_ref_layout(32));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 65, one_ref_layout(32));
         let uncached = with_class_layout(63, 1, |_| with_class_layout(65, 1, |l| l.body_size));
         assert_eq!(
             uncached,
@@ -1616,7 +1732,7 @@ mod tests {
 
         let rejected = std::panic::catch_unwind({
             let layout = Arc::clone(&layout);
-            move || register_class_layout(u32::MAX, layout)
+            move || register_class_layout(FIRST_LAYOUT_DOMAIN, u32::MAX, layout)
         });
         assert!(
             rejected.is_err(),
@@ -1625,7 +1741,7 @@ mod tests {
 
         // The guard fires before taking CLASS_LAYOUTS, so a later valid
         // registration must still succeed instead of observing a poisoned lock.
-        register_class_layout(0, Arc::clone(&layout));
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 0, Arc::clone(&layout));
         assert!(Arc::ptr_eq(&class_layout(0).unwrap(), &layout));
         assert!(class_layout(u32::MAX).is_none());
         clear_class_layouts();

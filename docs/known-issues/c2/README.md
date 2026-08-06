@@ -129,7 +129,7 @@ record and the per-call safepoint-id store are precise-root and deopt metadata
 the IR tier emits and the single-pass backend does not. Only the epilogue
 savetop-restore is genuinely dead (~1.32x -> 1.27x); the rest is `perf-01`'s
 still-open policy question about replacing a C1 body without evidence.
-[closeout](../../internal/perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md)
+closeout (`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`)
 · [brief](perf-02-ir-methods-run-46-nops-on-entry.md).
 
 Worth keeping the pair in mind together: `perf-01` was a worse body and the fix

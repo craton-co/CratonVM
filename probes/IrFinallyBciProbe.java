@@ -1,5 +1,5 @@
 // Residual of the cov-07 athrow lane (see
-// docs/known-issues/hibernate/offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804.md,
+// fixed-suite-bugs/hibernate/offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md,
 // "Why COV-07 is the leading suspect" — the paragraph flagging the shared
 // exception stub's missing `jit_set_throw_bci` stamp as a pre-existing gap the
 // cov-07 lane did not own).

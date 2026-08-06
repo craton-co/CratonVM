@@ -884,7 +884,7 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
 /// class that is plainly on the classpath" can only be chased by breakpoint.
 fn dbg_clinit_fail() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_CLINIT_FAIL").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CLINIT_FAIL").is_some())
 }
 
 fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {

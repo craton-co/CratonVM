@@ -114,7 +114,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`) and is
+        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -2546,7 +2546,7 @@ struct JdkOnlyExitDumpPaths {
 /// runs. Without this a `--jdk-only --jdk-only-report r.json` run of a program
 /// whose error handler exits produced no report at all — and those are the runs
 /// the report exists for. See
-/// `docs/internal/jdk-only-system-exit-census-FIXED-20260804.md`.
+/// `jdk-only-system-exit-census-FIXED-20260804.md`.
 ///
 /// Shares `write_jdk_only_dumps`' `WRITTEN` latch, so a `System.exit` racing a
 /// normal shutdown cannot produce two interleaved writes to the same path;
@@ -4297,6 +4297,15 @@ fn run() -> Result<()> {
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
+            // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
+            // `suppressed` counts times the memo answered "clean" while a scan
+            // of the same range found a frame — i.e. oops that went unmarked
+            // and a cycle that was never told to avoid moving them.
+            // `shortcircuits` is the denominator: without it a zero cannot be
+            // told apart from an audit that never ran.
+            let sc = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
+            let sup = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED.load(O::Relaxed);
+            eprintln!("[GC] unreg_memo: shortcircuits={sc} SUPPRESSED={sup}");
         }
     }
 

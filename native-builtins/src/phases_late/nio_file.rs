@@ -7011,7 +7011,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let letter = (b'A' + (drive - 1) as u8) as char;
                 // Windows keeps each drive's working directory in a hidden
                 // `=X:` environment variable; that IS what `_wgetdcwd` reads.
-                let dir = std::env::var(format!("={letter}:"))
+                let dir = cratonvm_types::flags::runtime_var(format!("={letter}:"))
                     .ok()
                     .or_else(|| {
                         let cwd = std::env::current_dir().ok()?;
@@ -11481,7 +11481,7 @@ pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
 //
 //     UnsatisfiedLinkError: java/io/UnixFileSystem.getBooleanAttributes0(Ljava/io/File;)I
 //
-// (docs/internal/fixed-suite-bugs/springboot/
+// (fixed-suite-bugs/springboot/
 // unixfilesystem-getbooleanattributes0-missing-native-20260804-FIXED.md).
 // The `java/io/File` natives normally hide this, because `File.exists` /
 // `isFile` / `isDirectory` ARE forced overrides — but only until some test

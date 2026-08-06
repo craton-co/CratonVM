@@ -1680,7 +1680,7 @@ fn execute_string_concat<S: AsRef<[u16]>>(
     // Units also remove a transcode from the hot path rather than adding one:
     // a `String` argument used to be decoded UTF-16 -> UTF-8 on the way in and
     // re-encoded UTF-8 -> UTF-16 by `create_string_or_oom` on the way out.
-    // See `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+    // See `string-concat-loses-unpaired-surrogates-FIXED-20260805.md`.
     let mut result: Vec<u16> = Vec::new();
     let mut arg_idx = 0;
     let mut const_idx = 0;

@@ -54,7 +54,7 @@ descriptor`, `invalid entry size (expected 80 but got 1321 bytes)` — four
 spellings of one wrong base offset.
 
 The same defect is what made `Arrays.equals(long[], long[])` return true for
-unequal arrays (`docs/internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`);
+unequal arrays (`fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`);
 `ArraysSupport.mismatch` reads `ARRAY_INT_BASE_OFFSET` the same way.
 
 ## How it was narrowed (the useful part for next time)
@@ -155,7 +155,7 @@ to repeat them — do not treat these as narrowed): `-osr-dead-locals`,
 `-kernel-reg-osr` and `-kernel-reg-locals` each made it PASS. If that survives
 repetition it points at a local that the OSR entry's dead-mask says is dead
 while a register home still holds a stale value — the coordinate-space family of
-`docs/internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md`
+`fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md`
 and `…/jit/arrays-sort-long-osr-miscompile-FIXED.md` (whose fix,
 `14a2740859`, is already in this build and does not cover this).
 

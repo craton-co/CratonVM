@@ -3,7 +3,7 @@
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
 `vm/src/vm/vm_exec.rs` (dispatch regions ~14700 and ~22700)
 **Gated on:** ~~**L9** (String)~~ — L9 is closed, and item 3 is done with it;
-see [the outcome record](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md).
+see the outcome record (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
 **L10** (ThreadPoolExecutor) still gates item 7. Do not start item 7's deletion
 before it lands — both naive directions have already reintroduced known
 defects.
@@ -86,7 +86,7 @@ That path had a defect until 2026-08-04: its decline fell through to
 has three outcomes and none of them is the bytecode. `--jdk-only` could not start
 a thread. It is fixed, but this lane routes *more* traffic onto that path than
 anything before it, so re-read
-[`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md)
+`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`
 before trusting it.
 
 ## Verification

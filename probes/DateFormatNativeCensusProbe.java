@@ -7,7 +7,7 @@
  * and shows the two JIT tier-up exclusions (`java/util/**` receivers,
  * `invokespecial`) are BOTH inert on it. That points at the per-call native
  * funnel documented in
- * `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`
+ * `native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`
  * (~330-810 ns per entry), not at compilation.
  *
  * Same technique as `LockNativeCensusProbe`: run with

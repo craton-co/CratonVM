@@ -6075,9 +6075,9 @@ fn reloc_emit_enabled() -> bool {
     /// # One stub per DISTINCT throw-site bci, not one shared stub
     ///
     /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
-    /// flagged and did not own (`docs/known-issues/hibernate/
+    /// flagged and did not own (`fixed-suite-bugs/hibernate/
     /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
-    /// 20260804.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// 20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
     /// as *this* method's throw site and range-tested against `[start_pc,
     /// end_pc)` of every entry in this method's own exception table. Until this
     /// stub stamped it, that field still held whatever the CALLEE's compiled

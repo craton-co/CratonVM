@@ -269,7 +269,7 @@ that the gate must reject — plus an *adjudicated* one it must accept, so the
 gate is not simply always-red. A guard never shown to fail is decoration; three
 shipped inert in this feature. The one-off injection into the real registrar
 that the lane doc asks for is recorded in
-[`docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`.
 
 **Re-freezing.** A count that goes *down* passes and prints an instruction; it
 is never absorbed automatically, because a slack-free ratchet left at the old

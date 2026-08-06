@@ -344,7 +344,20 @@ impl VerificationFrame {
     /// Push a type onto the operand stack.
     pub fn push(&mut self, vtype: VType) -> Result<(), LinkageError> {
         if self.stack.len() >= self.max_stack as usize {
-            return Err(verify_error("stack overflow during verification"));
+            // Name the numbers. "stack overflow during verification" alone
+            // cannot distinguish an under-declared `max_stack` in the class
+            // file from the verifier over-counting a category-2 value, and
+            // the two have opposite fixes — the Infinispan
+            // `ConfigurationBuilder` retransform rejection
+            // (`cacheautoconfigurationtests-…-20260805`) burned a whole
+            // investigation on exactly that ambiguity.
+            return Err(verify_error(&format!(
+                "stack overflow during verification: pushing {vtype:?} onto a \
+                 {}-deep stack would exceed max_stack={} (stack: {:?})",
+                self.stack.len(),
+                self.max_stack,
+                self.stack,
+            )));
         }
         self.stack.push(vtype);
         Ok(())
