@@ -4175,7 +4175,7 @@ pub(crate) fn try_osr_with_backoff(
     // Measured: with the stock thresholds this workload reports `osr=0` — not a
     // single OSR body in the entire scan — while the per-constant methods it
     // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
-    // See docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+    // See docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
     //
     // Credit loop work towards that same invocation counter, the way HotSpot
     // sums its invocation and back-edge counters against a single threshold.
