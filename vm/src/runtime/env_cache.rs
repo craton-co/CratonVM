@@ -439,6 +439,9 @@ pub fn intrinsics_disabled() -> bool {
 /// to yield at dispatch — this dial exists so that migration can re-take the
 /// measurement one subsystem at a time instead of arguing about it.
 ///
+/// All five blocker families, with symptoms, are in
+/// `docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
+///
 /// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
 #[inline]
 pub fn jdk_only_enforce_shadow() -> bool {
