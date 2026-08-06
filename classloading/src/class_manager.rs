@@ -520,7 +520,7 @@ pub fn loader_aware_resolution() -> bool {
 fn dbg_stub_bt_filter() -> Option<&'static str> {
     static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FILTER
-        .get_or_init(|| std::env::var("CRATONVM_DBG_STUB_BT").ok())
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_STUB_BT").ok())
         .as_deref()
 }
 
@@ -8720,7 +8720,7 @@ impl ClassManager {
     /// hottest lookup in the VM for no isolation benefit. Only a
     /// `UserDefined` component loader — the case that genuinely produces two
     /// same-named classes — yields a non-bootstrap array class.
-    /// See `docs/array-class-defining-loader.md`.
+    /// See `array-class-defining-loader.md`.
     fn array_defining_loader(&self, component_id: Option<ClassId>) -> ClassLoaderId {
         match component_id
             .and_then(|id| self.class_store.get(id))
@@ -17139,7 +17139,7 @@ mod tests {
     //
     // The pre-2026-08-01 code hard-coded `Bootstrap` for every array class
     // and `debug_assert`ed it, citing the same clause for the opposite
-    // conclusion. See `docs/array-class-defining-loader.md`.
+    // conclusion. See `array-class-defining-loader.md`.
     // -----------------------------------------------------------------
 
     /// A `Foo` defined by a user loader gives a `[LFoo;` defined by that same

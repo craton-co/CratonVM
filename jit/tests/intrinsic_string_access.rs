@@ -773,6 +773,7 @@ fn compact_string_class_id() -> u32 {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         register_class_layout(
+            cratonvm_types::FIRST_LAYOUT_DOMAIN,
             COMPACT_STRING_CLASS_ID,
             std::sync::Arc::new(CompactLayout {
                 field_offsets: vec![0, 8, 12, 16],

@@ -745,6 +745,51 @@ pub(crate) fn cb_write_hb(
     ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len_chars));
     ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len_chars));
     ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+    // `java.nio.Buffer.address` (long), and it MUST be written last, by name:
+    // the indexed CB_FIELD_* writes above can alias the real `address` slot,
+    // and CB_FIELD_MARK's -1 is exactly what used to land in it.
+    //
+    // A real `HeapCharBuffer` sets `address` to
+    // `ARRAY_CHAR_BASE_OFFSET + (offset << 1)` (= 16 + 0). Left at -1, the
+    // inherited bulk-put bytecode `CharBuffer.put(CharBuffer)` ->
+    // `putBuffer` -> `ScopedMemoryAccess.copyMemory` computes a source
+    // offset of `address(-1) + (pos << 1)`, which is below
+    // `arrayBaseOffset` (16), so `unsafe_array_read_bytes`'s
+    // `byte_off.checked_sub(ABASE)` underflows and the copy reports
+    // ArrayIndexOutOfBoundsException.
+    //
+    // This is the identical defect, and the identical fix, that
+    // `charset.rs`'s ByteBuffer allocator already carries with the same
+    // warning about aliasing. Found 2026-08-05: it is what fails
+    // `BeanRegistrationsAotContributionTests
+    // #applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` on
+    // current dev - javac's `BaseFileManager.decode` grows its CharBuffer and
+    // copies the old one in, so EVERY source file it reads hits this.
+    // 16 == `Unsafe.arrayBaseOffset(char[])` here.
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
+}
+
+/// Re-assert `java.nio.Buffer.address` after an indexed `CB_FIELD_MARK` write.
+///
+/// `CB_FIELD_MARK` is slot 4, and on a real-JDK `java/nio/CharBuffer` the
+/// hierarchy-wide field order is Buffer's `mark`(0) `position`(1) `limit`(2)
+/// `capacity`(3) `address`(4) followed by CharBuffer's `hb`/`offset`/
+/// `isReadOnly`. So the indexed mark write lands on **`address`**, not on
+/// `mark` — every `flip()`/`clear()`/`rewind()` reset it to -1.
+///
+/// With `address` at -1, `CharBuffer.put(CharBuffer)` -> `putBuffer` computes
+/// a source offset below `arrayBaseOffset` and the copy reports
+/// ArrayIndexOutOfBoundsException. The indexed writes have to stay for
+/// synthetic mode (where the by-name fields do not exist), so re-assert the
+/// real field afterwards, exactly as `cb_write_hb` does at allocation.
+///
+/// Measured 2026-08-05: `flip()` alone took a freshly allocated CharBuffer
+/// from address=16 to address=-1, which is why `put(char[])`, `get(char[])`
+/// and `put(String)` all worked while only `put(CharBuffer)` threw.
+#[inline]
+pub(crate) fn cb_reassert_address(ctx: &mut dyn NativeContext, buf: ObjectRef) {
+    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
 }
 
 /// Read the backing char[] from a CharBuffer, honouring both the
@@ -1160,6 +1205,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
             ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(new_lim));
             ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+            cb_reassert_address(ctx, buf);
             Ok(Some(Value::Object(Some(buf))))
         },
     );
@@ -1252,6 +1298,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, CB_FIELD_LIMIT, Value::Int(pos));
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
         ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
+        cb_reassert_address(ctx, this);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "clear", "()Ljava/nio/CharBuffer;", |ctx, args| {
@@ -1263,12 +1310,14 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
         ctx.set_field(this, CB_FIELD_LIMIT, Value::Int(cap));
         ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
+        cb_reassert_address(ctx, this);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "rewind", "()Ljava/nio/CharBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, CB_FIELD_POS, Value::Int(0));
         ctx.set_field(this, CB_FIELD_MARK, Value::Int(-1));
+        cb_reassert_address(ctx, this);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "remaining", "()I", |ctx, args| {

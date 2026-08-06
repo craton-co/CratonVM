@@ -2624,7 +2624,7 @@ mod bootstrap_property_fallback_tests {
     /// scope, because every reader here runs on this thread.
     fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = env_lock();
-        let previous = std::env::var_os("JBOSS_HOME");
+        let previous = cratonvm_types::flags::runtime_var_os("JBOSS_HOME");
         match home {
             Some(v) => std::env::set_var("JBOSS_HOME", v),
             None => std::env::remove_var("JBOSS_HOME"),
@@ -7685,7 +7685,7 @@ pub fn register_essential_natives_with_shims(
     // for every non-Latin-1 `String` key in the VM, which is not an edge case:
     // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
     // `StringUTF16` defect is filed separately — see
-    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // `string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md`
     // — and when it is fixed this registration should be re-measured and
     // probably deleted, because at that point it becomes a pure perf
     // optimisation again and has to argue for itself on those terms.

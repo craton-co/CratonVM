@@ -121,7 +121,17 @@ use cratonvm_types::compat::CompatibilityMode;
 /// reading: **no new fake was added.** Five registrations that were mis-tagged
 /// `Bridge` are now counted where they always belonged, and the real
 /// improvement is on the other gate, which fell by eight.
-const BASELINE_SYNTHETIC_STUBS: usize = 554;
+///
+/// # 554 -> 553, 2026-08-05 (a stub deleted, not re-tagged)
+///
+/// `java.util.Map.entry(K, V)` is no longer registered. A differential run
+/// against HotSpot 25 (`probes/ShadowDifferentialProbe.java`) showed the stub
+/// answering `java.util.Map$Entry@6c` where the JDK answers `k=7`, and
+/// accepting a `setValue` the JDK's immutable `KeyValueHolder` refuses. The
+/// method is ordinary bytecode in `java.base`, so deleting the registration is
+/// the whole fix. This is the direction the gate exists to encourage: one
+/// fewer fake, and the count follows.
+const BASELINE_SYNTHETIC_STUBS: usize = 553;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.

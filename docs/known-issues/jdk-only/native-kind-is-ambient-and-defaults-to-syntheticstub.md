@@ -41,7 +41,7 @@ exists on **neither** image — the Windows JDK names that class
 
 Still open, and still nothing reclassified. What is new is that the number can
 no longer rise unnoticed: wave-2 lane L6 shipped a slack-free ratchet on it
-([`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md)).
+(`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`).
 
 ```sh
 JAVA_HOME=<JDK25> sh regression-suite/bridge-ratchet.sh
@@ -248,7 +248,7 @@ Reading the three `java/lang/Thread` rows — `start0()V` `acc_native: true`,
 nobody was looking for: under `--jdk-only` this VM **could not start a thread**,
 because §7 step 3's decline fell through to `UnsatisfiedLinkError` instead of to
 the bytecode. Fixed, with the evidence, in
-[`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).
+`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`.
 The other 4,795 shadowing `Bridge` rows can all reach that same path.
 
 ### What the census does *not* settle

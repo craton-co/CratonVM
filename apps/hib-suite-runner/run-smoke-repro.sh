@@ -3,8 +3,8 @@
 # run-smoke-repro.sh — N-run repro harness for
 # `org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency`.
 #
-# Docs: docs/internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md
-#       docs/internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md
+# Docs: fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md
+#       fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md
 #         (the 120 s timeout, retired 2026-08-05 — read its correction table
 #          before quoting any number from an older revision of this comment)
 #

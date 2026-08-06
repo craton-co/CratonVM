@@ -15,7 +15,7 @@
 //! backend — which *vectorises* its `boolean[]` loops — and started getting a
 //! scalar IR body. 2,462 ms became 15,823 ms, a phase on which CratonVM had
 //! been faster than HotSpot C2, with an unchanged checksum and no failing
-//! test (`docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`).
+//! test (`perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`).
 //!
 //! Fixing that one method was a special case. This is the general form: the
 //! set of things the single-pass backend can do and the IR tier cannot is

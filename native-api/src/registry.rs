@@ -2642,7 +2642,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// dispatching `String.equals`. An implementation must never report `false`
     /// for a pair it did not actually read: doing so silently turned every
     /// `ConcurrentHashMap.get` on a String key into a miss (see
-    /// `docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    /// `chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }
@@ -4996,7 +4996,7 @@ impl NativeMethodRegistry {
     /// arithmetic: the bodies for which the funnel's ~180-330 ns of pinning,
     /// STW probing, thread-state transitions and unwind bookkeeping is the
     /// entire cost of the call. Measured on `probes/NativeShapeProbe.java`;
-    /// see `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+    /// see `native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
     ///
     /// The claim rides on the **callback**, not on the triple: it is captured
     /// into the slot by `register()` alongside the category, so a later phase
