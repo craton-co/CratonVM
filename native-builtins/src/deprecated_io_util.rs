@@ -865,9 +865,7 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
 
         let arr_len = ctx.array_length(byte_arr);
         if offset + count > arr_len {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (offset + count) as i32,
-            }
+            return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
             .into());
         }
 

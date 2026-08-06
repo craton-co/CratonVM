@@ -1198,9 +1198,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 .checked_add(count)
                 .map_or(true, |end| end > length)
             {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: src_index as i32,
-                }
+                return Err(RuntimeError::aioobe_no_length(src_index as i32)
                 .into());
             }
             let kind = crate::panama_libffi::read_layout_kind(ctx, layout);

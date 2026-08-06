@@ -3959,9 +3959,7 @@ pub(crate) fn native_unsafe_copy_memory(
                 }
             }
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: dest_offset as i32,
-                }
+                cratonvm_types::error::RuntimeError::aioobe_no_length(dest_offset as i32)
                 .into(),
             );
         }
@@ -4025,9 +4023,7 @@ pub(crate) fn native_unsafe_set_memory(
                 return Ok(None);
             }
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: offset as i32,
-                }
+                cratonvm_types::error::RuntimeError::aioobe_no_length(offset as i32)
                 .into(),
             );
         }

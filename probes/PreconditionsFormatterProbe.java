@@ -161,10 +161,305 @@ public class PreconditionsFormatterProbe {
             int[] a = new int[4];
             return a[9];
         });
-        row("System.arraycopy oob", () -> {
-            System.arraycopy(new int[4], 0, new int[4], 0, 9);
+        row("int[] load negative", () -> {
+            int[] a = new int[4];
+            return a[-1];
+        });
+        row("int[] load on empty", () -> {
+            int[] a = new int[0];
+            return a[0];
+        });
+        row("int[] store oob", () -> {
+            int[] a = new int[4];
+            a[9] = 1;
             return "ok";
         });
+        row("int[] store negative", () -> {
+            int[] a = new int[4];
+            a[-1] = 1;
+            return "ok";
+        });
+        row("byte[] load oob", () -> {
+            byte[] a = new byte[4];
+            return a[9];
+        });
+        row("boolean[] load oob", () -> {
+            boolean[] a = new boolean[4];
+            return a[9];
+        });
+        row("char[] load oob", () -> {
+            char[] a = new char[4];
+            return a[9];
+        });
+        row("short[] load oob", () -> {
+            short[] a = new short[4];
+            return a[9];
+        });
+        row("long[] load oob", () -> {
+            long[] a = new long[4];
+            return a[9];
+        });
+        row("float[] load oob", () -> {
+            float[] a = new float[4];
+            return a[9];
+        });
+        row("double[] load oob", () -> {
+            double[] a = new double[4];
+            return a[9];
+        });
+        row("Object[] load oob (aaload)", () -> {
+            Object[] a = new Object[4];
+            return a[9];
+        });
+        row("Object[] store oob (aastore)", () -> {
+            Object[] a = new Object[4];
+            a[9] = "x";
+            return "ok";
+        });
+        row("String[] store negative", () -> {
+            String[] a = new String[4];
+            a[-3] = "x";
+            return "ok";
+        });
+        row("int[][] outer oob", () -> {
+            int[][] a = new int[2][3];
+            return a[5];
+        });
+        row("int[][] inner oob", () -> {
+            int[][] a = new int[2][3];
+            return a[0][7];
+        });
+
+        System.out.println("--- Array domain: reflective access ---");
+        row("Array.get(int[4],9)", () -> java.lang.reflect.Array.get(new int[4], 9));
+        row("Array.get(int[4],-1)", () -> java.lang.reflect.Array.get(new int[4], -1));
+        row("Array.getInt(int[4],9)", () -> java.lang.reflect.Array.getInt(new int[4], 9));
+        row("Array.set(int[4],9,v)", () -> {
+            java.lang.reflect.Array.set(new int[4], 9, 1);
+            return "ok";
+        });
+        row("Array.setInt(int[4],9,v)", () -> {
+            java.lang.reflect.Array.setInt(new int[4], 9, 1);
+            return "ok";
+        });
+        row("Array.get(Object[4],9)", () -> java.lang.reflect.Array.get(new Object[4], 9));
+        row("Array.get(Object[4],4)", () -> java.lang.reflect.Array.get(new Object[4], 4));
+        row("Array.getLength(int[4])", () -> java.lang.reflect.Array.getLength(new int[4]));
+        row("Array.get(null,0)", () -> java.lang.reflect.Array.get(null, 0));
+        row("Array.get(\"hello\",0)", () -> java.lang.reflect.Array.get("hello", 0));
+        row("Array.getLength(\"hello\")", () -> java.lang.reflect.Array.getLength("hello"));
+        row("Array.getInt(Object[4],0)", () -> java.lang.reflect.Array.getInt(new Object[4], 0));
+        row("Array.getInt(long[4],0)", () -> java.lang.reflect.Array.getInt(new long[4], 0));
+        row("Array.getLong(int[4],0)", () -> java.lang.reflect.Array.getLong(new int[4], 0));
+        row("Array.set(int[4],0,\"x\")", () -> {
+            java.lang.reflect.Array.set(new int[4], 0, "x");
+            return "ok";
+        });
+        row("Array.set(null,0,v)", () -> {
+            java.lang.reflect.Array.set(null, 0, 1);
+            return "ok";
+        });
+        row("Array.setInt(long[4],9,v)", () -> {
+            java.lang.reflect.Array.setInt(new long[4], 9, 1);
+            return "ok";
+        });
+        row("Array.newInstance(int,-1)",
+                () -> java.lang.reflect.Array.newInstance(int.class, -1));
+
+        System.out.println("--- Array domain: System.arraycopy ---");
+        row("arraycopy int last src", () -> {
+            System.arraycopy(new int[4], 0, new int[16], 0, 9);
+            return "ok";
+        });
+        row("arraycopy int last dst", () -> {
+            System.arraycopy(new int[16], 0, new int[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy int srcPos<0", () -> {
+            System.arraycopy(new int[4], -1, new int[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy int dstPos<0", () -> {
+            System.arraycopy(new int[4], 0, new int[4], -1, 1);
+            return "ok";
+        });
+        row("arraycopy int length<0", () -> {
+            System.arraycopy(new int[4], 0, new int[4], 0, -1);
+            return "ok";
+        });
+        row("arraycopy int srcPos<0 AND length<0", () -> {
+            System.arraycopy(new int[4], -1, new int[4], 0, -1);
+            return "ok";
+        });
+        row("arraycopy int both pos<0", () -> {
+            System.arraycopy(new int[4], -1, new int[4], -2, 1);
+            return "ok";
+        });
+        row("arraycopy int srcPos in, last src out", () -> {
+            System.arraycopy(new int[4], 3, new int[16], 0, 2);
+            return "ok";
+        });
+        row("arraycopy byte last src", () -> {
+            System.arraycopy(new byte[4], 0, new byte[16], 0, 9);
+            return "ok";
+        });
+        row("arraycopy boolean last src", () -> {
+            System.arraycopy(new boolean[4], 0, new boolean[16], 0, 9);
+            return "ok";
+        });
+        row("arraycopy char last dst", () -> {
+            System.arraycopy(new char[16], 0, new char[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy short srcPos<0", () -> {
+            System.arraycopy(new short[4], -1, new short[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy long last src", () -> {
+            System.arraycopy(new long[4], 0, new long[16], 0, 9);
+            return "ok";
+        });
+        row("arraycopy float dstPos<0", () -> {
+            System.arraycopy(new float[4], 0, new float[4], -1, 1);
+            return "ok";
+        });
+        row("arraycopy double last dst", () -> {
+            System.arraycopy(new double[16], 0, new double[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy Object[] last src", () -> {
+            System.arraycopy(new Object[4], 0, new Object[16], 0, 9);
+            return "ok";
+        });
+        row("arraycopy String[] last dst", () -> {
+            System.arraycopy(new String[16], 0, new String[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy String[] srcPos<0", () -> {
+            System.arraycopy(new String[4], -1, new String[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy int[][] last src", () -> {
+            System.arraycopy(new int[4][1], 0, new int[16][1], 0, 9);
+            return "ok";
+        });
+        row("arraycopy self overlap oob", () -> {
+            int[] a = new int[4];
+            System.arraycopy(a, 2, a, 0, 9);
+            return "ok";
+        });
+        row("arraycopy null src", () -> {
+            System.arraycopy(null, 0, new int[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy null dst", () -> {
+            System.arraycopy(new int[4], 0, null, 0, 1);
+            return "ok";
+        });
+        row("arraycopy non-array src", () -> {
+            System.arraycopy("hello", 0, new int[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy non-array dst", () -> {
+            System.arraycopy(new int[4], 0, "hello", 0, 1);
+            return "ok";
+        });
+        row("arraycopy type mismatch", () -> {
+            System.arraycopy(new int[4], 0, new long[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy prim-to-ref mismatch", () -> {
+            System.arraycopy(new int[4], 0, new Object[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy zero length past end", () -> {
+            System.arraycopy(new int[4], 4, new int[4], 4, 0);
+            return "ok";
+        });
+
+        System.out.println("--- Array domain: arraycopy check precedence ---");
+        // Which check wins when two are violated at once. The class differs
+        // between them (ASE vs AIOOBE vs NPE), so this is control flow, not
+        // just wording.
+        row("arraycopy null src + srcPos<0", () -> {
+            System.arraycopy(null, -1, new int[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy non-array src + srcPos<0", () -> {
+            System.arraycopy("hello", -1, new int[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy type mismatch + length oob", () -> {
+            System.arraycopy(new int[4], 0, new long[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy type mismatch + srcPos<0", () -> {
+            System.arraycopy(new int[4], -1, new long[4], 0, 1);
+            return "ok";
+        });
+        row("arraycopy ref-to-prim mismatch + oob", () -> {
+            System.arraycopy(new Object[4], 0, new int[4], 0, 9);
+            return "ok";
+        });
+        row("arraycopy incompatible refs in bounds", () -> {
+            Object[] src = new Object[] { "a", "b" };
+            System.arraycopy(src, 0, new Integer[2], 0, 2);
+            return "ok";
+        });
+        row("arraycopy last src wins over last dst", () -> {
+            System.arraycopy(new int[4], 0, new int[2], 0, 9);
+            return "ok";
+        });
+        row("arraycopy dstPos<0 wins over last src", () -> {
+            System.arraycopy(new int[4], 0, new int[4], -1, 9);
+            return "ok";
+        });
+        row("arraycopy length<0 wins over last src", () -> {
+            System.arraycopy(new int[4], 5, new int[4], 0, -1);
+            return "ok";
+        });
+        row("arraycopy srcPos+length overflows int", () -> {
+            System.arraycopy(new int[4], Integer.MAX_VALUE, new int[4], 0, 2);
+            return "ok";
+        });
+
+        System.out.println("--- Array domain: Arrays helpers ---");
+        row("Arrays.copyOfRange(int[4],-1,2)",
+                () -> java.util.Arrays.copyOfRange(new int[4], -1, 2));
+        row("Arrays.copyOfRange(int[4],3,2)",
+                () -> java.util.Arrays.copyOfRange(new int[4], 3, 2));
+        row("Arrays.fill(int[4],0,9,v)", () -> {
+            java.util.Arrays.fill(new int[4], 0, 9, 1);
+            return "ok";
+        });
+        row("Arrays.sort(int[4],0,9)", () -> {
+            java.util.Arrays.sort(new int[4], 0, 9);
+            return "ok";
+        });
+
+        System.out.println("--- Array domain: after JIT warm-up ---");
+        int[] warm = new int[4];
+        for (int i = 0; i < 200_000; i++) {
+            hotLoad(warm, i & 3);
+            hotStore(warm, i & 3);
+            hotCopy(warm, 4);
+        }
+        row("hot int[] load oob", () -> hotLoad(new int[4], 9));
+        row("hot int[] load negative", () -> hotLoad(new int[4], -1));
+        row("hot int[] store oob", () -> {
+            hotStore(new int[4], 9);
+            return "ok";
+        });
+        row("hot arraycopy last src", () -> {
+            hotCopy(new int[4], 9);
+            return "ok";
+        });
+
+        System.out.println("--- Array domain: catch shapes ---");
+        System.out.println("a[9] caught by catch(ArrayIndexOutOfBoundsException): "
+                + caughtAsAioobe());
+        System.out.println("arraycopy oob caught by catch(IndexOutOfBoundsException): "
+                + arraycopyCaughtAsIoobe());
 
         System.out.println("--- catch-shape assertions ---");
         System.out.println("substring(-1) caught by catch(StringIndexOutOfBoundsException): "
@@ -191,6 +486,39 @@ public class PreconditionsFormatterProbe {
             Objects.checkIndex(-1, 5);
             return false;
         } catch (ArrayIndexOutOfBoundsException e) {
+            return false;
+        } catch (IndexOutOfBoundsException e) {
+            return true;
+        }
+    }
+
+    static int hotLoad(int[] a, int i) {
+        return a[i];
+    }
+
+    static void hotStore(int[] a, int i) {
+        a[i] = i;
+    }
+
+    static void hotCopy(int[] a, int len) {
+        System.arraycopy(a, 0, new int[16], 0, len);
+    }
+
+    static boolean caughtAsAioobe() {
+        int[] a = new int[4];
+        try {
+            int unused = a[9];
+            return false;
+        } catch (ArrayIndexOutOfBoundsException e) {
+            return true;
+        } catch (IndexOutOfBoundsException e) {
+            return false;
+        }
+    }
+
+    static boolean arraycopyCaughtAsIoobe() {
+        try {
+            System.arraycopy(new int[4], 0, new int[4], 0, 9);
             return false;
         } catch (IndexOutOfBoundsException e) {
             return true;

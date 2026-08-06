@@ -3924,7 +3924,7 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // honest option, and it is right for 0 and 3+ elements.
         let (_, n) = al_state(ctx, b);
         if index < 0 || index >= n {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            return Err(cratonvm_types::error::RuntimeError::aioobe_no_length(index).into());
         }
         return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
     }
@@ -3934,7 +3934,7 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if singleton_wrapper_size(ctx, this) == Some(1) {
         if index != 0 {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }
+                cratonvm_types::error::RuntimeError::aioobe_no_length(index)
                     .into(),
             );
         }
@@ -4934,13 +4934,13 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (_, size) = al_state(ctx, this);
     if from_i32 < 0 || from_i32 > size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: from_i32 }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(from_i32)
                 .into(),
         );
     }
     if to_i32 < 0 || to_i32 > size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: to_i32 }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(to_i32)
                 .into(),
         );
     }
@@ -12938,7 +12938,7 @@ fn native_arrays_array_list_get(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return Ok(Some(Value::Object(None)));
     };
     if index < 0 || index as usize >= ctx.array_length(arr) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        return Err(RuntimeError::aioobe_no_length(index).into());
     }
     Ok(Some(ctx.get_array_element(arr, index as usize)))
 }
@@ -29611,7 +29611,7 @@ fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let size = ll_size(ctx, this);
     if index < 0 || index > size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::aioobe_no_length(index).into(),
         );
     }
     if index == size {
@@ -29638,7 +29638,7 @@ fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let size = ll_size(ctx, this);
     if index < 0 || index >= size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::aioobe_no_length(index).into(),
         );
     }
     match ll_node_at(ctx, this, index) {
@@ -29694,7 +29694,7 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
         None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::aioobe_no_length(index).into(),
         ),
     }
 }
@@ -29723,7 +29723,7 @@ fn native_ll_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Ok(Some(old))
         }
         None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::aioobe_no_length(index).into(),
         ),
     }
 }
@@ -33306,9 +33306,7 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let (data, size) = al_state(ctx, this);
     if idx >= size as usize {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: idx as i32,
-            }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(idx as i32)
             .into(),
         );
     }
@@ -45479,7 +45477,7 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
             let (_, n) = al_state(ctx, backing);
             if *index < 0 || *index >= n {
-                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+                return Err(cratonvm_types::error::RuntimeError::aioobe_no_length(*index).into());
             }
         }
     }
@@ -45779,7 +45777,7 @@ fn native_unmod_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -
     if index < 0 || index > len {
         // JDK throws IndexOutOfBoundsException; ArrayIndexOutOfBoundsException
         // is a subclass, so `catch (IndexOutOfBoundsException)` still catches.
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        return Err(RuntimeError::aioobe_no_length(index).into());
     }
     Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
         ctx, snapshot, index,

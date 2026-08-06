@@ -2498,9 +2498,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
             (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: bad_index,
-            }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(bad_index)
             .into(),
         );
     }
@@ -6352,15 +6350,13 @@ pub(crate) fn native_string_utf16_get_chars(
             (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::aioobe_no_length(index).into(),
         );
     }
     let mut bytes = vec![0u8; count * 2];
     if ctx.read_byte_array_into(value, src_begin as usize * 2, &mut bytes) != bytes.len() {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: src_begin,
-            }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(src_begin)
             .into(),
         );
     }

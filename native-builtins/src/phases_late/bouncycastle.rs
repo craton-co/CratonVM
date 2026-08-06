@@ -1942,9 +1942,7 @@ impl BcSecTFieldSpec {
 }
 
 pub(crate) fn bc_sect_aioobe(index: usize) -> MethodCallFailed {
-    RuntimeError::ArrayIndexOutOfBoundsException {
-        index: index.min(i32::MAX as usize) as i32,
-    }
+    RuntimeError::aioobe_no_length(index.min(i32::MAX as usize) as i32)
     .into()
 }
 
@@ -4450,9 +4448,7 @@ pub(crate) fn bc_gost3411_process_block(
     in_off: usize,
 ) -> MethodCallResult {
     if in_off.saturating_add(32) > ctx.array_length(input) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: in_off.saturating_add(31).min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(in_off.saturating_add(31).min(i32::MAX as usize) as i32)
         .into());
     }
 
@@ -4533,7 +4529,7 @@ pub(crate) fn register_bc_gost3411_digest(r: &mut NativeMethodRegistry) {
             let in_off = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
                 Some(Value::Int(v)) => {
-                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                    return Err(RuntimeError::aioobe_no_length(*v).into())
                 }
                 _ => 0,
             };
@@ -4875,14 +4871,12 @@ pub(crate) fn bc_whirlpool_native_update_array(
         return Ok(None);
     }
     if in_off_i < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: in_off_i }.into());
+        return Err(RuntimeError::aioobe_no_length(in_off_i).into());
     }
     let in_off = in_off_i as usize;
     let len = len_i as usize;
     if in_off.saturating_add(len) > ctx.array_length(input) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: in_off.saturating_add(len).min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(in_off.saturating_add(len).min(i32::MAX as usize) as i32)
         .into());
     }
 
@@ -5108,14 +5102,12 @@ pub(crate) fn bc_poly1305_native_update(
         return Ok(None);
     }
     if in_off_i < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: in_off_i }.into());
+        return Err(RuntimeError::aioobe_no_length(in_off_i).into());
     }
     let in_off = in_off_i as usize;
     let len = len_i as usize;
     if in_off.saturating_add(len) > ctx.array_length(input) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: in_off.saturating_add(len).min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(in_off.saturating_add(len).min(i32::MAX as usize) as i32)
         .into());
     }
 
@@ -5169,7 +5161,7 @@ pub(crate) fn bc_poly1305_native_do_final(
         _ => 0,
     };
     if out_off_i < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: out_off_i }.into());
+        return Err(RuntimeError::aioobe_no_length(out_off_i).into());
     }
     let out_off = out_off_i as usize;
     if out_off.saturating_add(16) > ctx.array_length(out_arr) {
@@ -5280,7 +5272,7 @@ pub(crate) fn bc_digest_random_bad_state(message: &str) -> MethodCallFailed {
 }
 
 pub(crate) fn bc_digest_random_aioobe(index: i32) -> MethodCallFailed {
-    RuntimeError::ArrayIndexOutOfBoundsException { index }.into()
+    RuntimeError::aioobe_no_length(index).into()
 }
 
 pub(crate) fn bc_digest_random_range(
@@ -6165,7 +6157,7 @@ pub(crate) fn bc_aes_native_process_block(
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6173,7 +6165,7 @@ pub(crate) fn bc_aes_native_process_block(
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6284,7 +6276,7 @@ pub(crate) fn bc_sm4_native_process_block(
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6292,7 +6284,7 @@ pub(crate) fn bc_sm4_native_process_block(
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6391,7 +6383,7 @@ pub(crate) fn bc_xtea_native_process_block(
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6399,7 +6391,7 @@ pub(crate) fn bc_xtea_native_process_block(
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
         Some(Value::Int(v)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            return Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => 0,
     };
@@ -6476,7 +6468,7 @@ pub(crate) fn register_bc_gost3412_engine(r: &mut NativeMethodRegistry) {
             let in_off = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
                 Some(Value::Int(v)) => {
-                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                    return Err(RuntimeError::aioobe_no_length(*v).into())
                 }
                 _ => 0,
             };
@@ -6484,7 +6476,7 @@ pub(crate) fn register_bc_gost3412_engine(r: &mut NativeMethodRegistry) {
             let out_off = match args.get(4) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
                 Some(Value::Int(v)) => {
-                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                    return Err(RuntimeError::aioobe_no_length(*v).into())
                 }
                 _ => 0,
             };
@@ -7338,11 +7330,11 @@ pub(crate) fn register_bc_chacha(r: &mut NativeMethodRegistry) {
             let out_len = ctx.array_length(out_arr);
             if in_len < 64 || out_len < 64 {
                 let index = if in_len < 64 { in_len } else { out_len } as i32;
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+                return Err(RuntimeError::aioobe_no_length(index).into());
             }
             let mut inb = [0u8; 64];
             if ctx.read_byte_array_into(in_arr, 0, &mut inb) != 64 {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: 0 }.into());
+                return Err(RuntimeError::aioobe_no_length(0).into());
             }
             let mut outb = [0u8; 64];
             crate::bc_chacha::chacha_permute_bytes(&mut outb, &inb);
@@ -7471,7 +7463,7 @@ pub(crate) fn register_bc_newhope(r: &mut NativeMethodRegistry) {
         }
     }
     fn bad() -> MethodCallFailed {
-        RuntimeError::ArrayIndexOutOfBoundsException { index: 1024 }.into()
+        RuntimeError::aioobe_no_length(1024).into()
     }
 
     let poly = "org/bouncycastle/pqc/crypto/newhope/Poly";
@@ -7532,12 +7524,12 @@ pub(crate) fn register_bc_cbc_block_cipher(r: &mut NativeMethodRegistry) {
             };
             if in_off_i < 0 {
                 return Err(
-                    RuntimeError::ArrayIndexOutOfBoundsException { index: in_off_i }.into(),
+                    RuntimeError::aioobe_no_length(in_off_i).into(),
                 );
             }
             if out_off_i < 0 {
                 return Err(
-                    RuntimeError::ArrayIndexOutOfBoundsException { index: out_off_i }.into(),
+                    RuntimeError::aioobe_no_length(out_off_i).into(),
                 );
             }
             let in_off = in_off_i as usize;
@@ -7702,9 +7694,9 @@ pub(crate) fn bc_pack_offset_arg(args: &[Value], idx: usize) -> Result<usize, Me
     match args.get(idx) {
         Some(Value::Int(v)) if *v >= 0 => Ok(*v as usize),
         Some(Value::Int(v)) => {
-            Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            Err(RuntimeError::aioobe_no_length(*v).into())
         }
-        _ => Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
+        _ => Err(RuntimeError::aioobe_no_length(-1).into()),
     }
 }
 
@@ -7724,11 +7716,11 @@ pub(crate) fn bc_pack_check_range(
     let end = match off.checked_add(len) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX }.into())
+            return Err(RuntimeError::aioobe_no_length(i32::MAX).into())
         }
     };
     if ctx.array_length(arr) < end {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end as i32 }.into());
+        return Err(RuntimeError::aioobe_no_length(end as i32).into());
     }
     Ok(())
 }
@@ -7786,11 +7778,11 @@ pub(crate) fn bc_pack_check_int_array(
     let end = match off.checked_add(len) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX }.into())
+            return Err(RuntimeError::aioobe_no_length(i32::MAX).into())
         }
     };
     if ctx.array_length(arr) < end {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end as i32 }.into());
+        return Err(RuntimeError::aioobe_no_length(end as i32).into());
     }
     Ok(())
 }
@@ -8307,9 +8299,7 @@ pub(crate) fn bc_blake2s_int_array_field(
         _ => return Err(bc_blake2s_bad_state("Blake2sDigest: missing array field")),
     };
     if ctx.array_length(arr) < min_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: min_len as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(min_len as i32)
         .into());
     }
     Ok(arr)
@@ -8374,21 +8364,21 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
             let message_pos = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
                 Some(Value::Int(v)) => {
-                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                    return Err(RuntimeError::aioobe_no_length(*v).into())
                 }
-                _ => return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
+                _ => return Err(RuntimeError::aioobe_no_length(-1).into()),
             };
             let end = match message_pos.checked_add(64) {
                 Some(v) => v,
                 None => {
                     return Err(
-                        RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX }.into(),
+                        RuntimeError::aioobe_no_length(i32::MAX).into(),
                     )
                 }
             };
             if ctx.array_length(message_arr) < end {
                 return Err(
-                    RuntimeError::ArrayIndexOutOfBoundsException { index: end as i32 }.into(),
+                    RuntimeError::aioobe_no_length(end as i32).into(),
                 );
             }
 
@@ -8459,9 +8449,9 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
                 match args.get(idx) {
                     Some(Value::Int(v)) if (0..16).contains(v) => Ok(*v as usize),
                     Some(Value::Int(v)) => {
-                        Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                        Err(RuntimeError::aioobe_no_length(*v).into())
                     }
-                    _ => Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
+                    _ => Err(RuntimeError::aioobe_no_length(-1).into()),
                 }
             };
             let pos_a = pos(3)?;
@@ -8478,7 +8468,7 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
                 }
             };
             if ctx.array_length(state_arr) < 16 {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: 16 }.into());
+                return Err(RuntimeError::aioobe_no_length(16).into());
             }
             let mut state = [0u32; 16];
             for (i, slot) in state.iter_mut().enumerate() {
@@ -8548,7 +8538,7 @@ pub(crate) fn bc_keccak_state_array(
         _ => return Err(bc_keccak_bad_state("KeccakDigest: missing state")),
     };
     if ctx.array_length(state_arr) < 25 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: 25 }.into());
+        return Err(RuntimeError::aioobe_no_length(25).into());
     }
     Ok(state_arr)
 }
@@ -8759,9 +8749,9 @@ pub(crate) fn register_bc_keccak_digest(r: &mut NativeMethodRegistry) {
         let off = match args.get(2) {
             Some(Value::Int(v)) if *v >= 0 => *v as usize,
             Some(Value::Int(v)) => {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+                return Err(RuntimeError::aioobe_no_length(*v).into())
             }
-            _ => return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
+            _ => return Err(RuntimeError::aioobe_no_length(-1).into()),
         };
         let rate = bc_keccak_int_field(ctx, this, "rate")?;
         let count = (rate as usize) >> 6;
@@ -8770,7 +8760,7 @@ pub(crate) fn register_bc_keccak_digest(r: &mut NativeMethodRegistry) {
             .checked_add(byte_count)
             .map_or(true, |end| end > ctx.array_length(data_arr))
         {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: off as i32 }.into());
+            return Err(RuntimeError::aioobe_no_length(off as i32).into());
         }
 
         let state_arr = bc_keccak_state_array(ctx, this)?;
@@ -8802,9 +8792,7 @@ pub(crate) fn register_bc_keccak_digest(r: &mut NativeMethodRegistry) {
             out[i * 8..i * 8 + 8].copy_from_slice(&state[i].to_le_bytes());
         }
         if !ctx.write_byte_array_from(data_queue, 0, &out) {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: out.len() as i32,
-            }
+            return Err(RuntimeError::aioobe_no_length(out.len() as i32)
             .into());
         }
         ctx.set_field_by_name(this, "bitsInQueue", Value::Int(rate));
@@ -9269,21 +9257,19 @@ pub(crate) fn bc_clone_byte_array_range(
     len: i32,
 ) -> Result<ObjectRef, MethodCallFailed> {
     if off < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: off }.into());
+        return Err(RuntimeError::aioobe_no_length(off).into());
     }
     if len < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: len }.into());
+        return Err(RuntimeError::aioobe_no_length(len).into());
     }
     let off = off as usize;
     let len = len as usize;
     let src_len = ctx.array_length(src);
     let Some(end) = off.checked_add(len) else {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX }.into());
+        return Err(RuntimeError::aioobe_no_length(i32::MAX).into());
     };
     if end > src_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: end.min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
         .into());
     }
     let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
@@ -9694,9 +9680,7 @@ pub(crate) fn bc_argon2_block_words(
         }
     };
     if ctx.array_length(words) < BC_ARGON2_BLOCK_QWORDS {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: BC_ARGON2_BLOCK_QWORDS as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(BC_ARGON2_BLOCK_QWORDS as i32)
         .into());
     }
     Ok(words)
@@ -9769,9 +9753,9 @@ pub(crate) fn bc_argon2_round_index(args: &[Value], idx: usize) -> Result<usize,
     match args.get(idx) {
         Some(Value::Int(v)) if (0..BC_ARGON2_BLOCK_QWORDS as i32).contains(v) => Ok(*v as usize),
         Some(Value::Int(v)) => {
-            Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            Err(RuntimeError::aioobe_no_length(*v).into())
         }
-        _ => Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
+        _ => Err(RuntimeError::aioobe_no_length(-1).into()),
     }
 }
 
@@ -9920,7 +9904,7 @@ pub(crate) fn register_bc_argon2_bytes_generator(r: &mut NativeMethodRegistry) {
                     .checked_add(out_len as usize)
                     .map_or(true, |end| end > ctx.array_length(out_arr))
             {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: out_off }.into());
+                return Err(RuntimeError::aioobe_no_length(out_off).into());
             }
 
             let params = match ctx.get_field_by_name(this, "parameters") {
@@ -10002,7 +9986,7 @@ pub(crate) fn register_bc_argon2_bytes_generator(r: &mut NativeMethodRegistry) {
                 .hash_password_into(&password, &salt, &mut derived)
                 .map_err(|e| bc_argon2_bad_argument(&format!("Argon2 generation failed: {e}")))?;
             if !ctx.write_byte_array_from(out_arr, out_off as usize, &derived) {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: out_off }.into());
+                return Err(RuntimeError::aioobe_no_length(out_off).into());
             }
             if let Some((pin, _)) = out_pin {
                 ctx.unpin_native_roots(pin);

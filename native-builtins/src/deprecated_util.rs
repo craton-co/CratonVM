@@ -538,9 +538,7 @@ fn native_string_init_hibyte(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
     let arr_len = ctx.array_length(byte_arr);
     if offset + count > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + count) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
         .into());
     }
 
@@ -698,9 +696,7 @@ fn native_string_init_bytes_off_len(
     };
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + count) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
         .into());
     }
     let mut bytes = Vec::with_capacity(count);
@@ -758,9 +754,7 @@ fn native_string_init_bytes_off_len_charset_name(
     let charset_name = ctx.read_string(charset_obj).unwrap_or_default();
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + count) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
         .into());
     }
     let mut bytes = Vec::with_capacity(count);
@@ -817,9 +811,7 @@ fn native_string_init_bytes_off_len_charset(
     };
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + count) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
         .into());
     }
     let mut bytes = Vec::with_capacity(count);
@@ -859,9 +851,7 @@ fn native_string_get_bytes_deprecated(
     let chars: Vec<u16> = text.encode_utf16().collect();
 
     if src_end > chars.len() {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: src_end as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(src_end as i32)
         .into());
     }
 

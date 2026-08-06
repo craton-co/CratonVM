@@ -118,17 +118,13 @@ fn fnf(path: &str) -> MethodCallFailed {
 fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
     if off < 0 || len < 0 {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { len },
-            },
+            RuntimeError::aioobe_no_length(if off < 0 { off } else { len }),
         )));
     }
     match (off as usize).checked_add(len as usize) {
         Some(end) if end <= arr_len => Ok(()),
         _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: off.saturating_add(len),
-            },
+            RuntimeError::aioobe_no_length(off.saturating_add(len)),
         ))),
     }
 }

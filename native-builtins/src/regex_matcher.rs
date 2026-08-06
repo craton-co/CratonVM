@@ -1862,9 +1862,7 @@ fn matcher_group_boundary(
 
     if idx >= re.captures_len() {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: idx as i32,
-            }
+            cratonvm_types::error::RuntimeError::aioobe_no_length(idx as i32)
             .into(),
         );
     }
@@ -1916,7 +1914,7 @@ pub(crate) fn native_matcher_start_idx(
         Some(Value::Int(i)) if *i >= 0 => *i as usize,
         Some(Value::Int(i)) => {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *i }
+                cratonvm_types::error::RuntimeError::aioobe_no_length(*i)
                     .into(),
             );
         }
@@ -1945,7 +1943,7 @@ pub(crate) fn native_matcher_end_idx(
         Some(Value::Int(i)) if *i >= 0 => *i as usize,
         Some(Value::Int(i)) => {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *i }
+                cratonvm_types::error::RuntimeError::aioobe_no_length(*i)
                     .into(),
             );
         }

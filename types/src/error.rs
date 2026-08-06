@@ -847,8 +847,26 @@ pub enum RuntimeError {
     #[error("NullPointerException{}", format_optional_message(.message))]
     NullPointerException { message: Option<String> },
 
+    /// `message` carries HotSpot's exact text, and there are two shapes of
+    /// it: an array access says "Index 9 out of bounds for length 4" (the same
+    /// wording `Preconditions.checkIndex` produces, hence
+    /// [`out_of_bounds_message::check_index`]), and `System.arraycopy` says
+    /// "arraycopy: last source index 9 out of bounds for int[4]" (see
+    /// [`arraycopy_message`]). It was absent until 2026-08-06, which is why
+    /// every AIOOBE this VM threw from the interpreter had a null message
+    /// while the JIT tier's own bounds check already carried one — the two
+    /// tiers disagreed about the same array access.
+    ///
+    /// `None` is not "unknown": it is the deliberate answer for a call site
+    /// that cannot name the length (a native holding an index and nothing
+    /// else) and for `java.lang.reflect.Array`, whose out-of-bounds throw has
+    /// a null message on HotSpot too. Build it with the `aioobe*` constructors
+    /// below rather than by hand, so the wording stays in one place.
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
-    ArrayIndexOutOfBoundsException { index: i32 },
+    ArrayIndexOutOfBoundsException {
+        index: i32,
+        message: Option<String>,
+    },
     /// Plain `java.lang.IndexOutOfBoundsException` -- the SUPERCLASS of the
     /// Array/String variants above, and not interchangeable with them.
     ///
@@ -1103,6 +1121,96 @@ pub mod out_of_bounds_message {
     }
 }
 
+/// `System.arraycopy`'s exception wordings, reproduced from HotSpot's
+/// `TypeArrayKlass::copy_array` / `ObjArrayKlass::copy_array`.
+///
+/// `arraycopy` does not use [`out_of_bounds_message`] at all: it names the
+/// array's *type* and *length* and says which of the five arguments failed,
+/// because an index alone cannot distinguish "your source ran out" from "your
+/// destination did". The five out-of-bounds shapes below become
+/// `ArrayIndexOutOfBoundsException`s; the three type shapes become
+/// `ArrayStoreException`s, and live here so both halves of one JDK method's
+/// contract stay together.
+///
+/// `ty` is the element-type name HotSpot's `type2name_tab` prints — `"int"`,
+/// `"byte"`, `"boolean"`, `"char"`, `"short"`, `"long"`, `"float"`,
+/// `"double"` — or the literal `"object array"` for any reference array,
+/// which is why the rendered text reads `object array[4]` and not
+/// `java.lang.String[4]`. Use [`element_type_name`] rather than spelling one
+/// out at a call site.
+///
+/// The two `last_*` shapes print `pos + length` **unsigned** (`%u` in
+/// HotSpot), which is what makes an overflowing `pos + length` render as a
+/// huge positive number instead of a negative one.
+pub mod arraycopy_message {
+    use crate::ArrayElementType;
+
+    /// HotSpot's `type2name_tab` entry for an array's element type, which is
+    /// the token every message below interpolates before `[len]`.
+    ///
+    /// Every reference array collapses to the single literal `"object array"`
+    /// — HotSpot's `ObjArrayKlass::copy_array` never prints the component
+    /// class — so `String[]`, `Object[]` and `int[][]` all render alike.
+    pub fn element_type_name(element_type: ArrayElementType) -> &'static str {
+        match element_type {
+            ArrayElementType::Boolean => "boolean",
+            ArrayElementType::Char => "char",
+            ArrayElementType::Float => "float",
+            ArrayElementType::Double => "double",
+            ArrayElementType::Byte => "byte",
+            ArrayElementType::Short => "short",
+            ArrayElementType::Int => "int",
+            ArrayElementType::Long => "long",
+            ArrayElementType::Reference => "object array",
+        }
+    }
+
+    /// `srcPos < 0`.
+    pub fn source_index(src_pos: i32, ty: &str, src_len: i32) -> String {
+        format!("arraycopy: source index {src_pos} out of bounds for {ty}[{src_len}]")
+    }
+
+    /// `destPos < 0` — reached only once `srcPos` has been cleared.
+    pub fn destination_index(dest_pos: i32, ty: &str, dest_len: i32) -> String {
+        format!("arraycopy: destination index {dest_pos} out of bounds for {ty}[{dest_len}]")
+    }
+
+    /// `length < 0` — reached only once both positions have been cleared.
+    /// The one shape that names no array.
+    pub fn negative_length(length: i32) -> String {
+        format!("arraycopy: length {length} is negative")
+    }
+
+    /// `srcPos + length > src.length`, printed unsigned.
+    pub fn last_source_index(src_pos: i32, length: i32, ty: &str, src_len: i32) -> String {
+        let last = (src_pos as u32).wrapping_add(length as u32);
+        format!("arraycopy: last source index {last} out of bounds for {ty}[{src_len}]")
+    }
+
+    /// `destPos + length > dest.length`, printed unsigned.
+    pub fn last_destination_index(dest_pos: i32, length: i32, ty: &str, dest_len: i32) -> String {
+        let last = (dest_pos as u32).wrapping_add(length as u32);
+        format!("arraycopy: last destination index {last} out of bounds for {ty}[{dest_len}]")
+    }
+
+    /// `src` is not an array at all (an `ArrayStoreException`, not an AIOOBE).
+    pub fn source_not_an_array(class_name: &str) -> String {
+        format!("arraycopy: source type {class_name} is not an array")
+    }
+
+    /// `dest` is not an array at all (an `ArrayStoreException`).
+    pub fn destination_not_an_array(class_name: &str) -> String {
+        format!("arraycopy: destination type {class_name} is not an array")
+    }
+
+    /// Both are arrays but their element types differ (an
+    /// `ArrayStoreException`). HotSpot renders each side as `{ty}[]`, so a
+    /// reference array reads `object array[]`.
+    pub fn type_mismatch(src_ty: &str, dest_ty: &str) -> String {
+        format!("arraycopy: type mismatch: can not copy {src_ty}[] into {dest_ty}[]")
+    }
+}
+
 impl RuntimeError {
     /// `StringIndexOutOfBoundsException` with HotSpot's `checkIndex` wording.
     ///
@@ -1178,6 +1286,49 @@ impl RuntimeError {
         }
     }
 
+    /// An out-of-bounds **array access**: HotSpot's
+    /// `InterpreterRuntime::throw_ArrayIndexOutOfBoundsException` wording,
+    /// which is character-for-character `Preconditions.checkIndex`'s.
+    ///
+    /// This is the one every `aaload`/`aastore`/`iaload`/… reaches, in both
+    /// the interpreter and the JIT, so both tiers must call it rather than
+    /// formatting their own copy.
+    pub fn aioobe(index: i32, length: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(out_of_bounds_message::check_index(
+                i64::from(index),
+                i64::from(length),
+            )),
+        }
+    }
+
+    /// An AIOOBE carrying a message that is not the array-access shape —
+    /// `System.arraycopy`'s five (see [`arraycopy_message`]), and
+    /// `java.util.Arrays`' `"Array index out of range: N"`.
+    ///
+    /// `index` stays the machine-readable operand; the message is what
+    /// `getMessage()` returns.
+    pub fn aioobe_with_message(index: i32, message: impl Into<String>) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(message.into()),
+        }
+    }
+
+    /// An AIOOBE whose call site does not know the array's length, so it
+    /// cannot build HotSpot's text — a `getMessage()` of null, which is also
+    /// what HotSpot's own `java.lang.reflect.Array` accessors return.
+    ///
+    /// Prefer [`RuntimeError::aioobe`]; this exists so the remaining sites say
+    /// so explicitly rather than silently passing `None`.
+    pub fn aioobe_no_length(index: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: None,
+        }
+    }
+
     /// The Java throwable this error materialises as: `(internal class name,
     /// detail message)`, or `None` when it has no Java counterpart
     /// ([`RuntimeError::NotImplemented`], which must stay an internal error).
@@ -1217,9 +1368,10 @@ impl RuntimeError {
             RuntimeError::ArithmeticException { message } => {
                 ("java/lang/ArithmeticException", Some(message.as_str()))
             }
-            RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
-                ("java/lang/ArrayIndexOutOfBoundsException", None)
-            }
+            RuntimeError::ArrayIndexOutOfBoundsException { message, .. } => (
+                "java/lang/ArrayIndexOutOfBoundsException",
+                message.as_deref(),
+            ),
             RuntimeError::IndexOutOfBoundsException { message } => {
                 ("java/lang/IndexOutOfBoundsException", message.as_deref())
             }
@@ -1556,8 +1708,120 @@ mod tests {
 
     #[test]
     fn runtime_error_array_index_out_of_bounds() {
-        let err = RuntimeError::ArrayIndexOutOfBoundsException { index: -1 };
+        let err = RuntimeError::aioobe_no_length(-1);
         assert_eq!(format!("{err}"), "ArrayIndexOutOfBoundsException: index -1");
+        assert_eq!(
+            err.as_java_throwable(),
+            Some(("java/lang/ArrayIndexOutOfBoundsException", None)),
+            "a site that cannot name the length must still produce a \
+             message-less throwable, i.e. the no-arg constructor"
+        );
+    }
+
+    #[test]
+    fn aioobe_carries_hotspots_array_access_wording() {
+        let err = RuntimeError::aioobe(9, 4);
+        assert_eq!(
+            err.as_java_throwable(),
+            Some((
+                "java/lang/ArrayIndexOutOfBoundsException",
+                Some("Index 9 out of bounds for length 4")
+            ))
+        );
+        // The array-access wording IS `Preconditions.checkIndex`'s; if these
+        // two ever diverge, one of them has been rewritten by hand.
+        assert_eq!(
+            out_of_bounds_message::check_index(9, 4),
+            "Index 9 out of bounds for length 4"
+        );
+    }
+
+    #[test]
+    fn aioobe_negative_index_still_names_the_length() {
+        // HotSpot prints the negative index verbatim rather than clamping.
+        let err = RuntimeError::aioobe(-1, 4);
+        assert_eq!(
+            err.as_java_throwable().and_then(|(_, m)| m),
+            Some("Index -1 out of bounds for length 4")
+        );
+    }
+
+    #[test]
+    fn arraycopy_wordings_match_hotspot() {
+        use arraycopy_message as ac;
+        assert_eq!(
+            ac::last_source_index(0, 9, "int", 4),
+            "arraycopy: last source index 9 out of bounds for int[4]"
+        );
+        assert_eq!(
+            ac::last_destination_index(0, 9, "char", 4),
+            "arraycopy: last destination index 9 out of bounds for char[4]"
+        );
+        assert_eq!(
+            ac::source_index(-1, "short", 4),
+            "arraycopy: source index -1 out of bounds for short[4]"
+        );
+        assert_eq!(
+            ac::destination_index(-1, "float", 4),
+            "arraycopy: destination index -1 out of bounds for float[4]"
+        );
+        assert_eq!(ac::negative_length(-1), "arraycopy: length -1 is negative");
+        // A reference array is "object array", never its own class name.
+        assert_eq!(
+            ac::last_source_index(0, 9, "object array", 4),
+            "arraycopy: last source index 9 out of bounds for object array[4]"
+        );
+        assert_eq!(
+            ac::type_mismatch("int", "object array"),
+            "arraycopy: type mismatch: can not copy int[] into object array[]"
+        );
+        assert_eq!(
+            ac::source_not_an_array("java.lang.String"),
+            "arraycopy: source type java.lang.String is not an array"
+        );
+    }
+
+    #[test]
+    fn arraycopy_element_type_names_are_hotspots() {
+        use arraycopy_message::element_type_name as name;
+        assert_eq!(name(crate::ArrayElementType::Int), "int");
+        assert_eq!(name(crate::ArrayElementType::Boolean), "boolean");
+        assert_eq!(name(crate::ArrayElementType::Char), "char");
+        assert_eq!(name(crate::ArrayElementType::Byte), "byte");
+        assert_eq!(name(crate::ArrayElementType::Short), "short");
+        assert_eq!(name(crate::ArrayElementType::Long), "long");
+        assert_eq!(name(crate::ArrayElementType::Float), "float");
+        assert_eq!(name(crate::ArrayElementType::Double), "double");
+        // Not "java.lang.String", not "Object" — HotSpot prints this literal
+        // for every reference array, including an array of arrays.
+        assert_eq!(name(crate::ArrayElementType::Reference), "object array");
+    }
+
+    #[test]
+    fn arraycopy_last_index_is_printed_unsigned() {
+        // HotSpot formats `pos + length` with `%u`, so an addition that
+        // overflows `int` renders as a large positive number. Printing it
+        // signed would produce a negative "last index", which no HotSpot
+        // message ever shows.
+        assert_eq!(
+            arraycopy_message::last_source_index(i32::MAX, 1, "int", 4),
+            "arraycopy: last source index 2147483648 out of bounds for int[4]"
+        );
+    }
+
+    #[test]
+    fn arraycopy_message_carries_through_to_the_throwable() {
+        let err = RuntimeError::aioobe_with_message(
+            9,
+            arraycopy_message::last_source_index(0, 9, "int", 4),
+        );
+        assert_eq!(
+            err.as_java_throwable(),
+            Some((
+                "java/lang/ArrayIndexOutOfBoundsException",
+                Some("arraycopy: last source index 9 out of bounds for int[4]")
+            ))
+        );
     }
 
     #[test]

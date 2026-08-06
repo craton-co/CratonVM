@@ -141,6 +141,71 @@ pub(crate) fn native_system_current_time_millis(
     Ok(Some(Value::Long(millis)))
 }
 
+/// HotSpot's `Klass::external_name()` for an object's class: dotted, and an
+/// array rendered as `component[]` rather than as its `[L…;` descriptor.
+///
+/// Used only on `arraycopy`'s cold error paths, where the message names the
+/// offending class the way a Java stack trace would.
+fn external_class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    let class_id = ctx.class_id_of_object(obj);
+    let internal = ctx.class_name_of_id(class_id).unwrap_or_default();
+    external_class_name(&internal)
+}
+
+/// Descriptor -> HotSpot external name. `[Ljava/lang/String;` ->
+/// `java.lang.String[]`, `[I` -> `int[]`, `java/lang/String` ->
+/// `java.lang.String`.
+fn external_class_name(internal: &str) -> String {
+    let mut dims = 0usize;
+    let mut rest = internal;
+    while let Some(stripped) = rest.strip_prefix('[') {
+        dims += 1;
+        rest = stripped;
+    }
+    let base = if dims == 0 {
+        rest.replace('/', ".")
+    } else {
+        match rest.as_bytes().first() {
+            Some(b'L') => rest
+                .trim_start_matches('L')
+                .trim_end_matches(';')
+                .replace('/', "."),
+            Some(b'Z') => "boolean".to_string(),
+            Some(b'B') => "byte".to_string(),
+            Some(b'C') => "char".to_string(),
+            Some(b'S') => "short".to_string(),
+            Some(b'I') => "int".to_string(),
+            Some(b'J') => "long".to_string(),
+            Some(b'F') => "float".to_string(),
+            Some(b'D') => "double".to_string(),
+            _ => rest.replace('/', "."),
+        }
+    };
+    format!("{base}{}", "[]".repeat(dims))
+}
+
+/// HotSpot's per-element `ArrayStoreException` text for a reference copy whose
+/// source holds an element the destination component type cannot accept.
+///
+/// It names the source ARRAY and the destination COMPONENT — not the offending
+/// index, which is why the previous "source element at index N" wording could
+/// not have come from HotSpot.
+fn element_type_mismatch_message(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    dst_elem_class: cratonvm_types::ClassId,
+) -> String {
+    let src_component = ctx
+        .class_name_of_id(ctx.class_id_of_object(src))
+        .unwrap_or_default();
+    let dst_component = ctx.class_name_of_id(dst_elem_class).unwrap_or_default();
+    format!(
+        "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {}",
+        external_class_name(&src_component),
+        external_class_name(&dst_component)
+    )
+}
+
 pub(crate) fn native_system_arraycopy(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -149,8 +214,12 @@ pub(crate) fn native_system_arraycopy(
     let src = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
+            // HotSpot's `JVM_ArrayCopy` uses a bare `THROW(NPE)` for both
+            // null arguments — no detail message at all, and no way to tell
+            // which of the two was null from the exception. Inventing one
+            // here would be a divergence, not an improvement.
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("arraycopy: src is null".to_string()),
+                message: None,
             }
             .into());
         }
@@ -162,8 +231,9 @@ pub(crate) fn native_system_arraycopy(
     let dest = match args.get(2) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
+            // See the `src` arm above: HotSpot throws a message-less NPE.
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("arraycopy: dest is null".to_string()),
+                message: None,
             }
             .into());
         }
@@ -177,56 +247,31 @@ pub(crate) fn native_system_arraycopy(
         _ => 0,
     };
 
-    // Validate that src and dest are arrays
+    // Validate that src and dest are arrays.
+    //
+    // The whole rest of this function follows HotSpot's check ORDER, which is
+    // observable because each stage throws a different CLASS: null -> NPE,
+    // not-an-array -> ArrayStoreException, element-type mismatch ->
+    // ArrayStoreException, bad range -> ArrayIndexOutOfBoundsException. See
+    // `JVM_ArrayCopy` plus `TypeArrayKlass::copy_array` /
+    // `ObjArrayKlass::copy_array`; `probes/PreconditionsFormatterProbe`'s
+    // "arraycopy check precedence" rows pin every pairwise ordering that a
+    // reordering would flip.
     use cratonvm_types::ObjectKind;
+    use cratonvm_types::error::arraycopy_message;
     if ctx.heap_kind_of(src) != ObjectKind::Array {
+        let name = external_class_name_of(ctx, src);
         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
-            message: "arraycopy: src is not an array".to_string(),
+            message: arraycopy_message::source_not_an_array(&name),
         }
         .into());
     }
     if ctx.heap_kind_of(dest) != ObjectKind::Array {
+        let name = external_class_name_of(ctx, dest);
         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
-            message: "arraycopy: dest is not an array".to_string(),
+            message: arraycopy_message::destination_not_an_array(&name),
         }
         .into());
-    }
-
-    // Bounds checking
-    let src_len = ctx.array_length(src) as i32;
-    let dest_len = ctx.array_length(dest) as i32;
-
-    // SECURITY FIX (V14): widen the end-offset additions to i64 so that
-    // `src_pos + length` / `dest_pos + length` cannot wrap to a negative
-    // value (Rust `+` wraps in release builds) and silently defeat the
-    // `> len` bounds check. The individual >= 0 checks and the
-    // ArrayIndexOutOfBoundsException semantics are preserved.
-    let src_end = src_pos as i64 + length as i64;
-    let dest_end = dest_pos as i64 + length as i64;
-    if src_pos < 0
-        || dest_pos < 0
-        || length < 0
-        || src_end > src_len as i64
-        || dest_end > dest_len as i64
-    {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if src_pos < 0 {
-                    src_pos
-                } else if dest_pos < 0 {
-                    dest_pos
-                } else if src_end > src_len as i64 {
-                    src_end as i32
-                } else {
-                    dest_end as i32
-                },
-            }
-            .into(),
-        );
-    }
-
-    if length == 0 {
-        return Ok(None);
     }
 
     // Element-type compatibility.
@@ -238,43 +283,29 @@ pub(crate) fn native_system_arraycopy(
     //  3. Both reference arrays в†’ per-element assignability check against
     //     the destination component class, with prefix-commit on failure
     //     (JLS В§5.5 / `java.lang.System.arraycopy` contract).
+    //
+    // This must run BEFORE the range check: `arraycopy(int[4], 0, long[4], 0,
+    // 9)` violates both, and HotSpot reports the type mismatch. It used to run
+    // after, so that call threw an AIOOBE where a `catch (ArrayStoreException)`
+    // was written.
     use cratonvm_types::ArrayElementType;
     let src_elem = ctx.heap_element_type_of(src);
     let dest_elem = ctx.heap_element_type_of(dest);
-    if src_elem != dest_elem {
-        if src_elem == ArrayElementType::Char
-            && dest_elem == ArrayElementType::Byte
-            && is_abstract_string_builder_capacity_copy(ctx)
-        {
-            for i in 0..length {
-                let val = ctx.get_array_element(src, (src_pos + i) as usize);
-                let byte = match val {
-                    Value::Int(v) => v & 0xff,
-                    _ => 0,
-                };
-                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(byte));
-            }
-            return Ok(None);
-        }
-
+    // Two `AbstractStringBuilder` accommodations copy ACROSS element types on
+    // purpose (see the arms further down). Decide here whether this call is
+    // one of them, so the rejection below can let them through — but run the
+    // copies themselves after the range check, which they rely on.
+    let sb_capacity_copy = src_elem == ArrayElementType::Char
+        && dest_elem == ArrayElementType::Byte
+        && is_abstract_string_builder_capacity_copy(ctx);
+    let sb_append_copy = matches!(src_elem, ArrayElementType::Byte | ArrayElementType::Boolean)
+        && dest_elem == ArrayElementType::Char
+        && is_abstract_string_builder_append_copy(ctx);
+    if src_elem != dest_elem && !sb_capacity_copy && !sb_append_copy {
         // CRATONVM_DBG_ARRAYCOPY=1 вЂ” dump the Java caller chain + array
         // identities for the element-type mismatch. Env-gated; default output
         // unchanged. Used to localize the Hibernate/H2 "src=Char, dest=Byte"
         // cluster (an array mislabeled at its allocation site).
-        if matches!(src_elem, ArrayElementType::Byte | ArrayElementType::Boolean)
-            && dest_elem == ArrayElementType::Char
-            && is_abstract_string_builder_append_copy(ctx)
-        {
-            for i in 0..length {
-                let val = ctx.get_array_element(src, (src_pos + i) as usize);
-                let ch = match val {
-                    Value::Int(v) => v & 0xff,
-                    _ => 0,
-                };
-                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(ch));
-            }
-            return Ok(None);
-        }
         if crate::nbflags().dbg_arraycopy {
             let src_cls = ctx.class_id_of_object(src);
             let dest_cls = ctx.class_id_of_object(dest);
@@ -299,16 +330,100 @@ pub(crate) fn native_system_arraycopy(
             tracing::warn!(
                 target: "cratonvm::arraycopy",
                 "[DBG_ARRAYCOPY] mismatch src={src_elem:?}({src_name}) dest={dest_elem:?}({dest_name}) \
-                 srcLen={src_len} destLen={dest_len} len={length} caller chain:{rendered}"
+                 srcLen={srcl} destLen={destl} len={length} caller chain:{rendered}",
+                srcl = ctx.array_length(src),
+                destl = ctx.array_length(dest),
             );
         }
         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
-            message: format!(
-                "arraycopy: incompatible array element types (src={:?}, dest={:?})",
-                src_elem, dest_elem
+            message: arraycopy_message::type_mismatch(
+                arraycopy_message::element_type_name(src_elem),
+                arraycopy_message::element_type_name(dest_elem),
             ),
         }
         .into());
+    }
+
+    // Bounds checking
+    let src_len = ctx.array_length(src) as i32;
+    let dest_len = ctx.array_length(dest) as i32;
+
+    // SECURITY FIX (V14): widen the end-offset additions to i64 so that
+    // `src_pos + length` / `dest_pos + length` cannot wrap to a negative
+    // value (Rust `+` wraps in release builds) and silently defeat the
+    // `> len` bounds check. The individual >= 0 checks and the
+    // ArrayIndexOutOfBoundsException semantics are preserved.
+    let src_end = src_pos as i64 + length as i64;
+    let dest_end = dest_pos as i64 + length as i64;
+    if src_pos < 0
+        || dest_pos < 0
+        || length < 0
+        || src_end > src_len as i64
+        || dest_end > dest_len as i64
+    {
+        // HotSpot names WHICH argument failed and the array's type and
+        // length; an index alone cannot distinguish "your source ran out"
+        // from "your destination did". The five-way ladder below is its
+        // priority order, and it uses the SOURCE array's element type for
+        // both sides (the two are equal by the time we get here).
+        let ty = arraycopy_message::element_type_name(src_elem);
+        let (index, message) = if src_pos < 0 {
+            (src_pos, arraycopy_message::source_index(src_pos, ty, src_len))
+        } else if dest_pos < 0 {
+            (
+                dest_pos,
+                arraycopy_message::destination_index(dest_pos, ty, dest_len),
+            )
+        } else if length < 0 {
+            (length, arraycopy_message::negative_length(length))
+        } else if src_end > src_len as i64 {
+            (
+                src_end as i32,
+                arraycopy_message::last_source_index(src_pos, length, ty, src_len),
+            )
+        } else {
+            (
+                dest_end as i32,
+                arraycopy_message::last_destination_index(dest_pos, length, ty, dest_len),
+            )
+        };
+        return Err(
+            cratonvm_types::error::RuntimeError::aioobe_with_message(index, message).into(),
+        );
+    }
+
+    if length == 0 {
+        return Ok(None);
+    }
+
+    if src_elem != dest_elem {
+        if sb_capacity_copy {
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                let byte = match val {
+                    Value::Int(v) => v & 0xff,
+                    _ => 0,
+                };
+                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(byte));
+            }
+            return Ok(None);
+        }
+
+        if sb_append_copy {
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                let ch = match val {
+                    Value::Int(v) => v & 0xff,
+                    _ => 0,
+                };
+                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(ch));
+            }
+            return Ok(None);
+        }
+        // Unreachable: the only two cross-element-type calls that survive the
+        // rejection above are the accommodations, both handled.
+        debug_assert!(false, "unhandled cross-element-type arraycopy");
+        return Ok(None);
     }
 
     // Handle overlapping copy (same array).
@@ -433,10 +548,7 @@ pub(crate) fn native_system_arraycopy(
                 if let Value::Object(Some(elem)) = val {
                     if !assignable_to_dst(ctx, elem) {
                         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
-                            message: format!(
-                                "arraycopy: source element at index {} is not assignable to destination component type",
-                                src_pos + i
-                            ),
+                            message: element_type_mismatch_message(ctx, src, dst_elem_class),
                         }
                         .into());
                     }
@@ -457,10 +569,7 @@ pub(crate) fn native_system_arraycopy(
                         // has already been written. This is the spec
                         // partial-commit behavior.
                         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
-                            message: format!(
-                                "arraycopy: source element at index {} is not assignable to destination component type",
-                                src_pos + i
-                            ),
+                            message: element_type_mismatch_message(ctx, src, dst_elem_class),
                         }
                         .into());
                     }
@@ -3399,7 +3508,7 @@ fn read_define_class_nonnegative_int(
     match args.get(idx) {
         Some(Value::Int(v)) if *v >= 0 => Ok(*v as usize),
         Some(Value::Int(v)) => {
-            Err(RuntimeError::ArrayIndexOutOfBoundsException { index: *v }.into())
+            Err(RuntimeError::aioobe_no_length(*v).into())
         }
         _ => Ok(0),
     }
@@ -3414,11 +3523,9 @@ fn read_byte_array_define_class_slice(
     let arr_len = ctx.array_length(array);
     let end = offset
         .checked_add(length)
-        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
     if end > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: end.min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
         .into());
     }
 
@@ -3453,15 +3560,13 @@ fn read_byte_buffer_define_class_slice(
         let cap = ctx.array_length(array);
         let absolute_off = pos
             .checked_add(offset)
-            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+            .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
         let upper = limit.min(cap);
         let end = absolute_off
             .checked_add(length)
-            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+            .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
         if end > upper {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: end.min(i32::MAX as usize) as i32,
-            }
+            return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
             .into());
         }
         return read_byte_array_define_class_slice(ctx, array, absolute_off, length);
@@ -3491,15 +3596,13 @@ fn read_byte_buffer_define_class_slice(
     }
     let absolute_off = pos
         .checked_add(offset)
-        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
     let upper = limit.min(cap);
     let end = absolute_off
         .checked_add(length)
-        .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException { index: i32::MAX })?;
+        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
     if end > upper {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: end.min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
         .into());
     }
     let mut out = vec![0u8; length];
