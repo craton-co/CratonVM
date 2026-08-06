@@ -1412,7 +1412,52 @@ pub fn execute(
                             "java/util/Iterator" => "java/util/HashMap$KeyItr",
                             _ => "",
                         };
-                        if !canonical.is_empty() {
+                        // JDK-ONLY-WAVE2 §8, 2026-08-06. The record says: "Under
+                        // `JdkOnly` real class bytes make every one of these
+                        // interfaces resolvable, so the map should become
+                        // unreachable rather than conditional." That is now
+                        // enforced instead of hoped for.
+                        //
+                        // Substituting a DIFFERENT class's native for an
+                        // unresolvable interface call is a compatibility
+                        // substitution in the §1 sense and a silent one — the
+                        // receiver is not an instance of `canonical`, so
+                        // `HashMap$KeyItr`'s native runs against something that
+                        // is not one. Strict mode may not do that quietly.
+                        //
+                        // Measured before changing anything: across all 53
+                        // regression-corpus classes the map fires **zero**
+                        // times, in `--real-jdk` and `--jdk-only` alike
+                        // (`CRATONVM_DBG_CHECK_OVERRIDE=1`, `[CANONICAL_CENSUS]
+                        // rows=0` in both). So this is a guard against a
+                        // regression, not a live path being taken away — which
+                        // is also why it is a refusal and not a rewrite: the
+                        // record warns that "removing shim mappings has
+                        // regressed real-JDK boot before", and `Compatible`
+                        // keeps the mapping untouched.
+                        if !canonical.is_empty()
+                            && crate::vm::dispatch_policy(shared).is_jdk_only()
+                        {
+                            crate::vm::record_canonical_substitution(
+                                &class_name_owned,
+                                canonical,
+                                method_name,
+                            );
+                            crate::vm::record_interface_substitution_refusal(
+                                &class_name_owned,
+                                canonical,
+                                method_name,
+                                method_descriptor,
+                            );
+                            // Fall through to the ordinary no-native handling
+                            // below, which raises the resolution error the JVMS
+                            // calls for. Deliberately NOT a silent `Ok(None)`.
+                        } else if !canonical.is_empty() {
+                            crate::vm::record_canonical_substitution(
+                                &class_name_owned,
+                                canonical,
+                                method_name,
+                            );
                             // JDK-only §7. `bytecode_available = false`
                             // throughout: we are in the no-`Code` arm and the
                             // receiver matched no concrete class, so a
