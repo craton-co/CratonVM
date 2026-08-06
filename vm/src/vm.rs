@@ -31951,6 +31951,11 @@ mod tests {
             let n = call_native(&shared, &mut thread, "java/util/logging/Logger", "getName",
                 "()Ljava/lang/String;", &[Value::Object(Some(l))]);
             eprintln!("DIAG getName={n:?}");
+            for row in shared.natives.native_methods.census() {
+                if row.class == "java/util/logging/Logger" && row.name == "getName" {
+                    eprintln!("DIAG reg {} {} {} kind={:?} by={} inv={}", row.class, row.name, row.descriptor, row.kind, row.registered_by, row.invocations);
+                }
+            }
         }
     }
 
