@@ -1,11 +1,30 @@
-# L10 — Blocker: real `ThreadPoolExecutor` field initialisation
+# L10 — Blocker: real `ThreadPoolExecutor` field initialisation — **DONE 2026-08-06**
+
+> **Closed 2026-08-06, by measurement.** The blocker had already been removed:
+> every `Executors.*` factory shortcut drives the real
+> `ThreadPoolExecutor.<init>` through `initialize_real_thread_pool_executor`,
+> and `probes/ExecProbe.java` shows all six factory shapes
+> (fixed / cached / single / scheduled / single-scheduled / direct `new`)
+> running the task on a worker thread rather than the submitter, matching
+> HotSpot 25, in both `--real-jdk` and `--jdk-only`. Nobody had re-measured
+> after the ES-FAIL-20260710 work landed, so the lane stayed open on a stale
+> premise. **L11 item 7 landed in the same change** — all nine dispatch sites
+> are deleted. Outcome record:
+> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+>
+> Step 3 below ("confirm the receiver-shape probe returns `true` for every
+> executor the factories produce") was answered a better way than it asks: the
+> probe is *gone*, and the census shows `ThreadPoolExecutor.execute` at **0
+> invocations** on every probe run — the native was already unreachable on a
+> real-JDK image.
+
 
 **Owns:** `native-collections/src/lib.rs` (whole file)
 **Gated on:** nothing — but **it gates L11**.
 **Conflicts:** L2 owns the same file. **L2 lands first**; it is smaller.
 **Effort:** L
 **Note:** not a jdk-only change. Same caveat as L9 — staff it as a VM defect.
-**Evidence:** [`threadpoolexecutor-execute-receiver-shape-special-case-copies.md`](../../known-issues/jdk-only/threadpoolexecutor-execute-receiver-shape-special-case-copies.md)
+**Evidence:** [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md)
 
 ## Goal
 

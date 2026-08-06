@@ -205,7 +205,8 @@ Reclassifying them is the dangerous direction in *Blast radius* — it silences
 the violation, keeps fabricating, and makes the zero-stub census green while
 the substitution continues. L7 acted on that verdict: the bootstrap site
 **refuses** them rather than relabelling them. See
-[VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md).
+[VM-internal classes are mislabelled `CompatibilityStub`](../../internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md)
+(RETIRED 2026-08-06).
 
 ## What specifically must change
 

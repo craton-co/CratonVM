@@ -37,12 +37,12 @@ can work on what, simultaneously, without colliding.**
 | L7 (`L7-ensure-synthetic-class-migration-RETIRED-20260805.md`) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
 | L8 (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
-| [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
-| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
+| [L10](L10-blocker-threadpool-init.md) **DONE 2026-08-06** | ~~**Blocker.** Real `ThreadPoolExecutor` field init~~ (already satisfied; measuring it is what unblocked L11 item 7) | `native-collections/src/lib.rs` ⚠ | — | L |
+| [L11](L11-delete-the-hardcoded-lists.md) **DONE** | Items 3 + 7: delete the lists — **item 3 2026-08-04, item 7 2026-08-06** (all nine `ThreadPoolExecutor.execute` sites) | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
-**Every lane is done.** (L1–L8 landed; L9 is closed. L10 is the
-remaining blocker, and L11/L12 are gated behind it.)
+**Every lane but L12 is done.** (L1–L8 landed; L9 closed 2026-08-04;
+L10 and L11 closed 2026-08-06. L12 (item 11's residuals) is what is left.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -196,6 +196,19 @@ registered native on the triple alone, before any of them runs, which a binary
 with the lists deleted confirmed by producing a byte-identical 392-case
 transcript and identical invocation counts. Two lanes were planned around a
 comment. Item 7 is still blocked on L10.
+
+**Update, 2026-08-06 - L10 and L11 are closed, and item 7 with them.** L10 was
+not a blocker: `Executors.new*ThreadPool()` already returns objects built by the
+real `ThreadPoolExecutor.<init>`, and `probes/ExecProbe.java` shows all six
+factory shapes running asynchronously on a worker thread in both modes, matching
+HotSpot. That made the per-INSTANCE question the eight receiver-shape probes
+existed to answer vacuous, so all eight went, together with the ninth
+receiver-blind `force_native` arm and the probe helper. This is the SECOND lane
+pair planned around a stale premise - L9's was a comment, L10's was a `docs/`
+row nobody re-measured after the fix it asked for had landed. **Re-measure the
+blocker before staffing the lane.** The replacement is the same shape as item
+3's: the decision moved to registration (`NativeKind::SyntheticStub` plus one
+allow-list entry), where no dispatch path can disagree with another.
 
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,

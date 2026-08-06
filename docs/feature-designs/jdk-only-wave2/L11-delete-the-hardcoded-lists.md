@@ -1,4 +1,18 @@
-# L11 — Items 3 + 7: delete the hard-coded lists — **item 3 DONE 2026-08-04**
+# L11 — Items 3 + 7: delete the hard-coded lists — **DONE** (item 3 2026-08-04, item 7 2026-08-06)
+
+> **Item 7 closed 2026-08-06.** All eight `ThreadPoolExecutor.execute`
+> receiver-shape sites, the ninth receiver-blind `force_native_over_real_jdk_bytecode`
+> arm, the `threadpool_executor_has_real_workers` helper and the
+> `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` census constant are deleted.
+> L10 turned out not to be a blocker — it was already satisfied, and measuring
+> that is what unblocked this. What replaced the lists is the same move item 3
+> made: the decision went to REGISTRATION. `native_es_execute` is tagged
+> `NativeKind::SyntheticStub` and `java/util/concurrent/ThreadPoolExecutor` is
+> on `real_protected_stub_class_common`'s allow-list, so the one centralised
+> arbitration yields it to the real `execute()` body class-scoped, on both the
+> warm and the cold path. Outcome record:
+> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+
 
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
 `vm/src/vm/vm_exec.rs` (dispatch regions ~14700 and ~22700)
