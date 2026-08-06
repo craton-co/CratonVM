@@ -85,8 +85,9 @@ which genuinely has nothing to borrow.
 ## Verification
 
 `probes/PreconditionsFormatterProbe` against `/home/victor/jdk25` (Temurin
-25.0.3+9) as the oracle. Before: **56 of 118 rows differed**. After: see the
-run recorded in the commit message. The probe grew the `arraycopy` variants the
+25.0.3+9) as the oracle. Before: **56 of 118 rows differed**. After: **3 of
+140**, and all three are the reflective type-check contract named below.
+`probes/ListOutOfBoundsProbe` is identical to HotSpot on all 45 rows. The probe grew the `arraycopy` variants the
 original report asked for (`srcPos < 0`, `length < 0`, `last destination index`,
 the per-element-type names, the overflow row) plus a JIT-warmed section, because
 the JIT tier already carried the right message while the interpreter did not —
@@ -98,11 +99,17 @@ and the `object array` element-type name.
 
 ## Still divergent, and not this bug
 
-`CharBuffer.wrap(str).subSequence(…)` does not bounds-check — that is
-`docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`,
-a separate receiver with its own record.
-
-`Array.getInt(Object[4], 0)` and `Array.set(int[4], 0, "x")` want
+Three rows, all one receiver: `Array.getInt(Object[4], 0)`,
+`Array.getInt(long[4], 0)` and `Array.set(int[4], 0, "x")` want
 `IllegalArgumentException` with HotSpot's finer wording (`"Argument is not an
-array of primitive type"`, `"argument type mismatch"`). That is the reflective
-*type*-check contract, not the bounds contract, and it is untouched here.
+array of primitive type"`, `"argument type mismatch"`). The first two do not
+throw at all and return a fabricated `0`. That is the reflective *type*-check
+contract, not the bounds contract — five registrations share one untyped body,
+so the requested primitive type is not available at the call site. Filed as
+`docs/known-issues/reflect-array-primitive-accessors-do-not-type-check.md`
+rather than fixed here.
+
+The two `CharBuffer.wrap(str).subSequence(…)` rows this probe also flagged were
+closed on `dev` by other work while this branch was in flight; they were
+`charbuffer-wrap-string-subsequence-does-not-bounds-check.md`, a separate
+receiver with its own record.
