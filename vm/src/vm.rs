@@ -31953,7 +31953,7 @@ mod tests {
             eprintln!("DIAG getName={n:?}");
             for row in shared.natives.native_methods.census() {
                 if row.class == "java/util/logging/Logger" && row.name == "getName" {
-                    eprintln!("DIAG reg {} {} {} kind={:?} by={} inv={}", row.class, row.name, row.descriptor, row.kind, row.registered_by, row.invocations);
+                    eprintln!("DIAG reg {} {} {} kind={:?} by={} inv={}", row.class, row.name, row.descriptor, row.kind, row.registered_by.as_deref().unwrap_or("?"), row.invocations);
                 }
             }
         }
