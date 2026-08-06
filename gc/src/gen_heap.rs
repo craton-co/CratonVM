@@ -985,6 +985,17 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `CRATONVM_GC_YOUNG_PAUSE_MS=N` — young-collection pause goal in ms, driving
+/// [`GenerationalHeap::adapt_young_trigger_to_pause`]. `0` (the default) is off.
+fn young_pause_goal_ms() -> u64 {
+    static GOAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GOAL.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_YOUNG_PAUSE_MS")
+            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .unwrap_or(0)
+    })
+}
+
 fn moving_phase_count_push(name: &'static str, value: u128) {
     MOVING_PHASE_COUNTS.with(|m| m.borrow_mut().push((name, value)));
 }
@@ -4879,7 +4890,73 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
-        self.collect_garbage_inner(roots, finalizer_addrs, monitors)
+        let goal = young_pause_goal_ms();
+        let t0 = (goal > 0).then(std::time::Instant::now);
+        let out = self.collect_garbage_inner(roots, finalizer_addrs, monitors);
+        if let (Some(t0), true) = (t0, goal > 0) {
+            self.adapt_young_trigger_to_pause(t0.elapsed().as_millis() as u64, goal);
+        }
+        out
+    }
+
+    /// Feedback-size the young collection trigger against a pause goal.
+    ///
+    /// A moving young cycle's cost is dominated by how much it copies, and
+    /// nothing currently ties that to a pause target: `young_semi` is
+    /// `-Xmx / 4` and the trigger is a fixed percentage of it. Measured on the
+    /// OAuth2 issuer-URI workload at `--Xmx 2g` — young semi 512 MB, trigger
+    /// firing around 291 MB occupied — a single young collection copies ~994 000
+    /// objects and takes 283-872 ms. Spring Security gives that exchange a
+    /// 500 ms socket read budget and MockWebServer runs INSIDE the VM, so one
+    /// such pause loses the response and the read times out.
+    ///
+    /// **Why feedback rather than a smaller semi-space.** Capping the initial
+    /// young semi was tried before and measured a NET REGRESSION for large
+    /// `-Xmx` workloads (see `with_capacity`'s note and
+    /// `performance/binarytrees-bt18-half-gap-20260730.md`): those workloads
+    /// fall back to the non-moving sweep, and a smaller semi just fires that
+    /// expensive fallback more often. Reacting to the pause we actually
+    /// measured cannot repeat that mistake — a workload whose cycles are
+    /// already inside the goal is never touched.
+    ///
+    /// **Default OFF** (`goal == 0`). `CRATONVM_GC_YOUNG_PAUSE_MS=N` opts in.
+    /// Off by default because the correct default is a policy question the
+    /// measurement above does not settle, and this collector has a documented
+    /// history of young-sizing changes that helped one workload and cost
+    /// another.
+    fn adapt_young_trigger_to_pause(&self, pause_ms: u64, goal_ms: u64) {
+        let capacity = self.young_from.lock().capacity();
+        if capacity == 0 {
+            return;
+        }
+        // Never let feedback drive the trigger below this, or a workload with a
+        // genuinely large live set would collect continuously and make things
+        // worse than the pause it was trying to avoid.
+        let floor = (capacity / 16).max(1);
+        let ceiling = capacity * YOUNG_GC_THRESHOLD_PERCENT / 100;
+        let mut threshold = self.young_gc_threshold.lock();
+        let current = (*threshold).clamp(floor, ceiling.max(floor));
+        *threshold = if pause_ms > goal_ms {
+            // Overshot: copy less next time. Multiplicative decrease, because
+            // the overshoot can be large (872 ms against a 500 ms goal) and a
+            // linear back-off would take many over-budget cycles to converge —
+            // each of which is a missed deadline.
+            (current / 2).max(floor)
+        } else if pause_ms * 4 < goal_ms {
+            // Comfortably inside: give the trigger room back, additively, so a
+            // workload that transiently spiked does not stay permanently
+            // throttled. Slower than the decrease on purpose.
+            (current + capacity / 32).min(ceiling.max(floor))
+        } else {
+            current
+        };
+        if gc_flags().dbg_gcpause && *threshold != current {
+            eprintln!(
+                "[gcpause] young trigger {}KB -> {}KB (pause={pause_ms}ms goal={goal_ms}ms)",
+                current / 1024,
+                *threshold / 1024
+            );
+        }
     }
 
     /// Run a minor (or, if old gen is full, full) garbage-collection cycle.
@@ -4892,7 +4969,13 @@ impl GenerationalHeap {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
-        self.collect_garbage_inner(roots, &[], monitors).0
+        let goal = young_pause_goal_ms();
+        let t0 = (goal > 0).then(std::time::Instant::now);
+        let out = self.collect_garbage_inner(roots, &[], monitors).0;
+        if let Some(t0) = t0 {
+            self.adapt_young_trigger_to_pause(t0.elapsed().as_millis() as u64, goal);
+        }
+        out
     }
 
     /// Run one complete NON-MOVING young collection cycle (the divert path of
