@@ -31935,31 +31935,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn zz_diag_logger() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let name = create_java_string(&shared, "MyLogger");
-        let logger = call_native(&shared, &mut thread, "java/util/logging/Logger", "getLogger",
-            "(Ljava/lang/String;)Ljava/util/logging/Logger;", &[Value::Object(Some(name))]).unwrap().unwrap();
-        eprintln!("DIAG logger={logger:?}");
-        if let Value::Object(Some(l)) = logger {
-            let cid = shared.mem.heap.class_id_of(l);
-            eprintln!("DIAG class_id={cid:?} nfields={}", shared.mem.heap.num_fields(l));
-            for i in 0..shared.mem.heap.num_fields(l).min(8) {
-                eprintln!("DIAG slot{i}={:?}", shared.mem.heap.get_field(l, i));
-            }
-            let n = call_native(&shared, &mut thread, "java/util/logging/Logger", "getName",
-                "()Ljava/lang/String;", &[Value::Object(Some(l))]);
-            eprintln!("DIAG getName={n:?}");
-            for row in shared.natives.native_methods.census() {
-                if row.class == "java/util/logging/Logger" && row.name == "getName" {
-                    eprintln!("DIAG reg {} {} {} kind={:?} by={} inv={}", row.class, row.name, row.descriptor, row.kind, row.registered_by.as_deref().unwrap_or("?"), row.invocations);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn logger_get_and_info() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -54457,21 +54432,34 @@ mod tests {
         assert_eq!(ms, "name not found");
     }
 
+    /// A child node knows its own name and renders its absolute path.
+    ///
+    /// The parent comes from `Preferences.userRoot()`, the production entry
+    /// point, and not from a hand-rolled `alloc_object(.., 2)`. That fixture is
+    /// what made this test fail: `Preferences` grew from 2 slots to 6 (parent
+    /// link, child registry, removed flag, user/system tree), every native that
+    /// writes past slot 1 is guarded on `object_num_fields`, and the guards did
+    /// their job -- so the 2-field parent silently could not hold the back-link
+    /// that `absolutePath()` walks, and `toString()` rendered a path with no
+    /// node in it. Building the receiver the way the VM does keeps the fixture
+    /// from drifting behind the layout again.
     #[test]
     fn preferences_name_and_path() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
-        call_native(
+        let prefs_ref = call_native(
             &shared,
             &mut thread,
             "java/util/prefs/Preferences",
-            "<init>",
-            "()V",
-            &[Value::Object(Some(prefs_ref))],
+            "userRoot",
+            "()Ljava/util/prefs/Preferences;",
+            &[],
         )
-        .unwrap();
+        .unwrap()
+        .unwrap()
+        .as_object()
+        .expect("userRoot() must return a node");
 
         let child_name = create_java_string(&shared, "myNode");
         let child = call_native(
@@ -54522,7 +54510,12 @@ mod tests {
             Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
-        assert!(tss.contains("myNode"));
+        // `AbstractPreferences.toString()` is defined as
+        // `(isUserNode() ? "User" : "System") + " Preference Node: " +
+        // absolutePath()`, so this pins the name, the tree and the path
+        // together -- `contains("myNode")` alone passed while the path was
+        // wrong.
+        assert_eq!(tss, "User Preference Node: /myNode");
     }
 
     // ---- Compact reference array tests (Phase 5 Round 20) --------------------
