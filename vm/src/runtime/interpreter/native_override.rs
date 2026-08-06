@@ -6946,19 +6946,46 @@ pub(super) fn resolve_step1_native(
     // case never touches the class manager — `resolve_id(..)?` above has
     // already returned for every such triple, so this walk only ever runs for a
     // triple that HAS a registration. Narrowing further, `Bridge` is the only
-    // kind `resolve_native_dispatch_wave1` consults the flag for
-    // (`SyntheticStub` is refused and `Intrinsic` is taken regardless), and
-    // both consumers are `is_jdk_only()`-gated. So a default `--real-jdk` run
-    // pays one `Copy` field read and one enum compare, and nothing else.
+    // kind that consults the flag (`SyntheticStub` is refused and `Intrinsic`
+    // is taken regardless), and every consumer is `is_jdk_only()`-gated. So a
+    // default `--real-jdk` run pays one `Copy` field read and one enum compare,
+    // and nothing else.
     //
-    // The 2026-08-05 attempt failed here by asking the cheaper question —
-    // "does the NAMED class declare bytecode", from access flags. That is not
-    // the same question as "does the method this call will actually run have a
-    // `Code` attribute" the moment a hierarchy is involved, and answering the
-    // first one strands `--jdk-only` on `AbstractMethodError: ... has no Code
-    // attribute`. `step1_dispatch_has_code` asks the second.
-    let bytecode_available = policy.is_jdk_only()
-        && kind == cratonvm_native_api::NativeKind::Bridge
+    // The 2026-08-05 attempt asked the cheaper question — "does the NAMED class
+    // declare bytecode", from access flags. That is not the same question as
+    // "does the method this call will actually run have a `Code` attribute" the
+    // moment a hierarchy is involved. `step1_dispatch_has_code` asks the second
+    // one. See its doc comment.
+    //
+    // ENFORCEMENT IS A SEPARATE DECISION FROM OBSERVATION, and this is where
+    // the two part company:
+    //
+    // * The observation is unconditional. A `Bridge` in front of real bytes is
+    //   §1.4's `NativeShadowsBytecode` whether or not anything is done about
+    //   it, and step 1 answers first for nearly every dispatch in the VM — so
+    //   with the old hard-coded `false` the census could not see the shadows
+    //   that were actually dispatching, only the ones some other site caught.
+    // * The enforcement is off by default, and that is measured rather than
+    //   preferred: arming it takes the `--jdk-only` regression corpus from
+    //   32/17 to 3/46, because the surviving bridges ARE the object model for
+    //   large parts of `java.base` under strict mode. See
+    //   `env_cache::jdk_only_enforce_shadow` for the numbers and the four
+    //   named blocker families.
+    let strict_bridge = policy.is_jdk_only() && kind == cratonvm_native_api::NativeKind::Bridge;
+    let enforce = strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow();
+    // When the shadow is only being observed, the walk is worth doing exactly
+    // once per triple: the sink dedups, so a second walk buys nothing. When it
+    // is being enforced the answer is a dispatch input and must be current, so
+    // the walk runs every time.
+    let ask = strict_bridge
+        && (enforce
+            || !crate::vm::jdk_only_shadow_already_observed(
+                class_name,
+                method_name,
+                descriptor,
+                crate::vm::JDK_ONLY_SHADOW_UNENFORCED_TAG,
+            ));
+    let shadows_bytecode = ask
         && step1_dispatch_has_code(
             shared,
             class_name,
@@ -6966,6 +6993,13 @@ pub(super) fn resolve_step1_native(
             descriptor,
             dispatch_class_override,
         );
+    if shadows_bytecode && !enforce {
+        // The bridge is about to win in front of real bytes. Record it here;
+        // `resolve_native_dispatch_wave1` records only on the yield path, and
+        // it is not taking that path (`bytecode_available` is false below), so
+        // this cannot double-count.
+        crate::vm::record_native_shadow_ran_over_bytecode(class_name, method_name, descriptor);
+    }
     match crate::vm::resolve_native_dispatch_wave1(
         policy,
         class_name,
@@ -6978,7 +7012,7 @@ pub(super) fn resolve_step1_native(
         // AFTER this chain (see the `native_cb` rebindings below); wave 2 folds
         // them in as the real `compat_native_wins`.
         true,
-        bytecode_available,
+        shadows_bytecode && enforce,
     ) {
         Some(crate::vm::DispatchDecision::Reject(violation)) => {
             *refusal = Some(violation);

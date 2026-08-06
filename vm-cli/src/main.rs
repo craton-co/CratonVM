@@ -2409,7 +2409,8 @@ fn trace_jdk_only_violations(
         eprintln!(
             "[cratonvm][jdk-only:{phase}] refusals since last drain: \
              jit-direct-native-binds={} jit-inline-cache-natives={} \
-             jit-fastpath-admissions={} interpreter-bytecode-preferred={}",
+             jit-fastpath-admissions={} interpreter-bytecode-preferred={} \
+             interpreter-shadow-unenforced={}",
             refusals
                 .jit_direct_native_binds
                 .saturating_sub(watermark.refusals.jit_direct_native_binds),
@@ -2422,6 +2423,13 @@ fn trace_jdk_only_violations(
             refusals
                 .interpreter_bytecode_preferred
                 .saturating_sub(watermark.refusals.interpreter_bytecode_preferred),
+            // The one term on this line that is not a refusal: a `Bridge` that
+            // shadowed real bytes and ran. It rides here because a traced run
+            // that reports only what strict policy STOPPED reads as if nothing
+            // else happened.
+            refusals
+                .interpreter_shadow_unenforced
+                .saturating_sub(watermark.refusals.interpreter_shadow_unenforced),
         );
     }
     watermark.refusals = refusals;

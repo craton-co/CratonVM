@@ -207,6 +207,23 @@ fn reject_missing_implementation(
 static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Times a `Bridge` stood in front of concrete bytecode under `JdkOnly` and
+/// **ran anyway** — the §1.4 shadow that step 1 observes but does not enforce.
+///
+/// Deliberately a SECOND counter rather than more increments on the one above:
+/// that one means "bytecode won", this one means "the native won in front of
+/// bytecode", and they are opposite facts about the same triple. Folding them
+/// would make `interpreter_bytecode_preferred` report shadows it did not
+/// prevent, which is the exact blindness this pair exists to remove.
+static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `native_kind` tag for the observations the counter above records. Not a
+/// [`cratonvm_native_api::NativeKind`] spelling — the kind is always `Bridge`
+/// here, and what the row has to say is that this one DISPATCHED in front of
+/// real bytes. Same convention as the JIT's `"jit-thin-direct-helper"`.
+pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str = "bridge-ran-over-bytecode";
+
 /// Maximum number of distinct structured observations retained.
 pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
 
@@ -259,16 +276,55 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
     JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// FNV-1a over the triple plus the kind tag. Only ever computed under
-/// `JdkOnly`, inside the `#[cold]` recorder.
-fn jdk_only_shadow_digest(
+/// Exact number of times a `Bridge` dispatched in front of concrete bytecode
+/// under `JdkOnly` — §1.4's shadow observed but not enforced.
+///
+/// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
+/// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
+/// counters never describe the same event twice.
+pub fn jdk_only_native_shadow_unenforced() -> u64 {
+    JDK_ONLY_NATIVE_SHADOW_UNENFORCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Has this triple already been offered to the observation buffer?
+///
+/// Exposed so a caller that must do real work (a class-manager read lock and a
+/// hierarchy walk) to *discover* a shadow can skip that work once the shadow is
+/// recorded. Advisory in both directions — a filter collision answers `false`
+/// for a triple that was recorded, which costs one redundant walk and one
+/// redundant offer that the buffer dedups. Never a correctness input.
+pub fn jdk_only_shadow_already_observed(
     class: &str,
     method: &str,
     descriptor: &str,
-    kind: cratonvm_native_api::NativeKind,
-) -> u64 {
+    kind_tag: &str,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
+        return true;
+    }
+    let digest = jdk_only_shadow_digest(class, method, descriptor, kind_tag);
+    JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)]
+        .load(Ordering::Relaxed)
+        == digest
+}
+
+/// FNV-1a over the triple plus the `native_kind` tag. Only ever computed under
+/// `JdkOnly`, inside the `#[cold]` recorder.
+///
+/// Keyed on the tag STRING rather than on `NativeKind`, so the two recorders
+/// below cannot alias: the same triple legitimately produces a
+/// `"bridge"` row (bytecode won) and a `"bridge-ran-over-bytecode"` row (the
+/// native won) in one run, and a digest that could not tell them apart would
+/// silently drop the second.
+fn jdk_only_shadow_digest(class: &str, method: &str, descriptor: &str, kind_tag: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [class.as_bytes(), method.as_bytes(), descriptor.as_bytes()] {
+    for part in [
+        class.as_bytes(),
+        method.as_bytes(),
+        descriptor.as_bytes(),
+        kind_tag.as_bytes(),
+    ] {
         for &b in part {
             h ^= b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -277,14 +333,78 @@ fn jdk_only_shadow_digest(
         h ^= 0xff;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    h ^= kind as u64;
-    h = h.wrapping_mul(0x0000_0100_0000_01b3);
     // 0 is the filter's "empty" marker.
     if h == 0 {
         1
     } else {
         h
     }
+}
+
+/// Offer one structured observation to the bounded, deduplicated buffer.
+///
+/// The half of [`record_native_shadows_bytecode`] that is not the counter, so
+/// the "the native won instead" recorder shares the identical filter, cap and
+/// dedup rather than growing a second sink with its own bugs.
+#[cold]
+#[inline(never)]
+fn offer_native_shadow_observation(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+    kind_tag: &'static str,
+) {
+    use std::sync::atomic::Ordering;
+
+    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
+        return;
+    }
+    let digest = jdk_only_shadow_digest(class, method, descriptor, kind_tag);
+    let slot =
+        &JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
+    if slot.load(Ordering::Relaxed) == digest {
+        return;
+    }
+
+    let violation = cratonvm_types::error::JdkOnlyViolation::NativeShadowsBytecode {
+        class: class.to_string(),
+        method: method.to_string(),
+        descriptor: descriptor.to_string(),
+        native_kind: kind_tag,
+    };
+    let mut recorded = jdk_only_native_shadows().lock();
+    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
+        JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
+        return;
+    }
+    if !recorded.contains(&violation) {
+        recorded.push(violation);
+    }
+    // Published last: a reader that sees the digest is guaranteed the triple
+    // has already been offered to the buffer.
+    slot.store(digest, Ordering::Relaxed);
+}
+
+/// Record one "a registered `Bridge` stood in front of concrete bytecode and
+/// RAN" observation — §1.4's shadow, seen at the moment it actually dispatched.
+///
+/// This is the census hole
+/// `docs/internal/jdk-only-step1-bytecode-available-*.md` was filed for:
+/// `resolve_step1_native` passed a hard-coded `bytecode_available: false`, so
+/// step 1 — which answers first for nearly every dispatch in the VM — recorded
+/// nothing at all, and the shadow lists could read as inert while the natives
+/// kept winning.
+///
+/// **Only call this under `JdkOnly`**, same as its sibling.
+#[cold]
+#[inline(never)]
+pub fn record_native_shadow_ran_over_bytecode(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) {
+    JDK_ONLY_NATIVE_SHADOW_UNENFORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    offer_native_shadow_observation(class, method, descriptor, JDK_ONLY_SHADOW_UNENFORCED_TAG);
 }
 
 /// Record one "concrete bytecode won over a registered non-intrinsic native"
@@ -304,37 +424,8 @@ fn record_native_shadows_bytecode(
     descriptor: &str,
     kind: cratonvm_native_api::NativeKind,
 ) {
-    use std::sync::atomic::Ordering;
-
-    JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-
-    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
-        return;
-    }
-    let digest = jdk_only_shadow_digest(class, method, descriptor, kind);
-    let slot =
-        &JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
-    if slot.load(Ordering::Relaxed) == digest {
-        return;
-    }
-
-    let violation = cratonvm_types::error::JdkOnlyViolation::NativeShadowsBytecode {
-        class: class.to_string(),
-        method: method.to_string(),
-        descriptor: descriptor.to_string(),
-        native_kind: kind.as_str(),
-    };
-    let mut recorded = jdk_only_native_shadows().lock();
-    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
-        JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
-        return;
-    }
-    if !recorded.contains(&violation) {
-        recorded.push(violation);
-    }
-    // Published last: a reader that sees the digest is guaranteed the triple
-    // has already been offered to the buffer.
-    slot.store(digest, Ordering::Relaxed);
+    JDK_ONLY_NATIVE_SHADOW_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    offer_native_shadow_observation(class, method, descriptor, kind.as_str());
 }
 
 /// THE single native-vs-bytecode decision point (§7). Interpreter, JIT,

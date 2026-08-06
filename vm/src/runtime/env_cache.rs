@@ -419,6 +419,38 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
+/// `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` — arm §1.4 enforcement at
+/// `try_stackless_invoke` step 1 under `--jdk-only`.
+///
+/// Step 1 always *observes* a `Bridge` standing in front of concrete bytecode
+/// now (see `resolve_step1_native`), so the census is truthful either way. This
+/// dial decides whether the observation is also acted on — whether the bridge
+/// yields and the real bytecode runs.
+///
+/// **Default off, and that is a measurement, not a preference.** Turning it on
+/// takes the `--jdk-only` regression corpus from **32 passed / 17 failed to 3
+/// passed / 46 failed** (Azure Linux, JDK 25, 2026-08-06). The failures are not
+/// dispatch faults: `System.props` is null, `Charset.forName` hands out an
+/// instance of the ABSTRACT `java.nio.charset.Charset`, `String`'s coder does
+/// not match its `value[]`. Under `--jdk-only` the surviving bridges ARE the
+/// object model for large parts of `java.base`, so yielding them to bytecode
+/// hands real code objects it cannot service. §1.4's remedy for those is to
+/// retire the registration once the class's state is real (wave-2 item 4), not
+/// to yield at dispatch — this dial exists so that migration can re-take the
+/// measurement one subsystem at a time instead of arguing about it.
+///
+/// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
+#[inline]
+pub fn jdk_only_enforce_shadow() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JDK_ONLY_ENFORCE_SHADOW") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
+    })
+}
+
 /// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
 /// the non-invoke null-deref opcodes (`getfield`/`putfield`, `arraylength`,
 /// the array load/store family, `monitorenter`/`monitorexit`, `athrow`) emit
