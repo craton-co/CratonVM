@@ -661,6 +661,29 @@ impl Compiler {
         if helper == 0 {
             return;
         }
+        // Bisect lever `CRATONVM_JIT_SP_IC_DEOPT_CHECK`: `0` drops the check
+        // everywhere, `void` drops it only where the callee's descriptor
+        // returns VOID.
+        //
+        // The `void` case is the interesting one. This compares the raw return
+        // REGISTER against `i64::MIN`, and a void callee leaves in RAX whatever
+        // its last helper call returned — there is no return value to compare.
+        // A false positive is not a wasted helper call: the servicing helper
+        // DRAINS the thread's whole pending-signal record. `.done` still runs
+        // `emit_post_invoke_exception_check`, so a genuinely-throwing void
+        // callee is still caught by the caller's own drain with this off.
+        match crate::sp_ic_deopt_check_mode() {
+            crate::SpIcDeoptCheck::Off => return,
+            crate::SpIcDeoptCheck::SkipVoid => {
+                // SAFETY: `info` is a live `JitInvokeInfo` for the duration of
+                // this compilation — the same contract every other read of it
+                // on this path relies on.
+                if !info.is_null() && unsafe { (*info).return_type } == b'V' {
+                    return;
+                }
+            }
+            crate::SpIcDeoptCheck::On => {}
+        }
         // MOV R11, imm64(i64::MIN)  — 49 BB + imm64.
         self.buf.emit(&[0x49, 0xBB]);
         self.buf.emit(&i64::MIN.to_le_bytes());

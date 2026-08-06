@@ -771,6 +771,7 @@ pub fn native_matcher_find() -> bool {
 }
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
+cached_is_set!(jit_callee_deopt_dbg, "CRATONVM_DBG_CALLEE_DEOPT");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");
 cached_is_set!(letsgo_dbg, "CRATONVM_DBG_LETSGO");
 /// `CRATON_JIT_PFO_TRACE` / `CRATON_JIT_PFI_TRACE` / `CRATON_JIT_NEWARRAY_TRACE`
