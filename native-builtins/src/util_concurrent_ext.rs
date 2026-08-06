@@ -1244,15 +1244,33 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     ctx.set_array_element(snap, i, elem);
                 }
             }
-            // Return a self-contained snapshot iterator (3-field `HashMap$KeyItr`
-            // model: keys/cursor/total).  Unlike the previous `ArrayList$Itr`
-            // wrapper, this iterator's `remove()` throws
-            // `UnsupportedOperationException` — matching real COWAL's `COWIterator`,
-            // which never supports removal (MutablePropertySourcesTests
-            // `iteratorContainsPropertySource`).  The earlier wrapper reused the
-            // mutating `ArrayList$Itr.remove` native, so `it.remove()` silently
-            // succeeded instead of throwing.
-            cratonvm_native_collections::make_iterator_from_array(ctx, snap, size)
+            // Return the REAL `COWIterator` over that snapshot. It is the same
+            // array-plus-cursor shape the generic helper builds, so this is one
+            // allocation and two name-resolved field writes either way; the
+            // difference is that `getClass()` now says
+            // `java.util.concurrent.CopyOnWriteArrayList$COWIterator` instead of
+            // naming an iterator that belongs to a different collection
+            // (`probes/SnapshotIteratorShapeProbe`, line `cowal.class`).
+            //
+            // `remove()` still throws `UnsupportedOperationException` — now out
+            // of the real class's own body rather than by our arranging it —
+            // matching real COWAL, which never supports removal
+            // (MutablePropertySourcesTests `iteratorContainsPropertySource`).
+            // The wrapper before this one reused the mutating
+            // `ArrayList$Itr.remove` native, so `it.remove()` silently succeeded
+            // instead of throwing.
+            match cratonvm_native_collections::alloc_real_snapshot_iterator_of(
+                ctx,
+                "java/util/concurrent/CopyOnWriteArrayList$COWIterator",
+                "snapshot",
+                snap,
+            ) {
+                Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+                // No real `COWIterator` in this image (`synthetic-jdk`) — keep
+                // the generic snapshot iterator, which iterates correctly and
+                // also throws from `remove()`.
+                None => cratonvm_native_collections::make_iterator_from_array(ctx, snap, size),
+            }
         });
         // Writes — true copy-on-write: copy array, mutate copy, swap reference.
         // Uses `cowal_read_state` / `cowal_write_array` so both real and
