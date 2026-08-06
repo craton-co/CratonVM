@@ -3114,33 +3114,13 @@ pub(super) fn try_stackless_invoke(
     } else {
         native_cb
     };
-    // ThreadPoolExecutor.execute(Runnable): the registered native
-    // (`native_es_execute`) is exempted from the real-JDK-mode registration
-    // drop (native-api/src/registry.rs) specifically so it stays available
-    // for CratonVM's synthetic-layout Executors.* stand-ins (fixed-suite-bugs/
-    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). But this "native
-    // override" step is unconditional -- it has no receiver awareness -- so
-    // it was ALSO winning for a genuinely real, bytecode-constructed
-    // ThreadPoolExecutor (its own real `workers` field populated), routing
-    // every `execute()` call through `native_es_execute`'s defense-in-depth
-    // "run inline" fallback instead of real async bytecode.
-    // `intercept_force_registered_native` above already carries this exact
-    // receiver check for the FORCE-native case; mirror it here so a real
-    // receiver's native shadow is dropped too. See fixed-suite-bugs/
-    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
-    //
-    // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 2
-    // OF 4. See COPY 1 in `vm/src/vm/vm_exec.rs::invoke_or_native` for the full
-    // note and what must replace all four.
-    let native_cb = if class_name == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && descriptor == "(Ljava/lang/Runnable;)V"
-        && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv))
-    {
-        None
-    } else {
-        native_cb
-    };
+    // (`ThreadPoolExecutor.execute(Runnable)` receiver-shape check deleted
+    // 2026-08-06. `native_es_execute` is now tagged `SyntheticStub` and
+    // `java/util/concurrent/ThreadPoolExecutor` is on the real-protected-stub
+    // allow-list, so the `synthetic_stub_should_yield_to_real_bytecode` guard
+    // immediately above already drops this native shadow whenever the real
+    // `execute()` body is loaded — for every receiver, with no field probe.
+    // See `force_native_over_real_jdk_bytecode` in `native_override.rs`.)
     // A `JdkOnly` refusal recorded by `resolve_step1_native` is authoritative:
     // §1.3 forbids silently substituting some other implementation for a
     // refused stub, so this must surface as an error rather than fall through
@@ -3581,42 +3561,28 @@ pub(super) fn try_stackless_invoke(
         if let Some((id, callback)) =
             native_id.and_then(|id| registry.callback_of(id).map(|cb| (id, cb)))
         {
-            // Same ThreadPoolExecutor.execute(Runnable) receiver-aware
-            // exemption as step 1 above -- this is a SEPARATE, independent
-            // "double-check for a native override" that runs even after
-            // real bytecode was already resolved at step 4/5. Without this,
-            // a genuinely real ThreadPoolExecutor still gets shunted to
-            // `native_es_execute`'s inline "run synchronously" fallback right
-            // here, even though the real `execute()` bytecode was correctly
-            // found and would otherwise run. See fixed-suite-bugs/
-            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
+            // (The `ThreadPoolExecutor.execute(Runnable)` receiver-shape check
+            // that used to sit here — a SEPARATE, independent double-check
+            // running even after real bytecode was resolved at step 4/5 — was
+            // deleted 2026-08-06. The `synthetic_stub_should_yield_to_real_bytecode`
+            // term below now answers it for every receiver: `native_es_execute`
+            // is a `SyntheticStub` and `ThreadPoolExecutor` is allow-listed.)
             //
-            // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape
-            // check, COPY 3 OF 4. See COPY 1 in
-            // `vm/src/vm/vm_exec.rs::invoke_or_native` for the full note and
-            // what must replace all four.
-            let is_real_tpe_execute_step6 = class_name_arc.as_ref()
-                == "java/util/concurrent/ThreadPoolExecutor"
-                && method_name == "execute"
-                && descriptor == "(Ljava/lang/Runnable;)V"
-                && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv));
-            // These two guards ARE this site's compatibility verdict, so they
-            // are handed to §7 as `compat_native_wins` verbatim — same
-            // predicates, same order, same short-circuit — and `Compatible`
-            // mode is therefore bit-for-bit what it was.
+            // This guard IS this site's compatibility verdict, so it is handed
+            // to §7 as `compat_native_wins` verbatim — same predicate, same
+            // short-circuit.
             //
             // `synthetic_stub_should_yield_to_real_bytecode` deliberately keeps
             // its own `kind_of` lookup rather than reusing `kind_of_id` above:
             // the two disagree on the descriptor-quirk cold path (`kind_of`
             // misses and reports "not a stub"), and reusing the slot's true
             // kind would silently change which natives yield.
-            let compat_native_wins = !is_real_tpe_execute_step6
-                && !synthetic_stub_should_yield_to_real_bytecode(
-                    shared,
-                    &class_name_arc,
-                    method_name,
-                    descriptor,
-                );
+            let compat_native_wins = !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+            );
             let kind = registry
                 .kind_of_id(id)
                 .unwrap_or(cratonvm_native_api::NativeKind::Bridge);

@@ -4418,7 +4418,24 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(es, "execute", "(Ljava/lang/Runnable;)V", native_es_execute);
+    // JDK-ONLY-WAVE2 (2026-08-06): `native_es_execute` is adjudicated a
+    // `SyntheticStub`, not the ambient kind this registrar would otherwise give
+    // it. It is a compatibility stand-in for CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` receiver shape, and once the real
+    // `ThreadPoolExecutor.<init>` runs for every factory shortcut
+    // (`initialize_real_thread_pool_executor`) there is no receiver left for it
+    // to stand in for on a real-JDK image. The tag is what lets
+    // `real_protected_stub_class` yield it to the real `execute()` bytecode
+    // structurally, for every receiver, which is what replaced the eight
+    // hand-written receiver-shape probes in `vm`. See
+    // `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+    registry.register_with_kind(
+        es,
+        "execute",
+        "(Ljava/lang/Runnable;)V",
+        native_es_execute,
+        NativeKind::SyntheticStub,
+    );
     registry.register(es, "shutdown", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -4474,7 +4491,17 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(tp, "execute", "(Ljava/lang/Runnable;)V", native_es_execute);
+    // Same adjudication as the `ExecutorService` registration above — this is
+    // the copy that matters, because `java/util/concurrent/ThreadPoolExecutor`
+    // is the class whose real bytecode is always loaded and which
+    // `real_protected_stub_class` therefore protects.
+    registry.register_with_kind(
+        tp,
+        "execute",
+        "(Ljava/lang/Runnable;)V",
+        native_es_execute,
+        NativeKind::SyntheticStub,
+    );
     registry.register(tp, "shutdown", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,

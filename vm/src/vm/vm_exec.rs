@@ -15641,57 +15641,20 @@ pub fn invoke_or_native(
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
-    // `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)`: the
-    // registered native (`native_es_execute`) assumes CratonVM's synthetic
-    // 2-field `Executors.new*ThreadPool()` receiver. It is NOT disambiguated
-    // by the general SyntheticStub/CRATONVM_REAL `real_protected_stub` logic
-    // below, because that check is CLASS-scoped and the real
-    // `ThreadPoolExecutor` *class* bytecode is always loaded regardless of
-    // whether a given *instance* is genuinely real or one of our synthetic
-    // stand-ins. A genuinely real, bytecode-constructed `ThreadPoolExecutor`
-    // (its own real `<init>` ran, so its real `workers` field is populated --
-    // e.g. `spawn_runnable_on_real_thread`'s own singleton async pool) must
-    // run its own real `execute()` bytecode here too, or calling `.execute()`
-    // on it from native code (via `ctx.invoke_virtual`) recurses back into
-    // this same native forever (a real stack overflow, confirmed via gdb).
-    // See fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
-    //
-    // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
-    // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
-    // `vm/src/runtime/interpreter/native_override.rs` for the full census, for
-    // the ninth (receiver-blind) site these eight exist to override, and for
-    // why all nine have to go together.
-    //
-    // The wave-1 markers named four of eight, and got one of those wrong. The
-    // hazard that undercount creates is specific: a mechanical "delete every
-    // marked `ThreadPoolExecutor` site" sweep leaves the four unmarked ones
-    // enforcing a policy the other four no longer apply, which is the same
-    // cold-path/warm-path split as the forced-native `String` lists.
-    //
-    // This copy also used to inline the `workers`-field probe by hand rather
-    // than calling `threadpool_executor_has_real_workers`, making three
-    // implementations of one predicate — and it took a plain `read()` where the
-    // helper documents why `read_recursive()` is required at these call sites.
-    if effective_class == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        if let Some(recv_value @ Value::Object(Some(recv))) = args.first() {
-            if crate::runtime::interpreter::threadpool_executor_has_real_workers(
-                shared, recv_value,
-            ) {
-                return invoke_on_class_shared(
-                    shared,
-                    thread,
-                    shared.mem.heap.class_id_of(*recv),
-                    method_name,
-                    descriptor,
-                    args,
-                );
-            }
-        }
-    }
-
+    // JDK-ONLY-WAVE2, RETIRED 2026-08-06: a `ThreadPoolExecutor.execute`
+    // receiver-shape probe used to run here, ahead of the registry lookup,
+    // because the registered native (`native_es_execute`) assumed CratonVM's
+    // synthetic 2-field `Executors.new*ThreadPool()` receiver and the general
+    // `real_protected_stub` logic below is CLASS-scoped while the question was
+    // per-INSTANCE. It is no longer per-instance: every `Executors.*` factory
+    // shortcut drives the real `ThreadPoolExecutor.<init>`
+    // (`initialize_real_thread_pool_executor`), so on an image with the real
+    // class bytes there is no synthetic receiver left. The native is tagged
+    // `SyntheticStub` and the class is on `real_protected_stub_class`'s
+    // allow-list, so the `has_real` arm below answers it — for every receiver,
+    // with no field probe, and it is what keeps `ctx.invoke_virtual(pool,
+    // "execute", ...)` from recursing into the same native forever (a real
+    // stack overflow, confirmed via gdb, in the bug this probe was born from).
     if let Some((callback, native_kind)) =
         shared
             .natives
@@ -23589,37 +23552,20 @@ fn invoke_on_class_shared_inner(
             .get_class(declaring_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        // See the identical guard + comment in `invoke_or_native` above: a
-        // genuinely real, bytecode-constructed `ThreadPoolExecutor` (real
-        // `workers` field populated) must keep running its own real
-        // `execute()` bytecode -- only CratonVM's synthetic 2-field
-        // `Executors.new*ThreadPool()` objects need the forced native. This
-        // call site (`invoke_on_class_shared_inner`) is a SEPARATE dispatch
-        // path from `invoke_or_native` (e.g. reached from the interpreter's
-        // reflection/initial-invoke routes) that independently consults
-        // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See fixed-suite-bugs/
-        // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
+        // (`ThreadPoolExecutor.execute` receiver-shape check deleted
+        // 2026-08-06 — see `invoke_or_native` above and
+        // `force_native_over_real_jdk_bytecode` in `native_override.rs`. This
+        // site consults `should_force_registered_native_over_bytecode`, whose
+        // receiver-blind `ThreadPoolExecutor.execute` arm went with it, so
+        // there is no longer anything here to exempt.)
         //
-        // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
-        // COPY 2 OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
-        // `vm/src/runtime/interpreter/native_override.rs` for the census.
-        //
-        // This one re-inlined the `workers`-field probe rather than calling
-        // `threadpool_executor_has_real_workers` — with a plain `read()`, where
-        // the helper documents why `read_recursive()` is needed.
-        let force_native_receiver_exempt = class_name_for_force
-            == "java/util/concurrent/ThreadPoolExecutor"
-            && method_name == "execute"
-            && matches!(args.first(), Some(recv) if
-                crate::runtime::interpreter::threadpool_executor_has_real_workers(shared, recv));
         // §7 routing. This site's whole purpose is "force the registered native
         // in front of real JDK bytecode", so the pre-existing condition IS
         // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
         // before the registry lookup, exactly as before, so a call that does
         // not force a native still pays no hash.
-        let compat_native_wins = !force_native_receiver_exempt
-            && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+        let compat_native_wins =
+            crate::runtime::interpreter::should_force_registered_native_over_bytecode(
                 shared,
                 &class_name_for_force,
                 method_name,
