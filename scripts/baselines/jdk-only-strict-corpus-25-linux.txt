@@ -4,7 +4,7 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: PKCS12 setEntry fixed: JdkOnlyPlatformProbe security no longer diverges in either arm (p12=true)
+# note: javaagent transform-on-load + nio readAttributes(view:attrs) converged the agent section in both arms; regex/textformat/text converged on dev since the first freeze
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that
@@ -12,9 +12,7 @@
 JdkOnlyBreadthProbe/strict/PROBE2
 JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
 JdkOnlyBreadthProbe/strict/serialization
-JdkOnlyPlatformProbe/real/agent
 JdkOnlyPlatformProbe/real/jni
 JdkOnlyPlatformProbe/real/vthreads
-JdkOnlyPlatformProbe/strict/agent
 JdkOnlyPlatformProbe/strict/jni
 JdkOnlyPlatformProbe/strict/vthreads

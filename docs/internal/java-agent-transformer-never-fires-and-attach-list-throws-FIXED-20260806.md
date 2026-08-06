@@ -237,7 +237,7 @@ that filed this. The `agent` line is now byte-identical across all three:
           ifaceMethods=17 rtName=true rtSpec=true rtArgs=true attach=list-ok
 ```
 
-and the ratchet reports both of this doc's baseline lines as converged:
+and the ratchet reported both of this doc's baseline lines as converged:
 
 ```text
 NO LONGER DIVERGING (not a failure — re-freeze to keep the ratchet tight):
@@ -245,6 +245,18 @@ NO LONGER DIVERGING (not a failure — re-freeze to keep the ratchet tight):
   - JdkOnlyPlatformProbe/strict/agent
 RESULT: PASS
 ```
+
+`scripts/baselines/jdk-only-strict-corpus-25-linux.txt` is re-frozen without
+them, and a second run against the new baseline gates green
+(`divergent sections: 7 observed, 7 baselined` — `RESULT: PASS`).
+
+One note on the instrument: the confirming binary was built with **thin** LTO.
+The default `lto = fat` link of `cratonvm-cli` is the most memory-hungry step in
+the workspace, and the shared build host sat at ~5 GB available for hours —
+three attempts were `SIGKILL`ed mid-link, which is not a compile error. The gate
+compares transcripts against a HotSpot control, so the optimiser's inlining
+budget is not part of what it asks; a fat-LTO binary of the same tree, minus
+only the last ServiceLoader commit, passed the same gate earlier.
 
 `probes/NioAttrProbe` is byte-identical to HotSpot in both CratonVM modes,
 including the error contract (`unknownName=IllegalArgumentException
