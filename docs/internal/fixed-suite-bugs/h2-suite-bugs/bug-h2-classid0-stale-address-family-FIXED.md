@@ -9,21 +9,49 @@
 > name states only what is actually measured.
 
 ## Status
-**OPEN.** One defect, four faces, two of them measured to opposite verdicts on
-the same question. What is fixed, what is measured, and what is left:
+**FIXED 2026-08-06** — `fix/compactvalue-object-provenance-20260806`, merged to
+`dev` as `b50da356e`.
 
-* **Fixed and merged.** An old-gen mark gap (`old_gen_gc`'s root seed had no
-  resolution at all for an INTERIOR conservative root), and separately a JIT
-  miscompile that bound an `invokevirtual` to the compiled entry of its
-  CONSTANT-POOL-resolved method with no receiver guard. The second is not a GC
-  bug at all and is written up in
-  `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`.
-  It mattered here twice over: it made this family's only reproduction
-  (`TestMultiThread`) fail 100 % of runs in 2-9 s so nothing could be measured,
-  and a wrong-object return is **indistinguishable at the reader** from a stale
-  reference, so it is a live alternative explanation for every occurrence
-  recorded before `12769bb23c`.
-* **Still open.** The family reproduces on the fixed binary, on both faces.
+**Root cause: `CompactValue`'s SUB_OBJECT encoders never recorded into the
+provenance bitmap its own decoders consult**, so the encoder could mint a
+reference slot the decoder refused. The refusal degrades the value to
+`Value::Long`, which takes `LKIND_LONG`, and `Frame::scan_local_objects` skips
+LONG slots by design — so the root is never published and the sweep reclaims a
+live object. The full derivation, the four encoders, and the measurement that
+named it are in **[ROOT CAUSE (2026-08-06)](#root-cause-2026-08-06-a-sub_object-slot-the-encoder-minted-and-the-decoder-refused)**
+below. Everything above and below that section is the hunt as it was recorded,
+left intact because several of its measurements are load-bearing negatives.
+
+**Validation.** `TestMultiThread` x20 on the fixed binary: **zero degradations
+and zero `"result" is null`**, against a baseline of 6-in-32 on the immediately
+preceding binary (p ~ 0.016 on its own). Ten clean passes; the other ten were
+`TimeoutException` on a host at load 20-90 with 8000 logged-in users, every one
+degradation-free, and the passing runs were *faster* than baseline (456-947 s
+vs 689-1249 s), so the added recording on the GC relocation path costs nothing
+measurable. Gates on the merged tree: `cratonvm-types` 493/0, `cratonvm-gc`
+974/0, `cratonvm-vm` 2420/0.
+
+**Residual, stated honestly.** Only one of this page's faces (`"result" is
+null`) was frequent enough to measure directly. The `ClassId(0)` dispatch-miss
+face and the `The database has been closed` face did not occur in the 32-run
+baseline either, so 0-in-20 does not by itself retire them — what retires them
+is that the mechanism explains every recorded witness, including the ones this
+page could never reconcile (`in_published_snapshot=false` on a RUNNING mutator
+whose top frame holds the address, with `ROOT_IN_DEAD_SPANS=0` and
+`SWEEP_LIVENESS hits=0`). If a `ClassId(0)` receiver reappears in
+`TestMultiThread`, reopen this page rather than starting a new one, and check
+`object_degradation_count()` first.
+
+**Earlier fixes that landed under this page and remain valid.** An old-gen mark
+gap (`old_gen_gc`'s root seed had no resolution for an INTERIOR conservative
+root), and separately a JIT miscompile that bound an `invokevirtual` to the
+compiled entry of its CONSTANT-POOL-resolved method with no receiver guard
+(`../jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`). The second is
+not a GC bug at all, and it mattered here twice over: it made this family's only
+reproduction fail 100% of runs in 2-9 s so nothing could be measured, and a
+wrong-object return is **indistinguishable at the reader** from a stale
+reference — so it stays a live alternative explanation for every occurrence
+recorded before `12769bb23c`.
 
 ## Why this is one page
 
@@ -1447,13 +1475,13 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
 
 ## Related
 
-* `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
+* `../jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
   — the JIT miscompile that made this family's reproduction impossible, and the
   reason a wrong-object return has to be excluded before a stale reference is
   assumed. **Read this before attributing anything here to GC.**
 * `../../../gc/old-sweep-liveness.md` §7 — the interior-conservative-root fix,
   its counters and its negative control.
-* `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
+* `../h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
   — array receivers dispatched through their COMPONENT class id, the *other*
   defect that puts a receiver into `java.lang.Thread.clone`. The clone-face
   reporter added here exists to tell the two apart.
@@ -1577,7 +1605,7 @@ nothing, so a clean campaign is positive evidence rather than silence.
 
 A Hibernate witness of this family (`sql.exec.SmokeTests#testQueryConcurrency`,
 one occurrence) was filed as a separate page and has been retired into
-`../../internal/fixed-suite-bugs/hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`.
+`../hibernate/smoketests-stale-pointer-nosuchmethod-crash-20260804-RETIRED.md`.
 Two things from it belong here, because they apply to any future occurrence:
 
 **`reclaimed_hole_at`'s verdict already names the collector — read it before
