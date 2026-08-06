@@ -199,7 +199,7 @@ fn sweep_anchor_stride() -> usize {
 /// `live` is `cursor - free_list`, the metric the trigger actually uses.
 fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: usize, non_moving: bool) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
+    if !*ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
         return;
     }
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -12220,7 +12220,7 @@ impl GenerationalHeap {
         // Opt-in: the allocating call chain. Release builds carry line tables,
         // so this names the exact panicking-allocator caller — i.e. which
         // native / VM-internal path could not tolerate a GC-and-retry.
-        if std::env::var_os("CRATONVM_DBG_OOM_BT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOM_BT").is_some() {
             eprintln!(
                 "FATAL-OOM backtrace:\n{}",
                 std::backtrace::Backtrace::force_capture()

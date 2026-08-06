@@ -12648,7 +12648,7 @@ mod tests {
     #[test]
     fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
         assert!(
-            std::env::var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
             "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
         );
         assert!(

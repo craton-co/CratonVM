@@ -472,7 +472,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-159 tokens.
+158 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -621,7 +621,6 @@ export inherited from a parent shell.
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
-| `unban-junitcore` | `CRATONVM_JIT_UNBAN_JUNITCORE` |
 | `unroll` | `CRATONVM_JIT_UNROLL / CRATONVM_DISABLE_UNROLL` |
 | `vectorize` | `CRATONVM_JIT_VECTORIZE` |
 | `verify-arena-order` | `CRATONVM_JIT_VERIFY_ARENA_ORDER` |
