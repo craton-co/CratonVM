@@ -62,8 +62,47 @@ record's own count was 39% low.
   item is unchanged in kind, but anyone scoping the deletion from this page
   would plan against a number 39% too small.
 
-**Still open and untouched by this pass:** §1, §2, §4, §6, §7, §8, and the bulk
-of §11. §3's Matcher-leaf residual is unchanged.
+### Second pass, same day — §2, §6, §7
+
+* **§2 — FIXED, and the record named the wrong gate.** Two gates guard the thin
+  direct-call helpers: `build_helpers` skips REGISTERING the `*_DIRECT_FN`
+  addresses under `JdkOnly`, and `direct_native_helper` refuses to BIND once
+  the latch is strict. The registration skip is not the leak — it only fails to
+  set a cell, and a `Compatible` VM's own `build_helpers` sets it. **The latch
+  is the leak**: monotone toward strict and process-wide, so the first
+  `JdkOnly` VM makes every other VM's compilation get `0`.
+  So the fix inverts: the addresses are now registered **unconditionally**
+  (they are process-invariant Rust `fn` pointers — withholding them was never
+  per-VM protection), and the policy is threaded per compilation as an argument
+  on `try_compile_with_invokespecial_resolver` / `try_compile_inner`, with
+  three production callers in `jit_bridge.rs`.
+  The record asks for the policy to move into "a single per-VM struct that the
+  compile path already threads". It does thread one — `&JitRuntimeHelpers` —
+  but that is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, so a
+  policy bit does not belong in it; an argument is the right shape.
+  **Remaining half:** `jit_entry_publishable` still reads the latch. It has no
+  VM handle, and §1's own measurement says that refusal never fires, so
+  process-global there refuses nothing in either VM.
+* **§6 — FIXED.** `JNI_NATIVE_METHODS` now lives on
+  `SharedVm::natives::jni_native_methods`. The record says "NOT moved this wave
+  — it is touched by `vm_exec.rs`, owned by another agent"; measured, that is
+  three production call sites, all with `shared` already in scope. The record
+  also misses `UnregisterNatives`, which had the same defect in mirror image —
+  one VM's teardown removed another's bindings.
+  The census half is **not** closed and cannot honestly be: `record_invocation`
+  keys on a `NativeMethodId` and only `NativeMethodRegistry` issues one.
+* **§7 — the defect was already fixed; the note above it still denied it.** The
+  `JDK-ONLY-NOTE` said the `Call*Method` helpers swallow `ExceptionThrown`. The
+  arm thirty lines below has published the pending exception since the
+  bare-varargs slots started dispatching. Corrected. The honest residual is
+  every *other* `Err(_)`, which has no JNI representation.
+  The `ORCHESTRATOR:` loose end is now a decision: nothing else in the tree
+  materialises a violation as a throwable and `render` names no Java type, so
+  `InternalError` stands — and it already satisfies the constraint that
+  matters, which is that a refusal be catchable.
+
+**Still open:** §1, §4, §8, the bulk of §11, §3's Matcher-leaf residual, and
+the `jit_entry_publishable` half of §2.
 
 ## 2026-08-04 status
 
