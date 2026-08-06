@@ -347,8 +347,14 @@ thread_local! {
 /// log2 of the address span one leaf `u64` word covers (64 granules x 64 B).
 const PROVENANCE_WORD_COVER_SHIFT: u32 = PROVENANCE_GRANULE_SHIFT + 6;
 
+///
+/// `pub(crate)` so [`crate::compact_value::CompactValue`]'s four SUB_OBJECT
+/// *encoders* can record too. They are reference-construction boundaries just
+/// as much as `ObjectRef::from_raw` is, and until they recorded, the encoder
+/// could mint a slot its own decoder would refuse -- see the module note on
+/// `CompactValue::object`.
 #[inline(always)]
-fn record_object_ref_payload(ptr: *mut u8) {
+pub(crate) fn record_object_ref_payload(ptr: *mut u8) {
     let raw = ptr as u64;
     if !plausible_heap_pointer(raw) {
         return;

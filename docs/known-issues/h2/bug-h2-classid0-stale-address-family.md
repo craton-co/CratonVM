@@ -885,6 +885,76 @@ promotion still evacuates and the moving path still resets from-space; and the
 unbounded leak ends the run before much sweeping happens. So it is neither a
 clean negative nor soakable — do not read the first run as exoneration.
 
+### ROOT CAUSE (2026-08-06): a SUB_OBJECT slot the encoder minted and the decoder refused
+
+`CompactValue` NaN-boxes a reference as a `SUB_OBJECT` slot. Because a 64-bit
+`long` can carry the identical bit pattern, the *context-free* decoders
+(`CompactValue::to_value`, `crate::value::decode_value`) do not trust the tag
+alone: they ask `crate::value::object_ref_payload_is_known(payload)` -- a
+process-wide bitmap of every payload that has crossed a reference-construction
+boundary. An unknown payload is **degraded to `Value::Long`** and counted by
+`object_degradation_count()`.
+
+Only `ObjectRef::from_raw` / `from_raw_nonnull` recorded into that bitmap. The
+four *encoders* of a `SUB_OBJECT` payload did not:
+
+| encoder | who calls it |
+| --- | --- |
+| `CompactValue::object(raw)` | `local_slot_to_compact`, `RawSlot` bridge, SoA thaw |
+| `CompactValue::try_from_pointer(raw)` | `Frame::update_object_refs` (GC relocation) |
+| `CompactValue::update_object_ptr` | GC compaction scanner |
+| `CompactValue::update_object_ptr_unchecked` | GC compaction scanner (hot path) |
+
+So the encoder could mint a slot its own decoder refused. What follows is the
+whole family:
+
+1. a live reference lands in a frame slot through one of those encoders with a
+   payload the bitmap does not know;
+2. the next context-free decode returns `Value::Long`, and any `Value`-typed
+   store of that result marks `Frame::local_kinds[i] = LKIND_LONG`
+   (`ValueStack::kinds` for an operand-stack slot);
+3. `Frame::scan_local_objects` **skips LONG slots by design** -- the root is
+   never published. That is the measured `in_published_snapshot=false` on a
+   RUNNING mutator whose top frame holds the address, with
+   `ROOT_IN_DEAD_SPANS=0` and `SWEEP_LIVENESS hits=0`: nothing dropped the root,
+   the root was never handed over;
+4. the sweep reclaims the object. What the mutator reads back next depends on
+   what overwrote the span -- a zeroed span reads as `ClassId(0)` (class id 0 is
+   `java.lang.Object`), a span carrying free-list metadata fails
+   `is_object_address` and `coerce_value_for_return_validated` turns the
+   reference into **`null`**.
+
+`bytecode` never consults `local_kinds`, so step 2 is invisible from Java: the
+slot keeps loading and storing correctly right up to the moment the GC runs.
+
+**The evidence that named it.** `TestMultiThread` x32 on
+`cratonvm-h2cid0-slot-20260805`: the one-shot
+`CompactValue: first long<->object NaN-box collision degraded to Value::Long`
+line and the `"result" is null` failure face co-occur **perfectly** -- 6 runs
+with both, 26 runs with neither, and every remaining failure was a
+`TimeoutException` / `Timeout trying to lock table` on a host at load 90 (i.e.
+harness noise, and degradation-free). Two competing explanations were killed in
+the same campaign: `CRATONVM_DBG_ROOTSNAP_VERIFY` reported
+`miss_snapshots=0 missed_roots=0` over every snapshot of several runs, and the
+face still reproduced under `CRATONVM_ROOTSNAP_CACHE=0`, so the frozen-frame
+root-snapshot cache is exonerated.
+
+**Why it looked like three different bugs.** The `"result" is null` face is
+`Command.executeQuery`'s `ResultInterface result = query(maxrows);` -- a local
+assigned straight from a call return and used one bytecode later, so nothing
+about it is a GC *timing* window. It is the same slot corruption arriving
+through the return-value path.
+
+**The fix** records the payload inside all four encoders, so the invariant
+"anything the VM encoded as a reference decodes as a reference" holds by
+construction instead of by convention. Three sites
+(`Frame::update_object_refs` x2, `ValueStack::update_object_refs`) had already
+been hand-patched with a `ObjectRef::from_raw` round-trip whose comments state
+this exact mechanism -- three hand-patches of one invariant is the signal that
+the invariant belongs one level down. Those round-trips are now redundant and
+harmless. Regression test:
+`every_sub_object_encoder_records_decodable_provenance_cv`.
+
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
 Recorded so they are not re-derived; each cost a build-and-soak cycle. These
