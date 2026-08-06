@@ -110,7 +110,7 @@ def main(argv):
             if r["invocations"]:
                 dispatched[(r["class"], r["name"], r["descriptor"])] += r["invocations"]
 
-    absent, nowhere, live = [], [], []
+    absent, nowhere, live, gated = [], [], [], []
     for i in range(n):
         row = arms[0][1][i]
         key = (row["class"], row["name"], row["descriptor"])
@@ -123,7 +123,25 @@ def main(argv):
             bucket = nowhere
         else:
             continue
-        (live if dispatched.get(key) else bucket).append((row, dispatched.get(key, 0)))
+        if dispatched.get(key):
+            live.append((row, dispatched[key]))
+        elif row["kind"] == "synthetic-stub":
+            # THE RULE. A synthetic stub is CratonVM's OWN implementation, and
+            # no census of JDK images can adjudicate it: the census scores it
+            # ABSENT precisely because no JDK owes us a class this VM mints
+            # (`Comparator$Native`, `Function$Identity`), or a method the JDK
+            # never declared (`StampedLock.isLocked`). It is already gated —
+            # `NativeKind::SyntheticStub` is the one kind `--jdk-only` rejects,
+            # so strict mode drops it and the real bytecode wins — and in
+            # real-JDK mode it is inert rather than wrong, because nothing can
+            # reach a class that only exists when the VM minted it.
+            #
+            # Deleting one would remove the implementation the SYNTHETIC JDK
+            # depends on, which is the one image this sweep never censuses.
+            # Gate, never delete.
+            gated.append((row, 0))
+        else:
+            bucket.append((row, 0))
 
     print("images:     %s" % ", ".join(p.rsplit("/", 1)[-1] for p, _ in arms))
     print("rows:       %d" % n)
@@ -141,6 +159,17 @@ def main(argv):
               "name\n  can still be a class this VM mints — check before "
               "believing a census\n  that says a `java.util` class does not "
               "exist.")
+
+    print("\ngated, and NOT deletion candidates (kind=synthetic-stub): %d" % len(gated))
+    for row, _ in sorted(gated, key=lambda t: (t[0]["class"], t[0]["name"],
+                                               t[0]["descriptor"])):
+        print("  %s.%s%s" % (row["class"], row["name"], row["descriptor"]))
+    if gated:
+        print("  These are CratonVM's own implementations. `NativeKind::"
+              "SyntheticStub`\n  already gates them out of `--jdk-only`, and "
+              "no JDK-image census can\n  say whether the synthetic JDK needs "
+              "them — it is not one of the images\n  swept. They are omitted "
+              "from the written list on purpose.")
 
     survivors = absent + nowhere
     print("\nby kind: %s" % dict(Counter(r["kind"] for r, _ in survivors)))
@@ -160,7 +189,8 @@ def main(argv):
                                 r.get("registered_by"), tag))
         print("\nwritten: %s" % args.out)
     print("\nThis is a candidate list, not a delete-me list: it covers the "
-          "images swept\nand the workloads run, and nothing else.")
+          "images swept\nand the workloads run, and nothing else. Synthetic "
+          "stubs are excluded by\nrule — see the gated section above.")
     return 0
 
 
