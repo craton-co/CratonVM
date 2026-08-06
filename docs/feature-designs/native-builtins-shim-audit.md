@@ -336,8 +336,93 @@ with ITS answer — which is what earns the allowlist row in
 accessors the row's justification depends on, so a later edit cannot delete one
 and leave the row asserting something untrue.
 
-Measured against HotSpot 25 (`PrefsProbe`, 13 printed values including a
-subclass that overrides only the two accessors): all thirteen now match.
+Measured against HotSpot 25 (`PrefsProbe`, 13 printed values): **eleven of
+thirteen** matched after this fix. The two that did not are the subject of
+*Fix 6*, and they are recorded here rather than rounded off, because the first
+draft of this paragraph claimed all thirteen and was wrong.
+
+### Fix 6 — `node()` treated a whole path as one node name, and `AbstractPreferences` was not subclassable (MEDIUM)
+
+The two residuals *Fix 5* left open, and they are one change because the second
+is what makes the first testable.
+
+**`node(path)` resolved a single name.** `node("x/y/z")` produced ONE node
+literally called `x/y/z`. `absolutePath()` happened to render the same text —
+one segment that contains slashes — so a probe that only checked the path saw
+nothing wrong. `name()` answered `x/y/z` where HotSpot answers `z`,
+`nodeExists("x")` was false immediately after creating `x/y/z`, and
+`parent()` skipped two levels. None of the four malformed shapes the JDK
+rejects were rejected. It now walks the path:
+
+* a leading `/` resolves from the root of this node's tree, not from this node;
+* `""` names this node and `"/"` names the root;
+* an empty segment is `IllegalArgumentException`, with the JDK's own two
+  messages — `"Path ends with slash"` when it is the last segment,
+  `"Consecutive slashes in path"` otherwise;
+* a segment longer than `MAX_NAME_LENGTH` (80) is refused, and 80 itself is
+  legal.
+
+`nodeExists` walks the same grammar with a lookup-only step, because the two
+must agree; and both now raise `IllegalStateException` on a removed node, with
+`nodeExists("")` the one query a removed node still answers (`!removed`) rather
+than throwing, exactly as the JDK splits it.
+
+The single-segment get-or-create is lifted out of the old closure into
+`p72_prefs_child_or_create` so the walk reuses it rather than duplicating the
+pinning discipline — every step allocates, and each live reference is carried
+across it through `pin_native_root`/`read_native_pin`.
+
+**`AbstractPreferences(AbstractPreferences, String)` is registered**, so
+`class X extends AbstractPreferences` is constructible. It was not, and that
+is why *Fix 5* could only assert its central claim — "a subclass overrides an
+accessor and the rendering follows it" — at the registry level: a subclass
+could not be built to test it. Constructor validation is the real one, message
+for message (`Root name '…' must be ""`, `Name '…' contains '/'`,
+`Illegal name: empty string`). Its slot-5 answer follows the real definition of
+`isUserNode()`, which is `root == Preferences.userRoot()`: a node that roots
+ITSELF is not in the user tree, so it renders "System" — measured, not assumed,
+and the same reason the no-arg constructor's default flipped to 0.
+
+`java/util/prefs/AbstractPreferences` needed its own `instance_fields(6)` row
+for the same reason `Preferences` did; a subclass allocated through the new
+constructor has to have the slots the constructor writes.
+
+Measured against HotSpot 25: `PrefsPathProbe`'s 18 values — path splitting,
+parent chain, `nodeExists` at every level, node memoisation identity, absolute
+resolution, all five `IllegalArgumentException` texts, and three subclass
+shapes including one that overrides only `absolutePath`/`isUserNode` — are
+**identical**, and `PrefsProbe` is now 13 of 13. The path grammar also has
+hermetic coverage (`prefs_path_tests`), which asserts that a name of exactly 80
+characters is legal rather than only that 81 is refused.
+
+## Residual 5 — `Preferences.userRoot()` returns a FRESH tree on every call
+
+Found while measuring *Fix 6*; **not fixed here**, and it is the more serious
+of the two remaining. `userRoot()`/`systemRoot()` allocate a new node per call
+instead of answering a per-VM singleton, so the idiomatic
+write-here-read-there pattern loses data with no exception:
+
+| | HotSpot 25 | CratonVM `--synthetic-jdk` |
+|---|---|---|
+| `userRoot() == userRoot()` | `true` | `false` |
+| `userRoot().put("k","v")` then `userRoot().get("k","MISSING")` | `v` | **`MISSING`** |
+| `userRoot().node("n1")` then `userRoot().nodeExists("n1")` | `true` | **`false`** |
+
+This is the shape this repository keeps filing: the call succeeds, nothing
+throws, and the state is gone. It also means real `isUserNode()`'s definition
+(`root == Preferences.userRoot()`) could never have been implemented literally
+here — the slot-5 flag *Fix 5* added is the model that works without a
+singleton, and it stays correct once one exists.
+
+The fix has an established shape in this crate: hold the two roots in a
+VM-scoped side table keyed by `ctx.vm_identity()`, registered through
+`register_var_handle_root` / read back through `read_var_handle_root`, which is
+the documented remedy for a raw `ObjectRef` singleton going stale after a
+moving collection (the `ASYNC_POOL` shape). `userNodeForPackage` /
+`systemNodeForPackage` then become a `node()` walk of the package path under
+the right root, which is what they are in the JDK — today they are four
+identical calls to the same allocator and ignore their `Class` argument
+entirely.
 
 ## Handed-over item 1 — `ensure_synthetic_class` must become fallible: BLOCKED, cross-crate
 

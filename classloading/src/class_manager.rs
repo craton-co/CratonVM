@@ -11873,6 +11873,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // above describes — and every node would then answer `isUserNode()`
         // with the default rather than the tree it was created for.
         "java/util/prefs/Preferences" => instance_fields(6),
+        // Same layout, and it is reachable now that
+        // `AbstractPreferences(AbstractPreferences, String)` is registered: a
+        // user `class X extends AbstractPreferences` is constructed through
+        // that constructor, and its slots have to exist before the constructor
+        // writes them.
+        "java/util/prefs/AbstractPreferences" => instance_fields(6),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -14015,6 +14021,7 @@ fn native_constant_surface_raw_slot_layout_audit() {
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),
         ("java/util/prefs/Preferences", 6),
+        ("java/util/prefs/AbstractPreferences", 6),
         ("com/sun/net/httpserver/HttpServer", 6),
         ("com/sun/net/httpserver/HttpServerImpl", 6),
         ("sun/net/httpserver/HttpServerImpl", 6),
