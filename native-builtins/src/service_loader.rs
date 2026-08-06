@@ -862,6 +862,20 @@ fn discover_providers(
     let loader_ref_opt: Option<cratonvm_types::ObjectRef> = {
         let v = match ctx.get_field_by_name(sl, "loader") {
             Value::Object(Some(r)) => Some(r),
+            // Legacy slot 1 is where `build_service_loader` puts the loader on a
+            // SYNTHETIC ServiceLoader. On a real-JDK `ServiceLoader` slot 1 is
+            // `serviceName`, a `String` — and this fallback used to accept it,
+            // because the only filter was "is it a BUILT-IN loader class?" and
+            // `java/lang/String` is not one. The result was
+            // `invoke_virtual(<String>, "getResources")`, i.e. a
+            // `NoSuchMethodError java/lang/String.getResources` and a silent
+            // fall-through to the flat scan for every real `ServiceLoader` whose
+            // `loader` field this VM left null. Seen on
+            // `com.sun.tools.attach.spi.AttachProvider.providers()` and
+            // `sun.jvmstat.monitor.MonitoredHost.getMonitoredHost`.
+            //
+            // `sl_non_builtin_loader` already had the missing check; this is the
+            // second reader of the same two fields and it did not.
             _ => match ctx.get_field(sl, 1) {
                 Value::Object(Some(r)) => Some(r),
                 _ => None,
@@ -871,7 +885,9 @@ fn discover_providers(
             Some(r) => {
                 let cid = ctx.class_id_of_object(r);
                 let name = ctx.class_name_of_id(cid).unwrap_or_default();
-                if crate::classloader::is_builtin_loader_class(&name) {
+                if crate::classloader::is_builtin_loader_class(&name)
+                    || !crate::classloader::is_classloader_instance(ctx, r)
+                {
                     None
                 } else {
                     Some(r)
