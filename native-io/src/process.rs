@@ -1098,7 +1098,7 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// opposite answers — the first is a stub Process the VM owns, the second is
 /// someone else's.
 ///
-/// See `docs/known-issues/jdk-only/process-natives-answer-for-user-subclasses.md`
+/// See `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);

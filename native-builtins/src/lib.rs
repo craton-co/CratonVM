@@ -41984,7 +41984,7 @@ mod t2_6_crypto_acceptance_tests {
 // position 3 and limit 2, and `CharBuffer.wrap(new char[4], 3, 2)` a buffer
 // running two limbs past its own array, where HotSpot throws.
 //
-// See `docs/known-issues/buffer-constructor-does-not-validate-position-and-limit.md`
+// See `buffer-constructor-does-not-validate-position-and-limit-FIXED-20260806.md`
 // (retired) — and note that the validation is NOT missing from
 // `Buffer.limit(int)`/`position(int)` themselves, which are correct and do
 // fire for every direct caller. It was missing only here, because this native

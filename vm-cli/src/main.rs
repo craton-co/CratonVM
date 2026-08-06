@@ -114,7 +114,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
+        // (`docs/feature-designs/c2/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
