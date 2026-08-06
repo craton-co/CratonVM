@@ -36865,65 +36865,30 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
     registry.register(pb, "<init>", "(Ljava/util/List;)V", native_pb_init);
     registry.register(pb, "<init>", "([Ljava/lang/String;)V", native_pb_init);
     registry.register(pb, "command", "()Ljava/util/List;", native_pb_command);
-    registry.register(pb, "start", "()Ljava/lang/Process;", native_pb_start);
-
-    let proc = "java/lang/Process";
-    // `waitFor()`/`exitValue()` answered a constant 0 — "the process
-    // succeeded" — for EVERY process, discarding the exit code that
-    // `phases_late::register_phase57_process`'s real `start()` captures into
-    // slot 0 (`PROC_FIELD_EXIT`, the same slot `destroy()` below writes 143
-    // into). A failed child therefore reported success. Read the recorded
-    // code instead. `phases_late` registers real versions of all three that
-    // supersede these (it runs later, from `register_essential_natives_with_shims`),
-    // so today this is the belt to that braces — but a stub that lies is not
-    // an acceptable fallback for an ordering change.
-    registry.register(proc, "waitFor", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    registry.register(proc, "exitValue", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    // Correct constant: CratonVM's `ProcessBuilder.start()` runs the child to
-    // completion synchronously (`Command::output()`), so by the time any Java
-    // code holds a Process it has already exited.
-    registry.register(proc, "isAlive", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(proc, "destroy", "()V", |ctx, args| {
-        // Process is 3-field synthetic (exit_code=0, stdout=1, stderr=2). Our spawn model
-        // captures stdout/stderr synchronously via Command::output(), so destroy() merely
-        // needs to mark the process as terminated. SIGTERM exit code = 143.
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        ctx.set_field(this, 0, Value::Int(143));
-        Ok(None)
-    });
+    // `native-io`'s ProcessBuilder.start, not a local stub. What stood here
+    // was `native_pb_start`: it consulted the SecurityManager and then handed
+    // back a dummy Process that had never spawned anything, on a ONE-slot
+    // `alloc_concurrent_synthetic(ctx, "java/lang/Process", 1)`. Registering
+    // the real one costs nothing and cannot lie.
     registry.register(
-        proc,
-        "destroyForcibly",
+        pb,
+        "start",
         "()Ljava/lang/Process;",
-        |ctx, args| {
-            // Same 3-field synthetic Process as `destroy()` above, and the same
-            // "mark it terminated" job — `destroyForcibly` used to only return
-            // `this`, so `exitValue()` afterwards still read slot 0 and reported
-            // the process as a clean exit 0. 137 (128 + SIGKILL) rather than
-            // destroy()'s 143 (128 + SIGTERM): that is the difference the two
-            // methods exist to express, and shell-convention exit codes are what
-            // callers compare against.
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            ctx.set_field(this, 0, Value::Int(137));
-            Ok(Some(Value::Object(Some(this))))
-        },
+        cratonvm_native_io::process::native_process_builder_start,
     );
 
-    // Thread enhancements
+    // The five `java/lang/Process` natives that stood here -- waitFor,
+    // exitValue, isAlive, destroy and destroyForcibly -- read slot 0 of a THIRD
+    // Process layout (exit_code=0, stdout=1, stderr=2) that no longer has a
+    // producer, and their comments still described a spawn model
+    // ("`Command::output()`, so by the time any Java code holds a Process it
+    // has already exited") that stopped being true when `native-io` took over
+    // spawning. `register_process_natives` registers all five against the live
+    // child, on this class name and on `cratonvm/synthetic/Process`. The
+    // comment they carried said it best: a stub that lies is not an acceptable
+    // fallback for an ordering change.
+
+    // Thread enhancements    // Thread enhancements
     registry.register(
         "java/lang/Thread",
         "getStackTrace",

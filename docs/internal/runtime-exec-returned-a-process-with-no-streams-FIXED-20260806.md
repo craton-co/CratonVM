@@ -177,10 +177,135 @@ truncation whenever the real class has fewer than `n` fields, and in real-JDK
 mode `java/lang/Process` does. Every write past the real field count is
 dropped, every read past it returns nothing, and the only trace is a `WARN`
 from the heap guard that reads like a speculative-probe false positive. Two
-more callers still allocate a Process this way —
+more callers allocated a Process this way —
 `phases_late::register_phase57_process`'s `ProcessBuilder.start` and
-`lib.rs`'s `native_pb_start` — and both are dead only because `native-io`
-registers over them later. They were left in place (removing them would change
-what happens if the registration order ever moves), but they are the same
-landmine, and the next one will look exactly like this one: a `200 OK` with
-nothing in it.
+`lang_system`'s `native_pb_start` — dead only because `native-io` registers
+over them later. This section originally left them in place, on the grounds
+that removing them would change what happens if the registration order ever
+moved. See the follow-up below: they were removed the same day, and taking them
+out exposed a third defect underneath.
+
+## Follow-up 2026-08-06: the other two callers, and what removing them exposed
+
+The section above ended by naming two more callers that allocate a Process
+under the real class name `java/lang/Process` and were left in place because
+they are dead. They are gone now, and so is the third layout nobody mentioned.
+
+### Both `ProcessBuilder.start` reimplementations are now the same function
+
+`native-io`'s `native_process_builder_start` is `pub` and registered from all
+three sites. It was already a strict superset of the other two — it honours
+`redirectInput/Output/Error` and `redirectErrorStream`, reads a `List` through
+the List API when it is not ArrayList-shaped, and returns live pipes — and it
+already won every dispatch, since `register_io_natives` runs after
+`register_essential_natives_with_shims` and `register()` is
+last-registration-wins. Registering the same function pointer three times makes
+the redundancy real: whichever registration wins, the behaviour is identical.
+
+Deleted with them:
+
+* `phases_late`'s legacy Process layout (`JAVA_PROCESS_FIELD_COUNT` + four
+  `PROC_FIELD_*` slots) and the **sixteen** Process natives that read it —
+  `waitFor`, `exitValue`, `destroyForcibly`, `pid`, `toHandle`,
+  `getInputStream`, `getErrorStream`, `getOutputStream`, each on both
+  `java/lang/Process` and `cratonvm/synthetic/Process`. Every one of those
+  triples is registered by `native-io` on the same two class names against the
+  live child. What they *would* have answered if the ordering moved was worse
+  than nothing: they read pid from slot 9, which in the surviving layout is the
+  stderr file descriptor.
+* `lang_system`'s `native_pb_start` — a `ProcessBuilder.start` that asked the
+  SecurityManager for permission and then returned a one-slot dummy Process
+  that had spawned nothing — and `lib.rs`'s five `java/lang/Process` natives
+  reading slot 0 of a *third* layout, whose comments still described the
+  `Command::output()` spawn model that stopped being true when `native-io`
+  took over spawning.
+* `native-io`'s `captured_string_stream` / `legacy_captured_stream`, the
+  `getInputStream` path that re-wrapped those captured Strings. With no
+  producer left it was reading slot 7 of every Process hoping to find a String,
+  and slot 7 is now an `Int`.
+
+Net: −687 lines, +390.
+
+### One coincidence made load-bearing
+
+`ProcessBuilder.environment()` stored its map only at the indexed slot 2, while
+`start()` looks it up by the *name* `environment`. That worked solely because a
+real JDK 25 `java.lang.ProcessBuilder` declares `command`, `directory`,
+`environment` in that order, so slot 2 *is* the named field. `environment()`
+now writes both spellings (as the `command` registrations already did), and
+`read_process_environment` falls back to slot 2 when no named field exists.
+
+### What the verification probe found: `ProcessHandle.isAlive()` never went false
+
+Writing `probes/ProcHandleProbe.java` to check that nothing regressed turned up
+a defect that predates all of this — confirmed by building `origin/dev`
+unmodified and running the same probe:
+
+```
+HotSpot   AFTER proc_exists=false handle.isAlive=false process.isAlive=false
+dev       AFTER proc_exists=false handle.isAlive=true  process.isAlive=false
+```
+
+`Process.isAlive()` was right and `ProcessHandle.isAlive()` on a handle from
+the same child was wrong, for two independent reasons in one native:
+
+1. **It was keyed by the wrong identifier.** `ProcessHandleImpl`'s four natives
+   are handed a **pid** by the JDK's own bytecode — `isAlive0(pid)`,
+   `waitForProcessExit0(pid, ..)`, `destroyProcess0(pid, ..)`,
+   `destroy0(pid, startTime, ..)` — and all four passed it straight into
+   `try_exit_handle` / `wait_for_handle` / `destroy_handle`, which are keyed by
+   `NEXT_HANDLE`, a counter starting at 1. Two unrelated number spaces, so the
+   lookup always missed: `isAlive0` said "still running" for every pid forever,
+   `waitForProcessExit0` returned −1 without waiting, `destroyProcess0` killed
+   nothing. A comment on `native_process_to_handle` had already named this and
+   deferred it ("fixing that needs the table to also be queryable by real pid").
+   It is queryable now — `handle_for_pid`.
+
+2. **The return value is not a boolean.** `ProcessHandleImpl.isAlive()` reads
+   it as the process's *start time*:
+
+   ```java
+   long startTime = isAlive0(pid);
+   return startTime >= 0
+       && (startTime == this.startTime || startTime == 0 || this.startTime == 0);
+   ```
+
+   Any value ≥ 0 means alive; −1 is the only way to say "not alive". The native
+   returned 1 for running and **0 for exited** — and 0 is ≥ 0. With
+   `this.startTime == 0` on every handle `build_process_handle` mints, the third
+   disjunct then made the answer `true` unconditionally. The two errors could
+   not cancel: the answer was "alive" either way.
+
+Both fixed; `ProcHandleProbe` is now byte-identical to HotSpot 25.
+
+`process::tests::process_handle_wait_for_exit_enters_gc_blocked_region` had to
+be repaired rather than satisfied — it passed the internal handle where the JDK
+passes a pid, so it was asserting the bug.
+
+### Verification
+
+| | |
+|---|---|
+| `probes/ProcHandleProbe.java` | byte-identical to HotSpot 25 (was 1 line divergent on pristine `dev`) |
+| `probes/ProcSurfaceProbe.java`, 32 lines | still byte-identical, default AND `--jdk-only` |
+| `probes/CgiExecProbe.java` | `VERDICT=CGI_OK`, 33-byte body |
+| `probes/ExecPolicyProbe.java` | both entry points refused, neither child forked |
+| `TestSecurity2019` / `TestCGIServletCmdLineArguments` / `TestOpenSSLCipherConfigurationParser` | `OK (3)` / `OK (18)` / `OK (73)` |
+| `cargo test -p cratonvm-native-io --lib` | 407 passed, 0 failed — 5 consecutive runs, no flake |
+| `cargo test -p cratonvm-native-builtins --lib` | 3315 passed, 0 failed |
+| `cargo check --all-targets`, default AND `synthetic-jdk` | clean, no warnings |
+
+The `spawn_policy_hook` test needed a `SPAWN_TEST_LOCK`: the hook is
+process-global once installed, so its deny arm refused an unrelated test's
+spawn. That surfaced as a flaky `SecurityException` from
+`spawn_and_wrap_exposes_a_live_stdout_pipe`, which is worth recording — any
+future test that spawns through `spawn_and_wrap` needs that lock.
+
+### What is left
+
+Nothing allocates a Process under a real JDK class name any more, and there is
+exactly one Process layout with exactly one writer. The general landmine stands
+though, for other classes: `alloc_concurrent_synthetic(ctx, "<a real JDK class
+name>", n)` silently truncates whenever the real class has fewer than `n`
+fields, and reports it only as a `cratonvm::gc::guard` WARN whose own text
+blames a speculative collection probe.
