@@ -114,3 +114,26 @@ methods are unaffected and remain mockable
 | `ThreadLocalRetransformProbe`, ordinary target (control) | PROBE-OK | **PROBE-OK** |
 | `MockManyProbe`, 4-class list with `NamedThreadLocal` first | 0 ok / 4 fail | **4 ok / 0 fail** |
 | HotSpot 25, both probes | PROBE-OK | PROBE-OK |
+
+The 1901-class sweep that found it, same classpath, same probe:
+
+| arm | ok | fail | skip |
+|---|---:|---:|---:|
+| CratonVM, before | 636 | 92 | 1173 |
+| **CratonVM, after** | **725** | **3** | 1173 |
+| HotSpot 25 | 716 | 12 | 1173 |
+
+Zero `ThreadLocal.get()` NPEs. CratonVM now mocks a **superset** of what HotSpot
+manages here — 10 of HotSpot's 12 refusals succeed on this VM, and the two
+CratonVM shares with it (`ReflectionHintsExtensionsKt`, `BeanDefinitionDsl`) are
+Kotlin classes both refuse for the same legitimate reason.
+
+`cargo test -p cratonvm-vm --lib`: 2427 passed, 0 failed.
+
+## Residual — one class, filed separately
+
+`org.infinispan.query.remote.client.impl.QueryRequest` still fails to mock on
+CratonVM (`MockitoException`) where HotSpot mocks it. It reproduces **in
+isolation**, with no other mock in the process, so it is not a cascade and is
+unrelated to this defect — it was also the first failure in the pre-fix sweep,
+before any ThreadLocal had been touched. Not investigated here.
