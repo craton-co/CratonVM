@@ -2747,7 +2747,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // (that reasoning is what item 8 cost a session). See
     // `forced_native_string_policy_is_not_reintroduced` below for the guard,
     // and
-    // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`
+    // `forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`
     // for the measurement: with both lists deleted the 392-case `String`
     // matrix was byte-identical in both modes and every one of the 38
     // exercised `java/lang/String` registry slots reported an unchanged

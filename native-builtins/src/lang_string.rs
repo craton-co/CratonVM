@@ -937,6 +937,36 @@ pub(crate) fn native_string_init_abstract_string_builder(
     Ok(None)
 }
 
+/// Which field slot holds `String.hash`, from the element type of the string's
+/// backing `value` array — or `None` when this receiver cannot decide it.
+///
+/// JDK 9+ compact layout is `{value:[B, coder:B, hash:I, hashIsZero:Z}`, so the
+/// hash is slot **2**; the legacy synthetic-stub layout is `{value:[C, hash:I}`,
+/// so it is slot **1**. A `Boolean` element type is the byte-array alias this
+/// VM uses in some paths and means the compact layout too.
+///
+/// **`None` is the case that matters, and it used to be folded into slot 1.**
+/// `string_char_array` returns `None` for a `String` whose `value` field is
+/// null — an object allocated but not yet initialised. That receiver carries no
+/// evidence about the layout, and the caller latches this answer in a
+/// process-wide `OnceLock` that is never reset. Guessing 1 there, against the
+/// JDK 25 layout, selects `coder`: every later call would read the coder as a
+/// cached hash (so every UTF-16 string hashes to `1`) and, on the recompute
+/// path, WRITE the computed hash into `coder` — silent corruption of the
+/// string's encoding flag, for the whole process, decided by whichever string
+/// happened to be hashed first.
+///
+/// Returning `None` costs nothing: the caller returns 0 for that receiver
+/// either way, and the first readable string still latches the right slot.
+fn hash_slot_for(element_type: Option<cratonvm_types::ArrayElementType>) -> Option<usize> {
+    match element_type {
+        Some(cratonvm_types::ArrayElementType::Byte)
+        | Some(cratonvm_types::ArrayElementType::Boolean) => Some(2),
+        Some(_) => Some(1),
+        None => None,
+    }
+}
+
 pub(crate) fn native_string_hash_code(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -956,18 +986,26 @@ pub(crate) fn native_string_hash_code(
     // call — either by class+field name or by re-reading the value array —
     // was itself the bottleneck that kept cache hits ~20x slower than a plain
     // field read, dwarfing the hashing win.)
+    //
+    // The latch is process-wide and permanent, so it must only ever be set from
+    // a receiver that actually carries the evidence — see `hash_slot_for`.
     static HASH_SLOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let hash_field_index: usize = match HASH_SLOT.get() {
         Some(i) => *i,
         None => {
-            let slot =
-                match string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr)) {
-                    Some(cratonvm_types::ArrayElementType::Byte)
-                    | Some(cratonvm_types::ArrayElementType::Boolean) => 2,
-                    _ => 1,
-                };
-            let _ = HASH_SLOT.set(slot);
-            slot
+            let elem = string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr));
+            match hash_slot_for(elem) {
+                Some(slot) => {
+                    let _ = HASH_SLOT.set(slot);
+                    slot
+                }
+                // Unreadable receiver and no layout learned yet: hash 0 and
+                // latch NOTHING, leaving the decision to the first string that
+                // can answer it. The fall-through below returns 0 for this same
+                // receiver anyway, so the only behaviour that changes is that a
+                // guess no longer becomes permanent.
+                None => return Ok(Some(Value::Int(0))),
+            }
         }
     };
     if let Value::Int(cached) = ctx.get_field(this, hash_field_index) {
@@ -4499,7 +4537,9 @@ pub(crate) fn native_string_replace_all(
     // "x")` returned the input unchanged where HotSpot throws — a silently
     // wrong answer produced by the error path of a fast path.
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_all_java(&s, replacement.as_str());
+    let result = re
+        .replace_all_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4523,7 +4563,9 @@ pub(crate) fn native_string_replace_first(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_first_java(&s, replacement.as_str());
+    let result = re
+        .replace_first_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -7398,6 +7440,50 @@ mod tests {
         let s = ctx.create_string("");
         let r = native_string_hash_code(&mut ctx, &[Value::Object(Some(s))]);
         assert_eq!(r.unwrap(), Some(Value::Int(0)));
+    }
+
+    /// A `String` that cannot answer "which layout am I" must not answer it.
+    ///
+    /// `native_string_hash_code` latches the hash field slot in a process-wide
+    /// `OnceLock` that is never reset, from whichever `String` it happens to
+    /// hash first. That is fine for a receiver with a readable `value` array
+    /// and wrong for one without: `string_char_array` returns `None` for a
+    /// `String` allocated but not yet initialised, and folding `None` into
+    /// slot 1 — as this did — points every later call at `coder` on the JDK 25
+    /// layout. The read side returns `1` as the hash of every UTF-16 string;
+    /// the write side stores the hash INTO `coder`, silently corrupting the
+    /// encoding flag of every string the process hashes afterwards.
+    ///
+    /// The `OnceLock` makes the whole-native version of this untestable — one
+    /// latch per test binary — so the decision lives in a pure function and the
+    /// test is on that. `None => None` is the entire fix; the two `Some` arms
+    /// are here so a rewrite cannot quietly swap the layouts.
+    #[test]
+    fn hash_slot_is_never_guessed_from_an_unreadable_string() {
+        use cratonvm_types::ArrayElementType;
+
+        assert_eq!(
+            hash_slot_for(None),
+            None,
+            "a String with a null `value` carries no layout evidence; latching a \
+             guess from it points the whole process at `coder` (slot 1) and makes \
+             every later hash write corrupt the string it hashed"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Byte)),
+            Some(2),
+            "compact JDK 9+ layout: value:[B, coder:B, hash:I, hashIsZero:Z"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Boolean)),
+            Some(2),
+            "boolean[] is this VM's byte[] alias, so it is the compact layout too"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Char)),
+            Some(1),
+            "legacy synthetic-stub layout: value:[C, hash:I"
+        );
     }
 
     // -----------------------------------------------------------------------

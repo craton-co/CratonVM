@@ -7367,11 +7367,7 @@ fn tb_index_in_bounds(idx: i32, bound: i32) -> bool {
 /// (IndexOutOfBoundsException)` around a buffer access did not see it and the
 /// throw escaped as an unrelated failure.
 fn buffer_index_out_of_bounds() -> MethodCallFailed {
-    RuntimeError::IndexOutOfBoundsException {
-        // Empty == "no detail message"; see `RuntimeError::as_java_throwable`.
-        message: String::new(),
-    }
-    .into()
+    RuntimeError::ioobe_no_message().into()
 }
 
 /// `Objects.checkFromIndexSize(from, size, length)` for the buffer natives
@@ -7388,13 +7384,13 @@ fn buffer_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(),
     if !bad {
         return Ok(());
     }
-    Err(RuntimeError::IndexOutOfBoundsException {
-        message: cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+    Err(RuntimeError::ioobe(
+        cratonvm_types::error::out_of_bounds_message::check_from_index_size(
             i64::from(from),
             i64::from(size),
             i64::from(length),
         ),
-    }
+    )
     .into())
 }
 

@@ -1413,7 +1413,7 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
 fn dbg_class_resource_filter() -> Option<&'static str> {
     static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FILTER
-        .get_or_init(|| std::env::var("CRATONVM_DBG_CLASS_RESOURCE").ok())
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_CLASS_RESOURCE").ok())
         .as_deref()
 }
 
@@ -4566,7 +4566,7 @@ fn set_accessible_impl(
 /// `ClassLoader.defineClass` accessible, and whether it was denied.
 fn dbg_set_accessible() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CRATONVM_DBG_SETACC").is_ok())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_SETACC").is_ok())
 }
 
 pub(crate) fn check_class_loader_define_class_is_encapsulated(

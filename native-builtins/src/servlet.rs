@@ -2899,13 +2899,13 @@ fn s2_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), Met
     if !bad {
         return Ok(());
     }
-    Err(RuntimeError::IndexOutOfBoundsException {
-        message: crate::preconditions::CheckKind::FromIndexSize.message(&[
+    Err(RuntimeError::ioobe(
+        crate::preconditions::CheckKind::FromIndexSize.message(&[
             i64::from(from),
             i64::from(size),
             i64::from(length),
         ]),
-    }
+    )
     .into())
 }
 
@@ -2940,11 +2940,7 @@ fn s2_bb_check_abs(
     if ok {
         Ok(())
     } else {
-        Err(RuntimeError::IndexOutOfBoundsException {
-            // Empty == "no detail message"; see `RuntimeError::as_java_throwable`.
-            message: String::new(),
-        }
-        .into())
+        Err(RuntimeError::ioobe_no_message().into())
     }
 }
 

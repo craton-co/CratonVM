@@ -234,7 +234,7 @@ fn throw_constructed(
         "java/lang/ArrayIndexOutOfBoundsException" => {
             RuntimeError::ArrayIndexOutOfBoundsException { index }.into()
         }
-        _ => RuntimeError::IndexOutOfBoundsException { message }.into(),
+        _ => RuntimeError::ioobe(message).into(),
     }
 }
 

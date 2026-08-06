@@ -15593,12 +15593,27 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
         native_map_of_2,
     );
-    r.register(
-        "java/util/Map",
-        "entry",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        native_map_entry,
-    );
+    // DELETED 2026-08-05 — `Map.entry` is not registered, deliberately.
+    //
+    // It used to return a 2-field synthetic `java/util/Map$Entry`. A
+    // differential run against HotSpot 25 (`probes/ShadowDifferentialProbe.java`)
+    // caught two observable differences, both of them the fake being a worse
+    // version of code that already exists:
+    //
+    //   * `Map.entry("k", 7).toString()` was `java.util.Map$Entry@6c`, not
+    //     `k=7` — the synthetic has no `toString`, so `Object`'s ran.
+    //   * `setValue` SUCCEEDED. `Map.entry` is specified to return an
+    //     immutable entry and the JDK's `KeyValueHolder.setValue` throws
+    //     `UnsupportedOperationException`. Silently accepting the write is the
+    //     dangerous half: a caller that defensively mutates a copy got no
+    //     signal that it had mutated nothing anybody would read.
+    //
+    // `java.util.Map.entry` is a static interface method with ordinary
+    // bytecode, so deleting the registration is all it takes — contract §1.4's
+    // "the real bytecode wins" applied by removing the thing that was winning
+    // instead. Everything else this probe exercises (`List/Set/Map.of`,
+    // `copyOf`, `unmodifiable*`, `subList`, `LinkedHashMap` entry views incl.
+    // write-through `setValue`) already matched HotSpot byte for byte.
 
     // Higher-arity `List.of` / `Set.of` / `Map.of` overloads (real JDK
     // declares fixed-arity variants up to 10). Without these, e.g.
@@ -15663,8 +15678,15 @@ fn native_map_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
-/// `Map.ofEntries(Map$Entry...)` — each array element is a Map.Entry whose
-/// key/value live at slots 0/1 (see `native_map_entry`).
+/// `Map.ofEntries(Map$Entry...)`.
+///
+/// Each element is asked for its key and value through `getKey()`/`getValue()`
+/// rather than read at slots 0/1. Since `Map.entry` stopped being registered
+/// (see the note at its old registration site) the arguments are real
+/// `java.util.KeyValueHolder`s, whose layout this crate does not own and must
+/// not assume — and a caller may pass any `Map.Entry` implementation at all,
+/// including one the application wrote, where a positional read is not merely
+/// fragile but wrong.
 fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
@@ -15677,8 +15699,16 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(len);
     for i in 0..len {
         if let Value::Object(Some(entry)) = ctx.get_array_element(arr, i) {
-            let k = ctx.get_field(entry, 0);
-            let v = ctx.get_field(entry, 1);
+            let k = ctx
+                .invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            let v = ctx
+                .invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
             pairs.push((k, v));
         }
     }
@@ -15944,27 +15974,6 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
-fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let key = args.first().copied().unwrap_or(Value::Object(None));
-    let value = args.get(1).copied().unwrap_or(Value::Object(None));
-    // GC-safety: `alloc_synthetic` can complete a moving young GC, so the bare
-    // `key`/`value` copies would be pre-move addresses by the time they are
-    // stored — publishing dangling references into a live object. Pin both
-    // across the allocation and re-read them at the stores.
-    let key_pin = pin_value(ctx, key);
-    let value_pin = pin_value(ctx, value);
-    let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let value = read_pinned_elem(ctx, value_pin, value);
-    if key_pin != usize::MAX {
-        ctx.unpin_native_roots(key_pin);
-    } else if value_pin != usize::MAX {
-        ctx.unpin_native_roots(value_pin);
-    }
-    ctx.set_field(entry, 0, key);
-    ctx.set_field(entry, 1, value);
-    Ok(Some(Value::Object(Some(entry))))
-}
 
 // ===========================================================================
 // Stream API — Eager evaluation on Vec<Value>

@@ -163,7 +163,7 @@ this closure.
 ## What happened
 
 During the closing sweep of
-[`../../internal/fixed-suite-bugs/spring/spring-aot-cluster.md`](../../internal/fixed-suite-bugs/spring/spring-aot-cluster.md),
+`fixed-suite-bugs/spring/spring-aot-cluster.md`,
 chunk 9 aborted once while AOT-processing
 `org.springframework.test.context.bean.override.mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests`:
 

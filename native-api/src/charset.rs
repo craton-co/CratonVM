@@ -368,9 +368,28 @@ pub fn decode_bytes_lossy(name: &str, bytes: &[u8]) -> Vec<u16> {
     if let Ok(v) = decode_bytes(name, bytes) {
         return v;
     }
-    // Byte-oriented charsets never malform except for unsupported names,
-    // so only the UTF-family needs a replacement path.
+    // Byte-oriented charsets never malform except for unsupported names --
+    // with ONE exception, and the missing arm for it was a live bug until
+    // 2026-08-05. `US-ASCII` is byte-oriented AND rejects every byte > 0x7F,
+    // so `decode_bytes` returns `Err` and, with no arm here, control fell
+    // through to the `other =>` catch-all below, whose 1:1 `b as u16` map IS
+    // Latin-1. `new String(bytes, "US-ASCII")` therefore decoded 0xE9 as
+    // U+00E9 where HotSpot gives U+FFFD -- high-bit bytes silently became
+    // Latin-1 text instead of being reported unmappable.
+    //
+    // Every other byte-oriented arm in `decode_bytes` really is infallible
+    // (each maps all 256 byte values through a table), so US-ASCII is the
+    // whole of the exception the sentence above was missing.
     match name {
+        // REPLACE action, per byte: `CharsetDecoder`'s default substitutes one
+        // U+FFFD per malformed input byte, so the result keeps the input's
+        // length. Checked against HotSpot rather than assumed --
+        // `new String(new byte[]{(byte)0xE9,'a',(byte)0xFF}, "US-ASCII")` is
+        // three chars, U+FFFD 'a' U+FFFD, not one.
+        "US-ASCII" => bytes
+            .iter()
+            .map(|&b| if b > 0x7F { 0xFFFDu16 } else { u16::from(b) })
+            .collect(),
         "UTF-8" => decode_utf8_lossy(bytes),
         "UTF-16" => decode_utf16_bom_lossy(bytes, true),
         "UTF-16BE" => decode_utf16_fixed_lossy(bytes, true),
@@ -2036,6 +2055,36 @@ mod tests {
     #[test]
     fn ibm1047_lossy_replacement_is_ebcdic_question_mark() {
         assert_eq!(encode_chars_lossy("IBM1047", &[0x20AC]), vec![0x6F]);
+    }
+
+    /// `US-ASCII` is the ONE byte-oriented charset whose strict decode can
+    /// fail, and until 2026-08-05 `decode_bytes_lossy` had no arm for it: the
+    /// `Err` fell through to the unknown-name catch-all, whose `b as u16` map
+    /// is Latin-1. `new String(bytes, "US-ASCII")` silently produced Latin-1
+    /// text for any high-bit byte.
+    ///
+    /// Both halves matter, and the sibling test below is what makes this one
+    /// non-vacuous: a fallback that returned all-U+FFFD would pass this
+    /// assertion's first half while destroying the unknown-name behaviour.
+    #[test]
+    fn lossy_decode_us_ascii_replaces_high_bytes_rather_than_latin1() {
+        // HotSpot 25, checked directly:
+        //   new String(new byte[]{(byte)0xE9,'a',(byte)0xFF}, "US-ASCII")
+        //     -> length 3, units FFFD 0061 FFFD
+        let chars = decode_bytes_lossy("US-ASCII", &[0xE9, b'a', 0xFF]);
+        assert_eq!(
+            chars,
+            vec![REPLACEMENT_CHAR, 0x0061, REPLACEMENT_CHAR],
+            "a high-bit byte must become U+FFFD, not its Latin-1 character              (0x00E9/0x00FF is the pre-2026-08-05 answer)"
+        );
+        // One replacement PER BYTE: the decoded length tracks the input length.
+        assert_eq!(chars.len(), 3);
+
+        // Pure ASCII is untouched, so the fix cannot be a blanket substitution.
+        assert_eq!(decode_bytes_lossy("US-ASCII", b"hi"), vec![0x0068, 0x0069]);
+        assert!(decode_bytes_lossy("US-ASCII", b"hi")
+            .iter()
+            .all(|&c| c != REPLACEMENT_CHAR));
     }
 
     #[test]

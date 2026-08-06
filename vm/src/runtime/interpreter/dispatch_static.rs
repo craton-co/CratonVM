@@ -1312,7 +1312,7 @@ pub(super) fn execute_invokestatic_cached(
             // The "255 spin rounds" rationale is the ORIGINAL one and it did
             // not survive: measuring the *uncontended* path — which never
             // spins — showed the same cost, so the spin was never the story
-            // (`docs/internal/uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md`).
+            // (`uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md`).
             // The change is kept because the narrower reason is still true:
             // this call site's whole body is empty, so any dispatch cost at
             // all is pure waste.

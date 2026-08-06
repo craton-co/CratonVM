@@ -1236,6 +1236,13 @@ pub struct G1PauseSummary {
 
 /// G1 garbage collector implementing the `GarbageCollector` trait.
 pub struct G1Collector {
+    /// Compact-layout domain of the VM that owns this heap. See
+    /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
+    /// allocating against another domain's registry entry would give the object
+    /// a foreign shape. Defaults to the first domain, so an untold heap behaves
+    /// as it did before domains existed.
+    layout_domain: std::sync::atomic::AtomicU32,
+
     /// Collector configuration.
     config: G1CollectorConfig,
     /// Single contiguous backing store for every region.
@@ -1550,6 +1557,17 @@ unsafe impl Sync for G1Collector {}
 static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl G1Collector {
+    /// Bind this heap to its VM's compact-layout domain.
+    pub fn set_layout_domain(&self, domain: u32) {
+        self.layout_domain
+            .store(domain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// This heap's compact-layout domain.
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a new G1 collector with the given configuration.
     pub fn new(config: G1CollectorConfig) -> Self {
         let num_regions = config.heap_size / config.region_size;
@@ -1595,6 +1613,9 @@ impl G1Collector {
         let ihop_threshold = (config.heap_size as u64 * config.ihop_percent as u64 / 100) as usize;
 
         Self {
+            layout_domain: std::sync::atomic::AtomicU32::new(
+                cratonvm_types::FIRST_LAYOUT_DOMAIN,
+            ),
             config: config.clone(),
             arena,
             regions: Mutex::new(regions),
@@ -7636,7 +7657,11 @@ impl G1Collector {
 
 impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let compact_body = cratonvm_types::compact_object_body_size(
+            self.layout_domain(),
+            class_id.as_u32(),
+            num_fields,
+        );
         let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
         let total_size = HEADER_SIZE + body_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
