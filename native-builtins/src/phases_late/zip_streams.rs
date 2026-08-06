@@ -942,7 +942,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 /// InputStream/OutputStream contract, but use
 /// a reusable 16 MiB Java byte array so the concrete stream implementations
 /// retain ownership of their I/O and ZIP semantics.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `InputStream.transferTo` is ordinary bytecode and
+// `cratonvm/internal/StreamCollector` is a class this VM mints, so neither
+// can be what an `ACC_NATIVE` method binds to.
 pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for class in ["java/io/InputStream", "java/io/FileInputStream"] {
         r.register(
             class,
@@ -951,13 +963,26 @@ pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
             native_input_stream_transfer_to,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// Register real-JDK `ZipOutputStream`'s private little-endian primitive
 /// writers. A ZIP64 central directory invokes these helpers millions of times;
 /// appending directly to a `ByteArrayOutputStream` avoids one interpreter call
 /// for every individual byte while retaining the generic stream fallback.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `java.util.zip.ZipOutputStream`'s entry bookkeeping is
+// pure Java; only the `Deflater` underneath it is native, and that is
+// registered elsewhere and states its own kind.
 pub fn register_p59_zip_output_primitives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let zo = "java/util/zip/ZipOutputStream";
     r.register(zo, "writeShort", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1018,6 +1043,7 @@ pub fn register_p59_zip_output_primitives(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;J)I",
         native_sb_file_data_block_read,
     );
+    r.set_category(__prev_cat);
 }
 
 static SB_FILE_DATA_CACHE: std::sync::OnceLock<StdMutex<ZoHashMap<u64, std::sync::Arc<Vec<u8>>>>> =

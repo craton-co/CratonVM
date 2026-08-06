@@ -6722,7 +6722,16 @@ pub fn register_essential_natives_with_shims(
     // identity and can receive option instances crossing that namespace at a
     // parent/default-interface boundary. Compare the stable enum names here so
     // CLASS_TO_STRING continues to request Class[] -> String[] adaptation.
-    registry.register(
+    //
+    // `SyntheticStub`, stated. This was the ONE registration in the whole boot
+    // that ran on the registry's constructor default — it is the first
+    // `register` call the VM makes, before any `set_category` anywhere — so it
+    // got the right kind for the wrong reason, which is exactly the state
+    // `no_registration_runs_on_the_ambient_default` exists to end. The kind is
+    // right on its own terms too: `Adapt.isIn` is ordinary Spring bytecode that
+    // this VM shadows to work around a loader-identity problem, not a boundary
+    // anything must cross, so `--jdk-only` should and does refuse it.
+    registry.register_with_kind(
         "org/springframework/core/annotation/MergedAnnotation$Adapt",
         "isIn",
         "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z",
@@ -6749,6 +6758,7 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(Some(Value::Int(0)))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
@@ -32683,7 +32693,19 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
 /// RegisterNatives + libffi dispatch is unsafe on Windows; `vm_exec` also refuses
 /// `find_jni_native` / `resolve_jni_native_in_libraries` for this package.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `org.apache.tomcat.jni.*` is a third-party APR binding
+// this VM fakes rather than links; there is no CratonVM boundary here to
+// cross, only a `<clinit>` to satisfy.
 fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let lib = "org/apache/tomcat/jni/Library";
 
     registry.register(lib, "version", "(I)I", |_ctx, args| {
@@ -32827,6 +32849,7 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });
+    registry.set_category(__prev_cat);
 }
 
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.

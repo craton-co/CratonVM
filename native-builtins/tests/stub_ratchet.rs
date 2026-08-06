@@ -131,7 +131,44 @@ use cratonvm_types::compat::CompatibilityMode;
 /// method is ordinary bytecode in `java.base`, so deleting the registration is
 /// the whole fix. This is the direction the gate exists to encourage: one
 /// fewer fake, and the count follows.
-const BASELINE_SYNTHETIC_STUBS: usize = 553;
+///
+/// # 553 -> 632, 2026-08-06 (lies removed from the census, not fakes added)
+///
+/// **No new synthetic stub exists, and no slot the VM dispatches changed kind.**
+/// Measured, not asserted: two `--dump-native-registry` censuses from a real
+/// JDK 25 boot, before and after, agree on the effective kind of all **10,639**
+/// registered triples — zero differences (`scripts/jdk-only-kind-map.py`, and
+/// a last-write-wins fold over both files).
+///
+/// This gate counts *registrations*, superseded rows included, and that is
+/// where the 79 moved. Nine registrars had no `set_category` scope over them at
+/// all, so each of their callers imposed its own — and registration is
+/// last-write-wins, so what shipped was decided by call ORDER while the
+/// superseded rows were left claiming a kind nothing ever used.
+///
+///  * `register_stamped_lock_natives` is called three times. Two callers had
+///    `Bridge` in effect and one had none: 62 rows here (`StampedLock` and its
+///    two view classes).
+///  * `register_service_loader_natives`, `register_url_codec`,
+///    `register_p59_bulk_stream_transfer` and the netty/tomcat/slf4j shim
+///    registrars: the remaining 17.
+///
+/// All nine state `SyntheticStub` now, which is what their surviving row always
+/// was and what the classes deserve — `java.util.ServiceLoader`,
+/// `java.net.URLEncoder`/`URLDecoder`, `java.io.InputStream.transferTo` and
+/// `java.util.concurrent.locks.StampedLock` are ordinary bytecode in
+/// `java.base` and JDK 25 declares no `ACC_NATIVE` method on any of them, so
+/// contract §1.5 cannot call them bridges.
+///
+/// **`--jdk-only` changed, and this is the fix, not the fallout.** A strict
+/// census A/B shows 48 triples that strict mode used to ADMIT and now refuses,
+/// and none in the other direction. It admitted them because the drop happens
+/// at registration: the later `SyntheticStub` row was refused at the door and
+/// the earlier `Bridge` row therefore survived to own the slot. Contract §11's
+/// "zero synthetic-stub invocations through any path" was false for 48 triples,
+/// by registration order, invisibly. See
+/// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+const BASELINE_SYNTHETIC_STUBS: usize = 632;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
@@ -212,6 +249,63 @@ fn census() -> (usize, usize) {
         .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
         .count();
     (synthetic, rows.len())
+}
+
+/// THE GATE FOR STEP 3 OF
+/// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`:
+/// *"flip the default last — once every registration states its kind,
+/// `current_category` can default to something that fails loudly (or be
+/// deleted)."*
+///
+/// It cannot be phrased as "every registration states its kind", because
+/// `kind_stated` is true only for `register_with_kind` (849 of ~11,900) and is
+/// deliberately false on every row a `with_category` scope covers on purpose.
+/// The answerable form is the one the record actually needs: **no registration
+/// may be made with no scope covering it at all**, so the conservative
+/// `SyntheticStub` fallback in `NativeMethodRegistry::effective_category` is
+/// dead code that can be deleted the day `NativeKind` gains a `Refuse` arm.
+///
+/// The count was **one** when this gate was written — `MergedAnnotation$Adapt
+/// .isIn`, the first `register` in `register_essential_natives_with_shims`,
+/// which ran before any `set_category` in the whole boot and therefore took the
+/// constructor's default by accident rather than by decision. It is stated now.
+///
+/// Note what this gate is NOT. It does not say the kinds are right; the bridge
+/// ratchet asks that. It does not say anybody adjudicated a row; `kind_stated`
+/// and `scripts/jdk-only-kind-map.py` ask that. It says only that the *default*
+/// decides nothing any more, which is the specific property step 3 names.
+#[test]
+fn no_registration_runs_on_the_ambient_default() {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    let rows = registry.census();
+    let unchosen: Vec<_> = rows.iter().filter(|r| !r.kind_chosen).collect();
+
+    println!(
+        "unchosen: {} of {} registrations were made with no category scope in effect",
+        unchosen.len(),
+        rows.len()
+    );
+    for r in unchosen.iter().take(40) {
+        println!(
+            "  {}.{}{}  kind={}  at {}",
+            r.class,
+            r.name,
+            r.descriptor,
+            r.kind.as_str(),
+            r.registered_by.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    assert!(
+        unchosen.is_empty(),
+        "{} registration(s) inherited the registry's conservative default \
+         because no `set_category` / `with_category` / `register_with_kind` \
+         covered them. That is not a tag, it is the absence of one, and under \
+         `--jdk-only` it is the difference between a native being registered \
+         and being refused at the door. Wrap the call site in a category scope \
+         or state its kind with `register_with_kind`; see the list above.",
+        unchosen.len()
+    );
 }
 
 /// The old, essentials-only census, kept for exactly one purpose: to assert

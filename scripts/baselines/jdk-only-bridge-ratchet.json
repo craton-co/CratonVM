@@ -1,32 +1,32 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4686,
-      "bridge_without_acc_native": 9675,
+      "bridge_shadows_bytecode": 4605,
+      "bridge_without_acc_native": 9581,
       "jdk_version": "25.0.3",
       "mode": "compatible",
-      "note": "Re-freeze: dev drifted 22/2 below the previous freeze before this change (verified by scoring the PRISTINE d676f1c12 binary, which measures the same 9675/4686). This change deletes one registration, java.util.Map.entry, and that one was SyntheticStub \u2014 it moves stub_ratchet 554->553, not these two.",
+      "note": "Ambient-category scoping: current_category is an Option, nine registrars that had no scope now state SyntheticStub, and the 48 triples --jdk-only was admitting by registration order are refused. Effective kind of all 10,639 triples byte-identical; the counts fall because superseded rows stopped claiming a kind nothing used.",
       "observed": {
         "bridge": {
-          "abstract_method": 1321,
+          "abstract_method": 1322,
           "acc_native": 774,
-          "class_absent": 1191,
-          "class_present_method_undeclared": 2477,
-          "rows": 10449,
-          "shadows_bytecode": 4686,
-          "without_acc_native": 9675
+          "class_absent": 1190,
+          "class_present_method_undeclared": 2464,
+          "rows": 10355,
+          "shadows_bytecode": 4605,
+          "without_acc_native": 9581
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10449,
-          "intrinsic": 690,
-          "synthetic-stub": 756
+          "bridge": 10355,
+          "intrinsic": 687,
+          "synthetic-stub": 834
         },
         "schema": 1,
-        "total_rows": 11895
+        "total_rows": 11876
       },
       "os": "linux",
       "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
