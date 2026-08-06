@@ -15705,20 +15705,20 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        // Same encapsulation gate the typed `setAccessible` natives apply --
-        // this shorthand variant must not become a way around it.
-        if flag != 0 {
-            if let Err(msg) =
-                lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
-            {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: msg,
-                    }
-                    .into(),
-                );
-            }
-        }
+        // The full JEP 403 gate, not just the `ClassLoader.defineClass` edge.
+        //
+        // This registration is the LAST writer for
+        // `{Field,Method,Constructor,AccessibleObject}.setAccessible(Z)V` in
+        // `register_essential_natives_with_shims`, and the registry is
+        // last-writer-wins, so it silently replaced the module-checking
+        // `lang_class::native_field_set_accessible` registered ~1150 lines
+        // above. Real-JDK mode ran this body and nothing else: every
+        // `setAccessible(true)` into `java.base` succeeded, where HotSpot 25
+        // throws `InaccessibleObjectException`
+        // (`probes/ThreadGroupLayoutProbe.java`, the `ref *` lines). Calling
+        // the shared gate is what makes the duplicate harmless instead of
+        // load-bearing.
+        lang_class::enforce_set_accessible_gate(ctx, this, flag, "member")?;
         ctx.set_field_by_name(this, "override", Value::Int(flag));
         Ok(None)
     }
