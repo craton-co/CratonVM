@@ -114,13 +114,14 @@ The whole class, `KRun org.springframework.beans.factory.aot.BeanRegistrationsAo
 on the fixed binary, real JDK 25, Azure host:
 
 ```
-RESULT ... found=14 succ=14 fail=0 skip=0 abort=0 ms=4252687 status=OK
+RESULT ... found=14 succ=14 fail=0 skip=0 abort=0 ms=1634398 status=OK
 ```
 
 **14/14, rc=0** — parity with HotSpot, which is what the original Status line
-asked for. 4254 s wall on a box at load ~50 shared with other sessions; that is
-throughput, not correctness, and this page's own "Measuring here at all" section
-below explains why an absolute time from this host means little.
+asked for. Run twice: 4254 s on the pre-merge binary at host load ~50, and
+1635 s on the final merged binary at load ~15. The 2.6x is the shared box, not
+the change; this page's own "Measuring here at all" section below is why no
+absolute time from this host means much.
 
 Two notes on running it here at all, both learned the hard way this session:
 
