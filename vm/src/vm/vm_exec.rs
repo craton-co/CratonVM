@@ -23599,8 +23599,8 @@ fn invoke_on_class_shared_inner(
                 // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
-                // docs/known-issues/h2/
-                // bug-h2-classid0-stale-address-family.md.
+                // fixed-suite-bugs/h2-suite-bugs/
+                // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(
