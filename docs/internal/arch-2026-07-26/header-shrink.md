@@ -585,6 +585,30 @@ relocating every cycle.
 
 5,889 tests pass across the four crates (types 505, gc 979, jit 1964, vm 2441).
 
+**Throughput is flat**, which is what §5.1 predicted and should not be dressed
+up. Measured twice: once at host load 6-12, and again after the box rebooted
+at load 0.3 (13 interleaved pairs per phase, per-process user CPU,
+`arithmetic` as the negative control since it allocates nothing and therefore
+cannot move).
+
+| phase | load 6-12 | idle |
+|---|---:|---:|
+| arithmetic *(control)* | 0.983x | **1.003x** |
+| bintrees | 0.988x | **0.994x** |
+| hashmap | 1.014x | **1.010x** |
+| fib / sieve / matrix / stringregex | 1.000 / 1.008 / 0.996 / 1.000 | — |
+
+The idle run corrects the first: **bintrees is flat, not a small regression.**
+The 0.988x was load artefact — visible in the control moving the same
+direction by the same amount — and the "40-byte objects straddle cache lines
+more often than 48-byte ones" story invented to explain it was explaining
+nothing. Ranges overlap (fix 1.55-1.63, base 1.50-1.60). Only hashmap is
+outside noise, at ~1%, and only that one reproduces across both runs.
+
+So the deliverable is **footprint, not speed**: 8 bytes off every object, and
+a sixth fewer collections at a given heap (18 -> 15 at `-Xmx700m`). Anyone
+hoping this moves a 9x row should read §5.1 again.
+
 ### 9.6 The snapshot is correct, and I could not build an oracle for it
 
 §4.3 rates a mistake here as "silent monitor corruption ... the one place where
