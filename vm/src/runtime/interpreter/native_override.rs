@@ -6443,36 +6443,6 @@ pub(crate) fn dbg_stub_yield() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_YIELD").is_some())
 }
 
-/// Name the dispatch path that is about to run an allow-listed `SyntheticStub`.
-///
-/// The arbitration answers "yield to real bytecode" every time it is ASKED, and
-/// the census still counts thousands of stub dispatches — so the question is
-/// which path never asks. A per-site tag answers that directly; deducing it
-/// from the publish-site conditions did not, because the conditions that look
-/// decisive on the page (`receiver_has_own_bytecode`, `method.is_native()`)
-/// exclude the very class that keeps dispatching.
-///
-/// Diagnostic only, and gated: on a healthy run this is one atomic load.
-pub(crate) fn note_stub_dispatch_site(
-    shared: &SharedVm,
-    id: cratonvm_native_api::NativeMethodId,
-    site: &'static str,
-) {
-    if !dbg_stub_yield() {
-        return;
-    }
-    let registry = &shared.natives.native_methods;
-    if registry.kind_of_id(id) != Some(cratonvm_native_api::NativeKind::SyntheticStub) {
-        return;
-    }
-    let Some((class_name, method_name, descriptor)) = registry.triple_of(id) else {
-        return;
-    };
-    if !real_protected_stub_class(class_name) {
-        return;
-    }
-    eprintln!("[STUB-DISPATCH] site={site} {class_name}.{method_name}{descriptor}");
-}
 
 
 /// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
@@ -6996,6 +6966,40 @@ pub(super) fn revalidate_cached_native(
     let callback = registry.callback_of(id).unwrap_or(cached_callback);
     let kind = registry.kind_of_id(id).unwrap_or(cached_kind);
     if !policy.is_jdk_only() {
+        // REVALIDATE MEANS REVALIDATE. A warmed target is published once and
+        // then redeemed forever, and until 2026-08-05 the Compatible arm
+        // redeemed it without ever re-asking whether a `SyntheticStub` should
+        // now yield to real bytecode. The arbitration answers "yield" every
+        // time it is ASKED — measured, on both an isolated probe and a Spring
+        // Boot run — and the census still counted 2 889
+        // `AtomicBoolean.compareAndSet` stub dispatches, because the warmed
+        // path is the one that never asked.
+        //
+        // `AtomicBoolean` and `java/time/Instant` are on
+        // `real_protected_stub_class_common`'s allow-list, so the stated policy
+        // is that their real bytecode wins once loaded. A target published
+        // before that class finished loading pinned the stub for the rest of
+        // the run.
+        //
+        // Returning `None` is the eviction signal every caller already
+        // implements (`invoke_cache.evict(...)` then `CacheMiss`), so the site
+        // re-resolves through a path that does arbitrate. Cost on the hot path
+        // is one integer compare: only a `SyntheticStub` gets as far as
+        // materialising its triple, and only the eleven allow-listed classes
+        // reach the class manager.
+        if kind == cratonvm_native_api::NativeKind::SyntheticStub {
+            if let Some((class_name, method_name, descriptor)) = registry.triple_of(id) {
+                if synthetic_stub_kind_should_yield_to_real_bytecode(
+                    shared,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    Some(kind),
+                ) {
+                    return None;
+                }
+            }
+        }
         registry.record_invocation(id);
         return Some(callback);
     }
