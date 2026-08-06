@@ -70,19 +70,32 @@
 //!    Fallback paths — but they are the paths that run when the parseable walk
 //!    has already failed, which is exactly when correctness matters most.
 //!
-//!    **CLOSED 2026-08-06.** Each now takes a second pass over the stretch at
-//!    4-byte granularity under `narrow_oops_enabled()`, decoding each half as a
-//!    narrow oop. The mark pass is unconditionally safe (over-marking always
-//!    was). The rewrite pass inherits the wide pass's false-positive trade and
-//!    more of it — 32 bits of entropy instead of 64 — which is accepted for the
-//!    same reason and is bounded by `oldgen_compact_enabled` being off by
-//!    default, so `compact_map` is empty and neither pass runs.
+//!    **CLOSED 2026-08-06.** Both now go through
+//!    `gen_heap::for_each_conservative_ref_slot`, which visits each aligned
+//!    32-bit half decoded as a narrow oop *in addition to* the 64-bit word.
+//!    Both widths, not one or the other: only reference fields and reference
+//!    array elements are narrowed, so such a stretch can still hold full-width
+//!    pointers. Sharing one helper is what keeps the mark walk and the rewrite
+//!    walk agreeing about width — marking at one width and rewriting at
+//!    another would itself leave a dangling reference.
 //!
-//! `enable_for_live_heap` still prints an unsoundness warning, and the default
-//! must stay off: items 4 and 6 below are unmigrated, and item 6 in particular
-//! means the G1/ZGC backends would corrupt the heap outright. What is gone is
-//! the claim that the *generational* backend has a known wrong-width slot
-//! access.
+//! Both holes are now closed by a fix, not by refusal. `enable_for_live_heap`
+//! still warns and the default stays OFF, for two reasons that are NOT
+//! "unsound on this backend":
+//!
+//! * items 4 and 6 below are unmigrated, and item 6 means the G1/ZGC backends
+//!   would corrupt the heap outright — `vm/src/vm/vm_init.rs`'s backend check
+//!   is what stands between them and a user, and it is load-bearing;
+//! * **it is not worth much here.** 4.7 % of peak RSS, measured — see the
+//!   header note above. That is the honest reason not to spend a corpus run on
+//!   it yet, and it reorders the roadmap: the `ObjectHeader` shrink is the item
+//!   with the leverage, and this one is a prerequisite for it rather than a win
+//!   on its own.
+//!
+//! "No known hole" is still a weaker claim than "measured sound" — the sweep
+//! that found these two found them by reading, not by running — so a corpus
+//! run with `-XX:+UseCompressedOops` remains the next real step for the
+//! feature, just not an urgent one.
 //!
 //! For what closing hole 1 did and did not buy on the workload that prompted
 //! it, see `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.

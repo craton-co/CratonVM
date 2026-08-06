@@ -7,20 +7,25 @@
 //! `native_unmod_get` bounds-checks before delegating, so that a wrapper over
 //! an out-of-range index keeps raising `ArrayIndexOutOfBoundsException` rather
 //! than the plain `IndexOutOfBoundsException` the backing `ArrayList` would
-//! raise. The size for that check came from `al_state`, which returns its
-//! `(None, 0)` **"this is not a layout I can read"** sentinel for every backing
-//! that is not ArrayList/Vector-shaped — a real-JDK `java/util/LinkedList`, a
-//! `cratonvm/internal/ArrayListSubList`, any foreign `AbstractSequentialList`.
-//! Reading that sentinel as a size of 0 made `get` throw for **every** index on
-//! a list whose `size()`, `iterator()`, `toString()` and `indexOf()` all
-//! answered correctly.
+//! raise. The size for that check came from `al_state`, whose `(None, 0)`
+//! return means **"this is not a layout I can read"** for every backing that is
+//! not ArrayList/Vector-shaped — a real-JDK `java/util/LinkedList`, a
+//! `cratonvm/internal/ArrayListSubList`, any foreign `AbstractSequentialList` —
+//! and is indistinguishable from a genuinely empty ArrayList. Reading it as a
+//! size of 0 made `get` throw for **every** index on a list whose `size()`,
+//! `iterator()`, `toString()` and `indexOf()` all answered correctly.
+//!
+//! Fixed by `de3c4d35b` / `unmod_view_size`, which keys the decision on the
+//! DATA slot instead: `None` means stand aside and let the delegate answer.
+//! That helper has its own unit test in `lib.rs`; these are the end-to-end
+//! ones, driving the real registry through `Collections.unmodifiableList`.
 //!
 //! Live capture: spring-framework
-//! `BeanRegistrationsAotContributionTests#applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`,
-//! where `SourceFile.getClassName` runs the generated source through QDox and
-//! `DefaultJavaSource.getClasses()` hands back
-//! `Collections.unmodifiableList(<LinkedList>)`. `size() == 1` passed the
-//! assertion on the line above; `get(0)` on the line below threw.
+//! `BeanRegistrationsAotContributionTests`, where `SourceFile.getClassName`
+//! runs the generated source through QDox and `DefaultJavaSource.getClasses()`
+//! hands back `Collections.unmodifiableList(<LinkedList>)`. `size() == 1`
+//! passed the assertion on the line above; `get(0)` on the line below threw.
+//! See `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 
 mod common;
 
@@ -125,7 +130,7 @@ fn get_over_an_arraylist_backing_still_bounds_checks() {
 }
 
 #[test]
-fn a_negative_index_still_raises_on_a_foreign_backing() {
+fn a_negative_index_over_a_foreign_backing_is_delegated_too() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
 
@@ -139,17 +144,30 @@ fn a_negative_index_still_raises_on_a_foreign_backing() {
     let backing = ctx.alloc_object(cid, 3);
     let wrapper = wrap(&reg, &mut ctx, backing);
 
-    let err = call(
+    // The pre-check stands aside for an unreadable backing at EVERY index, not
+    // just the in-range ones: it has no size to compare against, and the
+    // delegate's own `get` is the thing that knows. Pinning this because the
+    // tempting "well, a negative index is always wrong" special case would
+    // reintroduce a second answer for the same question — the delegate's and
+    // this one's — which is how the original defect got in.
+    ctx.clear_invoke_virtual_log();
+    let _ = call(
         &reg,
         &mut ctx,
         UNMOD_LIST,
         "get",
         GET,
         &[Value::Object(Some(wrapper)), Value::Int(-1)],
-    )
-    .expect_err("get(-1) must raise regardless of the backing layout");
+    );
+
+    let log = ctx.invoke_virtual_log();
     assert!(
-        format!("{err:?}").contains("ArrayIndexOutOfBounds"),
-        "expected ArrayIndexOutOfBoundsException, got {err:?}",
+        log.iter().any(
+            |(recv, name, desc, args)| *recv == backing.as_ptr() as usize
+                && name == "get"
+                && desc == GET
+                && args == &[Value::Int(-1)]
+        ),
+        "get(-1) must reach the backing rather than being pre-rejected; log = {log:?}",
     );
 }

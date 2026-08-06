@@ -654,7 +654,17 @@ impl Compiler {
         //
         // The helper retains TLAB allocation (and its fast path); it merely
         // removes the unsynchronised machine-code cursor writer.
+        // Allocation spill sink (`alloc_spill_sink_enabled`) — the `new` arm
+        // asked `emit_pre_safepoint_spill` to withhold every blind-spill
+        // register this fast path does not clobber, and that emitter agreed.
+        // Two obligations follow, both discharged below: the preamble must stay
+        // within `ALLOC_FAST_PATH_CLOBBERS`, and every slow-path edge must emit
+        // the withheld stores before it can reach `new_object`.
+        let sink_spill = self.deferred_alloc_blind_spill;
         if !inline_tlab_new_enabled() {
+            // Unreachable under the sink (the request checks this gate), but the
+            // withheld stores are this arm's to emit if it ever becomes so.
+            self.emit_deferred_alloc_blind_spill();
             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
             self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32);
             self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32);
@@ -753,7 +763,19 @@ impl Compiler {
         // Until that plumbing lands, the helper call stays — see the
         // task notes for the planned approach.
         // Common case: one prologue/OSR helper call per invocation, not per `new`.
-        if self.jit_thread_slot_off != 0 {
+        if sink_spill {
+            // Sink form: the cached slot is the ONLY thread source here. The
+            // fallback below calls `get_current_thread`, and a CALL clobbers the
+            // whole caller-saved file — which would invalidate the eleven
+            // registers this site is about to spill at the slow-path label
+            // instead of here. A null cached slot therefore diverts to
+            // `new_object`, which resolves its own thread and allocates
+            // correctly; `emit_prologue` writes this slot on every entry
+            // (inherited on a proven self-call, fetched otherwise), so the
+            // divert only happens for a genuinely non-Java thread, where the
+            // fallback would have returned null and diverted anyway.
+            self.emit_load_local(RAX, self.jit_thread_slot_off);
+        } else if self.jit_thread_slot_off != 0 {
             self.emit_load_local(RAX, self.jit_thread_slot_off);
             self.emit_test_r64_r64(RAX);
             let have_cached_thread = self.emit_jcc_rel32_patch(0x85); // JNE have_thread
@@ -968,6 +990,12 @@ impl Compiler {
             // the helper allocates per the CURRENT layout.
             self.patch_rel32_to_here(patch);
         }
+        // Every edge that reaches `new_object` — and therefore a collection —
+        // converges here, so this is the one place the withheld half of the
+        // safepoint's blind spill has to be. Emitted before the argument setup
+        // below for the same reason the deopt stub spills before its own: the
+        // ARG_REGS are part of the spilled file.
+        self.emit_deferred_alloc_blind_spill();
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: ClassId fits in 32 bits
         self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding

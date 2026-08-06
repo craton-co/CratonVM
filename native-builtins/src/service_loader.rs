@@ -862,6 +862,20 @@ fn discover_providers(
     let loader_ref_opt: Option<cratonvm_types::ObjectRef> = {
         let v = match ctx.get_field_by_name(sl, "loader") {
             Value::Object(Some(r)) => Some(r),
+            // Legacy slot 1 is where `build_service_loader` puts the loader on a
+            // SYNTHETIC ServiceLoader. On a real-JDK `ServiceLoader` slot 1 is
+            // `serviceName`, a `String` — and this fallback used to accept it,
+            // because the only filter was "is it a BUILT-IN loader class?" and
+            // `java/lang/String` is not one. The result was
+            // `invoke_virtual(<String>, "getResources")`, i.e. a
+            // `NoSuchMethodError java/lang/String.getResources` and a silent
+            // fall-through to the flat scan for every real `ServiceLoader` whose
+            // `loader` field this VM left null. Seen on
+            // `com.sun.tools.attach.spi.AttachProvider.providers()` and
+            // `sun.jvmstat.monitor.MonitoredHost.getMonitoredHost`.
+            //
+            // `sl_non_builtin_loader` already had the missing check; this is the
+            // second reader of the same two fields and it did not.
             _ => match ctx.get_field(sl, 1) {
                 Value::Object(Some(r)) => Some(r),
                 _ => None,
@@ -871,7 +885,17 @@ fn discover_providers(
             Some(r) => {
                 let cid = ctx.class_id_of_object(r);
                 let name = ctx.class_name_of_id(cid).unwrap_or_default();
-                if crate::classloader::is_builtin_loader_class(&name) {
+                // "Actually a ClassLoader" is either answer being yes: the
+                // hierarchy walk, OR the name heuristic `sl_non_builtin_loader`
+                // has always used. Requiring the walk alone would be a real
+                // tightening — a synthetic-jdk stub's superclass chain does not
+                // always reach `java/lang/ClassLoader`, and rejecting a loader
+                // this path used to accept would silently lose providers. Both
+                // answers are no for the `java/lang/String` this guard exists
+                // for.
+                let is_loader = crate::classloader::is_classloader_instance(ctx, r)
+                    || name.contains("ClassLoader");
+                if crate::classloader::is_builtin_loader_class(&name) || !is_loader {
                     None
                 } else {
                     Some(r)
@@ -2276,6 +2300,16 @@ fn drain_real_spliterator(
     ctx: &mut dyn NativeContext,
     spliterator: cratonvm_types::ObjectRef,
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    // The third of the three `StreamCollector` mints. Ask the policy first for
+    // the same reason as the other two: an infallible fabrication anywhere
+    // makes the refusal everywhere else depend on which path ran first.
+    if ctx.try_ensure_synthetic_class(STREAM_COLLECTOR_CLASS, 2).is_err() {
+        return cratonvm_native_collections::drain_spliterator_via_real_iterator(
+            ctx,
+            spliterator,
+            SAFETY_CAP,
+        );
+    }
     let spl_pin = ctx.pin_native_root(spliterator);
     let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
     let col_pin = ctx.pin_native_root(collector);

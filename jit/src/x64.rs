@@ -992,6 +992,18 @@ struct Compiler {
     /// reserved callee-saved-register spill area: one 8-byte slot per entry in
     /// `alloc_used_regs`, same order. 0 when `safepoint_reg_spill` is off.
     reg_spill_base: i32,
+    /// Request half of the allocation spill sink (see `alloc_spill_sink_enabled`).
+    /// Raised by the `new` bytecode arm immediately before
+    /// `emit_pre_safepoint_spill` when the site will take the inline-TLAB path
+    /// with no post-init helper; taken (and cleared) by that emitter.
+    sink_alloc_blind_spill: bool,
+    /// Acknowledgement half of the allocation spill sink. Set by
+    /// `emit_pre_safepoint_spill` when it actually withheld the sinkable
+    /// registers; taken by `emit_deferred_alloc_blind_spill` at the allocation's
+    /// slow-path label. The two halves are separate so a request the safepoint
+    /// emitter cannot honour silently degrades to the full spill rather than to
+    /// a spill that is missing eleven registers.
+    deferred_alloc_blind_spill: bool,
     /// Stage A.2 (precise oop maps, B-K fix) — bytecode PCs at which a
     /// GC-capable safepoint flushed register-locals via
     /// `emit_pre_safepoint_spill`. Populated only under `precise_maps`. Used at
@@ -2350,6 +2362,8 @@ impl Compiler {
             safepoint_reg_spill_nostore,
             flush_callee_saved_oops,
             reg_spill_base,
+            sink_alloc_blind_spill: false,
+            deferred_alloc_blind_spill: false,
             safepoint_pcs: FxHashSet::default(),
             mapped_safepoint_pcs: FxHashSet::default(),
             shadow_enabled,

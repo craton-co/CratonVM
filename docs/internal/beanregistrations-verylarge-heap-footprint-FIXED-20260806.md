@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | ✅ **FIXED 2026-08-06.** `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` passes; the class matches HotSpot. |
 | **Scope** | `org.springframework.beans.factory.aot.BeanRegistrationsAotContributionTests` (spring-framework, `spring-beans`). |
-| **Fix** | `native_unmod_get` (`native-collections/src/lib.rs`) bounds-checked against `al_state`'s *"layout I cannot read"* sentinel. Regression test: `native-collections/tests/unmod_list_get_foreign_backing.rs`. |
+| **Fix** | `native_unmod_get` (`native-collections/src/lib.rs`) bounds-checked against `al_state`'s *"layout I cannot read"* sentinel. Landed on `dev` as `3d6af4029` → `5d265dbeb` → `de3c4d35b` by a concurrent session that found the same defect from a different starting point; this page contributes the end-to-end regression test `native-collections/tests/unmod_list_get_foreign_backing.rs` and the reduction below. |
 | **Also closed** | Both compressed-oops correctness holes this page named as residuals — see [§2026-08-06](#2026-08-06-resolved-the-last-failure-was-never-about-the-heap). |
 | **Measured** | 2026-08-02, 2026-08-05 and 2026-08-06, Azure host `20.83.144.174`, real JDK 25. |
 
@@ -57,12 +57,27 @@ foreign `AbstractSequentialList`. That sentinel is indistinguishable from a
 genuinely empty `ArrayList`, so every index was out of range and `get` threw for
 **every** element of a list whose `size()`, `iterator()`, `toString()`,
 `indexOf()`, `contains()`, `toArray()` and `listIterator()` all answered
-correctly. The fix is to apply the pre-check only when `al_is_list_layout`
-actually recognises the backing, and delegate otherwise.
+correctly. The fix is to stop reading a size out of that sentinel: apply the
+pre-check only when `al_state` actually read the backing — `unmod_view_size`
+keys on the DATA slot being `Some` — and delegate otherwise, so the backing's
+own `get` raises the bounds error HotSpot would.
 
 The `ArrayList` backing is the reason this was not noticed: it is `RandomAccess`,
 so HotSpot's own `getClass()` names it `Collections$UnmodifiableRandomAccessList`
 and it is the shape almost every caller in the corpus has.
+
+**Found twice, independently.** While this page was being reduced, another
+session hit the same defect from a different direction and landed the fix on
+`dev` first: `3d6af4029` *"an unmodifiable view's get() threw on a VALID
+index"*, then `5d265dbeb` *"fix the unmodifiable get() in the native that
+actually runs"* (there are two registrations; the first patch fixed the one
+that does not dispatch — see [[duplicate-native-registrations-verify-which-wins]]),
+then `de3c4d35b` *"use the DATA slot, not the size, to decide the unmod
+pre-check"*. `de3c4d35b`'s `unmod_view_size` is the better-factored form of the
+same idea — it keys on `al_state`'s DATA slot rather than on a layout predicate,
+which also covers an `ArrayList` whose `elementData` is null — so the merge took
+theirs and dropped this branch's implementation. What survives from here is the
+reduction, the regression test, and the measurement below.
 
 **Provenance.** The pre-check is 19 hours old:
 `026ba86c9` *"fix(nio,collections): ByteBuffer had NO bounds check, and two more
@@ -125,7 +140,7 @@ Two notes on running it here at all, both learned the hard way this session:
 | residual | outcome |
 |---|---|
 | *"hole 1 needs a proper narrow arm in `emit_load_string_value_ptr` rather than the blanket refusal"* | **Done.** `emit_load_narrow_ref_field` (`jit/src/x64/objects.rs`), selected per call site by the new `StringFieldLayout::value_compact_is_narrow`. The refusal in `try_resolve_string_intrinsic` is gone. Verified with `StringHot`, a hot loop over `charAt`/`length`/`isEmpty`/`hashCode`/`indexOf`/`equals`/`compareTo` across LATIN1, UTF-16 and empty receivers: byte-identical to HotSpot under `CRATONVM_COMPRESSED_OOPS=1`. |
-| *"hole 2 is untouched, so the gate must stay off"* | **Done.** `mark_young_to_old_refs` and `rewrite_stretch_conservatively` (`gc/src/gen_heap.rs`) each take a second pass over an unparseable stretch at 4-byte granularity under `narrow_oops_enabled()`. |
+| *"hole 2 is untouched, so the gate must stay off"* | **Done** — and, like the collections fix, found twice: `b50b71595` *"the conservative young-from rescan was blind to narrow oops"* landed on `dev` concurrently, factoring both scans through one `for_each_conservative_ref_slot` helper so the mark walk and the rewrite walk cannot disagree about width. The merge took that form. |
 | *"do not cite compressed oops as the fix for this page without re-measuring after hole 1 has a proper narrow arm"* | **Re-measured.** The throughput penalty was the stopgap, not compression, and is gone; the footprint win is **4.7 %** of peak RSS (1850 → 1763 MB), not 20-30 %. Details below. |
 | failure 3, the `ClassCastException` in javac's `Resolve.staticKind` | **Did not reproduce** on 2026-08-06 `dev`, in the Spring run or in `SkProbe` (300k iterations of the exact `candidates.stream().filter(..).map(StaticKind::from).reduce(StaticKind::reduce).orElse(..)` shape, over both an `ArrayList` and a generic-spliterator cons list). Its face — a `MethodSymbol` where an enum belongs — is the JIT dispatch-memo aliasing signature fixed by `383e7f5cf` (2026-08-05), which postdates the binary this page measured it on. Recorded as gone, not as chased down. |
 

@@ -8396,8 +8396,16 @@ pub fn try_resolve_string_intrinsic(
     // result.
     //
     // That emitter now has a proper narrow arm (`emit_load_narrow_ref_field`),
-    // so the refusal — and the throughput it cost — is gone. The intrinsics are
-    // admitted under both widths.
+    // selected per call site by `StringFieldLayout::value_compact_is_narrow`,
+    // so the refusal that used to stand here — and the throughput it cost —
+    // is gone. The intrinsics are admitted under both widths.
+    //
+    // Hole 2 — the conservative 8-byte-word rescan in `gen_heap`'s
+    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is closed
+    // too (both go through `for_each_conservative_ref_slot`, which visits
+    // narrow slots at 4 bytes as well). The gate still defaults off; see
+    // `gc/src/compressed_oops.rs` for why, which is no longer "a known
+    // wrong-width slot access on this backend".
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
