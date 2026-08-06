@@ -1199,10 +1199,29 @@ pub fn note_jit_boundary() {
 /// happens to OBSERVE, and a return-and-re-descend that falls entirely between
 /// two snapshots is invisible to it (measured: 972 suppressed detections in one
 /// run with hi-water enabled).
+///
+/// `CRATONVM_JIT_UNREG_MEMO_GC_RESET=0` restores the pre-fix behaviour (the
+/// memo surviving authoritative scans) so the fix can be A/B'd against the
+/// failure in one binary. Without a switch this would be the only change here
+/// that could never be shown to work.
 #[inline]
 pub fn invalidate_scan_cache_for_gc() {
     note_jit_boundary();
-    UNREG_JIT_MEMO.with(|c| c.set(UnregMemo::new()));
+    if unreg_memo_gc_reset_enabled() {
+        UNREG_JIT_MEMO.with(|c| c.set(UnregMemo::new()));
+    }
+}
+
+/// `CRATONVM_JIT_UNREG_MEMO_GC_RESET=0` — kill switch for the authoritative
+/// reset above.
+fn unreg_memo_gc_reset_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_MEMO_GC_RESET").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
 }
 
 fn jit_scan_cache_enabled() -> bool {
