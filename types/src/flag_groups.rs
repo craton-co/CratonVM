@@ -257,6 +257,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dupx-methods", on_key: Some("CRATONVM_DBG_DUPX_METHODS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ecwatch", on_key: Some("CRATONVM_DBG_ECWATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ecwatch-native", on_key: Some("CRATONVM_DBG_ECWATCH_NATIVE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "eintr-inject", on_key: Some("CRATONVM_DBG_EINTR_INJECT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "eintr-no-retry", on_key: Some("CRATONVM_DBG_EINTR_NO_RETRY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "enable-native-ring", on_key: Some("CRATONVM_ENABLE_NATIVE_RING"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "eqe", on_key: Some("CRATONVM_DBG_EQE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "excframe", on_key: Some("CRATONVM_DBG_EXCFRAME"), off_key: None, off_word: None },
@@ -445,6 +447,7 @@ pub const INVENTORY: &[E] = &[
     // rather than the latched snapshot and is invisible to the override hook.
     E { group: Group::DBG, token: "osr-frame-trace", on_key: Some("CRATONVM_DBG_OSR_FRAME_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "osr-seed-collision", on_key: Some("CRATONVM_DBG_OSR_SEED_COLLISION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
@@ -718,6 +721,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "licm", on_key: Some("CRATONVM_JIT_LICM"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "local-liveness", on_key: None, off_key: Some("CRATONVM_NO_LOCAL_LIVENESS"), off_word: None },
+    E { group: Group::JIT, token: "local-regs", on_key: Some("CRATONVM_JIT_LOCAL_REGS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "long-intrinsics", on_key: None, off_key: Some("CRATONVM_JIT_NO_LONG_INTRINSICS"), off_word: None },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "main-inline", on_key: Some("CRATONVM_JIT_MAIN_INLINE"), off_key: None, off_word: None },
@@ -763,6 +767,7 @@ pub const INVENTORY: &[E] = &[
     // off only because `0` is absent from their truthy list, not because they
     // were written to accept an opt-out.
     E { group: Group::JIT, token: "osr-seed-frame-slots", on_key: Some("CRATONVM_JIT_OSR_SEED_FRAME_SLOTS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-strip-all-high-halves", on_key: Some("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-single-pc", on_key: Some("CRATONVM_JIT_OSR_SINGLE_PC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
