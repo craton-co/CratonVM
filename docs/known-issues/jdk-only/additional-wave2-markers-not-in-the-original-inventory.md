@@ -101,8 +101,44 @@ record's own count was 39% low.
   `InternalError` stands — and it already satisfies the constraint that
   matters, which is that a refusal be catchable.
 
-**Still open:** §1, §4, §8, the bulk of §11, §3's Matcher-leaf residual, and
-the `jit_entry_publishable` half of §2.
+### Third pass, same day — §1 and §4
+
+* **§1 — CLOSED as "no gap", and the prescription would not have worked.** The
+  record asks for an `AtomicU8` kind array at the tail of the MIC/PIC slots,
+  checked instead of refusing. Two reasons not to, either sufficient:
+  1. **Nothing would read it.** The hit path is emitted machine code —
+     `ir_lower.rs` emits `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11` after
+     the guard. Consulting a kind means adding a load/test/branch to the JIT's
+     hottest dispatch shape, for a diagnostic this record itself says is "not a
+     performance defect".
+  2. **A native is never in the slot, in EITHER mode.** Both population
+     clusters in `vm/src/jit/helpers.rs` source their entry from
+     `try_jit_compile_callee` — a JIT callee with a live pin — so
+     `jit_entry_publishable`'s `owner.is_some()` early return fires first, and
+     it is **not policy-dependent**. This record asserts both "a native
+     trampoline never reaches the refusal from these sites" *and* "the missing
+     kind leaves the census incomplete in `Compatible` mode as much as strict".
+     Those contradict each other; the second is wrong.
+  Measured `ic_unowned_pub = 0`, `ic_refusals = 0` in both modes. Both struct
+  markers now say do-not-do-this and why.
+* **§4 — the policy half is done; the "delete the literals" half is not
+  achievable.** `direct_native_helper` now takes an `intrinsic_resolver` and
+  the VM answers from the registry's `NativeKind`. But the seven triples are
+  how the RECOGNITION picks which `*_DIRECT_FN` cell a site maps to — a
+  triple-to-helper-address map the registry does not have. Only the policy was
+  name-based, and only the policy moved.
+  From `scripts/baselines/jdk-only-kind-map-25-linux.tsv` the seven split
+  **3 intrinsic / 3 bridge / 1 unregistered**, so the old blanket refusal was
+  *stricter than §1.4*, which names `Intrinsic` as the reviewed exception.
+  `StringLatin1.toLowerCase`, `Integer.valueOf(I)` and `Integer.intValue()`
+  now bind under strict; the three bridges and the unregistered
+  `String.toLowerCase(Locale)` stay refused.
+  `probes/DirectLadderProbe.java` is new because `JdkOnlyIcHotProbe` never
+  reaches these ladders (`jit_direct_native_binds = 0`), so it could not tell a
+  gate that refuses from one that is never asked.
+
+**Still open:** §8, the bulk of §11, §3's Matcher-leaf residual, and the
+`jit_entry_publishable` half of §2 (which refuses nothing — see §1 above).
 
 ## 2026-08-04 status
 
