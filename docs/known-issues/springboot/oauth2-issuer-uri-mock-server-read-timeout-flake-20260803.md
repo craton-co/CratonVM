@@ -124,6 +124,51 @@ context, and MockWebServer, i.e. far more class loading and compilation churn
 than two HTTP requests generate. Keep the 6-lane class repro; do not spend more
 time trying to shrink it to a probe without a new idea about the mechanism.
 
+## ROOT CAUSE (2026-08-06): a young GC pause longer than the read budget
+
+`CRATONVM_DBG=gcpause` on the 6-lane repro, failing runs:
+
+```
+[gcpause] collection took 1538ms  scan_dirty_cards=22ms full_old_rset_scan=0ms
+          root_forward=17ms overlay_forward=125ms card_root_forward=0ms cheney_drain=872ms
+[gcpause] collection took  993ms  ... overlay_forward=94ms  cheney_drain=517ms
+[gcpause] collection took  989ms  ... overlay_forward=88ms  cheney_drain=525ms
+[gcpause] collection took  973ms  ... overlay_forward=101ms cheney_drain=505ms
+```
+
+**A stop-the-world young collection of 500–1538 ms, against a 500 ms per-read
+budget.** MockWebServer runs *inside the same VM*, so the pause freezes the
+thread that must write the response; the client's read then expires having
+genuinely received nothing. That is the whole mechanism, and it explains every
+established fact: the wait is real (this page's own finding), `--nojit` is clean
+(far less allocation and compilation, so far fewer and shorter collections),
+load matters (more lanes, more heap pressure), and HotSpot never does it —
+its young pauses on this workload are single-digit ms.
+
+Note the phases do **not** sum to the total (1036 of 1538 ms). The remainder is
+outside the instrumented span — lock acquisition, the young object-start bitmap
+build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
+
+### Two defects behind the pause
+
+1. **`cheney_drain` dominates — 350–872 ms**, i.e. the survivor copy/scan
+   itself. This is the one that has to come down for the flake to go away;
+   fixing anything else still leaves a pause over the budget.
+
+2. **`overlay_forward` is O(every overlay in the process), per minor GC** —
+   68–125 ms and growing with heap population. `gen_heap.rs` seeds it with
+   `external_roots_for_matching_owners(&|_| true)`: an always-true predicate
+   that materialises **every** overlay-backed root (LinkedList /
+   LinkedHashMap / TreeMap / TreeSet side tables) and only then filters with
+   `young_from.contains(...)`. A minor collection should be proportional to the
+   young set, not to the whole heap's overlay population. Real, separable, and
+   not sufficient on its own.
+
+Neither is fixed yet. The `gcphase`-style breakdown for the moving Cheney path
+is new (`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection
+on this arm printed a bare total, because `gcphase` instruments only the
+non-moving sweep this workload never takes.
+
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 
 Not the cause of this flake — MockWebServer reads through buffered Okio segments
@@ -141,6 +186,33 @@ Bulk reads are fine on both; it is fixed overhead per `read()` call. Any Java
 code that parses a protocol byte-at-a-time off a raw socket — a hand-rolled
 header parser, `DataInputStream.readLine`, an unbuffered `InputStreamReader` —
 pays ~35x on CratonVM.
+
+**Cause, and FIXED 2026-08-06.** `CRATONVM_DBG_READ0LAT=1` splits `net_read0`'s
+per-call cost (means over 24 576 calls):
+
+| stage | ns/call |
+|---|---:|
+| FileDescriptor field read | 91 |
+| socket registry lookup | 59 |
+| **`begin_blocking_region`** | **9 006** |
+| the `recv` itself | 819 |
+| **`end_blocking_region`** | **6 892** |
+| total | 16 867 |
+
+The GC blocking-region brackets are **~94% of the call and ~20x the `recv` they
+guard**. `begin_blocking_region` retires the TLAB and calls
+`deposit_root_snapshot()` — publishing the thread's entire Java root set — and
+`end_blocking_region` re-syncs refs against any GC that ran meanwhile.
+
+They exist so a read that parks in the OS cannot deadlock a stop-the-world, and
+that is right — for a read that *can* park. It was being paid unconditionally,
+including on the JDK's own timed-read path: `NioSocketImpl.timedRead` flips the
+fd **non-blocking** and polls separately (in `Net.poll`, which keeps its own
+region), so every `Socket.setSoTimeout(...)` reader paid a full root snapshot
+per read for a call that returns `WouldBlock` instead of waiting. `net_read0`
+now skips the brackets when `net_fd_is_nonblocking(fd)`. Safety rests on the
+fd's mode, not on timing — there is no race in which a non-blocking fd starts
+parking — and an unknown fd answers "blocking", keeping the region.
 
 ## Where the 500 ms comes from — RESOLVED 2026-08-06, and HotSpot budgets it too
 
