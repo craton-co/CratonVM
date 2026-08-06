@@ -563,6 +563,65 @@ already documents, and the reason the memo can stay for its hot purpose.
 memo asks for a FULL rescan rather than an incremental band over a prefix
 nothing has verified.
 
+### The face that read the new fields (2026-08-06)
+
+`TestMultiThread`, `--Xmx 1g`, on the arm running the PRE-fix behaviour
+(`CRATONVM_JIT_UNREG_MEMO_GC_RESET=0 CRATONVM_JIT_UNREG_MEMO_HIWATER=0`):
+
+```text
+gc::guard: receiver points into RECLAIMED memory obj="0x2004a5f3ab8"
+     site="invoke dispatch" location=young from-space FREE BLOCK (reclaimed)
+     target_class=java/lang/Object.hasNext()Z
+gc::guard: …and NO live heap object holds this address in a decoded reference slot.
+gc::guard: …non-moving sweep zeroed … sweep_cycle=13 free_seq=957866
+     interior_off=1888 root_coverage="NEVER-LOOKED"
+     xt_passes=0 xt_taken_over=0 xt_unclassified=0
+gc::guard: in_published_snapshot=false published_roots=37
+     last_publish_at_collection=15 collections_now=16
+     holder=<not found in frames> in_blocked_region=false frames=4
+     top_frame=org/h2/test/db/TestMultiThread.testConcurrentInsert
+```
+
+**`root_coverage="NEVER-LOOKED"` with `xt_passes=0`.** The sweep that freed this
+block ran with no cross-thread take-over pass at all.
+`stw_takeover_should_scan` gates round 0 on `any_thread_in_jit()` and runs
+rounds >= 1 unconditionally, so zero passes means the barrier was satisfied at
+round 0 — every thread parked cooperatively and no round ever ran. This is
+exactly the reading the three-way encoding exists for: the pre-2026-08-05
+counter printed only when `peers > 0` and would have rendered this as silence.
+
+**It is a root-CAPTURE gap.** The thread published a fresh snapshot of 37 roots
+for this very collection and the victim address was not among them; because it
+parked cleanly nothing conservatively scanned its real stack.
+
+> **Off-by-one warning.** `last_publish_at_collection=15` against
+> `collections_now=16` looks like a one-collection-stale snapshot and is not.
+> `HeapStats::minor_gc_count` is "cycles **completed**" and increments at the
+> END of a cycle, so a thread publishing during collection 16's safepoint stamps
+> 15. That pair is what a correct, FRESH publish looks like. This page briefly
+> claimed staleness on the strength of it; do not rebuild that claim without
+> re-deriving the counter's semantics.
+
+That matches the memo defect's shape: the memo gates `scan_active_jit_frames`,
+which is what the publish path enumerates from, so a suppressed detection means
+that frame's oops never enter the published set.
+
+#### A/B status — NOT a validation
+
+Four concurrent arms, one variable, one binary. As of this writing:
+`fixON = 0 guard hits / 9 iterations`, `fixOFF = 1 / 7`. Fisher's exact
+p ~ 0.47. The OFF arm is simply reproducing at its historical ~1-in-8 rate and
+the ON arm has not run long enough to be distinguished from it. **Nothing here
+validates the fix.**
+
+#### Throughput, checked but not controlled
+
+The authoritative reset costs one band rescan per GC-authoritative root
+collection rather than per native call. No regression is apparent: launched
+together, the fix-ON arm completed **9** iterations to the fix-OFF arm's **7**
+(mean minor GCs/run 25.1 vs 30.3). The arms are not length-controlled and host
+load ranged 12-124, so this rules out a gross regression and nothing finer.
+
 ### A marking fail-open found while reading (2026-08-05)
 
 `compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`

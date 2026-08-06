@@ -382,11 +382,49 @@ pub(crate) fn report_root_slice_provenance(
     // Where the address sits in the frames, and why a root scan might have
     // skipped it. `kind` is the `local_kinds` mark (LONG/DOUBLE => skipped
     // outright); `live` is the per-bci liveness bit the same scan filters on.
+    // H2-CID0 (2026-08-06): a slot whose payload IS the victim but which no
+    // longer decodes as a reference is the degradation signature — see
+    // `CompactValue`'s encoder/decoder provenance asymmetry. `to_value` refuses
+    // a `SUB_OBJECT` tag whose payload never crossed a recorded
+    // reference-construction boundary and hands back `Value::Long` with the same
+    // bits; the `Value`-typed store then marks `local_kinds[i] = LKIND_LONG`,
+    // and `Frame::scan_local_objects` skips LONG/DOUBLE slots BY DESIGN, so the
+    // root never reaches the published snapshot.
+    //
+    // Matching only `Value::Object` printed `<not found in frames>` for exactly
+    // this case — a verdict that says "look outside the frames" while the
+    // address sits in a local. Report the degraded variant instead.
+    fn payload_of(v: &Value) -> Option<(usize, &'static str)> {
+        match v {
+            Value::Object(Some(o)) => Some((o.as_ptr() as usize, "Object")),
+            Value::Long(l) => Some((*l as u64 as usize, "Long")),
+            Value::Double(d) => Some((d.to_bits() as usize, "Double")),
+            Value::Int(i) => Some((*i as u32 as usize, "Int")),
+            _ => None,
+        }
+    }
     let mut holder = String::from("<not found in frames>");
     'outer: for (fi, fr) in thread.frames.iter().enumerate() {
         let mask = fr.live_locals_mask_here();
         for li in 0..fr.locals_len() {
-            if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+            let slot = fr.get_local(li as u16);
+            if let Some((payload, variant)) = payload_of(&slot) {
+                if payload == addr && variant != "Object" {
+                    holder = format!(
+                        "frame#{fi} {}.{} pc={} local[{li}] DEGRADED decoded_as={variant} \
+                         kind={} live={} — the slot holds the victim's bits but is not a \
+                         reference, so `scan_local_objects` skipped it and the root was \
+                         never published (CompactValue provenance degradation)",
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                        fr.local_kind_at(li),
+                        li >= 64 || mask & (1u64 << li) != 0,
+                    );
+                    break 'outer;
+                }
+            }
+            if let Value::Object(Some(o)) = slot {
                 if o.as_ptr() as usize == addr {
                     holder = format!(
                         "frame#{fi} {}.{} pc={} local[{li}] kind={} live={}",
@@ -401,7 +439,20 @@ pub(crate) fn report_root_slice_provenance(
             }
         }
         for si in 0..fr.stack.len() {
-            if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+            let sv = fr.stack.peek_at(si);
+            if let Some((payload, variant)) = payload_of(&sv) {
+                if payload == addr && variant != "Object" {
+                    holder = format!(
+                        "frame#{fi} {}.{} pc={} stack[{si}] DEGRADED decoded_as={variant} \
+                         — operand-stack twin of the local case above",
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                    );
+                    break 'outer;
+                }
+            }
+            if let Value::Object(Some(o)) = sv {
                 if o.as_ptr() as usize == addr {
                     holder = format!(
                         "frame#{fi} {}.{} pc={} stack[{si}]",

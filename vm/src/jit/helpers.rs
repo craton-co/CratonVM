@@ -1876,6 +1876,100 @@ fn flush_raw_entry_dispatch_caches() {
 /// Kept as one function so a memo added later cannot be flushed by one of the
 /// two triggers above and missed by the other — the split that left
 /// `NATIVE_SITE_CACHE` and `VIRTUAL_TARGET_CACHE` unflushed by either.
+/// `CRATONVM_DBG_SITE_ALIAS=1` — count of dispatch-helper entries whose `JitSiteKey` named a
+/// DIFFERENT call site than the one that first used it — i.e. a `JitInvokeInfo`
+/// address that was freed with its `CompiledMethod` and re-issued.
+///
+/// This measures the PRECONDITION of the recycled-address defect rather than
+/// its (rare, workload-dependent) visible corruption, which is why it can
+/// answer "does this workload alias?" in a single run.
+static SITE_ALIAS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SITE_ALIAS_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn site_alias_hit_count() -> u64 {
+    SITE_ALIAS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn site_alias_key_count() -> u64 {
+    SITE_ALIAS_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// `JitSiteKey -> the (class, method, descriptor) that key FIRST named`.
+    /// Diagnostic-only; unbounded on purpose so nothing is missed.
+    static SITE_IDENTITY: std::cell::RefCell<
+        rustc_hash::FxHashMap<JitSiteKey, (String, String, String)>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Record/verify what this `JitSiteKey` names. Called at the
+/// top of both dispatch entry points, so it is independent of WHICH memo a
+/// given site would have consulted.
+fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
+    if !site_alias_detect_enabled() {
+        return;
+    }
+    SITE_IDENTITY.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.get(&info_key) {
+            Some((c, mm, d)) => {
+                if c != info.class_name || mm != info.method_name || d != info.descriptor {
+                    SITE_ALIAS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The running totals ride on the event line, not only on a
+                    // shutdown summary: a JUnit runner ends the process with
+                    // `System.exit`, so anything printed at VM shutdown is
+                    // unreachable in exactly the workloads this exists for.
+                    static N: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 40 {
+                        eprintln!(
+                            "[site-alias] #{} of {} keys: key={:#x} WAS {}.{}{} NOW {}.{}{}",
+                            n + 1,
+                            SITE_ALIAS_KEYS.load(std::sync::atomic::Ordering::Relaxed),
+                            info_key.1,
+                            c,
+                            mm,
+                            d,
+                            info.class_name,
+                            info.method_name,
+                            info.descriptor
+                        );
+                        if n + 1 == 40 {
+                            eprintln!(
+                                "[site-alias] (further hits are counted, not printed)"
+                            );
+                        }
+                    }
+                    m.insert(
+                        info_key,
+                        (
+                            info.class_name.to_string(),
+                            info.method_name.to_string(),
+                            info.descriptor.to_string(),
+                        ),
+                    );
+                }
+            }
+            None => {
+                SITE_ALIAS_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.insert(
+                    info_key,
+                    (
+                        info.class_name.to_string(),
+                        info.method_name.to_string(),
+                        info.descriptor.to_string(),
+                    ),
+                );
+            }
+        }
+    });
+}
+
+fn site_alias_detect_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
+}
+
 #[cold]
 fn clear_site_keyed_dispatch_memos() {
     DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
@@ -8817,6 +8911,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // owner's native. See `flush_raw_entry_dispatch_caches`.
     flush_raw_entry_dispatch_caches();
     let info_key = jit_site_key(vm.vm_identity, info_ptr as usize);
+    // Diagnostic (`CRATONVM_DBG_SITE_ALIAS`): does this key still name its site?
+    note_site_identity(info_key, info);
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
     // probes); this early block only serves sites the cache has already
@@ -11410,6 +11506,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // block further down, which this path returns before ever reaching. See
     // `flush_raw_entry_dispatch_caches`.
     flush_raw_entry_dispatch_caches();
+    // Diagnostic (`CRATONVM_DBG_SITE_ALIAS`): does this key still name its site?
+    note_site_identity(jit_site_key(vm.vm_identity, info_ptr as usize), info);
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
         info,
