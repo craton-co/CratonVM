@@ -700,6 +700,31 @@ Two consequences worth stating plainly:
   should have been believed: the thread is not parked when it trips, and
   `in_blocked_region=false` in the 2026-08-05 provenance line says so again.
 
+### Two more `TestMultiThread` faces worth counting, and one arm that cannot be soaked
+
+Faces seen on the 2026-08-05 campaigns beyond the four this page lists. Neither
+is established as this family; both are recorded so a future campaign counts
+them instead of dismissing them as application flakiness:
+
+* `General error: "java.lang.NullPointerException: Cannot invoke
+  ""org.h2.result.ResultInterface.isLazy()"" because ""result"" is null"` — a
+  reference field reading NULL. Note that a field read off a ZEROED object
+  returns 0, which decodes as `null`, so this is a plausible face of the same
+  defect one step downstream of `ClassId(0)`;
+* `The database has been closed` mid-run with 26 live connections. H2 closes a
+  database when its last session unregisters, so this is what losing an entry
+  from `Database.userSessions` looks like from the outside.
+
+**`CRATONVM_DBG_NO_NONMOVING_RECLAIM=1` cannot settle them.** The intent was a
+clean discriminator — with the non-moving sweep's dead spans neither zeroed nor
+published, a reference the root scan missed keeps its original header, so the
+failure should vanish if it really is reclamation. Two runs at `--Xmx 3g`: the
+first still failed (the `result is null` NPE, 40 s in), the second died of
+`OutOfMemoryError`. The flag defers only the NON-MOVING sweep, so selective
+promotion still evacuates and the moving path still resets from-space; and the
+unbounded leak ends the run before much sweeping happens. So it is neither a
+clean negative nor soakable — do not read the first run as exoneration.
+
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 
 Recorded so they are not re-derived; each cost a build-and-soak cycle. These
