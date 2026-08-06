@@ -996,6 +996,62 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
     }
 }
 
+/// Is `this` one of the VM's own `Process` objects — the only receiver whose
+/// `PROC_FIELD_*` slots mean anything?
+///
+/// # Why every concrete `java.lang.Process` native has to ask
+///
+/// These natives are registered under **both** `cratonvm/synthetic/Process` and
+/// `java/lang/Process`. The second registration is what makes the VM's own
+/// process reachable through a `java.lang.Process`-typed reference — which is
+/// how every caller holds one (`Process p = pb.start()`) — and removing it once
+/// raised `NoSuchMethodError` on exactly that path.
+///
+/// It also puts these natives in front of every **application** subclass of
+/// `Process`. For the ABSTRACT methods that is harmless: a concrete subclass
+/// must override them, so dispatch finds the override and never walks up here.
+/// For the CONCRETE ones — `isAlive`, `pid`, `toHandle`, `destroyForcibly`,
+/// `waitFor(long, TimeUnit)` — a subclass normally does *not* override, so
+/// dispatch reaches this code with a receiver whose layout is nothing like
+/// `PROC_FIELD_COUNT` fields of subprocess bookkeeping. `handle_of` then reads
+/// slot `PROC_FIELD_HANDLE` off a stranger, gets `0`, and every one of them took
+/// that as "a stub Process" and answered from field bytes that belong to someone
+/// else. Measured against HotSpot 25 before this guard existed:
+/// `isAlive()` **false** for a live process, `pid()` **0** where the spec
+/// requires `UnsupportedOperationException`, `toHandle()` handing back a handle,
+/// and `waitFor(0, NANOSECONDS)` **true** for a process that had not exited.
+///
+/// Contract §1.4 says a `Bridge` loses to real bytecode. For a foreign receiver
+/// that is exactly what has to happen, so each caller below delegates to what
+/// `java.lang.Process`'s own bytecode does instead of guessing.
+///
+/// `handle == 0` is deliberately NOT the test. It cannot distinguish "my object,
+/// not spawned or already reaped" from "not my object at all", and those need
+/// opposite answers — the first is a stub Process the VM owns, the second is
+/// someone else's.
+///
+/// See `docs/known-issues/jdk-only/process-natives-answer-for-user-subclasses.md`
+/// and `probes/UserProcessInterceptProbe.java`.
+fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    ctx.class_name_of_id(cid).as_deref() == Some(SYNTHETIC_PROCESS_CLASS)
+}
+
+/// `java.lang.Process.exitValue()` on `this`, as the JDK's own concrete methods
+/// call it: `Ok(Some(code))` when the process has exited, `Ok(None)` when
+/// `exitValue` threw (which is how a `Process` reports "still running", via
+/// `IllegalThreadStateException`).
+///
+/// The thrown exception is consumed rather than propagated because every caller
+/// here is a method the JDK specifies as *not* throwing it — `isAlive` and
+/// `waitFor(long, TimeUnit)` both turn it into a boolean.
+fn foreign_exit_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    match ctx.invoke_virtual(this, "exitValue", "()I", &[]) {
+        Ok(Some(Value::Int(code))) => Some(code),
+        _ => None,
+    }
+}
+
 fn time_unit_to_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<ObjectRef>) -> i64 {
     if value <= 0 {
         return 0;
@@ -1303,6 +1359,51 @@ fn native_process_wait_for_timeout(
         _ => None,
     };
 
+    if !is_vm_process(ctx, this) {
+        // `Process.waitFor(long, TimeUnit)` is specified as a poll of
+        // `exitValue()`: exited -> true, still `IllegalThreadStateException` at
+        // the deadline -> false. A zero/negative timeout is a single test, which
+        // is the case that made the old code answer `true` for a process that
+        // had not exited.
+        if foreign_exit_value(ctx, this).is_some() {
+            return Ok(Some(Value::Int(1)));
+        }
+        let millis = time_unit_to_millis(ctx, timeout, unit);
+        if millis <= 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(millis as u64))
+        else {
+            return Ok(Some(Value::Int(0)));
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Some(Value::Int(0)));
+            }
+            // Only the SLEEP goes inside the blocked region. A collection that
+            // starts while this thread naps must not have to wait for the
+            // timeout to expire — the thread is in `NativeRunning`, which the
+            // STW census waits for, so an unblocked 30-second nap is a
+            // 30-second GC pause. `this` is re-read afterwards because a moving
+            // collection during the block relocates it.
+            //
+            // `foreign_exit_value` stays OUTSIDE: it runs arbitrary application
+            // bytecode, which can allocate, take monitors and re-enter the VM,
+            // none of which is legal while the thread is counted as blocked.
+            let remaining = deadline.saturating_duration_since(now);
+            let mut held = [Value::Object(Some(this))];
+            ctx.begin_blocking_region();
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            ctx.end_blocking_region_refs(&mut held);
+            if let Value::Object(Some(updated)) = held[0] {
+                this = updated;
+            }
+            if foreign_exit_value(ctx, this).is_some() {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         let exited = !matches!(
@@ -1615,6 +1716,12 @@ fn native_process_is_alive(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.isAlive()` is `try { exitValue(); return false; }
+        // catch (IllegalThreadStateException) { return true; }`.
+        let alive = foreign_exit_value(ctx, this).is_none();
+        return Ok(Some(Value::Int(if alive { 1 } else { 0 })));
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         return Ok(Some(Value::Int(0)));
@@ -1645,6 +1752,12 @@ fn native_process_destroy_forcibly(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.destroyForcibly()` is `destroy(); return this;` — and
+        // `destroy()` is abstract, so this reaches the subclass's override.
+        ctx.invoke_virtual(this, "destroy", "()V", &[])?;
+        return Ok(Some(Value::Object(Some(this))));
+    }
     let handle = handle_of(ctx, this);
     if handle != 0 {
         destroy_handle(handle, true);
@@ -1691,6 +1804,15 @@ fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             .into())
         }
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.toHandle()`'s implementation on the abstract class is
+        // `throw new UnsupportedOperationException(...)`. A subclass that wants
+        // a handle overrides it, in which case dispatch never arrives here.
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Process.toHandle()".to_string(),
+        }
+        .into());
+    }
     let pid = match ctx.get_field(this, PROC_FIELD_PID) {
         Value::Long(p) => p,
         _ => -1,
@@ -2058,6 +2180,20 @@ fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(-1))),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.pid()` is `return toHandle().pid();`, so the
+        // `UnsupportedOperationException` from the default `toHandle()`
+        // propagates — which is the specified answer for a `Process` with no
+        // pid support, and is what distinguishes it from "the pid is 0".
+        let handle = ctx.invoke_virtual(this, "toHandle", "()Ljava/lang/ProcessHandle;", &[])?;
+        let Some(Value::Object(Some(handle))) = handle else {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Process.pid()".to_string(),
+            }
+            .into());
+        };
+        return Ok(ctx.invoke_virtual(handle, "pid", "()J", &[])?);
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         // Stub Process — fall back to whatever's in field 4.
@@ -2960,8 +3096,14 @@ mod tests {
         (handle, pid)
     }
 
+    /// A receiver shaped AND named like one of the VM's own process objects.
+    ///
+    /// The class name is load-bearing, not decoration: every concrete
+    /// `java.lang.Process` native now asks `is_vm_process` before trusting the
+    /// `PROC_FIELD_*` slots, so an unnamed mock takes the foreign-receiver path
+    /// and a test written for the VM path would quietly measure the other one.
     fn mock_process(ctx: &mut MockNativeContext, handle: i64, pid: i64) -> ObjectRef {
-        let proc_ref = ctx.alloc_object(PROC_FIELD_COUNT);
+        let proc_ref = ctx.alloc_object_with_class(PROC_FIELD_COUNT, SYNTHETIC_PROCESS_CLASS);
         ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
         ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
         ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
@@ -3145,6 +3287,49 @@ mod tests {
 
         let _ = destroy_handle(handle, true);
         let _ = wait_for_handle(handle);
+    }
+
+    /// The foreign-receiver timed wait must ALSO nap inside a blocked region.
+    ///
+    /// `waitFor(long, TimeUnit)` on an application subclass polls the
+    /// subclass's own `exitValue()`, so it can wait for the full timeout with no
+    /// subprocess handle in sight. The thread is in `NativeRunning` throughout,
+    /// which the STW census waits for, so a nap outside a blocked region is a
+    /// GC pause of the caller's choosing. The first cut of the receiver guard
+    /// had exactly that bug.
+    #[test]
+    fn foreign_receiver_timed_wait_also_enters_a_blocked_region() {
+        let mut ctx = MockNativeContext::new();
+        // No class name => not one of the VM's process objects, which is the
+        // whole point: this is the application-subclass path.
+        let foreign = ctx.alloc_object(2);
+        assert!(
+            !is_vm_process(&mut ctx, foreign),
+            "an unnamed mock object must not be mistaken for a VM Process"
+        );
+
+        let result = native_process_wait_for_timeout(
+            &mut ctx,
+            &[
+                Value::Object(Some(foreign)),
+                Value::Long(20),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        // The mock's `invoke_virtual` has no `exitValue` to run, so the poll
+        // never sees an exit and the wait times out — which is the specified
+        // answer for a process that has not exited, and the answer the
+        // pre-guard code got wrong by reading slot bytes off a stranger.
+        assert_eq!(result, Value::Int(0), "a never-exiting process waits out its timeout");
+        let (begin, end) = ctx.blocking_region_counts();
+        assert!(
+            begin >= 1,
+            "the foreign-receiver poll must nap inside a blocked region, not spin outside one"
+        );
+        assert_eq!(begin, end, "blocked-region enter/leave must balance");
     }
 
     /// `pid_for_handle` returns the captured pid even after reap.
