@@ -432,6 +432,61 @@ pub(super) fn publish_entry_metadata(
         }
         osr_dead_mask[pc] = hazardous;
     }
+    // ── The seed-collision invariant ─────────────────────────────────
+    //
+    // Measure the PRECONDITION instead of hunting the corruption. Every OSR
+    // miscompile in this family — `Arrays.sort(long[])`'s garbage index, the
+    // ES-tdigest XMM one — is downstream of one mechanical fact: the trampoline
+    // seeds locals into registers in ASCENDING INDEX ORDER, so if two locals it
+    // seeds at the same entry PC share a register, the higher index silently
+    // overwrites the lower one. Everything above (the pure-high-half strip, the
+    // per-PC dead mask, the hazardous refinement) exists to make that
+    // impossible. Nothing checked it.
+    //
+    // This asks the question directly, per entry PC, over the metadata about to
+    // be published. It is a *detector*, not a guard: it reports and does not
+    // refuse, because a false positive would silently disable OSR on a hot
+    // method and that trade needs evidence first.
+    //
+    // One run over a workload answers "does this program contain a method whose
+    // OSR metadata would clobber?" and NAMES it — the question the loader/zip
+    // cluster page could not ask, because its only oracle was a failure that had
+    // stopped occurring.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SEED_COLLISION").is_some() {
+        for &(pc, _) in osr_block_live_in {
+            let mask = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            // GPR and XMM kept apart — different register files, never alias.
+            let mut seen_gpr: [Option<usize>; 16] = [None; 16];
+            let mut seen_xmm: [Option<usize>; 16] = [None; 16];
+            for i in 0..num_locals.min(64) {
+                if (mask >> i) & 1 == 1 {
+                    continue; // the trampoline skips this one
+                }
+                if let Some(r) = gpr_home(i) {
+                    let slot = &mut seen_gpr[(r & 0x0F) as usize];
+                    if let Some(prev) = *slot {
+                        eprintln!(
+                            "[osr-seed-collision] {method_label} entry_pc={pc} \
+                             GPR r{r} seeded for local {prev} then OVERWRITTEN by local {i} \
+                             (mask={mask:#x})"
+                        );
+                    }
+                    *slot = Some(i);
+                }
+                if let Some(r) = xmm_home(i) {
+                    let slot = &mut seen_xmm[(r & 0x0F) as usize];
+                    if let Some(prev) = *slot {
+                        eprintln!(
+                            "[osr-seed-collision] {method_label} entry_pc={pc} \
+                             XMM x{r} seeded for local {prev} then OVERWRITTEN by local {i} \
+                             (mask={mask:#x})"
+                        );
+                    }
+                    *slot = Some(i);
+                }
+            }
+        }
+    }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
         // Report the mask that is actually published, alongside the blanket
         // "every dead register-resident local" set it is refined from, so the

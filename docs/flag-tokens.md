@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-406 tokens.
+409 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -151,6 +151,8 @@ export inherited from a parent shell.
 | `dupx-methods` | `CRATONVM_DBG_DUPX_METHODS` |
 | `ecwatch` | `CRATONVM_DBG_ECWATCH` |
 | `ecwatch-native` | `CRATONVM_DBG_ECWATCH_NATIVE` |
+| `eintr-inject` | `CRATONVM_DBG_EINTR_INJECT` |
+| `eintr-no-retry` | `CRATONVM_DBG_EINTR_NO_RETRY` |
 | `enable-native-ring` | `CRATONVM_ENABLE_NATIVE_RING` |
 | `eqe` | `CRATONVM_DBG_EQE` |
 | `excframe` | `CRATONVM_DBG_EXCFRAME` |
@@ -327,6 +329,7 @@ export inherited from a parent shell.
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
+| `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
@@ -472,7 +475,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-158 tokens.
+159 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -540,6 +543,7 @@ export inherited from a parent shell.
 | `leak-code` | `CRATONVM_JIT_LEAK_CODE` |
 | `licm` | `CRATONVM_JIT_LICM` |
 | `local-liveness` | `CRATONVM_NO_LOCAL_LIVENESS` |
+| `local-regs` | `CRATONVM_JIT_LOCAL_REGS` |
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
