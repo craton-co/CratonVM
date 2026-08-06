@@ -1,7 +1,9 @@
 # JDK-only mode — open wave-2 work list
 
-**Status:** OPEN, reduced 2026-08-04. Filed 2026-07-31 from wave-1
-implementation findings; re-verified against the re-landed tree the same day.
+**Status:** OPEN, reduced 2026-08-04 and again 2026-08-06. Filed 2026-07-31
+from wave-1 implementation findings; re-verified against the re-landed tree the
+same day. **Two of the five tier-1 rows (items 5 and 7) closed 2026-08-06** — see
+the pass note below the table.
 
 > ## Looking for the plan? It is not here.
 >
@@ -248,8 +250,34 @@ behaviour** — no exception, no log line, no failing test.
 | 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: 9,571 unadjudicated `Bridge` registrations, now in [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md). |
 | 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
 | 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
-| 5 | [VM-internal classes are mislabelled `CompatibilityStub`](vm-internal-classes-mislabelled-compatibility-stub.md) | `AnonymousObject$N` and `Proxy$Instance` are stamped `CompatibilityStub` to avoid flipping the derived `is_synthetic_stub` bool that 181 read sites across 20 files depend on. Correct deferral — but it makes contract §11's zero-stub criterion unachievable by construction, and two of those read sites gate native-vs-bytecode dispatch. |
-| 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
+
+Items 5 and 7 left this table on 2026-08-06, together with wave-2 lanes L10 and
+L11 item 7:
+
+| Was | Now |
+|---|---|
+| 5 — VM-internal classes mislabelled `CompatibilityStub` | `jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md` |
+| 7 — the `ThreadPoolExecutor.execute` receiver-shape copies | `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md` |
+
+Item 7 came down to the per-**instance** question the eight receiver-shape
+probes existed to answer having no receivers left. L10 landed that at
+registration the same day: real-JDK mode registers no `Executors` pool factory,
+so the real `Executors` bytecode builds every executor and a fabricated receiver
+CANNOT be minted — a statement about the code, not about a `false=0` reading.
+`native_es_execute` is then tagged `SyntheticStub` and `ThreadPoolExecutor` is
+on the real-protected-stub allow-list, which answers the question class-scoped
+on both dispatch paths; all nine sites and the probe helper are deleted, and a
+gate fails if one grows back. The native itself is NOT deleted — strict mode
+declines to admit it, and the `--features synthetic-jdk` build still runs it.
+
+Item 5 needed the prerequisite the record named: `is_synthetic_stub` was
+answering two different questions, so `Class::dispatch_lacks_class_file` now
+answers the dispatch one and `origin` answers the census one.
+`java/lang/reflect/Proxy$Instance` is `VmInternal` (census: 420 rows before and
+after, `compatibility-stub` 14 → 13, exactly one class moved), the fabricated
+`$$Lambda`/`$ProxyN`/`Generated*Accessor*` families are classified where they
+are minted, and **`Class::is_synthetic_stub` is deleted** — contract §5's "in a
+later wave", done.
 
 Item 8 left this table on 2026-08-04:
 the real-protected-stub allow-lists (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`)
@@ -337,15 +365,17 @@ the whole tree. Do not size anything here from a `rg` count.
    * ~~**The `StringJoiner` heap-reference-integrity defect**~~ — retired
      2026-08-04. It did not reproduce under the exact merge that was supposed to
      trigger it, and the merge is landed.
-   * **Real `ThreadPoolExecutor` field initialisation** so
-     `Executors.new*ThreadPool()` returns objects built by the real `<init>`.
-     Until this is fixed, reclassifying `native_es_execute` drops it under
-     `--jdk-only` and strict mode loses thread pools.
-4. **Items 3, 7, 8, and item 11 §4/§8/§9/§11** — delete the hard-coded lists,
-   each with its own regression corpus. Gated on 1 and 3.
-5. **Items 4 and 5** — migrate the remaining `ensure_synthetic_class` callers,
-   settle `Proxy$Instance`, then delete `is_synthetic_stub`. Drive the migration
-   from the `requested_by` census, not from a grep.
+   * ~~**Real `ThreadPoolExecutor` field initialisation**~~ — retired
+     2026-08-06 by L10, at REGISTRATION: real-JDK mode registers no
+     `java/util/concurrent/Executors` pool factory at all, so the real
+     `Executors` bytecode constructs every executor and CratonVM has no code
+     path that can mint a half-built one. Item 7 spent that the same day —
+     `native_es_execute` is reclassified and all nine sites are gone.
+4. **Item 11 §4/§8/§9/§11** — delete the hard-coded lists, each with its own
+   regression corpus. Items 3, 7 and 8 are done (2026-08-04 / 2026-08-06).
+5. **Item 4** — migrate the remaining `ensure_synthetic_class` callers. Drive
+   the migration from the `requested_by` census, not from a grep. (Item 5 is
+   done: `Proxy$Instance` is settled and `is_synthetic_stub` is deleted.)
 6. **Item 2** — finish the layout sweep across `native-builtins`,
    `native-collections`, `native-io` and `vm/src/native/`. Independent of the
    rest and can run in parallel, but it is the item most likely to surface new
@@ -353,8 +383,10 @@ the whole tree. Do not size anything here from a `rg` count.
 
 ## Standing constraints for anyone working this list
 
-* `native-builtins/tests/stub_ratchet.rs` asserts `BASELINE_SYNTHETIC_STUBS =
-  157` **exactly**, with `SLACK = 0`, and separately asserts only
+* `native-builtins/tests/stub_ratchet.rs` asserts `BASELINE_SYNTHETIC_STUBS`
+  **exactly**, with `SLACK = 0` (555 as of 2026-08-06; the constant carries its
+  own re-freeze history — the figure moves, so read it there rather than here),
+  and separately asserts only
   `total >= 8_000` as a vacuity floor. The floor is not a claim about the exact
   total — do not cite one. The strict-mode siblings in the same file assert
   zero `SyntheticStub` registrations and `strict_total >= 7_500`; that second

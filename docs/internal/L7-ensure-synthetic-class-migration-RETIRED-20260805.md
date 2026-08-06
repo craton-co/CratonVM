@@ -398,4 +398,4 @@ above (collections reclassification wave), and `Enumeration$Impl` in
 `classloader.rs` (L1's file, and the only one of the set without a drop-in
 real-bytecode fallback).
 
-[r2]: ../known-issues/jdk-only/vm-internal-classes-mislabelled-compatibility-stub.md
+[r2]: jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md

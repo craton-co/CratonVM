@@ -696,7 +696,6 @@ pub(crate) mod test_support {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,

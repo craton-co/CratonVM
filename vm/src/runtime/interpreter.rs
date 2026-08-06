@@ -2354,7 +2354,7 @@ pub fn execute(
                         .classes.class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| !c.is_synthetic_stub)
+                        .map(|c| !c.origin.is_compatibility_stub())
                         .unwrap_or(false);
                     if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty())
                     {

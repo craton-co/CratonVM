@@ -7582,7 +7582,7 @@ fn jit_fast_native_has_bytecode(
     cm.get_loaded_class_id(class_name)
         .and_then(|cid| {
             cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
+                if cls.origin.is_compatibility_stub() {
                     None
                 } else {
                     crate::classloading::find_method_recursive(

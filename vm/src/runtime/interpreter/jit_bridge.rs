@@ -1100,7 +1100,7 @@ pub(super) fn compile_osr_artifact(
                 .class_manager
                 .read()
                 .get_class(class_id)
-                .map(|c| !c.is_synthetic_stub)
+                .map(|c| !c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
                 let new_class_names: Vec<(usize, u16, Option<String>)> = {

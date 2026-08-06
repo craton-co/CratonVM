@@ -3049,24 +3049,12 @@ pub(super) fn populate_virtual_invoke_cache(
             .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
-        // ThreadPoolExecutor.execute(Runnable): same receiver-aware
-        // exemption as `try_stackless_invoke`'s step-1 native lookup above --
-        // a genuinely real ThreadPoolExecutor (its own `workers` field
-        // populated by a real `<init>`) must not have its native shadow
-        // cached here. This cache is keyed by (call site, receiver
-        // class_id) alone, so caching `VirtualNative` here would
-        // permanently route EVERY future call at this call site -- any
-        // instance of this class_id -- through `native_es_execute`'s
-        // inline "run synchronously" fallback instead of real async
-        // bytecode. Falling through instead lets the bytecode-resolution
-        // path below cache `VirtualBytecode`, whose dispatch-time
-        // `intercept_force_registered_native` check re-validates the
-        // ACTUAL receiver on every hit (not just at population time). See
-        // fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
-        let is_real_tpe_execute = lookup_name == "java/util/concurrent/ThreadPoolExecutor"
-            && method_name.as_ref() == "execute"
-            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
-            && threadpool_executor_has_real_workers(shared, receiver_value);
+        // (`ThreadPoolExecutor.execute(Runnable)` receiver-shape exemption
+        // deleted 2026-08-06 — see `force_native_over_real_jdk_bytecode` in
+        // `native_override.rs`. `resolve_cached_native_registration` consults
+        // the `SyntheticStub` yield rule, which is receiver-independent, so a
+        // cache entry populated here is right for every receiver of this
+        // class_id and there is nothing left to exempt.)
         // JVMTI redefine guard: this direct-native-override lookup has no
         // awareness of JVMTI `redefineClasses` -- unlike the SLOW,
         // uncached dispatch path (`intercept_force_registered_native` /
@@ -3094,17 +3082,35 @@ pub(super) fn populate_virtual_invoke_cache(
             && cm.class_redefine_generation(receiver_class_id) > 0
             && !redefine_immune_reflection_native(&lookup_name, &method_name)
             && !redefine_immune_layout_native(&lookup_name, &method_name, &descriptor);
-        let direct_native =
-            if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
-                resolve_cached_native_registration(
-                    shared,
-                    &lookup_name,
-                    &method_name,
-                    &descriptor,
-                )
-            } else {
-                None
-            };
+        let direct_native = if native_signature_may_exist && !receiver_redefined {
+            resolve_cached_native_registration(shared, &lookup_name, &method_name, &descriptor)
+                // A `SyntheticStub` on an allow-listed class yields to real
+                // bytecode, and `revalidate_cached_native` enforces that on
+                // every cache HIT — so publishing a `VirtualNative` target here
+                // would produce an entry that is evicted and re-resolved on
+                // every single call. Ask the same question once, at population
+                // time, and publish nothing.
+                //
+                // This generalises the `ThreadPoolExecutor.execute(Runnable)`
+                // receiver-shape exemption that used to sit here (deleted
+                // 2026-08-06): that one named a single triple and asked about
+                // the RECEIVER's `workers` field; this asks the arbitration
+                // that already governs every other allow-listed class.
+                //
+                // `_with_cm` because the `cm` read guard above is still held.
+                .filter(|(_, _, kind)| {
+                    *kind != cratonvm_native_api::NativeKind::SyntheticStub
+                        || !real_protected_stub_class(&lookup_name)
+                        || !synthetic_stub_yields_with_cm(
+                            &cm,
+                            &lookup_name,
+                            &method_name,
+                            &descriptor,
+                        )
+                })
+        } else {
+            None
+        };
         if let Some((callback, native_id, native_kind)) = direct_native {
             // WP2.4-F1: gate bound to the receiver class (where dispatch
             // landed). A redefine of the receiver swaps the method body.
@@ -3360,30 +3366,21 @@ pub(super) fn populate_virtual_invoke_cache(
     // through this call-site.
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        // ThreadPoolExecutor.execute(Runnable): `force_native_over_real_jdk_bytecode`
-        // is a pure (class, method, descriptor) allowlist with no receiver
-        // awareness -- it unconditionally returns true for this triple (see
-        // its own entry, added alongside the receiver-aware checks at
-        // `intercept_force_registered_native`/`invoke_or_native`/
-        // `invoke_on_class_shared_inner`). Consulting it directly here,
-        // bypassing those receiver checks entirely, is what actually poisons
-        // this call site's inline cache with `VirtualNative` for a
-        // genuinely real ThreadPoolExecutor. Exempt it the same way as the
-        // other call sites. See fixed-suite-bugs/
-        // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
-        let is_real_tpe_execute_force = declaring_name == "java/util/concurrent/ThreadPoolExecutor"
-            && method_name.as_ref() == "execute"
-            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
-            && threadpool_executor_has_real_workers(shared, receiver_value);
-        let force = !is_real_tpe_execute_force
-            && (force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
-                || (matches!(
-                    declaring_name,
-                    "java/util/HashMap"
-                        | "java/util/LinkedHashMap"
-                        | "java/util/Hashtable"
-                        | "java/util/concurrent/ConcurrentHashMap"
-                ) && matches!(
+        // (`ThreadPoolExecutor.execute(Runnable)` receiver-shape exemption
+        // deleted 2026-08-06. It existed because
+        // `force_native_over_real_jdk_bytecode` carried a receiver-blind arm
+        // for that triple which this site consulted directly, bypassing the
+        // receiver checks at the other call sites and poisoning this inline
+        // cache with `VirtualNative` for a genuinely real ThreadPoolExecutor.
+        // That arm is gone, so this site no longer forces anything for it.)
+        let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
+            || (matches!(
+                declaring_name,
+                "java/util/HashMap"
+                    | "java/util/LinkedHashMap"
+                    | "java/util/Hashtable"
+                    | "java/util/concurrent/ConcurrentHashMap"
+            ) && matches!(
                     &*method_name,
                     "computeIfAbsent" | "compute" | "computeIfPresent"
             | "merge" | "putIfAbsent" | "replace"
@@ -3401,7 +3398,7 @@ pub(super) fn populate_virtual_invoke_cache(
             // store data in a side-store, so the JDK bytecode sees an empty
             // table. See companion entry in `force_native_over_real_jdk_bytecode`.
             | "keys" | "elements"
-                )));
+            ));
         if force {
             if let Some((callback, native_id, native_kind)) =
                 resolve_cached_native_registration(

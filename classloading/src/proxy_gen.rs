@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(&*defined.name, "com/sun/proxy/$Proxy0");
         assert_ne!(&*defined.name, "java/lang/reflect/Proxy$Instance");
         assert!(
-            !defined.is_synthetic_stub,
+            !defined.origin.is_compatibility_stub(),
             "the canonical proxy must be a real generated classfile, \
              not a synthetic stub"
         );

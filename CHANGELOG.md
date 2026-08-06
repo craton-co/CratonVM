@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-08-06 The `ThreadPoolExecutor.execute` receiver-shape special case is gone
+
+Nine dispatch sites across four files decided whether to run
+`ThreadPoolExecutor.execute`'s real bytecode by reading the receiver's
+`workers` field — eight receiver-shape probes plus the one receiver-blind
+`force_native_over_real_jdk_bytecode` arm they existed to override. All nine
+and the probe helper are deleted.
+
+What replaced them is class-scoped and lives at registration:
+`native_es_execute` is tagged `NativeKind::SyntheticStub` and
+`java/util/concurrent/ThreadPoolExecutor` joins the real-protected-stub
+allow-list, so the one centralised arbitration yields it to the real
+`execute()` body for every receiver, on both the warm and the cold dispatch
+path. That became correct once the entry above removed CratonVM's ability to
+mint a fabricated executor at all. **The native is not deleted** — strict mode
+declines to admit it, and the `--features synthetic-jdk` build still runs it,
+which is the only build where the real `execute()` bytecode is absent.
+
+No behaviour change on a real JDK image: `probes/L10ThreadPoolInitProbe`,
+`JdkOnlyCensusLoadProbe` and the three-arm strict-corpus gate are unchanged in
+both modes, and the registry census moves by exactly the two retagged
+registrations (`bridge` 10,434 → 10,432, `synthetic-stub` 755 → 757, total
+unchanged). Stub ratchet re-frozen 553 → 555 — no new fake; two registrations
+that were mis-tagged `Bridge` are now counted where they belonged.
+
+See `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+
+### 2026-08-06 `Class::is_synthetic_stub` is deleted; `ClassOrigin` is the only answer
+
+The bool answered two different questions — *is this a compatibility
+substitution?* (the census and `--jdk-only` policy question) and *does this
+class have no class file, so dispatch must look for a native under its own
+exact name?* Splitting them is what let `java/lang/reflect/Proxy$Instance` be
+reclassified honestly: it is `ClassOrigin::VmInternal`, a generation artefact,
+not a stand-in for bytes that were never found — while keeping the three
+dispatch sites that genuinely need it, which now ask
+`Class::dispatch_lacks_class_file`.
+
+A fabricated `$$Lambda` / `$ProxyN` / `Generated*Accessor*` is likewise
+reported as what generated it, the same answer the define-from-bytes path
+already gave those names.
+
+`--dump-class-origins` on a dynamic-proxy workload: 420 rows before and after,
+`compatibility-stub` 14 → 13, `vm-internal` 1 → 2 — exactly one class moved,
+and under `--jdk-only` that probe now fabricates none at all.
+
+See `docs/internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
+
 ### 2026-08-06 `Executors.new*` returns real JDK executors in real-JDK mode
 
 `java.util.concurrent.Executors`' pool factories are no longer intercepted when
@@ -28,8 +76,10 @@ an executor could be half-built, which is the receiver shape nine dispatch sites
 in the interpreter exist to detect.
 
 `probes/L10ThreadPoolInitProbe` (new) is byte-identical to HotSpot 25 under both
-`--real-jdk` and `--jdk-only`. New diagnostic: `CRATONVM_DBG_TPE_SHAPE=1` reports
-every `ThreadPoolExecutor.execute` receiver-shape decision. The
+`--real-jdk` and `--jdk-only`. A diagnostic added with it, `CRATONVM_DBG_TPE_SHAPE=1`, reported every
+`ThreadPoolExecutor.execute` receiver-shape decision; it was removed the same
+day together with the predicate, when L11 item 7 deleted all nine dispatch
+sites (see below). The
 `--features synthetic-jdk` build is unaffected — it has no real `Executors`
 bytecode to fall back to and keeps its own factories.
 
