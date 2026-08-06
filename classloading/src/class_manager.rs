@@ -10354,6 +10354,18 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/lang/Iterable",
         ],
         "java/util/AbstractMap" => &["java/util/Map"],
+        // `AbstractMap$SimpleEntry` / `$SimpleImmutableEntry` implement
+        // `Map.Entry` — and until this arm existed they implemented nothing,
+        // which is not a cosmetic gap: `Map.Entry.equals` is SPECIFIED against
+        // any other `Map.Entry`, so every implementation of it starts with
+        // `if (!(o instanceof Map.Entry)) return false;`. With the interface
+        // unlinked that test answered false for CratonVM's own entries, so two
+        // entries with equal keys and values compared UNEQUAL — and so did
+        // every user `instanceof Map.Entry` and every `checkcast` javac emits
+        // for a `Map.Entry`-typed expression.
+        "java/util/AbstractMap$SimpleEntry" | "java/util/AbstractMap$SimpleImmutableEntry" => {
+            &["java/util/Map$Entry", "java/io/Serializable"]
+        }
         "java/util/AbstractQueue" => &[
             "java/util/Queue",
             "java/util/Collection",
@@ -11162,6 +11174,31 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             named_field("map", "Ljava/util/concurrent/ConcurrentHashMap;"),
             named_field("value", "Ljava/lang/Object;"),
         ],
+        // `AbstractMap$SimpleEntry` / `$SimpleImmutableEntry` — the JDK's own
+        // two fields, named, in the JDK's own order. This is the layout the
+        // natives in `phases_late/collections.rs` already write (key at slot
+        // 0, value at slot 1); until it was declared here the class was
+        // fabricated with ZERO slots, so `new AbstractMap.SimpleEntry<>(k, v)`
+        // allocated a 0-slot object and the native `<init>`'s two `set_field`
+        // writes were discarded in silence — `getKey()`/`getValue()` then read
+        // null and `toString()` printed `null=null` where HotSpot prints
+        // `k=7`. Entries the MAP creates were unaffected and that is what hid
+        // it: `alloc_synthetic` passes its own slot count to `alloc_object`,
+        // so a map-minted entry is well-sized whatever the class declares.
+        // Only the bytecode `new`, which sizes from `num_total_fields`, was
+        // reading this.
+        //
+        // Two, not three: `alloc_live_entry` mints these with a third
+        // write-through `sourceMap` slot, which stays native-only and
+        // undeclared exactly like `Proxy$Instance`'s slots 1 and 2 — a class
+        // may be allocated with MORE slots than it declares, and the JDK
+        // declares two.
+        "java/util/AbstractMap$SimpleEntry" | "java/util/AbstractMap$SimpleImmutableEntry" => {
+            vec![
+                named_field("key", "Ljava/lang/Object;"),
+                named_field("value", "Ljava/lang/Object;"),
+            ]
+        }
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields
@@ -16207,6 +16244,65 @@ mod tests {
         cm.ensure_synthetic_class("java/lang/Object", 0);
         let arr_id = cm.ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0);
         assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
+    }
+
+    /// `new AbstractMap.SimpleEntry<>(k, v)` needs two things from the
+    /// stand-in this VM fabricates for it, and until 2026-08-06 it had
+    /// neither.
+    ///
+    /// **Two slots.** The class declared ZERO, so the bytecode `new` — which
+    /// sizes the object from `num_total_fields` — allocated a 0-slot object
+    /// and the native `<init>`'s two `set_field` writes were dropped by the
+    /// heap's bounds guard, in silence apart from a WARN. `getKey()` then read
+    /// null and `toString()` printed `null=null` where HotSpot prints `k=7`.
+    /// Entries the MAP creates were unaffected, which is what hid it:
+    /// `alloc_synthetic` passes its own slot count straight to `alloc_object`.
+    ///
+    /// **The interface.** `Map.Entry.equals` is SPECIFIED against any other
+    /// `Map.Entry`, so every implementation of it — including this VM's
+    /// `native_entry_equals` — starts with an `instanceof Map.Entry` test.
+    /// With no interface linked that test answered false for CratonVM's own
+    /// entries, so two entries with equal keys and values compared UNEQUAL.
+    /// The native was running the whole time and returning the right answer to
+    /// the wrong question.
+    #[test]
+    fn abstract_map_entry_stand_ins_carry_two_slots_and_implement_map_entry() {
+        for name in [
+            "java/util/AbstractMap$SimpleEntry",
+            "java/util/AbstractMap$SimpleImmutableEntry",
+        ] {
+            let mut cm = ClassManager::new(&[], &[], &[]);
+            let id = cm
+                .load_class(name)
+                .unwrap_or_else(|e| panic!("{name} must get a stand-in: {e:?}"));
+            let (slots, field_names) = {
+                let class = cm.get_class(id).expect(name);
+                (
+                    class.num_total_fields,
+                    class
+                        .fields
+                        .iter()
+                        .map(|f| f.name.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            assert_eq!(
+                slots, 2,
+                "{name} must declare the JDK's two instance slots, or a bytecode                  `new` allocates an object the native `<init>` cannot write to"
+            );
+            assert_eq!(
+                field_names,
+                vec!["key".to_string(), "value".to_string()],
+                "{name}'s slots are key@0, value@1 — the order every entry native                  indexes by"
+            );
+            let entry = cm
+                .get_loaded_class_id("java/util/Map$Entry")
+                .unwrap_or_else(|| panic!("{name} must link java/util/Map$Entry"));
+            assert!(
+                cm.is_subclass_of(id, entry),
+                "{name} must be an instance of Map.Entry: the specified `equals`                  type-tests for it, and so does user code"
+            );
+        }
     }
 
     #[test]
