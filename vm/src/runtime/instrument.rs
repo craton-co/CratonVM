@@ -1386,7 +1386,7 @@ fn class_file_this_class(bytes: &[u8]) -> Option<String> {
 // take — `isRetransformClassesSupported()` answered `true`, `addTransformer`
 // returned normally, and every bytecode-rewriting agent (JaCoCo, APM, tracing,
 // most profilers) reported that it had installed and then instrumented nothing.
-// See `docs/internal/vm/java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`.
+// See `docs/internal/java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`.
 //
 // The transform has to run where two things are true at once: the raw class file
 // is in hand, and no class-manager lock is held (the transformer is Java code
