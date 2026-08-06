@@ -63,9 +63,57 @@ relocate. `chain_entry_rbp_is_foreign` already special-cases direct self-calls
 (`returned_from_direct_self_call` matches `E8 rel32` targeting the entry), so
 `bottomUpTree`→`bottomUpTree` is fine; what defeats it is `binaryTrees` calling
 **two different** JIT methods, leaving the chain entry's `compiled_method`
-unable to describe the innermost frame. The real fix is to walk the JIT frame
-chain and verify each frame against its own method — which is the most
-safety-critical code in the VM, and is why this page stops here.
+unable to describe the innermost frame.
+
+### FIXED 2026-08-06 — the frame says which method built it
+
+`innermost_frame_method` replaces the boolean. "The entry cannot describe this
+frame" is not "nothing can": the frame's own return address names the method,
+provided the call was the direct form.
+
+```text
+[exact_rbp + 8] = ret_addr
+[ret_addr - 5]  = E8 rel32
+ret_addr + rel32 == callee.entry_ptr()      <- must be the ENTRY, not just inside
+```
+
+That callee describes the frame exactly, because the frame was built by the
+prologue at `entry_ptr`. Indirect calls (the inline MIC/PIC cascade, the hashed
+megamorphic stub) encode no target and stay foreign, so the failure direction is
+still a non-moving sweep and never a frame walked with the wrong map. Measured
+on the same binary with `CRATONVM_GC_NO_CALLEE_RESOLVE=1` as the control:
+
+| `-Xmx` | collections | off | on |
+|---|---:|---|---|
+| 8g | 1 | `cycles=0 fallbacks=1` | **`cycles=1 fallbacks=0`** |
+| 2g | 6 | `cycles=0 fallbacks=6` | **`cycles=6 fallbacks=0`** |
+| 1g | 12 | `cycles=0 fallbacks=12` | **`cycles=12 fallbacks=0`** |
+| 700m | 18 | `cycles=0 fallbacks=18` | **`cycles=18 fallbacks=0`** |
+
+`young=MOVING reason=moving-jit-coverage-proven`. Every collection relocates;
+none fall back.
+
+**1.089x at 8g, 1.000x at 16g** — exactly as it should be, since 16g collects
+zero times and a change to what happens *at* a collection cannot help a run that
+never has one. Seven-phase checksums identical, and the bintrees checksum exact
+through all 18 relocating collections at 700m.
+
+That last point is worth stating precisely, because the sibling result on this
+page is the opposite. A green bintrees run cannot validate the **spill sink**
+(the positive control below stays green with the spill removed entirely). It
+*can* validate this one: under relocation the innermost frame's oop map is used
+to rewrite pointers, so a frame walked with the wrong method's map leaves real
+oops stale — and `itemCheck` dereferences every node immediately afterwards.
+18 relocating collections producing the exact checksum is evidence.
+
+**One correction to this section's own claim.** "Unlocks the 11% already being
+paid" is not what happened, and the 16g row shows it: the shadow push/reload is
+still emitted and still executed at every safepoint. The 11% was being paid and
+still is. What changed is that it now buys something — the collector uses the
+precise roots instead of declining them, so the *collection* gets cheaper (a
+Cheney copy of a nursery that is almost entirely garbage, in place of a
+~410 ms non-moving sweep). Removing the 11% itself would mean giving up precise
+roots, which is a different trade.
 
 ## The other structural half: objects are 2x
 
@@ -75,9 +123,71 @@ bump is `lea rax,[r11+30h]`, fields at 0x20/0x28. HotSpot's is 24.
 
 That is 2x the memory traffic for the same program, and it is the direct cause
 of the 10.6% `clear_page_erms` + 3.7% `memset`: ~3.3 GB of Node bytes get zeroed
-by the kernel on fault and again by the TLAB refill. `CompactHeader` exists
-(8-byte header) but pairs with 16-byte field slots, so `Node` would be 40 rather
-than 24 — it is not the answer here.
+by the kernel on fault and again by the TLAB refill.
+
+### Correction: the pieces already exist, they were never composed
+
+This page first said "`CompactHeader` exists (8-byte header) but pairs with
+16-byte field slots, so `Node` would be 40 rather than 24 — it is not the answer
+here." That is true of `CompactObjectHeap`'s *own* allocator
+(`CompactHeader::SIZE + num_fields * COMPACT_SLOT_SIZE` = 8 + 32 = 40) and
+misses the actual situation. There are **two independent compact mechanisms**,
+and the live allocation path uses exactly one of them:
+
+| | header | body (2 ref fields) | `Node` |
+|---|---:|---:|---:|
+| today, JIT inline TLAB | 32 | 16 | **48** |
+| `CompactObjectHeap`'s allocator | 8 | 32 | 40 |
+| HotSpot | 12 | 8 | **24** |
+| **the two composed** | **8** | **16** | **24** |
+
+The body is *already* compact on the live path: `cratonvm_types::class_layout`
+packs reference fields at 8 bytes each, which is why `emit_inline_tlab_new`
+emits `lea rax,[r11+30h]` (48 = 32 + 16) and not 32 + 2 x `SLOT_SIZE`(16) = 64.
+**The header alone carries all 24 bytes of the gap.**
+
+### ...but "just turn it on" is not available either
+
+Checked before claiming it, and the claim did not survive. **The compact-header
+path is entirely inert:**
+
+* `CompactAllocator` is instantiated in exactly two places, both `#[test]`
+  functions in `vm/src/vm.rs`, and it allocates out of its own `Vec<u8>` — it
+  is a demonstration, not a heap. Its own doc says so.
+* `config.use_compact_headers` has one non-test reader (`vm/src/vm_init.rs`),
+  where it appends the **string** `-XX:+UseCompactObjectHeaders` to a reported
+  flag list. It selects no allocator and reaches no allocation path.
+* `VmHeap::get_compact_header` says it is "only correct once a backend" writes
+  compact headers. None does.
+
+So there is no switch. Composing the two means teaching the real
+`GenerationalHeap`, the TLAB, `emit_inline_tlab_new`'s baked immediates, the GC
+walker, `object_body_size` and every native that computes a field address about
+an 8-byte header — and `HEADER_SIZE` is a `const` the JIT bakes into machine
+code. That is the enormous blast radius, and it is why this stays a structural
+item rather than a patch.
+
+**The tractable first step is smaller and self-contained.** The 32 bytes are:
+
+```
+0..4   class_id        8..12  identity_hash_code   16..24  forwarding_ptr
+4..8   kind/elem/age/flags    12..16 shape          24..32  mark_word
+```
+
+`forwarding_ptr` is 8 of those bytes — and it is redundant. The mark word
+already encodes relocation itself: `MARK_FORWARDED = 0b11` with the target in
+the upper 62 bits, complete with `forwarded_mark()`, `decode_forwarded()` and
+`is_forwarded()` in `types/src/heap_types.rs`. Two forwarding mechanisms exist;
+one is a whole field. Folding the field into the mark word takes `HEADER_SIZE`
+32 → 24 and `Node` 48 → 40 with no new encoding to invent — about 148
+`forwarding_ptr` references to migrate, all of them in GC-correctness code.
+
+For the record, because the size has moved before and the history is easy to
+misremember: `HEADER_SIZE` has never been 16. It was 32 at the open-source
+commit, went to **40** when `mark_word` was appended for thin-lock monitors,
+and came back to **32** in `d46e70521` (2026-07-24, "gc: compact object headers
+and field storage") — the same commit that introduced the 8-byte
+`CompactHeader` as a separate, default-off type.
 
 ## The JIT half: redundant stack traffic in inlined bodies
 
@@ -324,11 +434,15 @@ not a peephole.
 
 The two structural levers are large:
 
-1. **Make moving-young stop falling back** on multi-method JIT stacks. Unlocks
-   the 11% already being paid, and turns the 8g collection from a ~410 ms
-   non-moving sweep into a copy of a nursery that is almost entirely garbage.
-2. **Shrink the object header.** 32 → 16 would take `Node` from 48 to 32 bytes
-   and cut the memory traffic and both zeroing costs by a third.
+1. ~~**Make moving-young stop falling back** on multi-method JIT stacks.~~
+   **DONE 2026-08-06** — see the section above. 1.089x at 8g; every collection
+   now relocates. It does not remove the 11%, it makes the 11% buy something.
+2. **Shrink the header** (see the two corrections above). The end state is the
+   8-byte `CompactHeader` on the path that already packs reference fields at 8
+   bytes, which takes `Node` from 48 to 24 — level with HotSpot. That path is
+   inert today and the migration is large. The bounded first step is folding
+   `forwarding_ptr` into the mark word's existing `MARK_FORWARDED` encoding:
+   32 → 24, `Node` 48 → 40, no new encoding required.
 
 The JIT lead is now spent, and the arithmetic says so. The blind spill is the
 whole of what the single-pass backend has to give here — 1.178x if it vanished

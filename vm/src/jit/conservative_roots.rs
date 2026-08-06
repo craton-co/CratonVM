@@ -1731,11 +1731,67 @@ fn chain_entry_rbp_is_foreign(
     scanner_sp: usize,
     cm: *const cratonvm_jit::CompiledMethod,
 ) -> bool {
+    innermost_frame_method(exact_rbp, entry_sp, scanner_sp, cm).is_none()
+}
+
+/// Whether the direct-call callee resolution below is enabled. Default ON;
+/// opt out with `CRATONVM_GC_NO_CALLEE_RESOLVE=1`, which restores the
+/// "any deeper frame is foreign" behaviour exactly.
+fn callee_resolve_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_CALLEE_RESOLVE").is_none()
+    })
+}
+
+/// The [`cratonvm_jit::CompiledMethod`] that actually describes the frame
+/// standing at `exact_rbp`, or `None` when it cannot be established — in which
+/// case every caller must fail closed (no precise map, no relocation, and a
+/// conservative band bounded by the scanner's own SP).
+///
+/// The entry's own `cm` is the answer in two cases: the frame was entered from
+/// non-JIT code (the ordinary boundary frame this entry was pushed for), or it
+/// was entered by a direct self-call (a recursive activation of the very method
+/// the entry names — see the exception documented on
+/// [`chain_entry_rbp_is_foreign`]).
+///
+/// # Resolving a different callee
+///
+/// Neither of those covers the shape that made this the reason for **100% of
+/// bintrees fallbacks**: `binaryTrees` calls `bottomUpTree` and `itemCheck`, so
+/// the mirror names a frame belonging to a method the entry does not, and the
+/// old code gave up. But "the entry cannot describe this frame" is not the same
+/// as "nothing can" — the frame's own return address says exactly which method
+/// built it, provided the call was the direct form:
+///
+/// ```text
+/// [exact_rbp + 8] = ret_addr
+/// [ret_addr - 5]  = E8 rel32          <- direct CALL
+/// ret_addr + rel32 == callee.entry_ptr()
+/// ```
+///
+/// A callee resolved that way describes the frame exactly, because that frame
+/// was built by the prologue at `entry_ptr`. The requirement that the target be
+/// the registered **entry point** — not merely some address inside the method —
+/// is what makes it exact: a call landing anywhere else (an OSR entry, a stub)
+/// would not have run the prologue that establishes these slot offsets.
+///
+/// Everything else stays foreign, and that is the whole safety argument: an
+/// indirect call (the inline MIC/PIC cascade, the hashed megamorphic stub) has
+/// no decodable target, unreadable bytes decode to nothing, and a displacement
+/// resolving into the middle of a method resolves to `None`. The failure
+/// direction is a non-moving sweep, never a frame walked with the wrong map.
+fn innermost_frame_method(
+    exact_rbp: usize,
+    entry_sp: usize,
+    scanner_sp: usize,
+    cm: *const cratonvm_jit::CompiledMethod,
+) -> Option<*const cratonvm_jit::CompiledMethod> {
     if exact_rbp == 0 || exact_rbp & 0x7 != 0 {
-        return false;
+        return Some(cm);
     }
     if exact_rbp < scanner_sp || exact_rbp.saturating_add(16) > entry_sp {
-        return false;
+        return Some(cm);
     }
     // SAFETY: aligned read of the saved return address inside this thread's own
     // live JIT stack band, bounded by `scanner_sp` / `entry_sp` exactly as the
@@ -1743,18 +1799,79 @@ fn chain_entry_rbp_is_foreign(
     let ret_addr = unsafe { ((exact_rbp + 8) as *const usize).read() };
     let Some(caller_cm) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
         // A non-JIT caller is the ordinary boundary frame this entry was pushed
-        // for. Not foreign.
-        return false;
+        // for.
+        return Some(cm);
     };
-    if caller_cm as *const cratonvm_jit::CompiledMethod != cm {
-        return true;
+    if caller_cm as *const cratonvm_jit::CompiledMethod == cm {
+        // The caller is the entry's own method. That is a recursive activation
+        // iff the call really was the direct self-call form.
+        // SAFETY: `cm` is Arc-owned by the JIT cache while any of its frames is
+        // live, which is the precondition for being on this chain at all.
+        let entry_ptr = unsafe { (*cm).entry_ptr() } as usize;
+        if returned_from_direct_self_call(ret_addr, entry_ptr) {
+            return Some(cm);
+        }
     }
-    // The caller is the entry's own method. That is a recursive activation iff
-    // the call really was the direct self-call form.
-    // SAFETY: `cm` is Arc-owned by the JIT cache while any of its frames is
-    // live, which is the precondition for being on this chain at all.
-    let entry_ptr = unsafe { (*cm).entry_ptr() } as usize;
-    !returned_from_direct_self_call(ret_addr, entry_ptr)
+    if !callee_resolve_enabled() {
+        return None;
+    }
+    direct_call_callee(ret_addr, caller_cm)
+}
+
+/// Decode the direct `CALL` whose return address is `ret_addr` and resolve its
+/// target to the registered method whose **entry point** it is.
+///
+/// `caller_cm` is the method the return address lies in; its entry bounds the
+/// five-byte backward read, so the read stays inside that method's own
+/// executable buffer. Fails closed on every ambiguity.
+fn direct_call_callee(
+    ret_addr: usize,
+    caller_cm: usize,
+) -> Option<*const cratonvm_jit::CompiledMethod> {
+    if caller_cm == 0 {
+        return None;
+    }
+    // SAFETY: `caller_cm` is what `lookup_jit_code_range` resolved for a return
+    // address in a LIVE frame, so the JIT cache still owns the `Arc` whose inner
+    // value it addresses — the same keep-alive argument the neighbouring chain
+    // walks rely on.
+    let caller_entry =
+        unsafe { (*(caller_cm as *const cratonvm_jit::CompiledMethod)).entry_ptr() } as usize;
+    let target = direct_call_target(ret_addr, caller_entry)?;
+    let callee = cratonvm_jit::lookup_jit_code_range(target)? as *const cratonvm_jit::CompiledMethod;
+    // Exactness: only the registered entry point runs the prologue that
+    // establishes the slot offsets every caller is about to read.
+    // SAFETY: as above — `target` is a live code address, so its owner is
+    // retained by the JIT cache for as long as a frame of it is on this stack.
+    (unsafe { (*callee).entry_ptr() } as usize == target).then_some(callee)
+}
+
+/// Decode the `E8 rel32` whose return address is `ret_addr` and return its
+/// target, or `None` when the bytes are not a direct near CALL.
+///
+/// `caller_entry` bounds the five-byte backward read so it cannot run below the
+/// caller's own executable buffer. Split out from [`direct_call_callee`] with
+/// no pointer dereference of its own, which is what makes it testable — the
+/// resolution half needs a registered code range, and a unit test that
+/// fabricated a `CompiledMethod` pointer to reach this logic would be reading
+/// a `[u8; N]` as one.
+fn direct_call_target(ret_addr: usize, caller_entry: usize) -> Option<usize> {
+    // The call instruction lies between the caller's entry and the return
+    // address, so a return address within 5 bytes of it cannot be one.
+    if caller_entry == 0 || ret_addr < caller_entry.saturating_add(5) {
+        return None;
+    }
+    // SAFETY: `[ret_addr - 5, ret_addr)` lies inside the executable buffer of
+    // the compiled method `lookup_jit_code_range(ret_addr)` resolved, at or
+    // above its entry point, and that buffer is kept alive by the live frame
+    // whose return address this is. Code pages are readable.
+    if unsafe { ((ret_addr - 5) as *const u8).read() } != 0xE8 {
+        return None;
+    }
+    let rel = unsafe { ((ret_addr - 4) as *const i32).read_unaligned() };
+    // `E8 rel32` targets `next_instruction + rel32`, and `ret_addr` IS the next
+    // instruction.
+    Some(ret_addr.wrapping_add(rel as usize))
 }
 
 /// Whether the five bytes ending at `ret_addr` are `E8 rel32` with the target
@@ -2007,27 +2124,30 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 unverified = true;
                 continue;
             }
-            if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp, info.compiled_method) {
-                // `info.compiled_method` does NOT describe the frame now
-                // standing at `exact_rbp` -- an unguarded JIT->JIT call, or the
-                // inline MIC/PIC cascade, published its own (deeper) base
-                // there. This is the case
+            let Some(innermost_cm) =
+                innermost_frame_method(rbp, entry_sp, scanner_sp, info.compiled_method)
+            else {
+                // Nothing describes the frame now standing at `exact_rbp` — the
+                // inline MIC/PIC cascade or the hashed megamorphic stub reached
+                // it through an indirect call, so its method cannot be recovered
+                // from the return address. This is the case
                 // `refresh_moving_young_coverage_for_current_thread` reports as
                 // FOREIGN_INNERMOST_RBP. Every offset this loop reads
                 // (`shadow_thread_slot_off`, `osr_frame_size`, the band bounds)
-                // belongs to the wrong method, so nothing here can be verified.
-                // `scan_one_frame_precise` already declines to publish an oop
-                // map under the same condition; declining to VERIFY is the
+                // would belong to the wrong method, so nothing here can be
+                // verified. `scan_one_frame_precise` already declines to publish
+                // an oop map under the same condition; declining to VERIFY is the
                 // fail-closed counterpart -- it forces the non-moving sweep for
                 // this cycle instead of trusting a band read out of the wrong
                 // frame.
                 unverified = true;
                 continue;
-            }
+            };
             // SAFETY: same contract as `scan_compiled_frame_bands` — the chain
             // entry's CompiledMethod is Arc-owned by the JIT cache while any of
-            // its frames is live.
-            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+            // its frames is live, and a resolved callee is kept alive by the
+            // live frame whose return address resolved it.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
             let published = published_shadow_values(shadow_window_from_frame(rbp, cm));
             let mut frames = 0usize;
             while frames < 4096 {
@@ -2362,27 +2482,32 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 complete = false;
                 continue;
             }
-            if chain_entry_rbp_is_foreign(
-                exact_rbp,
-                entry.entry_sp,
-                scanner_sp,
-                info.compiled_method,
-            ) {
-                // The recorded RBP is a deeper frame reached by a direct
-                // JIT->JIT call that pushed no guard, so `cm` does not describe
-                // it and nothing here can. Relocating would strand that frame's
-                // oops; take the non-moving sweep for this cycle instead.
+            let innermost =
+                innermost_frame_method(exact_rbp, entry.entry_sp, scanner_sp, info.compiled_method);
+            // The frame standing at the recorded RBP may belong to a method the
+            // entry does not name (a JIT->JIT call published its own base
+            // there). When the call was the direct form, the callee resolves
+            // exactly and its own map is the one to check; when it was indirect
+            // there is nothing to check it against, and relocating would strand
+            // that frame's oops — take the non-moving sweep for this cycle.
+            // SAFETY: a resolved method is kept alive by the live frame that
+            // resolved it, the same contract as the chain entry's own pointer.
+            let innermost_cm: Option<&cratonvm_jit::CompiledMethod> =
+                innermost.map(|p| unsafe { &*p });
+            if innermost_cm.is_none() {
                 if dbg {
                     eprintln!(
-                        "[moving-young-coverage] incomplete: innermost rbp=0x{:x} belongs to an unguarded JIT callee",
-                        exact_rbp
+                        "[moving-young-coverage] incomplete: innermost rbp=0x{exact_rbp:x} belongs to a JIT callee reached indirectly"
                     );
                 }
                 cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                     cratonvm_gc::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
                 );
                 complete = false;
-            } else if !moving_young_frame_coverage_complete(exact_rbp, cm) {
+            } else if !moving_young_frame_coverage_complete(
+                exact_rbp,
+                innermost_cm.unwrap_or(cm),
+            ) {
                 if dbg {
                     eprintln!(
                         "[moving-young-coverage] incomplete: active frame map at rbp=0x{:x}",
@@ -3254,31 +3379,37 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 && info.exact_rbp & 0x7 == 0
                 && info.exact_rbp >= scanner_sp
                 && info.exact_rbp < entry_sp
-                // See `chain_entry_rbp_is_foreign`: after an unguarded
-                // JIT->JIT direct call this RBP is the CALLEE's frame, which
-                // `info.compiled_method` does not describe. The coverage check
-                // refuses to move in that case, so this is belt-and-braces —
-                // but remapping a frame with another method's oop map is the
-                // exact corruption being fixed, so never do it.
-                && !chain_entry_rbp_is_foreign(
+            {
+                // See `innermost_frame_method`: after a JIT->JIT call this RBP
+                // is the CALLEE's frame, which `info.compiled_method` does not
+                // describe. Remap it with the method that DOES — the callee
+                // resolved from the frame's own return address — and skip the
+                // frame entirely when that resolution fails, because remapping
+                // with another method's oop map is the exact corruption this
+                // guard exists to prevent.
+                //
+                // Only the remap is skipped when resolution fails — the parent
+                // chain walk below still runs, exactly as it did when this was a
+                // `!chain_entry_rbp_is_foreign(..)` term in the condition above.
+                if let Some(innermost_cm) = innermost_frame_method(
                     info.exact_rbp,
                     entry_sp,
                     scanner_sp,
                     info.compiled_method,
-                )
-            {
-                // SAFETY: `info.compiled_method` came from the live chain entry
-                // and is kept alive by the JIT cache while the frame is active.
-                let boundary_cm: &cratonvm_jit::CompiledMethod =
-                    unsafe { &*(info.compiled_method as *const cratonvm_jit::CompiledMethod) };
-                let (found, examined, n) =
-                    remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
-                dbg_frames += 1;
-                dbg_slots.set(dbg_slots.get() + n);
-                if found {
-                    dbg_maps_found.set(dbg_maps_found.get() + 1);
+                ) {
+                    // SAFETY: the chain entry's pointer is kept alive by the JIT
+                    // cache while the frame is active; a resolved callee is kept
+                    // alive by the live frame whose return address resolved it.
+                    let boundary_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+                    let (found, examined, n) =
+                        remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
+                    dbg_frames += 1;
+                    dbg_slots.set(dbg_slots.get() + n);
+                    if found {
+                        dbg_maps_found.set(dbg_maps_found.get() + 1);
+                    }
+                    dbg_examined.set(dbg_examined.get() + examined);
                 }
-                dbg_examined.set(dbg_examined.get() + examined);
             }
             // Stage 5 — walk the JIT RBP chain from the innermost frame
             // (`info.frame_base`, the EXACT RBP recorded by the deepest
@@ -3597,13 +3728,21 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         // so the true caller is still scanned precisely, and
         // `scan_compiled_frame_bands` covers the unidentified frame
         // conservatively.
-        if !chain_entry_rbp_is_foreign(
+        if let Some(innermost_cm) = innermost_frame_method(
             info.exact_rbp,
             info.frame_base,
             scanner_sp,
             info.compiled_method,
         ) {
-            scan_active_oop_map_at_rbp(info.exact_rbp, cm, heap, out);
+            // Publish the innermost frame's map under the method that actually
+            // describes it: the entry's own when the frame is the boundary or a
+            // direct self-call, the resolved callee when a JIT->JIT direct call
+            // published a deeper base here. An indirect callee resolves to
+            // `None` and is left to the conservative band below.
+            // SAFETY: as for the parent walk that follows — a code range retains
+            // its CompiledMethod metadata for the lifetime of an active frame.
+            let innermost_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            scan_active_oop_map_at_rbp(info.exact_rbp, innermost_cm, heap, out);
         }
 
         let mut child_rbp = info.exact_rbp;
@@ -3682,9 +3821,15 @@ fn scan_compiled_frame_bands(
     // scanner's own SP instead: the collector runs beneath that frame, so
     // `[scanner_sp, rbp)` covers all of it and nothing above it. Parent frames
     // are identified through the child frame's return address either way.
-    let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
-    let mut innermost_is_foreign =
-        chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp, info.compiled_method);
+    let innermost = innermost_frame_method(rbp, entry_sp, scanner_sp, info.compiled_method);
+    let mut innermost_is_foreign = innermost.is_none();
+    // SAFETY: the chain entry's pointer is Arc-owned by the JIT cache while any
+    // of its frames is live; a resolved callee is kept alive by the live frame
+    // whose return address resolved it. When resolution failed the pointer is
+    // unused — `innermost_is_foreign` bounds that frame by `scanner_sp` instead
+    // of by any method's frame size.
+    let mut cm: &cratonvm_jit::CompiledMethod =
+        unsafe { &*innermost.unwrap_or(info.compiled_method) };
     let mut frames = 0usize;
     while frames < 4096 {
         frames += 1;
@@ -4714,6 +4859,63 @@ mod tests {
             !returned_from_direct_self_call(ret, 0),
             "no entry pointer means nothing can be proven",
         );
+    }
+
+    /// `direct_call_callee` generalises the decoder above from "did this method
+    /// call itself" to "which method did this call reach" — the difference
+    /// between describing a self-recursive frame and describing every frame a
+    /// multi-method JIT stack produces.
+    ///
+    /// The resolution step needs a registered code range, which a unit test
+    /// cannot fabricate; what it CAN pin is the decode half, which is where the
+    /// fail-closed behaviour lives. Each rejection below is a case that would
+    /// otherwise hand a caller some other method's oop map.
+    ///
+    /// Writing this test is what found the null dereference in the first draft:
+    /// `direct_call_callee` read `caller_cm->entry_ptr()` *before* validating
+    /// the pointer, which the production path never exposes (the pointer always
+    /// comes from `lookup_jit_code_range`) and which a test reaches on its
+    /// first call.
+    #[test]
+    fn direct_call_target_decodes_only_a_real_e8_and_fails_closed_otherwise() {
+        let mut body = [0x90u8; 32];
+        let entry = body.as_ptr() as usize;
+        let call_at = 6usize;
+        let ret = entry + call_at + 5;
+        // rel32 = target - next_instruction; aim it back at the buffer start.
+        let rel = (entry as isize - ret as isize) as i32;
+        body[call_at] = 0xE8;
+        body[call_at + 1..call_at + 5].copy_from_slice(&rel.to_le_bytes());
+
+        assert_eq!(
+            direct_call_target(ret, entry),
+            Some(entry),
+            "E8 rel32 must decode to next_instruction + rel32",
+        );
+        assert_eq!(
+            direct_call_target(ret, 0),
+            None,
+            "no caller entry means the backward read cannot be bounded",
+        );
+        // Too close to the caller's entry to hold a five-byte CALL. Bounded by
+        // the CALLER's entry, since that is what keeps the read inside the
+        // caller's own executable buffer.
+        assert_eq!(
+            direct_call_target(entry + 2, entry),
+            None,
+            "a return address within 5 bytes of the caller entry is not a call",
+        );
+        // `FF /2` (`call rax`) and every other indirect form: the byte five back
+        // is ordinary body filler, and an indirect target is not encoded at all.
+        // This is the inline MIC/PIC cascade and the hashed megamorphic stub —
+        // the case that must stay foreign.
+        assert_eq!(
+            direct_call_target(entry + 20, entry),
+            None,
+            "a return address whose preceding bytes are not E8 must stay foreign",
+        );
+        // Keep `body` alive across every read above.
+        assert_eq!(body[call_at], 0xE8);
     }
 
     /// The third arm of the same invariant, and the one that silently voided

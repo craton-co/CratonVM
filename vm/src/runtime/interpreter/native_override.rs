@@ -2504,6 +2504,39 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // `ConcurrentHashMap$KeySetView` — the object `newKeySet()` / `keySet(V)`
+    // hands back is a real KeySetView over a native-backed ConcurrentHashMap,
+    // whose entries live in CratonVM's segmented layout rather than the `table`
+    // field. Every method listed here has a real body that reads `table`
+    // directly (`add` via `putVal`, `iterator`/`forEach`/`spliterator` via a
+    // `Traverser`, `hashCode`/`equals` via the iterator), so it must run the
+    // native instead. The methods NOT listed are the ones `CollectionView`
+    // declares in terms of `map` or `iterator()` — `size`/`isEmpty`/`clear`/
+    // `toArray`/`toString`/`containsAll`/`removeAll`/`retainAll`; their real
+    // bodies are correct once these are native, and forcing them here would
+    // also capture `ValuesView`/`EntrySetView`, which share that declaring
+    // class but not these semantics. See the retired
+    // `concurrenthashmap-newkeyset-returns-a-plain-hashset` write-up.
+    if class_name == "java/util/concurrent/ConcurrentHashMap$KeySetView"
+        && matches!(
+            method_name,
+            "add"
+                | "addAll"
+                | "remove"
+                | "contains"
+                | "iterator"
+                | "forEach"
+                | "spliterator"
+                | "stream"
+                | "hashCode"
+                | "equals"
+                | "removeIf"
+                | "getMappedValue"
+                | "getMap"
+        )
+    {
+        return true;
+    }
     // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
     // entries in a segmented native layout, so the real JDK `writeObject`
     // (which walks the always-null `table`) serialised every CHM as empty and
@@ -3025,21 +3058,38 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
-    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
+    // THE NINTH SITE. `Executors.newSingleThreadExecutor()`/
+    // `newFixedThreadPool()`/`newCachedThreadPool()` (native-builtins/src/lib.rs's
     // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
     // allocate their return value under the REAL class name
-    // `java/util/concurrent/ThreadPoolExecutor` but never run it through the
-    // real `<init>` -- real fields like `ctl`/`workQueue`/`mainLock` are never
-    // set. Once `execute(Runnable)` (invoked via `invokeinterface
-    // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
-    // class's own real bytecode, that bytecode reads the never-initialized
-    // `ctl` AtomicInteger and NPEs immediately (fixed-suite-bugs/
-    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). Force the
-    // registered native (`native_es_execute`) to win for this triple;
+    // `java/util/concurrent/ThreadPoolExecutor`. When this arm was written they
+    // never ran it through the real `<init>`, so real fields like
+    // `ctl`/`workQueue`/`mainLock` stayed null: once `execute(Runnable)`
+    // (invoked via `invokeinterface Executor.execute`/`ExecutorService.execute`)
+    // resolved to the concrete class's own real bytecode, that bytecode read the
+    // never-initialized `ctl` AtomicInteger and NPE'd immediately
+    // (fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md).
+    // Force the registered native (`native_es_execute`) to win for this triple;
     // `intercept_force_registered_native` additionally checks the receiver's
     // real `workers` field so a genuinely real, bytecode-constructed
     // `ThreadPoolExecutor` still runs its own real `execute()` bytecode.
+    //
+    // JDK-ONLY-WAVE2 L10, 2026-08-06 — THIS ARM IS NOW DEAD IN REAL-JDK MODE,
+    // and that is what makes it deletable. `NativeMethodRegistry::register`
+    // drops every `Executors` pool factory when `drop_real_layout_synthetic` is
+    // set, so the real `java.util.concurrent.Executors` bytecode builds every
+    // executor and there is no fabricated receiver left for this arm to protect.
+    // The three closures named above still exist and still run — but only in the
+    // `--features synthetic-jdk` build, which is also the only build where the
+    // real `ThreadPoolExecutor` bytecode this arm overrides is absent.
+    //
+    // It is NOT deleted here. Deleting it before `native_es_execute` is
+    // reclassified restores the `ctx.invoke_virtual` self-recursion the FIXED
+    // record above documents — a native stack overflow and a process abort, not
+    // a catchable `StackOverflowError` — and it has to go together with the
+    // eight receiver-shape sites that exist to override it. That is L11's
+    // sequenced removal; see `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` below for
+    // the order and for what has to be true first.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && method_descriptor == "(Ljava/lang/Runnable;)V"
@@ -5395,14 +5445,35 @@ fn admit_forced_native_id(
 /// Per the wave-1 marker, in this order — the order matters, and getting it
 /// wrong aborts the process rather than throwing:
 ///
-/// 1. give real `ThreadPoolExecutor` objects correct Java field initialisation
-///    so `Executors.new*ThreadPool()` returns objects built by the real
-///    `<init>` (`docs/jdk-only-runtime-services.md` P1). Until this lands,
-///    reclassifying below **drops** `native_es_execute` under
-///    `CRATONVM_NO_STUBS` / `--jdk-only` and synthetic-receiver executors lose
-///    their only implementation;
+/// 1. ~~give real `ThreadPoolExecutor` objects correct Java field
+///    initialisation so `Executors.new*ThreadPool()` returns objects built by
+///    the real `<init>`~~ (`docs/jdk-only-runtime-services.md` P1)
+///    — **DONE 2026-08-06, L10.** `NativeMethodRegistry::register` drops every
+///    `Executors` pool factory in real-JDK mode, so the real
+///    `java.util.concurrent.Executors` bytecode builds every executor and
+///    CratonVM has no way to mint a fabricated one. Measured, not argued:
+///    `probes/L10ThreadPoolInitProbe` is byte-identical to HotSpot 25 in both
+///    modes, and `CRATONVM_DBG_TPE_SHAPE` reports the predicate below `true`
+///    on every call and `false` on none across both strict-corpus workloads.
+///
+///    **What that reading does and does not say.** The same reading was taken
+///    on a pre-L10 binary and is IDENTICAL — the predicate already answered
+///    `true` for the receivers those workloads produce. What L10 changed is the
+///    domain, not the answer: real-JDK mode no longer has a code path that
+///    constructs an executor, so there is no input the predicate can be false
+///    for. Do not delete the sites below on the strength of a `false=0`
+///    reading; that is a statement about two workloads. Delete them on the
+///    strength of "nothing can build a fabricated receiver", which is a
+///    statement about the code. (The instrument's `false` branch is live and
+///    shown so by `probes/L10ShapeInstrumentControlProbe`, which allocates a
+///    constructor-less `ThreadPoolExecutor` — the shape a Mockito mock has.)
+///
+///    **This is the step that gated the rest**; the remaining three are L11's;
 /// 2. reclassify `native_es_execute` as `NativeKind::SyntheticStub` — it is
-///    currently tagged such that the general yield logic does not apply to it;
+///    currently tagged such that the general yield logic does not apply to it.
+///    Safe now that step 1 has landed: under `CRATONVM_NO_STUBS` / `--jdk-only`
+///    the reclassification drops the registration, and what it used to be the
+///    only implementation for no longer exists in that build;
 /// 3. delete the ninth site;
 /// 4. delete these eight. Contract §7 step 3 ("concrete bytecode beats a
 ///    registered `Bridge` or `SyntheticStub`") then produces the same answer
@@ -5479,16 +5550,33 @@ pub(crate) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Val
     // queued (release builds) -- same fix as resolve_method_ref /
     // surefire_lazy_launcher_discover_native.
     let cm = shared.classes.class_manager.read_recursive();
+    let dbg = crate::runtime::env_cache::dbg_tpe_shape();
+    // Read the name while the guard is held; only under the flag, so the
+    // un-instrumented path is unchanged.
+    let dbg_name = dbg
+        .then(|| cm.get_class(class_id).map(|c| c.name.to_string()))
+        .flatten()
+        .unwrap_or_else(|| format!("<class id {}>", class_id.as_u32()));
     let Some(index) =
         crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
     else {
+        if dbg {
+            // No `workers` field anywhere in the hierarchy: this receiver was
+            // not built by real `ThreadPoolExecutor` bytecode at all.
+            eprintln!("[tpe-shape] real=false reason=no-workers-field class={dbg_name}");
+        }
         return false;
     };
     drop(cm);
-    matches!(
+    let real = matches!(
         shared.mem.heap.get_field(*recv, index),
         Value::Object(Some(_))
-    )
+    );
+    if dbg {
+        let reason = if real { "populated" } else { "null-workers" };
+        eprintln!("[tpe-shape] real={real} reason={reason} class={dbg_name}");
+    }
+    real
 }
 
 /// CratonVM's own HTTP carrier classes — the concrete classes its

@@ -66,7 +66,8 @@ produces.
   harness does discriminate correctly and the two binaries are otherwise equal.
   `RequestMappingMessageConversionIntegrationTests` also scores 160/160 on both.
 * **Not the classpath rot** described in
-  `beanregistrations-verylarge-heap-footprint-20260805.md` — that was repaired
+  `../../internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`
+  — that was repaired
   first and re-checked (0 missing of 254) before these runs.
 
 ## Reproducing

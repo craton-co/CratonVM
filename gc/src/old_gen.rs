@@ -894,10 +894,12 @@ impl OldGen {
         // `scan_region_filtered` was **73.7% of ALL CPU samples** before this
         // change and does not appear in the profile at all after it.
         //
-        // Scope the claim honestly: removing that 73.7% does NOT make that test
-        // pass — it still exhausts the heap in javac (see
-        // `docs/known-issues/spring/beanregistrations-verylarge-heap-footprint
-        // -20260805.md`), it just gets there sooner. And on the 1001-definition
+        // Scope the claim honestly: removing that 73.7% did NOT make that test
+        // pass — at the time it still exhausted the heap in javac, it just got
+        // there sooner. (The test passes as of 2026-08-06, for an unrelated
+        // reason: see
+        // `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.)
+        // And on the 1001-definition
         // sibling, whose old gen is small enough that the quadratic never bites,
         // an alternating 2-binary A/B is within noise (221 s vs 229 s). The
         // justification for this change is the algorithm and the profile, not a

@@ -7088,8 +7088,15 @@ pub enum JitNewSite {
 pub struct StringFieldLayout {
     /// Abstract field slot index of `String.value` (the backing array ref).
     pub value_field_index: usize,
-    /// Byte offset of `value`'s bare 8-byte pointer in a COMPACT instance.
+    /// Byte offset of `value`'s bare pointer in a COMPACT instance.
     pub value_compact_offset: i32,
+    /// Whether `value`'s COMPACT slot is a 4-byte **narrow** oop rather than a
+    /// bare 8-byte pointer. True exactly when compressed oops are on *and* a
+    /// `CompactLayout` was actually registered for `string_class_id` — the
+    /// no-registered-layout fallback below points `value_compact_offset` at
+    /// the LEGACY 8-byte cell payload, which must keep the wide load even
+    /// under narrow oops.
+    pub value_compact_is_narrow: bool,
     /// Byte offset of `value`'s 8-byte pointer payload in a LEGACY instance
     /// (`HEADER_SIZE + value_field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD64_OFFSET`).
     pub value_legacy_offset: i32,
@@ -7209,27 +7216,33 @@ impl StringFieldLayout {
         // predicate every collector's allocation path uses), so the compact
         // arm is unreachable, and pointing it at the legacy address keeps it
         // harmless rather than wild if that invariant ever slips.
-        let compact = |idx: usize, is_ref: bool| -> (i32, bool) {
+        // Returns `(address, is_byte_wide, storage_width)`; `storage_width` is
+        // 8 for the fallback so a reference there keeps its wide load.
+        let compact = |idx: usize, is_ref: bool| -> (i32, bool, u32) {
             if cratonvm_types::compact_ref_fields_enabled() {
                 if let Some((body_off, storage)) =
                     cratonvm_types::compact_field_storage(string_class_id, idx)
                 {
+                    let width = storage.size_runtime();
                     return (
                         (cratonvm_types::HEADER_SIZE + body_off) as i32,
-                        storage.size_runtime() == 1,
+                        width == 1,
+                        width,
                     );
                 }
             }
-            (legacy(idx, is_ref), false)
+            (legacy(idx, is_ref), false, 8)
         };
 
-        let (value_compact_offset, _) = compact(value_field_index, true);
-        let (hash_compact_offset, _) = compact(hash_field_index, false);
-        let (coder_compact_offset, coder_compact_is_byte) =
-            coder_field_index.map_or((0, false), |idx| compact(idx, false));
+        let (value_compact_offset, _, value_compact_width) = compact(value_field_index, true);
+        let (hash_compact_offset, _, _) = compact(hash_field_index, false);
+        let (coder_compact_offset, coder_compact_is_byte, _) =
+            coder_field_index.map_or((0, false, 4), |idx| compact(idx, false));
         StringFieldLayout {
             value_field_index,
             value_compact_offset,
+            value_compact_is_narrow: value_compact_width
+                == cratonvm_types::narrow_oop::NARROW_REF_SIZE as u32,
             value_legacy_offset: legacy(value_field_index, true),
             hash_field_index,
             hash_compact_offset,
@@ -8375,33 +8388,25 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
-    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
-    // one of these intrinsics reaches `emit_load_string_value_ptr`
-    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
-    // `String.value` reference field. That emitter is NOT gated on
-    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
-    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
-    // the adjacent coder/hash field and dereferences the result - a
-    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
-    // indexOf / hashCode / equals / compareTo.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes" used to
+    // be closed here, by refusing every String intrinsic under narrow oops:
+    // all of them reach `emit_load_string_value_ptr` (`jit/src/x64/objects.rs`),
+    // which emitted an unconditional 64-bit load of the `String.value`
+    // reference field and so, under narrow oops, loaded 4 bytes of narrow oop
+    // plus 4 bytes of the adjacent coder/hash field and dereferenced the
+    // result.
     //
-    // Refusing the intrinsic here is the unblock that module's header
-    // prescribes: it costs throughput (the calls fall back to native
-    // dispatch) and costs nothing when the gate is off, which is the default.
-    // The real fix is a narrow arm in that emitter, mirroring
-    // `emit_narrow_ref_aload_regs`.
+    // That emitter now has a proper narrow arm (`emit_load_narrow_ref_field`),
+    // selected per call site by `StringFieldLayout::value_compact_is_narrow`,
+    // so the refusal that used to stand here — and the throughput it cost —
+    // is gone. The intrinsics are admitted under both widths.
     //
     // Hole 2 — the conservative 8-byte-word rescan in `gen_heap`'s
-    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is CLOSED
-    // (2026-08-06): both now go through `for_each_conservative_ref_slot`, which
-    // visits narrow slots at 4 bytes as well. So the two holes that made the
-    // gate unsound are covered: this one by refusal, that one by a fix.
-    // `enable_for_live_heap` still warns, and the default stays off, because
-    // "no known unsoundness" is not the same as "measured sound" — nothing has
-    // yet run a corpus with the gate ON. See gc/src/compressed_oops.rs.
-    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
-        return None;
-    }
+    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is closed
+    // too (both go through `for_each_conservative_ref_slot`, which visits
+    // narrow slots at 4 bytes as well). The gate still defaults off; see
+    // `gc/src/compressed_oops.rs` for why, which is no longer "a known
+    // wrong-width slot access on this backend".
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {

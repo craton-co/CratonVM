@@ -4184,6 +4184,7 @@ impl SharedVm {
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
     ///       "kind_stated": true,
+    ///       "owns_slot": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
     ///                                  "acc_native": true, "has_code": false },
     ///       "image_declaring_method": { "image_has_class": true, "declared": true,
@@ -4428,6 +4429,12 @@ impl SharedVm {
             // `set_category`?" — the discriminator the 157-entry
             // reclassification needs. See `NativeCensusEntry::kind_stated`.
             out.push_str(&format!("      \"kind_stated\": {},\n", row.kind_stated));
+            // "Would a dispatch of this triple reach THIS row?" A superseded
+            // registration answers `false` and can never be dispatched, so it
+            // is not a registration any reclassification wave has to decide.
+            // See `NativeCensusEntry::owns_slot` for the measured size of the
+            // difference.
+            out.push_str(&format!("      \"owns_slot\": {},\n", row.owns_slot));
 
             match cm {
                 Some(cm) => {

@@ -167,7 +167,7 @@ names `ofVirtual`, `startVirtualThread` or `isVirtual`.
 
 | defect | record |
 |---|---|
-| `ConcurrentHashMap.newKeySet()` returns a plain `HashSet`, so concurrent churn leaves an empty table reporting `size=18`, `ThreadPerTaskExecutor` never reaches `TERMINATED`, and `ExecutorService.close()` never returns | [record](../known-issues/vm/concurrenthashmap-newkeyset-returns-a-plain-hashset-20260805.md) |
+| `ConcurrentHashMap.newKeySet()` returns a plain `HashSet`, so concurrent churn leaves an empty table reporting `size=18`, `ThreadPerTaskExecutor` never reaches `TERMINATED`, and `ExecutorService.close()` never returns | [record](concurrenthashmap-newkeyset-returns-a-plain-hashset-FIXED-20260806.md) — FIXED 2026-08-06 |
 | JNI argument/return marshalling: `jint`/`jlong`/`jdouble` returns come back `0`, array commit-back dropped, object-array reads `null`, `SetIntField` lost, upcall returns the C code's null-method-id sentinel, `ThrowNew` delivered a call late | [record, FIXED 2026-08-06](./jni-argument-and-return-marshalling-FIXED-20260806.md) |
 | `Instrumentation.addTransformer` accepts a transformer that is never called, while `isRetransformClassesSupported()` answers `true`; `VirtualMachine.list()` throws `InternalError` | [record](java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md) FIXED 2026-08-06 |
 | ~~`KeyStore.setEntry` with a `SecretKeyEntry` is a silent no-op on PKCS12; `store()` then writes a valid 32-byte empty keystore without throwing~~ — FIXED 2026-08-06; it was all three entry kinds, not only `SecretKeyEntry` | [record](pkcs12-setentry-secretkeyentry-is-a-silent-noop-FIXED-20260806.md) |
