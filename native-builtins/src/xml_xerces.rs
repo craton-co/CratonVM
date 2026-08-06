@@ -948,10 +948,9 @@ fn xml_entity_scanner_units(
     if offset < 0 || length < 0 {
         return Err(RuntimeError::aioobe_index_only(offset).into());
     }
-    let end =
-        offset
-            .checked_add(length)
-            .ok_or_else(|| RuntimeError::aioobe_index_only(offset.wrapping_add(length)))?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| RuntimeError::aioobe_index_only(offset.wrapping_add(length)))?;
     if end as usize > ctx.array_length(chars) {
         return Err(RuntimeError::aioobe_index_only(end).into());
     }

@@ -1726,8 +1726,7 @@ fn antlr_list_get(
             .into());
         };
         if index >= antlr_arraylist_size(ctx, list) || index >= ctx.array_length(data) {
-            return Err(RuntimeError::aioobe_index_only(index as i32)
-            .into());
+            return Err(RuntimeError::aioobe_index_only(index as i32).into());
         }
         return Ok(ctx.get_array_element(data, index));
     }

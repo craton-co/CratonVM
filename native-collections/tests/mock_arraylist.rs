@@ -6,7 +6,10 @@
 mod common;
 
 #[allow(unused_imports)]
-use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+use cratonvm_native_api::{
+    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+};
 
 use common::{boxed_int, build_registry, call, new_arraylist, MockCtx};
 use cratonvm_native_api::NativeContext;
@@ -292,13 +295,28 @@ fn n_element_add_get_size_remove_iterator() {
     );
 }
 
+/// `java.util.ArrayList.get` out of range throws the PLAIN
+/// `IndexOutOfBoundsException`, not the `ArrayIndexOutOfBoundsException`
+/// subclass — measured on Temurin 25 with `probes/ListOutOfBoundsProbe`:
+///
+/// ```text
+/// new ArrayList().get(0)    IndexOutOfBoundsException: Index 0 out of bounds for length 0
+/// arrayListOf2.get(5)       IndexOutOfBoundsException: Index 5 out of bounds for length 2
+/// arrayListOf2.get(-1)      IndexOutOfBoundsException: Index -1 out of bounds for length 2
+/// ```
+///
+/// The subclass is the direction that breaks a `catch`. This test asserted the
+/// subclass and went red when `native_al_get` was corrected on 2026-08-05; it
+/// was the test that was stale, not the implementation. `native_unmod_get`'s
+/// AIOOBE on the *unmodifiable wrapper* path is a different receiver with a
+/// different measured answer — see the note there.
 #[test]
-fn get_out_of_bounds_throws_aioobe() {
+fn get_out_of_bounds_throws_ioobe() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
     let al = new_arraylist(&reg, &mut ctx);
 
-    // Empty list: any index throws AIOOBE.
+    // Empty list: any index throws the plain IndexOutOfBoundsException.
     let result = call(
         &reg,
         &mut ctx,
@@ -309,8 +327,8 @@ fn get_out_of_bounds_throws_aioobe() {
     );
     let err = result.expect_err("get on empty list must throw");
     assert!(
-        is_aioobe(&err, 0),
-        "expected ArrayIndexOutOfBoundsException(0), got {err:?}"
+        is_ioobe(&err, "Index 0 out of bounds for length 0"),
+        "expected IndexOutOfBoundsException with HotSpot's wording, got {err:?}"
     );
 
     // Non-empty, but request past end.
@@ -333,9 +351,12 @@ fn get_out_of_bounds_throws_aioobe() {
         &[Value::Object(Some(al)), Value::Int(5)],
     );
     let err = result.expect_err("get past end must throw");
-    assert!(is_aioobe(&err, 5), "expected AIOOBE(5), got {err:?}");
+    assert!(
+        is_ioobe(&err, "Index 5 out of bounds for length 1"),
+        "expected IndexOutOfBoundsException(5) on a size-1 list, got {err:?}"
+    );
 
-    // Negative index: also AIOOBE.
+    // Negative index: the same plain class and wording.
     let result = call(
         &reg,
         &mut ctx,
@@ -345,7 +366,10 @@ fn get_out_of_bounds_throws_aioobe() {
         &[Value::Object(Some(al)), Value::Int(-1)],
     );
     let err = result.expect_err("get(-1) must throw");
-    assert!(is_aioobe(&err, -1), "expected AIOOBE(-1), got {err:?}");
+    assert!(
+        is_ioobe(&err, "Index -1 out of bounds for length 1"),
+        "expected IndexOutOfBoundsException(-1) on a size-1 list, got {err:?}"
+    );
 }
 
 // Backed-view class returned by `ArrayList.subList(int,int)` (fix item 6: a
@@ -499,5 +523,16 @@ fn iterator_remove_drops_element() {
 fn is_aioobe(err: &MethodCallFailed, expected: i32) -> bool {
     matches!(err,
         MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(index))) if *index == expected)
+            RuntimeError::ArrayIndexOutOfBoundsException { index, .. })) if *index == expected)
+}
+
+/// The same shell, for the plain `IndexOutOfBoundsException` superclass — which
+/// is what `java.util.ArrayList` throws on HotSpot. Checks the message too: the
+/// class and the wording are two different halves of the contract, and this
+/// family has already shipped a right-class/wrong-message state once.
+fn is_ioobe(err: &MethodCallFailed, expected_message: &str) -> bool {
+    matches!(err,
+        MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IndexOutOfBoundsException { message: Some(m) }))
+            if m == expected_message)
 }

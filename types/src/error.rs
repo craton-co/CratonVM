@@ -48,7 +48,6 @@ pub enum MethodCallFailed {
     /// A Java exception was thrown (can be caught by exception handlers).
     /// The `ObjectRef` points to the `Throwable` object on the heap.
     ExceptionThrown(ObjectRef),
-
 }
 
 impl fmt::Display for MethodCallFailed {
@@ -365,21 +364,21 @@ impl JdkOnlyViolation {
                 "put the real class on the class path, or drop the dependency that needs it",
                 "list every fabrication this run wanted with --dump-class-origins <FILE>",
             ],
-            JdkOnlyViolation::SyntheticNativeRegistered { .. } => &[
-                "reclassify the registration as a Bridge or a reviewed Intrinsic, or delete it",
-            ],
-            JdkOnlyViolation::SyntheticNativeInvocation { .. } => &[
-                "the real JDK implements this method; check why its bytes were not loaded",
-            ],
+            JdkOnlyViolation::SyntheticNativeRegistered { .. } => {
+                &["reclassify the registration as a Bridge or a reviewed Intrinsic, or delete it"]
+            }
+            JdkOnlyViolation::SyntheticNativeInvocation { .. } => {
+                &["the real JDK implements this method; check why its bytes were not loaded"]
+            }
             JdkOnlyViolation::MissingNative { .. } => {
                 &["implement the method as a NativeKind::Bridge and register it at VM init"]
             }
-            JdkOnlyViolation::NativeShadowsBytecode { .. } => &[
-                "unregister the native, or have it reviewed and reclassified as an Intrinsic",
-            ],
-            JdkOnlyViolation::MissingBootClass { .. } => &[
-                "point --jdk-home at a complete JDK runtime image (one with lib/modules)",
-            ],
+            JdkOnlyViolation::NativeShadowsBytecode { .. } => {
+                &["unregister the native, or have it reviewed and reclassified as an Intrinsic"]
+            }
+            JdkOnlyViolation::MissingBootClass { .. } => {
+                &["point --jdk-home at a complete JDK runtime image (one with lib/modules)"]
+            }
             JdkOnlyViolation::MissingImplementation { .. } => &[
                 "the resolved method is abstract or bodiless; check the dispatch that reached it",
             ],
@@ -422,9 +421,7 @@ impl JdkOnlyViolation {
                 method,
                 descriptor,
                 native_kind,
-            } => format!(
-                "{native_kind} native shadows bytecode of {class}.{method}{descriptor}"
-            ),
+            } => format!("{native_kind} native shadows bytecode of {class}.{method}{descriptor}"),
             JdkOnlyViolation::MissingBootClass {
                 class,
                 searched_image,
@@ -577,7 +574,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(
                     &mut out,
                     &mut first,
@@ -593,7 +595,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "call_site", call_site.as_deref());
             }
             JdkOnlyViolation::MissingNative {
@@ -604,7 +611,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "module", module.as_deref());
             }
             JdkOnlyViolation::NativeShadowsBytecode {
@@ -615,7 +627,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
                 json_field(&mut out, &mut first, "native_kind", Some(*native_kind));
             }
             JdkOnlyViolation::MissingBootClass {
@@ -637,7 +654,12 @@ impl JdkOnlyViolation {
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
-                json_field(&mut out, &mut first, "descriptor", Some(descriptor.as_str()));
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "descriptor",
+                    Some(descriptor.as_str()),
+                );
             }
         }
         out.push('}');
@@ -698,7 +720,9 @@ fn is_absolute_path(token: &str) -> bool {
     let bytes = token.as_bytes();
     match bytes {
         [b'/', ..] | [b'\\', ..] => true,
-        [drive, b':', sep, ..] if drive.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\') => {
+        [drive, b':', sep, ..]
+            if drive.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\') =>
+        {
             true
         }
         _ => false,
@@ -864,10 +888,7 @@ pub enum RuntimeError {
     /// a null message on HotSpot too. Build it with the `aioobe*` constructors
     /// below rather than by hand, so the wording stays in one place.
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
-    ArrayIndexOutOfBoundsException {
-        index: i32,
-        message: Option<String>,
-    },
+    ArrayIndexOutOfBoundsException { index: i32, message: Option<String> },
     /// Plain `java.lang.IndexOutOfBoundsException` -- the SUPERCLASS of the
     /// Array/String variants above, and not interchangeable with them.
     ///
@@ -905,10 +926,7 @@ pub enum RuntimeError {
     /// nothing but that. Build it with the `sioobe_*` constructors below rather
     /// than by hand, so the wording stays in one place.
     #[error("StringIndexOutOfBoundsException: index {index}")]
-    StringIndexOutOfBoundsException {
-        index: i32,
-        message: Option<String>,
-    },
+    StringIndexOutOfBoundsException { index: i32, message: Option<String> },
 
     #[error("ClassNotFoundException: {class_name}")]
     ClassNotFoundException { class_name: String },
@@ -1479,8 +1497,12 @@ impl RuntimeError {
             RuntimeError::IllegalArgumentException { message } => {
                 ("java/lang/IllegalArgumentException", Some(message.as_str()))
             }
-            RuntimeError::IOException { message } => ("java/io/IOException", Some(message.as_str())),
-            RuntimeError::EOFException { message } => ("java/io/EOFException", Some(message.as_str())),
+            RuntimeError::IOException { message } => {
+                ("java/io/IOException", Some(message.as_str()))
+            }
+            RuntimeError::EOFException { message } => {
+                ("java/io/EOFException", Some(message.as_str()))
+            }
             RuntimeError::UnknownHostException { message } => {
                 ("java/net/UnknownHostException", Some(message.as_str()))
             }
@@ -1593,9 +1615,8 @@ mod tests {
     /// Expected text measured on HotSpot (Temurin jdk-25.0.3+9).
     #[test]
     fn payload_carrying_variants_synthesise_hotspots_message() {
-        let (cls, msg) = RuntimeError::aioobe_index_only(7)
-            .as_java_throwable()
-            .expect("AIOOBE is a Java throwable");
+        let err = RuntimeError::aioobe_index_only(7);
+        let (cls, msg) = err.as_java_throwable().expect("AIOOBE is a Java throwable");
         assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
         // `new ArrayIndexOutOfBoundsException(7)` on HotSpot — the wording for
         // a site that knows the index and not the length. An array access
@@ -1633,13 +1654,19 @@ mod tests {
             message: Some(String::new()),
         };
         let (_, msg) = npe.as_java_throwable().unwrap();
-        assert!(msg.is_none(), "an empty NPE marker means getMessage() == null");
+        assert!(
+            msg.is_none(),
+            "an empty NPE marker means getMessage() == null"
+        );
 
         let uoe = RuntimeError::UnsupportedOperationException {
             message: String::new(),
         };
         let (_, msg) = uoe.as_java_throwable().unwrap();
-        assert!(msg.is_none(), "an empty UOE message means getMessage() == null");
+        assert!(
+            msg.is_none(),
+            "an empty UOE message means getMessage() == null"
+        );
     }
 
     /// A variant that owns a message is still BORROWED, not copied — the `Cow`
@@ -1681,11 +1708,17 @@ mod tests {
             Some("Index 9 out of bounds for length 4")
         );
         assert_eq!(
-            index_only.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            index_only
+                .as_java_throwable()
+                .and_then(|(_, m)| m)
+                .as_deref(),
             Some("Array index out of range: 9")
         );
         assert_eq!(
-            reflective.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            reflective
+                .as_java_throwable()
+                .and_then(|(_, m)| m)
+                .as_deref(),
             None
         );
     }
@@ -1698,7 +1731,6 @@ mod tests {
         };
         assert!(err.as_java_throwable().is_none());
     }
-
 
     // -- VmError Display tests --
 
@@ -1895,7 +1927,7 @@ mod tests {
         let err = RuntimeError::aioobe_no_message(-1);
         assert_eq!(format!("{err}"), "ArrayIndexOutOfBoundsException: index -1");
         assert_eq!(
-            err.as_java_throwable().and_then(|(_, m)| m),
+            err.as_java_throwable().and_then(|(_, m)| m).as_deref(),
             None,
             "aioobe_no_message must produce a message-less throwable, i.e. the \
              no-arg constructor — HotSpot's reflect.Array behaviour"
@@ -1905,13 +1937,9 @@ mod tests {
     #[test]
     fn aioobe_carries_hotspots_array_access_wording() {
         let err = RuntimeError::aioobe(9, 4);
-        assert_eq!(
-            err.as_java_throwable(),
-            Some((
-                "java/lang/ArrayIndexOutOfBoundsException",
-                Some("Index 9 out of bounds for length 4")
-            ))
-        );
+        let (cls, msg) = err.as_java_throwable().expect("is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        assert_eq!(msg.as_deref(), Some("Index 9 out of bounds for length 4"));
         // The array-access wording IS `Preconditions.checkIndex`'s; if these
         // two ever diverge, one of them has been rewritten by hand.
         assert_eq!(
@@ -1925,7 +1953,7 @@ mod tests {
         // HotSpot prints the negative index verbatim rather than clamping.
         let err = RuntimeError::aioobe(-1, 4);
         assert_eq!(
-            err.as_java_throwable().and_then(|(_, m)| m),
+            err.as_java_throwable().and_then(|(_, m)| m).as_deref(),
             Some("Index -1 out of bounds for length 4")
         );
     }
@@ -1999,12 +2027,11 @@ mod tests {
             9,
             arraycopy_message::last_source_index(0, 9, "int", 4),
         );
+        let (cls, msg) = err.as_java_throwable().expect("is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
         assert_eq!(
-            err.as_java_throwable(),
-            Some((
-                "java/lang/ArrayIndexOutOfBoundsException",
-                Some("arraycopy: last source index 9 out of bounds for int[4]")
-            ))
+            msg.as_deref(),
+            Some("arraycopy: last source index 9 out of bounds for int[4]")
         );
     }
 
@@ -2442,12 +2469,14 @@ mod tests {
             let last = lines[lines.len() - 1].trim();
             let penultimate = lines[lines.len() - 2].trim();
             assert_eq!(
-                penultimate, REMEDIATION_FALLBACK,
+                penultimate,
+                REMEDIATION_FALLBACK,
                 "{}: fallback is not the penultimate line\n{rendered}",
                 v.kind()
             );
             assert_eq!(
-                last, REMEDIATION_CAPTURE,
+                last,
+                REMEDIATION_CAPTURE,
                 "{}: capture hint is not the last line\n{rendered}",
                 v.kind()
             );
@@ -2486,9 +2515,15 @@ mod tests {
             module: Some("java.base".into()),
         };
         let rendered = v.render(None, true);
-        assert!(rendered.contains("feature version: <unknown>"), "{rendered}");
+        assert!(
+            rendered.contains("feature version: <unknown>"),
+            "{rendered}"
+        );
         // The module the reporter *did* know is still named.
-        assert!(rendered.contains("module:          java.base"), "{rendered}");
+        assert!(
+            rendered.contains("module:          java.base"),
+            "{rendered}"
+        );
     }
 
     /// The three absolute forms leak the layout of the machine the run happened
@@ -2542,7 +2577,9 @@ mod tests {
         let quiet = boot.render(Some(25), false);
         assert!(!quiet.contains("/opt/jdk-25"), "{quiet}");
         assert!(quiet.contains(REDACTED), "{quiet}");
-        assert!(boot.render(Some(25), true).contains("/opt/jdk-25/lib/modules"));
+        assert!(boot
+            .render(Some(25), true)
+            .contains("/opt/jdk-25/lib/modules"));
 
         // `#[track_caller]` provenance is workspace-relative: redacting it
         // would delete the only actionable fact in the report.
@@ -2663,9 +2700,8 @@ mod tests {
 
     #[test]
     fn vm_error_invalid_configuration_display() {
-        let err = VmError::InvalidConfiguration(
-            "--jdk-only conflicts with --synthetic-jdk".to_string(),
-        );
+        let err =
+            VmError::InvalidConfiguration("--jdk-only conflicts with --synthetic-jdk".to_string());
         assert_eq!(
             format!("{err}"),
             "invalid configuration: --jdk-only conflicts with --synthetic-jdk"

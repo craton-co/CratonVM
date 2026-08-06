@@ -262,7 +262,11 @@ fn native_inflater_input_stream_read(
     let requested = args.get(3).and_then(Value::as_int).unwrap_or(0);
     let target_len = ctx.array_length(target) as i64;
     if off < 0 || requested < 0 || (off as i64) + (requested as i64) > target_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(requested) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(requested)
+        })
         .into());
     }
     if requested == 0 {
@@ -691,7 +695,11 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let arr_len = ctx.array_length(*src) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-                return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+                return Err(RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into());
             }
             let off = off as usize;
@@ -1724,7 +1732,11 @@ pub(crate) fn p58_gzip_in_read_bytes(
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let buf_len = ctx.array_length(buf) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > buf_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let (off, len) = (off as usize, len as usize);
@@ -1911,7 +1923,11 @@ pub(crate) fn p58_gzip_out_write_bytes(
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(src) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut bytes = vec![0u8; len as usize];
@@ -2564,7 +2580,11 @@ pub(crate) fn iis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(dst) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     if len == 0 {
@@ -2704,7 +2724,11 @@ pub(crate) fn dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(src) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut bytes = vec![0u8; len as usize];
@@ -3145,7 +3169,11 @@ fn copy_java_bytes(
         _ => (0, arr_len as i32),
     };
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut buf = vec![0u8; len as usize];
@@ -3170,7 +3198,11 @@ fn output_target(
         _ => (0, arr_len as i32),
     };
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     Ok(Some((dst, off as usize, len as usize)))

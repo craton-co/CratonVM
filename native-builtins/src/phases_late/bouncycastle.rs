@@ -1942,8 +1942,7 @@ impl BcSecTFieldSpec {
 }
 
 pub(crate) fn bc_sect_aioobe(index: usize) -> MethodCallFailed {
-    RuntimeError::aioobe_index_only(index.min(i32::MAX as usize) as i32)
-    .into()
+    RuntimeError::aioobe_index_only(index.min(i32::MAX as usize) as i32).into()
 }
 
 pub(crate) fn bc_read_long_array_fixed(
@@ -4448,7 +4447,9 @@ pub(crate) fn bc_gost3411_process_block(
     in_off: usize,
 ) -> MethodCallResult {
     if in_off.saturating_add(32) > ctx.array_length(input) {
-        return Err(RuntimeError::aioobe_index_only(in_off.saturating_add(31).min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(
+            in_off.saturating_add(31).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
@@ -4528,9 +4529,7 @@ pub(crate) fn register_bc_gost3411_digest(r: &mut NativeMethodRegistry) {
             let input = obj_arg(args, 1)?;
             let in_off = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
-                Some(Value::Int(v)) => {
-                    return Err(RuntimeError::aioobe_index_only(*v).into())
-                }
+                Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
                 _ => 0,
             };
             bc_gost3411_process_block(ctx, this, input, in_off)
@@ -4876,7 +4875,9 @@ pub(crate) fn bc_whirlpool_native_update_array(
     let in_off = in_off_i as usize;
     let len = len_i as usize;
     if in_off.saturating_add(len) > ctx.array_length(input) {
-        return Err(RuntimeError::aioobe_index_only(in_off.saturating_add(len).min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(
+            in_off.saturating_add(len).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
@@ -5107,7 +5108,9 @@ pub(crate) fn bc_poly1305_native_update(
     let in_off = in_off_i as usize;
     let len = len_i as usize;
     if in_off.saturating_add(len) > ctx.array_length(input) {
-        return Err(RuntimeError::aioobe_index_only(in_off.saturating_add(len).min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(
+            in_off.saturating_add(len).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
@@ -6156,17 +6159,13 @@ pub(crate) fn bc_aes_native_process_block(
     let in_arr = obj_arg(args, 1)?;
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
     let out_arr = obj_arg(args, 3)?;
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
     let wk_arr = match ctx.get_field_by_name(this, "WorkingKey") {
@@ -6275,17 +6274,13 @@ pub(crate) fn bc_sm4_native_process_block(
     let in_arr = obj_arg(args, 1)?;
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
     let out_arr = obj_arg(args, 3)?;
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
     let rk = bc_sm4_read_rk(ctx, this)?;
@@ -6382,17 +6377,13 @@ pub(crate) fn bc_xtea_native_process_block(
     let in_arr = obj_arg(args, 1)?;
     let in_off = match args.get(2) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
     let out_arr = obj_arg(args, 3)?;
     let out_off = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(v)) => {
-            return Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => 0,
     };
 
@@ -6467,17 +6458,13 @@ pub(crate) fn register_bc_gost3412_engine(r: &mut NativeMethodRegistry) {
             let in_arr = obj_arg(args, 1)?;
             let in_off = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
-                Some(Value::Int(v)) => {
-                    return Err(RuntimeError::aioobe_index_only(*v).into())
-                }
+                Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
                 _ => 0,
             };
             let out_arr = obj_arg(args, 3)?;
             let out_off = match args.get(4) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
-                Some(Value::Int(v)) => {
-                    return Err(RuntimeError::aioobe_index_only(*v).into())
-                }
+                Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
                 _ => 0,
             };
 
@@ -7523,14 +7510,10 @@ pub(crate) fn register_bc_cbc_block_cipher(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if in_off_i < 0 {
-                return Err(
-                    RuntimeError::aioobe_index_only(in_off_i).into(),
-                );
+                return Err(RuntimeError::aioobe_index_only(in_off_i).into());
             }
             if out_off_i < 0 {
-                return Err(
-                    RuntimeError::aioobe_index_only(out_off_i).into(),
-                );
+                return Err(RuntimeError::aioobe_index_only(out_off_i).into());
             }
             let in_off = in_off_i as usize;
             let out_off = out_off_i as usize;
@@ -7693,9 +7676,7 @@ pub(crate) fn register_bc_cbc_block_cipher(r: &mut NativeMethodRegistry) {
 pub(crate) fn bc_pack_offset_arg(args: &[Value], idx: usize) -> Result<usize, MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Int(v)) if *v >= 0 => Ok(*v as usize),
-        Some(Value::Int(v)) => {
-            Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => Err(RuntimeError::aioobe_index_only(-1).into()),
     }
 }
@@ -7715,9 +7696,7 @@ pub(crate) fn bc_pack_check_range(
 ) -> Result<(), MethodCallFailed> {
     let end = match off.checked_add(len) {
         Some(v) => v,
-        None => {
-            return Err(RuntimeError::aioobe_index_only(i32::MAX).into())
-        }
+        None => return Err(RuntimeError::aioobe_index_only(i32::MAX).into()),
     };
     if ctx.array_length(arr) < end {
         return Err(RuntimeError::aioobe_index_only(end as i32).into());
@@ -7777,9 +7756,7 @@ pub(crate) fn bc_pack_check_int_array(
 ) -> Result<(), MethodCallFailed> {
     let end = match off.checked_add(len) {
         Some(v) => v,
-        None => {
-            return Err(RuntimeError::aioobe_index_only(i32::MAX).into())
-        }
+        None => return Err(RuntimeError::aioobe_index_only(i32::MAX).into()),
     };
     if ctx.array_length(arr) < end {
         return Err(RuntimeError::aioobe_index_only(end as i32).into());
@@ -8299,8 +8276,7 @@ pub(crate) fn bc_blake2s_int_array_field(
         _ => return Err(bc_blake2s_bad_state("Blake2sDigest: missing array field")),
     };
     if ctx.array_length(arr) < min_len {
-        return Err(RuntimeError::aioobe_index_only(min_len as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(min_len as i32).into());
     }
     Ok(arr)
 }
@@ -8363,23 +8339,15 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
             let message_arr = obj_arg(args, 1)?;
             let message_pos = match args.get(2) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
-                Some(Value::Int(v)) => {
-                    return Err(RuntimeError::aioobe_index_only(*v).into())
-                }
+                Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
                 _ => return Err(RuntimeError::aioobe_index_only(-1).into()),
             };
             let end = match message_pos.checked_add(64) {
                 Some(v) => v,
-                None => {
-                    return Err(
-                        RuntimeError::aioobe_index_only(i32::MAX).into(),
-                    )
-                }
+                None => return Err(RuntimeError::aioobe_index_only(i32::MAX).into()),
             };
             if ctx.array_length(message_arr) < end {
-                return Err(
-                    RuntimeError::aioobe_index_only(end as i32).into(),
-                );
+                return Err(RuntimeError::aioobe_index_only(end as i32).into());
             }
 
             let chain_arr = bc_blake2s_int_array_field(ctx, this, "chainValue", 8)?;
@@ -8448,9 +8416,7 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
             let pos = |idx: usize| -> Result<usize, MethodCallFailed> {
                 match args.get(idx) {
                     Some(Value::Int(v)) if (0..16).contains(v) => Ok(*v as usize),
-                    Some(Value::Int(v)) => {
-                        Err(RuntimeError::aioobe_index_only(*v).into())
-                    }
+                    Some(Value::Int(v)) => Err(RuntimeError::aioobe_index_only(*v).into()),
                     _ => Err(RuntimeError::aioobe_index_only(-1).into()),
                 }
             };
@@ -8748,9 +8714,7 @@ pub(crate) fn register_bc_keccak_digest(r: &mut NativeMethodRegistry) {
         let data_arr = obj_arg(args, 1)?;
         let off = match args.get(2) {
             Some(Value::Int(v)) if *v >= 0 => *v as usize,
-            Some(Value::Int(v)) => {
-                return Err(RuntimeError::aioobe_index_only(*v).into())
-            }
+            Some(Value::Int(v)) => return Err(RuntimeError::aioobe_index_only(*v).into()),
             _ => return Err(RuntimeError::aioobe_index_only(-1).into()),
         };
         let rate = bc_keccak_int_field(ctx, this, "rate")?;
@@ -8792,8 +8756,7 @@ pub(crate) fn register_bc_keccak_digest(r: &mut NativeMethodRegistry) {
             out[i * 8..i * 8 + 8].copy_from_slice(&state[i].to_le_bytes());
         }
         if !ctx.write_byte_array_from(data_queue, 0, &out) {
-            return Err(RuntimeError::aioobe_index_only(out.len() as i32)
-            .into());
+            return Err(RuntimeError::aioobe_index_only(out.len() as i32).into());
         }
         ctx.set_field_by_name(this, "bitsInQueue", Value::Int(rate));
         Ok(None)
@@ -9269,8 +9232,7 @@ pub(crate) fn bc_clone_byte_array_range(
         return Err(RuntimeError::aioobe_index_only(i32::MAX).into());
     };
     if end > src_len {
-        return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32).into());
     }
     let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
     if len != 0 {
@@ -9680,8 +9642,7 @@ pub(crate) fn bc_argon2_block_words(
         }
     };
     if ctx.array_length(words) < BC_ARGON2_BLOCK_QWORDS {
-        return Err(RuntimeError::aioobe_index_only(BC_ARGON2_BLOCK_QWORDS as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(BC_ARGON2_BLOCK_QWORDS as i32).into());
     }
     Ok(words)
 }
@@ -9752,9 +9713,7 @@ pub(crate) fn bc_argon2_fillblock_block_field(
 pub(crate) fn bc_argon2_round_index(args: &[Value], idx: usize) -> Result<usize, MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Int(v)) if (0..BC_ARGON2_BLOCK_QWORDS as i32).contains(v) => Ok(*v as usize),
-        Some(Value::Int(v)) => {
-            Err(RuntimeError::aioobe_index_only(*v).into())
-        }
+        Some(Value::Int(v)) => Err(RuntimeError::aioobe_index_only(*v).into()),
         _ => Err(RuntimeError::aioobe_index_only(-1).into()),
     }
 }

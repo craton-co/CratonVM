@@ -803,9 +803,7 @@ fn native_unsafe_set_memory_consolidated(
                 if crate::unsafe_array_write_bytes(ctx, obj_ref, off, &fill) {
                     return Ok(None);
                 }
-                return Err(
-                    RuntimeError::aioobe_index_only(off as i32).into(),
-                );
+                return Err(RuntimeError::aioobe_index_only(off as i32).into());
             }
             // Object-field (non-array) target. `bytes` is treated as a slot
             // count in this slot-based model, so it MUST be bounded by the
@@ -949,8 +947,7 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
             .into());
         }
         if !crate::unsafe_array_write_bytes(ctx, dst_obj, dst_addr as usize, &buf) {
-            return Err(RuntimeError::aioobe_index_only(dst_addr as i32)
-            .into());
+            return Err(RuntimeError::aioobe_index_only(dst_addr as i32).into());
         }
         return Ok(None);
     }
@@ -1177,8 +1174,7 @@ pub(crate) fn native_unsafe_define_class(
     };
     let arr_len = ctx.array_length(byte_array);
     if off.saturating_add(len) > arr_len {
-        return Err(RuntimeError::aioobe_index_only(off.saturating_add(len) as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(off.saturating_add(len) as i32).into());
     }
     let mut bytes = Vec::with_capacity(len);
     for i in 0..len {

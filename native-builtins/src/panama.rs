@@ -1198,8 +1198,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 .checked_add(count)
                 .map_or(true, |end| end > length)
             {
-                return Err(RuntimeError::aioobe_index_only(src_index as i32)
-                .into());
+                return Err(RuntimeError::aioobe_index_only(src_index as i32).into());
             }
             let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
             let width = ffi::layout_byte_size(kind) as i64;

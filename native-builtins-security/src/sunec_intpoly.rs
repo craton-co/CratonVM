@@ -125,17 +125,14 @@ fn read_limbs(
     name: &str,
 ) -> Result<[u64; NUM_LIMBS], cratonvm_types::error::MethodCallFailed> {
     if ctx.array_length(arr) < NUM_LIMBS {
-        return Err(RuntimeError::aioobe_index_only(NUM_LIMBS as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(NUM_LIMBS as i32).into());
     }
     let mut out = [0u64; NUM_LIMBS];
     for (i, slot) in out.iter_mut().enumerate() {
         match ctx.get_array_element(arr, i) {
             Value::Long(v) => *slot = v as u64,
             // A non-long element means the caller passed the wrong array kind.
-            _ => {
-                return Err(RuntimeError::aioobe_index_only(i as i32).into())
-            }
+            _ => return Err(RuntimeError::aioobe_index_only(i as i32).into()),
         }
     }
     Ok(out)
@@ -147,8 +144,7 @@ fn write_limbs(
     limbs: &[i64; NUM_LIMBS],
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if ctx.array_length(arr) < NUM_LIMBS {
-        return Err(RuntimeError::aioobe_index_only(NUM_LIMBS as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(NUM_LIMBS as i32).into());
     }
     for (i, v) in limbs.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(*v));

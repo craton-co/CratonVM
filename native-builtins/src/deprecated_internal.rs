@@ -548,8 +548,7 @@ fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     // Validate bounds
     if offset.saturating_add(length) > arr_len {
-        return Err(RuntimeError::aioobe_index_only((offset + length) as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only((offset + length) as i32).into());
     }
 
     // Extract bytes

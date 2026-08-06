@@ -1861,10 +1861,7 @@ fn matcher_group_boundary(
     };
 
     if idx >= re.captures_len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32)
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
     }
 
     // Fast path: reuse `find()`'s cached capture-group spans for this match
@@ -1913,10 +1910,7 @@ pub(crate) fn native_matcher_start_idx(
     let idx = match args.get(1) {
         Some(Value::Int(i)) if *i >= 0 => *i as usize,
         Some(Value::Int(i)) => {
-            return Err(
-                cratonvm_types::error::RuntimeError::aioobe_index_only(*i)
-                    .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(*i).into());
         }
         _ => 0,
     };
@@ -1942,10 +1936,7 @@ pub(crate) fn native_matcher_end_idx(
     let idx = match args.get(1) {
         Some(Value::Int(i)) if *i >= 0 => *i as usize,
         Some(Value::Int(i)) => {
-            return Err(
-                cratonvm_types::error::RuntimeError::aioobe_index_only(*i)
-                    .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(*i).into());
         }
         _ => 0,
     };

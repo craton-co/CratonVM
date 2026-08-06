@@ -21014,13 +21014,11 @@ fn native_string_latin1_inflate(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut bytes = vec![0u8; count];
     let read = ctx.read_byte_array_into(src, src_off as usize, &mut bytes);
     if read != count {
-        return Err(RuntimeError::aioobe_index_only(src_off + read as i32)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(src_off + read as i32).into());
     }
     let chars: Vec<u16> = bytes.into_iter().map(u16::from).collect();
     if !ctx.write_char_array_from(dst, dst_off as usize, &chars) {
-        return Err(RuntimeError::aioobe_index_only(dst_off + count as i32 - 1)
-        .into());
+        return Err(RuntimeError::aioobe_index_only(dst_off + count as i32 - 1).into());
     }
     Ok(None)
 }
@@ -21124,8 +21122,7 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
         };
         let len = ctx.array_length(arr);
         if index >= len {
-            return Err(RuntimeError::aioobe_index_only(index as i32)
-            .into());
+            return Err(RuntimeError::aioobe_index_only(index as i32).into());
         }
         let val = match ctx.get_array_element(arr, index) {
             Value::Int(v) => v & 0xff,
@@ -21716,17 +21713,11 @@ fn native_arraylist_element_data(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 Some(Value::Int(v)) => *v,
                 _ => -1,
             };
-            return Err(
-                cratonvm_types::error::RuntimeError::aioobe_index_only(bad)
-                    .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(bad).into());
         }
     };
     if idx >= ctx.array_length(data) {
-        return Err(
-            cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32)
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
     }
     Ok(Some(ctx.get_array_element(data, idx)))
 }
@@ -21808,10 +21799,7 @@ fn range_bounds(
     }
     let len = ctx.array_length(arr);
     if from < 0 || (to as usize) > len {
-        return Err(
-            cratonvm_types::error::RuntimeError::aioobe_index_only(from)
-                .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(from).into());
     }
     Ok((from as usize, to as usize))
 }

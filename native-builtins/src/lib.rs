@@ -17731,7 +17731,11 @@ pub fn register_essential_natives_with_shims(
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let dest_len = ctx.array_length(dest) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
-                return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
+                return Err(RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into());
             }
             let pos_idx = ctx
@@ -20629,10 +20633,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         };
         let total = ctx.array_length(arr);
         if from > to || to > total {
-            return Err(
-                cratonvm_types::error::RuntimeError::aioobe_index_only(to as i32)
-                .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(to as i32).into());
         }
         let len = to - from;
         let mut hex = String::with_capacity(len * 2);
@@ -37497,15 +37498,24 @@ fn native_arraylist_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> i32 {
 fn native_arraylist_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let len = native_arraylist_size(ctx, this);
-    let mut cursor = match args.get(1) {
-        Some(Value::Int(v)) => *v,
+    // Three registrations share this body: `listIterator()`, `iterator()` and
+    // `listIterator(I)`. Only the last one has an index, and it must be
+    // REJECTED when out of range, not clamped into it —
+    // `ArrayList.rangeCheckForAdd` throws the plain
+    // `IndexOutOfBoundsException` with the comma wording ("Index: 5, Size: 2"),
+    // measured on Temurin 25. Clamping returned an iterator positioned at
+    // `size` instead, so a caller that expected the throw silently got an
+    // exhausted iterator. The no-arg forms pass no argument, hence the test on
+    // presence rather than on value.
+    let cursor = match args.get(1) {
+        Some(Value::Int(v)) => {
+            if *v < 0 || *v > len {
+                return Err(RuntimeError::ioobe(format!("Index: {v}, Size: {len}")).into());
+            }
+            *v
+        }
         _ => 0,
     };
-    if cursor < 0 {
-        cursor = 0;
-    } else if cursor > len {
-        cursor = len;
-    }
 
     let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5);
     let (cursor_slot, last_ret_slot, expected_slot, parent_list_slot, child_list_slot) =
@@ -38712,8 +38722,18 @@ fn array_new_instance_for_component(
 }
 
 fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `.max(0)` CLAMPED a negative length and returned an empty array, so
+    // `Array.newInstance(int.class, -1)` handed back an `int[0]` where HotSpot
+    // throws. Measured on Temurin 25: `NegativeArraySizeException` whose detail
+    // message is the size alone, with no prose — the same text `new int[-1]`
+    // produces, which is why the variant builds it from the payload rather than
+    // taking a string. Same shape as the missing bounds check on the accessors:
+    // an out-of-range argument silently accepted.
     let len = match args.get(1) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
+        Some(Value::Int(v)) if *v < 0 => {
+            return Err(RuntimeError::NegativeArraySizeException { size: *v }.into());
+        }
+        Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
     let (comp_name, component_id) = array_new_instance_component(ctx, args.first());

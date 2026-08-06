@@ -3333,16 +3333,12 @@ pub(crate) fn cl_define_class_basic(
     // Safe integer handling: reject negative offset/length (i32 → usize)
     let offset = match args.get(3) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::aioobe_index_only(-1).into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => 0,
     };
     let length = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::aioobe_index_only(-1).into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => array_len,
     };
 
@@ -3953,9 +3949,9 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::aioobe_index_only((off as i32).max(0)),
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4098,9 +4094,9 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::aioobe_index_only((off as i32).max(0)),
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4349,7 +4345,9 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "Unsafe.defineClass({name_str}): offset/length out of bounds \
              (off={offset}, len={length}, array={array_len}) — throwing AIOOBE"
         );
-        return Err(RuntimeError::aioobe_index_only(offset.saturating_add(length).min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(
+            offset.saturating_add(length).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
