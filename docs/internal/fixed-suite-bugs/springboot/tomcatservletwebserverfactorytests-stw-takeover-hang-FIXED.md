@@ -1,47 +1,134 @@
-# `TomcatServletWebServerFactoryTests`: intermittent STW cross-thread JIT takeover hang
+# `TomcatServletWebServerFactoryTests`: intermittent STW cross-thread JIT takeover hang — RESOLVED
 
-**Status: OPEN — REGRESSED 2026-08-05.** Previously root-caused and fixed
-2026-07-27, on branch `fix/tomcat-stw-takeover-20260726`. Filed 2026-07-26
-while verifying
-`tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md` (`fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`).
+**Status: FIXED 2026-07-27 (`fix/tomcat-stw-takeover-20260726`); the
+2026-08-05 "REGRESSED" note is WITHDRAWN 2026-08-06.** The July root cause and
+fix stand. The 08-05 sighting was one full-suite observation on a binary that
+predates `383e7f5cf`, and it does not survive a controlled rerun: **72 runs**
+across two binaries produced **zero** STW takeover stalls, with the census
+instrumentation demonstrably live throughout (126 logs carry its `[stw-arrive]`
+lines).
 
-## Regression note (2026-08-05)
+## Why the regression note was withdrawn
 
-Full-suite rerun `craton-fullsuite-azure-20260805-s8` (all-jit) hit the
-300s timeout ceiling on this class again:
-`apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-azure-20260805-s8/all-jit/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests.{out,err}.log`.
+The note read a class going silent past the 300s shard ceiling as "the same
+'everything froze mid-stream' signature as the original bug". Three things
+undercut that, and none of them was available to that session:
 
-The `.out.log` shows steady per-test progress (repeated
-`Tomcat initialized with port 0 (http)` / connector start/stop cycles,
-consistent with `132` short-lived embedded-Tomcat lifecycles) reaching at
-least connector instance `http-nio-auto-112` before output simply stops —
-no `SBRUNNER_RESULT` line, no JUnit summary, no further log lines of any
-kind (not even the recurring `[moving-young]` GC warnings that appear
-throughout the rest of the run). That is the same "everything froze
-mid-stream, not just slowed down" signature as the original bug, not a
-slow-but-progressing run. HotSpot passes this class in 75.7s (132/132,
-`hotspot-baseline-latest.tsv` row 136); a genuine host-load slowdown would
-still be producing periodic log output, not going silent.
+**1. The binary it was observed on had a different, suite-wide silent-failure
+mechanism.** `craton-fullsuite-azure-20260805-s8` ran `1078f6f05c`, which
+predates `383e7f5cf` — *a recycled `JitInvokeInfo` address let one call site
+serve another's dispatch*. On that binary a compiled call site can inherit the
+previous site's native resolution and return its value, which killed classes
+across the suite with no fixed face and, in the Flyway case, with no result line
+at all (see `flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`
+and the four Mockito/ByteBuddy pages retired against the same commit). "No
+`SBRUNNER_RESULT`, output stops" was not a signature unique to STW on that
+binary; it was the week's most common failure mode.
 
-`ps aux` on the host at investigation time showed no lingering/orphaned
-`cratonvm` process at this run's exact binary path — ruling out the
-"runner's timeout-kill failed to reap it" confound — but did show several
-*other* concurrent `cratonvm`/`cargo build` processes from unrelated
-sessions, so this is plausibly (not confirmed) a genuine STW deadlock,
-recurring either because a *different* blocking native (not one of the
-four SSL-stream natives + accept paths the 2026-07-27 fix bracketed) is
-now missing its `begin_blocking_region()`/`end_blocking_region()` bracket,
-or because the fix regressed. Not re-root-caused this session — the
-2026-07-27 fix's own diagnostic recipe
-(`CRATONVM_DBG_STW_CENSUS=1 CRATONVM_DBG_VM_STATE=1` against a live hung
-process, naming the exact `pending=1,blocked=false` native via
-`state="native:<class>.<method><desc>"`) is the fastest way to confirm and
-localize this on the next pass.
+**2. The bug has a named, positive signature, and it never fired.** The July
+investigation left the exact instrument for this:
+`CRATONVM_DBG=stw-census,vm-state` makes the round-64 census print
+`[stw-census] rounds=64 pending=1 taken=0 ...` and name the holdout native. It
+was enabled for **every** run below. `STW cross-thread JIT takeover is still
+waiting for cooperative mutators` appears **zero** times.
 
-## Original fix (2026-07-27), left as written below
+That silence is meaningful because the instrument was verified live rather than
+assumed: the same logs carry 19–20 `[stw-arrive]` lines each, and one
+non-completing run's *final* line is `[stw-arrive] tid=0 gen=6 arrived=4
+expected=4` — the STW barrier completing, `arrived == expected`. That is the
+exact inverse of the `pending=1 taken=0` this page documents.
 
-The same session closed every other CratonVM-specific failure in this test
-class, taking it from **129/132 with an intermittent hang** to **132/132**.
+**3. Every non-completing run in the rerun was the host, and provably so.**
+
+## The rerun
+
+Fixture `/data/data/springboot-jsonreader-deprecation-20260718`, one process per
+class, the runner's own craton knobs (`CRATONVM_REAL=net-sockets,aqs`,
+`CRATONVM_THREADS=-default-watchdog`, `CRATONVM_JIT=rootsnap-cache`),
+`--Xmx 4g`, `CRATONVM_DBG=stw-census,vm-state`. "ssl-subset stress" is this
+page's own harness: the class's `ssl*` methods repeated 4x in one JVM.
+
+| Arm | `origin/dev` (`c9fc71c9a`) | the 08-05 suite binary (`1078f6f05c`) |
+|---|---|---|
+| ssl-subset stress | 24 runs — 22 completed, all 32/32 | 10 runs — 8 completed, all 32/32 |
+| full class, sequential | 12 runs — 9 completed, all 132/132 | 8 runs — 5 completed, all 132/132 |
+| full class, **6 JVMs at once x 3 rounds** — the shard's shape | 18 runs — **18/18 at 132/132** | — |
+| **STW takeover stalls** | **0** | **0** |
+
+The 12 runs that did not complete are all in one host-OOM band, dissected below;
+every one of them was still writing output when its cap fired.
+
+Both binaries' arms ran **concurrently** so they shared one load regime; on this
+host a serial A/B is not a measurement.
+
+### The non-completing runs are a host OOM episode, not hangs
+
+Six runs (three per binary) hit the 900s cap. They are not distributed — they
+fall in one wall-clock band, the *same* band on both binaries:
+
+| | dev tip | 08-05 binary |
+|---|---|---|
+| before | runs 1–3 OK (00:46–00:56) | runs 1–2 OK (00:52–00:57) |
+| **the band** | **4, 5, 6 killed** (01:10, 01:26, 01:41) | **3, 4, 5 killed** (01:11, 01:26, 01:42) |
+| after | runs 7–8 OK (01:56, 01:59) | runs 6–8 OK (01:56–02:04) |
+
+Those kill times are exactly 900s apart: every one burned its full cap. Outside
+the band the same class completes in 4–5 minutes on both binaries.
+
+What the band was: `dmesg` records system-wide OOM from 01:46:17 to 01:53:55 —
+the kernel killed another session's `rustc` twice, plus `systemd` and
+`(sd-pam)`. Load average reached **229**; memory sat at 30 of 31 GB used with
+1 GB available. **No `cratonvm` process was OOM-killed** (0 hits in `dmesg`), so
+these are starvation, not death.
+
+And they were still running when killed, which is the point this page's own
+symptom section turns on. Its signature is *"output simply stops — no further
+log lines of any kind, not even the recurring `[moving-young]` GC warnings"*.
+Here the final line at the kill instant is fresh output in every case: a Tomcat
+connector line, a `cratonvm_gc` WARN, a `[stress] BEGIN` marker, or the
+`[stw-arrive] ... arrived=4 expected=4` above. Slowed to a crawl by a box under
+15x its core count, not frozen.
+
+### The concurrent arm's first result was my own harness, and it is worth recording
+
+The 6-JVM arm above is the second run of it. The **first** returned
+`persistSession` failing in **9 of 18** runs:
+
+```
+AssertionFailedError: [Session error s1=null:… s2=…:… s3=null:…]
+expected: "1785986620417" but was: "null"
+  AbstractServletWebServerFactoryTests.persistSession:819
+```
+
+A reproducible 50% failure under concurrency looks exactly like a real
+concurrency defect, and it is not one. Spring Boot's `ApplicationTemp` derives
+the session store's path from `java.io.tmpdir`, so six concurrent copies of the
+**same** class shared one store and clobbered each other's `SESSIONS.ser`. This
+page's own reproduction recipe sets `TMPDIR` to a per-run scratch directory —
+that line is load-bearing, and I had dropped it when rebuilding the harness.
+
+Giving each process its own `TMPDIR` + `-Djava.io.tmpdir` took the same arm,
+same binary, same host, from 9/18 failing to **18/18 at 132/132**. Sequential
+arms never showed it, because they never overlap. If you fan this class out,
+isolate the temp directory.
+
+## What this page is still good for
+
+The 2026-07-27 root cause, fix and diagnostic below are unchanged and remain the
+reference for this bug class. In particular the **reusable lesson** stands: for
+any `pending=N taken=0` STW stall, go straight to
+`CRATONVM_DBG=stw-census,vm-state`; the census names the exact native the
+holdout sits in (`state="native:<class>.<method><desc>"`) and marks it
+`blocked=false` against a sea of `blocked=true` peers.
+
+The 08-05 note also adds a trap worth keeping: **"no result line" is not a
+signature.** Before reading silence as a specific bug, run the instrument that
+would name that bug, and check it is live — and check what else the binary in
+question was known to do silently.
+
+---
+
+# Original record (2026-07-27), left as written
 
 ## Symptom
 
@@ -77,8 +164,8 @@ deadlock: STW waits on the client thread, the client thread waits on the
 server thread, the server thread waits for STW to finish.
 
 Same bug shape as several prior fixes here
-(`../keycloak/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`,
-`../wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`, the
+(`keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`,
+`wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`, the
 `net_phase_e` `HttpClient` fix): a blocking native call missing the
 blocking-region bracket its sibling call sites already had.
 
@@ -141,11 +228,7 @@ barrier stops waiting for).
   both callers of `s2_blocking_accept` (`ServerSocketChannel.accept`,
   `ServerSocket.accept`) now bracket the unbounded blocking accept.
 
-## Verification
-
-`module/spring-boot-tomcat`, `TomcatServletWebServerFactoryTests`, JDK 25,
-Azure Linux host. "ssl-subset stress" = the 16 `ssl*` methods repeated 4× in
-one JVM, which concentrates HTTPS connector churn without lengthening a run.
+## Verification (2026-07-27)
 
 | Binary | Harness | Runs | STW hangs |
 |---|---|---|---|
@@ -161,17 +244,11 @@ sample. Zero recurrences post-fix across 56 runs.
 
 Test outcomes on the final binary: **132/132 PASS on every one of 20
 consecutive full-class runs**, and 0 failures across 24 ssl-subset stress runs
-(96 executions of the 16 `ssl*` methods). `origin/dev` fails the same class
-3/132 on every run plus one intermittent — see below.
+(96 executions of the 16 `ssl*` methods).
 
-`cargo test -p cratonvm-native-builtins -p cratonvm-native-io --lib`:
-3098 passed / 5 failed — the identical 5 failures a pristine `origin/dev`
-build produces (`cglib_enhancer`, `lang_string`, `logmanager` ×2,
-`regex_matcher`), i.e. no regression.
+## Residuals also fixed in 2026-07-27 (this class went to 132/132)
 
-## Residuals also fixed (this class is now 132/132)
-
-`origin/dev` fails this class 3/132 every run, plus one intermittent. All four
+`origin/dev` failed this class 3/132 every run, plus one intermittent. All four
 were real VM bugs, not environment artifacts.
 
 ### 1. `persistSession`, `getValidSessionStoreWhenSessionStoreNotSet`
@@ -245,23 +322,24 @@ pending entry already consumed. Fixed by pinning across the region — precisely
 the hazard `new13_do_create_socket`'s own blocking-region comment describes,
 at the sibling call site that never got the same treatment.
 
-## Reproduction (pre-fix)
+## Reproduction harness
 
 ```
 cd module/spring-boot-tomcat
-export CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_ROOTSNAP_CACHE=1
-export CRATONVM_DBG_STW_CENSUS=1 CRATONVM_DBG_VM_STATE=1   # names the holdout thread
+export CRATONVM_REAL=net-sockets,aqs CRATONVM_THREADS=-default-watchdog CRATONVM_JIT=rootsnap-cache
+export CRATONVM_DBG=stw-census,vm-state   # names the holdout thread
 export TMPDIR=/data/tmp/<scratch>
 <cratonvm-exe> --java-home <jdk25> --Xmx 2g \
   -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Djava.io.tmpdir=/data/tmp/<scratch> \
   -cp <module classpath> SbRunner org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests
 ```
 
-Restricting the selection to the `ssl*` methods and repeating it several times
-in one JVM raises the hit rate to roughly 1 in 3-4 without lengthening a run.
+Restricting the selection to the `ssl*` methods and repeating them several
+times in one JVM raised the pre-fix hit rate to roughly 1 in 3-4 without
+lengthening a run.
 
 ## Affected classes
 
 | Module | Class | Outcome |
 |---|---|---|
-| `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests` | **132/132 PASS**; no STW hang in 32 post-fix runs |
+| `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests` | **132/132 PASS**; no STW stall in 72 further runs on 2026-08-06 |
