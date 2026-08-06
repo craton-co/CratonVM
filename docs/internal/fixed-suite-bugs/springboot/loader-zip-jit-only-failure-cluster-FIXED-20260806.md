@@ -9,9 +9,9 @@
 | 1 | the loader/zip header cluster (4 classes) | **CLOSED** - `4972cd9c91`, the mistyped `Unsafe` base offsets |
 | 2 | the same defect's **second door** | **FIXED 08-05** - `4ac429f2f`, `set_static_shared` seeded statics with a blanket `Value::Int(0)` |
 | 3 | `ZipContentTests` | **CLOSED - not a VM bug.** A disk-capacity failure; guarded in the oracle so it cannot be re-filed |
-| 4 | `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | **MOVED OUT 08-06**, still open - see below |
+| 4 | `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | **MOVED OUT 08-06**, and RESOLVED later the same day - see below |
 
-## Why this page is retired with one item still open
+## Why this page is retired with one item moved out
 
 Item 4 was never part of this cluster's defect. It shared only the
 "`--nojit` passes" signature, which is what put it here; it is an OSR
@@ -20,7 +20,11 @@ Keeping it here made three fixed items read as unfinished and made the open one
 read as part of a solved cluster.
 
 It now has its own page, carrying its own evidence:
-[`known-issues/springboot/origintrackedyamlloader-osr-miscompile-20260806.md`](../../../known-issues/springboot/origintrackedyamlloader-osr-miscompile-20260806.md).
+[`origintrackedyamlloader-osr-miscompile-RESOLVED-20260806`](origintrackedyamlloader-osr-miscompile-RESOLVED-20260806.md).
+It is no longer open, and it is **not** an OSR miscompile: both known OSR
+seed-invariant shapes are excluded by measurement, and the failure is
+attributed to the recycled-`JitInvokeInfo` defect `383e7f5cf` fixed on
+2026-08-05. The sentence below is what this page knew before that.
 
 **What 2026-08-06 added to it**, before the split: the mechanism it was
 attributed to - System V's smaller register pool forcing coalescing - is now
@@ -28,8 +32,8 @@ controllable on any host (`CRATONVM_JIT_LOCAL_REGS`), and the OSR entry-seed
 invariants are now checkable (`CRATONVM_DBG_OSR_SEED_COLLISION`). The test
 passes at 7, 5, 4 and 3 local registers, and 1038 takeable OSR entries across
 234 methods show zero violations of either invariant. So a Windows green is no
-longer the vacuous result it used to be. Still no fix and no attribution - see
-that page for what that does and does not mean, and
+longer the vacuous result it used to be. That elimination is what pointed the
+attribution elsewhere - see that page, and
 [`internal/fixed-suite-bugs/jit/osr-seed-invariants-instrumented-20260806.md`](../jit/osr-seed-invariants-instrumented-20260806.md)
 for the instruments.
 

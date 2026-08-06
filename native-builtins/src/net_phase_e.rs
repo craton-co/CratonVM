@@ -11619,8 +11619,41 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // collection, but the copied ObjectRefs above do not get rewritten
             // afterwards.  Retaining them later could publish a recycled
             // receiver into the TLS manager table.
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
+            //
+            // FIX (jdkclienthttprequestfactory-certificaterequired-alert):
+            // that ordering alone was NOT enough, because the FIRST helper
+            // re-enters Java — `attach_trust_managers_to_ctx` calls
+            // `getAcceptedIssuers()` on every manager (and pins the managers,
+            // but nothing else). A young collection landing in there leaves
+            // `this` and `kms_arr` naming vacated slots. Measured on Windows
+            // with `CRATONVM_DBG_GC_STRESS=1048576`, inside ONE `init` call:
+            //
+            //   attach_trust_managers_to_ctx  key=4754528796672
+            //   attach_key_managers_to_ctx    key=40643275522048 count=0
+            //
+            // Two different side-table keys for the same `SSLContext`, and a
+            // `KeyManager[]` whose length read back as 0 — so the key managers
+            // and the mTLS identity were filed under a recycled object's key
+            // (and, at count=0, `attach_key_managers_to_ctx` REMOVED the real
+            // entry) while every later lookup — `ctx_identity`,
+            // `ctx_key_managers_table` — used the true key and missed. A
+            // client built from such a context presents NO certificate, and a
+            // server that demands one answers `CertificateRequired`.
+            //
+            // Root all three through a handle scope and re-read them before
+            // each use; the scope closes on early return and on unwind.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let kms_h = kms_arr.map(|a| scope.root(a));
+            let tms_h = tms_arr.map(|a| scope.root(a));
+            let this_now = scope.get(&this_h);
+            let tms_now = tms_h.as_ref().map(|h| scope.get(h));
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            let this_now = scope.get(&this_h);
+            let kms_now = kms_h.as_ref().map(|h| scope.get(h));
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            let ctx = &mut scope;
+            let kms_arr = kms_h.as_ref().map(|h| ctx.get(h));
             // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
             // the KeyManager[] this call actually received (immune to an
             // intervening, unrelated SSLContext.init draining the
@@ -11632,8 +11665,11 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // context's cert+key rather than the process-global slot, so an
             // in-process server and client don't clobber each other.
             let resolved_identity =
-                crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_arr);
-            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
+                crate::x509_manager::resolved_identity_pem_for_key_manager_array(&mut **ctx, kms_arr);
+            // Re-read through the handle rather than reusing the copy from the
+            // top of the method: the two attaches above allocate.
+            let this = ctx.get(&this_h);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
             // Stash the actual TrustManager objects passed here (may include a
             // revocation-aware PKIXRevocationChecker attached by
             // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom

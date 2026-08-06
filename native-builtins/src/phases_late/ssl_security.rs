@@ -1398,15 +1398,46 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(array)) => Some(array),
                 _ => None,
             };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
+            // FIX (jdkclienthttprequestfactory-certificaterequired-alert):
+            // "capture before any helper can allocate" is not enough, because
+            // the FIRST helper allocates — `attach_trust_managers_to_ctx`
+            // calls `getAcceptedIssuers()` on every manager. From that point
+            // on `this`, `km_arg` and `tm_arg` all name vacated slots, so the
+            // second attach files the KeyManagers under a recycled object's
+            // key (measured: two different keys inside one `init`, and a
+            // `KeyManager[]` reading back length 0) and the field writes below
+            // plant stale references in a live object. Root all three and
+            // re-read at every use. Same defect, same call, as the sibling
+            // handler in `net_phase_e.rs` — see its comment for the numbers.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let kms_h = kms_array.map(|a| scope.root(a));
+            let tms_h = tms_array.map(|a| scope.root(a));
+            let sr_h = match sr_arg {
+                Value::Object(Some(o)) => Some(scope.root(o)),
+                _ => None,
+            };
+            let this_now = scope.get(&this_h);
+            let tms_now = tms_h.as_ref().map(|h| scope.get(h));
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            let this_now = scope.get(&this_h);
+            let kms_now = kms_h.as_ref().map(|h| scope.get(h));
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            let ctx = &mut scope;
 
             // FIX (es-restclient-https): if the supplied TrustManager[] is
             // bound to an explicit KeyStore (a custom truststore, not the
             // default), capture its trust anchors keyed by THIS SSLContext's
             // identity so getSocketFactory()/createSocket can add them to
             // the native-tls connector. See `p68_extract_trust_manager_roots`.
-            let extra_roots = p68_extract_trust_manager_roots(ctx, tm_arg);
+            let tm_arg = match tms_h.as_ref().map(|h| ctx.get(h)) {
+                Some(a) => Value::Object(Some(a)),
+                None => Value::Object(None),
+            };
+            let extra_roots = p68_extract_trust_manager_roots(&mut **ctx, tm_arg);
+            // `p68_extract_trust_manager_roots` re-enters Java, so the address
+            // this table is keyed by has to be taken from the handle AFTER it.
+            let this = ctx.get(&this_h);
             let ctx_key = this.as_ptr() as usize;
             if let Some(roots) = extra_roots.clone() {
                 p68_ctx_trust_roots_table().lock().insert(ctx_key, roots);
@@ -1437,6 +1468,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .into());
             }
 
+            // Every reference written here comes from a handle, not from the
+            // pre-allocation copies: `new13_build_connector` and the reads
+            // above can have moved all of them, and storing a stale reference
+            // into a live object's field plants a dangling root.
+            let this = ctx.get(&this_h);
+            let from_handle = |h: Option<&cratonvm_native_api::NativeHandle>,
+                               ctx: &cratonvm_native_api::NativeHandleScope|
+             -> Value {
+                match h.map(|h| ctx.get(h)) {
+                    Some(a) => Value::Object(Some(a)),
+                    None => Value::Object(None),
+                }
+            };
+            let km_arg = from_handle(kms_h.as_ref(), ctx);
+            let tm_arg = from_handle(tms_h.as_ref(), ctx);
+            let sr_arg = from_handle(sr_h.as_ref(), ctx);
             ctx.set_field(this, NEW13_CTX_KM, km_arg);
             ctx.set_field(this, NEW13_CTX_TM, tm_arg);
             ctx.set_field(this, NEW13_CTX_RANDOM, sr_arg);
@@ -1448,9 +1495,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // transfers, a Java-supplied TrustManager is retained only in the
             // synthetic fields and HttpURLConnection silently falls back to
             // the platform verifier.
+            let kms_array = kms_h.as_ref().map(|h| ctx.get(h));
             let resolved_identity =
-                crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_array);
-            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
+                crate::x509_manager::resolved_identity_pem_for_key_manager_array(
+                    &mut **ctx,
+                    kms_array,
+                );
+            let this = ctx.get(&this_h);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
             Ok(None)
         },
     );
