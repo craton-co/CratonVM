@@ -609,6 +609,10 @@ pub const INVENTORY: &[E] = &[
     // so `=0` still enables it and `off_word` must stay `None`.
     E { group: Group::JIT, token: "activation-global-mutex", on_key: Some("CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "alloc-class-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE"), off_word: None },
+    // Sinking the per-safepoint blind GPR spill at an inline-TLAB `new` onto
+    // the allocation's slow-path edges. Presence-parsed opt-out, so `=0` still
+    // disables the sink and `off_word` must stay `None`.
+    E { group: Group::JIT, token: "alloc-spill-sink", on_key: None, off_key: Some("CRATONVM_JIT_NO_ALLOC_SPILL_SINK"), off_word: None },
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None },

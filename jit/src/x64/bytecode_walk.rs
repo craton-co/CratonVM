@@ -10021,6 +10021,22 @@ impl Compiler {
                         // before the `new` safepoint (both inline TLAB
                         // and slow-path helper can reach GC via
                         // jit_post_tlab_init / new_object).
+                        //
+                        // ...but only the paths that CALL one of those can. With
+                        // `skip_helper` the inline arm emits no call at all
+                        // between here and the merge point, so no collector can
+                        // observe this frame on it, and the blind full-GPR half
+                        // of the spill is dead there. Ask for it to be sunk onto
+                        // the allocation's slow-path edges instead; the request
+                        // degrades to the full spill if the safepoint emitter
+                        // cannot honour it. `inline_tlab_new_enabled()` is part
+                        // of the condition because its opt-out turns the inline
+                        // arm back into a bare `new_object` call.
+                        self.sink_alloc_blind_spill = alloc_spill_sink_enabled()
+                            && can_inline
+                            && skip_helper
+                            && inline_tlab_new_enabled()
+                            && self.jit_thread_slot_off != 0;
                         self.emit_pre_safepoint_spill();
                         if can_inline {
                             // CRIT-2 — when neither primitive-init nor
@@ -10051,6 +10067,16 @@ impl Compiler {
                                 num_fields,
                                 self.helpers.frame_record,
                             );
+                        }
+                        // The withheld half of the blind spill must have been
+                        // emitted by now — the only consumer is the arm above.
+                        // Fail the compile closed rather than ship a safepoint
+                        // whose spill is missing eleven registers: an unspilled
+                        // register-resident oop is a reclaimed live object, and
+                        // the cost of bailing is one interpreted method.
+                        if self.deferred_alloc_blind_spill {
+                            self.deferred_alloc_blind_spill = false;
+                            self.fail("singlepass-codegen/alloc-spill-sink-unconsumed");
                         }
                         // T1.1.a — `new` is a GC-triggering safepoint.
                         // Emit an oop map for the slots that were live
