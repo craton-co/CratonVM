@@ -2,10 +2,190 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN.** 13 of 14 tests match HotSpot. `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` does not. |
+| **Status** | ✅ **FIXED 2026-08-06.** `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` passes; the class matches HotSpot. |
 | **Scope** | `org.springframework.beans.factory.aot.BeanRegistrationsAotContributionTests` (spring-framework, `spring-beans`). |
-| **Measured** | 2026-08-02 and 2026-08-05, Azure host `20.83.144.174`, real JDK 25, branch `fix/spring-4tests-20260802`, binaries `/data/data/wt-spr4-20260802/localbin/cvm-spr4-{base,poll,gcscan}.bin`. |
-| **Not** | Not the quadratic dirty-card scan fixed on this same branch (`gc/src/old_gen.rs`) — that is real and removes 73.7% of CPU here, but this test still fails with it in. |
+| **Fix** | `native_unmod_get` (`native-collections/src/lib.rs`) bounds-checked against `al_state`'s *"layout I cannot read"* sentinel. Regression test: `native-collections/tests/unmod_list_get_foreign_backing.rs`. |
+| **Also closed** | Both compressed-oops correctness holes this page named as residuals — see [§2026-08-06](#2026-08-06-resolved-the-last-failure-was-never-about-the-heap). |
+| **Measured** | 2026-08-02, 2026-08-05 and 2026-08-06, Azure host `20.83.144.174`, real JDK 25. |
+
+---
+
+## 2026-08-06 RESOLVED — the last failure was never about the heap
+
+**Read this section; everything below it is the derivation that got here, kept
+because four separate causes were mistaken for one and the record of how each
+was ruled out is worth more than the conclusion.**
+
+### The failure on 2026-08-06 `dev`
+
+Re-run on `dev` @ `5081aa095`, the test no longer OOMs, no longer reaches javac,
+and fails in **67 seconds** — a fifth distinct failure, and much earlier than
+any before it:
+
+```
+java.lang.IllegalStateException: Unable to parse source file content:
+  <the 20-line generated TestTarget__BeanFactoryRegistrations dispatcher>
+  at org.springframework.core.test.tools.SourceFile.getClassName(SourceFile.java:188)
+Caused by: java.lang.ArrayIndexOutOfBoundsException
+  at org.springframework.core.test.tools.SourceFile.getClassName(SourceFile.java:183)
+```
+
+`SourceFile.java:183` is `javaSource.getClasses().get(0)`, one line after an
+`Assert.state(javaSource.getClasses().size() == 1)` that **passed**. A list
+whose `size()` is 1 and whose `get(0)` throws is not a Spring bug.
+
+Deterministic, and `--nojit` reproduces it, so not a JIT miscompile.
+
+### Root cause
+
+QDox's `DefaultJavaSource.getClasses()` returns
+`Collections.unmodifiableList(<a LinkedList>)`. `Collections.unmodifiableList`
+is a CratonVM native returning a `cratonvm/internal/UnmodifiableList` wrapper,
+and `native_unmod_get` (`native-collections/src/lib.rs`) bounds-checks the index
+*before* delegating, so that an out-of-range `get` keeps raising
+`ArrayIndexOutOfBoundsException` rather than the plain `IndexOutOfBoundsException`
+the backing `ArrayList` would raise. That check took its size from `al_state`:
+
+```rust
+let (_, n) = al_state(ctx, backing);
+if *index < 0 || *index >= n { return Err(AIOOBE) }
+```
+
+`al_state` returns `(None, 0)` for **any receiver whose layout it cannot read** —
+a real-JDK `java/util/LinkedList`, a `cratonvm/internal/ArrayListSubList`, any
+foreign `AbstractSequentialList`. That sentinel is indistinguishable from a
+genuinely empty `ArrayList`, so every index was out of range and `get` threw for
+**every** element of a list whose `size()`, `iterator()`, `toString()`,
+`indexOf()`, `contains()`, `toArray()` and `listIterator()` all answered
+correctly. The fix is to apply the pre-check only when `al_is_list_layout`
+actually recognises the backing, and delegate otherwise.
+
+The `ArrayList` backing is the reason this was not noticed: it is `RandomAccess`,
+so HotSpot's own `getClass()` names it `Collections$UnmodifiableRandomAccessList`
+and it is the shape almost every caller in the corpus has.
+
+**Provenance.** The pre-check is 19 hours old:
+`026ba86c9` *"fix(nio,collections): ByteBuffer had NO bounds check, and two more
+shadowed overrides"*, 2026-08-05 22:15. That is why the 2026-08-05 runs recorded
+below sail past `SourceFile.getClassName` and die 55 minutes later inside javac,
+while the 2026-08-06 run dies in 67 seconds — and it is why chasing this page's
+listed failure 3 would have been wasted work. `026ba86c9` is a good change; only
+its size source was wrong.
+
+### Reduction
+
+The 55-minute Spring run reduces to a 3-second pure-JDK probe. On CratonVM
+before the fix, on HotSpot 25 and on CratonVM after it:
+
+```java
+List<String> ll = new LinkedList<>(List.of("a", "b", "c"));
+List<String> u  = Collections.unmodifiableList(ll);
+u.size();    // 3      — correct on both
+u.get(0);    // "a" on HotSpot; ArrayIndexOutOfBoundsException on CratonVM
+Collections.unmodifiableList(new ArrayList<>(List.of("a","b","c"))).subList(1,3).get(0);
+             // "b" on HotSpot; ArrayIndexOutOfBoundsException on CratonVM
+```
+
+Probes used, in the order they narrowed it:
+`SkProbe` (ruled out the `Resolve.staticKind` stream shape — see failure 3
+below, which is **not** what was failing here), `QdoxProbe` → `QdoxLex`
+(lexer is fine) → `QdoxStep` (`Parser`/`ModelBuilder`/`addSource` all fine) →
+`QdoxClasses` (pinned it to `JavaSource.getClasses()`) → `UnmodList` /
+`UnmodPeel` / `LinkedGet` (pure JDK, no QDox).
+
+### Verification
+
+The whole class, `KRun org.springframework.beans.factory.aot.BeanRegistrationsAotContributionTests`,
+on the fixed binary, real JDK 25, Azure host:
+
+```
+RESULT ... found=14 succ=14 fail=0 skip=0 abort=0 ms=4252687 status=OK
+```
+
+**14/14, rc=0** — parity with HotSpot, which is what the original Status line
+asked for. 4254 s wall on a box at load ~50 shared with other sessions; that is
+throughput, not correctness, and this page's own "Measuring here at all" section
+below explains why an absolute time from this host means little.
+
+Two notes on running it here at all, both learned the hard way this session:
+
+* **The host OOM killer, not the VM.** Three runs died at 562 / 1137 / 1566 s
+  with `rc=137` and no VM output. That is the *kernel* killing the largest-RSS
+  process while other sessions held 28 of 31 GB in 3-4 GB `rustc` processes —
+  not an `OutOfMemoryError`, and nothing to do with this page's footprint story.
+  `rc=137` with no Java-level message is that, every time. The runner now
+  self-shields with `oom_score_adj=-300` after launch (needs the host's
+  passwordless `sudo`), which is enough to lose the coin flip against a
+  comparable `rustc` without making the VM immune.
+* A `RESULT` line is the only trustworthy signal — see
+  [[timeout-is-often-a-sigsegv-with-no-result-line]].
+
+### The residuals this page named, and what happened to them
+
+| residual | outcome |
+|---|---|
+| *"hole 1 needs a proper narrow arm in `emit_load_string_value_ptr` rather than the blanket refusal"* | **Done.** `emit_load_narrow_ref_field` (`jit/src/x64/objects.rs`), selected per call site by the new `StringFieldLayout::value_compact_is_narrow`. The refusal in `try_resolve_string_intrinsic` is gone. Verified with `StringHot`, a hot loop over `charAt`/`length`/`isEmpty`/`hashCode`/`indexOf`/`equals`/`compareTo` across LATIN1, UTF-16 and empty receivers: byte-identical to HotSpot under `CRATONVM_COMPRESSED_OOPS=1`. |
+| *"hole 2 is untouched, so the gate must stay off"* | **Done.** `mark_young_to_old_refs` and `rewrite_stretch_conservatively` (`gc/src/gen_heap.rs`) each take a second pass over an unparseable stretch at 4-byte granularity under `narrow_oops_enabled()`. |
+| *"do not cite compressed oops as the fix for this page without re-measuring after hole 1 has a proper narrow arm"* | **Re-measured.** The throughput penalty was the stopgap, not compression, and is gone; the footprint win is **4.7 %** of peak RSS (1850 → 1763 MB), not 20-30 %. Details below. |
+| failure 3, the `ClassCastException` in javac's `Resolve.staticKind` | **Did not reproduce** on 2026-08-06 `dev`, in the Spring run or in `SkProbe` (300k iterations of the exact `candidates.stream().filter(..).map(StaticKind::from).reduce(StaticKind::reduce).orElse(..)` shape, over both an `ArrayList` and a generic-spliterator cons list). Its face — a `MethodSymbol` where an enum belongs — is the JIT dispatch-memo aliasing signature fixed by `383e7f5cf` (2026-08-05), which postdates the binary this page measured it on. Recorded as gone, not as chased down. |
+
+### Compressed oops, re-measured with hole 1 properly closed
+
+This is the measurement the page asked for. Same binary both ways, arms
+**interleaved A-B-B-A** in one script per this page's own "Measuring here at
+all" rule, on the 1001-definition sibling (the page's designated A/B proxy —
+the 10001 case takes 70 minutes on this box and its variance swamps the effect).
+`A` = default, `B` = `CRATONVM_COMPRESSED_OOPS=1`. Peak RSS from
+`/proc/<pid>/status` `VmHWM`, sampled every 2 s.
+
+| arm | peak RSS | wall |
+|---|--:|--:|
+| A (wide, slot 1) | 1833 MB | 194 s |
+| B (narrow, slot 2) | 1763 MB | 205 s |
+| B (narrow, slot 3) | 1762 MB | 157 s |
+| A (wide, slot 4) | 1866 MB | 153 s |
+| **mean A** | **1850 MB** | |
+| **mean B** | **1763 MB** | |
+
+All four arms `succ=1 fail=0`.
+
+**Verdict, three parts:**
+
+1. **The throughput penalty is gone.** The earlier measurement in this page had
+   narrow oops *not finishing* inside a 2700 s ceiling while wide finished in
+   1677 s. With the emitter's narrow arm in place instead of the blanket
+   intrinsic refusal, the two arms are indistinguishable — the A arm's own
+   spread across a separate A-B-B-A round (220 / 413 s) is larger than any
+   A-vs-B gap. That earlier number was measuring the stopgap, not compression.
+2. **The footprint win is ~4.7%, not 20-30%.** 87 MB of 1850. That is a real
+   saving and it is not nothing, but it is nowhere near what
+   `gc/src/compressed_oops.rs`'s header advertises, and it does not make narrow
+   oops "the lever" this page called it. The arithmetic below explains why: the
+   dominant term is the **32-byte `ObjectHeader`** (HotSpot's is 12), which
+   compression does not touch at all. Halving the reference *fields* of objects
+   whose header already costs 32 bytes moves a minority of the bytes.
+3. **So the recommendation stands, for a different reason.** Do not enable
+   compressed oops for this workload — not because it is unsound on the
+   generational backend (it no longer is) and not because it is slow (it is
+   not), but because a 4.7 % RSS saving does not justify running the one
+   configuration in this VM that no suite exercises by default. The header's
+   `ObjectHeader` shrink is the item with the leverage.
+
+The gate is **still off**, now for §1.3's reason in
+`arch-2026-07-26/value-repr-and-compressed-oops.md` — G1/ZGC are unmigrated
+behind a load-bearing backend check — and not because the generational backend
+has a known wrong-width slot access. `enable_for_live_heap`'s stderr warning
+was rewritten to say what is actually left.
+
+---
+
+# Historical record (2026-08-02 → 2026-08-05)
+
+Everything from here down is the original page, unchanged except where a claim
+is explicitly annotated. It is kept because the eliminations in it are real work
+that should not be redone — in particular the two withdrawn measurements in
+"Heap accounting" and the object-width table, which are still correct facts
+about this VM even though they were not what failed this test.
 
 ## Symptom
 
@@ -114,6 +294,13 @@ fix moved the failure later:
 | 1 | `OutOfMemoryError` in javac at a 4 GiB heap | gone on current `dev` (plausibly the 2026-08-04 `defrag-promote` change) |
 | 2 | `ArrayIndexOutOfBoundsException` in `CharBuffer.putBuffer` | **FIXED** — heap CharBuffer carried `address = -1`; see below |
 | 3 | `ClassCastException` in javac's `Resolve.staticKind` | **OPEN**, and it is the current failure |
+
+> **2026-08-06:** make that five. Failure 3 did not reproduce on `dev` of
+> 2026-08-06 (its face is the JIT dispatch-memo aliasing `383e7f5cf` fixed the
+> day after this section was written), and failure **4/5** — the one that
+> actually closed this page — was `Collections.unmodifiableList(…).get(i)`
+> throwing for every index over a non-`ArrayList` backing, 55 minutes earlier
+> in the test than anything below. See the resolution section at the top.
 
 Failure 3, measured on the fixed binary (`rc=0`, 3222 s, `aioobe=0`, so the
 test now runs to completion rather than dying in `BaseFileManager.decode`):
@@ -282,6 +469,32 @@ pass). The 1001-definition sibling
 useful for A/B work; note its old gen is small enough that the dirty-card
 quadratic never bites, so it is **not** a proxy for the GC fix (an alternating
 2-binary A/B there is within noise: base 221/221/183 s, fixed 229/204 s).
+
+**2026-08-06 addendum: use that sibling, not this test.** The
+`unmodifiableList.get` defect broke the sibling too, in **19 seconds**, with the
+identical `IllegalStateException: Unable to parse source file content` /
+`ArrayIndexOutOfBoundsException` pair. A/B on the same host, same classpath:
+
+| binary | result |
+|---|---|
+| `dev` @ `5081aa095` | `found=1 succ=0 fail=1`, 19 s |
+| same + the `native_unmod_get` fix | `found=1 succ=1 fail=0`, 144 s |
+
+That is a 19-second reproducer for a defect this page spent three sessions
+chasing through a 55-minute one. The general lesson is
+[[run-it-alone-before-calling-it-a-missing-feature]]'s sibling: when a page
+names a *cheap proxy that passes*, re-run the proxy on current `dev` before
+paying for the expensive case — a regression that lands in between will show up
+there first and far faster.
+
+For the VM-level defect, skip Spring entirely (3 seconds, no Gradle, no
+classpath):
+
+```java
+List<String> u = Collections.unmodifiableList(new LinkedList<>(List.of("a","b","c")));
+u.size();   // 3
+u.get(0);   // "a" on HotSpot; ArrayIndexOutOfBoundsException on CratonVM before the fix
+```
 
 ## Measuring here at all
 
