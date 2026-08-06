@@ -643,3 +643,43 @@ one store per slid object.
 available here can distinguish the fix from its absence. That is the reason to
 put this branch through a real concurrent suite (Spring Boot / Tomcat) before
 landing it, rather than on unit tests and a benchmark.
+
+### 9.7 Validated against real Spring Boot, both arms
+
+§9.6 says the local probes cannot tell this fix from a broken version of it.
+That was the blocker on landing, so the branch was put through a real
+concurrent suite before merge: **374 test classes, both arms, one process per
+class**, from the eight modules that actually thread, allocate and do I/O
+(webmvc, web-server, webflux, jdbc, http-client, devtools, actuator, health).
+
+| | base (dev) | fix (24-byte header) |
+|---|---:|---:|
+| PASS | 363 | **364** |
+| FAIL | 2 | 2 |
+| HANG | 1 | 0 |
+| VACUOUS | 8 | 8 |
+| tests executed | 3,029 | **3,057** |
+
+**No class is red on fix and green on base** — the only direction that would
+indicate a regression. Both asymmetries went the other way and both resolved as
+pre-existing, at 5 reps per arm:
+
+* `JettyClientHttpRequestFactoryBuilderTests` (base FAIL, fix PASS) — 5/5 PASS
+  on both arms. A flake.
+* `HttpComponentsClientHttpConnectorBuilderTests` (base HANG, fix FAIL) — red
+  5/5 on both arms (base 4 FAIL + 1 HANG, fix 5 FAIL). A pre-existing failure
+  that alternates between FAIL and HANG; the single-run difference was that
+  alternation, not the arms.
+
+`WebFluxManagementChildContextConfigurationIntegrationTests` fails on both arms
+and is likewise pre-existing.
+
+One harness note worth keeping: the 8 `VACUOUS` rows are `Abstract*Tests` base
+classes with no runnable methods, symmetric across arms — but `sbrun.sh` scores
+`tests=0` as **PASS**, so they have to be extracted and reclassified. That is
+the `containersFailed=0` substring trap in another guise: a suite oracle that
+reports a class which never ran as green.
+
+This does not prove the fold is sound — nothing available here can — but it is
+the first thing run against it that would plausibly have caught it, and it is
+clean.
