@@ -151,9 +151,46 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
 
 ### Two defects behind the pause
 
-1. **`cheney_drain` dominates — 350–872 ms**, i.e. the survivor copy/scan
+1. **`cheney_drain` dominates — 283–872 ms**, i.e. the survivor copy/scan
    itself. This is the one that has to come down for the flake to go away;
    fixing anything else still leaves a pause over the budget.
+
+   `CRATONVM_DBG=gcpause` now prints the counts that say what "slow" means:
+
+   ```
+   [gcpause] collection took 563ms  … overlay_forward=51ms cheney_drain=306ms
+             objects_copied=994447 young_bytes_before=291741144 pointer_map_len=994447
+   ```
+
+   So **~994 000 objects copied out of a ~291 MB young gen, at ~300 ns each**.
+   The count is astonishingly stable across cycles (994 444 / 994 445 /
+   994 447 / 994 448 / 994 450).
+
+   **That stability is NOT "survivors are never tenured" — I checked, and
+   age-based promotion works.** `PROMOTION_AGE = 3`, and `forward_object_impl`
+   increments `gc_age` in the `else` branch of the promotion test, i.e. on every
+   young→young copy, so a survivor is tenured on its third cycle. The stable
+   count is a genuine steady state: a workload building 52 Spring contexts
+   allocates and retains a near-constant population. Worth stating because "the
+   tenuring counter only advances on the path that has already tenured" is
+   exactly what the shape of the number suggests, and it is wrong.
+
+   What is left is arithmetic: a young generation of that size, at that survival
+   rate and that per-object cost, cannot be collected inside a 500 ms budget.
+   Two independent levers, and they are not alternatives — both are real:
+
+   * **Young-gen sizing.** ~291 MB of young in a 2 GB heap is very large, and
+     nothing ties it to a pause goal. `VmConfig` already carries
+     `g1_max_gc_pause_ms` with no equivalent for this collector. Sizing young to
+     a pause target is the standard fix and the one that would actually clear
+     the 500 ms budget.
+   * **Redundant per-object work.** `pointer_map_len == objects_copied`
+     **exactly**, every cycle: one `FxHashMap` insert per copied object, on top
+     of the forwarding pointer that `forward_object_impl` already installs in
+     the source header two lines earlier. HotSpot pays only the forwarding
+     pointer. The map exists to serve `remap_external_roots` afterwards, so
+     removing it means teaching that pass to chase forwarding pointers instead
+     — a contained change, ~1M hash inserts and one large map per cycle saved.
 
 2. **`overlay_forward` is O(every overlay in the process), per minor GC** —
    68–125 ms and growing with heap population. `gen_heap.rs` seeds it with
