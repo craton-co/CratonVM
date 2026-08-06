@@ -143,10 +143,14 @@ Also re-measured, unchanged:
   byte-identical to HotSpot.
 * `probes/StringPolicyMatrixProbe` — still 3 divergences of 392.
 
-Suites, 0 failures: `native-builtins --lib` 3279, `vm --lib` 2418,
-`native-io --lib` 390, `types --lib` 493,
-`vm --test wp8_10_9_string_contains_native` 6, and the blocking
-synthetic-JDK VM gate.
+All of the above re-run on the **merged** state (see the section above — two
+independent fixes for one defect landed in the same window, and neither had
+been measured against the other), with identical results.
+
+Suites on the merged state, 0 failures: `native-builtins --lib` 3287,
+`vm --lib` 2425, `native-io --lib` 402, `types --lib` 497,
+`vm --test wp8_10_9_string_contains_native` 6, and the blocking synthetic-JDK
+VM gate.
 
 ## What is deliberately NOT fixed here
 
