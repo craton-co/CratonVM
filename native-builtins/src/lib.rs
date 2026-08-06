@@ -2624,7 +2624,7 @@ mod bootstrap_property_fallback_tests {
     /// scope, because every reader here runs on this thread.
     fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = env_lock();
-        let previous = std::env::var_os("JBOSS_HOME");
+        let previous = cratonvm_types::flags::runtime_var_os("JBOSS_HOME");
         match home {
             Some(v) => std::env::set_var("JBOSS_HOME", v),
             None => std::env::remove_var("JBOSS_HOME"),
@@ -7685,7 +7685,7 @@ pub fn register_essential_natives_with_shims(
     // for every non-Latin-1 `String` key in the VM, which is not an edge case:
     // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
     // `StringUTF16` defect is filed separately — see
-    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // `string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md`
     // — and when it is fixed this registration should be re-measured and
     // probably deleted, because at that point it becomes a pure perf
     // optimisation again and has to argue for itself on those terms.
@@ -11180,27 +11180,6 @@ pub fn register_essential_natives_with_shims(
     // very bottom of bootstrap — before `java.lang.invoke` is usable — so
     // running the real <clinit> there would be a bootstrap-ordering hazard for
     // no behavioural gain. Suppressing it is therefore spec-neutral here.
-    //
-    // EXCEPTION CLASS (2026-08-05): every one of the overrides below used to
-    // throw `ArrayIndexOutOfBoundsException`. The real
-    // `Preconditions.outOfBounds` asks the `oobef` formatter first and, when
-    // it is absent, throws plain `IndexOutOfBoundsException` — never the
-    // array subclass. Suppressing `<clinit>` above means the formatter
-    // statics are null for every caller here, so the JDK's null-formatter
-    // answer is the whole of the observable behaviour, and it is
-    // `IndexOutOfBoundsException`. Getting this wrong in the *subclass*
-    // direction is what breaks a `catch`: `catch (IndexOutOfBoundsException)`
-    // matched either way, but code catching the specific sibling did not.
-    // Surfaced by `ByteBufferBulkProbe`'s `absDirectPastLimit` case, where a
-    // DIRECT receiver's absolute `get(int)` correctly bails to real
-    // `DirectByteBuffer` bytecode and lands on `Buffer.checkIndex` →
-    // `Preconditions.checkIndex(i, limit, IOOBE_FORMATTER)`.
-    //
-    // This is HALF of `known-issues/preconditions-ignores-the-exception-
-    // formatter.md`: the fallback class is now right, but the formatter is
-    // still discarded. That half is currently unobservable (the statics are
-    // null), and making it observable means un-suppressing the `<clinit>`
-    // this comment explains cannot safely run — see that doc.
     registry.register(
         "jdk/internal/util/Preconditions",
         "<clinit>",
@@ -11221,10 +11200,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index }
-                        .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11245,10 +11234,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index }
-                        .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11273,10 +11272,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
-                        .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11300,10 +11299,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
-                        .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11327,11 +11326,13 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            if from < 0 || size < 0 || from + size > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { index: from }
-                        .into(),
-                )
+            // Overflow-safe: `from + size` can wrap for large arguments, which
+            // is why the JDK's own message prints the addition unevaluated.
+            if from < 0 || size < 0 || (from as i64 + size as i64) > length as i64 {
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {from} + {size}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -16902,7 +16903,13 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`. See the
+            // slot table in `logmanager.rs`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -16918,7 +16925,12 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -37006,13 +37018,37 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/util/FormatterClosedException",
         "java/util/NoSuchElementException",
         "java/text/ParseException",
-        "java/util/regex/PatternSyntaxException",
+        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+        // list. It is the one exception here that OVERRIDES `getMessage()`:
+        // the JDK builds a three-line report ("Unclosed character class near
+        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+        // fields and never sets `Throwable.detailMessage`. A blanket
+        // `getMessage` bridge in front of that override returns the null
+        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+        // where HotSpot gives the full report. Its real constructor is
+        // `(String,String,int)V`, which is not among the `<init>` shapes
+        // registered here either, so every bridge this loop would add is
+        // either dead or actively wrong. Removed 2026-08-05.
         "java/util/InputMismatchException",
         "java/io/IOException",
         "java/io/FileNotFoundException",
         "java/io/UncheckedIOException",
         "java/io/NotSerializableException",
-        "java/io/InvalidClassException",
+        // `java/io/InvalidClassException` is deliberately NOT in this list, for
+        // the same reason `java/util/regex/PatternSyntaxException` is not: it
+        // OVERRIDES `getMessage()`, prepending the offending class name to the
+        // detail message. A blanket bridge in front of that override returns
+        // the bare `Throwable.detailMessage`, so
+        // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
+        // reported "bad serialVersionUID" where HotSpot reports
+        // "com.example.Foo; bad serialVersionUID" -- and deserialization
+        // diagnostics lose the one field that says WHICH class failed.
+        //
+        // Found 2026-08-05 by checking `javap -p` for a declared
+        // getMessage/getLocalizedMessage/toString across every class in these
+        // two lists; it and `NullPointerException` were the only two left after
+        // PatternSyntaxException. See
+        // `docs/internal/a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",

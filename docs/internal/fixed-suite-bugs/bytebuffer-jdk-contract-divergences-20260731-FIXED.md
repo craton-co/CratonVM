@@ -21,6 +21,20 @@ fixed independently by a concurrent session — see
 `direct-bytebuffers-are-never-reclaimed-FIXED-20260805.md` and its still-open
 residual `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
 
+## Who fixed what
+
+Divergence 1 was fixed **twice, independently and identically**, on the same
+day: this branch and `fix/nio-list-oob-20260805` both landed an
+`s2_bb_check_index` gated on resolvable storage, applied to the same twelve
+absolute accessors. That branch reached `dev` first, so its implementation is
+the one in the tree and this page keeps only the reasoning. Divergences 2 and 3
+are this branch's.
+
+The convergence is itself worth recording: two independent readings of the same
+code arrived at the same seam (the registration layer, not `s2_bb_get_byte`)
+and the same gate (does this buffer have storage). See *the objection the
+original record raised* below for why that seam is the load-bearing choice.
+
 ## 1. Absolute `get(int)` / `put(int, byte)` were not bounds-checked against the limit — FIXED
 
 `java.nio.Buffer`'s absolute accessors check the index against the **limit**,
@@ -105,19 +119,16 @@ Extending the probe with a DIRECT receiver (`absDirectPastLimit`) surfaced one
 more mismatch, in a *different* component: a direct buffer's absolute
 `get(int)` correctly bails to real `DirectByteBuffer` bytecode, which lands on
 `Buffer.checkIndex` → `jdk/internal/util/Preconditions.checkIndex`, whose
-CratonVM override also threw AIOOBE. All five `Preconditions` overrides now
-throw plain `IndexOutOfBoundsException`, which is what the real
-`Preconditions.outOfBounds` does when the `oobef` formatter is absent — and it
-is always absent here, because `Preconditions.<clinit>` is deliberately
-suppressed.
+CratonVM override also threw AIOOBE where the JDK's own
+`Preconditions.outOfBounds` gives plain `IndexOutOfBoundsException` for an
+absent `oobef` formatter — and it is always absent here, because
+`Preconditions.<clinit>` is deliberately suppressed.
 
-That closes **half** of `known-issues/preconditions-ignores-the-exception-
-formatter.md` (defect 2, the fallback class). Defect 1 — the formatter itself
-being discarded — remains open there and is currently unobservable for the
-same `<clinit>` reason. Verified no String-domain regression:
-`StringUtf16HashProbe` and `StringPolicyMatrixProbe` are byte-identical
-between the pre- and post-fix binaries (the `String` callers go through the F4
-interception in `lang_string.rs` and never reach `Preconditions`).
+That is defect 2 of `known-issues/preconditions-ignores-the-exception-formatter.md`,
+and it was **also fixed concurrently**, more completely, by the same
+`fix/nio-list-oob-20260805` branch — which made the overrides message-exact
+against HotSpot rather than only class-exact. Its version is the one in the
+tree; that page now reads "OPEN in mechanism, CLOSED in observable behaviour".
 
 ## Reproduction
 

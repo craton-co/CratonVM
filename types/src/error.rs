@@ -849,24 +849,17 @@ pub enum RuntimeError {
 
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
     ArrayIndexOutOfBoundsException { index: i32 },
-
-    /// `java.lang.IndexOutOfBoundsException` — the PLAIN superclass, for the
-    /// APIs whose spec names it rather than one of the array/string
-    /// subclasses. `java.nio.Buffer`'s absolute accessors and the
-    /// `ByteBuffer` bulk `get`/`put` forms are the motivating case: they
-    /// check an index against a *buffer's* limit, not an array's length, and
-    /// the JDK throws exactly `IndexOutOfBoundsException` there.
+    /// Plain `java.lang.IndexOutOfBoundsException` -- the SUPERCLASS of the
+    /// Array/String variants above, and not interchangeable with them.
     ///
-    /// Throwing `ArrayIndexOutOfBoundsException` instead is *nearly* harmless
-    /// — it is a subclass, so every `catch (IndexOutOfBoundsException)`
-    /// still matches — which is why it survived as a documented-benign
-    /// divergence for a while. It is not free, though: a differential that
-    /// compares thrown exception *types* against HotSpot can never go green,
-    /// and `catch (ArrayIndexOutOfBoundsException)` around a buffer operation
-    /// matches here while missing on a real JVM. See
-    /// fixed-suite-bugs/bytebuffer-jdk-contract-divergences-20260731-FIXED.md.
-    #[error("IndexOutOfBoundsException: index {index}")]
-    IndexOutOfBoundsException { index: i32 },
+    /// Added 2026-08-05. Code that needed this previously reached for
+    /// `ArrayIndexOutOfBoundsException`, which is a *subclass*: a
+    /// `catch (IndexOutOfBoundsException)` still catches it, but anything
+    /// testing the class, and the JDK's own contracts, do not agree. Two
+    /// callers need the exact class: `Preconditions.outOfBounds` with a null
+    /// formatter, and `Matcher.appendReplacement`'s "No group N".
+    #[error("IndexOutOfBoundsException: {message:?}")]
+    IndexOutOfBoundsException { message: Option<String> },
 
     #[error("ArithmeticException: {message}")]
     ArithmeticException { message: String },
@@ -1045,8 +1038,20 @@ pub enum RuntimeError {
     /// That is exactly what `String.matches` / `replaceAll` / `replaceFirst`
     /// did until 2026-08-04 — `"Hello, World".matches("[")` returned `false`
     /// where HotSpot throws.
-    #[error("PatternSyntaxException: {message}")]
-    PatternSyntaxException { message: String },
+    #[error("PatternSyntaxException: {description} near index {index} in {pattern}")]
+    /// The three fields `java.util.regex.PatternSyntaxException` actually
+    /// stores. NOT a pre-formatted message: that class **overrides**
+    /// `getMessage()` and builds its three-line report from `desc`, `pattern`
+    /// and `index`, using `System.lineSeparator()` -- so formatting it here
+    /// would hard-code `\n` where HotSpot emits `\r\n` on Windows, and would
+    /// still leave `getDescription()` / `getPattern()` / `getIndex()` empty.
+    /// The throw site sets the fields and lets the JDK's own bytecode format
+    /// them. `index` is -1 when unknown.
+    PatternSyntaxException {
+        description: String,
+        pattern: String,
+        index: i32,
+    },
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -1094,6 +1099,18 @@ impl RuntimeError {
             message: Some(format!(
                 "Range [{from}, {from} + {size}) out of bounds for length {length}"
             )),
+        }
+    }
+
+    /// Plain `IndexOutOfBoundsException` with a message.
+    ///
+    /// Use where the JDK throws the SUPERCLASS -- `Preconditions` with no
+    /// exception formatter, and `Matcher`'s "No group N". Reaching for
+    /// `ArrayIndexOutOfBoundsException` there is wrong in the direction that
+    /// breaks a `catch`.
+    pub fn ioobe(message: impl Into<String>) -> Self {
+        RuntimeError::IndexOutOfBoundsException {
+            message: Some(message.into()),
         }
     }
 
@@ -1149,8 +1166,8 @@ impl RuntimeError {
             RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
                 ("java/lang/ArrayIndexOutOfBoundsException", None)
             }
-            RuntimeError::IndexOutOfBoundsException { index: _ } => {
-                ("java/lang/IndexOutOfBoundsException", None)
+            RuntimeError::IndexOutOfBoundsException { message } => {
+                ("java/lang/IndexOutOfBoundsException", message.as_deref())
             }
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))
@@ -1277,10 +1294,12 @@ impl RuntimeError {
             // `getMessage()` — the same `msg=null` the real `Pattern.compile`
             // bridge already produces. Getting the class right is the part that
             // changes control flow; the description text is a separate gap.
-            RuntimeError::PatternSyntaxException { message } => (
-                "java/util/regex/PatternSyntaxException",
-                Some(message.as_str()),
-            ),
+            // `None`: the real class leaves `Throwable.detailMessage` null and
+            // overrides `getMessage()`. The throw site fills `desc`/`pattern`/
+            // `index` right after construction.
+            RuntimeError::PatternSyntaxException { .. } => {
+                ("java/util/regex/PatternSyntaxException", None)
+            }
             RuntimeError::NotImplemented { feature: _ } => return None,
         };
         Some(pair)

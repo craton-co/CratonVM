@@ -3901,6 +3901,31 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     if let Some(b) = unmod_receiver_backing(ctx, this) {
+        // Bounds-check HERE, before delegating, and keep the
+        // `ArrayIndexOutOfBoundsException` this path has always thrown.
+        //
+        // `native_al_get` below now throws the plain `IndexOutOfBoundsException`
+        // that HotSpot's `ArrayList` throws -- correct for a real `ArrayList`
+        // receiver and WRONG for most of the receivers that arrive here.
+        // Measured against a HotSpot 25 control with
+        // `probes/ListOutOfBoundsProbe`:
+        //
+        //   List.of()            -> ArrayIndexOutOfBoundsException
+        //   List.of(a)/(a,b)     -> IndexOutOfBoundsException "Index: 3 Size: 1"
+        //   List.of(a,b,c,d)     -> ArrayIndexOutOfBoundsException
+        //
+        // i.e. the JDK splits on `ImmutableCollections.List12` vs `ListN`, which
+        // index their storage differently. Two of those three want the subclass,
+        // and this VM funnels every unmodifiable/immutable list through ONE
+        // synthetic class, so there is no discriminator here that would let the
+        // 1-2 element case be told from `Collections.unmodifiableList` over a
+        // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
+        // split would mean guessing; keeping the status quo for this path is the
+        // honest option, and it is right for 0 and 3+ elements.
+        let (_, n) = al_state(ctx, b);
+        if index < 0 || index >= n {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        }
         return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
     }
     // `Collections$SingletonList` keeps its one element in a field, not in an
@@ -3918,12 +3943,15 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException
-        // (ArrayIndexOutOfBoundsException is a subclass, so `catch
-        // (IndexOutOfBoundsException)` still catches it).
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index N out of bounds for
+        // length M". NOT the ArrayIndexOutOfBoundsException subclass -- that is
+        // the direction that breaks a `catch`, and it is what this threw until
+        // 2026-08-05 even though the comment already named the right class.
+        // There was no plain variant in `RuntimeError` before then.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -3953,10 +3981,12 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException with the same wording as
+        // `get`; see the note there for why this is not the Array... subclass.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -4013,9 +4043,13 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     if index < 0 || index as usize > size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, and note the wording is NOT the
+        // one `get`/`set` use -- `ArrayList.add(int,E)` goes through
+        // `rangeCheckForAdd`, which builds "Index: 9, Size: 2" (comma, and
+        // "Size" rather than "length"). Measured, not assumed:
+        // probes/ListOutOfBoundsProbe against a HotSpot 25 control shows four
+        // different OOB wordings across the List API.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into());
     }
     let index = index as usize;
     // GC-SAFETY: same hazard as `native_al_add` -- `al_ensure_capacity` can
@@ -4049,10 +4083,12 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException with the same wording as
+        // `get`; see the note there for why this is not the Array... subclass.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -5219,9 +5255,13 @@ fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     asl_check_comod(ctx, parent, expected)?;
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index 1 out of bounds for
+        // length 1" -- a subList reports the SUBLIST's length, not the
+        // parent's. Not the Array... subclass; see native_al_get.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     // Write-through READ: index straight into the parent's live backing array.
     let (data, _) = al_state(ctx, parent);
@@ -5247,9 +5287,13 @@ fn native_asl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     asl_check_comod(ctx, parent, expected)?;
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index 1 out of bounds for
+        // length 1" -- a subList reports the SUBLIST's length, not the
+        // parent's. Not the Array... subclass; see native_al_get.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     // Write-through SET: the element write lands in the PARENT's backing array.
     let (data, _) = al_state(ctx, parent);
@@ -15593,12 +15637,27 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
         native_map_of_2,
     );
-    r.register(
-        "java/util/Map",
-        "entry",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        native_map_entry,
-    );
+    // DELETED 2026-08-05 — `Map.entry` is not registered, deliberately.
+    //
+    // It used to return a 2-field synthetic `java/util/Map$Entry`. A
+    // differential run against HotSpot 25 (`probes/ShadowDifferentialProbe.java`)
+    // caught two observable differences, both of them the fake being a worse
+    // version of code that already exists:
+    //
+    //   * `Map.entry("k", 7).toString()` was `java.util.Map$Entry@6c`, not
+    //     `k=7` — the synthetic has no `toString`, so `Object`'s ran.
+    //   * `setValue` SUCCEEDED. `Map.entry` is specified to return an
+    //     immutable entry and the JDK's `KeyValueHolder.setValue` throws
+    //     `UnsupportedOperationException`. Silently accepting the write is the
+    //     dangerous half: a caller that defensively mutates a copy got no
+    //     signal that it had mutated nothing anybody would read.
+    //
+    // `java.util.Map.entry` is a static interface method with ordinary
+    // bytecode, so deleting the registration is all it takes — contract §1.4's
+    // "the real bytecode wins" applied by removing the thing that was winning
+    // instead. Everything else this probe exercises (`List/Set/Map.of`,
+    // `copyOf`, `unmodifiable*`, `subList`, `LinkedHashMap` entry views incl.
+    // write-through `setValue`) already matched HotSpot byte for byte.
 
     // Higher-arity `List.of` / `Set.of` / `Map.of` overloads (real JDK
     // declares fixed-arity variants up to 10). Without these, e.g.
@@ -15663,8 +15722,15 @@ fn native_map_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
-/// `Map.ofEntries(Map$Entry...)` — each array element is a Map.Entry whose
-/// key/value live at slots 0/1 (see `native_map_entry`).
+/// `Map.ofEntries(Map$Entry...)`.
+///
+/// Each element is asked for its key and value through `getKey()`/`getValue()`
+/// rather than read at slots 0/1. Since `Map.entry` stopped being registered
+/// (see the note at its old registration site) the arguments are real
+/// `java.util.KeyValueHolder`s, whose layout this crate does not own and must
+/// not assume — and a caller may pass any `Map.Entry` implementation at all,
+/// including one the application wrote, where a positional read is not merely
+/// fragile but wrong.
 fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
@@ -15677,8 +15743,16 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(len);
     for i in 0..len {
         if let Value::Object(Some(entry)) = ctx.get_array_element(arr, i) {
-            let k = ctx.get_field(entry, 0);
-            let v = ctx.get_field(entry, 1);
+            let k = ctx
+                .invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            let v = ctx
+                .invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
             pairs.push((k, v));
         }
     }
@@ -15944,27 +16018,6 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
-fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let key = args.first().copied().unwrap_or(Value::Object(None));
-    let value = args.get(1).copied().unwrap_or(Value::Object(None));
-    // GC-safety: `alloc_synthetic` can complete a moving young GC, so the bare
-    // `key`/`value` copies would be pre-move addresses by the time they are
-    // stored — publishing dangling references into a live object. Pin both
-    // across the allocation and re-read them at the stores.
-    let key_pin = pin_value(ctx, key);
-    let value_pin = pin_value(ctx, value);
-    let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-    let key = read_pinned_elem(ctx, key_pin, key);
-    let value = read_pinned_elem(ctx, value_pin, value);
-    if key_pin != usize::MAX {
-        ctx.unpin_native_roots(key_pin);
-    } else if value_pin != usize::MAX {
-        ctx.unpin_native_roots(value_pin);
-    }
-    ctx.set_field(entry, 0, key);
-    ctx.set_field(entry, 1, value);
-    Ok(Some(Value::Object(Some(entry))))
-}
 
 // ===========================================================================
 // Stream API — Eager evaluation on Vec<Value>
@@ -45403,6 +45456,33 @@ fn native_unmod_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Bounds-check BEFORE delegating, and keep the
+    // `ArrayIndexOutOfBoundsException` this path has always thrown.
+    //
+    // The delegate is a real `java/util/ArrayList`, so it now answers with the
+    // plain `IndexOutOfBoundsException` that HotSpot's `ArrayList` throws --
+    // right for that receiver, wrong for this one. Measured against HotSpot 25
+    // with `probes/ListOutOfBoundsProbe`: `List.of()` and `List.of(a,b,c,d)`
+    // throw `ArrayIndexOutOfBoundsException` (`ImmutableCollections.ListN`
+    // indexes its array directly), while the 1-2 element `List12` throws the
+    // plain class with a different wording again ("Index: 3 Size: 1").
+    //
+    // Two of the three want the subclass, and this VM funnels every
+    // unmodifiable/immutable list through ONE synthetic class -- there is no
+    // discriminator here that separates a 1-2 element `List.of` from
+    // `Collections.unmodifiableList` over a 1-2 element `ArrayList`, which
+    // wants the plain class. Reproducing the JDK's split would be guessing;
+    // holding this path where it was is right for 0 and 3+ elements and is the
+    // status quo for the rest.
+    if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
+    {
+        if let Some(backing) = unmod_receiver_backing(ctx, *this) {
+            let (_, n) = al_state(ctx, backing);
+            if *index < 0 || *index >= n {
+                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+            }
+        }
+    }
     unmod_delegate(ctx, args, "get", "(I)Ljava/lang/Object;")
 }
 

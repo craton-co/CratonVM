@@ -7,7 +7,7 @@ once as the file layout allows. This is the *guide*; each lane has its own doc.
 **This is not the defect list.** The evidence — what is broken, how it was
 measured, blast radius — lives in
 [`docs/known-issues/jdk-only/`](../../known-issues/jdk-only/) and stays there.
-A record moves to `docs/internal/` when it is fixed. This directory says **who
+A record moves to the internal record tree when it is fixed. This directory says **who
 can work on what, simultaneously, without colliding.**
 
 ---
@@ -30,12 +30,12 @@ can work on what, simultaneously, without colliding.**
 | [L2](L2-native-map-init-by-name.md) **DONE 2026-08-04** | `native_map_init`'s raw `MAP_FIELD_*` branch → by-name | `native-collections/src/lib.rs` | — | M |
 | [L3](L3-scanner-membername-residual.md) **DONE 2026-08-05** | Trace + fix the last unclassified layout rows | `native-builtins/src/phases_early.rs`, `lang_invoke.rs`, **`native-io/src/lib.rs`** | — | S |
 | [L4](L4-overlay-detector-blind-spots.md) **DONE 2026-08-05** | Detector misses reads, same-kind writes, null writes | `vm/src/vm/vm_exec.rs` (hunter only), `classloading/src/shadow_layout.rs` | — | M |
-| [L5](../../internal/jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
-| [L5b/L5c](../../internal/jdk-only-wave2-L5bc-nativekind-awt-builtins-DONE-20260805.md) **DONE 2026-08-05** | The same migration for the other crates — `native-awt` 21 and `native-builtins` 582 registrations stated; `native-collections` measured and has **zero** to state ([residuals](../../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)) | `native-awt/src/*.rs`, `native-builtins/src/*.rs` | L5 | M |
+| L5 (`jdk-only-wave2-L5-nativekind-native-io-DONE-20260805.md`) **DONE 2026-08-05** | `register_with_kind` migration, `native-io` first — 87 registrations stated, 117 left inherited on purpose ([residuals](../../known-issues/jdk-only/l5-native-io-bridge-residuals.md)) | `native-io/src/*.rs` | — | M |
+| L5b/L5c (`jdk-only-wave2-L5bc-nativekind-awt-builtins-DONE-20260805.md`) **DONE 2026-08-05** | The same migration for the other crates — `native-awt` 21 and `native-builtins` 582 registrations stated; `native-collections` measured and has **zero** to state ([residuals](../../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)) | `native-awt/src/*.rs`, `native-builtins/src/*.rs` | L5 | M |
 | L5-residuals **DONE 2026-08-05** | Closes what L5/L5b/L5c left: the `unknown`-marked registrars, all 31 mixed sites, `vm/src/runtime/instrument.rs`, and the two instrument gaps that made three verdicts wrong ([record](../../known-issues/jdk-only/census-asks-one-class-on-one-platform.md)) | `native-io/`, `native-builtins/`, `native-awt/`, `vm/src/runtime/instrument.rs`, `scripts/`, `probes/` | L5, L5b/L5c | M |
-| [L6](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
-| [L7](../../internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
-| [L8](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
+| L6 (`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`) **DONE 2026-08-05** | Ratchet the unadjudicated `Bridge` rows — frozen at **10,069** (25/linux); L5 did not move it, and could not: the 87 rows L5 stated are exactly the ones that DO have an `ACC_NATIVE` target | `regression-suite/`, `scripts/` | — | S |
+| L7 (`L7-ensure-synthetic-class-migration-RETIRED-20260805.md`) **DONE 2026-08-05** | Make fabrication refusable, migrate the callers that fire — 10 fire, not 52; a strict boot fabricates **zero** compatibility classes now | `classloading/src/class_manager.rs` + callers | — | M |
+| L8 (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | [L10](L10-blocker-threadpool-init.md) | **Blocker.** Real `ThreadPoolExecutor` field init | `native-collections/src/lib.rs` ⚠ | — | L |
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
@@ -147,7 +147,7 @@ above looks paranoid.
 6. **Strict corpus green.** The unmeasured half until 2026-08-04, and where the
    defects turned out to be. **Not green**, and now measured on every CI run by
    `scripts/jdk-only-strict-probes.sh` — see
-   [L8 retired](../../internal/jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md).
+   L8 retired (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`).
    Four open records stand between here and green, all four **compatibility**
    defects that `--jdk-only` did not introduce.
 
@@ -305,7 +305,7 @@ advisory applies to a `Compatible`-mode census with a committed baseline. The
 `jdk-only` matrix keeps its copy as the multi-JDK/OS probe.
 
 **Update, 2026-08-05 — L7 landed, and the lane doc is retired to
-`docs/internal/L7-ensure-synthetic-class-migration-RETIRED-20260805.md`.** A
+`L7-ensure-synthetic-class-migration-RETIRED-20260805.md`.** A
 strict boot now fabricates **zero** compatibility classes (13 before), and the
 two breadth probes drop 17 → 1 and 18 → 5. `Compatible`-mode stdout is
 byte-identical on all three workloads against the pre-fix binary. Another

@@ -2875,6 +2875,47 @@ fn s2_bb_pos(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 fn s2_bb_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_LIMIT).as_int().unwrap_or(0)
 }
+/// `Buffer.checkIndex` for the ABSOLUTE accessors: `index` must admit `width`
+/// bytes within the buffer's **limit**.
+///
+/// This did not exist until 2026-08-05 and none of the twelve absolute
+/// accessors below bounds-checked at all. `ByteBuffer.wrap(new byte[8]).get(99)`
+/// returned **0** where HotSpot throws; `getInt(6)` on the same buffer returned
+/// `117964800`, i.e. the two real bytes at 6 and 7 followed by two fabricated
+/// zeroes. Silently wrong DATA is worse than an exception, because a
+/// computation consumes it.
+///
+/// `s2_bb_get_byte` already refuses to read out of range -- it returns a benign
+/// 0 and says so in its comment -- but it returns `i8` and so has no way to
+/// raise a Java exception. That defensiveness is the right thing for a helper
+/// and the wrong thing for the API contract, so the check belongs HERE, at the
+/// registration sites, where `MethodCallResult` can carry the throw. The
+/// helper's zero stays as the panic guard it was written to be.
+///
+/// **`limit`, not `capacity`** -- `ByteBuffer.get(int)` is `Objects.checkIndex(i,
+/// limit)`. A buffer whose limit has been pulled in must refuse an absolute read
+/// past it even though the storage is still there.
+///
+/// HotSpot's message here is null (`Buffer.checkIndex` throws the no-arg
+/// `IndexOutOfBoundsException`), which is why this passes `None` rather than
+/// inventing text -- checked against a HotSpot 25 control, not assumed.
+fn s2_bb_check_index(
+    ctx: &dyn NativeContext,
+    buf: ObjectRef,
+    index: i32,
+    width: i32,
+) -> Result<(), MethodCallFailed> {
+    let limit = s2_bb_limit(ctx, buf);
+    // Widened so `index + width` cannot overflow for an index near i32::MAX.
+    let end = index as i64 + width as i64;
+    if index < 0 || end > limit as i64 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message: None }.into(),
+        );
+    }
+    Ok(())
+}
+
 #[inline]
 fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_CAP).as_int().unwrap_or(0)
@@ -3266,49 +3307,6 @@ fn s2_bb_bulk_array_copy(
         return false;
     }
     ctx.write_byte_array_from(dst, dst_off, &buf)
-}
-
-/// `java.nio.Buffer.checkIndex` for the ABSOLUTE accessors: an index is valid
-/// iff `0 <= idx` and `idx + width <= limit` — against the **limit**, never
-/// the capacity — and an invalid one throws plain
-/// `IndexOutOfBoundsException`.
-///
-/// Why this lives at the registration layer instead of inside
-/// `s2_bb_get_byte`/`s2_bb_put_byte`, where the missing check was first
-/// noticed: those two are private byte-level primitives called from ~15 sites
-/// (`s2_bb_read2/4/8`, `s2_bb_write2/4/8`, the typed-view accessors, the
-/// char-decoding loop), most of which have already done their own
-/// position/limit arithmetic and some of which deliberately walk with a
-/// negative sentinel. Their "a bad index reads back a benign zero" contract
-/// is load-bearing for those callers and for genuinely half-built synthetic
-/// buffers, and is left exactly as it was. What was wrong is that the
-/// *public* absolute accessors inherited that leniency, so a reader walking
-/// past the limit got zeros where HotSpot throws — a truncated message
-/// decoding as zero-padded instead of failing, the same silently-plausible
-/// shape as the Lucene footer/checksum bug (ES-FAIL-FAMILY-20260709).
-///
-/// The `s2_bb_storage` gate is what the divergence doc said the code could
-/// not do — "that reasoning is sound for a half-built synthetic buffer and
-/// wrong for a real HeapByteBuffer, and the code cannot currently tell them
-/// apart at that point". At *this* point it can: a buffer with a resolvable
-/// heap array or direct address is a real buffer whose `limit` means
-/// something, and a storage-less synthetic keeps the benign-zero behaviour it
-/// has always had.
-fn s2_bb_check_index(
-    ctx: &dyn NativeContext,
-    buf: ObjectRef,
-    idx: i32,
-    width: i32,
-) -> Result<(), MethodCallFailed> {
-    if s2_bb_storage(ctx, buf).is_none() {
-        return Ok(());
-    }
-    let limit = s2_bb_limit(ctx, buf) as i64;
-    // Widened: `idx + width` cannot wrap into a passing value for idx near i32::MAX.
-    if idx < 0 || (idx as i64) + (width as i64) > limit {
-        return Err(RuntimeError::IndexOutOfBoundsException { index: idx }.into());
-    }
-    Ok(())
 }
 
 fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
@@ -4506,19 +4504,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let dst_cap = ctx.array_length(dst) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > dst_cap {
-            // The JDK throws plain `IndexOutOfBoundsException` here
-            // (`Objects.checkFromIndexSize`). This used to throw the
-            // ArrayIndexOutOfBounds subclass, which every
-            // `catch (IndexOutOfBoundsException)` caller still matched — but a
-            // type-exact differential can never agree with HotSpot while it
-            // does, and `catch (ArrayIndexOutOfBoundsException)` around this
-            // call matched here while missing on a real JVM.
+            // Plain `IndexOutOfBoundsException`, which is what the JDK throws
+            // here (`Objects.checkFromIndexSize`). This threw the
+            // ArrayIndexOutOfBounds SUBCLASS until 2026-08-05, filed at the
+            // time as benign because `catch (IndexOutOfBoundsException)` still
+            // matched. It is not: the subclass direction is the one that
+            // breaks a `catch`, so `catch (ArrayIndexOutOfBoundsException)`
+            // around this call matched here and missed on a real JVM — and
+            // while it stood, a type-exact differential could never agree with
+            // HotSpot, so it could detect nothing new either.
             return Err(RuntimeError::IndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
+                message: Some(format!(
+                    "Range [{off}, {off} + {len}) out of bounds for length {dst_cap}"
+                )),
             }
             .into());
         }
@@ -4647,15 +4645,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let src_cap = ctx.array_length(src) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > src_cap {
-            // Plain `IndexOutOfBoundsException`, matching the JDK — see the
-            // symmetric comment in `get([BII)` for why the AIOOBE subclass
-            // this used to throw was not good enough.
+            // Plain `IndexOutOfBoundsException` — see the symmetric comment in
+            // `get([BII)` for why the AIOOBE subclass this used to throw was
+            // not good enough.
             return Err(RuntimeError::IndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
+                message: Some(format!(
+                    "Range [{off}, {off} + {len}) out of bounds for length {src_cap}"
+                )),
             }
             .into());
         }
@@ -4742,15 +4738,17 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let src = obj_arg(args, 1)?;
             // `ByteBuffer.put(ByteBuffer src)` rejects a self-copy outright:
-            // `if (src == this) throw createSameBufferException()`. This is
-            // checked FIRST, ahead of the read-only test, matching the JDK's
-            // own order — a read-only buffer put into itself reports the
+            // `if (src == this) throw createSameBufferException()`. Checked
+            // FIRST, ahead of the read-only test, matching the JDK's own order
+            // — a read-only buffer put into itself reports the
             // IllegalArgumentException, not ReadOnlyBufferException.
             //
-            // CratonVM used to perform the copy (well-defined since the
-            // 2026-07-31 bulk rewrite routed it through an owned intermediate,
-            // but still wrong): `ByteBuffer.wrap(new byte[16]).put(b)` left
-            // pos=16 where HotSpot throws.
+            // CratonVM used to perform the copy. Since the 2026-07-31 bulk
+            // rewrite that copy at least went through an owned intermediate,
+            // so it was well defined rather than an overlapping element-wise
+            // walk — but `ByteBuffer.wrap(new byte[16]).put(b)` still left
+            // pos=16 where HotSpot throws, and any code doing it is already
+            // broken on a real JVM.
             if src == this {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "The source buffer is this buffer".to_string(),

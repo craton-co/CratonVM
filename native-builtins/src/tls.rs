@@ -302,7 +302,7 @@ fn noncrypto_engine_allowed() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let allowed = std::env::var("CRATONVM_ALLOW_NONCRYPTO_SSLENGINE")
+            let allowed = cratonvm_types::flags::runtime_var("CRATONVM_ALLOW_NONCRYPTO_SSLENGINE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             NONCRYPTO_ENGINE_OPT_IN.store(if allowed { 2 } else { 1 }, Ordering::Relaxed);

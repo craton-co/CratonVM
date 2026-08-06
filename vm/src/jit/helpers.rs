@@ -7617,7 +7617,7 @@ static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
 /// removable from a run in one flag.
 ///
 /// See
-/// `docs/internal/fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+/// `fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -7645,7 +7645,8 @@ mod site_refusal {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// One counter per refusal reason, in the order they are tested.
-    pub(super) static COUNTS: [AtomicU64; 7] = [
+    pub(super) static COUNTS: [AtomicU64; 8] = [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -7655,21 +7656,20 @@ mod site_refusal {
         AtomicU64::new(0),
     ];
 
-    pub(super) const REASONS: [&str; 7] = [
+    pub(super) const REASONS: [&str; 8] = [
         "invoke-kind not virtual/interface/static, or receiver not a heap object",
         "method name is special-cased by invoke_or_native",
         "receiver class unavailable",
         "capability-classified triple",
         "no native for the triple on the receiver or its supers (bytecode wins)",
-        // Slot 5 is retired: it meant "registered, but does not claim leaf",
-        // which was a refusal only while this cache served leaves alone.
-        // Non-leaf natives now get an entry too — they skip `invoke_or_native`
-        // and still enter the funnel — so nothing reports it. Kept as a slot
-        // rather than renumbered, so a reader comparing an old run's output
-        // against a new one is not silently misled about which reason a count
-        // belongs to.
-        "(retired: not-a-leaf is no longer a refusal)",
+        // Slot 5 meant "registered, but does not claim leaf". It was retired
+        // when non-leaf natives started getting entries too, and is LIVE AGAIN
+        // under `CRATONVM_JIT_SITE_CACHE=leaf`, which restores the leaf-only
+        // cache this path shipped with before 836631dcc. Under the default
+        // `all` nothing reports it, exactly as during its retirement.
+        "registered, but does not claim leaf (mode=leaf)",
         "SyntheticStub / policy refused",
+        "site cache disabled (mode=off)",
     ];
 
     #[inline]
@@ -7700,6 +7700,119 @@ mod site_refusal {
 /// once on shutdown by `CRATONVM_DBG=intrinsic-stats`.
 pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
     site_refusal::report()
+}
+
+/// How much of the per-call-site native cache is in effect. **Default `All`.**
+///
+/// ## This lever once carried a wrong conclusion. Read the correction first.
+///
+/// The cache resolves a JIT call site's native ONCE and dispatches it directly,
+/// skipping `invoke_or_native`'s hand-written gate cascade. 836631dcc widened it
+/// from leaf natives to every registered native, and `CacheAutoConfigurationTests`
+/// then failed 53 of 59 with the cache on and 0 with it leaf-only — on one
+/// binary, with this mode as the only variable. That measurement was real. The
+/// conclusion drawn from it, that the widening was the defect, was **wrong**.
+///
+/// `dev` landed `383e7f5cf` — "a recycled `JitInvokeInfo` address let one call
+/// site serve another's dispatch" — during the same investigation, and that is
+/// the actual defect. Every memo here is keyed on `(vm_identity, JitInvokeInfo
+/// pointer)`; those boxes are freed with the `CompiledMethod` that owns them, so
+/// the allocator can hand the same address to the next compile and the key then
+/// names a DIFFERENT call site while the memo still holds the old site's answer.
+/// A cache holding a resolved native is the loudest form of that — the reused
+/// site CALLs the previous site's native and returns what it returns — which is
+/// exactly why widening this cache *amplified* the recycled-key defect until it
+/// looked like its cause.
+///
+/// Re-measured on current `dev` (with `383e7f5cf` in), same class, same fixture:
+///
+/// | mode | failures | when |
+/// |---|---:|---|
+/// | `all` | 53 | before `383e7f5cf` |
+/// | `leaf` | 0 | before `383e7f5cf` |
+/// | **`all`** | **0, twice** | **after `383e7f5cf` — the default** |
+///
+/// The faces were all "a call returned the wrong object": `Function$Identity`
+/// (whose native returns its first argument) dispatched 5 870 times under the
+/// JIT and 0 times under `--nojit`, `StreamSupport.stream(spliterator, false)`
+/// handing back the spliterator, `Proxy$Dispatch.invokeProxy` reached with a
+/// null `Method`. See
+/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
+///
+/// So `all` is restored. Gating it would cost 836631dcc's win to work around a
+/// defect that no longer exists. **A perf change that makes a latent defect
+/// reproducible is an amplifier, not the cause — merge `dev` and re-measure
+/// before gating one.**
+///
+/// The lever survives its wrong conclusion because the question it answers is
+/// permanent: a bisect over VM binaries costs ~15 minutes a step, and a bisect
+/// over this costs one run. `native_site_cache_enabled()` is the coarse
+/// on/off kill switch beside it; this is the shape selector.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SiteCacheMode {
+    /// Every registered native the resolver can reach, including via the
+    /// superclass walk — the 836631dcc behaviour, and **the default**.
+    All,
+    /// As `All`, but a native is only served when it is registered on the
+    /// dispatch class ITSELF — the rule `invoke_or_native` actually applies
+    /// (`find_with_kind(effective_class, …)`).
+    NoSuperWalk,
+    /// Leaf natives only — the behaviour this path shipped with before
+    /// 836631dcc. The leaf claim is made per registration by someone who
+    /// checked that the native may skip the funnel, so this is the narrowest
+    /// mode that still has a fast path at all. No longer the default: see the
+    /// correction on [`SiteCacheMode`].
+    Leaf,
+    /// No site caching at all; every call runs the generic dispatcher.
+    Off,
+}
+
+impl SiteCacheMode {
+    #[inline]
+    fn walks_supers(self) -> bool {
+        matches!(self, SiteCacheMode::All | SiteCacheMode::Leaf)
+    }
+
+    #[inline]
+    fn admits_non_leaf(self) -> bool {
+        matches!(self, SiteCacheMode::All | SiteCacheMode::NoSuperWalk)
+    }
+}
+
+/// `CRATONVM_JIT_SITE_CACHE` — `leaf` (default), `all`, `no-super-walk`, `off`.
+///
+/// An unrecognised value is a hard error rather than a silent fall-back to the
+/// default: a bisect lever that reads as "no effect" when it was misspelled is
+/// worse than no lever, because "no effect" is exactly the answer it exists to
+/// produce and the reader cannot tell the two apart.
+fn site_cache_mode() -> SiteCacheMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<SiteCacheMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        site_cache_mode_from(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The parse, split out from the `OnceLock` so it is testable: a mode latched
+/// once per process cannot be exercised across values from a unit test.
+fn site_cache_mode_from(raw: Option<&str>) -> SiteCacheMode {
+    match raw {
+        None => SiteCacheMode::All,
+        Some(v) => match v.trim() {
+            "" | "all" => SiteCacheMode::All,
+            "leaf" => SiteCacheMode::Leaf,
+            "no-super-walk" => SiteCacheMode::NoSuperWalk,
+            "off" => SiteCacheMode::Off,
+            other => panic!(
+                "CRATONVM_JIT_SITE_CACHE={other:?} is not one of \
+                 all / leaf / no-super-walk / off"
+            ),
+        },
+    }
 }
 
 /// Does `invoke_or_native` special-case this method name BEFORE it reaches its
@@ -7775,6 +7888,10 @@ fn resolve_native_site(
     info: &JitInvokeInfo,
     receiver_class_id: Option<ClassId>,
 ) -> Option<NativeSiteCache> {
+    let mode = site_cache_mode();
+    if mode == SiteCacheMode::Off {
+        return site_refusal::note(7);
+    }
     if !matches!(info.invoke_kind, 0 | 2 | 3) {
         return site_refusal::note(0);
     }
@@ -7830,9 +7947,13 @@ fn resolve_native_site(
     // reached with a `ReentrantLock$NonfairSync` receiver, two levels down —
     // and `invoke_or_native` has a specific rule for that walk which has to be
     // reproduced, not approximated. See `resolve_native_owner_for_receiver`.
-    let Some((owner_class, id)) =
-        resolve_native_owner_for_receiver(vm, &lookup_class, receiver_class_id, info)
-    else {
+    let Some((owner_class, id)) = resolve_native_owner_for_receiver(
+        vm,
+        &lookup_class,
+        receiver_class_id,
+        info,
+        mode.walks_supers(),
+    ) else {
         return site_refusal::note(4);
     };
     // `Thread.currentThread()` is served from the thread mirror instead of the
@@ -7858,6 +7979,9 @@ fn resolve_native_site(
             vm.natives.native_methods.is_leaf_id(id),
         )
     };
+    if !leaf && !mode.admits_non_leaf() {
+        return site_refusal::note(5);
+    }
     if vm.natives.native_methods.kind_of_id(id)
         == Some(cratonvm_native_api::NativeKind::SyntheticStub)
     {
@@ -7931,10 +8055,19 @@ fn resolve_native_owner_for_receiver(
     dispatch_class: &str,
     receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
+    walk_supers: bool,
 ) -> Option<(String, cratonvm_native_api::NativeMethodId)> {
     let registry = &vm.natives.native_methods;
     if let Some(id) = registry.resolve_id(dispatch_class, info.method_name, info.descriptor) {
         return Some((dispatch_class.to_string(), id));
+    }
+    if !walk_supers {
+        // `invoke_or_native` looks the native up on `effective_class` and
+        // nothing else — rule 1 above and no more. The walk below is an
+        // *approximation* of what the rest of the dispatch pipeline does, so
+        // `CRATONVM_JIT_SITE_CACHE=no-super-walk` restricts this resolver to
+        // the part that is a literal reproduction.
+        return None;
     }
     // `<init>` is never inherited; the walk below would be wrong for it. It is
     // already refused by `site_name_is_special_cased`, but state it here
@@ -12521,7 +12654,7 @@ mod tests {
     #[test]
     fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
         assert!(
-            std::env::var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
             "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
         );
         assert!(
@@ -12579,6 +12712,67 @@ mod tests {
                  leaf claim or remove the special case."
             );
         }
+    }
+
+    /// The site cache serves EVERY registered native by default.
+    ///
+    /// This test was written asserting the opposite, on a measurement that was
+    /// correct and a conclusion that was not: `CacheAutoConfigurationTests`
+    /// went 53 failures to 0 when this mode was narrowed to `leaf`, so the
+    /// widening looked like the defect. It was the amplifier —
+    /// `dev`'s `383e7f5cf` (a recycled `JitInvokeInfo` address serving one call
+    /// site's memo to another) was the defect, and with it in, `all` measures 0
+    /// failures twice over. See [`SiteCacheMode`] for the full correction.
+    ///
+    /// It is kept, inverted, because the regression it now guards is the one
+    /// that actually happened: a plausible measurement talking someone into
+    /// gating a perf win around a defect that lives somewhere else.
+    ///
+    /// Asserted through the mode's own predicates rather than by re-deriving
+    /// the rule, and in BOTH directions — a predicate answering the same for
+    /// every mode would satisfy a one-sided check while making the lever inert.
+    #[test]
+    fn site_cache_admits_every_registered_native_by_default() {
+        assert_eq!(
+            site_cache_mode_from(None),
+            SiteCacheMode::All,
+            "the default is `All`: gating it would cost 836631dcc's win to work \
+             around 383e7f5cf's recycled-key defect, which is fixed. See the \
+             correction on `SiteCacheMode`."
+        );
+        assert!(
+            SiteCacheMode::All.admits_non_leaf(),
+            "the default must actually admit non-leaf natives, or the fast path \
+             is inert and the default reads as a decision nobody made"
+        );
+        // Both directions. A predicate that answered the same for every mode
+        // would satisfy a one-sided check while making the lever inert, which
+        // is the failure this whole family keeps producing.
+        assert!(SiteCacheMode::NoSuperWalk.admits_non_leaf());
+        assert!(!SiteCacheMode::Leaf.admits_non_leaf());
+        assert!(!SiteCacheMode::Off.admits_non_leaf());
+    }
+
+    /// Every spelling the lever accepts, and the fact that it rejects anything
+    /// else loudly. A silently-ignored value would read as "this mode made no
+    /// difference", which is exactly the verdict the lever exists to produce.
+    #[test]
+    fn site_cache_mode_parses_every_spelling() {
+        assert_eq!(site_cache_mode_from(Some("")), SiteCacheMode::All);
+        assert_eq!(site_cache_mode_from(Some("all")), SiteCacheMode::All);
+        assert_eq!(site_cache_mode_from(Some(" all ")), SiteCacheMode::All);
+        assert_eq!(site_cache_mode_from(Some("leaf")), SiteCacheMode::Leaf);
+        assert_eq!(
+            site_cache_mode_from(Some("no-super-walk")),
+            SiteCacheMode::NoSuperWalk
+        );
+        assert_eq!(site_cache_mode_from(Some("off")), SiteCacheMode::Off);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not one of")]
+    fn site_cache_mode_rejects_an_unknown_spelling() {
+        let _ = site_cache_mode_from(Some("leaves"));
     }
 
     /// The leaf set is an audited list, so it is worth stating what is on it —

@@ -199,7 +199,7 @@ fn sweep_anchor_stride() -> usize {
 /// `live` is `cursor - free_list`, the metric the trigger actually uses.
 fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: usize, non_moving: bool) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
+    if !*ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
         return;
     }
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -705,6 +705,9 @@ struct YoungFreedRec {
     size: AtomicU64,
     cycle: AtomicU64,
     seq: AtomicU64,
+    /// H2-CID0 (2026-08-05) — packed cross-thread root coverage of the sweep
+    /// that published this span. See [`pack_xt_coverage`].
+    xt: AtomicU64,
 }
 
 impl YoungFreedRec {
@@ -714,8 +717,36 @@ impl YoungFreedRec {
             size: AtomicU64::new(0),
             cycle: AtomicU64::new(0),
             seq: AtomicU64::new(0),
+            xt: AtomicU64::new(0),
         }
     }
+}
+
+/// Marks a packed coverage word as actually written.
+///
+/// Zero is a legitimate reading (`passes=0` = the takeover never ran, which
+/// `gc_quiescence::XT_PASSES_LAST_CYCLE` warns is the OPPOSITE conclusion from
+/// "ran and found nothing"), so absence needs its own encoding.
+const XT_CAPTURED: u64 = 1 << 48;
+
+/// Pack `(passes, taken_over, unclassified)` into one word, saturating each at
+/// 16 bits — the counts are per-cycle peer tallies, so anything near the cap is
+/// already far past "a few threads".
+#[inline]
+fn pack_xt_coverage(passes: u64, taken: u64, unclassified: u64) -> u64 {
+    XT_CAPTURED
+        | (passes.min(0xFFFF) << 32)
+        | (taken.min(0xFFFF) << 16)
+        | unclassified.min(0xFFFF)
+}
+
+/// `(passes, taken_over, unclassified)`, or `None` if nothing was captured.
+#[inline]
+fn unpack_xt_coverage(w: u64) -> Option<(u64, u64, u64)> {
+    if w & XT_CAPTURED == 0 {
+        return None;
+    }
+    Some(((w >> 32) & 0xFFFF, (w >> 16) & 0xFFFF, w & 0xFFFF))
 }
 
 static YOUNG_FREED_RING: [YoungFreedRec; YOUNG_FREED_RING_LEN] =
@@ -732,15 +763,31 @@ pub fn record_young_span_freed(base: usize, size: usize, cycle: u64) {
     r.size.store(size as u64, Ordering::Relaxed);
     r.cycle.store(cycle, Ordering::Relaxed);
     r.seq.store(seq, Ordering::Relaxed);
+    // H2-CID0: the coverage of THIS sweep, captured here because this call
+    // happens inside it — after the take-over pass published its outcome and
+    // before `reset_xt_cycle` clears it for the next one. Read back by the
+    // reclaim guard for the exact span it reports, so a stale receiver can say
+    // whether the sweep that freed it had seen every running peer's JIT frames.
+    let (passes, taken, unclassified, _roots, _hw, _hw_roots) =
+        crate::gc_quiescence::xt_cycle_coverage();
+    r.xt.store(
+        pack_xt_coverage(passes, taken, unclassified),
+        Ordering::Relaxed,
+    );
     // Publish `base` LAST, as in the old-gen ring.
     r.base.store(base as u64, Ordering::Release);
 }
 
 /// Did the young sweep reclaim a span covering `addr`? Returns
-/// `(base, size, cycle, seq)` for the most recent covering record.
-pub fn young_freed_lookup(addr: usize) -> Option<(usize, usize, u64, u64)> {
+/// `(base, size, cycle, seq, xt_coverage)` for the most recent covering record,
+/// where `xt_coverage` is `(passes, taken_over, unclassified)` for the sweep
+/// that published the span — `None` when nothing was captured.
+#[allow(clippy::type_complexity)]
+pub fn young_freed_lookup(
+    addr: usize,
+) -> Option<(usize, usize, u64, u64, Option<(u64, u64, u64)>)> {
     let a = addr as u64;
-    let mut best: Option<(usize, usize, u64, u64)> = None;
+    let mut best: Option<(usize, usize, u64, u64, Option<(u64, u64, u64)>)> = None;
     for r in YOUNG_FREED_RING.iter() {
         let base = r.base.load(Ordering::Acquire);
         if base == 0 {
@@ -751,12 +798,13 @@ pub fn young_freed_lookup(addr: usize) -> Option<(usize, usize, u64, u64)> {
             continue;
         }
         let seq = r.seq.load(Ordering::Relaxed);
-        if best.is_none_or(|(_, _, _, b)| seq > b) {
+        if best.is_none_or(|(_, _, _, b, _)| seq > b) {
             best = Some((
                 base as usize,
                 size as usize,
                 r.cycle.load(Ordering::Relaxed),
                 seq,
+                unpack_xt_coverage(r.xt.load(Ordering::Relaxed)),
             ));
         }
     }
@@ -1287,6 +1335,13 @@ impl Drop for GenerationalHeap {
 /// Old generation: non-moving free-list allocator with mark-sweep.
 /// Card table: tracks old→young cross-generation references.
 pub struct GenerationalHeap {
+    /// Compact-layout domain of the VM that owns this heap. See
+    /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
+    /// allocating against another domain's registry entry would give the object
+    /// a foreign shape. Defaults to the first domain, so an untold heap behaves
+    /// as it did before domains existed.
+    layout_domain: std::sync::atomic::AtomicU32,
+
     /// Young generation from-space (allocation target).
     young_from: Mutex<Arena>,
     /// Young generation to-space (GC copy target).
@@ -1487,6 +1542,17 @@ unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
 impl GenerationalHeap {
+    /// Bind this heap to its VM's compact-layout domain.
+    pub fn set_layout_domain(&self, domain: u32) {
+        self.layout_domain
+            .store(domain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// This heap's compact-layout domain.
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a new generational heap with default sizes.
     pub fn new() -> Self {
         Self::with_sizes(DEFAULT_YOUNG_SEMI_SIZE, DEFAULT_OLD_GEN_SIZE)
@@ -1542,6 +1608,9 @@ impl GenerationalHeap {
         };
 
         let heap = Self {
+            layout_domain: std::sync::atomic::AtomicU32::new(
+                cratonvm_types::FIRST_LAYOUT_DOMAIN,
+            ),
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
@@ -1754,7 +1823,7 @@ impl GenerationalHeap {
         // `plan_object_alloc` also picks the compact reference-field layout when
         // enabled (smaller `total_size`, `array_length` = body bytes,
         // `GC_FLAG_COMPACT`).
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
             .unwrap_or_else(|| {
                 eprintln!(
                     "FATAL: object size overflow in gen_heap alloc_object \
@@ -1837,7 +1906,7 @@ impl GenerationalHeap {
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
@@ -2180,7 +2249,7 @@ impl GenerationalHeap {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
         // near-`usize::MAX` field count can't wrap past the checked multiply.
         // `plan_object_alloc` also selects the compact reference-field layout.
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
         let init = |ptr: *mut u8| {
             let mut header = ObjectHeader::new(
@@ -2403,7 +2472,7 @@ impl GenerationalHeap {
         class_id: ClassId,
         num_fields: usize,
     ) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
@@ -2446,7 +2515,7 @@ impl GenerationalHeap {
         // spill: arm the boundary-GC pressure flag (advisability-gated; one
         // extra old-gen lock per 2048-object batch, not per allocation).
         self.note_young_spill_pressure();
-        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(class_id, num_fields)
+        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
         else {
             return Vec::new();
         };
@@ -12172,7 +12241,7 @@ impl GenerationalHeap {
         // Opt-in: the allocating call chain. Release builds carry line tables,
         // so this names the exact panicking-allocator caller — i.e. which
         // native / VM-internal path could not tolerate a GC-and-retry.
-        if std::env::var_os("CRATONVM_DBG_OOM_BT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOM_BT").is_some() {
             eprintln!(
                 "FATAL-OOM backtrace:\n{}",
                 std::backtrace::Backtrace::force_capture()
@@ -14953,10 +15022,14 @@ fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 ///
 /// `None` only on size overflow.
 #[inline]
-fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
+fn plan_object_alloc(
+    layout_domain: u32,
+    class_id: ClassId,
+    num_fields: usize,
+) -> Option<(usize, u32, u8)> {
     if compact_ref_fields_enabled() {
         if let Some(body_size) =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields)
+            cratonvm_types::compact_object_body_size(layout_domain, class_id.as_u32(), num_fields)
         {
             let total = HEADER_SIZE.checked_add(body_size)?;
             let body_size = u32::try_from(body_size).ok()?;
@@ -15575,6 +15648,40 @@ impl GarbageCollector for GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H2-CID0 (2026-08-05) — "nobody looked" must not read as "nothing found".
+    ///
+    /// `gc_quiescence::XT_PASSES_LAST_CYCLE` documents the trap: the take-over
+    /// is gated on an `any_thread_in_jit()` hint, so a cycle can legitimately
+    /// run ZERO passes — and then `unclassified = 0` means "never looked", the
+    /// opposite conclusion from "looked and every peer answered". The guard
+    /// reports a stale receiver's freeing sweep through this encoding, so the
+    /// three readings have to survive the round trip distinctly.
+    #[test]
+    fn packed_sweep_coverage_separates_never_looked_from_complete() {
+        // Looked, everyone answered.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(2, 3, 0)),
+            Some((2, 3, 0)),
+        );
+        // Looked, someone did not — the defect's signature.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(2, 1, 4)),
+            Some((2, 1, 4)),
+        );
+        // Never looked: distinguishable from both of the above.
+        assert_eq!(
+            unpack_xt_coverage(pack_xt_coverage(0, 0, 0)),
+            Some((0, 0, 0)),
+        );
+        // Nothing captured at all is a FOURTH reading, and the only one that
+        // may be absent — an all-zero word must not decode as a real sample.
+        assert_eq!(unpack_xt_coverage(0), None);
+        // Saturation must not alias a large count onto a small one, or onto
+        // the captured bit.
+        let (p, t, u) = unpack_xt_coverage(pack_xt_coverage(1 << 20, 1 << 20, 1 << 20)).unwrap();
+        assert_eq!((p, t, u), (0xFFFF, 0xFFFF, 0xFFFF));
+    }
 
     /// No-op monitor cleanup for tests in the gc crate.
     struct NoOpMonitors;
