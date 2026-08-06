@@ -5,6 +5,17 @@
 and it is **not** the dispatch bug that took out the four sibling
 `*AutoConfigurationTests` classes filed the same day.
 
+## Reconfirmed 2026-08-06, Windows box, longer timeout
+
+Same class, same throughput shape, on a fresh `dev` merge and a 1500s
+ceiling (5x this doc's 300s Azure runs): reached `HikariPool-13` of the 17
+needed cycles before the timeout killed it (vs. 9/17 in the 08-05
+1200s-local run cited below at "Where the time actually goes"). Consistent
+per-cycle cost, consistent HANG — nothing here changes this doc's diagnosis.
+Not re-investigated further; filed only to confirm the throughput problem is
+still live and still the whole story, not superseded by anything newer.
+Log: `apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-20260806-s4/all-jit/logs/module_spring-boot-jooq.org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests.out.log`.
+
 ## Correction (2026-08-05, measured)
 
 **1. It did not regress on 08-05.** Azure's own recorded rows:

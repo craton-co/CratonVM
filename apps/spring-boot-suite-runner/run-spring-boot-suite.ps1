@@ -381,7 +381,7 @@ function Import-HotspotBaseline {
     $path = Join-Path (Join-Path $script:WorkRoot 'baseline') 'hotspot-baseline-latest.tsv'
   }
   if (-not (Test-Path $path)) {
-    Write-Info "hotspot baseline: none at $path — every failure will be attributed to CratonVM"
+    Write-Info "hotspot baseline: none at $path -- every failure will be attributed to CratonVM"
     return $null
   }
   $map = @{}

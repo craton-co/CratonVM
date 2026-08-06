@@ -365,6 +365,26 @@ pub fn layout_generation() -> u64 {
 /// also refuse to ALLOCATE against a slot it does not own, because the lookup
 /// is what is ambiguous.
 pub fn register_class_layout(domain: u32, class_id: u32, layout: Arc<CompactLayout>) {
+    let idx = class_id as usize;
+    // FIRST, before touching any slot-indexed table. There are TWO dense
+    // `Vec`s keyed by `class_id` here — `CLASS_LAYOUT_OWNERS` and
+    // `CLASS_LAYOUTS` — and this check used to sit between them, so it
+    // bounded the second and not the first. `register_class_layout(_, u32::MAX,
+    // _)` therefore resized `CLASS_LAYOUT_OWNERS` to 2^32 `u32`s = **16 GiB**,
+    // writing `NO_LAYOUT_OWNER` into every one of them, and only then panicked
+    // about refusing the sparse allocation. On a 31 GiB host that is an
+    // OOM-kill: measured `anon-rss:10946560kB` at the moment the kernel killed
+    // the `cratonvm_types` test binary, taking every other test in the process
+    // with it (`cargo test` then reports "test failed" naming nothing).
+    //
+    // A corrupt or hostile `class_id` must not be able to allocate memory
+    // proportional to its own value, which is exactly what the limit exists to
+    // prevent — so it has to precede the first resize, not the last one.
+    assert!(
+        idx < MAX_DENSE_CLASS_LAYOUTS,
+        "compact field-layout class_id {class_id} exceeds dense registry limit \
+         ({MAX_DENSE_CLASS_LAYOUTS}); refusing sparse allocation"
+    );
     if let Some(owner) = layout_owner(class_id) {
         if owner != domain {
             FOREIGN_LAYOUT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -373,18 +393,11 @@ pub fn register_class_layout(domain: u32, class_id: u32, layout: Arc<CompactLayo
     }
     {
         let mut owners = CLASS_LAYOUT_OWNERS.write().unwrap();
-        let idx = class_id as usize;
         if idx >= owners.len() {
             owners.resize(idx + 1, NO_LAYOUT_OWNER);
         }
         owners[idx] = domain;
     }
-    let idx = class_id as usize;
-    assert!(
-        idx < MAX_DENSE_CLASS_LAYOUTS,
-        "compact field-layout class_id {class_id} exceeds dense registry limit \
-         ({MAX_DENSE_CLASS_LAYOUTS}); refusing sparse allocation"
-    );
 
     let field_count = u32::try_from(layout.field_count())
         .expect("compact field count exceeds u32");
@@ -1737,6 +1750,21 @@ mod tests {
         assert!(
             rejected.is_err(),
             "corrupt high class_id must be rejected before dense allocation"
+        );
+        // "before dense allocation" is the whole point, and asserting only that
+        // the call panicked cannot see it: the pre-fix code resized
+        // `CLASS_LAYOUT_OWNERS` to 2^32 entries (16 GiB) and THEN panicked, so
+        // this test passed while OOM-killing the test binary on any host
+        // without 16 GiB to spare. Assert the tables, not just the panic.
+        assert_eq!(
+            CLASS_LAYOUT_OWNERS.read().unwrap().len(),
+            0,
+            "rejected class_id must not have resized the owners table",
+        );
+        assert_eq!(
+            CLASS_LAYOUTS.read().unwrap().len(),
+            0,
+            "rejected class_id must not have resized the layouts table",
         );
 
         // The guard fires before taking CLASS_LAYOUTS, so a later valid

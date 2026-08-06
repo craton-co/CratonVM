@@ -4179,6 +4179,17 @@ fn run() -> Result<()> {
         }
     }
 
+    // A counter nobody can read is not a diagnostic. This reports under the
+    // flag that PRODUCED the numbers, not under `intrinsic-stats`, so
+    // `CRATONVM_DBG_SITE_ALIAS=1` alone is enough to get the totals.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SITE_ALIAS").is_some() {
+        eprintln!(
+            "[cratonvm] site-alias: distinct JitSiteKeys={} recycled-key hits={}",
+            cratonvm_vm::jit::helpers::site_alias_key_count(),
+            cratonvm_vm::jit::helpers::site_alias_hit_count()
+        );
+    }
+
     // Interpreter intrinsic-table stats. `CRATONVM_INTRINSIC_STATS=1` prints
     // the steady-state intrinsic-dispatch hit count on shutdown — the
     // counter that verifies acceptance criterion §9 of

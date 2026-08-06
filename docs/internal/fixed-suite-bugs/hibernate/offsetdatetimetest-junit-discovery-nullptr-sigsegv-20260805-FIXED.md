@@ -281,7 +281,7 @@ Before attributing a future "wrong method called" / "NoSuchMethodError naming
 a class that never declared the method" / "small integer used as a reference"
 report to codegen, check whether it predates this fix.
 
-Related, still open: `../../../known-issues/h2/bug-h2-classid0-stale-address-family.md`
+Related, FIXED 2026-08-06: `../h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`
 is a *different* family (a collector reclaiming or relocating something still
 referenced). This page is not a witness of it, for the two reasons the
 original page already gave.
