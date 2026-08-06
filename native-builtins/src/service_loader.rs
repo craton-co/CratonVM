@@ -885,9 +885,17 @@ fn discover_providers(
             Some(r) => {
                 let cid = ctx.class_id_of_object(r);
                 let name = ctx.class_name_of_id(cid).unwrap_or_default();
-                if crate::classloader::is_builtin_loader_class(&name)
-                    || !crate::classloader::is_classloader_instance(ctx, r)
-                {
+                // "Actually a ClassLoader" is either answer being yes: the
+                // hierarchy walk, OR the name heuristic `sl_non_builtin_loader`
+                // has always used. Requiring the walk alone would be a real
+                // tightening — a synthetic-jdk stub's superclass chain does not
+                // always reach `java/lang/ClassLoader`, and rejecting a loader
+                // this path used to accept would silently lose providers. Both
+                // answers are no for the `java/lang/String` this guard exists
+                // for.
+                let is_loader = crate::classloader::is_classloader_instance(ctx, r)
+                    || name.contains("ClassLoader");
+                if crate::classloader::is_builtin_loader_class(&name) || !is_loader {
                     None
                 } else {
                     Some(r)
