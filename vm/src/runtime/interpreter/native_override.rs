@@ -4888,6 +4888,7 @@ pub(super) fn redefine_immune_layout_native(
     redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
         || redefine_immune_synthetic_collection_native(class_name)
+        || redefine_immune_thread_local_native(class_name)
 }
 
 pub(super) fn redefine_immune_string_builder_native(
@@ -5060,6 +5061,7 @@ pub(super) fn redefine_immune_forced_native(
                 "<init>" | "publish" | "flush" | "close"
             ))
         || redefine_immune_synthetic_collection_native(class_name)
+        || redefine_immune_thread_local_native(class_name)
 }
 
 /// CratonVM implements these collections as small synthetic objects — a bucket
@@ -5111,6 +5113,53 @@ fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
             | "java/util/TreeMap"
             | "java/util/TreeSet"
             | "java/util/concurrent/ConcurrentHashMap"
+    )
+}
+
+/// `ThreadLocal`'s values do not live where its real JDK body looks for them.
+///
+/// CratonVM serves `get`/`set`/`remove`/`initialValue`/`withInitial`/`<init>` on
+/// these two classes from registered natives whose store is a Rust
+/// thread-local keyed by the ThreadLocal's identity hash
+/// (`TL_MAP` / `tl_with_initial_suppliers`, `native-builtins/src/
+/// phases_early.rs`). The real `java.lang.ThreadLocal` bytecode reads
+/// `Thread.threadLocals` — a `ThreadLocalMap` those natives never populate —
+/// so it can only ever answer `null`, for every value the process has set.
+///
+/// Same shape as the synthetic-collection arm above, and the same trigger:
+/// Mockito's inline mock maker instruments the target's whole superclass chain,
+/// so `mock()` of ANY `ThreadLocal` subclass — `org.springframework.core.
+/// NamedThreadLocal` is the one that found this — retransforms
+/// `java.lang.ThreadLocal` itself, the suppress-native-shadow-on-redefine rule
+/// fires, and every `ThreadLocal` in the process silently empties. Measured on
+/// one binary with the mock target as the only variable
+/// (`probes/ThreadLocalRetransformProbe.java`, `--dump-native-registry`):
+///
+/// ```text
+///                                 mock a ThreadLocal subclass | mock any other class
+///   ThreadLocal.get native calls                            4 |                  23
+///   value set before the mock                            null |              "hello"
+///   ThreadLocal.withInitial(() -> TRUE).get()            null |                true
+///   probe                                        PROBE-FAIL 4 |           PROBE-OK
+/// ```
+///
+/// Mockito's own internals are the first casualty, which is why the failure
+/// reads as "Mockito broke" rather than "ThreadLocal broke":
+/// `InlineDelegateByteBuddyMockMaker` holds `ThreadLocal.withInitial(() ->
+/// false)` fields, and once those answer `null` the very next
+/// `Boolean.booleanValue()` NPEs — inside mock creation, so EVERY subsequent
+/// `mock()` in the JVM fails too (89 of 728 in the sweep that found this).
+///
+/// Class-wide rather than method-wise, for the collection arm's reason: no
+/// suite stubs a method on a mocked `ThreadLocal`, and one un-stubbed mock
+/// costs far less than silent data loss on every ThreadLocal in the process.
+/// A subclass that overrides `initialValue()` is unaffected either way — that
+/// override is the subclass's own bytecode and dispatch resolves to it before
+/// reaching this gate.
+fn redefine_immune_thread_local_native(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/lang/ThreadLocal" | "java/lang/InheritableThreadLocal"
     )
 }
 
@@ -7159,12 +7208,67 @@ mod redefine_immunity_tests {
         }
     }
 
+    /// `ThreadLocal`'s values live in a Rust thread-local keyed by identity
+    /// hash, not in `Thread.threadLocals`, so its real JDK body answers `null`
+    /// for every value the process ever set. Mockito instruments the whole
+    /// superclass chain, so mocking ANY `ThreadLocal` subclass retransforms
+    /// `java.lang.ThreadLocal` and arms it — measured at
+    /// `ThreadLocal.get` native calls 23 -> 4 with the mock target as the only
+    /// variable. `probes/ThreadLocalRetransformProbe.java` is the witness.
+    #[test]
+    fn thread_local_keeps_its_natives_across_a_redefinition() {
+        for class in ["java/lang/ThreadLocal", "java/lang/InheritableThreadLocal"] {
+            for (name, desc) in [
+                ("<init>", "()V"),
+                ("get", "()Ljava/lang/Object;"),
+                ("set", "(Ljava/lang/Object;)V"),
+                ("remove", "()V"),
+                ("initialValue", "()Ljava/lang/Object;"),
+                (
+                    "withInitial",
+                    "(Ljava/util/function/Supplier;)Ljava/lang/ThreadLocal;",
+                ),
+            ] {
+                assert!(
+                    redefine_immune_forced_native(class, name, desc),
+                    "{class}.{name}{desc} must survive a redefinition"
+                );
+            }
+        }
+    }
+
+    /// The two aggregators are consulted by different dispatch paths — the
+    /// invoke-cache sites use `redefine_immune_layout_native`, everything else
+    /// `redefine_immune_forced_native`. An arm added to one only is the failure
+    /// the collection entry already made once: the probe went from 32 broken
+    /// operations to 18 instead of to 0, because the cache sites re-assembled
+    /// their own chain and never saw it. So assert the layout aggregator
+    /// directly rather than trusting that both were edited.
+    #[test]
+    fn thread_local_immunity_reaches_the_invoke_cache_sites_too() {
+        for class in ["java/lang/ThreadLocal", "java/lang/InheritableThreadLocal"] {
+            assert!(
+                super::redefine_immune_layout_native(class, "get", "()Ljava/lang/Object;"),
+                "{class}.get must be immune on the invoke-cache path as well"
+            );
+        }
+    }
+
     #[test]
     fn ordinary_classes_stay_evictable() {
         assert!(!redefine_immune_forced_native(
             "com/example/Service",
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ));
+        // A ThreadLocal SUBCLASS is an ordinary class: its own methods are its
+        // own bytecode, dispatch resolves to them before this gate is reached,
+        // and a mock of one must still be able to intercept them. Only the two
+        // JDK classes whose bodies CratonVM replaces are immune.
+        assert!(!redefine_immune_forced_native(
+            "org/springframework/core/NamedThreadLocal",
+            "get",
+            "()Ljava/lang/Object;"
         ));
         // The two operations the Mockito suite genuinely stubs on a mocked
         // StringBuilder — see `is_string_builder_layout_native_override`.
@@ -7342,6 +7446,7 @@ mod redefine_immunity_tests {
                     "redefine_immune_path_native(",
                     "redefine_immune_jfr_native(",
                     "redefine_immune_synthetic_collection_native(",
+                    "redefine_immune_thread_local_native(",
                 ] {
                     // An arm's own `fn` declaration is not a call site.
                     if code.contains(part) && !code.contains(&format!("fn {part}")) {

@@ -4001,11 +4001,47 @@ fn run() -> Result<()> {
         );
     }
 
-    // Now (after `initPhase1` has set up system properties / encodings
-    // / standard streams) it's safe to resolve and load the user main
-    // class. See the comment on the `initPhase1` block above for why
-    // this ordering matters in real-JDK mode.
-    if let Err(e) = vm.load_class(&class_name) {
+    // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
+    // still fresh, so a later 100%-full-heap OOM (in either user code or a
+    // premain) can be thrown without allocating the throwable — which would
+    // otherwise hard-abort in the non-fallible String allocator. Idempotent and
+    // best-effort: if the class isn't loadable yet it leaves the slot empty and
+    // the OOM paths keep their prior behaviour.
+    cratonvm_vm::runtime::exceptions::ensure_singleton_oom(&vm.shared, &mut vm.main_thread);
+
+    // WP2.4-C — run every `-javaagent:` agent's `premain(String,
+    // Instrumentation)` hook BEFORE the application's `main`. Per the
+    // `java.lang.instrument` package spec, agent failures are warnings
+    // (logged inside the dispatcher) unless the agent throws a fatal
+    // `Error`, in which case we abort here.
+    if !java_agents.is_empty() {
+        let res = cratonvm_vm::runtime::agent_loader::invoke_premains(
+            &vm.shared,
+            &mut vm.main_thread,
+            &java_agents,
+        );
+        if let Err(e) = res {
+            finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
+            bail!("javaagent premain aborted VM: {e}");
+        }
+    }
+
+    // Resolve and load the user main class.
+    //
+    // Two orderings constrain this point. It must come after `initPhase1` (see
+    // the comment on that block above) — that is why it is not next to the
+    // classpath setup. And it must come after `invoke_premains`, because the
+    // `java.lang.instrument` contract is that a transformer registered by
+    // `premain` is offered *every subsequent definition*, and the application's
+    // main class is the first one an agent expects to see. HotSpot starts its
+    // agents during VM creation and loads the main class afterwards, from the
+    // launcher; loading it first made the main class the one class a
+    // `-javaagent:` could never instrument. `load_class_transformed` is the
+    // entry point that offers the bytes to the chain (a no-op with no agent).
+    if let Err(e) = vm
+        .shared
+        .load_class_transformed(&mut vm.main_thread, &class_name)
+    {
         // JDK-only: this is the likeliest strict-mode failure — the main class
         // (or something it needs) was refused rather than fabricated. The
         // census must survive it, or `difftest` cannot categorise the failure
@@ -4024,6 +4060,13 @@ fn run() -> Result<()> {
     }
 
     // Build String[] args array for main(String[]).
+    //
+    // Built here, not earlier: `args_array` is a bare `ObjectRef` held on the
+    // Rust stack, which no GC root provider knows about, so every allocating
+    // Java call between its creation and the `main` invoke is a window in which
+    // a young collection could move it. Constructing it after `premain` and the
+    // main-class load — the two arbitrarily-large stretches of Java on this path
+    // — leaves only the invoke itself.
     let java_args: Vec<Value> = args
         .args
         .iter()
@@ -4059,31 +4102,6 @@ fn run() -> Result<()> {
             .map_err(|idx| {
                 anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)")
             })?;
-    }
-
-    // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
-    // still fresh, so a later 100%-full-heap OOM (in either user code or a
-    // premain) can be thrown without allocating the throwable — which would
-    // otherwise hard-abort in the non-fallible String allocator. Idempotent and
-    // best-effort: if the class isn't loadable yet it leaves the slot empty and
-    // the OOM paths keep their prior behaviour.
-    cratonvm_vm::runtime::exceptions::ensure_singleton_oom(&vm.shared, &mut vm.main_thread);
-
-    // WP2.4-C — run every `-javaagent:` agent's `premain(String,
-    // Instrumentation)` hook BEFORE the application's `main`. Per the
-    // `java.lang.instrument` package spec, agent failures are warnings
-    // (logged inside the dispatcher) unless the agent throws a fatal
-    // `Error`, in which case we abort here.
-    if !java_agents.is_empty() {
-        let res = cratonvm_vm::runtime::agent_loader::invoke_premains(
-            &vm.shared,
-            &mut vm.main_thread,
-            &java_agents,
-        );
-        if let Err(e) = res {
-            finish_jdk_only(&args, &vm.shared, &mut jdk_only_watermark);
-            bail!("javaagent premain aborted VM: {e}");
-        }
     }
 
     // Phase accounting: startup ends here, execution begins. This is the

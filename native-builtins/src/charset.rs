@@ -302,6 +302,61 @@ fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32
     Some((arr, 0, pos, lim))
 }
 
+/// The chars an encoder should consume from `cb`, with the `position` and
+/// `limit` that window came from.
+///
+/// [`buf_state`] needs a backing `char[]`, and `java.nio.StringCharBuffer` —
+/// which is what `CharBuffer.wrap(CharSequence)` builds — has none: it holds
+/// the sequence itself in `str` and indexes it directly. Every encode entry
+/// point read zero chars from one and reported success, so
+/// `Charset.encode(CharBuffer.wrap(csq))` returned an EMPTY `ByteBuffer` with
+/// no error anywhere. That is the shape Tomcat's `MessageBytes.toBytes`
+/// (`encoder.encode(CharBuffer.wrap(charChunk))`) takes.
+///
+/// The class check comes first deliberately: `buf_state`'s fallback reads an
+/// indexed slot, and on a real `StringCharBuffer` that index is not a
+/// `char[]` — a plausible-looking answer from the wrong field is worse than
+/// no answer.
+fn char_window(ctx: &mut dyn NativeContext, cb: ObjectRef) -> Option<(Vec<u16>, i32, i32)> {
+    let class_id = ctx.class_id_of_object(cb);
+    let is_string_backed =
+        ctx.class_name_of_id(class_id).unwrap_or_default() == "java/nio/StringCharBuffer";
+    if !is_string_backed {
+        let (carr, coff, cpos, clim) = buf_state(ctx, cb)?;
+        let chars = read_char_array(
+            ctx,
+            carr,
+            (coff + cpos).max(0) as usize,
+            (clim - cpos).max(0) as usize,
+        );
+        return Some((chars, cpos, clim));
+    }
+    let seq = match ctx.get_field_by_name(cb, "str") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let text = crate::phases_late::charset_buffers::read_wrapped_char_sequence(ctx, seq);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let off = ctx
+        .get_field_by_name(cb, "offset")
+        .as_int()
+        .unwrap_or(0)
+        .max(0);
+    let pos = ctx
+        .get_field_by_name(cb, "position")
+        .as_int()
+        .unwrap_or(0)
+        .max(0);
+    let lim = ctx
+        .get_field_by_name(cb, "limit")
+        .as_int()
+        .unwrap_or(0)
+        .max(0);
+    let start = ((off + pos) as usize).min(units.len());
+    let end = ((off + lim) as usize).clamp(start, units.len());
+    Some((units[start..end].to_vec(), pos, lim))
+}
+
 fn set_pos(ctx: &dyn NativeContext, obj: ObjectRef, pos: i32) {
     // Update both the real-JDK named `position` field (read back by buffer
     // bytecode) and the synthetic indexed slot, mirroring `buf_state`'s
@@ -640,7 +695,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // args[3] = boolean endOfInput (passed as Int 0/1).
     let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
-    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
+    let (chars, cpos, clim) = match char_window(ctx, cb) {
         Some(s) => s,
         None => {
             return Ok(Some(Value::Object(Some(alloc_coder_result(
@@ -660,7 +715,6 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
 
     let name = enc_name(ctx, this);
-    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     if chars.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
         return Ok(Some(Value::Object(Some(r))));
@@ -952,11 +1006,10 @@ fn native_charset_encode_charbuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
+    let (chars, _cpos, clim) = match char_window(ctx, cb) {
         Some(s) => s,
         None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     let bytes = encode_with_charset(ctx, this, &chars);
     // Advance the input position — matches HotSpot's contract that
     // Charset.encode(CharBuffer) consumes the buffer.
@@ -1368,11 +1421,10 @@ fn native_charset_encode_charbuf_via_encoder(
         Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
+    let (chars, _cpos, clim) = match char_window(ctx, cb) {
         Some(s) => s,
         None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     let name = enc_name(ctx, this);
     let malformed = coding_action(ctx, this, "malformedInputAction");
     let unmappable = coding_action(ctx, this, "unmappableCharacterAction");

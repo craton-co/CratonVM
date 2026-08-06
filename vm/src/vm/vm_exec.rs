@@ -6050,6 +6050,14 @@ impl<'a> NativeContextImpl<'a> {
     /// either fake or absent, so this can only ever resolve MORE classes --
     /// it never overrides a class a built-in loader really defined.
     fn resolve_class_loader_faithful(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        // The native-side twin of the constant-pool hook in
+        // `resolve_class_loader_aware`: `Class.forName`, JNI `FindClass` and
+        // every native that resolves a class by name land here, and this is the
+        // last point that has a Java thread and no class-manager lock. See
+        // `runtime::instrument::pre_transform_for_load`.
+        if crate::runtime::instrument::transformers_armed(self.shared.vm_identity) {
+            crate::runtime::instrument::pre_transform_for_load(self.shared, self.thread, name, 0);
+        }
         if let Some(cid) = self.class_via_caller_loader_before_stub(name) {
             return Ok(cid);
         }
@@ -7818,6 +7826,35 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             superclass_id_override: opts.superclass_id_override,
             interface_id_overrides: opts.interface_id_overrides.clone(),
             ..Default::default()
+        };
+
+        // `java.lang.instrument` transform-on-load, native half.
+        //
+        // This is the single backend for every "define a class from raw bytes"
+        // entry point — `ClassLoader.defineClass1/2/0`, `Unsafe.defineClass`,
+        // `MethodHandles.Lookup.defineClass`/`defineHiddenClass` — which is
+        // where a user-defined loader's classes come from. The load-time hook in
+        // `runtime::instrument` only covers the built-in delegation chain, so
+        // without this a `-javaagent:` would be offered the JDK and the
+        // classpath but not a single webapp / Spring / OSGi class.
+        //
+        // The chain runs here, before the define, with no class-manager lock
+        // held. Two exclusions, both deliberate: HIDDEN classes have no binding
+        // name, `Instrumentation.isModifiableClass` reports them unmodifiable,
+        // and the JDK does not offer them to transformers either; and a
+        // REDEFINE already ran the chain in `native_redefine_classes0`, so
+        // running it again here would weave the same class twice.
+        let transformed;
+        let bytes = if !opts.hidden
+            && !opts.allow_redefine
+            && !name.is_empty()
+            && crate::runtime::instrument::transformers_armed(self.shared.vm_identity)
+        {
+            transformed =
+                crate::runtime::instrument::run_load_time_transform_chain(self, name, cl_id, bytes);
+            &transformed[..]
+        } else {
+            bytes
         };
 
         let cid = {
@@ -23762,8 +23799,18 @@ fn invoke_on_class_shared_inner(
 
             let env = crate::native::jni::get_jni_env();
             // For instance methods, args[0] is the receiver; for static, it is absent.
+            // A static native's second C parameter is the `jclass` of the
+            // class that DECLARES it — that is what `GetStaticMethodID(env,
+            // cls, ...)`, `GetStaticFieldID`, `FindClass`-free upcalls and
+            // `RegisterNatives`-style self-reference are all written against.
+            // Passing `0` there made every one of those calls fail: the strict
+            // corpus's `callBackTriple` returned its own "GetStaticMethodID
+            // returned NULL" sentinel (-1) where HotSpot returned 27.
+            //
+            // The encoding is the one the rest of this JNI table uses for a
+            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
             let (receiver, call_args) = if is_static {
-                (0u64, args)
+                (declaring_class_id.as_u32() as u64, args)
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),
@@ -23811,10 +23858,10 @@ fn invoke_on_class_shared_inner(
                 .rfind(')')
                 .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
                 .unwrap_or(b'V');
-            if ret_char == b'V' {
-                Ok(None)
-            } else {
-                Ok(Some(result_value))
+            match jni_pending_exception_after_native(shared, thread) {
+                Some(failed) => Err(failed),
+                None if ret_char == b'V' => Ok(None),
+                None => Ok(Some(result_value)),
             }
         } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
             None
@@ -23844,8 +23891,18 @@ fn invoke_on_class_shared_inner(
             let _jni_local_frame = JniImplicitFrameGuard::enter();
 
             let env = crate::native::jni::get_jni_env();
+            // A static native's second C parameter is the `jclass` of the
+            // class that DECLARES it — that is what `GetStaticMethodID(env,
+            // cls, ...)`, `GetStaticFieldID`, `FindClass`-free upcalls and
+            // `RegisterNatives`-style self-reference are all written against.
+            // Passing `0` there made every one of those calls fail: the strict
+            // corpus's `callBackTriple` returned its own "GetStaticMethodID
+            // returned NULL" sentinel (-1) where HotSpot returned 27.
+            //
+            // The encoding is the one the rest of this JNI table uses for a
+            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
             let (receiver, call_args) = if is_static {
-                (0u64, args)
+                (declaring_class_id.as_u32() as u64, args)
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),
@@ -23888,10 +23945,10 @@ fn invoke_on_class_shared_inner(
                 .rfind(')')
                 .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
                 .unwrap_or(b'V');
-            if ret_char == b'V' {
-                Ok(None)
-            } else {
-                Ok(Some(result_value))
+            match jni_pending_exception_after_native(shared, thread) {
+                Some(failed) => Err(failed),
+                None if ret_char == b'V' => Ok(None),
+                None => Ok(Some(result_value)),
             }
         } else {
             let full_sig = format!("{class_name}.{method_name}{descriptor}");
@@ -24155,6 +24212,57 @@ impl Drop for SynchronizedMethodGuard<'_> {
             );
         }
     }
+}
+
+/// Turn an exception a JNI native left PENDING into this call's failure.
+///
+/// `ThrowNew`/`Throw` do not unwind — they record a pending throwable and let
+/// the native run to its `return`, and the exception becomes real to Java at
+/// the moment the native returns. Only the Rust-registry dispatch path
+/// (`safe_native_call`) was draining that slot; the two JNI function-pointer
+/// paths below returned the native's value and left the throwable sitting in
+/// thread-local storage for whatever ran next to pick up.
+///
+/// The strict corpus caught the shape exactly, because it records each branch
+/// separately rather than printing one verdict:
+///
+/// ```text
+/// upcall=-1 throw=<no-throw> throw=ISE:from-native registered=false
+/// ```
+///
+/// BOTH branches printed — the `try` body completed (so the native "returned
+/// normally") and the `catch` also ran, from the same `IllegalStateException`
+/// delivered later. That is a different defect from "the exception was lost",
+/// and it is worse: the statements between the native's return and the
+/// eventual delivery all executed.
+///
+/// Mirrors `safe_native_call`'s handling, including the `u64::MAX` sentinel a
+/// producer with no thread context uses, and the preference for
+/// `native_pending_return` (a GC root remapped in place) over the raw handle.
+fn jni_pending_exception_after_native(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+) -> Option<MethodCallFailed> {
+    let exc_handle = crate::native::jni::take_jni_pending_exception()?;
+    if exc_handle == u64::MAX {
+        thread.native_pending_return = None;
+        return Some(crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::IllegalStateException {
+                message: "JNI ThrowNew pending exception".to_string(),
+            },
+        ));
+    }
+    let ptr = exc_handle as *mut u8;
+    if ptr.is_null() || (ptr as usize) % 8 != 0 {
+        return None;
+    }
+    let exc_ref = thread
+        .native_pending_return
+        .unwrap_or_else(|| unsafe { crate::types::ObjectRef::from_raw(ptr) });
+    thread.native_pending_return = Some(exc_ref);
+    Some(MethodCallFailed::ExceptionThrown(exc_ref))
 }
 
 /// RAII guard for the JNI thread-local context (`*mut SharedVm` Arc + the
