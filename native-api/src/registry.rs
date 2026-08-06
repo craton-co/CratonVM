@@ -5661,13 +5661,45 @@ impl NativeMethodRegistry {
         {
             return;
         }
-        // Real-JDK mode: drop the synthetic LinkedBlockingDeque fallback surface.
-        // Its constructor writes the native-collections four-slot queue layout
-        // (array/head/size/capacity). A real JDK LinkedBlockingDeque needs its
-        // own constructor to initialize `lock`, `notEmpty`, `notFull`, and the
-        // linked-node fields before methods such as `clear()` run.
+        // Real-JDK mode: drop the synthetic blocking/concurrent QUEUE family.
+        // Every one of these is registered with the native-collections
+        // four-slot layout (array/head/size/capacity), which no real JDK class
+        // in the family has: `LinkedBlockingQueue` is
+        // head/last/count/putLock/takeLock/notEmpty/notFull/capacity,
+        // `ArrayBlockingQueue` is items/takeIndex/putIndex/count/lock/notEmpty/
+        // notFull, and the `ConcurrentLinked*` pair is a CAS-linked node chain
+        // with no lock fields at all. The synthetic `<init>` never assigns the
+        // real ones, so the real bytecode NPEs on them the moment it runs.
+        //
+        // Only the Deque was dropped here originally, which left the other four
+        // half-native: `offer` returned `true` into the side layout while
+        // `size()` read 0 and the real `poll(timeout)`/`take()` bytecode NPE'd
+        // on a null `takeLock`. That is silent, and it is load-bearing —
+        // `ThreadPoolExecutor`'s work queue IS a `LinkedBlockingQueue`, so
+        // `execute()` queued every task past `corePoolSize` into a store no
+        // worker could see. Exactly `corePoolSize` tasks ran, the rest were
+        // lost with no exception, and the pool never reached TERMINATED
+        // (`newSingleThreadExecutor` resolved 1 of 6 futures). The real bodies
+        // are self-contained — ReentrantLock/Condition for the blocking pair,
+        // CAS for the ConcurrentLinked pair — so dropping the surface is all
+        // that is needed.
+        //
+        // This only ever bit a binary built with the `synthetic-jdk` Cargo
+        // feature and RUN in real-JDK mode: the default `cratonvm-cli` build
+        // does not compile these registrations at all. That is precisely the
+        // configuration the vm test gate and the regression suite use, so the
+        // damage was to measurement rather than to shipped behaviour — seven
+        // regression-suite classes were red for this reason alone.
         if self.drop_real_layout_synthetic
-            && class_name == "java/util/concurrent/LinkedBlockingDeque"
+            && matches!(
+                class_name,
+                "java/util/concurrent/LinkedBlockingDeque"
+                    | "java/util/concurrent/LinkedBlockingQueue"
+                    | "java/util/concurrent/ArrayBlockingQueue"
+                    | "java/util/concurrent/ConcurrentLinkedQueue"
+                    | "java/util/concurrent/ConcurrentLinkedDeque"
+                    | "java/util/concurrent/BlockingQueue"
+            )
         {
             return;
         }

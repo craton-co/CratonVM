@@ -241,16 +241,37 @@ regression** for large-`-Xmx` workloads, which fall back to the non-moving sweep
 and just fire it more often). Reacting to a measured pause cannot repeat that:
 a workload already inside its goal is never touched.
 
-Measured, 6 lanes × 2 rounds, arms interleaved OFF → ON → OFF:
+**What is established, and what is not.** The GC-level effects are direct
+per-collection measurements over many samples and they hold:
 
-| arm | runs | failed |
-|---|---:|---:|
-| goal off | 12 | **12** |
-| **goal on, 250 ms** | 12 | **4** |
-| goal off (repeat) | 12 | **12** |
+* the trigger adapts as designed, `262144KB → 131072KB → 65536KB → 32768KB`;
+* `cheney_drain` **266–341 ms → 33–76 ms**;
+* `objects_copied` **857k–994k → 116k–236k**;
+* worst observed pause **1016 ms → 550 ms**.
 
-Worst pause **1016 ms → 550 ms**. The trigger adapts as designed:
-`262144KB → 131072KB → 65536KB → 32768KB`.
+**The end-to-end failure-rate improvement is NOT established, and an earlier
+revision of this page overstated it.** That revision reported goal-off 12/12,
+goal-on 4/12, goal-off 12/12 and called the middle arm trustworthy because it
+sat between two controls. A later properly-alternated run refutes it — four
+6-lane blocks, flag flipped every block:
+
+| block | card-table-only | failed |
+|---|---|---:|
+| A goal on | 0 | **0 / 6** |
+| B goal on + ct-only | 1 | 6 / 6 |
+| C goal on | 0 | **6 / 6** |
+| D goal on + ct-only | 1 | 6 / 6 |
+
+**A and C are the same configuration and gave opposite results.** Block-to-block
+variance on this host is as large as the effect that was claimed, so the 12/12 →
+4/12 reading cannot be attributed to the pause goal. It may still be real; it is
+not shown.
+
+The lesson is specific: a pass/fail *rate* over 6–12 runs on a box under hours
+of sustained load is not enough resolution for an effect this size, while
+per-collection pause and copy counts — hundreds of samples per run, measured
+inside the process — are. Prefer the latter as the fix's evidence, and re-test
+the rate on a quiet host before believing it.
 
 **It is an improvement, not a cure — 4/12 still fail, and the reason is worth
 more than the fix.** Shrinking young cut the drain exactly as intended but did
@@ -294,10 +315,15 @@ investigated:
   misses shows up as occasional much larger cycles. Do not re-run this
   combination expecting a win.
 
-  Caveat on all four arms: one block each, on a box that had been under heavy
-  load for hours. The goal-on result is trustworthy because it sits between two
-  12/12 controls; the card-table-only result is adjacent to a 12/12 control and
-  is weaker evidence.
+  **Re-tested properly alternated, and the rate comparison collapses.** Four
+  6-lane blocks with the flag flipped every block gave 0/6, 6/6, 6/6, 6/6 — and
+  the 0/6 and the third 6/6 are the *same* configuration. So the earlier "12/12
+  vs 4/12" reading, which is what made card-table-only look like a regression,
+  does not survive alternation. What stands is only the per-collection fact:
+  `full_old_rset_scan` goes to 0 ms and typical pauses improve (184/120 ms),
+  while the tail was worse in the one arm where it was sampled (679 vs 550 ms).
+  Whether card-table-only helps, hurts, or is neutral end-to-end is **open**,
+  and needs a quiet host — not another run on this one.
 * `overlay_forward` barely moves (57→40 ms) because it is proportional to the
   whole heap's overlay population, not to young — the 1+N global-mutex defect
   below. Its *share* of the pause is now much larger.
