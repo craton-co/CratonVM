@@ -2413,6 +2413,93 @@ mod tests {
         assert_eq!(class_file_this_class(&short), None);
     }
 
+    // ---- load-time transform: supertype pre-stage walk ----
+
+    /// A class file with `this_class`, `super_class` and `interfaces`, built
+    /// from the same constant-pool shape `minimal_class_file` uses.
+    ///
+    /// Each name gets a `CONSTANT_Class` + `CONSTANT_Utf8` pair, in order, so
+    /// the pool indices are `1,2` for the first name, `3,4` for the second, and
+    /// so on.
+    fn class_file_with_hierarchy(this: &str, super_name: &str, interfaces: &[&str]) -> Vec<u8> {
+        let names: Vec<&str> = std::iter::once(this)
+            .chain(std::iter::once(super_name))
+            .chain(interfaces.iter().copied())
+            .collect();
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&65u16.to_be_bytes());
+        // cp_count is one past the last used index; two entries per name.
+        b.extend_from_slice(&((names.len() as u16) * 2 + 1).to_be_bytes());
+        for (i, name) in names.iter().enumerate() {
+            // CONSTANT_Class at index 2i+1, pointing at the CONSTANT_Utf8 that
+            // immediately follows it at index 2i+2.
+            b.push(7);
+            b.extend_from_slice(&((i as u16) * 2 + 2).to_be_bytes());
+            b.push(1);
+            b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            b.extend_from_slice(name.as_bytes());
+        }
+        b.extend_from_slice(&0x0021u16.to_be_bytes()); // access_flags
+        b.extend_from_slice(&1u16.to_be_bytes()); // this_class  = #1
+        b.extend_from_slice(&3u16.to_be_bytes()); // super_class = #3
+        b.extend_from_slice(&(interfaces.len() as u16).to_be_bytes());
+        for i in 0..interfaces.len() {
+            b.extend_from_slice(&((i as u16) * 2 + 5).to_be_bytes());
+        }
+        b
+    }
+
+    /// The supertype walk is what lets a transformer see the abstract base of a
+    /// class it is offered: supertypes are loaded from *inside*
+    /// `define_class_shared_with_options`, under the class-manager write lock,
+    /// where no Java transformer can run.
+    #[test]
+    fn supertypes_reports_superclass_and_every_interface() {
+        let bytes = class_file_with_hierarchy(
+            "com/app/Impl",
+            "com/app/AbstractBase",
+            &["com/app/Api", "java/io/Serializable"],
+        );
+        assert_eq!(class_file_this_class(&bytes).as_deref(), Some("com/app/Impl"));
+        assert_eq!(
+            class_file_supertypes(&bytes),
+            vec![
+                "com/app/AbstractBase".to_string(),
+                "com/app/Api".to_string(),
+                "java/io/Serializable".to_string(),
+            ]
+        );
+    }
+
+    /// `super_class == 0` is legal — it is what `java/lang/Object`'s own class
+    /// file carries — and must not be reported as a supertype named "".
+    #[test]
+    fn supertypes_treats_a_zero_super_class_as_no_supertype() {
+        let mut bytes = class_file_with_hierarchy("java/lang/Object", "unused/Placeholder", &[]);
+        // Overwrite super_class (the u2 after magic..cp, access_flags,
+        // this_class) with 0. Locate it by walking back from the tail: the
+        // trailer is access_flags(2) + this_class(2) + super_class(2) +
+        // interfaces_count(2) with no interfaces.
+        let len = bytes.len();
+        bytes[len - 4..len - 2].copy_from_slice(&0u16.to_be_bytes());
+        assert!(class_file_supertypes(&bytes).is_empty());
+    }
+
+    /// Anything unparseable means "no supertypes to pre-stage" — a coverage
+    /// limit, never a failure that could break a class load.
+    #[test]
+    fn supertypes_of_garbage_is_empty_not_a_panic() {
+        assert!(class_file_supertypes(&[]).is_empty());
+        assert!(class_file_supertypes(b"PK\x03\x04not a class").is_empty());
+        let mut truncated = class_file_with_hierarchy("a/B", "a/C", &[]);
+        truncated.truncate(truncated.len() - 3);
+        // Truncated inside the trailer: the walk must decline, not index past
+        // the end.
+        let _ = class_file_supertypes(&truncated);
+    }
+
     /// The point of the extractor: a classpath resource that defines a
     /// *different* class must be distinguishable from the right one, so
     /// `original_class_bytes` can refuse to seed a retransform with it. The

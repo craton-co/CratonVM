@@ -15642,6 +15642,75 @@ pub(crate) fn read_named_attributes(
     Ok(Some(Value::Object(Some(map))))
 }
 
+#[cfg(test)]
+mod named_attribute_tests {
+    use super::{
+        attribute_names_for_view, split_attribute_spec, supported_attribute_view_names,
+    };
+
+    /// `Files` treats a spec with no colon as the `basic` view. Getting this
+    /// wrong turns `readAttributes(p, "size")` into a request for a view named
+    /// `size`.
+    #[test]
+    fn a_spec_without_a_colon_is_the_basic_view() {
+        assert_eq!(split_attribute_spec("size"), ("basic", "size"));
+        assert_eq!(split_attribute_spec("*"), ("basic", "*"));
+        assert_eq!(split_attribute_spec("unix:dev"), ("unix", "dev"));
+        assert_eq!(split_attribute_spec("posix:*"), ("posix", "*"));
+        // Only the FIRST colon splits; the JDK's own rule.
+        assert_eq!(split_attribute_spec("unix:a:b"), ("unix", "a:b"));
+    }
+
+    /// Every view this VM advertises through `supportedFileAttributeViews()`
+    /// must have a name table, or `readAttributes` answers
+    /// `UnsupportedOperationException` for a view the same VM just claimed to
+    /// support. `user` is the documented exception: it is the extended-attribute
+    /// view, which has no fixed attribute names at all.
+    #[test]
+    fn every_advertised_view_except_user_has_a_name_table() {
+        for view in supported_attribute_view_names() {
+            if *view == "user" || *view == "acl" {
+                continue;
+            }
+            assert!(
+                attribute_names_for_view(view).is_some(),
+                "view `{view}` is advertised by supportedFileAttributeViews() but \
+                 readAttributes has no name table for it"
+            );
+        }
+    }
+
+    /// A wider view must be a superset of `basic`: the JDK's `PosixFileAttributes`
+    /// and `UnixFileAttributes` extend `BasicFileAttributes`, so
+    /// `readAttributes(p, "unix:*")` returning fewer keys than
+    /// `readAttributes(p, "basic:*")` would be a silent regression for every
+    /// caller that widened its view to get one extra field.
+    #[test]
+    fn posix_unix_and_dos_all_contain_the_basic_names() {
+        let basic = attribute_names_for_view("basic").expect("basic");
+        for view in ["posix", "unix", "dos"] {
+            let names = attribute_names_for_view(view).expect(view);
+            for b in basic {
+                assert!(
+                    names.contains(b),
+                    "view `{view}` is missing basic attribute `{b}`"
+                );
+            }
+        }
+    }
+
+    /// The `unix` view is the one `sun.jvmstat.PlatformSupportImpl` reads during
+    /// container detection, and that read is what made
+    /// `com.sun.tools.attach.VirtualMachine.list()` throw `InternalError`.
+    #[test]
+    fn the_unix_view_carries_the_stat_fields_jvmstat_asks_for() {
+        let unix = attribute_names_for_view("unix").expect("unix");
+        for name in ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "ctime"] {
+            assert!(unix.contains(&name), "unix view is missing `{name}`");
+        }
+    }
+}
+
 fn box_long(ctx: &mut dyn NativeContext, v: i64) -> Value {
     crate::lang_class::box_value(ctx, Value::Long(v), "J")
 }
