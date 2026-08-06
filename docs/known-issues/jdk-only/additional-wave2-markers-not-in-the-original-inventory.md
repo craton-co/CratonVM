@@ -57,10 +57,12 @@ record's own count was 39% low.
   is still recorded, by the `Bridge if bytecode_available` arm. Genuinely a
   deferred cleanup contingent on unifying the two forced-native lists, as the
   record says — not something running wrong today.
-* **§11 — the count is stale and low.** Filed as 217 disjuncts over ~2,650
-  lines (17595–20244). Measured 2026-08-06: **302** disjuncts, 19668–22292. The
-  item is unchanged in kind, but anyone scoping the deletion from this page
-  would plan against a number 39% too small.
+* **§11 — ~~the count is stale and low~~ RETRACTED.** This pass reported "302
+  disjuncts, the record's 217 is 39% low". That was wrong, and the record was
+  right: `grep -cE '^\s+\|\|'` counts every `||` at any indentation, including
+  those nested inside `matches!` blocks and parenthesised groups. Splitting on
+  the chain's own top-level indent gives exactly **217**. Corrected 2026-08-06
+  in the same pass that did the first deletion.
 
 ### Second pass, same day — §2, §6, §7
 
@@ -180,9 +182,42 @@ variable (drive the classes directly); the frozen binary was swept out of
 triples" counts included the per-process hit column, inflating 20/13 to 37/28.
 The `reached=` counter exists so the first two are visible in the output.
 
-**Still open:** the bulk of §11 (the deletion itself, pending an app-suite
-census), §3's Matcher-leaf residual, and the `jit_entry_publishable` half of §2
-— which refuses nothing, per §1 above.
+### Fifth pass, same day — §11's first deletion: 217 -> 205
+
+The census was the wrong licence. The chain is only consulted as
+`check_override && registry.find(...).is_some()`, so a disjunct that can only
+match classes with **no registered native** is inert whatever runs — a static
+criterion no workload can refute. Two facts make it checkable:
+
+* the native registry is **eagerly** populated (dumps from a corpus class and
+  from `org.h2.test.TestBase` are identical: 11,897 rows, 1,227 classes), so
+  "absent from the dump" is not "not loaded yet";
+* of the 46 chain-named classes absent from it, **19 appear nowhere in any
+  native crate's source**, so no feature-gated build can register them either —
+  which matters because `app-stubs` is a real default-off gate.
+
+**12 disjuncts name only those 19 classes, and they are orphaned rather than
+merely unreached.** The largest explains itself as pinning "the no-op natives
+registered in `native-builtins/src/log4j_extras.rs` (via
+`register_log4j_stubs`)" — a file that does not exist, and a symbol that
+survives nowhere in the tree except inside those comments. The registrar was
+deleted; the entries protecting it were not. All 12 are third-party shims:
+log4j-core/simple/spi, logback, `org/jboss/modules`, `org/springframework/beans`
+BeanInfo factories, Spring Boot's `DefaultLogbackConfiguration`.
+
+Verified by the admitted set not moving: corpus `chain_true` 917 -> 917 and 20
+triples -> 20 triples; H2 17 -> 17; both diffs empty; suite 29/29. **161 lines
+out.**
+
+One tooling trap worth repeating: the first cut attributed each disjunct's
+*trailing* comment block to it. Those blocks are preambles for the NEXT entry,
+so it would have stripped the rationale off entries being kept — exactly what
+§13 of this page is about. Comments must attach forward.
+
+**Still open:** the remaining 205 disjuncts — this pass licenses nothing about
+them (140 name a class that does have a native, 44 name no class at all, and
+the rest need the app-suite census). Plus §3's Matcher-leaf residual and the
+`jit_entry_publishable` half of §2, which refuses nothing per §1.
 
 ## 2026-08-04 status
 
