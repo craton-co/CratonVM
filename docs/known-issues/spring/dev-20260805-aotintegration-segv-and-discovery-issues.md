@@ -106,7 +106,32 @@ The label happened to be right, but only two deliberate re-runs (one on a quiet
 box) made it evidence. The step script now reports `INCONCLUSIVE` when no
 RESULT appears and the driver `git bisect skip`s it, and the ceiling is 3000 s.
 
-Bisect state as left: `git bisect start --first-parent`, `bad 9c98c57ce`,
-`good 86a01abf90`, ~30 revisions / 5 steps remaining, driver at
-`/tmp/bisect-drive.sh`, per-commit binaries accumulating in
-`/data/data/bisect-bins/`.
+### Bisect state as left, and why it stopped
+
+Two rounds ran with a 3000 s ceiling and **both returned INCONCLUSIVE** —
+neither `d26046798` nor `36b5b16b7` produced a RESULT, and neither crashed, so
+`git bisect skip` took them and the range never narrowed. That is a result in
+itself: the slowdown is **broad across this range**, not one late commit, so an
+oracle that demands HotSpot's answer inside 3000 s cannot discriminate here.
+
+Raising the ceiling to 9000 s (a good commit finishes in 770-971 s) is the way
+forward, but that is ~2.5 h per step for 5 steps on a box other sessions keep
+at load average 100+, so it was stopped rather than left burning shared capacity
+unattended. The worktree and its 1.5 GB target dir were removed.
+
+To resume:
+
+```bash
+git worktree add --detach /data/data/wt-bisect-aot <dev-tip>
+cd /data/data/wt-bisect-aot
+git bisect start --first-parent && git bisect bad 9c98c57ce && git bisect good 86a01abf90
+# then per step: build, run AotIntegrationTests, classify.
+# GOOD == found=4 succ=2 fail=0 skip=2. Treat "no RESULT" as INCONCLUSIVE, never
+# as BAD - that mistake sent the first attempt down the wrong half.
+```
+
+Kept for comparison without rebuilding:
+`/data/data/bisect-bins/cvm-baddev.bin` (plain dev at the bad base, reproduces
+the failure with none of the branch's changes), `cvm-b1.bin`, `cvm-b2.bin`, and
+`/data/data/wt-spr4-20260802/localbin/cvm-spr4-{gcscan,merged}.bin` (the
+good/bad pair from the original controlled A/B).
