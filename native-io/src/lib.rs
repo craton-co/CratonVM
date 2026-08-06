@@ -847,18 +847,14 @@ fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
 fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
     if off < 0 || len < 0 {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { len },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 { off } else { len }),
         )));
     }
     let end = (off as usize).checked_add(len as usize);
     match end {
         Some(end) if end <= arr_len => Ok(()),
         _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: off.saturating_add(len),
-            },
+            RuntimeError::aioobe_index_only(off.saturating_add(len)),
         ))),
     }
 }
@@ -1536,13 +1532,11 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 {
+                off
+            } else {
+                off.saturating_add(len)
+            }),
         )));
     }
     let off = off as usize;
@@ -2002,13 +1996,11 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 {
+                off
+            } else {
+                off.saturating_add(len)
+            }),
         )));
     }
     let off = off as usize;

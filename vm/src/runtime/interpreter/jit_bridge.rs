@@ -1806,7 +1806,7 @@ pub(super) fn try_osr(
         // in the catch block by returning `None`. Otherwise re-stash so the
         // exception survives the OSR→interpreter handoff and is surfaced by
         // the next JIT helper return drain rather than being silently lost.
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,
@@ -5471,9 +5471,7 @@ pub fn jit_panic_to_exception(
 
     // Parse ArrayIndexOutOfBoundsException
     if msg.starts_with("ArrayIndexOutOfBoundsException") {
-        let error = RuntimeError::ArrayIndexOutOfBoundsException {
-            index: parse_aioobe_index(msg),
-        };
+        let error = RuntimeError::aioobe_index_only(parse_aioobe_index(msg));
         return crate::runtime::exceptions::throw_runtime_error(shared, thread, error);
     }
 
@@ -6697,7 +6695,7 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,
@@ -6861,9 +6859,10 @@ pub(super) fn execute_jit_call(
                 }
             }
             return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: index as i32, // Cast: bounds-check index
-                },
+                RuntimeError::aioobe(
+                    index as i32, // Cast: bounds-check index
+                    _length as i32,
+                ),
             )));
         }
         // Note: pending-NPE drain was hoisted above the i64::MIN branch
@@ -7148,7 +7147,7 @@ pub(super) fn execute_jit_call_decoded(
         }
     }
     if let Some((index, length)) = sig.aioobe {
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,

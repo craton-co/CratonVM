@@ -2107,10 +2107,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                             // Match the JDK: the index reported is the offending
                             // linear pixel index `y * width + x`.
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                                index: index as i32,
-                            }
-                            .into());
+                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
                         }
                         return int_ok(img.get_rgb(x as u32, y as u32) as i32);
                     }
@@ -2133,10 +2130,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                                index: index as i32,
-                            }
-                            .into());
+                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
                         }
                         img.set_rgb(x as u32, y as u32, argb);
                     }
@@ -2232,7 +2226,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 || start_x.checked_add(w).map_or(true, |e| e > iw)
                 || start_y.checked_add(h).map_or(true, |e| e > ih)
             {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: start_x }.into());
+                return Err(RuntimeError::aioobe_index_only(start_x).into());
             }
             // Allocate the result array if the caller passed null.
             let needed = if h == 0 {
@@ -2255,9 +2249,9 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                     let argb = img.get_rgb((start_x + col) as u32, (start_y + row) as u32) as i32;
                     let idx = offset as i64 + row as i64 * scansize as i64 + col as i64;
                     if idx < 0 || idx >= arr_len {
-                        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                            index: idx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                        }
+                        return Err(RuntimeError::aioobe_index_only(
+                            idx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        )
                         .into());
                     }
                     ctx.set_array_element(arr, idx as usize, Value::Int(argb));
