@@ -876,6 +876,22 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                         &[map],
                     );
                 }
+                // A `ConcurrentHashMap` backing is the other canonical spelling
+                // of "give me a concurrent set", and the `HashSet` below is the
+                // same wrong answer `ConcurrentHashMap.newKeySet()` used to
+                // give: its `add`/`remove`/`size` run the unlocked `HashMap`
+                // natives, so the set corrupts under concurrent mutation and
+                // its size can go negative. Hand back the live `KeySetView`
+                // over that very map instead — `newSetFromMap` over an empty
+                // map IS `map.keySet(Boolean.TRUE)` — so every mutation takes
+                // the per-segment monitor `native_chm_put`/`native_chm_remove`
+                // already hold. See the retired
+                // `concurrenthashmap-newkeyset-returns-a-plain-hashset`
+                // write-up.
+                if cname == "java/util/concurrent/ConcurrentHashMap" {
+                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m);
+                    return Ok(Some(Value::Object(Some(view))));
+                }
             }
             let _map = map;
             let cap = 16usize;
