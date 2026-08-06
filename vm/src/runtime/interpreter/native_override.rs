@@ -7199,7 +7199,27 @@ mod redefine_immunity_tests {
         // subject has left. That fails CLOSED here (the aggregator lookup finds
         // nothing and the assertion below fires), which is the right direction,
         // and is how the split found it.
-        let src = include_str!("native_override.rs");
+        // Normalise line endings before ANY byte-offset arithmetic below.
+        // `include_str!` embeds the file's raw bytes and this repository is
+        // checked out with CRLF on Windows (`core.autocrlf=true`). Two things
+        // then go wrong, and the second is the one that bit:
+        //
+        //   * the `"\n}"` body terminator still matches (`\r\n}` contains
+        //     `\n}`), so that one is fine either way; but
+        //   * `offset += line.len() + 1` below assumes `lines()` stripped ONE
+        //     byte. On CRLF it strips two, so `line_start` drifts a byte per
+        //     line. By the aggregators (~line 4900) it is ~4900 bytes short of
+        //     the true offset, the `inside_aggregator` range check misses, and
+        //     the aggregators' OWN arms are reported as offenders — the gate
+        //     failing for a reason that has nothing to do with what it
+        //     polices, which is precisely the staleness mode the comment above
+        //     was written to prevent. A fourth way to go stale, after the two
+        //     it already lists.
+        //
+        // Same fix, same reason, as `jit::ir_lower`'s `declared_op_variants`
+        // and `vm::runtime::env_cache`'s flags scan.
+        let src = include_str!("native_override.rs").replace("\r\n", "\n");
+        let src = src.as_str();
 
         // The exemption is the RULE, located in the source: an arm may be named
         // only inside the two aggregators, whose entire job is to compose them.
