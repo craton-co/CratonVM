@@ -23255,6 +23255,11 @@ mod tests {
     /// global and the test binary runs tests in parallel, so a concurrent
     /// publication in another test may also bump it. `>` is the assertion that
     /// is both true and stable; `== before + 1` would be a flake.
+    ///
+    /// **Verified as a negative control.** Deleting the `fetch_add` at the
+    /// first-time publication site turns this red on the first arm, with the
+    /// message it was written to produce — so it is pinning the bump, not
+    /// riding on a counter something else moves.
     #[test]
     fn every_publication_advances_the_jit_cache_generation() {
         fn ret_body(osr: bool) -> CompiledMethod {
