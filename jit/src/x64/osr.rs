@@ -520,11 +520,15 @@ pub(super) fn publish_entry_metadata(
                 }
                 let body_home = local_assignments.get(i).copied().flatten();
                 let seeded = osr_local_assignments.get(i).copied().flatten();
-                if body_home.is_some() && seeded.is_none() {
+                // `if let`, not `is_some()` + `.unwrap()` — same reason as the
+                // trace at the top of this file: a diagnostic that can panic is
+                // a diagnostic that turns an investigation into a crash, and
+                // this file is one of the strict-zero production-panic targets
+                // (`hot_files_have_no_production_panics`).
+                if let (Some(reg), None) = (body_home, seeded) {
                     stripped_live += 1;
                     eprintln!(
-                        "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{} in the body but the trampoline seeds no register for it",
-                        body_home.unwrap()
+                        "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{reg} in the body but the trampoline seeds no register for it"
                     );
                 }
             }
