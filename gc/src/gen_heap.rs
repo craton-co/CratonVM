@@ -974,6 +974,25 @@ fn moving_phase_marks_take() -> Vec<(&'static str, u128)> {
     MOVING_PHASE_MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
 }
 
+thread_local! {
+    /// Unit-less counts for the current moving-young cycle (objects copied,
+    /// bytes copied, …), reported beside the phase durations.
+    ///
+    /// A duration alone cannot say whether a slow `cheney_drain` means "too
+    /// many survivors" or "the copy loop is too slow per object", and those
+    /// have opposite fixes. The count is what separates them.
+    static MOVING_PHASE_COUNTS: std::cell::RefCell<Vec<(&'static str, u128)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn moving_phase_count_push(name: &'static str, value: u128) {
+    MOVING_PHASE_COUNTS.with(|m| m.borrow_mut().push((name, value)));
+}
+
+fn moving_phase_counts_take() -> Vec<(&'static str, u128)> {
+    MOVING_PHASE_COUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
 /// DBG (`CRATONVM_DBG_PROMO_SEED`): report how many of THIS cycle's young→old
 /// promotion destinations the in-place old sweep seeded its mark from, and how
 /// many `old_gen_mark_candidate_plausible` rejected. A nonzero rejection count
@@ -5022,6 +5041,7 @@ impl GenerationalHeap {
                     // Drain unconditionally: marks from a fast cycle must not
                     // survive to be reported against the next slow one.
                     let marks = moving_phase_marks_take();
+                    let counts = moving_phase_counts_take();
                     if ms >= 100 {
                         if marks.is_empty() {
                             eprintln!("[gcpause] collection took {ms}ms");
@@ -5031,7 +5051,12 @@ impl GenerationalHeap {
                                 .map(|(n, d)| format!("{n}={d}ms"))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            eprintln!("[gcpause] collection took {ms}ms  {detail}");
+                            let tally = counts
+                                .iter()
+                                .map(|(n, v)| format!("{n}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("[gcpause] collection took {ms}ms  {detail}  {tally}");
                         }
                     }
                 }
@@ -6298,6 +6323,17 @@ impl GenerationalHeap {
         }
 
         mv_phase!("cheney_drain");
+        if mv_phase_on {
+            // The numbers that decide what a slow drain MEANS. `bytes_before`
+            // is the young occupancy the cycle started from, so
+            // copied/bytes_before is the survival rate: a drain that is slow
+            // with few survivors is a per-object cost problem, one that is slow
+            // with most of young surviving is a promotion/sizing problem, and
+            // the fixes have nothing in common.
+            moving_phase_count_push("objects_copied", objects_copied as u128);
+            moving_phase_count_push("young_bytes_before", bytes_before as u128);
+            moving_phase_count_push("pointer_map_len", pointer_map.len() as u128);
+        }
 
         // Phase 2.5: Resurrect dead finalizable objects — forward any
         // unreachable finalizable objects so finalize() can access them.
