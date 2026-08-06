@@ -234,9 +234,13 @@ impl JavaRegex {
     /// `String.replaceAll` must do; the engine's own `$`-syntax differs
     /// (`$$` for a literal `$`, greedy `$NN`, no `\`-escape), so we drive the
     /// expansion ourselves via a per-match closure.
-    pub fn replace_all_java(&self, text: &str, replacement: &str) -> String {
-        let tokens = parse_java_replacement(replacement, self.group_count());
-        match self {
+    ///
+    /// `Err(n)` means the replacement referenced group `n`, which this pattern
+    /// does not have; the caller raises `IndexOutOfBoundsException("No group
+    /// n")` exactly as `Matcher.appendReplacement` does.
+    pub fn replace_all_java(&self, text: &str, replacement: &str) -> Result<String, usize> {
+        let tokens = parse_java_replacement(replacement, self.group_count())?;
+        Ok(match self {
             JavaRegex::Std(r) => r
                 .replace_all(text, |caps: &regex::Captures| {
                     render_java_replacement(
@@ -255,14 +259,14 @@ impl JavaRegex {
                     )
                 })
                 .into_owned(),
-        }
+        })
     }
 
     /// Like [`replace_all_java`](Self::replace_all_java) but only the first
     /// match (`String.replaceFirst`).
-    pub fn replace_first_java(&self, text: &str, replacement: &str) -> String {
-        let tokens = parse_java_replacement(replacement, self.group_count());
-        match self {
+    pub fn replace_first_java(&self, text: &str, replacement: &str) -> Result<String, usize> {
+        let tokens = parse_java_replacement(replacement, self.group_count())?;
+        Ok(match self {
             JavaRegex::Std(r) => r
                 .replace(text, |caps: &regex::Captures| {
                     render_java_replacement(
@@ -281,7 +285,7 @@ impl JavaRegex {
                     )
                 })
                 .into_owned(),
-        }
+        })
     }
 }
 
@@ -295,7 +299,10 @@ impl JavaRegex {
 /// * A `$` followed by neither a digit nor `{` is emitted as a literal `$`
 ///   (Java throws `IllegalArgumentException`; we choose the lenient path —
 ///   malformed replacements are programming errors and rare).
-fn parse_java_replacement(rep: &str, group_count: usize) -> Vec<JavaReplToken> {
+fn parse_java_replacement(
+    rep: &str,
+    group_count: usize,
+) -> Result<Vec<JavaReplToken>, usize> {
     let mut tokens: Vec<JavaReplToken> = Vec::new();
     let mut lit = String::new();
     let bytes = rep.as_bytes();
@@ -340,6 +347,16 @@ fn parse_java_replacement(rep: &str, group_count: usize) -> Vec<JavaReplToken> {
             if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
                 let mut j = i + 1;
                 let mut num = (bytes[j] - b'0') as usize;
+                // The FIRST digit was previously accepted unconditionally, and a
+                // reference past the last group then rendered as "" -- so
+                // `"abc".replaceAll("(b)", "$9")` returned "bc" where HotSpot
+                // throws `IndexOutOfBoundsException: No group 9`. A silently
+                // wrong answer, not a missing message. The greedy loop below
+                // already bounds the SUBSEQUENT digits; only the first was
+                // unchecked.
+                if num > group_count {
+                    return Err(num);
+                }
                 j += 1;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     let trial = num * 10 + (bytes[j] - b'0') as usize;
@@ -366,7 +383,7 @@ fn parse_java_replacement(rep: &str, group_count: usize) -> Vec<JavaReplToken> {
         i = end;
     }
     flush_lit!();
-    tokens
+    Ok(tokens)
 }
 
 /// Render parsed replacement tokens against one match's capture groups. A
@@ -407,11 +424,13 @@ mod java_replacement_tests {
         compile_java_regex(pat, 0)
             .unwrap()
             .replace_all_java(text, rep)
+            .expect("replacement references a group the pattern does not have")
     }
     fn rf(text: &str, pat: &str, rep: &str) -> String {
         compile_java_regex(pat, 0)
             .unwrap()
             .replace_first_java(text, rep)
+            .expect("replacement references a group the pattern does not have")
     }
 
     // Each expectation below is the exact output of the equivalent
@@ -558,6 +577,154 @@ pub(crate) fn compile_java_regex(
     Ok(compiled)
 }
 
+/// Build a `PatternSyntaxException` detail message in **Java's** layout.
+///
+/// `java.util.regex.PatternSyntaxException.getMessage()` is three lines:
+///
+/// ```text
+/// Unclosed character class near index 0
+/// [
+/// ^
+/// ```
+///
+/// `<description> near index <i>`, then the pattern, then a caret under column
+/// `i`. Rust's engines report something quite different ("Parsing error at
+/// position 1: ..."), so code that reads the message -- and every differential
+/// against HotSpot -- disagreed even though the exception CLASS was right.
+///
+/// # Why guessing a description here is safe
+///
+/// This runs **only after both engines have already rejected the pattern**. It
+/// cannot turn a valid regex into an error; the worst it can do is describe an
+/// already-invalid pattern differently from HotSpot. That asymmetry is what
+/// makes a hand-written scanner acceptable on a path as hot and as widely used
+/// as `Pattern.compile`, where a false rejection would be far worse than an
+/// imperfect message.
+///
+/// When the scan cannot name a Java-defined cause it keeps the ENGINE's text as
+/// the description rather than inventing one, so the message is never less
+/// informative than before.
+fn java_pattern_syntax_error(
+    pattern: &str,
+    engine_text: &str,
+) -> cratonvm_types::error::RuntimeError {
+    let (description, index) = diagnose_java_pattern(pattern)
+        .unwrap_or_else(|| (engine_text.replace('\n', " ").trim().to_string(), -1));
+    // Parts, not a formatted string: `PatternSyntaxException.getMessage()` is
+    // an override that assembles them itself, with `System.lineSeparator()`
+    // (so `\r\n` on Windows, which a Rust-side format! would get wrong), and
+    // `getDescription()` / `getPattern()` / `getIndex()` need them anyway.
+    cratonvm_types::error::RuntimeError::PatternSyntaxException {
+        description,
+        pattern: pattern.to_string(),
+        index,
+    }
+}
+
+/// Find the first Java-named syntax fault in `pattern`, as
+/// `(description, char index)`.
+///
+/// Deliberately covers only the causes `java.util.regex.Pattern` names in its
+/// own error strings, and returns `None` for anything else so the caller falls
+/// back to the engine's wording.
+fn diagnose_java_pattern(pattern: &str) -> Option<(String, i32)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    let mut group_stack: Vec<usize> = Vec::new();
+    // Whether a quantifier could legally attach at this point.
+    let mut quantifiable = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                if i + 1 >= chars.len() {
+                    return Some(("Trailing backslash".to_string(), i as i32));
+                }
+                let e = chars[i + 1];
+                // Java rejects an alphabetic escape it does not define. The set
+                // below is what `Pattern` accepts; any other letter is
+                // "Illegal/unsupported escape sequence".
+                if e.is_ascii_alphabetic() && !"aefnrtdDsSwWbBAZzGQERhHvVXpPuxcNk".contains(e) {
+                    return Some((
+                        "Illegal/unsupported escape sequence".to_string(),
+                        (i + 1) as i32,
+                    ));
+                }
+                i += 2;
+                quantifiable = true;
+                continue;
+            }
+            '[' => {
+                // Scan to the matching ']'. A ']' first (or right after '^') is
+                // a literal, per Java and POSIX.
+                let open = i;
+                let mut j = i + 1;
+                if j < chars.len() && chars[j] == '^' {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ']' {
+                    j += 1;
+                }
+                let mut closed = false;
+                while j < chars.len() {
+                    if chars[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == ']' {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !closed {
+                    // Reported at the '[', which is what HotSpot does.
+                    return Some(("Unclosed character class".to_string(), open as i32));
+                }
+                i = j + 1;
+                quantifiable = true;
+                continue;
+            }
+            '(' => {
+                group_stack.push(i);
+                i += 1;
+                quantifiable = false;
+                continue;
+            }
+            ')' => {
+                if group_stack.pop().is_none() {
+                    return Some(("Unmatched closing ')'".to_string(), i as i32));
+                }
+                i += 1;
+                quantifiable = true;
+                continue;
+            }
+            '*' | '+' | '?' => {
+                if !quantifiable {
+                    return Some((format!("Dangling meta character '{c}'"), i as i32));
+                }
+                i += 1;
+                // `a*?` and `a*+` are legal (reluctant / possessive), so one
+                // quantifier after another is not by itself an error; a third in
+                // a row is, and the engines already reject that.
+                quantifiable = false;
+                continue;
+            }
+            _ => {
+                i += 1;
+                quantifiable = true;
+            }
+        }
+    }
+    if !group_stack.is_empty() {
+        // HotSpot reports an unclosed group at the END of the pattern, not at
+        // the '(' -- `"(a"` is "Unclosed group near index 2".
+        return Some(("Unclosed group".to_string(), chars.len() as i32));
+    }
+    None
+}
+
 /// Compile a Java regex without consulting the cache. See `compile_java_regex`.
 fn compile_java_regex_uncached(
     pattern: &str,
@@ -568,11 +735,7 @@ fn compile_java_regex_uncached(
         let escaped = regex::escape(pattern);
         return regex::Regex::new(&escaped)
             .map(JavaRegex::Std)
-            .map_err(
-                |e| cratonvm_types::error::RuntimeError::PatternSyntaxException {
-                    message: format!("{e}"),
-                },
-            );
+            .map_err(|e| java_pattern_syntax_error(pattern, &format!("{e}")));
     }
 
     // Build the Rust regex pattern with flag prefixes
@@ -619,11 +782,7 @@ fn compile_java_regex_uncached(
         // is the same event HotSpot reports from `Pattern.compile`, and code
         // that validates a user-supplied regex catches the concrete class by
         // name.
-        Err(e) => Err(
-            cratonvm_types::error::RuntimeError::PatternSyntaxException {
-                message: format!("{e}"),
-            },
-        ),
+        Err(e) => Err(java_pattern_syntax_error(pattern, &format!("{e}"))),
     }
 }
 
@@ -1795,6 +1954,14 @@ pub(crate) fn native_matcher_end_idx(
     matcher_group_boundary(ctx, this, idx, true)
 }
 
+
+/// `Matcher.appendReplacement`'s error for a `$N` naming a group the pattern
+/// does not have: `IndexOutOfBoundsException("No group N")`. The message text
+/// is HotSpot's, verbatim.
+pub(crate) fn no_group_error(n: usize) -> cratonvm_types::error::VmError {
+    cratonvm_types::error::RuntimeError::ioobe(format!("No group {n}")).into()
+}
+
 pub(crate) fn native_matcher_replace_all(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1813,7 +1980,9 @@ pub(crate) fn native_matcher_replace_all(
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_all_java(&input, replacement.as_str());
+    let result = re
+        .replace_all_java(&input, replacement.as_str())
+        .map_err(no_group_error)?;
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -1835,7 +2004,9 @@ pub(crate) fn native_matcher_replace_first(
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_first_java(&input, replacement.as_str());
+    let result = re
+        .replace_first_java(&input, replacement.as_str())
+        .map_err(no_group_error)?;
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 

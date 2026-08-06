@@ -79,3 +79,59 @@ CRATONVM_BIN=<merged-build> ./one.sh org.springframework.test.context.aot.AotInt
 ~80-160 s to the failure, versus ~900 s for a clean pass. Bisecting the 882
 commits is the obvious next step; the JIT code-cache retirement path is the
 place to start given failure 1.
+
+## 2026-08-05, later: the range contains a SECOND, earlier failure mode
+
+Bisecting turned up something the two tip signatures above do not describe.
+`9c98c57ce` ("fix(jdk-only): section 7 step 3 fell through to
+UnsatisfiedLinkError, not to bytecode"), roughly the midpoint of the
+first-parent range, **does not complete the test at all**:
+
+| commit | runs | outcome |
+|---|---|---|
+| `86a01abf90` (good base) | 3 | completes, `found=4 succ=2 fail=0 skip=2`, 769 / 865 / 971 s |
+| `9c98c57ce` | 2 | **no result** at 4132 s (loaded box) and 3010 s (quiet box, load 22), `segv=0` |
+| tip (`4fafae0d4`) | 2 | SIGSEGV at 157 s; or `succ=0 fail=2` with 294 critical discovery issues at 77 s |
+
+So there are at least two distinct behaviours in this range: a **hang / extreme
+slowdown** at or before `9c98c57ce`, and the **fast segv / discovery failure**
+at the tip. They may be one defect that changed expression, or two. Do not
+assume the tip's crash bisects to the same commit as the hang.
+
+**Method warning, learned the hard way here.** The first bisect step classified
+`9c98c57ce` BAD on an *empty* result — i.e. purely on hitting the ceiling. That
+is not sound on this shared box, where a *good* commit takes 770-971 s and other
+sessions have pushed load average to 376: a timeout is not evidence of failure.
+The label happened to be right, but only two deliberate re-runs (one on a quiet
+box) made it evidence. The step script now reports `INCONCLUSIVE` when no
+RESULT appears and the driver `git bisect skip`s it, and the ceiling is 3000 s.
+
+### Bisect state as left, and why it stopped
+
+Two rounds ran with a 3000 s ceiling and **both returned INCONCLUSIVE** —
+neither `d26046798` nor `36b5b16b7` produced a RESULT, and neither crashed, so
+`git bisect skip` took them and the range never narrowed. That is a result in
+itself: the slowdown is **broad across this range**, not one late commit, so an
+oracle that demands HotSpot's answer inside 3000 s cannot discriminate here.
+
+Raising the ceiling to 9000 s (a good commit finishes in 770-971 s) is the way
+forward, but that is ~2.5 h per step for 5 steps on a box other sessions keep
+at load average 100+, so it was stopped rather than left burning shared capacity
+unattended. The worktree and its 1.5 GB target dir were removed.
+
+To resume:
+
+```bash
+git worktree add --detach /data/data/wt-bisect-aot <dev-tip>
+cd /data/data/wt-bisect-aot
+git bisect start --first-parent && git bisect bad 9c98c57ce && git bisect good 86a01abf90
+# then per step: build, run AotIntegrationTests, classify.
+# GOOD == found=4 succ=2 fail=0 skip=2. Treat "no RESULT" as INCONCLUSIVE, never
+# as BAD - that mistake sent the first attempt down the wrong half.
+```
+
+Kept for comparison without rebuilding:
+`/data/data/bisect-bins/cvm-baddev.bin` (plain dev at the bad base, reproduces
+the failure with none of the branch's changes), `cvm-b1.bin`, `cvm-b2.bin`, and
+`/data/data/wt-spr4-20260802/localbin/cvm-spr4-{gcscan,merged}.bin` (the
+good/bad pair from the original controlled A/B).

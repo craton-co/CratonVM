@@ -1182,6 +1182,39 @@ fn fire_class_file_load_hook(
     }
 }
 
+/// Write the class bytes a `redefine_class` verification rejected to
+/// `$CRATONVM_DBG_REDEFINE_DUMP/<mangled-name>.class`, so the rejection can be
+/// disassembled with `javap` instead of reasoned about from an offset.
+///
+/// Off unless the variable names a directory; every failure is best-effort and
+/// silent, because this runs on a path that is already returning an error and
+/// must not turn a diagnosable rejection into a second one.
+fn dump_rejected_redefine_bytes(class_name: &str, bytes: &[u8]) {
+    let Ok(dir) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_REDEFINE_DUMP") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let safe: String = class_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // A class can be retransformed more than once in a run and fail every
+    // time; a counter keeps the later attempts from overwriting the first.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("{safe}.{n}.class"));
+    if std::fs::write(&path, bytes).is_ok() {
+        eprintln!(
+            "[REDEFINE-DUMP] rejected bytes for {class_name} ({} bytes) -> {}",
+            bytes.len(),
+            path.display()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WP2.4-B — JIT cache invalidation hook
 // ---------------------------------------------------------------------------
@@ -2693,6 +2726,17 @@ impl ClassManager {
         self.class_store
             .iter()
             .map(|c| ClassOriginEntry {
+                // Superclass first, then declared interfaces, each resolved
+                // back to a name through the same store. An id that does not
+                // resolve is dropped: it can only mean the row was taken
+                // mid-definition, and a census that guesses is worse than one
+                // that is short.
+                supertypes: c
+                    .superclass
+                    .into_iter()
+                    .chain(c.interfaces.iter().copied())
+                    .filter_map(|id| self.class_store.get(id).map(|s| s.name.to_string()))
+                    .collect(),
                 name: c.name.to_string(),
                 origin: c.origin.as_str().to_string(),
                 reason: c.origin.reason().map(|r| r.to_string()),
@@ -7601,6 +7645,12 @@ impl ClassManager {
                     error = ?verify_err,
                     "WP2.4-B redefine: bytecode verification failed; rolled back",
                 );
+                // The rejected bytes are the ONLY copy of what the agent
+                // produced — the rollback below throws them away, and the
+                // transformer is not deterministic enough to re-derive them by
+                // hand. `CRATONVM_DBG_REDEFINE_DUMP=<dir>` keeps them so a
+                // rejection can be disassembled instead of guessed at.
+                dump_rejected_redefine_bytes(&existing_name, &effective_new_bytes);
                 return Err(LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
                     message: format!("new bytes failed bytecode verification: {verify_err}",),
@@ -8670,7 +8720,7 @@ impl ClassManager {
     /// hottest lookup in the VM for no isolation benefit. Only a
     /// `UserDefined` component loader — the case that genuinely produces two
     /// same-named classes — yields a non-bootstrap array class.
-    /// See `docs/array-class-defining-loader.md`.
+    /// See `array-class-defining-loader.md`.
     fn array_defining_loader(&self, component_id: Option<ClassId>) -> ClassLoaderId {
         match component_id
             .and_then(|id| self.class_store.get(id))
@@ -12541,106 +12591,60 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // loggerRegistry, rootLogger, ready). Reserving them in the
         // synthetic layout means alloc_object has room when the real
         // LogManager bytecode isn't loaded (e.g. pre-clinit fixup).
+        // Real JDK 21-25 declaration order (`javap -p --module java.logging`).
+        // The old model was a compact four-field guess — `properties`,
+        // `loggerRegistry`, `rootLogger`, `ready` at 0..3 — which put
+        // `loggerRegistry` on `systemContext`, `rootLogger` on `userContext`,
+        // and the `ready` INT on `rootLogger`, a reference field.
+        //
+        // `loggerRegistry` and `ready` have no real field to live in
+        // (`loggerRegistry` is a placeholder for Rust-side state, `ready` is our
+        // own init bit), so they are `_vmN` anchored PAST the real field count —
+        // padding nobody owns, which the shadow-layout diff reports as `pad`
+        // rather than a finding. Slot indices in
+        // `native-builtins/src/logmanager.rs` must agree; they are derived from
+        // the same table.
         "java/util/logging/LogManager" | "org/jboss/logmanager/LogManager" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("properties"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/Properties;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("loggerRegistry"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("rootLogger"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Logger;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("ready"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
+            named_field("props", "Ljava/util/Properties;"),
+            named_field("systemContext", "Ljava/util/logging/LogManager$LoggerContext;"),
+            named_field("userContext", "Ljava/util/logging/LogManager$LoggerContext;"),
+            named_field("rootLogger", "Ljava/util/logging/Logger;"),
+            named_field("readPrimordialConfiguration", "Z"),
+            named_field("globalHandlersState", "I"),
+            named_field("configurationLock", "Ljava/util/concurrent/locks/ReentrantLock;"),
+            named_field("closeOnResetLoggers", "Ljava/util/concurrent/CopyOnWriteArrayList;"),
+            named_field("listeners", "Ljava/util/Map;"),
+            named_field("initializedCalled", "Z"),
+            named_field("initializationDone", "Z"),
+            named_field("loggerRefQueue", "Ljava/lang/ref/ReferenceQueue;"),
+            // VM-internal, anchored past the real layout: LM_FIELD_LOGGER_REGISTRY, LM_FIELD_READY.
+            vm_internal_field(12),
+            vm_internal_field(13),
         ],
-        // String Enumeration backing for `LogManager.getLoggerNames()`.
-        //   0 = Object[] backing names,  1 = cursor int.
-        "java/util/logging/LogManager$StringEnumeration" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("names"),
-                descriptor: cratonvm_types::intern_arc("[Ljava/lang/Object;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("cursor"),
-                descriptor: cratonvm_types::intern_arc("I"),
-                attributes: vec![],
-            },
-        ],
-
-        "java/util/logging/Level" => {
-            let mk = |n: &'static str| ClassFileField {
-                access_flags: FieldAccessFlags::PUBLIC
-                    | FieldAccessFlags::STATIC
-                    | FieldAccessFlags::FINAL,
-                name: cratonvm_types::intern_arc(n),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Level;"),
-                attributes: vec![],
-            };
-            let mut fields = vec![
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("name"),
-                    descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                    attributes: vec![],
-                },
-                ClassFileField {
-                    access_flags: FieldAccessFlags::empty(),
-                    name: cratonvm_types::intern_arc("value"),
-                    descriptor: cratonvm_types::intern_arc("I"),
-                    attributes: vec![],
-                },
-            ];
-            fields.extend([
-                mk("ALL"),
-                mk("SEVERE"),
-                mk("WARNING"),
-                mk("INFO"),
-                mk("CONFIG"),
-                mk("FINE"),
-                mk("FINER"),
-                mk("FINEST"),
-                mk("OFF"),
-            ]);
-            fields
-        }
-
-        // java.util.logging.Logger (synthetic) — 3 slots (name, level, parent).
+        // Real JDK 21-25 declaration order. The old model was `name`, `level`,
+        // `parent` at 0..2 — which put the logger's NAME on `config`, its level
+        // on `manager`, and its PARENT on `name`. All references, so no
+        // value-tag check could ever see it; found by the L4 shadow-layout
+        // census running under real workloads.
+        //
+        // A real `Logger` has no `level` field at all — the effective level
+        // lives inside `config` (`Logger$ConfigurationData`) — so that slot is
+        // `_vm12`, anchored past the real field count.
         "java/util/logging/Logger" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("name"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("level"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Level;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("parent"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Logger;"),
-                attributes: vec![],
-            },
+            named_field("config", "Ljava/util/logging/Logger$ConfigurationData;"),
+            named_field("manager", "Ljava/util/logging/LogManager;"),
+            named_field("name", "Ljava/lang/String;"),
+            named_field("loggerBundle", "Ljava/util/logging/Logger$LoggerBundle;"),
+            named_field("anonymous", "Z"),
+            named_field("catalogRef", "Ljava/lang/ref/WeakReference;"),
+            named_field("catalogName", "Ljava/lang/String;"),
+            named_field("catalogLocale", "Ljava/util/Locale;"),
+            named_field("parent", "Ljava/util/logging/Logger;"),
+            named_field("kids", "Ljava/util/ArrayList;"),
+            named_field("callerModuleRef", "Ljava/lang/ref/WeakReference;"),
+            named_field("isSystemLogger", "Z"),
+            // VM-internal, anchored past the real layout: LOGGER_FIELD_LEVEL.
+            vm_internal_field(12),
         ],
         "java/util/logging/LogRecord" => vec![
             ClassFileField {
@@ -17135,7 +17139,7 @@ mod tests {
     //
     // The pre-2026-08-01 code hard-coded `Bootstrap` for every array class
     // and `debug_assert`ed it, citing the same clause for the opposite
-    // conclusion. See `docs/array-class-defining-loader.md`.
+    // conclusion. See `array-class-defining-loader.md`.
     // -----------------------------------------------------------------
 
     /// A `Foo` defined by a user loader gives a `[LFoo;` defined by that same

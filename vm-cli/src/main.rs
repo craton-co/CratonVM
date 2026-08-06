@@ -114,7 +114,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`) and is
+        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -2546,7 +2546,7 @@ struct JdkOnlyExitDumpPaths {
 /// runs. Without this a `--jdk-only --jdk-only-report r.json` run of a program
 /// whose error handler exits produced no report at all — and those are the runs
 /// the report exists for. See
-/// `docs/internal/jdk-only-system-exit-census-FIXED-20260804.md`.
+/// `jdk-only-system-exit-census-FIXED-20260804.md`.
 ///
 /// Shares `write_jdk_only_dumps`' `WRITTEN` latch, so a `System.exit` racing a
 /// normal shutdown cannot produce two interleaved writes to the same path;
@@ -4280,11 +4280,32 @@ fn run() -> Result<()> {
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =
                 cratonvm_vm::jit::xt_root_scan::XT_CYCLES_WITH_UNCLASSIFIED.load(O::Relaxed);
-            if peers > 0 {
-                eprintln!(
-                    "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles}"
-                );
-            }
+            // H2-CID0 (2026-08-05): UNCONDITIONAL. This used to print only when
+            // `peers > 0`, which made "every peer answered" indistinguishable
+            // from "the take-over never ran" — and a run that FAILED printed
+            // nothing, which reads as the reassuring one and was the other.
+            // `taken_over` is what separates them.
+            let taken = cratonvm_vm::jit::xt_root_scan::XT_THREADS_TAKEN_OVER.load(O::Relaxed);
+            let roots = cratonvm_vm::jit::xt_root_scan::XT_ROOTS_FOUND.load(O::Relaxed);
+            let hw = cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_SCANNED.load(O::Relaxed);
+            let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
+            let saved =
+                cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            eprintln!(
+                "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 resignals={resig} classified_after_retry={saved} enabled={}",
+                cratonvm_vm::jit::xt_root_scan::enabled(),
+            );
+            // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
+            // `suppressed` counts times the memo answered "clean" while a scan
+            // of the same range found a frame — i.e. oops that went unmarked
+            // and a cycle that was never told to avoid moving them.
+            // `shortcircuits` is the denominator: without it a zero cannot be
+            // told apart from an audit that never ran.
+            let sc = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
+            let sup = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED.load(O::Relaxed);
+            eprintln!("[GC] unreg_memo: shortcircuits={sc} SUPPRESSED={sup}");
         }
     }
 

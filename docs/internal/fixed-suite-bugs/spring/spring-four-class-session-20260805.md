@@ -29,8 +29,12 @@ The single residual is
 `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`, filed as
 [`../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md`](../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md).
 It is a memory-footprint gap, not a correctness one: HotSpot compiles the
-10001-definition case in 13 s inside `-Xmx512m`; CratonVM's live set for the
-same test is ~1.2 GB and it exhausts a 4 GiB heap inside javac.
+10001-definition case in 13 s inside `-Xmx512m`, while CratonVM exhausts a
+4 GiB heap inside javac (`OutOfMemoryError` in `JavacTaskImpl.call`). Stated
+that way it is instrument-independent; an earlier "CratonVM's live set is
+~1.2 GB, 8x HotSpot's" claim was withdrawn — `GC.heap_info`'s young figure is
+the allocation cursor and `GC.class_histogram` walks garbage too, so it was
+CratonVM-allocated compared against HotSpot-live.
 
 ## VM bug 1 — `Net.poll` turned a signal into a dropped connection
 

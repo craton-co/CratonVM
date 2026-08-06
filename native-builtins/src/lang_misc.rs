@@ -2243,7 +2243,17 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         "java/util/concurrent/ExecutionException",
         "java/util/concurrent/BrokenBarrierException",
         "java/text/ParseException",
-        "java/util/regex/PatternSyntaxException",
+        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+        // list. It is the one exception here that OVERRIDES `getMessage()`:
+        // the JDK builds a three-line report ("Unclosed character class near
+        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+        // fields and never sets `Throwable.detailMessage`. A blanket
+        // `getMessage` bridge in front of that override returns the null
+        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+        // where HotSpot gives the full report. Its real constructor is
+        // `(String,String,int)V`, which is not among the `<init>` shapes
+        // registered here either, so every bridge this loop would add is
+        // either dead or actively wrong. Removed 2026-08-05.
         "java/lang/NegativeArraySizeException",
         "java/lang/AssertionError",
         "java/lang/MatchException",

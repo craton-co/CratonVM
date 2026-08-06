@@ -76,7 +76,7 @@ Added because this class is a **cheap, JIT-only reproduction** — ~15 s per
 attempt at `-Dcraton.smoke.forks=1` — and because it was until now filed under a
 throughput page that explicitly told triagers not to look for a crash here. That
 page is retired
-([`../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`](../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md));
+(`fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`);
 the throughput finding it was tracking is closed, and this is what is left.
 
 Twenty-six runs at `forks=1`, dev tip, JIT on, in two batches (10 then 16),
@@ -273,6 +273,11 @@ which such a copy is ever *read*.
 
 ### The decisive run: `UNCLASSIFIED` is NOT always zero (2026-08-05)
 
+> **Superseded the same day — see *The dose-response that falsified it* below.**
+> The measurement in this section is real; the inference drawn from it is not.
+> Unclassified peers turn out to be neither necessary nor sufficient for the
+> face.
+
 *Where that leaves the residual* below asks for exactly one thing: "the decisive
 run is one that ends in a `cannot be cast` with these lines above it." Here it
 is. `TestMVStoreCacheLoop`, `--Xmx 512m`, `CRATONVM_GC=-moving-young`, JIT on,
@@ -313,6 +318,250 @@ is a direct observation of the defect the interior-root fix removes, firing in a
 run that then produced the family's symptom. It is one contributor, not the
 whole family — `LIVE_REFERRERS=0` says the rest of the dropped set was
 genuinely unreferenced.
+
+### The dose-response that falsified it (2026-08-05)
+
+The section above made cross-thread coverage the prime suspect off a single
+correlation. `CRATONVM_XT_PEER_DEADLINE_MS` makes that testable without a
+rebuild: it is the deadline a signalled peer has to reach the take-over handler,
+and missing it is what produces `STATE_CANCELLED` — the unclassified reading.
+Three arms, same binary, same class (`TestMultiThread`), same `--Xmx 1g`, same
+host, one variable:
+
+| arm | deadline | unclassified peers | faces |
+|-----|----------|--------------------|-------|
+| XD1 | 1 ms     | **45**, 20 cycles  | **0** |
+| HH1 | 20 ms (default) | 0             | 0     |
+| XD3 | 3000 ms  | **0** (whole run)  | **1** |
+
+The arm with forty-five unclassified peers produced no failure; the arm with
+none produced one. **Unclassified peers are neither necessary nor sufficient for
+this face.** Do not restore that hypothesis without new evidence.
+
+#### The silence that produced the wrong reading
+
+`vm-cli/src/main.rs` printed the `xt_peer_scan:` summary only `if peers > 0`. So
+a run that *failed* printed nothing — and nothing looks like the reassuring
+answer while actually covering three others: the scan ran and found nothing, the
+scan never ran, the feature is off. `gc_quiescence::XT_PASSES_LAST_CYCLE`
+documents this exact trap one level down ("`taken_over=0 unclassified=0` means
+'never looked', not 'looked and found nothing' … they must not share an
+encoding"), and the process summary simply did not follow it. It is now
+unconditional and carries `taken_over=`, `helper_windows=` and `enabled=`.
+
+### The holder verdict, and what it retires (2026-08-05)
+
+The page has been asking which object still holds the stale reference. The
+answer, from `live_holders_of` on the unconditional guard path — a walk of old
+gen plus the live young arena, decoding through each object's own
+`for_each_ref_slot` rather than comparing raw words:
+
+```text
+gc::guard: receiver points into RECLAIMED memory …
+     obj="0x200498491e8" site="invoke dispatch"
+     location=young TO-space (the inactive semispace) span="0x20042400000+0x0"
+gc::guard: …and NO live heap object holds this address in a decoded reference
+     slot. The holder is therefore a frame local, a register, or a native side
+     table — not a heap field.
+gc::guard: receiver is inside a YOUNG span the non-moving sweep zeroed and
+     returned to the free list … sweep_cycle=0 free_seq=2420 interior_off=26320
+```
+
+Two things follow, and both correct earlier entries on this page.
+
+**The `TO-space` label is an artifact, not a finding.** `span=…+0x0` — the
+extent is zero. Young collections in these runs are essentially never moving
+(`decision histogram: moving=1 non_moving=38`), so the inactive semispace is
+empty and an address "in" it is really in the region the non-moving sweep freed,
+which the very next line says outright. Every reading built on that label — in
+particular "the reference survived un-rewritten, it was not unrooted", i.e. a
+*remap* gap — rests on a label the collector prints regardless. The authoritative
+line is the sweep one, and this is a **mark** gap.
+
+**Heap-side referrer scanning was never going to answer.** The holder is a stack
+slot, a register, or a native side table. That retires `LIVE_REFERRERS=0` as
+evidence of anything: it asks whether a *heap object* points at a doomed block,
+and the answer here is that none ever did.
+
+#### The asymmetry that lets this happen
+
+Every coverage-incompleteness signal in this collector downgrades **relocation**
+— `mark_moving_young_coverage_incomplete_because` and the `[moving-young]
+fallback #N` warnings, whose reasons in the failing run are
+`unregistered-jit-frame-on-stack`, `innermost-rbp-belongs-to-unguarded-callee`
+and `compiled-frame-oop-not-published`. **None of them downgrades
+reclamation.** `xt_cycle_coverage()` has exactly one caller in the tree: a
+`CRATONVM_DBG_SWEEP_REFERRERS`-gated printer. So the collector can know its root
+set omitted a running thread's frames and still free on `GC_FLAG_MARKED` alone —
+and the non-moving sweep, which incompleteness *selects*, is the path that
+frees.
+
+The guard now reports the coverage of the sweep that freed the specific span,
+captured while that sweep ran: `root_coverage=complete` / `INCOMPLETE` /
+`NEVER-LOOKED`, with `xt_passes` / `xt_taken_over` / `xt_unclassified` beside it.
+`NEVER-LOOKED` is a distinct reading on purpose — the take-over is gated on an
+`any_thread_in_jit()` hint, so zero passes means the scan never looked, which is
+the opposite conclusion from zero unclassified peers.
+
+### The take-over contributes nothing here (2026-08-05)
+
+With the summary made unconditional, every arm reports the same thing:
+
+```text
+[GC] xt_peer_scan: unclassified_peers=0 cycles_with_unclassified=0
+     taken_over=0 xt_roots=0 helper_windows=253 resignals=16
+     classified_after_retry=0 enabled=true
+```
+
+**`taken_over=0` and `xt_roots=0` on 6 of 7 runs measured.** The seventh
+reported `taken_over=1 xt_roots=1298`, so the take-over is not dead — it is
+rare, and when it does fire it contributes a lot. The routine case is that it
+freezes nobody: cross-thread coverage in this workload comes almost entirely
+from the helper-window pass (100-570 windows per run), which handles peers
+blocked in native code with JIT frames below them.
+
+That is consistent with the dose-response above — a deadline on a pass that
+usually classifies nobody has little to act on — and it retires the take-over
+deadline as a factor here. It does NOT say the take-over is useless; a single
+pass contributing 1298 conservative roots is the opposite of useless, and that
+run is a reminder to keep the counter rather than the impression.
+
+It also confirms what the retry does: `resignals=16` with `unclassified=0`,
+against **16** unclassified peers on the pre-retry twin run. Those sixteen were
+converted to definite `STATE_NOT_JIT` answers. (The `classified_after_retry`
+counter read 0 while doing so — it only incremented in the `STATE_PARKED` arm —
+and has been corrected to count every definitive answer that needed a
+re-signal.)
+
+### The unregistered-JIT-frame memo is unsound across a re-descend (2026-08-05)
+
+Found by reading, then given both a fix and a direct measurement.
+
+`scan_active_jit_frames` detects a JIT frame that is live WITHOUT having pushed
+an entry guard — the A5 case — by looking for a JIT return address in the band
+above the registered chain. On a hit it conservatively marks that band and flags
+the cycle non-moving. Miss it and that frame's oops are never marked, so the
+non-moving sweep frees them while it is live: this family's exact face.
+
+The detection is memoized by `UNREG_JIT_VERIFIED_LO`, justified as:
+
+> nothing above our current stack pointer can change while we are nested below it
+
+That statement is true, and it does not support the memo, because **the memo
+outlives the nesting**. `verified_lo` only ever moves deeper. A thread that
+returns above it, enters an already-compiled method — which pushes no guard and
+adds no code range — and descends again will short-circuit the detection over a
+band that was rewritten in between, for the rest of its life. The memo's only
+staleness guard is `jit_code_range_count()`, which changes when a method
+COMPILES, not when one is ENTERED. The sibling cache in the same file
+(`JIT_SCAN_CACHE`) keys on `JIT_BOUNDARY_GEN` for the analogous reason; this one
+never did.
+
+It applies to peers as well as to the collecting thread: the same memo gates the
+per-native-call `update_root_snapshot`, so a parked peer's *published* snapshot
+inherits the stale verdict.
+
+**Fix.** Track the shallowest stack pointer observed since verification. Rising
+to `hiwater` pops every frame below it and leaves everything at or above it
+untouched, so the still-clean floor is `max(verified_lo, hiwater)` and the band
+between is rescanned. A thread that only descends — the perpetually-deepening
+recursion the incremental path was written for — sees `hiwater == verified_lo`
+and behaves exactly as before; a regression test asserts that, and another
+asserts the returning-thread sequence the old rule got wrong (it also pins the
+old rule's wrong answer, so the fix cannot be silently reverted).
+`CRATONVM_JIT_UNREG_MEMO_HIWATER=0` restores the old rule for A/B.
+
+**Measurement.** `CRATONVM_DBG_UNREG_MEMO_AUDIT=1` runs the detection scan even
+when the memo says clean and counts the disagreement, reported unconditionally
+as `[GC] unreg_memo: shortcircuits=N SUPPRESSED=M`. It marks nothing and changes
+no collector decision, so unlike most instruments on this page it cannot perturb
+what it measures. `SUPPRESSED > 0` means the memo hid a real unregistered JIT
+frame. The denominator is printed beside it for the reason this page has now
+learned twice: a zero with no denominator is not a measurement.
+
+### The memo suppresses real detections, measured (2026-08-05)
+
+`CRATONVM_DBG_UNREG_MEMO_AUDIT=1`, one `TestMultiThread` run at `--Xmx 1g`:
+
+```text
+[GC] unreg_memo: shortcircuits=222869 SUPPRESSED=972
+```
+
+The memo answered "no unregistered JIT frame above here" 222,869 times without
+scanning, and in **972** of those a scan of the same range found one. Each is a
+detection that did not happen — so that frame's oops were not conservatively
+marked and the cycle was not forced off the moving path, which is the mechanism
+that leaves a live object unmarked for the non-moving sweep to free.
+
+The denominator is the point of the line. `SUPPRESSED=0` beside
+`shortcircuits=0` means the audit never ran; beside `shortcircuits=222869` it
+would mean the memo is honest. Those must not look alike — see the
+`if peers > 0` mistake above, which is the same error one instrument earlier.
+
+**Measured with the hi-water rule already ON.** So that rule is a real but
+PARTIAL improvement: it can only react to stack-pointer rises it happens to
+observe, and a thread that returns above the verified point and re-descends
+entirely between two root-snapshot calls never presents one. It is not the fix
+and is not claimed as one.
+
+#### The hi-water A/B, and what it does not show
+
+Same binary, same class, same heap, arms run CONCURRENTLY so host load (which
+ranged 20-124 during this session) hits both:
+
+| arm | hi-water | short-circuits | SUPPRESSED |
+|-----|----------|----------------|------------|
+| AU  | ON       | 222 869        | 972        |
+| AU  | ON       | 228 108        | 431        |
+| AU  | ON       | 277 271        | 754        |
+| AU2 | OFF      | 276 145        | 790        |
+
+**No measurable effect on either column.** The ON runs straddle the OFF run on
+both metrics and their own spread (431-972 suppressed, 223 K-277 K
+short-circuits) is wider than any gap to the control.
+
+An intermediate reading of the first two ON samples looked like a ~19% reduction
+in short-circuits; the third sample (277 271, with the rule ON) removed it. Two
+points against one is not a measurement on a host whose load ranged 20-124
+during this session — see the standing note on interleaved A/B here.
+
+The rule is kept anyway, described for what it is: a sound tightening of an
+argument that was plainly wrong as written (`verified_lo` alone claims the
+verdict holds for the life of the thread), with no demonstrated effect on this
+workload. It is **not** credited with fixing anything, and the correctness
+argument rests entirely on the authoritative reset below.
+
+### Two caches, one invalidation hook (2026-08-05) — the load-bearing fix
+
+`conservative_roots.rs` memoizes two different per-native-call scans:
+
+| cache | what it decides | keyed on |
+|-------|-----------------|----------|
+| `JIT_SCAN_CACHE` | the conservative root set | `JIT_BOUNDARY_GEN` |
+| the unregistered-frame memo | whether an unguarded live JIT frame exists above the chain | `jit_code_range_count()` only |
+
+`invalidate_scan_cache_for_gc()` exists because such a cache can be stale by GC
+time. Its own doc states the rule — *"we only need the **authoritative** GC root
+scans to be fresh"* — and it is called from all four authoritative sites:
+`collect_roots`, the safepoint publish, the pre-park publish, and the
+blocked-path deposit. It bumps the boundary generation, which discards the first
+cache and **does nothing to the second**, because the second is keyed on a
+question the hook does not answer.
+
+So the identical soundness gap was diagnosed and closed for one cache and left
+open on the other, forty lines away — and the one left open is the more
+dangerous: a stale root snapshot drops individual references, while a stale
+unregistered-frame verdict drops an entire frame's worth AND leaves the
+collector believing it may relocate.
+
+**Fix:** reset the memo in `invalidate_scan_cache_for_gc` too. Suppression on
+the paths a collector actually consumes becomes impossible by construction,
+because every one of them invalidates first. The cost is one band rescan per GC
+root collection instead of per native call — exactly the trade that function
+already documents, and the reason the memo can stay for its hot purpose.
+`a_reset_memo_demands_a_full_rescan_at_any_depth` pins the property that a reset
+memo asks for a FULL rescan rather than an incremental band over a prefix
+nothing has verified.
 
 ### A marking fail-open found while reading (2026-08-05)
 
@@ -610,6 +859,31 @@ Two consequences worth stating plainly:
 * the `blocked=false` in the original 2026-08-02 receiver dump was right and
   should have been believed: the thread is not parked when it trips, and
   `in_blocked_region=false` in the 2026-08-05 provenance line says so again.
+
+### Two more `TestMultiThread` faces worth counting, and one arm that cannot be soaked
+
+Faces seen on the 2026-08-05 campaigns beyond the four this page lists. Neither
+is established as this family; both are recorded so a future campaign counts
+them instead of dismissing them as application flakiness:
+
+* `General error: "java.lang.NullPointerException: Cannot invoke
+  ""org.h2.result.ResultInterface.isLazy()"" because ""result"" is null"` — a
+  reference field reading NULL. Note that a field read off a ZEROED object
+  returns 0, which decodes as `null`, so this is a plausible face of the same
+  defect one step downstream of `ClassId(0)`;
+* `The database has been closed` mid-run with 26 live connections. H2 closes a
+  database when its last session unregisters, so this is what losing an entry
+  from `Database.userSessions` looks like from the outside.
+
+**`CRATONVM_DBG_NO_NONMOVING_RECLAIM=1` cannot settle them.** The intent was a
+clean discriminator — with the non-moving sweep's dead spans neither zeroed nor
+published, a reference the root scan missed keeps its original header, so the
+failure should vanish if it really is reclamation. Two runs at `--Xmx 3g`: the
+first still failed (the `result is null` NPE, 40 s in), the second died of
+`OutOfMemoryError`. The flag defers only the NON-MOVING sweep, so selective
+promotion still evacuates and the moving path still resets from-space; and the
+unbounded leak ends the run before much sweeping happens. So it is neither a
+clean negative nor soakable — do not read the first run as exoneration.
 
 ### Young-side hypotheses closed with measurements (2026-08-02 → 08-05)
 

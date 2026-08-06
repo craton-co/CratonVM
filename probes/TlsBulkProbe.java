@@ -59,7 +59,7 @@ import javax.net.ssl.TrustManagerFactory;
  * is a Tomcat NIO connector driving a rustls-backed {@code SSLEngine}, not an
  * {@code SSLServerSocket} — so this was set aside rather than chased during the
  * testPost investigation (see
- * {@code docs/internal/fixed-suite-bugs/tomcat/testssl-testpost-connection-dies-under-concurrent-bulk-tls-FIXED.md}).
+ * {@code fixed-suite-bugs/tomcat/testssl-testpost-connection-dies-under-concurrent-bulk-tls-FIXED.md}).
  * Use {@code TlsPostShapeProbe} for the testPost shape. This file is kept
  * because the server-side failure above is itself worth a page.
  */

@@ -7405,6 +7405,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let our_weak = Arc::downgrade(&shared);
         set_process_vm(&shared);
 
         let _raw = attach_foreign_thread(&shared, false, None);
@@ -7415,6 +7416,16 @@ mod tests {
         });
         let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
+
+        // `ForeignCallGuard::enter` resolves the process-global cell (see its
+        // `process_vm()` call), which `PROCESS_VM_TEST_LOCK` does not protect --
+        // `Vm::new` republishes it from test sites that never take this lock.
+        // A theft here sends the blocked-region LEAVE to another VM's barrier
+        // and ours stays at 1: `left: 1, right: 0` on "outermost call must
+        // leave the blocked region", 1 of 30 full-suite runs.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
 
         {
             // Outermost call → leave blocked region, counted mutator.
@@ -7473,6 +7484,7 @@ mod tests {
         use std::collections::HashMap;
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let our_weak = Arc::downgrade(&shared);
         set_process_vm(&shared);
 
         let init = shared.threads.thread_registry.next_thread_id();
@@ -7483,6 +7495,20 @@ mod tests {
             .thread_registry
             .register(coord, "coordinator", None);
         assert_eq!(shared.threads.thread_registry.alive_count(), 2);
+
+        // `host_thread_enter_native` resolves the PROCESS-GLOBAL cell, not the
+        // `shared` above, and `PROCESS_VM_TEST_LOCK` does not protect it:
+        // `Vm::new` republishes that cell unconditionally, from 60+ test call
+        // sites that never take this lock (see `process_vm_cell_holds`). When
+        // one of them lands in this window, the call below marks a blocked
+        // region on THEIR barrier and the assertion reads ours, which is still
+        // 0 -- measured as `left: 0, right: 1`, 2 of 20 full-suite runs.
+        //
+        // Checked BEFORE the call, not just before the assertion, so a lost
+        // cell also means we never perturb the other test's barrier.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
 
         // This thread declares itself in-native (no foreign attachment present).
         assert!(host_thread_enter_native());
@@ -7499,6 +7525,11 @@ mod tests {
         shared.mem.gc_barrier.complete_gc(HashMap::new());
 
         assert!(host_thread_leave_native());
+        // Same re-check as the twin below: a republish mid-body sends the
+        // `leave` to another VM's barrier and leaves ours at 1.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
     }
 
@@ -7529,6 +7560,7 @@ mod tests {
         use std::collections::HashMap;
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let our_weak = Arc::downgrade(&shared);
         set_process_vm(&shared);
 
         let init = shared.threads.thread_registry.next_thread_id();
@@ -7545,6 +7577,13 @@ mod tests {
         shared.threads.thread_registry.set_os_tid_current(coord);
         assert!(!is_foreign_attached());
         assert_eq!(shared.threads.thread_registry.alive_count(), 2);
+
+        // Same process-cell hazard as the twin above: `host_thread_enter_native`
+        // resolves the global cell, and `Vm::new` republishes it from test call
+        // sites that never take this lock. Bail before touching the barrier.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
 
         assert!(host_thread_enter_native());
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
@@ -7580,6 +7619,14 @@ mod tests {
         shared.mem.gc_barrier.complete_gc(HashMap::new());
 
         assert!(host_thread_leave_native());
+        // Re-checked, not assumed: the cell can be republished at any point in
+        // this body, and `host_thread_leave_native` then decrements the NEW
+        // owner's barrier instead of ours, leaving ours at 1. That is the
+        // `left: 1, right: 0` seen here in 1 of 24 full-suite runs — the same
+        // theft as the guard above, observed one assertion later.
+        if !process_vm_cell_holds(&our_weak) {
+            return;
+        }
         assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
         assert!(
             !shared.threads.thread_registry.is_blocked(coord),

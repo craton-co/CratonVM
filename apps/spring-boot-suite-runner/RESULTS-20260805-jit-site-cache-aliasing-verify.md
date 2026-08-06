@@ -81,9 +81,9 @@ class that has an unrelated cause.
 ## Docs retired
 
 - `docs/known-issues/springboot/flywayautoconfigurationtests-silent-hang-after-hsqldb-validate-20260805.md`
-  → `docs/internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`
+  → `fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`
 - `docs/known-issues/springboot/classfile-annotation-metadata-corruption-20260805.md`
-  → `docs/internal/fixed-suite-bugs/springboot/classfile-annotation-metadata-corruption-FIXED-20260805.md`
+  → `fixed-suite-bugs/springboot/classfile-annotation-metadata-corruption-FIXED-20260805.md`
 
 Both filed hypotheses were wrong and are recorded as such on the retired
 pages: the flyway page blamed a `org/hsqldb/` JIT ban that had already been

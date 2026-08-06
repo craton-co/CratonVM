@@ -95,6 +95,19 @@ pub static XT_PEERS_UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
 /// Collections during which at least one peer went unclassified.
 pub static XT_CYCLES_WITH_UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
 
+/// H2-CID0 (2026-08-05) — takeover signals re-sent because a peer had not
+/// reached the handler within one per-attempt deadline.
+///
+/// Non-zero here is the normal, healthy state on a loaded box; it is the
+/// counter that says the retry is doing work rather than being decorative.
+pub static XT_PEER_RESIGNALS: AtomicU64 = AtomicU64::new(0);
+/// H2-CID0 (2026-08-05) — peers that answered only AFTER a re-signal.
+///
+/// Every one of these would have been an UNCLASSIFIED peer before the retry
+/// landed: a running thread whose JIT-frame oops were absent from the mark set
+/// while the non-moving sweep freed on `GC_FLAG_MARKED` alone.
+pub static XT_PEERS_CLASSIFIED_AFTER_RETRY: AtomicU64 = AtomicU64::new(0);
+
 /// Deadline for a signalled peer to reach the takeover handler.
 ///
 /// `CRATONVM_XT_PEER_DEADLINE_MS` (default 20). The default is a scheduling
@@ -109,6 +122,35 @@ pub fn peer_deadline_ms() -> u64 {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(20)
+    })
+}
+
+/// H2-CID0 (2026-08-05) — TOTAL time a peer gets to answer, across re-signals.
+///
+/// [`peer_deadline_ms`] is one scheduling bet. Losing it means the peer was not
+/// placed on a CPU in that window, which on a loaded host says nothing about
+/// whether it would ever answer — and the cost of concluding "unclassified" is
+/// that the non-moving sweep marks from a root set provably missing a RUNNING
+/// thread's JIT frames, then frees on `GC_FLAG_MARKED` alone. Measured 16 such
+/// peers across 15 cycles on the H2 `ClassId(0)` reproducer.
+///
+/// The takeover is signal-based, so a peer need not reach a safepoint to
+/// answer; it only needs to be scheduled. Retrying therefore converges for any
+/// peer that is genuinely running, which is exactly the population that matters
+/// here. `CRATONVM_XT_PEER_TOTAL_MS` (default 1000); set it equal to
+/// `CRATONVM_XT_PEER_DEADLINE_MS` to restore the old one-shot behaviour.
+pub fn peer_total_deadline_ms() -> u64 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        let total = cratonvm_types::flags::runtime_var("CRATONVM_XT_PEER_TOTAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1000);
+        // A total below one attempt would silently shorten the per-attempt
+        // deadline instead of extending it.
+        total.max(peer_deadline_ms())
     })
 }
 
@@ -754,7 +796,10 @@ mod imp {
     const MAX_STACK_SCAN: usize = 8 * 1024 * 1024;
     const REG_COUNT: usize = 17;
 
-    use super::{peer_deadline_ms, XT_CYCLES_WITH_UNCLASSIFIED, XT_PEERS_UNCLASSIFIED};
+    use super::{
+        peer_deadline_ms, peer_total_deadline_ms, XT_CYCLES_WITH_UNCLASSIFIED,
+        XT_PEERS_CLASSIFIED_AFTER_RETRY, XT_PEER_RESIGNALS, XT_PEERS_UNCLASSIFIED,
+    };
 
     const STATE_EMPTY: u8 = 0;
     const STATE_ARMED: u8 = 1;
@@ -980,19 +1025,65 @@ mod imp {
         rc == 0
     }
 
-    fn wait_for_response(slot: &LinuxSlot, timeout: Duration) -> u8 {
+    /// Poll for at most `timeout`, WITHOUT cancelling when it expires.
+    ///
+    /// Split out of `wait_for_response` so an expired attempt can be retried:
+    /// cancelling is a decision about the whole budget, not about one attempt,
+    /// and `STATE_CANCELLED` is the state the handler reads to bail out.
+    fn poll_for_response(slot: &LinuxSlot, timeout: Duration) -> Option<u8> {
         let start = Instant::now();
         loop {
             let state = slot.state.load(Ordering::Acquire);
             if state != STATE_ARMED {
-                return state;
+                return Some(state);
             }
             if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// H2-CID0 (2026-08-05) — wait for a peer across re-signals.
+    ///
+    /// Replaces a single [`peer_deadline_ms`] bet. Missing that deadline means
+    /// the peer was not scheduled inside the window; because the takeover is
+    /// signal-based rather than poll-based, that is a statement about the
+    /// scheduler and not about whether the peer can answer. Concluding
+    /// "unclassified" instead costs a root set that provably omits a RUNNING
+    /// thread's JIT-frame oops, which the non-moving sweep then frees on
+    /// `GC_FLAG_MARKED` alone.
+    ///
+    /// Re-signalling an already-`STATE_ARMED` slot is safe and idempotent: the
+    /// handler re-checks `ACTIVE`, re-finds the slot and early-returns unless
+    /// the state is still `STATE_ARMED`, so a redundant delivery (including one
+    /// racing with the peer parking) does no work.
+    ///
+    /// Returns `STATE_EMPTY` if the peer exited mid-wait — nothing to scan and
+    /// nothing running, which is not a coverage hole and must not be counted as
+    /// one.
+    fn wait_for_response_retrying(slot: &LinuxSlot, tid: u32) -> u8 {
+        let attempt = Duration::from_millis(peer_deadline_ms());
+        let budget = Duration::from_millis(peer_total_deadline_ms());
+        let start = Instant::now();
+        loop {
+            if let Some(state) = poll_for_response(slot, attempt) {
+                return state;
+            }
+            if start.elapsed() >= budget {
+                // Out of budget. This IS a coverage hole; the caller counts it.
                 slot.resume.store(1, Ordering::Release);
                 slot.state.store(STATE_CANCELLED, Ordering::Release);
                 return STATE_CANCELLED;
             }
-            std::thread::yield_now();
+            if !send_takeover_signal(tid) {
+                // ESRCH: exited while we waited.
+                slot.resume.store(1, Ordering::Release);
+                slot.state.store(STATE_CANCELLED, Ordering::Release);
+                slot.clear();
+                return STATE_EMPTY;
+            }
+            XT_PEER_RESIGNALS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1168,7 +1259,20 @@ mod imp {
                 slot.clear();
                 continue;
             }
-            match wait_for_response(slot, Duration::from_millis(peer_deadline_ms())) {
+            let resignals_before = XT_PEER_RESIGNALS.load(Ordering::Relaxed);
+            let answer = wait_for_response_retrying(slot, tid);
+            // Any DEFINITIVE answer that needed a re-signal would have been an
+            // UNCLASSIFIED peer before the retry — `STATE_NOT_JIT` counts, it
+            // means the peer reached the handler with its `Rip` outside JIT
+            // code and is a cooperative barrier participant publishing its own
+            // roots. Counting only `STATE_PARKED` reported zero on a run where
+            // the retry had just converted sixteen.
+            if answer != STATE_CANCELLED
+                && XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before
+            {
+                XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
+            }
+            match answer {
                 STATE_PARKED => {
                     let found = scan_slot(slot, is_obj, roots);
                     taken.handles.push(0);
@@ -1285,7 +1389,20 @@ mod imp {
                 slot.clear();
                 continue;
             }
-            match wait_for_response(slot, Duration::from_millis(peer_deadline_ms())) {
+            let resignals_before = XT_PEER_RESIGNALS.load(Ordering::Relaxed);
+            let answer = wait_for_response_retrying(slot, tid);
+            // Any DEFINITIVE answer that needed a re-signal would have been an
+            // UNCLASSIFIED peer before the retry — `STATE_NOT_JIT` counts, it
+            // means the peer reached the handler with its `Rip` outside JIT
+            // code and is a cooperative barrier participant publishing its own
+            // roots. Counting only `STATE_PARKED` reported zero on a run where
+            // the retry had just converted sixteen.
+            if answer != STATE_CANCELLED
+                && XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before
+            {
+                XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
+            }
+            match answer {
                 STATE_PARKED => {
                     candidates.clear();
                     let has_jit = classify_slot_helper_window(
