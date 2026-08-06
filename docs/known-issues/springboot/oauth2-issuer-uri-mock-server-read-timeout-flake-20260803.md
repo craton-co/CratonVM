@@ -161,13 +161,43 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
    that materialises **every** overlay-backed root (LinkedList /
    LinkedHashMap / TreeMap / TreeSet side tables) and only then filters with
    `young_from.contains(...)`. A minor collection should be proportional to the
-   young set, not to the whole heap's overlay population. Real, separable, and
-   not sufficient on its own.
+   young set, not to the whole heap's overlay population.
 
-Neither is fixed yet. The `gcphase`-style breakdown for the moving Cheney path
-is new (`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection
-on this arm printed a bare total, because `gcphase` instruments only the
-non-moving sweep this workload never takes.
+   Traced to the source, it is worse than "one big Vec". There is exactly one
+   provider (`native-collections`), and its
+   `gc_overlay_roots_for_matching_owners` does, per minor GC, for **N** overlay
+   owners (a Spring context has thousands):
+
+   ```rust
+   let owners = overlay_owner_keys().lock()… .keys().filter(|o| true).collect();  // 1 lock, 1 Vec
+   for owner in owners {
+       roots.extend(gc_overlay_roots_for_collection(owner, None));               // per owner:
+   }                                                                             //   re-lock + clone
+   ```
+
+   and `gc_overlay_roots_for_collection` re-takes that **same global mutex** and
+   does `index.get(&owner).cloned()` — so the cycle pays **1 + N lock/unlock
+   cycles on one global mutex, N key-set clones, N result `Vec` allocations**,
+   and then walks every element of every overlay collection. All of it to
+   discover which handful of refs happen to be in young.
+
+   Three fixes, cheapest first, none of them started:
+   * hold the mutex **once** and gather owner→keys in a single pass (removes N
+     locks and N clones; local to `native-collections`, no cross-crate API
+     change);
+   * append into one caller-owned buffer instead of returning a fresh `Vec` per
+     owner (removes N allocations);
+   * the real one — a **dirty/card flag on overlay side-table writes**, so a
+     minor GC visits only owners mutated since the last cycle. That is what
+     makes the phase proportional to the young set instead of to the heap, and
+     it mirrors what the card table already does for ordinary object fields.
+
+**Neither defect is fixed.** The moving-Cheney phase breakdown is new
+(`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection on this
+arm printed a bare total, because `gcphase` instruments only the non-moving
+sweep this workload never takes. `cheney_drain` is the one that decides whether
+the flake survives; `overlay_forward` alone cannot bring a 1538 ms pause under
+500 ms.
 
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 

@@ -11593,7 +11593,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // `flush_raw_entry_dispatch_caches`.
     flush_raw_entry_dispatch_caches();
     // Diagnostic (`CRATONVM_DBG_SITE_ALIAS`): does this key still name its site?
-    note_site_identity(jit_site_key(vm.vm_identity, info_ptr as usize), info);
+    // The gate is here rather than inside, for the same reason as the sibling
+    // call site above: an all-off run must not make the call at all. This was
+    // the ONE of the three call sites that had the comment but not the `if`, so
+    // the "diagnostic" printed `[site-alias]` lines on stderr and grew the
+    // unbounded `SITE_IDENTITY` map on every raw-entry native dispatch in an
+    // ordinary run — caught by `scripts/jdk-only-strict-probes.sh`, which saw
+    // the lines in BOTH CratonVM arms of `JdkOnlyPlatformProbe`.
+    if site_alias_detect_enabled() {
+        note_site_identity(jit_site_key(vm.vm_identity, info_ptr as usize), info);
+    }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
         info,

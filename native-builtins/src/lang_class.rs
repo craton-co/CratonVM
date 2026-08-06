@@ -12052,7 +12052,7 @@ fn resolve_annotation_type_class_id(
     class_name: &str,
     container_class_id: Option<ClassId>,
 ) -> Option<ClassId> {
-    container_class_id
+    let resolved = container_class_id
         .and_then(|h| ctx.class_id_by_name_near(class_name, h))
         .or_else(|| ctx.class_id_by_name(class_name))
         .or_else(|| {
@@ -12068,7 +12068,51 @@ fn resolve_annotation_type_class_id(
             // that member and can lose identity under an isolated loader.
             container_class_id
                 .and_then(|h| ctx.class_id_by_name_via_referencing_class(h, class_name).ok())
-        })
+        })?;
+    // "Resolved" has to mean "resolved to an ANNOTATION TYPE".
+    //
+    // Every arm above ends in a name lookup, and `ctx.load_class` FABRICATES a
+    // synthetic stand-in for a name that is on no classpath — so the filter
+    // this function exists to implement could essentially never say
+    // "unresolvable", and the compile-only annotation it was written to drop
+    // came back as a plain synthetic class instead. A `Proxy` built over that
+    // implements a non-interface with no superinterfaces, so the proxy is not a
+    // `java.lang.annotation.Annotation` and every consumer that casts to one
+    // gets a `ClassCastException` — measured on
+    // `org.infinispan.query.remote.client.impl.QueryRequest`, whose
+    // `@org.jboss.marshalling.Externalize` is not on the Spring Boot cache
+    // classpath: `jdk.proxy1.$Proxy0` with `isInterface=false
+    // isAnnotation=false superinterfaces=[]`, against the eight real
+    // annotations on the same class which are all `isAnnotation=true
+    // superinterfaces=[java.lang.annotation.Annotation]`.
+    //
+    // The visible damage was Byte Buddy's `AnnotationList$ForLoadedAnnotations`
+    // — it casts each element of `getDeclaredAnnotations()` to `Annotation` —
+    // which took out Mockito's inline mock maker: `Could not modify all
+    // classes`, and for a FINAL class (nothing to subclass) `mock()` then
+    // failed outright instead of silently degrading to a subclass proxy.
+    //
+    // JLS 9.6 gives the test: an annotation interface is an interface that
+    // implicitly extends `java.lang.annotation.Annotation`, and javac marks it
+    // `ACC_ANNOTATION`. Checking the resolved class rather than "is this a
+    // stub?" also rejects a genuinely wrong class of the same name, and states
+    // the invariant the proxy's consumers actually depend on.
+    is_annotation_type(ctx, resolved).then_some(resolved)
+}
+
+/// Is `class_id` an annotation interface (JLS 9.6)?
+///
+/// `ACC_ANNOTATION` is what javac emits and is the cheap answer. The
+/// superinterface check is the same question asked structurally, and covers a
+/// class file that carries the interface without the flag.
+fn is_annotation_type(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
+    const ACC_ANNOTATION: u16 = 0x2000;
+    if ctx.class_access_flags(class_id) & ACC_ANNOTATION != 0 {
+        return true;
+    }
+    ctx.class_interfaces(class_id).into_iter().any(|i| {
+        ctx.class_name_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
+    })
 }
 
 /// The IDENTITY half: the declaring class's ("container's") own loader, as
@@ -19628,10 +19672,23 @@ mod tests {
     }
 
     fn ensure_nullable_annotation_type(ctx: &mut crate::test_utils::MockNativeContext) {
-        ctx.ensure_class_initialized("java/lang/annotation/Annotation")
+        let annotation = ctx
+            .ensure_class_initialized("java/lang/annotation/Annotation")
             .unwrap();
-        ctx.ensure_class_initialized("org/jspecify/annotations/Nullable")
+        let nullable = ctx
+            .ensure_class_initialized("org/jspecify/annotations/Nullable")
             .unwrap();
+        // Make the stand-in an actual annotation TYPE. `ensure_class_initialized`
+        // mints a bare class, and `resolve_annotation_type_class_id` now refuses
+        // to build a proxy over anything that is not an annotation interface
+        // (JLS 9.6) — which is the whole point of that check: a fabricated
+        // stand-in for a type on no classpath looks exactly like this, and a
+        // `Proxy` over it is not a `java.lang.annotation.Annotation`.
+        //
+        // Declaring the superinterface rather than setting `ACC_ANNOTATION`
+        // exercises the structural half of the predicate; the flag half is
+        // covered by `annotation_type_predicate_accepts_both_shapes`.
+        ctx.set_interfaces(nullable, vec![annotation]);
     }
 
     fn declared_annotation_count(
@@ -19647,6 +19704,56 @@ mod tests {
             Some(Value::Object(Some(arr))) => ctx.array_length(arr),
             other => panic!("expected Annotation[] from AnnotatedType, got {other:?}"),
         }
+    }
+
+    /// The predicate that decides whether an annotation may be surfaced at all.
+    ///
+    /// Both shapes must pass — `ACC_ANNOTATION` is what javac emits, the
+    /// `java.lang.annotation.Annotation` superinterface is the same fact stated
+    /// structurally (JLS 9.6) — and a bare class must fail. A bare class is not
+    /// a hypothetical: `ctx.load_class` FABRICATES exactly that for an
+    /// enterprise-prefixed name (`org/jboss/`, `org/infinispan/`, …) that is on
+    /// no classpath, which is how `@org.jboss.marshalling.Externalize` reached
+    /// `getDeclaredAnnotations()` as a `Proxy` that was not an `Annotation`.
+    #[test]
+    fn annotation_type_predicate_accepts_both_shapes_and_rejects_a_bare_class() {
+        const ACC_ANNOTATION: u16 = 0x2000;
+        let mut ctx = mock_ctx();
+        let annotation = ctx
+            .ensure_class_initialized("java/lang/annotation/Annotation")
+            .unwrap();
+
+        // Shape 1: carries ACC_ANNOTATION.
+        let flagged = ctx
+            .ensure_class_initialized("com/example/FlaggedAnno")
+            .unwrap();
+        unsafe {
+            (*ctx.class_flags_override.get()).insert(flagged.as_u32(), ACC_ANNOTATION);
+        }
+        assert!(
+            is_annotation_type(&ctx, flagged),
+            "a class carrying ACC_ANNOTATION is an annotation type"
+        );
+
+        // Shape 2: declares the superinterface instead.
+        let structural = ctx
+            .ensure_class_initialized("com/example/StructuralAnno")
+            .unwrap();
+        ctx.set_interfaces(structural, vec![annotation]);
+        assert!(
+            is_annotation_type(&ctx, structural),
+            "a class declaring java.lang.annotation.Annotation is an annotation type"
+        );
+
+        // The fabricated stand-in: neither flag nor superinterface.
+        let fabricated = ctx
+            .ensure_class_initialized("org/jboss/marshalling/Externalize")
+            .unwrap();
+        assert!(
+            !is_annotation_type(&ctx, fabricated),
+            "a bare class must not be treated as an annotation type — a Proxy \
+             over it is not a java.lang.annotation.Annotation"
+        );
     }
 
     #[test]

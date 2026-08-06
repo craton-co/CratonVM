@@ -318,7 +318,7 @@ instead of a loud one. That is the collections reclassification wave
 > `Object[]` it was handed, not a `table[]`. `StreamCollector` went the other
 > way and needed no `Consumer` at all (`Spliterators.iterator`). Details and
 > measurements in
-> `docs/known-issues/jdk-only/strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`.
+> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
 > Worth recording as a process note: this page's premise was derived by reading
 > the code, and a probe that measured it instead
 > (`probes/StrictIterPrimitivesProbe`) found the actual cause was different —

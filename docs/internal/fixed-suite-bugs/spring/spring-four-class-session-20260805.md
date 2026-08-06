@@ -27,7 +27,8 @@ claimed.
 
 The single residual is
 `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`, filed as
-[`../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md`](../../../known-issues/spring/beanregistrations-verylarge-heap-footprint-20260805.md).
+[`../../beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`](../../beanregistrations-verylarge-heap-footprint-FIXED-20260806.md)
+(FIXED 2026-08-06 — and not by anything to do with footprint; see that page).
 It is a memory-footprint gap, not a correctness one: HotSpot compiles the
 10001-definition case in 13 s inside `-Xmx512m`, while CratonVM exhausts a
 4 GiB heap inside javac (`OutOfMemoryError` in `JavacTaskImpl.call`). Stated

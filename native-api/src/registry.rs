@@ -4447,6 +4447,33 @@ pub struct NativeCensusEntry {
     /// Times this slot was dispatched through any path this run. `0` on a
     /// superseded row: the count belongs to whoever currently owns the slot.
     pub invocations: u64,
+    /// Whether this registration still **owns its slot**, i.e. whether a
+    /// dispatch of this triple would reach *this* row's callback.
+    ///
+    /// `false` means a later `register*` of the identical triple replaced it
+    /// (last-write-wins into the slot), so the row records that a registration
+    /// happened and nothing more: it can never be dispatched, and adjudicating
+    /// its kind decides nothing.
+    ///
+    /// # Why this is a column and not left to the reader
+    ///
+    /// Every consumer of this census was inferring it — or not inferring it.
+    /// Measured on `JdkOnlyCensusLoadProbe` (JDK 25, 2026-08-06): of 11,876
+    /// rows, **1,237 own no slot**, and **1,092 of the 9,660 rows the
+    /// adjudication reports as unadjudicated `Bridge` are among them**. So the
+    /// live unadjudicated surface is 8,568, and a reclassification wave sized
+    /// off the larger number would go looking for ~1,100 registrations that
+    /// cannot affect anything.
+    ///
+    /// It is derivable from census order (within a triple, the last row owns the
+    /// slot) — which is exactly why it belongs here instead: that is an
+    /// undocumented ordering guarantee for external scripts to depend on, and
+    /// [`NativeMethodRegistry::census`] already has the answer in hand.
+    ///
+    /// This is the fourth distinct way this census has been misread; the other
+    /// three are in
+    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
     /// some enclosing registrar (`register`).
@@ -5173,10 +5200,8 @@ impl NativeMethodRegistry {
             .enumerate()
             .map(|(reg_index, (class, name, descriptor))| {
                 let prov = self.provenance.get(reg_index);
-                let invocations = owner_slot
-                    .get(reg_index)
-                    .copied()
-                    .flatten()
+                let owning_slot = owner_slot.get(reg_index).copied().flatten();
+                let invocations = owning_slot
                     .and_then(|slot_idx| self.slot_invocations.get(slot_idx as usize))
                     .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(0);
@@ -5201,6 +5226,10 @@ impl NativeMethodRegistry {
                     // fallback direction) as `kind` above: a hypothetical
                     // desync reports "inherited", never a false "adjudicated".
                     kind_stated: self.kind_stated.get(reg_index).copied().unwrap_or(false),
+                    // The same `owner_slot` reverse index the invocation count
+                    // above is read through — a superseded registration has no
+                    // entry in it, which is precisely what "owns no slot" means.
+                    owns_slot: owning_slot.is_some(),
                 }
             })
             .collect()
@@ -5602,11 +5631,68 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
+        // `java.util.concurrent.Executors` bytecode builds every executor.
+        //
+        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
+        // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
+        // factories were the ones still fabricating. What they did was subtler
+        // than a two-slot stub and is worth stating, because the obvious reading
+        // of the code says they were already fine:
+        //
+        //   `alloc_concurrent_synthetic(.., "java/util/concurrent/ThreadPoolExecutor", 2)`
+        //   followed by `initialize_real_thread_pool_executor`, which
+        //   `invoke_special`s the real `ThreadPoolExecutor.<init>`.
+        //
+        // On the happy path that does produce a genuinely real executor — which
+        // is why the fixed/cached transcripts already matched HotSpot. But it
+        // keeps TWO fallbacks (`stpe_legacy_slot_init`, taken when the
+        // `BlockingQueue` or the `TimeUnit` constant cannot be built) that write
+        // the historical two-slot shape onto a real-layout object and return it
+        // as if construction had succeeded. A fallback that silently hands back a
+        // half-constructed executor is exactly the state the eight
+        // `ThreadPoolExecutor.execute` receiver-shape dispatch sites exist to
+        // detect, so leaving it in place would keep the predicate they consult
+        // conditionally true — and "conditionally true" is what blocks deleting
+        // them (L11).
+        //
+        // And one of the three was observably wrong, not just fragile:
+        // `newSingleThreadExecutor()` returned a bare `ThreadPoolExecutor`, where
+        // the real JDK returns `Executors$AutoShutdownDelegatedExecutorService`
+        // wrapping one. Every `instanceof ThreadPoolExecutor` a caller writes
+        // flipped, and the pool was reconfigurable when the JDK guarantees it is
+        // not. Measured against HotSpot 25 by `probes/L10ThreadPoolInitProbe`:
+        // `single.class` and `single.isTpe` were the ONLY two divergent lines out
+        // of 62 in both `--real-jdk` and `--jdk-only`.
+        //
+        // Dropping is the whole fix, and it is a registration-time decision on
+        // purpose — the L11/item-3 precedent
+        // (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`)
+        // is that a policy expressed at dispatch has to be restated once per
+        // dispatch path, while a policy expressed here is invisible to all of
+        // them at once. With no native, `Executors.newFixedThreadPool` et al. run
+        // their own bytecode — `new ThreadPoolExecutor(...)`, or for the single-
+        // thread case the delegating wrapper — so a factory-built executor is
+        // real by CONSTRUCTION rather than by a fallback that happened not to be
+        // taken. `newSingleThreadExecutor(ThreadFactory)` was never registered
+        // and has always run that real path, which is what made this safe to do
+        // rather than merely desirable.
+        //
+        // Scoped to the pool factories by NAME. `Executors.callable`,
+        // `defaultThreadFactory`, `privilegedThreadFactory` and the
+        // `unconfigurable*` wrappers are not fabrications and keep whatever
+        // registration they have; and the synthetic-JDK build never sets this
+        // flag, so its own two-slot executor model is untouched.
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/Executors"
             && matches!(
                 method_name,
-                "newScheduledThreadPool" | "newSingleThreadScheduledExecutor"
+                "newScheduledThreadPool"
+                    | "newSingleThreadScheduledExecutor"
+                    | "newFixedThreadPool"
+                    | "newCachedThreadPool"
+                    | "newSingleThreadExecutor"
             )
         {
             return;
@@ -7865,6 +7951,113 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // JDK-only wave 2, L10 — real `ThreadPoolExecutor` field initialisation
+    // -----------------------------------------------------------------------
+
+    /// Every `Executors` pool factory, and the descriptor CratonVM registered
+    /// it under before the L10 drop.
+    const EXECUTOR_POOL_FACTORIES: &[(&str, &str)] = &[
+        (
+            "newFixedThreadPool",
+            "(I)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newSingleThreadExecutor",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newScheduledThreadPool",
+            "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+        (
+            "newSingleThreadScheduledExecutor",
+            "()Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+    ];
+
+    /// In real-JDK mode no `Executors` pool factory may be registered: the real
+    /// `java.util.concurrent.Executors` bytecode has to build every executor,
+    /// so a factory-made pool is genuinely `<init>`-constructed by construction
+    /// rather than by a fallback that happened not to be taken.
+    ///
+    /// That is what unblocks L11. The eight `ThreadPoolExecutor.execute`
+    /// receiver-shape dispatch sites exist to detect an executor CratonVM
+    /// fabricated; they are deletable only once no such executor can exist, and
+    /// a native here is the only thing that could make one.
+    ///
+    /// Asserted in BOTH directions. Without the `drop_real_layout_synthetic ==
+    /// false` half this test passes on a registry that refuses the triples
+    /// unconditionally — which would break the synthetic-JDK build, whose
+    /// two-slot executor model is exactly what those natives are for, while
+    /// this test went on reading green.
+    #[test]
+    fn real_jdk_mode_registers_no_executors_pool_factory() {
+        let exec = "java/util/concurrent/Executors";
+
+        let mut compatible = NativeMethodRegistry::new();
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            compatible.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                compatible.find(exec, name, descriptor).is_some(),
+                "synthetic-JDK mode must KEEP Executors.{name}{descriptor}: it is the \
+                 only implementation there, and dropping it would leave the synthetic \
+                 two-slot executor model with no factory at all"
+            );
+        }
+
+        let mut real = NativeMethodRegistry::new();
+        real.set_drop_real_layout_synthetic(true);
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            real.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                real.find(exec, name, descriptor).is_none(),
+                "real-JDK mode still registers Executors.{name}{descriptor}. A native here \
+                 can hand back an executor the real `<init>` never ran on, which is the \
+                 receiver shape the eight `ThreadPoolExecutor.execute` dispatch sites exist \
+                 to detect — and while one can exist, those sites cannot be deleted (L11)."
+            );
+        }
+
+        // Negative control: the drop is scoped to the pool factories by name.
+        // `callable`/`defaultThreadFactory`/`unconfigurable*` fabricate no
+        // executor and must be unaffected, or a future widening of the
+        // `matches!` arm would take them out silently.
+        for (name, descriptor) in [
+            (
+                "callable",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Callable;",
+            ),
+            (
+                "defaultThreadFactory",
+                "()Ljava/util/concurrent/ThreadFactory;",
+            ),
+            (
+                "unconfigurableExecutorService",
+                "(Ljava/util/concurrent/ExecutorService;)Ljava/util/concurrent/ExecutorService;",
+            ),
+        ] {
+            real.register(exec, name, descriptor, dummy_native);
+            assert!(
+                real.find(exec, name, descriptor).is_some(),
+                "the L10 drop must not reach Executors.{name}{descriptor} — it builds no \
+                 executor of its own"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // JDK-only mode (docs/feature-designs/jdk-only-mode.md §4), 2026-07-31
     // -----------------------------------------------------------------------
 
@@ -8043,12 +8236,23 @@ mod tests {
         assert_eq!(census[0].kind, NativeKind::SyntheticStub);
         assert_eq!(census[0].overwrote, None);
         assert_eq!(census[0].invocations, 0);
+        // ... and it owns no slot, which is the fact that makes the zero above
+        // mean "cannot be dispatched" rather than "was not dispatched yet".
+        // Adjudicating this row's kind decides nothing.
+        assert!(
+            !census[0].owns_slot,
+            "a superseded registration must not claim to own its slot"
+        );
 
         // Row 1: the current owner. `overwrote` is the history that was
         // previously unrecoverable — it is read before the in-place slot update.
         assert_eq!(census[1].kind, NativeKind::Bridge);
         assert_eq!(census[1].overwrote, Some(NativeKind::SyntheticStub));
         assert_eq!(census[1].invocations, 3);
+        assert!(
+            census[1].owns_slot,
+            "the surviving registration must own its slot"
+        );
 
         for row in &census {
             let site = row.registered_by.as_deref().expect("provenance recorded");
