@@ -1,22 +1,39 @@
 # Spring Boot loader/zip: the JIT-only failure cluster, root-caused
 
-**Status as of 2026-08-05 — three of the four things on this page are settled.**
+| | |
+|---|---|
+| **Status** | RETIRED from `docs/known-issues/springboot/` on 2026-08-06 |
 
 | # | item | status |
 |---|---|---|
-| 1 | the loader/zip header cluster (4 classes) | ✅ **CLOSED** — `4972cd9c91`, the mistyped `Unsafe` base offsets |
-| 2 | the same defect's **second door** | ✅ **FIXED 08-05** — `4ac429f2f`, `set_static_shared` seeded statics with a blanket `Value::Int(0)` |
-| 3 | `ZipContentTests` | ✅ **CLOSED — not a VM bug.** It is a **disk-capacity** failure; guarded in the oracle so it cannot be re-filed |
-| 4 | `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | ⚠️ **OPEN and NOT REPRODUCIBLE** — no fix, no attribution |
+| 1 | the loader/zip header cluster (4 classes) | **CLOSED** - `4972cd9c91`, the mistyped `Unsafe` base offsets |
+| 2 | the same defect's **second door** | **FIXED 08-05** - `4ac429f2f`, `set_static_shared` seeded statics with a blanket `Value::Int(0)` |
+| 3 | `ZipContentTests` | **CLOSED - not a VM bug.** A disk-capacity failure; guarded in the oracle so it cannot be re-filed |
+| 4 | `OriginTrackedYamlLoaderTests.canLoadFilesBiggerThan3Mb` | **MOVED OUT 08-06**, still open - see below |
 
-Read this before acting on item 4: it does not reproduce on **any** condition
-tried, including on the pre-fix binary it was filed against and with the suite's
-own invocation flags. The page is deliberately **not** retired — the failure was
-real when observed, and nothing here identifies a fix for it.
+## Why this page is retired with one item still open
 
-**The one thing worth doing when it next appears:** capture that run's full
-stderr, `CRATONVM_DBG=osr`, and the host's `df` and load *at that moment*. Every
-lever below asks a question about a failure that is currently absent.
+Item 4 was never part of this cluster's defect. It shared only the
+"`--nojit` passes" signature, which is what put it here; it is an OSR
+miscompile, not a mistyped `Unsafe` offset, and `4972cd9c91` does not touch it.
+Keeping it here made three fixed items read as unfinished and made the open one
+read as part of a solved cluster.
+
+It now has its own page, carrying its own evidence:
+[`known-issues/springboot/origintrackedyamlloader-osr-miscompile-20260806.md`](../../../known-issues/springboot/origintrackedyamlloader-osr-miscompile-20260806.md).
+
+**What 2026-08-06 added to it**, before the split: the mechanism it was
+attributed to - System V's smaller register pool forcing coalescing - is now
+controllable on any host (`CRATONVM_JIT_LOCAL_REGS`), and the OSR entry-seed
+invariants are now checkable (`CRATONVM_DBG_OSR_SEED_COLLISION`). The test
+passes at 7, 5, 4 and 3 local registers, and 1038 takeable OSR entries across
+234 methods show zero violations of either invariant. So a Windows green is no
+longer the vacuous result it used to be. Still no fix and no attribution - see
+that page for what that does and does not mean, and
+[`internal/fixed-suite-bugs/jit/osr-seed-invariants-instrumented-20260806.md`](../jit/osr-seed-invariants-instrumented-20260806.md)
+for the instruments.
+
+Everything below is the original page, unchanged, as the record of items 1-3.
 
 ## What it was
 

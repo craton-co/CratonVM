@@ -429,6 +429,20 @@ pub struct JvmThread {
     /// native (`Object.wait` / `Thread.join` / `LockSupport.park` /
     /// `ReferenceQueue.remove`). See [`GcBlockState`].
     pub gc_block_state: Arc<GcBlockState>,
+    /// This thread's own `ThreadEntry::jmx_locked_synchronizers` list, fetched
+    /// on the first AQS ownership transition this thread performs.
+    ///
+    /// `AbstractOwnableSynchronizer.setExclusiveOwnerThread` is intercepted so
+    /// `ThreadInfo.getLockedSynchronizers()` has something to report, and it
+    /// runs twice per uncontended `ReentrantLock.lock()`/`unlock()` pair. Going
+    /// through `ThreadRegistry::threads` to find this thread's own list put a
+    /// registry-wide `RwLock` read and a `ThreadId` hash on that path; the
+    /// handle removes both, exactly as [`GcBlockState`] above does for the
+    /// blocked-region protocol.
+    ///
+    /// `None` until first use, and left `None` for a thread the registry does
+    /// not know — which falls back to `set_jmx_owned_synchronizer`.
+    pub jmx_locked_synchronizers: Option<Arc<parking_lot::Mutex<Vec<ObjectRef>>>>,
 
     /// GC roots for `Value::Object` arguments popped from the operand stack into a
     /// Rust `Vec` while a registered native runs (`safe_native_call`). Those refs
@@ -734,6 +748,7 @@ impl JvmThread {
             rs_cache: Vec::new(),
             rs_cache_gen: 0,
             gc_block_state: Arc::new(GcBlockState::new()),
+            jmx_locked_synchronizers: None,
             native_pin_roots: Vec::new(),
             native_alloc_pool: Vec::new(),
             native_alloc_pool_layout: None,
