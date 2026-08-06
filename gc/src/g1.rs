@@ -441,12 +441,18 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
     ) -> Option<(*mut u8, bool)> {
-        let fwd_atomic = &*(std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr)
-            as *const AtomicUsize);
+        // Since the 32 -> 24 header shrink the forwarding slot IS the mark
+        // word, so this is a tagged CAS rather than a zero-vs-nonzero one: the
+        // unforwarded value is not 0 but "any word whose 2-bit state is not
+        // `MARK_FORWARDED`" (NEUTRAL, THIN_LOCKED or INFLATED). Comparing
+        // against 0 here would fail forever on any locked object and, worse,
+        // would install a forward over an INFLATED word's monitor pointer.
+        let mark_atomic = &(*(old_ptr as *const ObjectHeader)).mark_word;
 
         // Fast path: already forwarded this cycle.
-        let existing = fwd_atomic.load(Ordering::Acquire);
-        if existing != 0 {
+        let observed = mark_atomic.load(Ordering::Acquire);
+        if ObjectHeader::is_forwarded_mark(observed) {
+            let existing = ObjectHeader::forwarding_target(observed) as usize;
             // DEFECT-2 FIX (part 1 of 2): record the forward in THIS cycle's
             // forward set even though we didn't perform the copy, so it reaches
             // `pointer_map`. The serial path dedups via the per-cycle
@@ -499,9 +505,9 @@ impl<'a> SharedEvac<'a> {
                 // (a real new location, or another self-forward). `fresh` from the
                 // CAS keeps the object scanned exactly once.
                 let old = old_ptr as usize;
-                return match fwd_atomic.compare_exchange(
-                    0,
-                    old,
+                return match mark_atomic.compare_exchange(
+                    observed,
+                    ObjectHeader::make_forwarded(old),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
@@ -509,7 +515,16 @@ impl<'a> SharedEvac<'a> {
                         forwards.push((old, old));
                         Some((old_ptr, true))
                     }
-                    Err(winner) => Some((winner as *mut u8, false)),
+                    // A racing worker got there first. Its word is FORWARDED by
+                    // construction (nothing else writes this word during the
+                    // pause), but decode defensively: a non-forwarded loser
+                    // value would mean an unmodelled writer, and adopting its
+                    // payload as an address is exactly the INFLATED/FORWARDED
+                    // aliasing this encoding was audited against.
+                    Err(actual) if ObjectHeader::is_forwarded_mark(actual) => {
+                        Some((ObjectHeader::forwarding_target(actual), false))
+                    }
+                    Err(_) => None,
                 };
             }
         };
@@ -520,10 +535,12 @@ impl<'a> SharedEvac<'a> {
         // Atomic mark-word transfer (matches the serial T2-4 fix: the bulk
         // memcpy is UB for the AtomicU64 mark word).
         {
-            let old_h = old_ptr as *const ObjectHeader;
             let new_h = new_ptr as *mut ObjectHeader;
-            let mark = (*old_h).mark_word.load(Ordering::Relaxed);
-            (*new_h).mark_word.store(mark, Ordering::Relaxed);
+            // `observed`, NOT a fresh load: the mark word is the forwarding slot
+            // now, so re-reading it here could pick up a racing worker's
+            // FORWARDED value and stamp the destination as forwarded. The
+            // snapshot was taken before the copy and is known non-forwarded.
+            (*new_h).mark_word.store(observed, Ordering::Relaxed);
         }
 
         let new_header = &mut *(new_ptr as *mut ObjectHeader);
@@ -535,13 +552,17 @@ impl<'a> SharedEvac<'a> {
         } else {
             new_header.gc_age = new_header.gc_age.saturating_add(1);
         }
-        // Clear the NEW copy's forwarding slot (the memcpy may have copied a
-        // racing non-null value from the old header).
-        new_header.forwarding_ptr = std::ptr::null_mut();
+        // (No destination forwarding clear: the mark-word store above wrote
+        // the known non-forwarded snapshot over whatever the memcpy carried.)
 
         // Install the forward on the OLD (from-space) header. Winner copies; a
         // loser abandons its `new_ptr` and adopts the winner's address.
-        match fwd_atomic.compare_exchange(0, new_addr, Ordering::AcqRel, Ordering::Acquire) {
+        match mark_atomic.compare_exchange(
+            observed,
+            ObjectHeader::make_forwarded(new_addr),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => {
                 forwards.push((old_ptr as usize, new_addr));
                 *objs += 1;
@@ -3409,7 +3430,13 @@ impl G1Collector {
             // its header is intact and its region is held under the collection's
             // `regions` lock (Phase 5 has not run yet).
             unsafe {
-                (*(k as *mut ObjectHeader)).forwarding_ptr = std::ptr::null_mut();
+                // Retire the forward. These are from-space objects the cycle has
+                // abandoned, so NEUTRAL is the right resting state — there is no
+                // lock state left to preserve on a dead copy, and the live one
+                // carries the mark word this evacuation transferred to it.
+                (*(k as *const ObjectHeader))
+                    .mark_word
+                    .store(cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
             }
         }
 
@@ -4039,8 +4066,6 @@ impl G1Collector {
         } else {
             new_header.gc_age = new_header.gc_age.saturating_add(1);
         }
-        new_header.forwarding_ptr = std::ptr::null_mut();
-
         pointer_map.insert(old_addr, new_ptr as usize);
         *objects_copied += 1;
         *bytes_copied += obj_size;
@@ -12237,7 +12262,7 @@ mod tests {
         // THE FIX: the kept object's persistent forwarding_ptr is cleared, so it
         // does not look "already forwarded" to the next cycle.
         assert!(
-            gc.get_header(roots[0]).forwarding_ptr.is_null(),
+            !gc.get_header(roots[0]).is_forwarded(),
             "self-forwarded object's forwarding_ptr must be cleared after the cycle"
         );
 
@@ -12293,8 +12318,8 @@ mod tests {
         };
         assert_eq!(drained_child.as_ptr() as usize, child_addr);
         assert_eq!(gc.get_field(drained_child, 0).as_int(), Some(77));
-        assert!(gc.get_header(roots[0]).forwarding_ptr.is_null());
-        assert!(gc.get_header(drained_child).forwarding_ptr.is_null());
+        assert!(!gc.get_header(roots[0]).is_forwarded());
+        assert!(!gc.get_header(drained_child).is_forwarded());
     }
 
     #[test]
@@ -12334,13 +12359,13 @@ mod tests {
         gc.young_collection_parallel(&mut troots, &NoopMonitors); // promote -> Old
         let t_old = troots[0].as_ptr() as usize;
 
-        // O lives in young Eden; pre-install O.forwarding_ptr = T as if a worker
+        // O lives in young Eden; pre-install O's forward to T as if a worker
         // had already forwarded O to T this cycle (or a stale prior-cycle
         // redirect). Root O.
         let o = gc.alloc_object(ClassId::new(1), 0);
         let o_addr = o.as_ptr() as usize;
         unsafe {
-            (*(o.as_ptr() as *mut ObjectHeader)).forwarding_ptr = t_old as *mut u8;
+            (*(o.as_ptr() as *mut ObjectHeader)).set_forwarding_address(t_old as *mut u8);
         }
         let mut roots = vec![o];
         let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
@@ -12610,10 +12635,19 @@ mod tests {
         let mut cfg = small_config();
         cfg.region_size = 1024 * 1024;
         cfg.heap_size = 2 * 1024 * 1024; // exactly 2 regions
+        let heap_size = cfg.heap_size;
         let gc = G1Collector::new(cfg);
         // Fill ~1.1 MB across the 2 regions with a held chain → both regions
         // become Eden (CSet), leaving 0 Free regions for evacuation to-space.
-        let n = 24000usize;
+        // Sized from the layout, not restated: the premise is "fill both
+        // regions so evacuation has ZERO free to-space", and a literal object
+        // count silently stops meaning that when the header shrinks. At
+        // HEADER_SIZE = 32 the old literal 24000 filled ~1.15 MB of the 2 MB
+        // heap; at 24 the same count fits in ONE region, evacuation succeeds,
+        // and the test failed asserting a *successful* collection freed
+        // nothing. One field, no registered compact layout -> legacy SLOT_SIZE.
+        let obj_size = cratonvm_types::HEADER_SIZE + cratonvm_types::SLOT_SIZE;
+        let n = (heap_size * 55 / 100) / obj_size;
         let head = gc.alloc_object(ClassId::new(1), 1);
         let mut cur = head;
         for _ in 1..n {

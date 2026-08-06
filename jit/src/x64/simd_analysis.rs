@@ -2487,9 +2487,20 @@ pub mod vector_gate {
             (g, case)
         }
 
+        /// A 16-aligned base is NOT by itself enough to prove element-zero
+        /// alignment: the element sits at `base + HEADER_SIZE`, and the
+        /// 2026-08-06 shrink took `HEADER_SIZE` from 32 to 24 — so the header
+        /// stopped contributing a multiple of 16 and index 0 stopped being
+        /// provably 16-aligned. Start at the first index that IS, derived from
+        /// the header rather than restated, so this keeps exercising the
+        /// provable branch at whatever the header becomes next.
         fn strict_alignment_provable_loop() -> (Graph, Case) {
             let (g, mut case) = strict_alignment_unprovable_loop();
             case.base_alignment = 16;
+            let elem = elem_bytes(MemKind::Int) as i64;
+            let pad = (16 - (HEADER_SIZE as i64 % 16)) % 16;
+            assert_eq!(pad % elem, 0, "header padding must land on an element boundary");
+            case.counted = counted_loop((pad / elem) as i32, 1024);
             (g, case)
         }
 
@@ -3259,19 +3270,37 @@ pub mod vector_gate {
 
         #[test]
         fn element_zero_alignment_is_not_provable_at_the_current_object_alignment() {
-            // HEADER_SIZE is 32 and the TLAB grid is 8-byte aligned, so the
-            // *base* is the limit, not the header. This is what makes every
-            // x86 plan come back `Alignment::Unknown`.
-            assert_eq!(HEADER_SIZE % 16, 0);
+            // The *base* is the limit, not the header: the TLAB grid is
+            // 8-byte aligned and `PROVEN_OBJECT_ALIGNMENT` is 8, which is what
+            // makes every x86 plan come back `Alignment::Unknown` regardless of
+            // the header.
+            //
+            // Since the 2026-08-06 shrink the header no longer contributes a
+            // multiple of 16 either (24, not 32), so element ZERO is not
+            // 16-aligned even on a base the caller CAN prove 16-aligned. That
+            // costs nothing on x86 — `MOVDQU` is correct and the gate does not
+            // refuse — but a strict-alignment ISA would have to start at
+            // `HEADER_SIZE % 16` bytes in. Pin the fact rather than the old
+            // premise.
+            assert_eq!(HEADER_SIZE % 8, 0);
+            assert_eq!(
+                analyze_alignment(MemKind::Int, Some(0), 16, 16),
+                Alignment::Unknown,
+                "element zero cannot be 16-aligned while HEADER_SIZE % 16 != 0"
+            );
             assert_eq!(
                 analyze_alignment(MemKind::Int, Some(0), PROVEN_OBJECT_ALIGNMENT, 16),
                 Alignment::Unknown
             );
+            // ...and the first index that IS 16-aligned on a 16-aligned base
+            // is `HEADER_SIZE % 16` bytes in, not index 0.
+            let pad = ((16 - (HEADER_SIZE as i64 % 16)) % 16) / 4;
             assert_eq!(
-                analyze_alignment(MemKind::Int, Some(0), 16, 16),
+                analyze_alignment(MemKind::Int, Some(pad), 16, 16),
                 Alignment::Proven(16)
             );
-            // Element 1 of an int[] sits at byte 36 — never 16-aligned.
+            // The next element along is never 16-aligned.
+            let _ = pad;
             assert_eq!(
                 analyze_alignment(MemKind::Int, Some(1), 64, 16),
                 Alignment::Unknown
