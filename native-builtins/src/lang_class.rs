@@ -4495,38 +4495,7 @@ fn set_accessible_impl(
     };
 
     // Only the `true` case needs the deep-reflection check.
-    if flag != 0 {
-        if let Err(msg) = check_class_loader_define_class_is_encapsulated(ctx, this) {
-            return Err(
-                cratonvm_types::error::RuntimeError::InaccessibleObjectException { message: msg }
-                    .into(),
-            );
-        }
-        // Field 0 on Field/Method/Constructor is the declaring-class mirror.
-        let declaring_mirror = match ctx.get_field(this, 0) {
-            Value::Object(Some(m)) => Some(m),
-            _ => None,
-        };
-        let target_class_name = declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
-
-        if let Some(target_class_name) = target_class_name {
-            // JEP 403: setAccessible(true) is where the check is paid,
-            // so we pass accessible_override=false even though the caller
-            // is trying to *become* accessible.
-            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: format!(
-                            "Unable to make {member_label} accessible: {msg} \
-                         (use --add-opens to grant access)"
-                        ),
-                    }
-                    .into(),
-                );
-            }
-        }
-    }
-
+    enforce_set_accessible_gate(ctx, this, flag, member_label)?;
     ctx.set_field(this, flag_field_index, Value::Int(flag));
     Ok(None)
 }
@@ -4648,6 +4617,240 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
     )
 }
 
+/// Access flags consulted by the `setAccessible` gate. The JDK's
+/// `AccessibleObject.checkCanSetAccessible` reads the *member's* modifiers and
+/// the *declaring class's* modifiers, not only the module edge.
+const SA_ACC_PUBLIC: i32 = 0x0001;
+const SA_ACC_STATIC: i32 = 0x0008;
+const SA_ACC_PROTECTED: i32 = 0x0004;
+
+/// Read the declaring-class mirror off a `Field`/`Method`/`Constructor`.
+///
+/// By name first: the real-JDK `Method` layout starts with
+/// `AccessibleObject.override`, so slot 0 holds the mirror only in the
+/// synthetic layout. Slot 0 is the fallback for objects built with positional
+/// slots and no named fields.
+fn set_accessible_declaring_mirror(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    if let Value::Object(Some(m)) = ctx.get_field_by_name(this, "clazz") {
+        return Some(m);
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// The carve-out JDK 17+ keeps for *exported* (as opposed to *opened*)
+/// packages.
+///
+/// `AccessibleObject.checkCanSetAccessible` does not stop at `opens`. Once that
+/// test fails it asks a second question:
+///
+/// ```text
+/// if (declaringClass is public && declaringModule.isExported(pkg, callerModule)) {
+///     if (member is public)                        return;   // allowed
+///     if (member is protected && member is static) return;   // allowed
+/// }
+/// ```
+///
+/// So `setAccessible(true)` on `java.lang.String.length()` succeeds on HotSpot
+/// with no `--add-opens`, while the same call on the private field
+/// `java.lang.String.hash` throws. A gate that consults only `opens` gets the
+/// first of those wrong, and it is by far the more common call - which is why
+/// this is a step of its own rather than a footnote.
+///
+/// Returns `true` only where the JDK would allow the access. Every unreadable
+/// input (no modifiers slot, unresolvable declaring class) answers `false`, so
+/// the caller's refusal stands.
+fn set_accessible_export_carve_out(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    target_cid: ClassId,
+) -> bool {
+    let member_mods = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => return false,
+    };
+    let member_ok = (member_mods & SA_ACC_PUBLIC) != 0
+        || ((member_mods & SA_ACC_PROTECTED) != 0 && (member_mods & SA_ACC_STATIC) != 0);
+    if !member_ok {
+        return false;
+    }
+    if (i32::from(ctx.class_access_flags(target_cid)) & SA_ACC_PUBLIC) == 0 {
+        return false;
+    }
+    // No resolvable caller frame means the VM itself is driving the reflection.
+    // `check_reflection_module_access` allows that case outright, so reaching
+    // here without a caller would be a contradiction; answer permissively to
+    // keep the two in agreement rather than inventing a third policy.
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return true;
+    };
+    ctx.reflective_export_to_accessor(accessor_cid, target_cid)
+}
+
+/// The one JEP 403 gate every `setAccessible(true)` native goes through.
+///
+/// Before 2026-08-06 there were two. The typed natives below carried the module
+/// check; `native_set_accessible_write_override` carried none, and because it
+/// is registered LATER in `register_essential_natives_with_shims` (the registry
+/// is last-writer-wins) it was the one real-JDK mode actually ran. Every
+/// `setAccessible(true)` into `java.base` therefore succeeded, where HotSpot 25
+/// throws `InaccessibleObjectException` - `probes/ThreadGroupLayoutProbe.java`,
+/// the `ref *` lines, is the measurement. Routing all of them here is what
+/// keeps a future duplicate registration from silently re-opening the hole.
+///
+/// `flag == false` is never checked: clearing the override cannot fail.
+pub(crate) fn enforce_set_accessible_gate(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    flag: i32,
+    member_label: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if flag == 0 {
+        return Ok(());
+    }
+    if let Err(msg) = check_class_loader_define_class_is_encapsulated(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::InaccessibleObjectException { message: msg }
+                .into(),
+        );
+    }
+    let Some(mirror) = set_accessible_declaring_mirror(ctx, this) else {
+        return Ok(());
+    };
+    let Some(target_class_name) = mirror_class_name(ctx, mirror) else {
+        return Ok(());
+    };
+    // Carry the mirror's own ClassId, never just its binary name. Two child
+    // loaders may define the same name, and the name lookup then fails and
+    // hits the fail-closed "cannot resolve target class" arm — which turns a
+    // legitimate same-loader `setAccessible` into a spurious refusal
+    // (`regression-suite/src/RFieldSiteCache.java`, `twoLoadersOneName`).
+    let target_cid = mirror_class_id(ctx, mirror);
+    // JEP 403: setAccessible(true) is where the check is paid, so
+    // `accessible_override` is false even though the caller is trying to
+    // *become* accessible.
+    let Err(msg) = check_reflection_module_access_with_target_id(
+        ctx,
+        &target_class_name,
+        target_cid,
+        false,
+    ) else {
+        return Ok(());
+    };
+    if target_cid.is_some_and(|cid| set_accessible_export_carve_out(ctx, this, cid)) {
+        return Ok(());
+    }
+    Err(
+        cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+            message: format!(
+                "Unable to make {member_label} accessible: {msg} \
+                 (use --add-opens to grant access)"
+            ),
+        }
+        .into(),
+    )
+}
+
+const SA_ACC_PRIVATE: i32 = 0x0002;
+
+/// Is the `setAccessible` override already granted on this reflective object?
+///
+/// The JDK-inherited `override` field first — that is what real-JDK bytecode
+/// and our own natives write — then the CratonVM extra slot, because a
+/// `Field`/`Method`/`Constructor` built with positional slots has no named
+/// `override` at all.
+///
+/// The extra-slot fallback dispatches on the receiver's actual class instead of
+/// trying all three readers in turn. Each reader derives its slot index from
+/// its own layout (`method_extra_base` and friends), so asking the Method
+/// reader about a Field object reads whatever Field slot happens to sit at that
+/// offset — a false positive that would silently re-grant the access this gate
+/// exists to refuse. All three classes are `final`, so the name is exact.
+pub(crate) fn accessible_override_is_set(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    if let Value::Int(v) = ctx.get_field_by_name(obj, "override") {
+        if v != 0 {
+            return true;
+        }
+    }
+    match ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+    {
+        Some("java/lang/reflect/Field") => read_field_accessible(ctx, obj),
+        Some("java/lang/reflect/Method") => read_method_accessible(ctx, obj),
+        Some("java/lang/reflect/Constructor") => read_constructor_accessible(ctx, obj),
+        _ => false,
+    }
+}
+
+/// Runtime package of a class, or `None` when the name cannot be read.
+fn package_of_class_id(ctx: &dyn NativeContext, cid: ClassId) -> Option<String> {
+    let name = ctx.class_name_of_id(cid)?;
+    Some(match name.rfind('/') {
+        Some(i) => name[..i].to_string(),
+        None => String::new(),
+    })
+}
+
+/// Would the current caller reach a member with these `modifiers`, declared by
+/// `declaring_id`, WITHOUT a `setAccessible(true)` override?
+///
+/// This is `Reflection.verifyMemberAccess` composed with
+/// `Reflection.verifyModuleAccess` — the pair `AccessibleObject.canAccess`
+/// falls back on once `isAccessible()` is false. The module half comes first
+/// because it is the half that is not expressible in Java modifiers: a public
+/// method of a public class in a package its module does not export
+/// (`jdk.internal.misc.Unsafe.getUnsafe`) is unreachable however public it
+/// looks.
+///
+/// No resolvable caller frame means the VM itself is asking; answer `true`,
+/// matching every other reflection gate here.
+pub(crate) fn verify_member_access(
+    ctx: &mut dyn NativeContext,
+    declaring_id: ClassId,
+    modifiers: i32,
+) -> bool {
+    let Some(caller_id) = resolve_caller_class_id(ctx) else {
+        return true;
+    };
+    if caller_id == declaring_id {
+        return true;
+    }
+    // Module half. `reflective_export_to_accessor` is the `exports` edge;
+    // `check_deep_reflection_access` additionally accepts `opens` and the
+    // same-module / unnamed-target cases, so either one passing is enough.
+    if !ctx.reflective_export_to_accessor(caller_id, declaring_id)
+        && ctx
+            .check_deep_reflection_access(caller_id, declaring_id)
+            .is_err()
+    {
+        return false;
+    }
+    // Modifier half (JLS 6.6.1).
+    if (modifiers & SA_ACC_PUBLIC) != 0 {
+        return (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
+    }
+    if (modifiers & SA_ACC_PRIVATE) != 0 {
+        return false;
+    }
+    let same_package = match (
+        package_of_class_id(ctx, caller_id),
+        package_of_class_id(ctx, declaring_id),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if same_package {
+        return true;
+    }
+    (modifiers & SA_ACC_PROTECTED) != 0 && ctx.is_subclass(caller_id, declaring_id)
+}
+
 /// Field.setAccessible(boolean) вЂ” writes the accessible flag.
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
@@ -4669,25 +4872,7 @@ pub(crate) fn native_field_set_accessible(
         _ => 0,
     };
 
-    if flag != 0 {
-        let target_class_name = match ctx.get_field_by_name(this, "clazz") {
-            Value::Object(Some(m)) => mirror_class_name(ctx, m),
-            _ => None,
-        };
-        if let Some(target_class_name) = target_class_name {
-            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: format!(
-                            "Unable to make field accessible: {msg} \
-                         (use --add-opens to grant access)"
-                        ),
-                    }
-                    .into(),
-                );
-            }
-        }
-    }
+    enforce_set_accessible_gate(ctx, this, flag, "field")?;
 
     write_field_accessible(ctx, this, flag != 0);
     // Also mirror to the JDK `override` inherited field so Java-side code
@@ -4744,26 +4929,7 @@ fn set_method_like_accessible_impl(
         _ => 0,
     };
 
-    if flag != 0 {
-        let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
-            Value::Object(Some(m)) => Some(m),
-            _ => None,
-        };
-        let target_class_name = declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
-        if let Some(target_class_name) = target_class_name {
-            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: format!(
-                            "Unable to make {member_label} accessible: {msg} \
-                         (use --add-opens to grant access)"
-                        ),
-                    }
-                    .into(),
-                );
-            }
-        }
-    }
+    enforce_set_accessible_gate(ctx, this, flag, member_label)?;
 
     write_flag(ctx, this, flag != 0);
     // Mirror the JDK inherited `override` field as well (JEP 403).
