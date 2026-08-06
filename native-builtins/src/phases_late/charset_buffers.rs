@@ -723,6 +723,28 @@ pub(crate) const CB_FIELD_MARK: usize = 4;
 /// — observed on icu4j-68.2 / icu4j-70.1 going through
 /// `CharBuffer.subSequence(...).toString()` in `ICUResourceBundleReader.
 /// getStringV2`.
+/// Is this a bare synthetic CharBuffer — five slots and none of the real
+/// `java.nio.Buffer` field metadata — rather than a real-JDK-shaped one?
+///
+/// The indexed `CB_FIELD_*` writes are only meaningful on the former. On the
+/// latter the same indices alias real fields (`mark`@0, `address`@4) that the
+/// by-name writes already set correctly. Mirrors
+/// `servlet.rs::s2_bb_synthetic_layout`, which guards the ByteBuffer side of
+/// the identical hazard.
+fn cb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    // Slot count, exactly as `s2_bb_synthetic_layout` decides it for
+    // ByteBuffer: the bare synthetic carrier is five slots
+    // (array/pos/limit/capacity/mark), and `alloc_concurrent_synthetic`
+    // widens the allocation to the real field count — strictly more than
+    // five — whenever the real class is loaded.
+    ctx.object_num_fields(buf) == CB_SYNTHETIC_FIELD_COUNT
+}
+
+/// The bare synthetic CharBuffer carrier's slot count — the `5` every
+/// `alloc_concurrent_synthetic(_, "java/nio/*CharBuffer", 5)` call site here
+/// passes, named so [`cb_synthetic_layout`] and those sites cannot drift apart.
+pub(crate) const CB_SYNTHETIC_FIELD_COUNT: usize = 5;
+
 pub(crate) fn cb_write_hb(
     ctx: &mut dyn NativeContext,
     buf: ObjectRef,
@@ -739,12 +761,34 @@ pub(crate) fn cb_write_hb(
     ctx.set_field_by_name(buf, "limit", Value::Int(len_chars));
     ctx.set_field_by_name(buf, "capacity", Value::Int(len_chars));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-    // Synthetic-mode indexed fallback (older callers).
-    ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
-    ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
-    ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len_chars));
-    ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len_chars));
-    ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+    // Synthetic-mode indexed fallback — ONLY for the bare synthetic layout,
+    // exactly as `servlet.rs::bb_write_hb` already guards the ByteBuffer side.
+    //
+    // The two layouts alias. On a real-JDK `java/nio/CharBuffer` the
+    // hierarchy-wide field order is Buffer's `mark`(0) `position`(1)
+    // `limit`(2) `capacity`(3) `address`(4), then CharBuffer's
+    // `hb`/`offset`/`isReadOnly` — so of the five indexed slots only 1/2/3
+    // mean the same thing in both. `CB_FIELD_ARRAY`(0) lands on **`mark`** and
+    // `CB_FIELD_MARK`(4) lands on **`address`**.
+    //
+    // Redoing them unconditionally clobbered both. `address` was noticed and
+    // is re-asserted below; `mark` was not, so a real-layout CharBuffer
+    // carried the backing `char[]`'s reference — a large positive number — in
+    // its `mark`. Nothing read it until `Buffer.<init>` began validating
+    // `mark > position`, at which point `CharBuffer.allocate(12).duplicate()`
+    // threw `IllegalArgumentException: mark > position: (52784352 > 0)`:
+    // `duplicate()` passes `markValue()` straight into the constructor.
+    //
+    // Re-asserting the one aliased field somebody remembered is what left the
+    // other corrupt. Not writing them at all on a real layout cannot rot the
+    // same way.
+    if cb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
+        ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len_chars));
+        ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len_chars));
+        ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+    }
     // `java.nio.Buffer.address` (long), and it MUST be written last, by name:
     // the indexed CB_FIELD_* writes above can alias the real `address` slot,
     // and CB_FIELD_MARK's -1 is exactly what used to land in it.
@@ -957,7 +1001,19 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 16,
         };
-        let buf = p62_alloc_char_buffer(ctx, cap.max(0) as usize);
+        // `CharBuffer.allocate` opens with
+        // `if (capacity < 0) throw createCapacityException(capacity)`.
+        // Clamping to 0 instead handed back an empty buffer and reported
+        // success, so a negative capacity — an arithmetic slip upstream —
+        // surfaced later as an unexplained `BufferOverflowException`, or not
+        // at all.
+        if cap < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("capacity < 0: ({cap} < 0)"),
+            }
+            .into());
+        }
+        let buf = p62_alloc_char_buffer(ctx, cap as usize);
         Ok(Some(Value::Object(Some(buf))))
     });
     // `CharBuffer.wrap(char[])` and `CharBuffer.wrap(CharSequence)` are
@@ -1373,11 +1429,15 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             // buffer that had been allocated at exactly its own length.
             ctx.set_field_by_name(buf, "capacity", Value::Int(cur_cap));
             ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-            ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
-            ctx.set_field(buf, CB_FIELD_POS, Value::Int(new_pos));
-            ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
-            ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(cur_cap));
-            ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+            // Guarded for the same reason as `cb_write_hb`: on a real layout
+            // slot 0 is `mark` and slot 4 is `address`.
+            if cb_synthetic_layout(ctx, buf) {
+                ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
+                ctx.set_field(buf, CB_FIELD_POS, Value::Int(new_pos));
+                ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
+                ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(cur_cap));
+                ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+            }
             cb_write_heap_address(ctx, buf, cur_off);
             Ok(Some(Value::Object(Some(buf))))
         },
@@ -1665,4 +1725,72 @@ pub(crate) fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> 
     ctx.unpin_native_roots(arr_pin);
     cb_write_hb(ctx, buf, arr, cap as i32);
     buf
+}
+
+#[cfg(test)]
+mod cb_layout_tests {
+    use super::*;
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+    use cratonvm_types::ClassId;
+
+    /// On a real-JDK-shaped CharBuffer the indexed `CB_FIELD_*` writes must
+    /// not happen at all: slot 0 is `mark` and slot 4 is `address`.
+    ///
+    /// The `mark` half is what `Buffer.<init>`'s `mark > position` check
+    /// caught. Before the guard, `cb_write_hb` left the backing `char[]`'s
+    /// reference sitting in `mark`, and `CharBuffer.allocate(12).duplicate()`
+    /// — which passes `markValue()` straight into the constructor — threw
+    /// `IllegalArgumentException: mark > position: (52784352 > 0)`.
+    ///
+    /// Mirrors `servlet.rs::bb_write_hb_real_layout_preserves_address_and_mark`,
+    /// which pins the identical hazard on the ByteBuffer side.
+    #[test]
+    fn cb_write_hb_real_layout_preserves_address_and_mark() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/CharBuffer")
+            .expect("class init");
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, 12);
+        let buf = ctx.alloc_object(class_id, 10);
+
+        cb_write_hb(&mut ctx, buf, arr, 12);
+
+        // Slot 0 is the real `mark`. The indexed fallback would put the
+        // backing `char[]`'s reference there — the exact corruption
+        // `Buffer.<init>`'s `mark > position` check surfaced. Assert on the
+        // SLOTS rather than the names: this is what the guard controls, and
+        // it is observable without the field-name metadata a mock context
+        // does not carry for this class.
+        assert_ne!(
+            ctx.get_field(buf, CB_FIELD_ARRAY),
+            Value::Object(Some(arr)),
+            "slot 0 is the real Buffer.mark — the indexed fallback must be suppressed here"
+        );
+        // Slot 4 is the real `address`; the indexed fallback would put -1
+        // there, which is the defect `cb_write_heap_address` exists to undo.
+        assert_ne!(
+            ctx.get_field(buf, CB_FIELD_MARK),
+            Value::Int(-1),
+            "slot 4 is the real Buffer.address — the indexed fallback must be suppressed here"
+        );
+    }
+
+    /// A genuinely synthetic carrier has no field-name metadata, so the
+    /// indexed fallback is the only way these natives round-trip state. Guard
+    /// against the fix above suppressing it for the case it exists to serve.
+    #[test]
+    fn cb_write_hb_pure_synthetic_layout_still_gets_indexed_fallback() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ClassId::new(9999); // never registered by name
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, 8);
+        let buf = ctx.alloc_object(class_id, 5);
+
+        cb_write_hb(&mut ctx, buf, arr, 8);
+
+        assert_eq!(ctx.get_field(buf, CB_FIELD_ARRAY), Value::Object(Some(arr)));
+        assert_eq!(ctx.get_field(buf, CB_FIELD_POS), Value::Int(0));
+        assert_eq!(ctx.get_field(buf, CB_FIELD_LIMIT), Value::Int(8));
+        assert_eq!(ctx.get_field(buf, CB_FIELD_CAPACITY), Value::Int(8));
+        assert_eq!(ctx.get_field(buf, CB_FIELD_MARK), Value::Int(-1));
+    }
 }

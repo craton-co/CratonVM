@@ -41530,6 +41530,30 @@ mod t2_6_crypto_acceptance_tests {
 // MemorySegment) initializes inherited private fields. Field-index writes are
 // unsafe here because CharBuffer subclasses add their own layout; use the
 // resolved names so duplicate()/asReadOnlyBuffer() preserve mark semantics.
+//
+// The constructor is not just four field writes: it VALIDATES, and several
+// callers depend on that rather than checking themselves. The JDK body is
+//
+//     if (cap < 0) throw createCapacityException(cap);
+//     this.capacity = cap; this.segment = segment;
+//     limit(lim);       // IllegalArgumentException if lim > cap or lim < 0
+//     position(pos);    // IllegalArgumentException if pos > limit or pos < 0
+//     if (mark >= 0) { if (mark > pos) throw ...; this.mark = mark; }
+//
+// and `CharBuffer.wrap(csq, start, end)`, `CharBuffer.wrap(char[], off, len)`
+// and `StringCharBuffer.subSequence` are all written as
+// `try { new ...(...) } catch (IllegalArgumentException x) { throw new
+// IndexOutOfBoundsException(); }` — the range check IS the constructor's.
+// Writing the fields without checking them made
+// `CharBuffer.wrap("Hello, World").subSequence(3, 2)` return a buffer with
+// position 3 and limit 2, and `CharBuffer.wrap(new char[4], 3, 2)` a buffer
+// running two limbs past its own array, where HotSpot throws.
+//
+// See `docs/known-issues/buffer-constructor-does-not-validate-position-and-limit.md`
+// (retired) — and note that the validation is NOT missing from
+// `Buffer.limit(int)`/`position(int)` themselves, which are correct and do
+// fire for every direct caller. It was missing only here, because this native
+// stands in front of the constructor that would have called them.
 fn register_real_buffer_constructor_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/nio/Buffer",
@@ -41542,6 +41566,33 @@ fn register_real_buffer_constructor_natives(registry: &mut NativeMethodRegistry)
             let limit = args.get(3).and_then(Value::as_int).unwrap_or(0);
             let capacity = args.get(4).and_then(Value::as_int).unwrap_or(0);
             let segment = args.get(5).copied().unwrap_or(Value::Object(None));
+            // Messages are `createCapacityException` / `createLimitException` /
+            // `createPositionException` verbatim: callers that convert this to
+            // an `IndexOutOfBoundsException` discard them, but anything that
+            // lets the `IllegalArgumentException` out shows them to the user.
+            let bad = |message: String| -> cratonvm_types::error::MethodCallFailed {
+                cratonvm_types::error::RuntimeError::IllegalArgumentException { message }.into()
+            };
+            if capacity < 0 {
+                return Err(bad(format!("capacity < 0: ({capacity} < 0)")));
+            }
+            if limit > capacity {
+                return Err(bad(format!(
+                    "newLimit > capacity: ({limit} > {capacity})"
+                )));
+            }
+            if limit < 0 {
+                return Err(bad(format!("newLimit < 0: ({limit} < 0)")));
+            }
+            if position > limit {
+                return Err(bad(format!("newPosition > limit: ({position} > {limit})")));
+            }
+            if position < 0 {
+                return Err(bad(format!("newPosition < 0: ({position} < 0)")));
+            }
+            if mark >= 0 && mark > position {
+                return Err(bad(format!("mark > position: ({mark} > {position})")));
+            }
             ctx.set_field_by_name(this, "mark", Value::Int(mark));
             ctx.set_field_by_name(this, "position", Value::Int(position));
             ctx.set_field_by_name(this, "limit", Value::Int(limit));
