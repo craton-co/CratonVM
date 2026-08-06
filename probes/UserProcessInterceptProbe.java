@@ -205,17 +205,38 @@ public class UserProcessInterceptProbe {
                 + safe(() -> String.valueOf(cp.toHandle() == null)));
         System.out.println("concrete.destroyForciblySelf="
                 + safe(() -> String.valueOf(cp.destroyForcibly() == cp)));
+
+        // Snapshot the counters HERE, before `onExit`.
+        //
+        // `Process.onExit()`'s default is
+        // `CompletableFuture.supplyAsync(this::waitForInternal)` — it calls the
+        // subclass on a POOL thread, so whether it has bumped `exitValues` by
+        // the time this method prints is a race with no bound. Observed once on
+        // real HotSpot as `2` against `1` on eleven other runs across both VMs,
+        // which is exactly rare enough to be misread as a regression in an
+        // unrelated change. The rungs above are all synchronous.
+        int cExit = plain.exitValues;
+        int cWait = plain.waitFors;
+        int cDestroy = plain.destroys;
+
         System.out.println("concrete.onExitNull="
                 + safe(() -> String.valueOf(cp.onExit() == null)));
-        // After the calls above, a correct run has reached the subclass's own
-        // abstract-method overrides, because that is what the bytecode is made
-        // of. Zeroes here mean a native answered without asking.
-        System.out.println("concrete.count.exitValue=" + plain.exitValues);
-        System.out.println("concrete.count.waitFor=" + plain.waitFors);
-        System.out.println("concrete.count.destroy=" + plain.destroys);
+
+        // After the synchronous calls above, a correct run has reached the
+        // subclass's own abstract-method overrides, because that is what the
+        // bytecode is made of. Zeroes here mean a native answered without
+        // asking.
+        System.out.println("concrete.count.exitValue=" + cExit);
+        System.out.println("concrete.count.waitFor=" + cWait);
+        System.out.println("concrete.count.destroy=" + cDestroy);
 
         // The counters are the actual assertion: every call above must have
         // landed in this class.
+        //
+        // ORDERING REQUIREMENT: every rung above this point is synchronous. Do
+        // not append a rung that schedules work on another thread (`onExit`,
+        // anything building a `CompletableFuture`) before these prints — see the
+        // snapshot in the concrete section for what that costs.
         System.out.println("count.waitFor=" + lp.waitFors);
         System.out.println("count.exitValue=" + lp.exitValues);
         System.out.println("count.destroy=" + lp.destroys);

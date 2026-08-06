@@ -1,8 +1,81 @@
 # `java.lang.Process`'s CONCRETE natives answer for a user subclass, from the wrong object's fields
 
-**Status:** OPEN — measured, with a committed repro. Found 2026-08-06 while
-closing the L5 residuals; it is a **behaviour** defect, not a classification
-question, and it is the one the L5 record filed in its harmless column.
+**Status:** FIXED 2026-08-06 — `native-io/src/process.rs`, verified
+byte-identical to HotSpot 25 by `probes/UserProcessInterceptProbe.java`. Found
+the same day while closing the L5 residuals; it was a **behaviour** defect, not a
+classification question, and it is the one the L5 record filed in its harmless
+column.
+
+## The fix
+
+Each of the five concrete natives now asks `is_vm_process(ctx, this)` — is the
+receiver's class `cratonvm/synthetic/Process`? — before trusting the
+`PROC_FIELD_*` slots, and for any other receiver does what
+`java.lang.Process`'s own bytecode does:
+
+| native | what a foreign receiver now gets |
+|---|---|
+| `isAlive()` | `try { exitValue(); return false; } catch (ITSE) { return true; }` |
+| `pid()` | `return toHandle().pid();` — so the UOE propagates, and a subclass that overrides `toHandle` is honoured |
+| `toHandle()` | `UnsupportedOperationException`, the abstract class's own default |
+| `destroyForcibly()` | `destroy(); return this;` — reaching the subclass's override |
+| `waitFor(long, TimeUnit)` | polls `exitValue()` to the deadline; a zero/negative timeout is a single test |
+
+**`handle == 0` was not usable as the test**, which is why the bug existed: it
+cannot separate "my object, not spawned or already reaped" from "not my object at
+all", and those need opposite answers. The class-name check can.
+
+### The GC-safety bug in the first cut, and the test that caught it
+
+The first version got the Java semantics right and the VM semantics wrong. A
+foreign `waitFor(long, TimeUnit)` polls the subclass's own `exitValue()`, so it
+can run for the caller's full timeout with no subprocess handle in sight — and
+the thread is in `NativeRunning` throughout, which the STW census **waits for**.
+Sleeping between polls outside a blocked region therefore made
+`waitFor(30, SECONDS)` a thirty-second GC pause.
+`process_wait_for_timeout_enters_gc_blocked_region_between_polls` failed on it.
+No behavioural probe could have: HotSpot and CratonVM agree on every printed
+value either way.
+
+The fix is the idiom the VM-receiver loop twenty lines below already used: wrap
+**only** the sleep, re-read `this` afterwards (a moving collection during the
+block relocates it), and keep `exitValue()` strictly outside — it runs arbitrary
+application bytecode, which can allocate, take monitors and re-enter the VM,
+none of which is legal while the thread is counted as blocked.
+
+That test also had to be repaired rather than merely satisfied. Its
+`mock_process` receiver had no class name, so the guard silently re-aimed it at
+the foreign path; once the sleep was fixed it would have gone green again while
+asserting the wrong path's property. The mock now carries
+`SYNTHETIC_PROCESS_CLASS`, and `foreign_receiver_timed_wait_also_enters_a_blocked_region`
+covers the other receiver, so the blocked-region property is asserted on **both**
+rather than migrating between them.
+
+### Verification
+
+* `probes/UserProcessInterceptProbe.java`: **byte-identical** to HotSpot 25 on
+  all 24 lines, call counters and both `VERDICT` lines included.
+  `stillRunning.VERDICT` reads `bytecode-polled-the-subclass`.
+* A real spawned subprocess still works under `--real-jdk` **and**
+  `--jdk-only` (`probes/SubprocessKindProbe.java`): correct stdout, exit code
+  and `isAlive` afterwards. This is the WildFly path the guard sits on.
+* `cargo test --release -p cratonvm-native-io --lib`: **403 passed, 0 failed**.
+
+### What this does NOT fix
+
+The receiver it protects is still not a `java.lang.Process` subtype by its own
+reflective account — `isAssignableFrom` says yes while the `getSuperclass()`
+chain omits `Process`. That is the separate defect in
+[`synthetic-process-cluster-and-the-supertype-lie.md`](synthetic-process-cluster-and-the-supertype-lie.md),
+and it is the reason this guard has to exist at all: an object that really
+extended `java.lang.Process` would inherit these concrete methods and need no
+native standing in for them.
+
+---
+
+## The original report
+
+**Status:** was OPEN — measured, with a committed repro.
 
 `register_process_natives` registers all of `java.lang.Process`'s methods —
 abstract and concrete alike — under both `java/lang/Process` and
@@ -93,7 +166,7 @@ Two `VERDICT=` lines and the `concrete.*` block are the assertion.
 `stillRunning.VERDICT` reads
 `A-NATIVE-ANSWERED-WITHOUT-ASKING-THE-SUBCLASS` today.
 
-## What would close this
+## What closed it (the plan as written, for the record)
 
 The registration on `java/lang/Process` cannot simply be dropped: it is what
 makes the VM's own synthetic `Process` reachable through a
@@ -111,11 +184,10 @@ what `java.lang.Process`'s bytecode does, which for three of them is one line:
 * `isAlive()` / `waitFor(long, TimeUnit)` → poll `exitValue()` through
   `invoke_virtual`, treating `IllegalThreadStateException` as "not exited"
 
-Deliberately **not** done in the change that filed this: it is five natives on
-the subprocess path WildFly depends on, the guard wants applying to the whole
-registrar rather than to the methods this probe happened to cover, and a fix
-belongs with its own verification of the real-subprocess arm (which this probe
-does not exercise — it never spawns anything).
+That is what was done, with one correction to the plan: the real-subprocess arm
+**is** verified, by `SubprocessKindProbe` in both modes, because the guard
+changes which branch every one of these natives takes and "the probe never
+spawns anything" was a reason to add that check rather than to skip it.
 
 **The other receiver of these same registrations** is
 `cratonvm/synthetic/Process`, for which reading `PROC_FIELD_*` by fixed index is
