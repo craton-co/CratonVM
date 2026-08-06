@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-403 tokens.
+405 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -304,6 +304,8 @@ export inherited from a parent shell.
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
+| `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
 | `npe-trace` | `CRATONVM_DBG_NPE_TRACE` |
 | `nsee-trace` | `CRATONVM_NSEE_TRACE` |
@@ -469,7 +471,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-155 tokens.
+158 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -573,6 +575,7 @@ export inherited from a parent shell.
 | `range-scan-legacy` | `CRATONVM_JIT_RANGE_SCAN_LEGACY` |
 | `reassoc` | `CRATONVM_JIT_REASSOC` |
 | `retpc-validate` | `CRATONVM_JIT_NO_RETPC_VALIDATE` |
+| `native-site-cache` | `CRATONVM_JIT_NO_NATIVE_SITE_CACHE` |
 | `rootsnap-cache` | `CRATONVM_ROOTSNAP_CACHE` |
 | `rootsnap-cache-survive-gc` | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` |
 | `safepoint-polls` | `CRATONVM_JIT_SAFEPOINT_POLLS` |
@@ -583,6 +586,7 @@ export inherited from a parent shell.
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
+| `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
 | `field-site-slots` | `CRATONVM_JIT_FIELD_SITE_SLOTS` |
 | `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
@@ -628,6 +632,7 @@ export inherited from a parent shell.
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
+| `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 
 ## `CRATONVM_GC`
 
