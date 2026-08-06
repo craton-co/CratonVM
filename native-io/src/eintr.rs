@@ -184,15 +184,32 @@ fn no_retry() -> bool {
 /// injection on whichever socket operation happens to be in flight, the way a
 /// real signal does.
 fn injected_eintr() -> Option<io::Error> {
+    // Floor of 2. A period of 1 would inject on the retry as well, so a
+    // correctly-retrying caller would spin forever and the switch would look
+    // like a hang instead of like the defect.
     let period = match crate::io_flags().dbg_eintr_inject {
-        Some(period) if period > 0 => period,
-        _ => return None,
+        Some(period) => period.max(2),
+        None => return None,
     };
     static OPS: AtomicU64 = AtomicU64::new(0);
     if OPS.fetch_add(1, Ordering::Relaxed) % period != period - 1 {
         return None;
     }
-    Some(io::Error::from_raw_os_error(4))
+    // On unix, errno 4 renders as "Interrupted system call (os error 4)" — the
+    // exact text of the reported failure. Windows has no EINTR and would render
+    // error 4 as something unrelated, so spell the message out there instead;
+    // the point of the switch is that the two hosts produce the same evidence.
+    #[cfg(unix)]
+    {
+        Some(io::Error::from_raw_os_error(4))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Interrupted system call (os error 4)",
+        ))
+    }
 }
 
 #[cfg(test)]
