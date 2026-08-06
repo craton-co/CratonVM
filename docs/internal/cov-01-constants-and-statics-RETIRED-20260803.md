@@ -406,7 +406,7 @@ field 0.
 |---|---|---|
 | `putstatic` (`0xb3`) has no IR lowering — 1 measured event, deliberately out of scope (the SATB pre-barrier) | `ir.rs`, `ir_lower.rs` | nobody |
 | the "fails to rewrite" half of the root test is unreachable until `JIT_PUBLISHES_RELOCATION_CONTRACT` flips | `types/src/flags.rs` | nobody |
-| `cov-04`'s `invokespecial` refusal is now 71, double what the survey measured | [`cov-04`](../known-issues/c2/cov-04-the-invoke-arms.md) | `cov-04` |
+| `cov-04`'s `invokespecial` refusal is now 71, double what the survey measured | [`cov-04`](../feature-designs/c2/cov-04-the-invoke-arms.md) | `cov-04` |
 | a `new` with no `new_info` entry, 1 event, newly visible | `ir.rs:5256` | nobody |
 | guarded virtual inlining (`pgo-02`, default-off) no longer reaches a `getstatic; invokevirtual` method | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
 

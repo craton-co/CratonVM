@@ -520,16 +520,16 @@ pub(super) fn publish_entry_metadata(
                 }
                 let body_home = local_assignments.get(i).copied().flatten();
                 let seeded = osr_local_assignments.get(i).copied().flatten();
-                // `if let`, not `is_some()` + `.unwrap()` — same reason as the
-                // trace at the top of this file: a diagnostic that can panic is
-                // a diagnostic that turns an investigation into a crash, and
-                // this file is one of the strict-zero production-panic targets
-                // (`hot_files_have_no_production_panics`).
-                if let (Some(reg), None) = (body_home, seeded) {
-                    stripped_live += 1;
-                    eprintln!(
-                        "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{reg} in the body but the trampoline seeds no register for it"
-                    );
+                // `if let` rather than `is_some()` + `.unwrap()`: this file
+                // carries `deny(clippy::unwrap_used)` for production code, and
+                // a diagnostic is the last place worth a panic site.
+                if let Some(home) = body_home {
+                    if seeded.is_none() {
+                        stripped_live += 1;
+                        eprintln!(
+                            "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{home} in the body but the trampoline seeds no register for it"
+                        );
+                    }
                 }
             }
         }

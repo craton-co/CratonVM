@@ -3084,7 +3084,12 @@ mod concurrent_mark_controller_tests {
         // `validate_header_tags_or_desync`) reaching the forwarding word.
         unsafe {
             let header = &mut *(obj.as_ptr() as *mut ObjectHeader);
-            header.forwarding_ptr = 0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8;
+            // Raw bits: `set_forwarding_address` asserts a plausible target,
+            // and an implausible one is exactly what this test installs.
+            header.mark_word.store(
+                0xFFFF_FFFF_FFFF_FFF8u64 | cratonvm_types::MARK_FORWARDED,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         assert_eq!(
             heap.load_and_forward(obj).as_ptr(),

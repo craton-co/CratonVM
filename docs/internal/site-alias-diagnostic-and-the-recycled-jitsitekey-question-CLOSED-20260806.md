@@ -77,15 +77,36 @@ through them and no memo can be keyed on them. They are freed unobserved.
 pins it against `site_keyed_memo_census()`, the real list, so a memo added later
 is covered the moment it is declared.
 
-## What is argued but not pinned
+## Step 4 is now pinned too
 
-Step 4 — *publication always bumps* — is the load-bearing one, and it rests on a
-comment plus four call sites, not on a test. A guard that asserted "a
-`CompiledMethod` becoming reachable advances `jit_cache_generation()`" would
-close the last gap by construction, the way `site_keyed_memos!` closed step 2.
-It is not written here: the invariant holds today by inspection and the detector
-measures `recycled-key hits=0` on this corpus, so this is a hardening item, not
-a defect.
+It was the one part of the chain resting on a comment plus four hand-written
+`fetch_add` calls rather than on a test.
+`every_publication_advances_the_jit_cache_generation` (`jit/src/lib.rs`) closes
+it, over all three publication shapes:
+
+* **first-time insertion** — the one a replacement-only bump would miss, which is
+  why the bump site calls it out ("bump on EVERY publication, not just
+  replacements");
+* **replacement** — the case that actually frees the previous artifact's
+  `JitInvokeInfo` boxes, i.e. the one the whole argument is about;
+* **`put_osr`** — a separate entry point with its own bump.
+
+Two properties keep it honest. Each arm asserts the body is **reachable**
+afterwards, not merely that a counter moved: a `put` that declines (stale
+publication epoch, `prepare_for_publication` refusal) publishes nothing and
+correctly does not bump, so a counter-only test could pass while proving nothing
+about publication. And the comparison is strictly-greater rather than
+`== before + 1`, because `JIT_CACHE_GENERATION` is a process global and the test
+binary runs in parallel — `==` would be a flake, not a stronger assertion.
+
+**Verified as a negative control**, which is the difference between a guard and a
+decoration: deleting the `fetch_add` at the first-time publication site turns the
+test red on the first arm, with the message it was written to produce —
+
+```text
+a first-time publication did not advance the JIT cache generation; a recycled
+JitInvokeInfo address could then inherit the previous site's memoized dispatch
+```
 
 ## The reason this doc is not just deleted
 

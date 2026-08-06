@@ -1,0 +1,48 @@
+# check_override admissions baseline — schema 1
+#
+# JDK-ONLY-WAVE2 §11. THE UNIT IS ONE (class, method, descriptor) TRIPLE that
+# the ~302-disjunct check_override chain admitted, i.e. where the chain was
+# true AND a native was registered for the triple. Produced by
+# CRATONVM_DBG_CHECK_OVERRIDE=1 (see vm/src/vm/vm_exec.rs).
+#
+# Sources: all 53 regression-suite classes (--real-jdk and --jdk-only) plus
+# 16 org.h2.test classes (--real-jdk). 19 distinct classes, 27 triples.
+#
+# The last column is whether method.is_abstract() alone would have sufficed.
+# NAME means a name disjunct earned it — is_abstract did not. Every row here
+# is NAME, which is why the chain cannot simply be reduced to its one
+# contract-legal disjunct.
+#
+# THIS IS NOT A DELETION LIST. Absence from this file means no measured
+# workload reached it, not that it is dead: the list was built from Spring,
+# Tomcat, WildFly and H2 boots and only H2 is represented. Extend the file
+# before deleting anything.
+#
+# class\tmethod\tdescriptor\tadmitted_by
+java/io/File	getAbsolutePath	()Ljava/lang/String;	NAME
+java/io/File	getPath	()Ljava/lang/String;	NAME
+java/lang/Class	getEnumConstantsShared	()[Ljava/lang/Object;	NAME
+java/lang/Class	getName	()Ljava/lang/String;	NAME
+java/lang/StringBuilder	toString	()Ljava/lang/String;	NAME
+java/lang/Thread	run	()V	NAME
+java/lang/reflect/AccessibleObject	setAccessible	(Z)V	NAME
+java/lang/reflect/Constructor	newInstance	([Ljava/lang/Object;)Ljava/lang/Object;	NAME
+java/util/ArrayList	iterator	()Ljava/util/Iterator;	NAME
+java/util/ArrayList	toArray	()[Ljava/lang/Object;	NAME
+java/util/HashMap	<init>	()V	NAME
+java/util/HashMap	isEmpty	()Z	NAME
+java/util/HashMap	put	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	NAME
+java/util/HashSet	add	(Ljava/lang/Object;)Z	NAME
+java/util/Hashtable	<init>	()V	NAME
+java/util/Hashtable	put	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	NAME
+java/util/LinkedHashMap	<init>	()V	NAME
+java/util/TreeSet	iterator	()Ljava/util/Iterator;	NAME
+java/util/TreeSet	size	()I	NAME
+java/util/concurrent/ConcurrentHashMap	<init>	()V	NAME
+java/util/concurrent/ConcurrentHashMap	isEmpty	()Z	NAME
+java/util/concurrent/CountDownLatch	countDown	()V	NAME
+java/util/concurrent/ThreadPoolExecutor	execute	(Ljava/lang/Runnable;)V	NAME
+java/util/jar/Manifest	<init>	()V	NAME
+org/h2/expression/condition/Comparison	compare	(Lorg/h2/engine/SessionLocal;Lorg/h2/value/Value;Lorg/h2/value/Value;I)Lorg/h2/value/Value;	NAME
+org/h2/value/ValueBigint	get	(J)Lorg/h2/value/ValueBigint;	NAME
+sun/nio/ch/FileChannelImpl	open	(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;	NAME

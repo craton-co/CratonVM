@@ -4268,6 +4268,12 @@ fn run() -> Result<()> {
         );
     }
 
+    // JDK-ONLY-WAVE2 §8/§11 census dumps (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
+    // Both are no-ops without the flag; they exist to drive the per-family
+    // deletion exercise those two records describe but never measured.
+    cratonvm_vm::vm::dump_check_override_census();
+    cratonvm_vm::vm::dump_canonical_census();
+
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
     // (env-gated inside `dump_now` callers; `enabled()` re-checked here).
     if cratonvm_vm::jit::helpers::mic_prof::enabled() {

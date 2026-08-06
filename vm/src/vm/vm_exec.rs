@@ -204,6 +204,153 @@ fn reject_missing_implementation(
 
 /// Times concrete bytecode was preferred over a registered non-intrinsic
 /// native under `JdkOnly`. Exact; never saturates.
+/// Reach counters for the §11 census, so "the site never runs" is
+/// distinguishable from "it runs and never admits a native". Without this a
+/// zero census reads as "the exception list is dead" when it may only mean the
+/// probe never got there.
+static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record a `--jdk-only` refusal of the §8 interface substitution.
+///
+/// The substitution runs a DIFFERENT class's native against a receiver that is
+/// not an instance of it (`java/util/Iterator` -> `java/util/HashMap$KeyItr` is
+/// the sharpest case). Under strict mode that is a compatibility substitution
+/// §1 forbids, and it is silent, so it earns a violation row rather than a
+/// counter: a reader of `--jdk-only-report` should see which interface was
+/// asked for and that a substitution would have answered it.
+///
+/// A free-text `native_kind` tag, the same mechanism the JIT's
+/// `"jit-thin-direct-helper"` rows use, so the row names the shape of the
+/// decision instead of borrowing a `NativeKind` that does not describe it.
+///
+/// Deliberately does NOT bump `JDK_ONLY_NATIVE_SHADOW_ATTEMPTS`: that counter
+/// surfaces as `interpreter_bytecode_preferred`, and nothing was preferred here
+/// — the substitution was refused and the call falls through to ordinary
+/// resolution failure. Counting it there would inflate a "bytecode won"
+/// statistic with cases where nothing won.
+pub fn record_interface_substitution_refusal(
+    interface: &str,
+    canonical: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    let _ = canonical;
+    offer_native_shadow_observation(interface, method_name, descriptor, "interface-substitution");
+}
+
+/// JDK-ONLY-WAVE2 §8 census: which of the five hard-coded interface
+/// substitutions in `interpreter.rs` actually fires, and for what.
+fn canonical_census() -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>
+{
+    static C: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Record one interface->canonical-class substitution.
+pub fn record_canonical_substitution(interface: &str, canonical: &str, method_name: &str) {
+    if !check_override_census_on() {
+        return;
+    }
+    *canonical_census()
+        .lock()
+        .entry((
+            interface.to_string(),
+            canonical.to_string(),
+            method_name.to_string(),
+        ))
+        .or_insert(0) += 1;
+}
+
+/// Dump the §8 census as TSV on stderr.
+pub fn dump_canonical_census() {
+    if !check_override_census_on() {
+        return;
+    }
+    let c = canonical_census().lock();
+    eprintln!("[CANONICAL_CENSUS] rows={}", c.len());
+    for ((iface, canon, m), n) in c.iter() {
+        eprintln!("[CANONICAL] {}	{}	{}	{}", iface, canon, m, n);
+    }
+}
+
+/// JDK-ONLY-WAVE2 §11 census: which `check_override` disjuncts actually admit
+/// a native, keyed by the triple that reached the branch.
+///
+/// Off unless `CRATONVM_DBG_CHECK_OVERRIDE` is set, and then it is a `Mutex`
+/// around a map on a cold-ish path — this is a measurement instrument for the
+/// per-family deletion exercise, not something the fast path pays for.
+#[allow(clippy::type_complexity)]
+fn check_override_census(
+) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>> {
+    static C: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn check_override_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_CHECK_OVERRIDE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Record one `check_override`-admitted native. `abstract_only` marks the
+/// contract-§7-legal case so it can be subtracted from the name-list evidence.
+pub(crate) fn record_check_override_hit(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    is_abstract: bool,
+) {
+    if !check_override_census_on() {
+        return;
+    }
+    let mut c = check_override_census().lock();
+    let e = c
+        .entry((
+            class_name.to_string(),
+            method_name.to_string(),
+            descriptor.to_string(),
+        ))
+        .or_insert((0, true));
+    e.0 += 1;
+    // Sticky: if ANY hit for this triple was non-abstract, a name disjunct is
+    // doing real work for it.
+    e.1 &= is_abstract;
+}
+
+/// Dump the §11 census as TSV on stderr. Called from the VM shutdown path.
+pub fn dump_check_override_census() {
+    if !check_override_census_on() {
+        return;
+    }
+    let c = check_override_census().lock();
+    eprintln!(
+        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={}",
+        c.len(),
+        CHECK_OVERRIDE_REACHED.load(std::sync::atomic::Ordering::Relaxed),
+        CHECK_OVERRIDE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    for ((cls, m, d), (n, abstract_only)) in c.iter() {
+        eprintln!(
+            "[CHECK_OVERRIDE] {}	{}	{}	{}	{}",
+            cls,
+            m,
+            d,
+            n,
+            if *abstract_only { "abstract" } else { "NAME" }
+        );
+    }
+}
+
 static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -22482,6 +22629,14 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
+                    if check_override_census_on() {
+                        CHECK_OVERRIDE_REACHED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if check_override {
+                            CHECK_OVERRIDE_TRUE
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     if check_override
                         && shared
                             .natives
@@ -22489,6 +22644,27 @@ fn invoke_on_class_shared_inner(
                             .find(class_name, method_name, descriptor)
                             .is_some()
                     {
+                        // JDK-ONLY-WAVE2 §11 census (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
+                        //
+                        // The chain has ~302 disjuncts and the record calls
+                        // deleting them "a separate, per-family exercise; each
+                        // entry is load-bearing for a real boot today". That
+                        // second clause is an assumption nobody has measured:
+                        // a disjunct only does work when it ALSO finds a
+                        // registered native here, so the set that matters is
+                        // whatever this branch actually admits.
+                        //
+                        // `method.is_abstract()` is recorded separately because
+                        // it is the ONE disjunct that survives contract §7 (step
+                        // 3b — no `Code`, so the native is the only body there
+                        // is). A triple admitted only via `is_abstract` is not
+                        // evidence for any name entry.
+                        record_check_override_hit(
+                            class_name,
+                            method_name,
+                            descriptor,
+                            method.is_abstract(),
+                        );
                         native = true;
                     }
                     // C25: For abstract methods (e.g. Iterator.hasNext, Enumeration.hasMoreElements),

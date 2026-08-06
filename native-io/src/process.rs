@@ -74,6 +74,41 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
+// Java-visible spawn policy gate
+// ---------------------------------------------------------------------------
+
+/// A pre-spawn policy check, called with `command[0]` before any fork/exec.
+///
+/// Returning `Err` cancels the spawn and propagates the error verbatim to the
+/// Java caller, so a `SecurityException` stays a `SecurityException`.
+pub type SpawnPolicyHook = fn(&mut dyn NativeContext, &str) -> Result<(), MethodCallFailed>;
+
+/// Installed once at native-registration time by `native-builtins`, which owns
+/// `SecurityManager` and therefore cannot be called from here directly (it
+/// depends on this crate, not the reverse).
+///
+/// A `fn` pointer, not per-VM state: the hook is the same code in every VM in
+/// the process, and it resolves the *calling* VM's SecurityManager through the
+/// `NativeContext` it is handed. Nothing about a particular VM is latched.
+static SPAWN_POLICY_HOOK: OnceLock<SpawnPolicyHook> = OnceLock::new();
+
+/// Install the pre-spawn policy gate. Idempotent: the first hook wins, so
+/// calling this from more than one registration path is safe.
+pub fn set_spawn_policy_hook(hook: SpawnPolicyHook) {
+    let _ = SPAWN_POLICY_HOOK.set(hook);
+}
+
+/// Run the installed policy gate, if any. With no hook installed (a
+/// native-io-only build, or a unit test) this is a no-op, which matches the
+/// JDK: spawning is unrestricted until a SecurityManager is installed.
+fn run_spawn_policy(ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+    match SPAWN_POLICY_HOOK.get() {
+        Some(hook) => hook(ctx, program),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process-table (holds live std::process::Child handles)
 // ---------------------------------------------------------------------------
 
@@ -474,6 +509,25 @@ fn spawn_and_wrap_with_redirects(
         .into());
     }
 
+    // SECURITY: the Java-visible spawn gate (`SecurityManager.checkExec`),
+    // ahead of everything else so a denial cannot be observed as an
+    // `IOException` and so no fork/exec syscall is issued.
+    //
+    // It lives HERE, in the one function every spawn route funnels through
+    // (`ProcessBuilder.start`, `Runtime.exec`, `ProcessImpl.create`,
+    // `forkAndExec`), because it previously lived in only some of them:
+    // `native-builtins` gated `Runtime.exec` and its own now-shadowed
+    // `ProcessBuilder.start`, while THIS crate's `ProcessBuilder.start` -- the
+    // registration that actually wins at runtime -- had no gate at all. A
+    // deny-all `checkExec` policy therefore refused `Runtime.exec` and let
+    // `new ProcessBuilder(...).start()` fork the same child unchallenged
+    // (probes/ExecPolicyProbe.java, PB_CHILD_RAN=true).
+    //
+    // Called with `program` verbatim, before the Windows quote-strip below, so
+    // the SecurityManager sees exactly the `command[0]` the caller wrote --
+    // which is what HotSpot's `ProcessBuilder.start` passes to `checkExec`.
+    run_spawn_policy(ctx, program)?;
+
     // Windows launchers wrap a space-containing program path in double quotes
     // (e.g. WildFly's `StandaloneCommandBuilder` →
     // `"C:\Program Files\…\bin\java"`). The OS `CreateProcess` takes the program
@@ -650,6 +704,20 @@ fn spawn_and_wrap_with_redirects(
         },
     );
 
+    // `ensure_synthetic_class` gives `cratonvm/synthetic/Process` a real
+    // `java.lang.Process` superclass, but it resolves it with
+    // `get_loaded_class_id` — which answers only for a class that is ALREADY
+    // loaded. Load it here so the fabrication cannot silently fall back to
+    // `java/lang/Object` and reintroduce the supertype inconsistency
+    // (`isAssignableFrom` true while the `getSuperclass()` chain omits it).
+    //
+    // In practice the caller's own bytecode has already resolved
+    // `java.lang.Process` — it is `start()`'s return type — so this is
+    // ordinarily a no-op lookup. It is not free to rely on that: this native is
+    // also reached from paths that never named the type, and a mode without a
+    // real `java.lang.Process` at all must still get the old behaviour rather
+    // than an error, which is why the result is deliberately discarded.
+    let _ = ctx.load_class("java/lang/Process");
     // Allocate the synthetic Process under its own named class (see
     // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
     // ahead of them belong to java.lang.Process's own reader/writer caches and
@@ -996,6 +1064,62 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
     }
 }
 
+/// Is `this` one of the VM's own `Process` objects — the only receiver whose
+/// `PROC_FIELD_*` slots mean anything?
+///
+/// # Why every concrete `java.lang.Process` native has to ask
+///
+/// These natives are registered under **both** `cratonvm/synthetic/Process` and
+/// `java/lang/Process`. The second registration is what makes the VM's own
+/// process reachable through a `java.lang.Process`-typed reference — which is
+/// how every caller holds one (`Process p = pb.start()`) — and removing it once
+/// raised `NoSuchMethodError` on exactly that path.
+///
+/// It also puts these natives in front of every **application** subclass of
+/// `Process`. For the ABSTRACT methods that is harmless: a concrete subclass
+/// must override them, so dispatch finds the override and never walks up here.
+/// For the CONCRETE ones — `isAlive`, `pid`, `toHandle`, `destroyForcibly`,
+/// `waitFor(long, TimeUnit)` — a subclass normally does *not* override, so
+/// dispatch reaches this code with a receiver whose layout is nothing like
+/// `PROC_FIELD_COUNT` fields of subprocess bookkeeping. `handle_of` then reads
+/// slot `PROC_FIELD_HANDLE` off a stranger, gets `0`, and every one of them took
+/// that as "a stub Process" and answered from field bytes that belong to someone
+/// else. Measured against HotSpot 25 before this guard existed:
+/// `isAlive()` **false** for a live process, `pid()` **0** where the spec
+/// requires `UnsupportedOperationException`, `toHandle()` handing back a handle,
+/// and `waitFor(0, NANOSECONDS)` **true** for a process that had not exited.
+///
+/// Contract §1.4 says a `Bridge` loses to real bytecode. For a foreign receiver
+/// that is exactly what has to happen, so each caller below delegates to what
+/// `java.lang.Process`'s own bytecode does instead of guessing.
+///
+/// `handle == 0` is deliberately NOT the test. It cannot distinguish "my object,
+/// not spawned or already reaped" from "not my object at all", and those need
+/// opposite answers — the first is a stub Process the VM owns, the second is
+/// someone else's.
+///
+/// See `docs/known-issues/jdk-only/process-natives-answer-for-user-subclasses.md`
+/// and `probes/UserProcessInterceptProbe.java`.
+fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    ctx.class_name_of_id(cid).as_deref() == Some(SYNTHETIC_PROCESS_CLASS)
+}
+
+/// `java.lang.Process.exitValue()` on `this`, as the JDK's own concrete methods
+/// call it: `Ok(Some(code))` when the process has exited, `Ok(None)` when
+/// `exitValue` threw (which is how a `Process` reports "still running", via
+/// `IllegalThreadStateException`).
+///
+/// The thrown exception is consumed rather than propagated because every caller
+/// here is a method the JDK specifies as *not* throwing it — `isAlive` and
+/// `waitFor(long, TimeUnit)` both turn it into a boolean.
+fn foreign_exit_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    match ctx.invoke_virtual(this, "exitValue", "()I", &[]) {
+        Ok(Some(Value::Int(code))) => Some(code),
+        _ => None,
+    }
+}
+
 fn time_unit_to_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<ObjectRef>) -> i64 {
     if value <= 0 {
         return 0;
@@ -1303,6 +1427,51 @@ fn native_process_wait_for_timeout(
         _ => None,
     };
 
+    if !is_vm_process(ctx, this) {
+        // `Process.waitFor(long, TimeUnit)` is specified as a poll of
+        // `exitValue()`: exited -> true, still `IllegalThreadStateException` at
+        // the deadline -> false. A zero/negative timeout is a single test, which
+        // is the case that made the old code answer `true` for a process that
+        // had not exited.
+        if foreign_exit_value(ctx, this).is_some() {
+            return Ok(Some(Value::Int(1)));
+        }
+        let millis = time_unit_to_millis(ctx, timeout, unit);
+        if millis <= 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(millis as u64))
+        else {
+            return Ok(Some(Value::Int(0)));
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Some(Value::Int(0)));
+            }
+            // Only the SLEEP goes inside the blocked region. A collection that
+            // starts while this thread naps must not have to wait for the
+            // timeout to expire — the thread is in `NativeRunning`, which the
+            // STW census waits for, so an unblocked 30-second nap is a
+            // 30-second GC pause. `this` is re-read afterwards because a moving
+            // collection during the block relocates it.
+            //
+            // `foreign_exit_value` stays OUTSIDE: it runs arbitrary application
+            // bytecode, which can allocate, take monitors and re-enter the VM,
+            // none of which is legal while the thread is counted as blocked.
+            let remaining = deadline.saturating_duration_since(now);
+            let mut held = [Value::Object(Some(this))];
+            ctx.begin_blocking_region();
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            ctx.end_blocking_region_refs(&mut held);
+            if let Value::Object(Some(updated)) = held[0] {
+                this = updated;
+            }
+            if foreign_exit_value(ctx, this).is_some() {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         let exited = !matches!(
@@ -1615,6 +1784,12 @@ fn native_process_is_alive(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.isAlive()` is `try { exitValue(); return false; }
+        // catch (IllegalThreadStateException) { return true; }`.
+        let alive = foreign_exit_value(ctx, this).is_none();
+        return Ok(Some(Value::Int(if alive { 1 } else { 0 })));
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         return Ok(Some(Value::Int(0)));
@@ -1645,6 +1820,12 @@ fn native_process_destroy_forcibly(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.destroyForcibly()` is `destroy(); return this;` — and
+        // `destroy()` is abstract, so this reaches the subclass's override.
+        ctx.invoke_virtual(this, "destroy", "()V", &[])?;
+        return Ok(Some(Value::Object(Some(this))));
+    }
     let handle = handle_of(ctx, this);
     if handle != 0 {
         destroy_handle(handle, true);
@@ -1691,6 +1872,15 @@ fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             .into())
         }
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.toHandle()`'s implementation on the abstract class is
+        // `throw new UnsupportedOperationException(...)`. A subclass that wants
+        // a handle overrides it, in which case dispatch never arrives here.
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Process.toHandle()".to_string(),
+        }
+        .into());
+    }
     let pid = match ctx.get_field(this, PROC_FIELD_PID) {
         Value::Long(p) => p,
         _ => -1,
@@ -2058,6 +2248,20 @@ fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(-1))),
     };
+    if !is_vm_process(ctx, this) {
+        // `Process.pid()` is `return toHandle().pid();`, so the
+        // `UnsupportedOperationException` from the default `toHandle()`
+        // propagates — which is the specified answer for a `Process` with no
+        // pid support, and is what distinguishes it from "the pid is 0".
+        let handle = ctx.invoke_virtual(this, "toHandle", "()Ljava/lang/ProcessHandle;", &[])?;
+        let Some(Value::Object(Some(handle))) = handle else {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Process.pid()".to_string(),
+            }
+            .into());
+        };
+        return Ok(ctx.invoke_virtual(handle, "pid", "()J", &[])?);
+    }
     let handle = handle_of(ctx, this);
     if handle == 0 {
         // Stub Process — fall back to whatever's in field 4.
@@ -2960,12 +3164,168 @@ mod tests {
         (handle, pid)
     }
 
+    /// A receiver shaped AND named like one of the VM's own process objects.
+    ///
+    /// The class name is load-bearing, not decoration: every concrete
+    /// `java.lang.Process` native now asks `is_vm_process` before trusting the
+    /// `PROC_FIELD_*` slots, so an unnamed mock takes the foreign-receiver path
+    /// and a test written for the VM path would quietly measure the other one.
     fn mock_process(ctx: &mut MockNativeContext, handle: i64, pid: i64) -> ObjectRef {
-        let proc_ref = ctx.alloc_object(PROC_FIELD_COUNT);
+        let proc_ref = ctx.alloc_object_with_class(PROC_FIELD_COUNT, SYNTHETIC_PROCESS_CLASS);
         ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
         ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
         ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
         proc_ref
+    }
+
+    /// A spawn must hand back a LIVE, READABLE stdout pipe.
+    ///
+    /// This is the property `Runtime.exec` did not have: it ran the child to
+    /// completion with `Command::output()` and stored the bytes as a Java
+    /// String on an object nothing downstream could read, so
+    /// `Process.getInputStream()` fell through to fd -1 and every read
+    /// returned EOF. Tomcat's `CGIServlet` copies exactly that stream into
+    /// the HTTP response, which is why `TestSecurity2019.testCVE_2019_0232`
+    /// saw `200 OK` with an empty body.
+    ///
+    /// Asserted through the `FdTable`, the same route the pipe-stream natives
+    /// take, rather than through the Java stream objects: the point is that
+    /// the fd recorded on the Process is the child's real stdout.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_and_wrap_exposes_a_live_stdout_pipe() {
+        let mut ctx = MockNativeContext::new();
+        let result = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["hello-from-the-child".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("spawn /bin/echo")
+        .expect("spawn returns a Process");
+        let proc_ref = match result {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected a Process object, got {other:?}"),
+        };
+
+        let handle = match ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+            Value::Long(h) => h,
+            other => panic!("PROC_FIELD_HANDLE must be a Long, got {other:?}"),
+        };
+        assert_ne!(handle, 0, "a spawned Process must carry a live handle");
+
+        let stdout_fd = match ctx.get_field(proc_ref, PROC_FIELD_STDOUT_FD) {
+            Value::Int(fd) => fd,
+            other => panic!("PROC_FIELD_STDOUT_FD must be an Int, got {other:?}"),
+        };
+        assert!(
+            stdout_fd >= 0,
+            "a piped stdout must have a real fd-table id, got {stdout_fd}"
+        );
+
+        let mut buf = [0u8; 64];
+        let n = ctx
+            .fd_table()
+            .read_bytes(stdout_fd as FdId, &mut buf)
+            .expect("read the child's stdout");
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            text.contains("hello-from-the-child"),
+            "the child's stdout must be readable through the recorded fd, got {text:?}"
+        );
+
+        assert_eq!(wait_for_handle(handle), 0);
+    }
+
+    /// The spawn policy gate runs BEFORE the fork, on every spawn route.
+    ///
+    /// `SecurityManager.checkExec` used to be applied by `Runtime.exec` and by
+    /// `native-builtins`' own (shadowed) `ProcessBuilder.start`, but NOT by the
+    /// `ProcessBuilder.start` that actually wins at runtime, so a deny-all
+    /// policy refused one entry point and let the other fork the same child.
+    /// The gate now lives in `spawn_and_wrap`, which all of them funnel
+    /// through.
+    ///
+    /// Both arms are in one test on purpose: the hook is a process-global
+    /// `OnceLock`, so a second test installing a different one would silently
+    /// keep the first.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_policy_hook_is_consulted_and_can_refuse_the_fork() {
+        use std::sync::atomic::AtomicBool;
+
+        static DENY: AtomicBool = AtomicBool::new(true);
+        static SAW: Mutex<Option<String>> = Mutex::new(None);
+
+        fn hook(_ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+            *SAW.lock() = Some(program.to_string());
+            if DENY.load(Ordering::Relaxed) {
+                Err(RuntimeError::SecurityException {
+                    message: format!("test policy denies {program}"),
+                }
+                .into())
+            } else {
+                Ok(())
+            }
+        }
+        set_spawn_policy_hook(hook);
+
+        // --- deny arm: the error propagates verbatim and nothing is spawned.
+        let mut ctx = MockNativeContext::new();
+        let marker = std::env::temp_dir().join(format!(
+            "cratonvm-spawn-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let denied = spawn_and_wrap(
+            &mut ctx,
+            "/usr/bin/touch",
+            &[marker.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
+            false,
+        );
+        match denied {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::SecurityException { .. },
+            ))) => {}
+            other => panic!("a refused spawn must surface the SecurityException, got {other:?}"),
+        }
+        assert_eq!(
+            SAW.lock().as_deref(),
+            Some("/usr/bin/touch"),
+            "the gate must see command[0]"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a refused spawn must not fork: {} exists",
+            marker.display()
+        );
+
+        // --- allow arm: the same call goes through once the gate says yes.
+        DENY.store(false, Ordering::Relaxed);
+        let allowed = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["ok".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("an allowed spawn must proceed")
+        .expect("spawn returns a Process");
+        if let Value::Object(Some(proc_ref)) = allowed {
+            if let Value::Long(handle) = ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+                assert_eq!(wait_for_handle(handle), 0);
+            }
+        }
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// End-to-end spawn + waitFor round-trip — no NativeContext needed.
@@ -3145,6 +3505,49 @@ mod tests {
 
         let _ = destroy_handle(handle, true);
         let _ = wait_for_handle(handle);
+    }
+
+    /// The foreign-receiver timed wait must ALSO nap inside a blocked region.
+    ///
+    /// `waitFor(long, TimeUnit)` on an application subclass polls the
+    /// subclass's own `exitValue()`, so it can wait for the full timeout with no
+    /// subprocess handle in sight. The thread is in `NativeRunning` throughout,
+    /// which the STW census waits for, so a nap outside a blocked region is a
+    /// GC pause of the caller's choosing. The first cut of the receiver guard
+    /// had exactly that bug.
+    #[test]
+    fn foreign_receiver_timed_wait_also_enters_a_blocked_region() {
+        let mut ctx = MockNativeContext::new();
+        // No class name => not one of the VM's process objects, which is the
+        // whole point: this is the application-subclass path.
+        let foreign = ctx.alloc_object(2);
+        assert!(
+            !is_vm_process(&mut ctx, foreign),
+            "an unnamed mock object must not be mistaken for a VM Process"
+        );
+
+        let result = native_process_wait_for_timeout(
+            &mut ctx,
+            &[
+                Value::Object(Some(foreign)),
+                Value::Long(20),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        // The mock's `invoke_virtual` has no `exitValue` to run, so the poll
+        // never sees an exit and the wait times out — which is the specified
+        // answer for a process that has not exited, and the answer the
+        // pre-guard code got wrong by reading slot bytes off a stranger.
+        assert_eq!(result, Value::Int(0), "a never-exiting process waits out its timeout");
+        let (begin, end) = ctx.blocking_region_counts();
+        assert!(
+            begin >= 1,
+            "the foreign-receiver poll must nap inside a blocked region, not spin outside one"
+        );
+        assert_eq!(begin, end, "blocked-region enter/leave must balance");
     }
 
     /// `pid_for_handle` returns the captured pid even after reap.

@@ -10035,6 +10035,13 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if is_tree_map_receiver(ctx, this) {
         return native_tm_key_set(ctx, args);
     }
+    // A `ConcurrentHashMap` reached polymorphically through `Map.keySet()` must
+    // get the same `KeySetView` its own `keySet()` returns — otherwise the
+    // static receiver type silently decides the class, the cast and whether
+    // `add` throws.
+    if is_chm_receiver(ctx, this) {
+        return native_chm_key_set(ctx, args);
+    }
     // Build the live view through the shared helper so every key, including a
     // legal HashMap null key, is inserted through native_map_put.
     let keys = map_collect_keys(ctx, this);
@@ -43308,24 +43315,34 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
+/// `ConcurrentHashMap.keySet()` — the JDK's `new KeySetView<>(this, null)`.
+///
+/// This used to build a `java/util/HashSet` carrying a view-backing that
+/// remembered the source map, so reads resynced and `remove` wrote through.
+/// That got the common paths right and three things wrong, all of which the
+/// real `KeySetView` gets right for free now that it has its own natives:
+///
+/// * `(ConcurrentHashMap.KeySetView<K,?>) map.keySet()` threw
+///   `ClassCastException` — the object was a `HashSet`.
+/// * `add`/`addAll` SUCCEEDED, mutating the view's private snapshot and
+///   silently losing the element at the next resync. A `keySet()` view has no
+///   mapped value, so the JDK throws `UnsupportedOperationException`.
+/// * `retainAll` did not write through at all (the map kept every element the
+///   caller asked to drop), and `removeAll` returned `false` after removing.
+///
+/// The iteration order is unchanged: the view-backing read
+/// `collect_keys_any` → `map_collect_keys` → `chm_collect_all_keys`, which is
+/// exactly what the `KeySetView` natives read, so the HotSpot-faithful bucket
+/// order `chm_reorder_by_virtual_bucket` reconstructs (and which Spring's
+/// `SimpleAliasRegistry.getAliases` depends on) is preserved.
 fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let keys = chm_collect_all_keys(ctx, this);
-    // Live view: build the backing HashSet with a view-backing that remembers
-    // the source ConcurrentHashMap, so `keySet().remove(k)` /
-    // `keySet().iterator().remove()` / `keySet().removeIf(...)` write through to
-    // the map (matching the JDK's `KeySetView`). The previous detached-snapshot
-    // copy silently dropped such removals — e.g.
-    // `CachedIntrospectionResults.clearClassLoader` does
-    // `strongClassCache.keySet().removeIf(...)` and the entries were never
-    // evicted. Write-through dispatches via the map's own `remove` (see
-    // `source_map_remove`), which handles CHM; reads resync via
-    // `collect_keys_any`, which also handles CHM.
-    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
-    Ok(Some(Value::Object(Some(set))))
+    // A null mapped value is what makes this view read-only, per the JDK.
+    let view = make_key_set_view(ctx, this, Value::Object(None));
+    Ok(Some(Value::Object(Some(view))))
 }
 
 fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -44508,6 +44525,12 @@ fn native_ksv_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // JDK: `addAll` throws before looking at the collection, so an EMPTY
+    // collection throws too. Deferring to the per-element `add` below would
+    // quietly return `false` for that case.
+    if matches!(ksv_mapped_value(ctx, this), Value::Object(None)) {
+        return Err(unsupported_op());
+    }
     let this_pin = ctx.pin_native_root(this);
     let elems = collect_collection_elements_or_real(ctx, coll);
     let (_, handles) = pin_value_slice(ctx, &elems);

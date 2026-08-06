@@ -101,8 +101,88 @@ record's own count was 39% low.
   `InternalError` stands — and it already satisfies the constraint that
   matters, which is that a refusal be catchable.
 
-**Still open:** §1, §4, §8, the bulk of §11, §3's Matcher-leaf residual, and
-the `jit_entry_publishable` half of §2.
+### Third pass, same day — §1 and §4
+
+* **§1 — CLOSED as "no gap", and the prescription would not have worked.** The
+  record asks for an `AtomicU8` kind array at the tail of the MIC/PIC slots,
+  checked instead of refusing. Two reasons not to, either sufficient:
+  1. **Nothing would read it.** The hit path is emitted machine code —
+     `ir_lower.rs` emits `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11` after
+     the guard. Consulting a kind means adding a load/test/branch to the JIT's
+     hottest dispatch shape, for a diagnostic this record itself says is "not a
+     performance defect".
+  2. **A native is never in the slot, in EITHER mode.** Both population
+     clusters in `vm/src/jit/helpers.rs` source their entry from
+     `try_jit_compile_callee` — a JIT callee with a live pin — so
+     `jit_entry_publishable`'s `owner.is_some()` early return fires first, and
+     it is **not policy-dependent**. This record asserts both "a native
+     trampoline never reaches the refusal from these sites" *and* "the missing
+     kind leaves the census incomplete in `Compatible` mode as much as strict".
+     Those contradict each other; the second is wrong.
+  Measured `ic_unowned_pub = 0`, `ic_refusals = 0` in both modes. Both struct
+  markers now say do-not-do-this and why.
+* **§4 — the policy half is done; the "delete the literals" half is not
+  achievable.** `direct_native_helper` now takes an `intrinsic_resolver` and
+  the VM answers from the registry's `NativeKind`. But the seven triples are
+  how the RECOGNITION picks which `*_DIRECT_FN` cell a site maps to — a
+  triple-to-helper-address map the registry does not have. Only the policy was
+  name-based, and only the policy moved.
+  From `scripts/baselines/jdk-only-kind-map-25-linux.tsv` the seven split
+  **3 intrinsic / 3 bridge / 1 unregistered**, so the old blanket refusal was
+  *stricter than §1.4*, which names `Intrinsic` as the reviewed exception.
+  `StringLatin1.toLowerCase`, `Integer.valueOf(I)` and `Integer.intValue()`
+  now bind under strict; the three bridges and the unregistered
+  `String.toLowerCase(Locale)` stay refused.
+  `probes/DirectLadderProbe.java` is new because `JdkOnlyIcHotProbe` never
+  reaches these ladders (`jit_direct_native_binds = 0`), so it could not tell a
+  gate that refuses from one that is never asked.
+
+### Fourth pass, same day — §8 and §11, measured
+
+Both sections describe a per-family deletion exercise and neither had been
+measured; "each entry is load-bearing for a real boot today" was an assumption.
+`CRATONVM_DBG_CHECK_OVERRIDE=1` now records, at CLI shutdown: every triple the
+§11 chain admits (with whether `is_abstract()` alone would have sufficed),
+the site's `reached=`/`chain_true=` counts, and every §8 substitution.
+
+| workload | reached | chain_true | triples | classes | §8 substitutions |
+|---|---:|---:|---:|---:|---:|
+| corpus `--real-jdk` (53 classes) | 11,648,908 | 917 | 20 | 14 | **0** |
+| corpus `--jdk-only` | 11,650,412 | 453 | 13 | 9 | **0** |
+| 16 `org.h2.test` classes | — | — | 21 | 16 | **0** |
+| **union** | | | **27** | **19** | **0** |
+
+* **§8 — FIXED under strict.** The map fires **zero** times in either mode,
+  including on real H2 application code. So the record's "under `JdkOnly` the
+  map should become unreachable rather than conditional" is now enforced: under
+  strict the substitution is refused and recorded as an `interface-substitution`
+  violation instead of silently running `HashMap$KeyItr`'s native against a
+  receiver that is not one. `Compatible` is untouched — a corpus that never
+  reaches the path cannot license removing it there, and the record warns that
+  removing shim mappings has regressed real-JDK boot before.
+* **§11 — 19 families identified, and the deletion still is not licensed.**
+  Every admitted row is earned by a NAME disjunct; `is_abstract()` alone
+  sufficed for none, so the chain cannot be reduced to its one contract-legal
+  disjunct. Two of the 19 are H2's *own* classes
+  (`org/h2/expression/condition/Comparison`, `org/h2/value/ValueBigint`), so a
+  deletion pass cannot reason about `java.*` alone.
+  Baseline checked in at
+  `scripts/baselines/jdk-only-check-override-admissions.tsv`. **It is not a
+  deletion list** — the chain was built from Spring, Tomcat, WildFly and H2
+  boots and only H2 is represented. Extend it from the app suites before
+  deleting anything; the instrument makes that one run rather than a fresh
+  investigation.
+
+Three measurement traps hit on the way, all of which produced a confident and
+false zero: the regression suite swallows per-class output into a shell
+variable (drive the classes directly); the frozen binary was swept out of
+`/tmp` mid-run so every invocation failed instantly; and the first "distinct
+triples" counts included the per-process hit column, inflating 20/13 to 37/28.
+The `reached=` counter exists so the first two are visible in the output.
+
+**Still open:** the bulk of §11 (the deletion itself, pending an app-suite
+census), §3's Matcher-leaf residual, and the `jit_entry_publishable` half of §2
+— which refuses nothing, per §1 above.
 
 ## 2026-08-04 status
 
