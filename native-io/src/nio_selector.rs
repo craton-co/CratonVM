@@ -4191,6 +4191,43 @@ mod tests {
         selector_close(id);
     }
 
+    /// The other half of the gate: a select that IS parked must still be woken
+    /// by an interest change.
+    ///
+    /// This is what the nudge was added for on 2026-07-18 — Tomcat arms
+    /// OP_WRITE after a partial gathering write, and without a wakeup the last
+    /// HTTP/2 frame sat queued until shutdown and the peer saw a truncated
+    /// GOAWAY (`dohead-post-fix-sporadic-residuals-FIXED`). Gating the nudge on
+    /// `in_flight_selects` could have deleted that fix instead of the storm, so
+    /// the two tests are written together and neither is meaningful alone.
+    #[test]
+    fn set_interest_wakes_a_select_that_is_already_parked() {
+        let id = selector_open();
+        let (_client, server) = make_stream_pair();
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, None, 0, Some(SelectableKind::Stream(server)))
+            .unwrap();
+
+        let handle = thread::spawn(move || {
+            // Long enough that the main thread is parked in the kernel wait.
+            thread::sleep(Duration::from_millis(100));
+            selector_set_interest(id, fd, OP_READ | OP_WRITE).unwrap();
+        });
+
+        let start = Instant::now();
+        let _ = selector_select(id, 5000).unwrap();
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "an interest change must wake a PARKED select: waited {elapsed:?} of \
+             a 5000ms timeout. Gating the nudge must not delete the Tomcat \
+             OP_WRITE wakeup it exists for."
+        );
+        selector_close(id);
+    }
+
     #[test]
     fn t19_7_a_select_returns_ready_read_after_accept() {
         let id = selector_open();
