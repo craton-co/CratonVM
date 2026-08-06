@@ -32477,84 +32477,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             registry.register(bbacb, "hasArray", "()Z", |_ctx, _args| {
                 Ok(Some(Value::Int(0)))
             });
-            // subSequence(II) — return a fresh CharBuffer with copied chars.
-            // The JDK returns a slice of the same BBACB type, but copying
-            // into a flat char[] backed CharBuffer is sufficient for
-            // `subSequence(...).toString()` and `subSequence(...).charAt(i)`.
-            registry.register(
-                bbacb,
-                "subSequence",
-                "(II)Ljava/nio/CharBuffer;",
-                |ctx, args| {
-                    let this = match args.first() {
-                        Some(Value::Object(Some(o))) => *o,
-                        _ => {
-                            return Err(RuntimeError::NullPointerException {
-                                message: Some("ByteBufferAsCharBuffer.subSequence on null".into()),
-                            }
-                            .into())
-                        }
-                    };
-                    let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                    let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-                    let (byte_arr, pos, lim, bb_off, big_endian) = bbacb_read_underlying_bytes(
-                        ctx, this,
-                    )
-                    .ok_or(RuntimeError::IllegalStateException {
-                        message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
-                    })?;
-                    // `ByteBufferAsCharBuffer.subSequence` opens with
-                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
-                    // `lim` was read and then explicitly discarded here, so the
-                    // range was never checked: `subSequence(0, 99)` on a
-                    // six-char view decoded 93 code units from past the end of
-                    // the underlying `byte[]` and handed them back as content.
-                    // Same defect, same day, as `CharBuffer.subSequence` —
-                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
-                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
-                        return Err(RuntimeError::ioobe(
-                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
-                                i64::from(start),
-                                i64::from(end),
-                                i64::from(lim.saturating_sub(pos)),
-                            ),
-                        )
-                        .into());
-                    }
-                    let n = (end - start).max(0) as usize;
-                    let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
-                    for i in 0..n {
-                        let real = pos + start + i as i32;
-                        let bi = (bb_off + 2 * real) as usize;
-                        let hi = ctx.get_array_element(byte_arr, bi).as_int().unwrap_or(0) & 0xFF;
-                        let lo = ctx
-                            .get_array_element(byte_arr, bi + 1)
-                            .as_int()
-                            .unwrap_or(0)
-                            & 0xFF;
-                        let ch = if big_endian {
-                            (hi << 8) | lo
-                        } else {
-                            (lo << 8) | hi
-                        };
-                        ctx.set_array_element(chars_arr, i, Value::Int(ch));
-                    }
-                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
-                    ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars_arr)));
-                    ctx.set_field_by_name(buf, "offset", Value::Int(0));
-                    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-                    ctx.set_field_by_name(buf, "position", Value::Int(0));
-                    ctx.set_field_by_name(buf, "limit", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "capacity", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-                    ctx.set_field(buf, 0, Value::Object(Some(chars_arr)));
-                    ctx.set_field(buf, 1, Value::Int(0));
-                    ctx.set_field(buf, 2, Value::Int(n as i32));
-                    ctx.set_field(buf, 3, Value::Int(n as i32));
-                    ctx.set_field(buf, 4, Value::Int(-1));
-                    Ok(Some(Value::Object(Some(buf))))
-                },
-            );
+            // subSequence(II) -- DELETED, deliberately.
+            //
+            // This used to return a fresh char[]-backed buffer stamped with
+            // the ABSTRACT `java/nio/CharBuffer`, on the reasoning that a
+            // copy is "sufficient for `subSequence(...).toString()`". It is
+            // not: the JDK returns a slice of the same BBACB type over the
+            // same bytes, so a copy loses write-through, reports
+            // `hasArray() == true`, and -- the part that actually broke --
+            // leaves every method with no native on the abstract class
+            // throwing `AbstractMethodError`.
+            //
+            // Now that `asCharBuffer` hands back a real
+            // `ByteBufferAsCharBuffer{B,L}` (see `s2_bb_as_char_buffer`),
+            // the JDK's own `subSequence` body is present and correct,
+            // including the `Objects.checkFromToIndex` bounds check this
+            // override was originally written to add. Leaving the override
+            // in place would shadow it and re-introduce all three
+            // divergences.
             // toString() — read all chars between pos..lim.
             registry.register(bbacb, "toString", "()Ljava/lang/String;", |ctx, args| {
                 let this = match args.first() {
