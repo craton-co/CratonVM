@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-405 tokens.
+406 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -305,6 +305,7 @@ export inherited from a parent shell.
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `unreg-memo-audit` | `CRATONVM_DBG_UNREG_MEMO_AUDIT` |
 | `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
 | `npe-trace` | `CRATONVM_DBG_NPE_TRACE` |
@@ -471,7 +472,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-158 tokens.
+159 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -587,6 +588,7 @@ export inherited from a parent shell.
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
+| `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
 | `field-site-slots` | `CRATONVM_JIT_FIELD_SITE_SLOTS` |
 | `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
