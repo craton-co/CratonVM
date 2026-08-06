@@ -554,7 +554,7 @@ fn offer_native_shadow_observation(
 /// RAN" observation — §1.4's shadow, seen at the moment it actually dispatched.
 ///
 /// This is the census hole
-/// `docs/internal/jdk-only-step1-bytecode-available-*.md` was filed for:
+/// `jdk-only-step1-bytecode-available-*.md` was filed for:
 /// `resolve_step1_native` passed a hard-coded `bytecode_available: false`, so
 /// step 1 — which answers first for nearly every dispatch in the VM — recorded
 /// nothing at all, and the shadow lists could read as inert while the natives

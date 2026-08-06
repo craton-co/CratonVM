@@ -23376,7 +23376,7 @@ mod tests {
     /// This is the load-bearing step of the recycled-`JitSiteKey` argument, and
     /// until now it rested on a comment plus four hand-written `fetch_add`
     /// calls. See
-    /// `docs/internal/site-alias-diagnostic-and-the-recycled-jitsitekey-question-CLOSED-20260806.md`.
+    /// `site-alias-diagnostic-and-the-recycled-jitsitekey-question-CLOSED-20260806.md`.
     ///
     /// The chain it closes: a `JitInvokeInfo` box is owned by its
     /// `CompiledMethod` (`_jit_invoke_infos`), so its ADDRESS — which is what a

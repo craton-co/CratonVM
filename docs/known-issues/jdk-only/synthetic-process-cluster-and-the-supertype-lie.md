@@ -131,7 +131,7 @@ hand.
 It also means the `Bridge`-registered natives are the *only* reason this object
 answers `Process`'s methods at all: it inherits nothing from `java.lang.Process`
 because it does not extend it. Which is precisely why
-[`process-natives-answer-for-user-subclasses-FIXED-20260806.md`](../../internal/process-natives-answer-for-user-subclasses-FIXED-20260806.md)
+`process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 found the concrete methods answering from the synthetic layout — for this
 receiver that is correct and necessary, and for a real subclass it is the bug.
 The two records are the same registration seen from its two receivers.

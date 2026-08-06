@@ -5,7 +5,7 @@
 //! being defined, and the bytes it returns are the ones the VM defines.
 //!
 //! This is the regression test for
-//! `docs/internal/java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`,
+//! `java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`,
 //! whose failure shape was the worst one available: `addTransformer` returned
 //! normally, `isRetransformClassesSupported()` answered `true`, and the
 //! transformer was then never called for any class. An agent has no way to

@@ -4492,7 +4492,7 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     // `real_protected_stub_class` yield it to the real `execute()` bytecode
     // structurally, for every receiver, which is what replaced the eight
     // hand-written receiver-shape probes in `vm`. See
-    // `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+    // `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
     registry.register_with_kind(
         es,
         "execute",

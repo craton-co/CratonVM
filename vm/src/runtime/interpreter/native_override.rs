@@ -6960,7 +6960,7 @@ pub(super) fn resolve_step1_native(
     //   32/17 to 3/46, because the surviving bridges ARE the object model for
     //   large parts of `java.base` under strict mode. See
     //   `env_cache::jdk_only_enforce_shadow` for the numbers, and
-    //   `docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`
+    //   `jdk-only-step1-bytecode-available-RESOLVED-20260806.md`
     //   for all five blocker families with their symptoms.
     let strict_bridge = policy.is_jdk_only() && kind == cratonvm_native_api::NativeKind::Bridge;
     let enforce = strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow();

@@ -117,7 +117,7 @@ first looked like it had to be, and did not:
 * `String.substring` out-of-range threw `ArrayIndexOutOfBoundsException`
   instead of `StringIndexOutOfBoundsException`. **FIXED 2026-08-05, both
   halves**
-  ([record](../../internal/preconditions-ignores-the-exception-formatter-FIXED-20260805.md)
+  (record (`preconditions-ignores-the-exception-formatter-FIXED-20260805.md`)
   — which supersedes the original `string-substring-bounds-…` record, that
   having named the wrong subsystem: the fault is `Preconditions` ignoring its
   exception-formatter argument, not anything `substring` does).
@@ -153,7 +153,7 @@ the natives kept winning". **Half of that is right, and it is the half that is
 now closed.**
 
 Full record:
-[`docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`](../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md).
+`jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
 Two of this paragraph's original claims were already known wrong: **4,796** is a
 static count of registrations, not of dispatches (10 → 24 shadow observations on
 the matrix workload), and the default `--real-jdk` path costs nothing because

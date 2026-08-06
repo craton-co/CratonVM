@@ -5,7 +5,7 @@
 | **Status** | OPEN |
 | **Severity** | medium |
 | **Discovered** | 2026-08-06, complete 651-class Tomcat suite rerun |
-| **Prior history** | [`testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`](../../internal/fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md) — the original `ExpandWar` `seek0: bad fd for rw_seek` defect is confirmed fixed in this build (no longer appears); its retirement commit (`d77025185`) says it "opens the deploy-scan wall behind it" but no doc for that residual was found in either `docs/known-issues` or `docs/internal` |
+| **Prior history** | `fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md` — the original `ExpandWar` `seek0: bad fd for rw_seek` defect is confirmed fixed in this build (no longer appears); its retirement commit (`d77025185`) says it "opens the deploy-scan wall behind it" but no doc for that residual was found in either `docs/known-issues` or `docs/internal` |
 
 ## Symptom
 

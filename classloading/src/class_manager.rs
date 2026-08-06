@@ -3645,7 +3645,7 @@ impl ClassManager {
     // [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
     // which answers the dispatch question directly and gives the same answer for
     // this class before and after. See
-    // `docs/internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
+    // `jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
     #[track_caller]
     fn fabricate_class(
         &mut self,

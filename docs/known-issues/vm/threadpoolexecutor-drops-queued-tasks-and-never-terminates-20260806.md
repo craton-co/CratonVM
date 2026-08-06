@@ -74,7 +74,7 @@ never returns.
 
 Both faces live in `ThreadPoolExecutor`'s `ctl` accounting, which CratonVM's
 `execute` bridge partly replaces (see the already-fixed family in
-`docs/internal/fixed-suite-bugs/threadpoolexecutor-*` — dispatch degrading to
+`fixed-suite-bugs/threadpoolexecutor-*` — dispatch degrading to
 synchronous, `mainLock` NPEs, `shutdown` self-recursion, prestart). None of
 those touched enqueue-versus-reject or idle-worker wakeup.
 

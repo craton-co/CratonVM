@@ -5,7 +5,7 @@
 | **Status** | OPEN — third recurrence of a previously-closed issue |
 | **Severity** | high — breaks a "passes standalone in ~30s" guarantee the prior closures relied on |
 | **Discovered** | 2026-08-06, complete 651-class Tomcat suite rerun after merging `dev` (~1044 commits) |
-| **Prior history** | [`docs/internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md`](../../internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md) (closed 2026-07-27), [`docs/internal/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md`](../../internal/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) (a second recurrence, also closed) |
+| **Prior history** | `tomcat/04-embedded-server-throughput-wall-CLOSED.md` (closed 2026-07-27), `tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md` (a second recurrence, also closed) |
 
 ## Symptom
 

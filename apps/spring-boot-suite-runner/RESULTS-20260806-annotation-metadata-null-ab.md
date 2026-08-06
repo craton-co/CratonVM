@@ -3,7 +3,7 @@
 Closes `docs/known-issues/springboot/spring-boot-annotation-metadata-null-cluster-20260805.md`
 and its `Related` page `spring-bean-attribute-type-null-flake-20260803.md`.
 Verdict and mechanism:
-`docs/internal/fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`.
+`fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`.
 
 - **Worktrees:** `C:\craton\CratonVM-annmeta-20260806` (branch
   `fix/springboot-annotation-metadata-null-20260806`, off `dev` @ `ce462d315`)
