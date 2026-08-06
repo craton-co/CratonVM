@@ -1090,6 +1090,21 @@ pub trait NativeClassAccess {
         None
     }
 
+    /// Do `bytes` fingerprint-match the class file `class_id`'s current
+    /// definition came from?
+    ///
+    /// `None` means the VM recorded no fingerprint and cannot adjudicate.
+    /// Used by `Instrumentation.retransformClasses` when `class_bytes` misses
+    /// (that cache is size-capped and FIFO-evicted) and the retransformation
+    /// base has to be re-read from the classpath: the classpath is searched
+    /// bootstrap → extension → application, *not* through the class's defining
+    /// loader, so what it returns can be a different build of the same name.
+    /// Matching `this_class` does not catch that; this does. Default impl
+    /// returns `None` so test mocks compile.
+    fn class_bytes_match_base(&self, _class_id: ClassId, _bytes: &[u8]) -> Option<bool> {
+        None
+    }
+
     /// Return a URL string (e.g. `file:/...` or `jar:file:/...!/...`) for
     /// every classpath entry that contains a resource with the given name.
     /// Used by `ClassLoader.getResources` / `getSystemResources`.

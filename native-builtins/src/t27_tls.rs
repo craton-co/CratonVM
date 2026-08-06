@@ -65,6 +65,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
 
+use cratonvm_native_io::eintr::EintrIo;
+
 use crate::alloc_concurrent_synthetic;
 use crate::servlet;
 
@@ -3060,13 +3062,13 @@ pub(crate) fn rustls_client_connect(
         if stream.conn.wants_write() {
             stream
                 .conn
-                .write_tls(&mut stream.sock)
+                .write_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("handshake write: {}", e))?;
         }
         if stream.conn.wants_read() {
             let n = stream
                 .conn
-                .read_tls(&mut stream.sock)
+                .read_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("handshake read: {}", e))?;
             if n == 0 {
                 return Err(
@@ -3191,7 +3193,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                         }
                         stream
                             .conn
-                            .read_tls(&mut stream.sock)
+                            .read_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| format!("server handshake read: {e}"))?;
                         stream
                             .conn
@@ -3207,7 +3209,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                         }
                         stream
                             .conn
-                            .write_tls(&mut stream.sock)
+                            .write_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| format!("server handshake write: {e}"))?;
                     }
                 }
@@ -3314,7 +3316,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
         if stream.conn.wants_read() {
             let n = stream
                 .conn
-                .read_tls(&mut stream.sock)
+                .read_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("layered server handshake read: {e}"))?;
             if debug_srv {
                 eprintln!(
@@ -3330,7 +3332,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
         if stream.conn.wants_write() {
             let n = stream
                 .conn
-                .write_tls(&mut stream.sock)
+                .write_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("layered server handshake write: {e}"))?;
             if debug_srv {
                 eprintln!(
@@ -3350,7 +3352,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     while stream.conn.wants_write() {
         let n = stream
             .conn
-            .write_tls(&mut stream.sock)
+            .write_tls(&mut EintrIo::new(&mut stream.sock))
             .map_err(|e| format!("layered server post-handshake write: {e}"))?;
         if debug_srv {
             eprintln!(
@@ -3449,13 +3451,13 @@ pub(crate) fn rustls_client_handshake_over_stream(
         if stream.conn.wants_write() {
             stream
                 .conn
-                .write_tls(&mut stream.sock)
+                .write_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("handshake write: {}", e))?;
         }
         if stream.conn.wants_read() {
             let n = stream
                 .conn
-                .read_tls(&mut stream.sock)
+                .read_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("handshake read: {}", e))?;
             if n == 0 {
                 return Err(
@@ -3813,11 +3815,17 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
                 buf.len()
             );
         }
+        // `EintrIo`: a server-side `SSLSocket.getInputStream().read()` parks
+        // in `recv` on a socket that carries `SO_RCVTIMEO`, which Linux
+        // excludes from `SA_RESTART`. CratonVM's own cross-thread JIT
+        // root-scan `SIGUSR2` therefore reaches Java as
+        // `IOException: Interrupted system call`. The client-side arm above
+        // gets the same treatment inside `read_eof_tolerant`.
         let result = match &mut *e {
-            TlsServerStream::Rustls(s) => s.read(buf),
-            TlsServerStream::Native(s) => s.read(buf),
+            TlsServerStream::Rustls(s) => EintrIo::new(s).read(buf),
+            TlsServerStream::Native(s) => EintrIo::new(s).read(buf),
             #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => s.read(buf),
+            TlsServerStream::LegacyDsa(s) => EintrIo::new(s).read(buf),
         };
         if debug_srv {
             eprintln!(
@@ -3846,7 +3854,7 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
     };
     if let Some(stream) = client {
         let mut e = stream.lock();
-        return e.write(data);
+        return EintrIo::new(&mut *e).write(data);
     }
     if let Some(stream) = server {
         let mut e = stream.lock();
@@ -3858,10 +3866,10 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
             );
         }
         let result = match &mut *e {
-            TlsServerStream::Rustls(s) => s.write(data),
-            TlsServerStream::Native(s) => s.write(data),
+            TlsServerStream::Rustls(s) => EintrIo::new(s).write(data),
+            TlsServerStream::Native(s) => EintrIo::new(s).write(data),
             #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => s.write(data),
+            TlsServerStream::LegacyDsa(s) => EintrIo::new(s).write(data),
         };
         if debug_srv {
             eprintln!(
@@ -5422,7 +5430,7 @@ pub(crate) fn run_loopback_self_test(
             if stream.conn.wants_read() {
                 stream
                     .conn
-                    .read_tls(&mut stream.sock)
+                    .read_tls(&mut EintrIo::new(&mut stream.sock))
                     .map_err(|e| format!("s read: {}", e))?;
                 stream
                     .conn
@@ -5432,7 +5440,7 @@ pub(crate) fn run_loopback_self_test(
             if stream.conn.wants_write() {
                 stream
                     .conn
-                    .write_tls(&mut stream.sock)
+                    .write_tls(&mut EintrIo::new(&mut stream.sock))
                     .map_err(|e| format!("s write: {}", e))?;
             }
         }
@@ -5478,13 +5486,13 @@ pub(crate) fn run_loopback_self_test(
         if stream.conn.wants_write() {
             stream
                 .conn
-                .write_tls(&mut stream.sock)
+                .write_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("c write: {}", e))?;
         }
         if stream.conn.wants_read() {
             stream
                 .conn
-                .read_tls(&mut stream.sock)
+                .read_tls(&mut EintrIo::new(&mut stream.sock))
                 .map_err(|e| format!("c read: {}", e))?;
             stream
                 .conn
@@ -5998,7 +6006,7 @@ mod tests {
                 if stream.conn.wants_read() {
                     stream
                         .conn
-                        .read_tls(&mut stream.sock)
+                        .read_tls(&mut EintrIo::new(&mut stream.sock))
                         .map_err(|e| e.to_string())?;
                     stream
                         .conn
@@ -6008,7 +6016,7 @@ mod tests {
                 if stream.conn.wants_write() {
                     stream
                         .conn
-                        .write_tls(&mut stream.sock)
+                        .write_tls(&mut EintrIo::new(&mut stream.sock))
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -6032,10 +6040,10 @@ mod tests {
         let mut stream = StreamOwned::new(conn, tcp);
         while stream.conn.is_handshaking() {
             if stream.conn.wants_write() {
-                stream.conn.write_tls(&mut stream.sock).unwrap();
+                stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
             }
             if stream.conn.wants_read() {
-                stream.conn.read_tls(&mut stream.sock).unwrap();
+                stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                 stream.conn.process_new_packets().unwrap();
             }
         }
@@ -6073,7 +6081,7 @@ mod tests {
                     if stream.conn.wants_read() {
                         stream
                             .conn
-                            .read_tls(&mut stream.sock)
+                            .read_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| e.to_string())?;
                         stream
                             .conn
@@ -6083,7 +6091,7 @@ mod tests {
                     if stream.conn.wants_write() {
                         stream
                             .conn
-                            .write_tls(&mut stream.sock)
+                            .write_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -6107,10 +6115,10 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut stream.sock).unwrap();
+                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut stream.sock).unwrap();
+                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }
@@ -6165,10 +6173,10 @@ mod tests {
         // Drive handshake.
         while stream.conn.is_handshaking() {
             if stream.conn.wants_write() {
-                stream.conn.write_tls(&mut stream.sock).unwrap();
+                stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
             }
             if stream.conn.wants_read() {
-                stream.conn.read_tls(&mut stream.sock).unwrap();
+                stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                 stream.conn.process_new_packets().unwrap();
             }
         }
@@ -6219,7 +6227,7 @@ mod tests {
                     if stream.conn.wants_read() {
                         stream
                             .conn
-                            .read_tls(&mut stream.sock)
+                            .read_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| e.to_string())?;
                         stream
                             .conn
@@ -6229,7 +6237,7 @@ mod tests {
                     if stream.conn.wants_write() {
                         stream
                             .conn
-                            .write_tls(&mut stream.sock)
+                            .write_tls(&mut EintrIo::new(&mut stream.sock))
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -6253,10 +6261,10 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut stream.sock).unwrap();
+                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut stream.sock).unwrap();
+                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }
@@ -6284,10 +6292,10 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut stream.sock).unwrap();
+                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut stream.sock).unwrap();
+                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }

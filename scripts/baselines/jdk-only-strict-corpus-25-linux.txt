@@ -4,7 +4,7 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: the refused snapshot iterator and stream collector are fixed: HashMap$KeyItr/TreeSet$Itr fall back to a real Arrays$ArrayItr and the StreamCollector drain goes through Spliterators.iterator, retiring 17 sections. JdkOnlyPlatformProbe/*/vthreads stays baselined — it is the documented intermittent section and a first re-freeze landed on the rare run where the real arm matched, writing a baseline too tight to hold
+# note: PKCS12 setEntry fixed: JdkOnlyPlatformProbe security no longer diverges in either arm (p12=true)
 #
 # note: JNI argument/return marshalling is fixed — the thirteen filed families plus a new upcall-exception family all match HotSpot 25 in both modes over three consecutive three-arm runs, so JdkOnlyPlatformProbe real/jni and strict/jni come off. Removed by hand rather than by --update-baseline: that regenerates the whole set from ONE run, and two runs of this gate ten minutes apart disagreed about */vthreads (both arms diverging, then neither), so a regenerate would have written the documented intermittent section out on a coin flip. Dropping two measured lines can only tighten the ratchet.
 #
@@ -15,8 +15,15 @@ JdkOnlyBreadthProbe/strict/PROBE2
 JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
 JdkOnlyBreadthProbe/strict/serialization
 JdkOnlyPlatformProbe/real/agent
+<<<<<<< HEAD
 JdkOnlyPlatformProbe/real/security
 JdkOnlyPlatformProbe/real/vthreads
 JdkOnlyPlatformProbe/strict/agent
 JdkOnlyPlatformProbe/strict/security
+=======
+JdkOnlyPlatformProbe/real/jni
+JdkOnlyPlatformProbe/real/vthreads
+JdkOnlyPlatformProbe/strict/agent
+JdkOnlyPlatformProbe/strict/jni
+>>>>>>> origin/dev
 JdkOnlyPlatformProbe/strict/vthreads
