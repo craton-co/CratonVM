@@ -538,6 +538,7 @@ public class JdkOnlyPlatformProbe {
             JniProbe.writeValue(holder, 21);
             sb.append("->").append(holder.value);
             sb.append(" upcall=").append(JniProbe.callBackTriple(9));
+            sb.append(" upcallThrow=").append(JniProbe.upcallThrow(4));
             try {
                 JniProbe.throwIse("from-native");
                 sb.append(" throw=<no-throw>");
@@ -573,11 +574,23 @@ public class JdkOnlyPlatformProbe {
         public static native void throwIse(String msg);
         /** Calls back into {@link #triple(int)} via CallStaticIntMethod. */
         public static native int callBackTriple(int n);
+        /**
+         * Calls {@link #boom(int)} the same way and reports what the native
+         * saw afterwards: {@code iae} when the thrown exception was pending at
+         * the up-call's return, {@code no-pending} when it was swallowed. The
+         * native clears it, so nothing escapes back to here.
+         */
+        public static native String upcallThrow(int n);
         /** Bound by JNI_OnLoad's RegisterNatives, not by symbol lookup. */
         public static native int registeredNative(int n);
 
         public static int triple(int n) {
             return n * 3;
+        }
+
+        /** The up-call target for {@link #upcallThrow(int)}. Always throws. */
+        public static int boom(int n) {
+            throw new IllegalArgumentException("boom-" + n);
         }
     }
 }
