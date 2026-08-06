@@ -13257,11 +13257,12 @@ mod tests {
     /// worth testing is that the TRIGGER fires — that a generation change
     /// actually reaches the flush — and that is what this asserts.
     ///
-    /// Non-vacuous two ways. Each populated memo is checked non-empty before
-    /// the flush, so an assertion cannot pass on a map that was already clear.
-    /// And the post-flush sweep runs over `site_keyed_memo_census()` — the real
-    /// list — rather than a copy of it, so a memo added later is covered here
-    /// the moment it is declared.
+    /// Non-vacuous two ways. **Every** memo is populated and checked non-empty
+    /// before the flush, so no assertion below can pass on a map that was
+    /// already clear. And both sweeps run over `site_keyed_memo_census()` — the
+    /// real list — rather than a copy of it, so a memo added later is covered
+    /// the moment it is declared, and the pre-flush sweep names it if whoever
+    /// added it forgot a population line.
     #[test]
     fn a_jit_generation_change_clears_every_site_keyed_memo() {
         let _g = memo_test_guard();
@@ -13303,16 +13304,26 @@ mod tests {
                 },
             );
         });
-        // OBJECT_NATIVE_DISPATCH_CACHE holds a resolved `NativeCallback`, which
-        // cannot be conjured without a registry. It is covered by the sweep
-        // below rather than by a population line; the seven above are what make
-        // that sweep non-vacuous.
+        // A `NativeCallback` is a plain fn pointer, so this needs no registry —
+        // the callback is never invoked here, only stored and then flushed.
+        OBJECT_NATIVE_DISPATCH_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                key,
+                NativeDispatchCache {
+                    receiver_class_id: 77,
+                    callback: (|_ctx: &mut dyn cratonvm_native_api::NativeContext,
+                                _args: &[Value]| {
+                        unreachable!("this test stores the callback, it never calls it")
+                    })
+                        as cratonvm_native_api::NativeCallback,
+                    kind: ObjectNativeKind::HashMap,
+                    native_id: None,
+                },
+            );
+        });
 
-        // Non-empty first, or the post-flush assertions prove nothing.
+        // Every memo non-empty first, or the post-flush sweep proves nothing.
         for (name, len) in site_keyed_memo_census() {
-            if name == "OBJECT_NATIVE_DISPATCH_CACHE" {
-                continue;
-            }
             assert!(
                 len > 0,
                 "{name} was not populated by this test. A site-keyed memo added to \

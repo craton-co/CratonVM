@@ -30,11 +30,20 @@ The 08-05 Azure full suite ran at `origin/dev` @ `1078f6f05c`
 | `383e7f5cf` — recycled `JitInvokeInfo` address (**the fix**) | 13:22 | no | yes |
 
 So every class on that page was measured on a binary carrying the defect and
-neither its amplifier nor its fix. On that tree `flush_raw_entry_dispatch_caches`
-cleared exactly two memos — `DISPATCH_CACHE` and `VIRTUAL_DISPATCH_CACHE` — while
-`VIRTUAL_TARGET_CACHE`, `OBJECT_NATIVE_DISPATCH_CACHE`,
-`INTEGER_NATIVE_DISPATCH_CACHE` and both counters were flushed by neither
-trigger (verified by reading the anchor worktree, not assumed).
+neither its amplifier nor its fix. Read out of the anchor worktree, not assumed,
+that tree's flush state was:
+
+| memo | cleared on JIT generation | cleared on class-definition epoch |
+|---|---|---|
+| `DISPATCH_CACHE`, `VIRTUAL_DISPATCH_CACHE` | yes | yes |
+| `VIRTUAL_TARGET_CACHE` | **no** | yes |
+| `OBJECT_NATIVE_DISPATCH_CACHE`, `INTEGER_NATIVE_DISPATCH_CACHE`, both counters | **no** | **no** |
+
+Only the JIT-generation trigger moves when a `CompiledMethod` is published or
+dropped, which is the event that recycles a `JitInvokeInfo` address. So six of
+the eight were unprotected against recycling — `VIRTUAL_TARGET_CACHE` included,
+despite having a flush, because the epoch it hangs off does not move on a code
+lifetime event.
 
 ## The mechanism, named in these exact workloads
 
@@ -162,11 +171,12 @@ without being flushed. The compiler enforces it instead of a reviewer.
 `a_jit_generation_change_clears_every_site_keyed_memo` was also vacuous for
 three of the eight: it populated and asserted five, so dropping
 `DISPATCH_CACHE`, `VIRTUAL_DISPATCH_CACHE` or `OBJECT_NATIVE_DISPATCH_CACHE`
-from the flush would have left it green. It now populates seven (the eighth
-holds a resolved `NativeCallback` that cannot be built without a registry) and
-sweeps `site_keyed_memo_census()` — the real list — both before and after the
-flush, so a memo added later is covered the moment it is declared, and the
-pre-flush sweep fails loudly if a new memo has no population line.
+from the flush would have left it green. It now populates **all eight** —
+`OBJECT_NATIVE_DISPATCH_CACHE` needs a `NativeCallback`, which is a plain fn
+pointer and so needs no registry, since the test stores it and never calls it —
+and sweeps `site_keyed_memo_census()`, the real list, both before and after the
+flush. So a memo added later is covered the moment it is declared, and the
+pre-flush sweep names it if whoever added it forgot a population line.
 
 ## Reproduce
 
