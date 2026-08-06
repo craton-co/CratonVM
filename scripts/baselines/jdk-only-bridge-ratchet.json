@@ -1,32 +1,32 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4679,
-      "bridge_without_acc_native": 9660,
+      "bridge_shadows_bytecode": 4675,
+      "bridge_without_acc_native": 9656,
       "jdk_version": "",
       "mode": "compatible",
-      "note": "Re-freeze after dev drift: 9675->9660 and 4686->4679 both predate this change (an identical census from the pristine dev tip scores the same), so this only stops a slack-free gate from silently re-admitting 15+7. This change itself is inert on both counters, which is the expected result for a kind-statement pass: stating Bridge does not alter whether the image backs the target.",
+      "note": "Re-freeze to the merged landing tree. The count fell 9675->9660->9656 as dev moved during verification; none of it is this change, which is inert on both counters (a kind-statement pass cannot alter whether the image backs a target). Frozen here so the gate is tight for the tree that actually lands.",
       "observed": {
         "bridge": {
           "abstract_method": 1322,
           "acc_native": 774,
           "class_absent": 1191,
           "class_present_method_undeclared": 2468,
-          "rows": 10434,
-          "shadows_bytecode": 4679,
-          "without_acc_native": 9660
+          "rows": 10430,
+          "shadows_bytecode": 4675,
+          "without_acc_native": 9656
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10434,
-          "intrinsic": 687,
+          "bridge": 10430,
+          "intrinsic": 683,
           "synthetic-stub": 755
         },
         "schema": 1,
-        "total_rows": 11876
+        "total_rows": 11868
       },
       "os": "linux",
       "workload": ""

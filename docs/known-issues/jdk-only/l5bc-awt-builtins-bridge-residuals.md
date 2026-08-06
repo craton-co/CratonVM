@@ -18,10 +18,11 @@ method, so `--jdk-only` admits every one of them on a claim nobody has checked.
 >   state their kind.
 > * **The tree-wide totals this file quotes have moved and were overstated.**
 >   `bridge` is 10,434 (not 10,842) and `synthetic-stub` 755 (not 387) on
->   2026-08-06; the unadjudicated `Bridge` population is 9,660 (L6's baseline was
->   a stale 9,675 and is re-frozen here). More importantly the metric itself
->   double-counts: **1,092 of those 9,660 rows own no slot and can never
->   dispatch**, so the live surface is **8,568**. `owns_slot` is now a census
+>   2026-08-06; the unadjudicated `Bridge` population is 9,656 (L6's baseline was
+>   a stale 9,675 and is re-frozen here — it fell twice while this was being
+>   verified, 9,675 -> 9,660 -> 9,656, none of it this change's doing). More
+>   importantly the metric itself double-counts: **1,092 of those rows own no slot
+>   and can never dispatch**, so the live surface is **~8,564**. `owns_slot` is now a census
 >   column rather than something a reader had to infer from row order, and
 >   `jdk-only-adjudicate.py` breaks it out as a separate addend — L6's number is
 >   left whole on purpose, for the same reason section 3 keeps the shadows
