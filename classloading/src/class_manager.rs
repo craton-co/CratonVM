@@ -2369,11 +2369,13 @@ struct RedefineInvariantSnapshot {
     /// Provenance is an invariant of the class, not of its bytes: JEP 109
     /// swaps method bodies, it does not turn a boot-image class into a
     /// fabricated one (or vice versa). Snapshotting it means a redefine that
-    /// silently rewrote `origin` — and with it the derived
-    /// `is_synthetic_stub` — trips the assertion instead of quietly changing
-    /// what the `--jdk-only` policy sees.
+    /// silently rewrote `origin` trips the assertion instead of quietly
+    /// changing what the `--jdk-only` policy sees.
+    ///
+    /// This used to be snapshotted twice — once as `origin`, once as the
+    /// derived `is_synthetic_stub` bool. The bool is gone (2026-08-06); the
+    /// origin is the single source of truth, and comparing it covers both.
     origin: ClassOrigin,
-    is_synthetic_stub: bool,
     has_finalizer: bool,
     code_source_present: bool,
     array_info_present: bool,
@@ -2418,7 +2420,6 @@ impl RedefineInvariantSnapshot {
             hidden,
             module_name,
             origin,
-            is_synthetic_stub,
             has_finalizer,
             code_source,
             array_info,
@@ -2463,7 +2464,6 @@ impl RedefineInvariantSnapshot {
             hidden: *hidden,
             module_name: module_name.clone(),
             origin: origin.clone(),
-            is_synthetic_stub: *is_synthetic_stub,
             has_finalizer: *has_finalizer,
             code_source_present: code_source.is_some(),
             array_info_present: array_info.is_some(),
@@ -2571,10 +2571,6 @@ impl RedefineInvariantSnapshot {
         debug_assert_eq!(
             self.origin, after.origin,
             "redefine_class mutated Class::origin on {class_name}"
-        );
-        debug_assert_eq!(
-            self.is_synthetic_stub, after.is_synthetic_stub,
-            "redefine_class mutated Class::is_synthetic_stub on {class_name}"
         );
         debug_assert_eq!(
             self.has_finalizer, after.has_finalizer,
@@ -3449,7 +3445,7 @@ impl ClassManager {
         let fabricated = self.fabricate_class(
             name,
             num_fields,
-            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
+            fabricated_origin_for_name(name),
             // Record the `--jdk-only` violation, then fabricate anyway — there
             // is no error channel on this signature. NOTE: `enforce` governs
             // only the jdk-only refusal. The ambiguity refusal added below is
@@ -3500,12 +3496,7 @@ impl ClassManager {
         name: &str,
         num_fields: usize,
     ) -> Result<ClassId, VmError> {
-        self.fabricate_class(
-            name,
-            num_fields,
-            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
-            true,
-        )
+        self.fabricate_class(name, num_fields, fabricated_origin_for_name(name), true)
     }
 
     /// Register a VM-generated class with an explicit, legitimate provenance.
@@ -3622,41 +3613,39 @@ impl ClassManager {
     /// allocation of a stub-backed container re-enters here), and counting
     /// them would bury the handful of names that actually have no bytes.
     ///
-    // JDK-ONLY-WAVE2: every class minted here is labelled with whatever
-    // `origin` the caller passed, and `ensure_synthetic_class` — still the
-    // overwhelming majority of the traffic — passes `CompatibilityStub`. That
-    // over-reports: two of its callers are not compatibility substitutions at
-    // all.
+    // JDK-ONLY-WAVE2, CLOSED 2026-08-06: every class minted here is labelled
+    // with whatever `origin` the caller passed. `ensure_synthetic_class` used to
+    // pass `CompatibilityStub` unconditionally, which over-reported two of its
+    // callers. Both are now classified by name in
+    // [`fabricated_origin_for_name`], so the caller no longer decides:
     //   * `cratonvm/synthetic/AnonymousObject$N` — the untyped allocation
     //     shape behind every `HashMap`/`LinkedHashMap` node and friends
-    //     (`alloc_concurrent_synthetic` in `native-builtins`). It is
-    //     `ClassOrigin::VmInternal`: a VM bookkeeping type that never had, and
-    //     never will have, a class file. **DONE (2026-08-04)** — the minting
-    //     site in `vm_exec::heap_alloc_object` now calls
-    //     [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
-    //     because the class is inert at every `is_synthetic_stub` read site:
-    //     no native is registered on it, neither real-protected-stub allow-list
-    //     names it, and the `Proxy$Instance` / collection-iterator special
-    //     cases below key on the *name*, not the origin.
-    //   * `java/lang/reflect/Proxy$Instance` — the synthetic supertype of
-    //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). It is
-    //     a generation artefact, not a stand-in for absent bytes. **STILL
-    //     OPEN**, and the original prescription of `GeneratedProxy` was wrong:
-    //     that variant carries `interfaces: Arc<[ClassId]>`, which the shared
-    //     *supertype* has no meaningful value for, and
-    //     `is_generated_proxy_name` in this file already says in terms that
-    //     `Proxy$Instance` "must NOT be counted as a generated proxy". The
-    //     right origin is `VmInternal`. What is not yet established is whether
-    //     flipping it is safe: unlike `AnonymousObject$N` it has a
-    //     NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods`, is
-    //     special-cased twice in this function, and is the superclass every
-    //     `$ProxyN` links against — so it needs the regression suite, not an
-    //     argument.
-    // Classifying either honestly flips the derived `is_synthetic_stub` bool
-    // from `true` to `false` for classes that ~181 read sites already reason
-    // about, which is a *Compatible-mode* behaviour change. That is why the
-    // flavour is also kept in the `reason` string, and why the two are being
-    // migrated one at a time with evidence rather than as a pair.
+    //     (`alloc_concurrent_synthetic` in `native-builtins`). **DONE
+    //     (2026-08-04)** — the minting site in `vm_exec::heap_alloc_object`
+    //     calls [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
+    //     because the class is inert at every read site: no native is registered
+    //     on it, neither real-protected-stub allow-list names it, and the
+    //     `Proxy$Instance` / collection-iterator special cases below key on the
+    //     *name*, not the origin.
+    //   * `java/lang/reflect/Proxy$Instance` — the VM's own supertype for
+    //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). A
+    //     generation artefact, not a stand-in for absent bytes. **DONE
+    //     (2026-08-06)**, as `VmInternal`: `GeneratedProxy` was the wrong
+    //     prescription (it carries `interfaces: Arc<[ClassId]>`, which the
+    //     shared *supertype* has no value for) and `is_generated_proxy_name`
+    //     already says in terms that this name "must NOT be counted as a
+    //     generated proxy".
+    //
+    // What made the second one hard: unlike `AnonymousObject$N` it has a
+    // NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods` and native
+    // registrations of its own, so it genuinely needs the dispatch branches
+    // that used to be selected by the derived `is_synthetic_stub` bool —
+    // flipping the origin alone would have moved it off three of them. The
+    // prerequisite was splitting that bool's two meanings; those sites now ask
+    // [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
+    // which answers the dispatch question directly and gives the same answer for
+    // this class before and after. See
+    // `docs/internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
     #[track_caller]
     fn fabricate_class(
         &mut self,
@@ -3680,7 +3669,7 @@ impl ClassManager {
             let is_synthetic = self
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             // HIB-DEV-03: skip the full-classpath upgrade rescan once we've
             // learned the real `.class` is absent — otherwise every
@@ -3912,7 +3901,6 @@ impl ClassManager {
             // Overwritten (together with `is_synthetic_stub`) by the
             // `set_origin` call below — the only writer of either field.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -4367,7 +4355,7 @@ impl ClassManager {
                     let is_real = self
                         .class_store
                         .get(class_id)
-                        .map(|c| !c.is_synthetic_stub)
+                        .map(|c| !c.origin.is_compatibility_stub())
                         .unwrap_or(false);
                     if is_real {
                         loaded += 1;
@@ -4566,7 +4554,7 @@ impl ClassManager {
             let is_synthetic = self
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             // HIB-DEV-03: skip the full-classpath upgrade rescan once the real
             // `.class` is known absent (re-armed on classpath extension) so a
@@ -5209,7 +5197,7 @@ impl ClassManager {
                 let is_stub = self
                     .class_store
                     .get(existing_id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if is_stub {
                     self.upgrade_synthetic_class(
@@ -5816,7 +5804,6 @@ impl ClassManager {
             // Installed together with the derived `is_synthetic_stub` by the
             // `set_origin` call below.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
             array_info: None,
@@ -5877,7 +5864,7 @@ impl ClassManager {
         // even when the assignability verdicts are not.
         let skip_all_verification = options.skip_verification
             || self.cds_class_cache.contains_key(name)
-            || class.is_synthetic_stub
+            || class.origin.is_compatibility_stub()
             || class.state == ClassState::Verified;
         if !skip_all_verification {
             let hierarchy = ClassStoreHierarchy {
@@ -7599,7 +7586,7 @@ impl ClassManager {
         let verify_skip = self
             .class_store
             .get(class_id)
-            .map(|c| c.is_synthetic_stub)
+            .map(|c| c.origin.is_compatibility_stub())
             .unwrap_or(false)
             || self.skip_bytecode_verification.contains(&class_id);
 
@@ -8795,7 +8782,6 @@ impl ClassManager {
             module_name: None,
             // Set together with `is_synthetic_stub` by `set_origin` below.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
@@ -9246,7 +9232,6 @@ impl ClassManager {
             // construction. Set directly (not via `set_origin`) because the
             // derived bool is written in the same literal, one line down.
             origin: ClassOrigin::VmArray,
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -10226,6 +10211,12 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/TreeSet" => "java/util/AbstractSet",
         "java/util/EnumSet" => "java/util/AbstractSet",
         "java/util/concurrent/CopyOnWriteArraySet" => "java/util/AbstractSet",
+        // `ConcurrentHashMap.newKeySet()` / `keySet(V)`. The real JDK parent is
+        // the package-private `CollectionView`, which contributes the same one
+        // field (`map`) the stub layout below already declares by name; naming
+        // `AbstractSet` here instead gives the synthetic stub the `Set` dispatch
+        // chain without a second stub class whose only job is to hold `map`.
+        "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
         // Concrete List/Queue hierarchy:
@@ -10338,7 +10329,11 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         | "java/util/TreeSet"
         | "java/util/EnumSet"
         | "java/util/concurrent/CopyOnWriteArraySet"
-        | "java/util/concurrent/ConcurrentSkipListSet" => &[
+        | "java/util/concurrent/ConcurrentSkipListSet"
+        // `newKeySet()`'s product. Without `Set` here the synthetic stub is not
+        // `instanceof Set`, and `AbstractSet.equals`'s "a Set equals only
+        // another Set" guard answers false for a set that is plainly equal.
+        | "java/util/concurrent/ConcurrentHashMap$KeySetView" => &[
             "java/util/Set",
             "java/util/Collection",
             "java/lang/Iterable",
@@ -10682,6 +10677,69 @@ fn is_generated_proxy_name(name: &str) -> bool {
 fn is_reflection_accessor_name(name: &str) -> bool {
     let simple = simple_name_of(name);
     simple.starts_with("Generated") && simple.contains("Accessor")
+}
+
+/// This VM's own invented supertype for dynamic proxies.
+///
+/// `java/lang/reflect/Proxy$Instance` is a name no JDK declares and no class
+/// file can ever back. `proxy_gen` emits every `$ProxyN` extending it (unless
+/// `CRATONVM_REAL_PROXY_SUPER=0` is unset — by default `real_proxy_super()` is
+/// on and `$ProxyN` extends the real `java.lang.reflect.Proxy` instead), and
+/// `reflect_annotations.rs` registers `<init>` / `getProxyInterfacesNative`
+/// natives on it. That makes it a *generation artefact*, not a stand-in for
+/// bytes that should have been found.
+pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
+    name == "java/lang/reflect/Proxy$Instance"
+}
+
+/// The origin a **fabricated** class deserves on the strength of its name
+/// alone.
+///
+/// [`ClassManager::ensure_synthetic_class`] and
+/// [`ClassManager::try_ensure_synthetic_class`] used to hard-code
+/// [`ClassOrigin::CompatibilityStub`] for everything they minted. That is right
+/// for the overwhelming majority — a name whose real bytes were not found — and
+/// wrong for the handful of names the VM *invents*, which have no real bytes to
+/// find and are not standing in for anyone's class:
+///
+/// * `java/lang/reflect/Proxy$Instance` → [`ClassOrigin::VmInternal`].
+///   `is_generated_proxy_name` above already says in terms that it "must NOT be
+///   counted as a generated proxy", and [`ClassOrigin::GeneratedProxy`] carries
+///   an `interfaces` list the shared *supertype* has no value for. The
+///   dispatch consequences of the flip are handled by
+///   [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
+///   which is what the three read sites that can observe this class now ask.
+/// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
+///   `Generated*Accessor*` is what generated it, exactly as
+///   [`ClassManager::classify_defined_origin`] already reports for the same
+///   names when they arrive with real bytes. Neither path may report the same
+///   class differently depending on whether it happened to be fabricated.
+///   Measured 2026-08-05 (L7) and again 2026-08-06: **none of the three fires**
+///   on a strict boot, `JdkOnlyCensusLoadProbe` or `JdkOnlyBreadthProbe`. They
+///   are here so the classification cannot drift, not because anything hits
+///   them — which is the permanent form of the one-off audit the wave-2 record
+///   asked for.
+///
+/// `host`/`interfaces` are empty rather than guessed: this path has no class
+/// file, so there is no nest host to read and no resolved interface set. A
+/// fabricated generated-name class is a pathology worth seeing in the census
+/// with its producer named, not a place to invent metadata.
+fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
+    if is_vm_proxy_supertype_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_generated_lambda_name(name) {
+        return ClassOrigin::GeneratedLambda { host: None };
+    }
+    if is_generated_proxy_name(name) {
+        return ClassOrigin::GeneratedProxy {
+            interfaces: Arc::from(Vec::new()),
+        };
+    }
+    if is_reflection_accessor_name(name) {
+        return ClassOrigin::ReflectionAccessor { host: None };
+    }
+    ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON)
 }
 
 fn is_jdk_class(name: &str) -> bool {
@@ -11096,6 +11154,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/util/EnumMap"
         | "java/util/Hashtable"
         | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
+        // `ConcurrentHashMap$KeySetView` — the JDK's own two fields, named, so
+        // `resolve_field_index_by_class_id` finds the same slots in synthetic
+        // mode that it finds against the real class (`CollectionView.map` and
+        // `KeySetView.value`).
+        "java/util/concurrent/ConcurrentHashMap$KeySetView" => vec![
+            named_field("map", "Ljava/util/concurrent/ConcurrentHashMap;"),
+            named_field("value", "Ljava/lang/Object;"),
+        ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields
@@ -11954,6 +12020,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // above describes — and every node would then answer `isUserNode()`
         // with the default rather than the tree it was created for.
         "java/util/prefs/Preferences" => instance_fields(6),
+        // Same layout, and it is reachable now that
+        // `AbstractPreferences(AbstractPreferences, String)` is registered: a
+        // user `class X extends AbstractPreferences` is constructed through
+        // that constructor, and its slots have to exist before the constructor
+        // writes them.
+        "java/util/prefs/AbstractPreferences" => instance_fields(6),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -14096,6 +14168,7 @@ fn native_constant_surface_raw_slot_layout_audit() {
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),
         ("java/util/prefs/Preferences", 6),
+        ("java/util/prefs/AbstractPreferences", 6),
         ("com/sun/net/httpserver/HttpServer", 6),
         ("com/sun/net/httpserver/HttpServerImpl", 6),
         ("sun/net/httpserver/HttpServerImpl", 6),
@@ -16233,7 +16306,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16295,7 +16367,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16334,7 +16405,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16428,7 +16498,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::compatibility_stub("test fixture: hand-built synthetic stub"),
-            is_synthetic_stub: true,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16468,7 +16537,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16654,7 +16722,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16927,7 +16994,7 @@ mod tests {
             .class_store
             .get(class_id)
             .expect("upgraded class remains registered");
-        assert!(!class.is_synthetic_stub);
+        assert!(!class.origin.is_compatibility_stub());
         assert_eq!(class.state, ClassState::Loaded);
         assert_eq!(class.initializing_thread, None);
         assert_eq!(
@@ -17698,7 +17765,7 @@ mod tests {
             .expect("array class must be registered in ClassStore");
         assert_eq!(&*array_class.name, "[Ljava/util/HashMap;");
         assert!(
-            !array_class.is_synthetic_stub,
+            !array_class.origin.is_compatibility_stub(),
             "array classes are synthesised, not stubbed",
         );
         assert!(
@@ -17747,7 +17814,7 @@ mod tests {
         let inner = mgr
             .get_class(inner_id)
             .expect("inner array class must be registered");
-        assert!(!inner.is_synthetic_stub);
+        assert!(!inner.origin.is_compatibility_stub());
         assert_eq!(&*inner.name, "[Ljava/lang/Object;");
     }
 
@@ -17759,7 +17826,7 @@ mod tests {
 
         let int_arr = mgr.load_class("[I").expect("[I synthesis must succeed");
         let int_arr_class = mgr.get_class(int_arr).unwrap();
-        assert!(!int_arr_class.is_synthetic_stub);
+        assert!(!int_arr_class.origin.is_compatibility_stub());
         assert_eq!(&*int_arr_class.name, "[I");
 
         let int_arr_arr = mgr.load_class("[[I").expect("[[I synthesis must succeed");
@@ -17871,7 +17938,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18011,7 +18077,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18059,7 +18124,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18108,7 +18172,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18176,7 +18239,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18229,7 +18291,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: true,
             signature: None,
             code_source: None,
@@ -18273,7 +18334,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18454,7 +18514,7 @@ mod tests {
         assert_eq!(&*cls.name, "java/lang/Object");
         assert!(cls.superclass.is_none(), "Object should have no superclass");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Object should NOT be a synthetic stub — it came from real bytecode"
         );
 
@@ -18463,7 +18523,7 @@ mod tests {
             class_id,
             cls.methods.len(),
             cls.fields.len(),
-            cls.is_synthetic_stub
+            cls.origin.is_compatibility_stub()
         );
     }
 
@@ -18600,7 +18660,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18864,7 +18923,7 @@ mod tests {
         assert!(
             mgr.class_store
                 .get(id)
-                .is_some_and(|c| c.is_synthetic_stub),
+                .is_some_and(|c| c.origin.is_compatibility_stub()),
             "fixture must actually be a compatibility stub",
         );
 
@@ -18991,7 +19050,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -19061,7 +19119,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -19140,7 +19197,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,

@@ -1,4 +1,18 @@
-# L11 — Items 3 + 7: delete the hard-coded lists — **item 3 DONE 2026-08-04**
+# L11 — Items 3 + 7: delete the hard-coded lists — **DONE** (item 3 2026-08-04, item 7 2026-08-06)
+
+> **Item 7 closed 2026-08-06.** All eight `ThreadPoolExecutor.execute`
+> receiver-shape sites, the ninth receiver-blind `force_native_over_real_jdk_bytecode`
+> arm, the `threadpool_executor_has_real_workers` helper and the
+> `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` census constant are deleted.
+> L10 turned out not to be a blocker — it was already satisfied, and measuring
+> that is what unblocked this. What replaced the lists is the same move item 3
+> made: the decision went to REGISTRATION. `native_es_execute` is tagged
+> `NativeKind::SyntheticStub` and `java/util/concurrent/ThreadPoolExecutor` is
+> on `real_protected_stub_class_common`'s allow-list, so the one centralised
+> arbitration yields it to the real `execute()` body class-scoped, on both the
+> warm and the cold path. Outcome record:
+> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+
 
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
 `vm/src/vm/vm_exec.rs` (dispatch regions ~14700 and ~22700)
@@ -57,6 +71,34 @@ partial sweep — so a half-done deletion is caught rather than shipped.
 were reconciled into one predicate on 2026-08-04, after the defect that forced
 the divergence was re-measured and did not reproduce.
 
+## The standing rule: gate, do not remove
+
+**Read `README.md`'s *The end state is two modes, and it is a rename* before
+deleting anything in this lane.** It governs, and it is easy to violate here
+because this lane's title is the word "delete".
+
+The short form: the three modes collapse to two, by renaming rather than by
+purging. Today's `--jdk-only` becomes `--real-jdk`; today's `--real-jdk`
+becomes `--synthetic-jdk`. **A native that is load-bearing in either surviving
+mode must survive.** Strict mode declines to *admit* it; nothing deletes it.
+
+Applied to this lane, that draws a line straight through the middle of item 7:
+
+| | Verdict |
+|---|---|
+| the eight receiver-shape **dispatch sites** | **Delete.** They are policy expressed at dispatch, restated once per path. Not natives. |
+| the ninth **receiver-blind arm** in `force_native_over_real_jdk_bytecode` | **Delete.** Same — a policy list, not an implementation. |
+| item 3's **`String` policy lists** | **Deleted 2026-08-04.** Same category. |
+| `native_es_execute` itself | **KEEP.** Retag it `NativeKind::SyntheticStub` so strict refuses it at registration. It is the only `ExecutorService.execute` implementation the `--features synthetic-jdk` build has. |
+| `executor_has_real_workers` / `tp_is_real` (the callee-side backstops) | **KEEP**, per the evidence record's *Not in this list*. |
+
+So this doc's own sentence — the evidence record's *"`native_es_execute` can go
+away entirely"* — **is wrong under the rule and must not be executed.** What
+goes away is its *admission* in strict mode, which the reclassification in step
+2 already achieves. Deleting the Rust function would take
+`Executors.new*ThreadPool()` out of the synthetic build, which has no real
+`ThreadPoolExecutor` bytecode to fall back to.
+
 ## The trap, in both directions
 
 From item 8's history, which cost a session: *both* naive directions reintroduce
@@ -70,12 +112,32 @@ condition that required it is provably gone — which is what L9 and L10 deliver
 ## Steps
 
 1. Confirm L9's exit criterion: the `String` lists removed, strict boot clean.
-2. Confirm L10's: `threadpool_executor_has_real_workers` true for every executor
-   the factories produce.
+   ~~2. Confirm L10's~~ **— done 2026-08-06.** `threadpool_executor_has_real_workers`
+   is true for every executor the factories produce, and true by construction
+   rather than conditionally: real-JDK mode registers no `Executors` pool
+   factory at all, so nothing can mint a receiver the real `<init>` did not
+   build. Measured `true=62 false=0` / `true=38 false=0` over both
+   strict-corpus workloads in both modes with `CRATONVM_DBG_TPE_SHAPE`. See
+   `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`. **Do not
+   re-derive this from the transcript** — the census probe's `concurrent`
+   section matched HotSpot *before* L10 as well as after, so a green transcript
+   is not evidence for step 2's precondition. Run the flag.
 3. Delete item 3's lists; run the 29-shape verdict table — it should now be
    uniform, and if it is not, the deletion is premature.
-4. Delete item 7's eight sites and the ninth arm; the partial-sweep gate must go
-   green *because there is nothing left to sweep*, not because it was relaxed.
+4. ~~Delete item 7's eight sites and the ninth arm~~ **- done 2026-08-06.** The
+   partial-sweep gate went green because there was nothing left to sweep, and
+   was then replaced by `every_threadpool_receiver_shape_site_is_gone`, which
+   asserts ZERO call sites and zero hand-inlined `workers` lookups across the
+   four files that carried them - what can regress now is a copy growing back,
+   not a partial removal. What replaced the sites is the same move step 3
+   made: `native_es_execute` is tagged `NativeKind::SyntheticStub` and
+   `java/util/concurrent/ThreadPoolExecutor` is on
+   `real_protected_stub_class_common`'s allow-list, so the one centralised
+   arbitration answers the question class-scoped for every receiver on both
+   dispatch paths. `CRATONVM_DBG_TPE_SHAPE` and
+   `probes/L10ShapeInstrumentControlProbe` were retired with the predicate
+   they instrumented. Outcome record:
+   `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
 5. Replace both with `resolve_dispatch`. §7 step 3 already fires ~3,344 times per
    short run, so this path is exercised — but see the caution below.
 

@@ -138,6 +138,18 @@ const CF_HAS_NAME: u16 = 1 << 9;
 /// entirely for an identity-map receiver — see `map_hash_key_identity`
 /// and `map_keys_equal_identity`.
 const CF_IDENTITY_MAP: u16 = 1 << 10;
+/// Exact class is `java/util/concurrent/ConcurrentHashMap$KeySetView` — the
+/// object `newKeySet()` / `keySet(V)` hands back.
+///
+/// It is neither HashSet-shaped nor ArrayList-shaped: slot 0 is the backing
+/// `ConcurrentHashMap`, whose own slot 0 is a segments array rather than a
+/// bucket table. The interface-level natives (`java/util/Set.size`,
+/// `java/util/Collection.iterator`, …) would read those slots as their own
+/// layout and answer 0 / null, so they consult this bit and reroute — see
+/// `ksv_route`. A memoized bit rather than a `class_name_of_id` call because
+/// those natives are on the hot path for every ordinary HashSet and ArrayList
+/// too (see the `collections-classification-cost` notes above).
+const CF_KEY_SET_VIEW: u16 = 1 << 11;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +300,13 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
                 _ => break,
             }
         }
+    }
+    // `ConcurrentHashMap$KeySetView` decides no family question the
+    // `WellKnownClass` chain walk above answers — it is an exact-class test on
+    // one name — so it gets the same one-name treatment as `IdentityHashMap`
+    // rather than a 17th variant. Paid once per `ClassId`, then cached forever.
+    if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+        flags |= CF_KEY_SET_VIEW;
     }
     ClassFacts(flags)
 }
@@ -1192,10 +1211,7 @@ impl DenseIntEntries {
             // `resize`, an occupied-slot probe, and sparse lookup are all
             // redundant when this is exactly the next dense slot and no
             // sparse entry can already own it.
-            if index <= Self::MAX_DENSE_KEY
-                && index == self.dense.len()
-                && self.sparse.is_empty()
-            {
+            if index <= Self::MAX_DENSE_KEY && index == self.dense.len() && self.sparse.is_empty() {
                 let seq = self.note_fresh_insert();
                 self.dense.push(Some(value));
                 if seq != key as u64 {
@@ -1851,8 +1867,29 @@ fn dbg_kcbool_report_miss(
     }
 }
 
-/// Create an iterator backed by a snapshot array of the given size.
-/// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
+/// Create an iterator over a snapshot array of the given size.
+///
+/// Returns a real `java.util.Arrays$ArrayItr` — the JDK's own `Object[]`
+/// iterator — so `getClass()`, `hasNext()`, `next()` and the `remove()` that
+/// throws are all the real thing. It falls back to the historical
+/// `HashMap$KeyItr` shape (field 0 = array, 1 = cursor, 2 = total) only when
+/// the image has no `Arrays$ArrayItr` to build, i.e. a `synthetic-jdk` build.
+///
+/// This used to mint `HashMap$KeyItr` unconditionally, and two things were
+/// wrong with that. The visible one: no JDK declares that class, so
+/// `Arrays.asList(a).iterator().getClass()` reported `java.util.HashMap$KeyItr`
+/// where HotSpot says `java.util.Arrays$ArrayItr` — measured by
+/// `probes/StrictIterPrimitivesProbe`. The structural one: it minted through
+/// the INFALLIBLE `alloc_synthetic` while three sibling sites used the fallible
+/// spelling, so under `--jdk-only` the refusal was order-dependent rather than
+/// a policy — `Arrays.asList(a).iterator()` created the class and every LATER
+/// `try_alloc_synthetic` for that name then found it and succeeded, which is
+/// why `linkedhashset.iterator()` passed in a probe that had called
+/// `Arrays.asList` first and threw `NoClassDefFoundError` in one that had not.
+///
+/// Building the real class costs one allocation and two field writes, against
+/// one allocation and three writes for the fabricated shape, so the honest
+/// version is not the expensive one — see `probes/SnapshotIteratorCostProbe`.
 pub fn make_iterator_from_array(
     ctx: &mut dyn NativeContext,
     snapshot_array: ObjectRef,
@@ -1864,23 +1901,53 @@ pub fn make_iterator_from_array(
     // through their pins. Covered by
     // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
     let array_pin = ctx.pin_native_root(snapshot_array);
-    // Fallible since 2026-08-05: this was the LAST infallible `HashMap$KeyItr`
-    // fabrication, and while it stood the refusal at the other three sites was
-    // order-dependent rather than a policy. `probes/StrictIterPrimitivesProbe`
-    // caught it under `--jdk-only`: `Arrays.asList(a).iterator()` reaches this
-    // helper, fabricates the class, and every LATER `try_alloc_synthetic` for
-    // the same name then finds it and succeeds — so
-    // `linkedhashset.iterator()` passed in a probe that had called
-    // `Arrays.asList` first and threw `NoClassDefFoundError` in one that had
-    // not. Route the refusal here too, so no snapshot iterator anywhere wears
-    // a fabricated class name in strict mode.
+    // The real iterator reads `a.length`, so a caller that over-allocated its
+    // snapshot has to be trimmed first — `real_snapshot_iterator` does that and
+    // then builds the same shape.
+    if ctx.array_length(snapshot_array) != size {
+        let cur = ctx.read_native_pin(array_pin, snapshot_array);
+        match real_snapshot_iterator(ctx, cur, size) {
+            Ok(v) => {
+                ctx.unpin_native_roots(array_pin);
+                return Ok(v);
+            }
+            // Only reachable in an image with no `Arrays$ArrayItr`. Re-read the
+            // array through its pin BEFORE dropping it: `real_snapshot_iterator`
+            // allocated, so the bare local above is stale by now, and handing a
+            // from-space reference to the fallback would store a dead array in
+            // the iterator. Nothing allocates between this unpin and the re-pin
+            // the callee takes as its first action.
+            Err(_) => {
+                let cur = ctx.read_native_pin(array_pin, snapshot_array);
+                ctx.unpin_native_roots(array_pin);
+                return make_fabricated_iterator_from_array(ctx, cur, size);
+            }
+        }
+    }
+    let snapshot_array_cur = ctx.read_native_pin(array_pin, snapshot_array);
+    if let Some(itr) = alloc_real_array_iterator(ctx, snapshot_array_cur) {
+        ctx.unpin_native_roots(array_pin);
+        return Ok(Some(Value::Object(Some(itr))));
+    }
+    let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
+    ctx.unpin_native_roots(array_pin);
+    make_fabricated_iterator_from_array(ctx, snapshot_array, size)
+}
+
+/// The pre-2026-08-06 snapshot-iterator shape, kept for images with no real
+/// `java.util.Arrays$ArrayItr` to build (`synthetic-jdk`). Under `--jdk-only`
+/// the fabrication is refused, and correctly: no JDK declares this class.
+fn make_fabricated_iterator_from_array(
+    ctx: &mut dyn NativeContext,
+    snapshot_array: ObjectRef,
+    size: usize,
+) -> MethodCallResult {
+    let array_pin = ctx.pin_native_root(snapshot_array);
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3) {
         Ok(itr) => itr,
-        Err(_refused) => {
-            let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
-            let real = real_snapshot_iterator(ctx, snapshot_array, size);
+        Err(refused) => {
             ctx.unpin_native_roots(array_pin);
-            return real;
+            return Err(refused);
         }
     };
     let itr_pin = ctx.pin_native_root(itr);
@@ -1946,32 +2013,102 @@ fn real_snapshot_iterator(
         }
         exact
     };
-    let arr_pin = ctx.pin_native_root(arr);
-    let list = ctx.new_object_initialized(
-        "java/util/Arrays$ArrayList",
-        "([Ljava/lang/Object;)V",
-        &[Value::Object(Some(arr))],
-    );
-    ctx.unpin_native_roots(arr_pin);
-    match list? {
-        Some(Value::Object(Some(list))) => {
-            ctx.invoke_virtual_bytecode_only(list, "iterator", "()Ljava/util/Iterator;", &[])
-        }
-        // No real `Arrays$ArrayList` to wrap it in. Nothing is left to fall
-        // back TO — returning the fabricated shape here would defeat the whole
-        // point — so surface a refusal naming the class that is actually
-        // missing, rather than the synthetic one the caller asked for.
-        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+    match alloc_real_array_iterator(ctx, arr) {
+        Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+        // Nothing is left to fall back TO — returning the fabricated shape
+        // here would defeat the whole point — so surface a refusal naming the
+        // class that is actually missing, not the synthetic one the caller
+        // asked for.
+        None => Err(cratonvm_native_api::refusal_to_java_failure(
             ctx,
             cratonvm_native_api::ClassIdentityError::Refused {
-                name: "java/util/Arrays$ArrayList".to_string(),
-                reason: "--jdk-only: a snapshot iterator needs the real \
-                         fixed-size list to stand in for the refused \
+                name: "java/util/Arrays$ArrayItr".to_string(),
+                reason: "--jdk-only: a snapshot iterator needs the real array \
+                         iterator to stand in for the refused \
                          `java.util.HashMap$KeyItr`, and this image has none"
                     .to_string(),
             },
         )),
     }
+}
+
+/// Allocate a real `java.util.Arrays$ArrayItr` over `arr`, or `None` when this
+/// image has no such class.
+///
+/// `Arrays$ArrayItr` is the JDK's own iterator over a bare `Object[]`, and it
+/// declares exactly the two fields a snapshot iterator needs:
+///
+/// ```text
+///   cursor : int
+///   a      : Object[]   (final)
+/// ```
+///
+/// So this is construction, not a fabricated layout: both fields are declared
+/// by the real class, both are written by NAME, and both receive a value of the
+/// declared type — the same thing `ArrayItr(E[] a)` does, minus running a
+/// constructor whose entire body is `this.a = a`. Everything the iterator then
+/// does — `hasNext`, `next`, and the inherited `remove` that throws — is real
+/// JDK bytecode reading real fields.
+///
+/// `arr` must ALREADY be exactly the logical length: `hasNext()` is
+/// `cursor < a.length`, so an over-allocated snapshot would iterate trailing
+/// nulls. Both callers trim first.
+///
+/// Returns `None` rather than fabricating anything, so a build without the real
+/// `java.util` (the `synthetic-jdk` feature) keeps its old shape instead of
+/// losing the ability to make an iterator at all.
+fn alloc_real_array_iterator(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Option<ObjectRef> {
+    alloc_real_snapshot_iterator_of(ctx, "java/util/Arrays$ArrayItr", "a", arr)
+}
+
+/// Build a real snapshot iterator of `class_name`, whose backing array lives in
+/// the field `array_field` and whose position lives in `cursor`.
+///
+/// The JDK has more than one iterator of exactly this shape, and which one is
+/// correct depends on the collection that produced it:
+///
+/// ```text
+///   java.util.Arrays$ArrayItr                            a         cursor
+///   java.util.concurrent.CopyOnWriteArrayList$COWIterator snapshot cursor
+/// ```
+///
+/// Both are array-plus-position, both snapshot at creation, and both inherit or
+/// declare a `remove()` that throws — which is why one helper serves both and
+/// why the choice is the CALLER's: returning an `Arrays$ArrayItr` from
+/// `CopyOnWriteArrayList.iterator()` iterates correctly but reports the wrong
+/// `getClass()`, and `probes/SnapshotIteratorShapeProbe` measures exactly that.
+pub fn alloc_real_snapshot_iterator_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    array_field: &str,
+    arr: ObjectRef,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    // `ensure_class_initialized` reports success with another class's id for
+    // some loader fallbacks. The real class or nothing.
+    if ctx.class_name_of_id(cid).unwrap_or_default() != class_name {
+        return None;
+    }
+    let a_slot = ctx.resolve_field_index(class_name, array_field)?;
+    let cursor_slot = ctx.resolve_field_index(class_name, "cursor")?;
+    let n_fields = ctx
+        .class_num_total_fields(cid)
+        .max(a_slot.max(cursor_slot) + 1);
+    // GC-SAFETY: `alloc_object` collects, and `arr` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins — the contract `make_iterator_from_array`
+    // documents, and what `gc_native_pins` covers.
+    let arr_pin = ctx.pin_native_root(arr);
+    let itr = ctx.alloc_object(cid, n_fields);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(itr, a_slot, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(arr_pin);
+    Some(itr)
 }
 
 fn native_unsorted_set_comparator(
@@ -2558,15 +2695,13 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
     &seg_locks()[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
-static SEG_RESIZE_EPOCHS: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
+static SEG_RESIZE_EPOCHS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
 
 fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_RESIZE_EPOCHS.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_RESIZE_EPOCHS.get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 // Validity generation for the per-thread CHM String-node memo. Every CHM
@@ -2588,25 +2723,23 @@ fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
 // is around `monitor_enter` — i.e. a host mutex held across a GC-safepoint
 // park. A thread blocked on such a mutex is not at a safepoint, so it would
 // stall every collection queued behind it.
-static SEG_MUTATION_EPOCHS: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
-static SEG_MUTATION_ACTIVE: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
+static SEG_MUTATION_EPOCHS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
+static SEG_MUTATION_ACTIVE: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
 
 fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_MUTATION_EPOCHS.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_MUTATION_EPOCHS
+        .get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 fn chm_seg_mutation_active(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_MUTATION_ACTIVE.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_MUTATION_ACTIVE
+        .get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 /// `(epoch, in-flight mutators)` for the stripe owning `seg_id`. The in-flight
@@ -2633,13 +2766,17 @@ impl ChmSegmentResizeGuard {
         let lock = chm_seg_lock_for(seg_id).write();
         let epoch = chm_seg_resize_epoch(seg_id);
         epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self { epoch, lock: Some(lock) }
+        Self {
+            epoch,
+            lock: Some(lock),
+        }
     }
 }
 
 impl Drop for ChmSegmentResizeGuard {
     fn drop(&mut self) {
-        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.lock.take();
     }
 }
@@ -3897,6 +4034,74 @@ fn unmod_view_size(al_state_data: Option<ObjectRef>, al_state_size: i32) -> Opti
     al_state_data.map(|_| al_state_size.max(0))
 }
 
+/// Whether a `cratonvm/internal/Unmodifiable*` receiver came from an
+/// *immutable* factory (`List.of` / `copyOf`) rather than from
+/// `Collections.unmodifiable*`.
+///
+/// Slot 1 is [`UNMOD_FIELD_IMMUTABLE`], stamped by `freeze_result`. CONTRACT:
+/// mirrors `getclass_immutable_marker` in native-builtins, which reads the same
+/// slot to decide whether `getClass()` reports `ImmutableCollections$*` or
+/// `Collections$Unmodifiable*`.
+fn unmod_is_immutable(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, UNMOD_FIELD_IMMUTABLE), Value::Int(1))
+}
+
+/// The out-of-range error for an unmodifiable/immutable list wrapper, or `None`
+/// to stand aside and let the backing's own `get` throw.
+///
+/// HotSpot has three answers here and this VM funnels all three through one
+/// synthetic class — but not through one *object shape*. Measured on Temurin 25
+/// with `probes/ListOutOfBoundsProbe`:
+///
+/// ```text
+/// List.of("a").get(3)                       IndexOutOfBoundsException  "Index: 3 Size: 1"
+/// List.of("a","b").get(2)                   IndexOutOfBoundsException  "Index: 2 Size: 2"
+/// List.of().get(0)                          ArrayIndexOutOfBounds...   "Index 0 out of bounds for length 0"
+/// List.of("a","b","c").get(3)               ArrayIndexOutOfBounds...   "Index 3 out of bounds for length 3"
+/// unmodifiableList(new ArrayList(1)).get(3) IndexOutOfBoundsException  "Index 3 out of bounds for length 1"
+/// unmodifiableList(Arrays.asList(2)).get(5) ArrayIndexOutOfBounds...   "Index 5 out of bounds for length 2"
+/// unmodifiableList(new LinkedList(2)).get(5) IndexOutOfBoundsException "Index: 5, Size: 2"
+/// ```
+///
+/// The JDK's split is `ImmutableCollections.List12` (1-2 elements, bounds-checks
+/// first, plain class) versus `ListN` (0 or 3+, indexes its array directly, so
+/// the array access throws the subclass); and `Collections.unmodifiable*` is a
+/// *view* that simply delegates, so its answer is whatever its backing throws —
+/// which is why the last three rows differ from each other despite the same
+/// wrapper.
+///
+/// The doc for this bug recorded that the `List12` case could not be told from
+/// `Collections.unmodifiableList` here. It can: [`unmod_is_immutable`] reads the
+/// marker slot, which is the same bit `getClass()` already splits on. Reproducing
+/// the JDK's shape is therefore not a guess.
+fn unmod_list_oob_error(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    index: i32,
+    size: i32,
+) -> Option<MethodCallFailed> {
+    if !unmod_is_immutable(ctx, this) {
+        // `Collections.unmodifiableList` is a view. HotSpot delegates, so the
+        // backing decides both class and wording — an ArrayList backing answers
+        // with the plain class, an `Arrays$ArrayList` with the subclass, a
+        // LinkedList with a third wording again. Pre-empting it here is what
+        // made all three look alike.
+        return None;
+    }
+    if (1..=2).contains(&size) {
+        // `ImmutableCollections.List12` — bounds-checks before indexing, so the
+        // plain class, and its own wording: a SPACE, not the comma that
+        // `ArrayList.add`'s `rangeCheckForAdd` uses.
+        return Some(
+            cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index} Size: {size}"))
+                .into(),
+        );
+    }
+    // `ImmutableCollections.ListN` (0 or 3+ elements) indexes its array
+    // directly, so the array access itself throws the subclass.
+    Some(cratonvm_types::error::RuntimeError::aioobe(index, size).into())
+}
+
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
@@ -3929,6 +4134,9 @@ fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i3
 }
 
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3952,6 +4160,9 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -4031,13 +4242,12 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         //   List.of(a,b,c,d)     -> ArrayIndexOutOfBoundsException
         //
         // i.e. the JDK splits on `ImmutableCollections.List12` vs `ListN`, which
-        // index their storage differently. Two of those three want the subclass,
-        // and this VM funnels every unmodifiable/immutable list through ONE
-        // synthetic class, so there is no discriminator here that would let the
-        // 1-2 element case be told from `Collections.unmodifiableList` over a
-        // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
-        // split would mean guessing; keeping the status quo for this path is the
-        // honest option, and it is right for 0 and 3+ elements.
+        // index their storage differently. This VM funnels every
+        // unmodifiable/immutable list through ONE synthetic class -- but not
+        // through one object shape: slot 1 carries `UNMOD_FIELD_IMMUTABLE`, and
+        // `unmod_list_oob_error` makes the split from it. See that function for
+        // the measured table and for why the `Collections.unmodifiable*` case
+        // must delegate rather than answer here.
         //
         // The SIZE, though, must not come from `al_state`. That reads an
         // `elementData`-shaped backing and reports 0 for anything else, so an
@@ -4065,7 +4275,11 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let (data, al_size) = al_state(ctx, b);
         if let Some(n) = unmod_view_size(data, al_size) {
             if index < 0 || index >= n {
-                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+                if let Some(err) = unmod_list_oob_error(&*ctx, this, index, n) {
+                    return Err(err);
+                }
+                // `None` = a `Collections.unmodifiable*` view. Fall through to
+                // the delegation below and let the backing throw its own.
             }
         }
         // Unreadable backing: stand aside, exactly as `native_unmod_get` does.
@@ -4074,14 +4288,26 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `Collections$SingletonList` keeps its one element in a field, not in an
     // `elementData` array, so `al_state` reports size 0 and every index looked
     // out of range. Same reason `size()` needed `singleton_wrapper_size`.
-    if singleton_wrapper_size(ctx, this) == Some(1) {
-        if index != 0 {
+    match singleton_wrapper_size(ctx, this) {
+        Some(1) => {
+            if index != 0 {
+                // `Collections$SingletonList.get` -> `IndexOutOfBoundsException
+                // ("Index: "+index+", Size: 1")`. Plain class, comma form.
+                return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index: {index}, Size: 1"
+                ))
+                .into());
+            }
+            return Ok(Some(ctx.get_field_by_name(this, "element")));
+        }
+        Some(0) => {
+            // `Collections$EmptyList.get` names no size at all — its message is
+            // "Index: 0", full stop. Measured; not an omission here.
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }
-                    .into(),
+                cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}")).into(),
             );
         }
-        return Ok(Some(ctx.get_field_by_name(this, "element")));
+        _ => {}
     }
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
@@ -4192,7 +4418,10 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // "Size" rather than "length"). Measured, not assumed:
         // probes/ListOutOfBoundsProbe against a HotSpot 25 control shows four
         // different OOB wordings across the List API.
-        return Err(cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into());
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index: {index}, Size: {size}"
+        ))
+        .into());
     }
     let index = index as usize;
     // GC-SAFETY: same hazard as `native_al_add` -- `al_ensure_capacity` can
@@ -4330,6 +4559,9 @@ pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_contains) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -4453,6 +4685,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_to_array) {
+        return r;
+    }
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}",
@@ -4650,6 +4885,9 @@ fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Ve
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -4777,6 +5015,9 @@ fn native_collection_to_array_generator(
 }
 
 pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
     let input = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -5075,17 +5316,25 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     let (_, size) = al_state(ctx, this);
-    if from_i32 < 0 || from_i32 > size {
+    // `AbstractList.subListRangeCheck`: the plain class, and a wording that
+    // names WHICH endpoint failed rather than printing an index. The
+    // `fromIndex > toIndex` case below is an IllegalArgumentException, not a
+    // bounds exception at all, and already was.
+    if from_i32 < 0 {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: from_i32 }
-                .into(),
+            cratonvm_types::error::RuntimeError::ioobe(format!("fromIndex = {from_i32}")).into(),
         );
     }
-    if to_i32 < 0 || to_i32 > size {
+    if to_i32 > size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: to_i32 }
-                .into(),
+            cratonvm_types::error::RuntimeError::ioobe(format!("toIndex = {to_i32}")).into(),
         );
+    }
+    if from_i32 > size || to_i32 < 0 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "fromIndex = {from_i32}, toIndex = {to_i32}"
+        ))
+        .into());
     }
     if from_i32 > to_i32 {
         return Err(
@@ -6746,11 +6995,7 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     map_resize_inner(ctx, this, is_concurrent);
 }
 
-fn map_resize_inner(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    is_concurrent: bool,
-) {
+fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent: bool) {
     // Bug 1+2+5 (CRIT/HIGH) round-10 fix: only take the resize lock when
     // resizing a CHM segment. Plain `java/util/HashMap.put` is single-
     // threaded; serializing its resize through the striped lock array
@@ -9179,8 +9424,16 @@ fn native_map_remove_pinned(
         // address (fixed-suite-bugs/tomcat/
         // dohead-post-fix-sporadic-residuals-FIXED.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
-        let head_matches =
-            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
+        let head_matches = node_matches_inner(
+            ctx,
+            head_pin,
+            head,
+            is_null_key,
+            hash,
+            key_pin,
+            key_val,
+            identity_mode,
+        )?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -9236,8 +9489,16 @@ fn native_map_remove_pinned(
             // dereferencing either again.
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
-            let curr_matches =
-                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val, identity_mode)?;
+            let curr_matches = node_matches_inner(
+                ctx,
+                curr_pin,
+                curr,
+                is_null_key,
+                hash,
+                key_pin,
+                key_val,
+                identity_mode,
+            )?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
@@ -10765,7 +11026,10 @@ fn make_view_set_of(
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, present_marker(elem)]) {
+        if let Err(e) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing)), elem, present_marker(elem)],
+        ) {
             ctx.unpin_native_roots(first_pin);
             return Err(e);
         }
@@ -11483,7 +11747,10 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]);
+        let _ = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
+        );
     }
     let set = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(set_pin);
@@ -11680,6 +11947,9 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// `containsAll`/`retainAll`/`removeAll` — which falls back to the
 /// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_hash_code) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -11746,7 +12016,8 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             for i in 0..keys.len() {
                 let other = ctx.read_native_pin(other_pin, other);
                 let key = read_pinned_elem(ctx, handles[i], keys[i]);
-                let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[key])?;
+                let contains =
+                    ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[key])?;
                 if !matches!(contains, Some(Value::Int(1))) {
                     return Ok(false);
                 }
@@ -11922,6 +12193,9 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -11945,6 +12219,9 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -12347,6 +12624,9 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -12861,7 +13141,16 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // iterator itself rooted across that nested native call: its `lastRet`
     // update below must use the post-GC address, not a from-space reference.
     let this_pin = ctx.pin_native_root(this);
-    let removed = native_hs_remove(ctx, &[Value::Object(Some(backing)), key]);
+    // A `ConcurrentHashMap.newKeySet()` view is not HashSet-shaped: its slot 0
+    // is the backing ConcurrentHashMap, not a bucket-table HashMap, so
+    // `native_hs_remove` would read the segments array as buckets. Route it to
+    // the view's own remove, which takes the segment monitor.
+    // `CollectionView.retainAll`/`removeAll` reach here through `it.remove()`.
+    let removed = if is_key_set_view(ctx, backing) {
+        native_ksv_remove(ctx, &[Value::Object(Some(backing)), key])
+    } else {
+        native_hs_remove(ctx, &[Value::Object(Some(backing)), key])
+    };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let _ = removed?;
@@ -13086,7 +13375,11 @@ fn native_arrays_array_list_get(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return Ok(Some(Value::Object(None)));
     };
     if index < 0 || index as usize >= ctx.array_length(arr) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        // `Arrays$ArrayList` has no bounds check of its own: it indexes `a[i]`
+        // directly, so what a caller sees is the ARRAY access failing. Hence
+        // the subclass, and hence the array-access wording rather than the
+        // index-only one.
+        return Err(RuntimeError::aioobe(index, ctx.array_length(arr) as i32).into());
     }
     Ok(Some(ctx.get_array_element(arr, index as usize)))
 }
@@ -14392,6 +14685,9 @@ fn native_collections_unmodifiable_list(
 // ===========================================================================
 
 fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -14542,6 +14838,9 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -15988,7 +16287,10 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]) {
+        if let Err(err) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
+        ) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -16165,7 +16467,6 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let r = make_map_of(ctx, &[(k1, v1), (k2, v2)]);
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
-
 
 // ===========================================================================
 // Stream API — Eager evaluation on Vec<Value>
@@ -18734,6 +19035,9 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_stream) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
@@ -26729,7 +27033,10 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     for (i, val) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, present_marker(val)]) {
+        if let Err(e) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing)), val, present_marker(val)],
+        ) {
             ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
@@ -27071,10 +27378,7 @@ const CMP_TAG_COMPARING_INT: i32 = 6;
 const CMP_TAG_COMPARING_LONG: i32 = 7;
 const CMP_TAG_COMPARING_DOUBLE: i32 = 8;
 
-fn make_comparator(
-    ctx: &mut dyn NativeContext,
-    tag: i32,
-) -> Result<ObjectRef, MethodCallFailed> {
+fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> Result<ObjectRef, MethodCallFailed> {
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.Comparator$Native`; it stands in for the comparator objects
     // the real `Comparator` factory methods return.
@@ -29865,9 +30169,7 @@ fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let element = args.get(2).copied().unwrap_or(Value::Object(None));
     let size = ll_size(ctx, this);
     if index < 0 || index > size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(ll_out_of_bounds(index, size));
     }
     if index == size {
         ll_link_last(ctx, this, element);
@@ -29892,9 +30194,7 @@ fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this);
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(ll_out_of_bounds(index, size));
     }
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ll_unlink_node(ctx, this, node))),
@@ -29937,6 +30237,18 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
 }
 
+/// `LinkedList`'s private `outOfBoundsMsg`, shared by every positional
+/// operation: `"Index: " + index + ", Size: " + size`.
+///
+/// The plain `IndexOutOfBoundsException`, not the array subclass — measured on
+/// Temurin 25, and the subclass is the direction that breaks a `catch`. Note
+/// the COMMA: `ArrayList.add(int, E)` uses this same wording, but
+/// `ImmutableCollections.List12` uses a SPACE ("Index: 3 Size: 1"). Three
+/// receivers, three shapes; `probes/ListOutOfBoundsProbe` holds all three.
+fn ll_out_of_bounds(index: i32, size: i32) -> MethodCallFailed {
+    cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into()
+}
+
 fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -29948,9 +30260,10 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
-        None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        ),
+        None => {
+            let size = ll_size(ctx, this);
+            Err(ll_out_of_bounds(index, size))
+        }
     }
 }
 
@@ -29977,9 +30290,10 @@ fn native_ll_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             ctx.set_field(node, LL_NODE_ELEM, new_val);
             Ok(Some(old))
         }
-        None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        ),
+        None => {
+            let size = ll_size(ctx, this);
+            Err(ll_out_of_bounds(index, size))
+        }
     }
 }
 
@@ -30622,9 +30936,7 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
 /// [`for_each_overlay_ref`]. Cached, because the root scan runs on every GC.
 fn lhm_root_all() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some())
 }
 
 fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
@@ -33560,12 +33872,7 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let (data, size) = al_state(ctx, this);
     if idx >= size as usize {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: idx as i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
     }
     if let Some(buf) = data {
         ctx.set_array_element(buf, idx, elem);
@@ -33905,6 +34212,14 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // zero elements and the auto-configuration pipeline collapses.
     let cid = ctx.class_id_of_object(coll);
     if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        // `ConcurrentHashMap.newKeySet()` / `keySet(V)`: the elements are the
+        // backing CHM's keys, held in the segmented native layout. None of the
+        // slot heuristics below model that — slot 0 is the map object, not a
+        // bucket array — so `new HashSet<>(view)` / `addAll(view)` /
+        // `containsAll(view)` would silently see nothing.
+        if cls_name == KSV_CLASS {
+            return ksv_collect(ctx, coll);
+        }
         if cls_name == "java/util/EnumSet" {
             if let Value::Object(Some(backing)) = ctx.get_field(coll, 0) {
                 return collect_collection_elements(ctx, backing);
@@ -41575,6 +41890,10 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "keys", "()Ljava/util/Enumeration;", native_chm_keys);
 
+    // The `newKeySet()` / `keySet(V)` product's own surface — see the module
+    // comment above `KSV_CLASS`.
+    register_chm_key_set_view_natives(r);
+
     // Bulk operations — snapshot under per-segment locks
     r.register(
         c,
@@ -42194,7 +42513,14 @@ fn native_chm_get_string_fast(
         let after_mutation = chm_seg_mutation_snapshot(seg_id);
         if before_mutation == after_mutation && before_mutation.1 == 0 {
             if let Some(key_text) = ctx.read_string(key) {
-                ctx.chm_string_node_cache_put(this, seg_id, key, &key_text, node, before_mutation.0);
+                ctx.chm_string_node_cache_put(
+                    this,
+                    seg_id,
+                    key,
+                    &key_text,
+                    node,
+                    before_mutation.0,
+                );
             }
         }
     }
@@ -43475,33 +43801,959 @@ fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
 }
 
+/// `ConcurrentHashMap.newKeySet()` — a real `KeySetView` over a real
+/// native-backed `ConcurrentHashMap`, mapped value `Boolean.TRUE`.
+///
+/// This used to return a `java/util/HashSet` because a real `KeySetView`'s
+/// Java-side `add()` runs `CHM.putVal`, which walks the `table` field
+/// CratonVM's segmented layout never populates. The answer to that is not to
+/// hand back a different class — a `HashSet` takes no lock, so the JDK's
+/// canonical concurrent set corrupted under concurrent mutation and its
+/// `size()` could go negative — it is to give `KeySetView` its own natives, so
+/// no method of the view is left running `table`-walking bytecode. See the
+/// module comment above `KSV_CLASS`.
 fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // GC-safety: three allocations in a row, each a potential moving young GC,
-    // with the previous results held in bare Rust locals that nothing roots —
-    // a freshly allocated object no bucket/field yet points at is reclaimed
-    // outright by a collection here. Root each result across the next
-    // allocation.
-    let mut set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let mut backing = rooted_across(ctx, &mut [&mut set], |ctx| alloc_backing_map(ctx));
-    let buckets = rooted_across(ctx, &mut [&mut set, &mut backing], |ctx| {
-        alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY)
+    let map = alloc_backing_chm(ctx, None);
+    // `Boolean.valueOf` is arbitrary Java and can complete a moving GC, so the
+    // fresh map — which nothing points at yet — has to stay rooted across it.
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    let view = make_key_set_view(ctx, map, mapped);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `ConcurrentHashMap.newKeySet(int initialCapacity)`. Static, so the capacity
+/// is the first argument — but the dispatch path can shift argument positions
+/// (see `newSetFromMap`), hence the search rather than a fixed index.
+fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cap = args.iter().find_map(|v| match v {
+        Value::Int(n) if *n > 0 => Some(*n),
+        _ => None,
     });
-    publish_map_table(ctx, backing, buckets, MAP_DEFAULT_CAPACITY as i32);
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    Ok(Some(Value::Object(Some(set))))
+    let map = alloc_backing_chm(ctx, cap);
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    let view = make_key_set_view(ctx, map, mapped);
+    Ok(Some(Value::Object(Some(view))))
 }
 
-fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Ignore capacity hint; behave identically to no-arg newKeySet().
-    // KeySetView's Java-side add() calls CHM.putVal which uses the native
-    // CHM's segment fields that we don't populate, so we must back this with
-    // our HashSet synthetic instead of letting a real KeySetView form.
-    native_chm_new_key_set(ctx, _args)
-}
-
+/// `ConcurrentHashMap.keySet(V mappedValue)` — a LIVE, add-able view of this
+/// map's keys, exactly as the JDK's `new KeySetView<>(this, mappedValue)`.
+///
+/// Previously this delegated to `keySet()`, whose product has no `add` (a
+/// `keySet()` view must not be add-able) and is not a `KeySetView`, so the one
+/// thing this overload exists for did not work.
 fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_chm_key_set(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mapped = args.get(1).copied().unwrap_or(Value::Object(None));
+    if matches!(mapped, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap.keySet(null)".to_string()),
+        }
+        .into());
+    }
+    let view = make_key_set_view(ctx, this, mapped);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+// ===========================================================================
+// ConcurrentHashMap$KeySetView — the object `newKeySet()` / `keySet(V)` returns
+// ===========================================================================
+//
+// `newKeySet()` used to hand back a plain `java/util/HashSet`. Two things were
+// wrong with that. It is not the class the JDK promises, so
+// `(ConcurrentHashMap.KeySetView<K,?>) set` threw `ClassCastException` and
+// `getMappedValue()` was a `NoSuchMethodError`. And, far worse, a `HashSet`'s
+// `add`/`remove`/`size` run the `HashMap` natives, which take no lock — so
+// `ConcurrentHashMap.newKeySet()`, the JDK's canonical "give me a concurrent
+// set", was answered with a structure that corrupts under concurrent mutation.
+// Balanced churn (every `add` followed by its own `remove`, correct final size
+// 0 on any interleaving) left the size at 18, at -3, at 131; a real
+// `ConcurrentHashMap.size()` cannot even go negative. `isEmpty()` is
+// `size() == 0`, and `ThreadPerTaskExecutor.tryTerminate()` only advances
+// SHUTDOWN → TERMINATED when its `newKeySet()` of live threads reports empty —
+// so `Executors.newVirtualThreadPerTaskExecutor()` in a try-with-resources hung
+// forever on the closing brace. See the retired
+// `concurrenthashmap-newkeyset-returns-a-plain-hashset` write-up.
+//
+// The view is now a real `ConcurrentHashMap$KeySetView` over a real
+// native-backed `ConcurrentHashMap`, so every mutation inherits the per-segment
+// monitor that already makes `native_chm_put` / `native_chm_remove` safe, and
+// `size()` is the sum of per-segment counts that a writer only ever updates
+// under that segment's lock.
+//
+// The surface below is deliberately COMPLETE rather than "the methods the
+// reproducer needs". In real-JDK mode the methods `CollectionView` declares
+// (`size` / `isEmpty` / `clear` / `toArray` / `toString` / `containsAll` /
+// `removeAll` / `retainAll`) are written in terms of `map` — already native —
+// or of `iterator()`, native below, so their real bytecode is correct and
+// these registrations are simply never consulted for them. In synthetic-jdk
+// mode there is no `CollectionView` bytecode at all and the same registrations
+// are the only implementation. Leaving any of them out would reproduce the
+// partial-surface trap the known-issue doc warns about: a method left to real
+// bytecode walks the `table` field CratonVM's segmented layout never
+// populates, and quietly answers empty.
+
+const KSV_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$KeySetView";
+const CHM_CLASS: &str = "java/util/concurrent/ConcurrentHashMap";
+/// `CollectionView.map`, slot 0 in the JDK's layout. Also the fallback when the
+/// field cannot be resolved by name — synthetic-jdk mode fabricates the class,
+/// so there is no declared field list to resolve against.
+const KSV_FIELD_MAP: usize = 0;
+/// `KeySetView.value` — the value `add(e)` maps `e` to.
+const KSV_FIELD_VALUE: usize = 1;
+const KSV_NUM_FIELDS: usize = 2;
+
+/// Slot index of `name` on `this`, preferring the class's own declared layout
+/// and falling back to the synthetic slot. Resolved by `ClassId` rather than by
+/// class name so a redefined/duplicate-loader `ConcurrentHashMap` still
+/// resolves (see `resolve_field_index_by_class_id`).
+fn ksv_slot(ctx: &dyn NativeContext, this: ObjectRef, name: &str, fallback: usize) -> usize {
+    let n = ctx.object_num_fields(this);
+    let cid = ctx.class_id_of_object(this);
+    match ctx.resolve_field_index_by_class_id(cid, name) {
+        Some(i) if i < n => i,
+        _ => fallback,
+    }
+}
+
+/// The backing `ConcurrentHashMap` of a `KeySetView`.
+fn ksv_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let slot = ksv_slot(ctx, this, "map", KSV_FIELD_MAP);
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// `this`'s mapped value — what `add(e)` stores against `e`. `Object(None)` for
+/// a view that has none, which is exactly the JDK's `add` → `UnsupportedOperation`
+/// condition. Deliberately allocation-free: callers read it next to a
+/// `ksv_map` read and must not have a GC in between.
+fn ksv_mapped_value(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    let slot = ksv_slot(ctx, this, "value", KSV_FIELD_VALUE);
+    if slot >= ctx.object_num_fields(this) {
+        return Value::Object(None);
+    }
+    ctx.get_field(this, slot)
+}
+
+/// True when `obj`'s runtime class is `ConcurrentHashMap$KeySetView`.
+#[inline]
+fn is_key_set_view(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    receiver_facts(ctx, obj).has(CF_KEY_SET_VIEW)
+}
+
+/// Reroute a `KeySetView` receiver that arrived through a generic
+/// `HashSet`/`ArrayList`-shaped native to the view's own implementation.
+///
+/// Needed because the *interface* registrations — `java/util/Set.size`,
+/// `java/util/Collection.iterator`, `java/util/AbstractSet.hashCode`, … — are
+/// what a call site resolves to when the receiver's class declares no such
+/// method, which in synthetic-jdk mode is every method of the fabricated
+/// `KeySetView` class. Those natives win over the exact-class registrations,
+/// and a `KeySetView` matches neither layout they read, so `size()` answered 0
+/// and `iterator()` answered null (a `for (x : set)` NPE) while `add` /
+/// `contains` / `remove` — which have no interface-level registration and so
+/// fall through to the exact-class natives — worked. Guarding at the generic
+/// entry points is what keeps that split from existing at all.
+#[inline]
+fn ksv_route(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    imp: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+) -> Option<MethodCallResult> {
+    match args.first() {
+        Some(Value::Object(Some(o))) if is_key_set_view(ctx, *o) => Some(imp(ctx, args)),
+        _ => None,
+    }
+}
+
+/// `Boolean.TRUE` — `newKeySet()`'s mapped value in the JDK. Falls back to the
+/// unboxed truth so a fabricated view still has a non-null mapped value (the
+/// CHM natives reject a null value per JDK spec, so `add` would otherwise NPE).
+fn ksv_boxed_true(ctx: &mut dyn NativeContext) -> Value {
+    match ctx.invoke(
+        "java/lang/Boolean",
+        "valueOf",
+        "(Z)Ljava/lang/Boolean;",
+        &[Value::Int(1)],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Int(1),
+    }
+}
+
+/// Allocate a `KeySetView` instance with no constructor run.
+///
+/// In real-JDK mode allocate with the class's OWN field count rather than the
+/// hard-coded two: `set_field` past the end of an under-sized object is dropped
+/// silently, so a JDK that ever adds a field would leave `map` unset and every
+/// method below answering empty.
+fn alloc_key_set_view_object(ctx: &mut dyn NativeContext) -> ObjectRef {
+    // `ensure_class_initialized` can report success having FABRICATED a
+    // stand-in, so check the resolved name rather than trusting `Ok`.
+    let mut real_cid = None;
+    if let Ok(cid) = ctx.ensure_class_initialized(KSV_CLASS) {
+        if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+            real_cid = Some(cid);
+        }
+    }
+    match real_cid {
+        Some(cid) => {
+            let n = ctx.class_num_total_fields(cid).max(KSV_NUM_FIELDS);
+            ctx.alloc_object(cid, n)
+        }
+        None => alloc_synthetic(ctx, KSV_CLASS, KSV_NUM_FIELDS),
+    }
+}
+
+/// Allocate a fresh, fully segmented native `ConcurrentHashMap` with no
+/// constructor run — the backing store for a `newKeySet()` view.
+///
+/// `initial_capacity` mirrors `newKeySet(int)`; `None` reproduces the no-arg
+/// `ConcurrentHashMap()` shape so iteration order matches a default map.
+fn alloc_backing_chm(ctx: &mut dyn NativeContext, initial_capacity: Option<i32>) -> ObjectRef {
+    let mut real_cid = None;
+    if let Ok(cid) = ctx.ensure_class_initialized(CHM_CLASS) {
+        if ctx.class_name_of_id(cid).as_deref() == Some(CHM_CLASS) {
+            real_cid = Some(cid);
+        }
+    }
+    let chm = match real_cid {
+        Some(cid) => {
+            let n = ctx.class_num_total_fields(cid).max(_CHM_NUM_FIELDS);
+            ctx.alloc_object(cid, n)
+        }
+        None => alloc_synthetic(ctx, CHM_CLASS, _CHM_NUM_FIELDS),
+    };
+    // Segment construction is 2N+1 allocations deep; keep the fresh map rooted
+    // across it, since nothing points at it yet.
+    let chm_pin = ctx.pin_native_root(chm);
+    match initial_capacity {
+        Some(cap) => {
+            let _ = native_chm_init_capacity(ctx, &[Value::Object(Some(chm)), Value::Int(cap)]);
+        }
+        None => chm_init_segments(
+            ctx,
+            chm,
+            CHM_DEFAULT_INIT_SEGMENTS,
+            CHM_DEFAULT_SEGMENT_CAP,
+        ),
+    }
+    let chm = ctx.read_native_pin(chm_pin, chm);
+    ctx.unpin_native_roots(chm_pin);
+    chm
+}
+
+/// Build a `KeySetView` over `map` with mapped value `mapped`.
+fn make_key_set_view(ctx: &mut dyn NativeContext, map: ObjectRef, mapped: Value) -> ObjectRef {
+    // The view allocation can move both operands; `map_pin` is the unpin base.
+    let map_pin = ctx.pin_native_root(map);
+    let mapped_pin = pin_value(ctx, mapped);
+    let view = alloc_key_set_view_object(ctx);
+    let view_pin = ctx.pin_native_root(view);
+    let map = ctx.read_native_pin(map_pin, map);
+    let mapped = read_pinned_elem(ctx, mapped_pin, mapped);
+    let view = ctx.read_native_pin(view_pin, view);
+    let map_slot = ksv_slot(ctx, view, "map", KSV_FIELD_MAP);
+    let value_slot = ksv_slot(ctx, view, "value", KSV_FIELD_VALUE);
+    ctx.set_field(view, map_slot, Value::Object(Some(map)));
+    ctx.set_field(view, value_slot, mapped);
+    ctx.unpin_native_roots(map_pin);
+    view
+}
+
+/// The view's current elements. Weakly consistent, exactly like the JDK's own
+/// `KeySetView` iterator: a concurrent writer's effect may or may not be seen.
+fn ksv_collect(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    match ksv_map(ctx, this) {
+        Some(m) => chm_collect_all_keys(ctx, m),
+        None => Vec::new(),
+    }
+}
+
+/// `ksv_collect` into a fresh `Object[]`, GC-safely.
+///
+/// The array allocation can move every ref the first collection returned, so
+/// count first, allocate, then RE-collect from the live map and store with
+/// nothing allocating in between — the `native_hs_iterator` / `native_hs_to_array`
+/// idiom. Returns the array and its live element count; a concurrent removal
+/// between the two passes trims the array rather than leaving null holes, which
+/// is what `CollectionView.toArray`'s own `Arrays.copyOf(r, i)` does.
+fn ksv_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, usize) {
+    let this_pin = ctx.pin_native_root(this);
+    let len = ksv_collect(ctx, this).len();
+    let this = ctx.read_native_pin(this_pin, this);
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elems = ksv_collect(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let n = len.min(elems.len());
+    for (i, e) in elems.iter().enumerate().take(n) {
+        ctx.set_array_element(arr, i, *e);
+    }
+    ctx.unpin_native_roots(this_pin);
+    if n == len {
+        return (arr, n);
+    }
+    let arr_pin = ctx.pin_native_root(arr);
+    let trimmed = alloc_ref_array(ctx, n);
+    let trimmed_pin = ctx.pin_native_root(trimmed);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let trimmed = ctx.read_native_pin(trimmed_pin, trimmed);
+    for i in 0..n {
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(trimmed, i, v);
+    }
+    ctx.unpin_native_roots(arr_pin);
+    (trimmed, n)
+}
+
+fn native_ksv_get_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(match ksv_map(ctx, this) {
+        Some(m) => Value::Object(Some(m)),
+        None => Value::Object(None),
+    }))
+}
+
+fn native_ksv_get_mapped_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ksv_mapped_value(ctx, this)))
+}
+
+fn native_ksv_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match ksv_map(ctx, this) {
+        Some(m) => native_chm_size(ctx, &[Value::Object(Some(m))]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_ksv_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = match native_ksv_size(ctx, args)? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+fn native_ksv_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    match ksv_map(ctx, this) {
+        Some(m) => native_chm_clear(ctx, &[Value::Object(Some(m))]),
+        None => Ok(None),
+    }
+}
+
+fn native_ksv_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    match ksv_map(ctx, this) {
+        // `containsKey` carries the JDK's null-key NPE, which is also
+        // `KeySetView.contains(null)`'s contract.
+        Some(m) => native_chm_contains_key(ctx, &[Value::Object(Some(m)), elem]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_ksv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // JDK: `if ((v = value) == null) throw new UnsupportedOperationException();`
+    // — a view from `keySet()` (no mapped value) cannot be added to.
+    let mapped = match ksv_mapped_value(ctx, this) {
+        Value::Object(None) => return Err(unsupported_op()),
+        v => v,
+    };
+    let map = match ksv_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // `putIfAbsent` takes the target segment's monitor, so concurrent adds are
+    // safe and the per-segment count stays exact. Its null-key guard is
+    // `add(null)`'s NPE.
+    let prior = native_chm_put_if_absent(ctx, &[Value::Object(Some(map)), elem, mapped])?;
+    Ok(Some(Value::Int(i32::from(matches!(
+        prior,
+        None | Some(Value::Object(None))
+    )))))
+}
+
+fn native_ksv_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let map = match ksv_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // JDK: `return map.remove(o) != null;` — a CHM never holds a null value, so
+    // the returned value doubles as the membership answer.
+    let prior = native_chm_remove(ctx, &[Value::Object(Some(map)), elem])?;
+    Ok(Some(Value::Int(i32::from(matches!(
+        prior,
+        Some(Value::Object(Some(_)))
+    )))))
+}
+
+fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let (arr, total) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
+    // Wire the view itself as the removal target: `CollectionView.retainAll`
+    // and `removeAll` are written in terms of `it.remove()`, so an iterator
+    // without a backing silently makes both no-ops.
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_ksv_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (arr, _) = ksv_snapshot_array(ctx, this);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `toArray(T[])` — fill the caller's array when it is large enough (writing
+/// the spec's null terminator), otherwise allocate a fresh array of the
+/// template's runtime component type so `Set<String>.toArray(new String[0])`
+/// stays a `String[]`.
+fn native_ksv_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match args.get(1).copied() {
+        Some(Value::Object(Some(t))) => Some(t),
+        _ => None,
+    };
+    let target_pin = match target {
+        Some(t) => ctx.pin_native_root(t),
+        None => usize::MAX,
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let (src, n) = ksv_snapshot_array(ctx, this);
+    let src_pin = ctx.pin_native_root(src);
+    let target = target.map(|t| ctx.read_native_pin(target_pin, t));
+    if let Some(t) = target {
+        if ctx.array_length(t) >= n {
+            let len = ctx.array_length(t);
+            let src = ctx.read_native_pin(src_pin, src);
+            for i in 0..n {
+                let v = ctx.get_array_element(src, i);
+                ctx.set_array_element(t, i, v);
+            }
+            if len > n {
+                ctx.set_array_element(t, n, Value::Object(None));
+            }
+            ctx.unpin_native_roots(if target_pin == usize::MAX {
+                this_pin
+            } else {
+                target_pin
+            });
+            return Ok(Some(Value::Object(Some(t))));
+        }
+    }
+    let out = match target {
+        Some(t) => {
+            let comp = ctx.class_id_of_object(t);
+            ctx.new_ref_array(comp, n)
+        }
+        None => alloc_ref_array(ctx, n),
+    };
+    let out_pin = ctx.pin_native_root(out);
+    let src = ctx.read_native_pin(src_pin, src);
+    let out = ctx.read_native_pin(out_pin, out);
+    for i in 0..n {
+        let v = ctx.get_array_element(src, i);
+        ctx.set_array_element(out, i, v);
+    }
+    ctx.unpin_native_roots(if target_pin == usize::MAX {
+        this_pin
+    } else {
+        target_pin
+    });
+    Ok(Some(Value::Object(Some(out))))
+}
+
+fn native_ksv_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = ksv_collect(ctx, this);
+    // `obj_to_display_string` dispatches `toString()`, which allocates — pin
+    // every element and re-read it at the point of use.
+    let (elems_pin, handles) = pin_value_slice(ctx, &elems);
+    let mut parts = Vec::with_capacity(elems.len());
+    for i in 0..elems.len() {
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        parts.push(obj_to_display_string(ctx, &e));
+    }
+    if elems_pin != usize::MAX {
+        ctx.unpin_native_roots(elems_pin);
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_ksv_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = ksv_collect(ctx, this);
+    let (elems_pin, handles) = pin_value_slice(ctx, &elems);
+    let mut h: i32 = 0;
+    for i in 0..elems.len() {
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        // `Set.hashCode` contract: the sum of the elements' hash codes.
+        h = h.wrapping_add(element_hash_code(ctx, &e));
+    }
+    if elems_pin != usize::MAX {
+        ctx.unpin_native_roots(elems_pin);
+    }
+    Ok(Some(Value::Int(h)))
+}
+
+fn native_ksv_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    // `AbstractSet.equals`: a Set equals only another Set. The guard must
+    // precede the `size()` dispatch, or `set.equals("text")` raises
+    // NoSuchMethodError instead of answering false.
+    if !obj_is_instance_of(ctx, other, "java/util/Set") {
+        return Ok(Some(Value::Int(0)));
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| -> MethodCallResult {
+        let other = ctx.read_native_pin(other_pin, other);
+        let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+            Some(Value::Int(n)) => n,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let elems = ksv_collect(ctx, this);
+        if elems.len() as i32 != other_size {
+            return Ok(Some(Value::Int(0)));
+        }
+        let (_, handles) = pin_value_slice(ctx, &elems);
+        for i in 0..elems.len() {
+            let other = ctx.read_native_pin(other_pin, other);
+            let e = read_pinned_elem(ctx, handles[i], elems[i]);
+            let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[e])?;
+            if !matches!(contains, Some(Value::Int(1))) {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn native_ksv_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let elems = ksv_collect(ctx, this);
+    // `accept` is arbitrary Java: it allocates, so `action` and every element
+    // must be pinned and re-read per dispatch.
+    let action_pin = ctx.pin_native_root(action);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut result = Ok(None);
+    for i in 0..elems.len() {
+        let a = ctx.read_native_pin(action_pin, action);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        if let Err(err) = ctx.invoke_virtual(a, "accept", "(Ljava/lang/Object;)V", &[e]) {
+            result = Err(err);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(action_pin);
+    result
+}
+
+fn native_ksv_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (arr, _) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn native_ksv_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (arr, n) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(spl))))
+}
+
+fn native_ksv_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut answer = 1;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_contains(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(r) => {
+                if !matches!(r, Some(Value::Int(1))) {
+                    answer = 0;
+                    break;
+                }
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(answer))),
+    }
+}
+
+fn native_ksv_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_add(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let keep = collect_collection_elements_or_real(ctx, coll);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let current = ksv_collect(ctx, this_now);
+    let (_, keep_handles) = pin_value_slice(ctx, &keep);
+    let (_, cur_handles) = pin_value_slice(ctx, &current);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..current.len() {
+        let mut e = read_pinned_elem(ctx, cur_handles[i], current[i]);
+        let mut should_keep = false;
+        for j in 0..keep.len() {
+            let k = read_pinned_elem(ctx, keep_handles[j], keep[j]);
+            let matched = list_element_matches(ctx, &k, &e);
+            e = read_pinned_elem(ctx, cur_handles[i], e);
+            if matched {
+                should_keep = true;
+                break;
+            }
+        }
+        if should_keep {
+            continue;
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let elems = ksv_collect(ctx, this_now);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let p = ctx.read_native_pin(pred_pin, pred);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        let verdict = match ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e]) {
+            Ok(v) => matches!(v, Some(Value::Int(1))),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        if !verdict {
+            continue;
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+/// Public builder for a live, add-able, concurrency-safe `Set` view over an
+/// existing native-backed `ConcurrentHashMap`, mapped value `Boolean.TRUE`.
+///
+/// `Collections.newSetFromMap(new ConcurrentHashMap<>())` — the other canonical
+/// spelling of "give me a concurrent set" — used to answer with a plain
+/// `HashSet` for exactly the same reason `newKeySet()` did, and with exactly
+/// the same consequence: `add`/`remove`/`size` on the result ran the unlocked
+/// `HashMap` natives. A `newSetFromMap` over an empty map is definitionally the
+/// same object as `map.keySet(Boolean.TRUE)`, so it is built here rather than
+/// duplicated. See `native-builtins`' `newSetFromMap` registration.
+pub fn make_concurrent_key_set_view(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    make_key_set_view(ctx, map, mapped)
+}
+
+fn register_chm_key_set_view_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = KSV_CLASS;
+    r.register(c, "size", "()I", native_ksv_size);
+    r.register(c, "isEmpty", "()Z", native_ksv_is_empty);
+    r.register(c, "clear", "()V", native_ksv_clear);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_ksv_contains);
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_ksv_add);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_ksv_remove);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_ksv_iterator);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_ksv_to_array);
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_ksv_to_array_typed,
+    );
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+    r.register(c, "toString", "()Ljava/lang/String;", native_ksv_to_string);
+    r.register(c, "hashCode", "()I", native_ksv_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_ksv_equals);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_ksv_for_each,
+    );
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_ksv_stream);
+    r.register(
+        c,
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        native_ksv_spliterator,
+    );
+    r.register(
+        c,
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_contains_all,
+    );
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ksv_add_all);
+    r.register(
+        c,
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_remove_all,
+    );
+    r.register(
+        c,
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_retain_all,
+    );
+    r.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_ksv_remove_if,
+    );
+    r.register(
+        c,
+        "getMappedValue",
+        "()Ljava/lang/Object;",
+        native_ksv_get_mapped_value,
+    );
+    r.register(
+        c,
+        "getMap",
+        "()Ljava/util/concurrent/ConcurrentHashMap;",
+        native_ksv_get_map,
+    );
+    r.set_category(__prev_cat);
 }
 
 fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
@@ -45733,13 +46985,10 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // indexes its array directly), while the 1-2 element `List12` throws the
     // plain class with a different wording again ("Index: 3 Size: 1").
     //
-    // Two of the three want the subclass, and this VM funnels every
-    // unmodifiable/immutable list through ONE synthetic class -- there is no
-    // discriminator here that separates a 1-2 element `List.of` from
-    // `Collections.unmodifiableList` over a 1-2 element `ArrayList`, which
-    // wants the plain class. Reproducing the JDK's split would be guessing;
-    // holding this path where it was is right for 0 and 3+ elements and is the
-    // status quo for the rest.
+    // The discriminator is slot 1 (`UNMOD_FIELD_IMMUTABLE`), not the class:
+    // `unmod_list_oob_error` separates a 1-2 element `List.of` from
+    // `Collections.unmodifiableList` over a 1-2 element `ArrayList` with the
+    // same bit `getClass()` already splits on. See that function.
     if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
     {
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
@@ -45761,7 +47010,12 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let (data, al_size) = al_state(ctx, backing);
             if let Some(n) = unmod_view_size(data, al_size) {
                 if *index < 0 || *index >= n {
-                    return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+                    if let Some(err) = unmod_list_oob_error(&*ctx, *this, *index, n) {
+                        return Err(err);
+                    }
+                    // `None` = a `Collections.unmodifiable*` view; `unmod_delegate`
+                    // below lets the backing throw its own, which is what HotSpot
+                    // does for that receiver.
                 }
             }
             // `None` = `al_state` could not read this backing. STAND ASIDE and
@@ -46067,9 +47321,23 @@ fn native_unmod_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if index < 0 || index > len {
-        // JDK throws IndexOutOfBoundsException; ArrayIndexOutOfBoundsException
-        // is a subclass, so `catch (IndexOutOfBoundsException)` still catches.
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        // The JDK throws the PLAIN `IndexOutOfBoundsException`. Throwing the
+        // subclass because "a `catch (IndexOutOfBoundsException)` still catches
+        // it" was the old rationale here, and it is the wrong way round: the
+        // subclass passes every catch the superclass would, and fails every
+        // test of the class itself.
+        //
+        // The wording follows the same split as `unmod_list_oob_error` — a
+        // SPACE for the immutable factories ("Index: 5 Size: 2"),
+        // `ArrayList`/`LinkedList`'s comma for an unmodifiable view.
+        let immutable = matches!(args.first(), Some(Value::Object(Some(this)))
+            if unmod_is_immutable(&*ctx, *this));
+        let message = if immutable {
+            format!("Index: {index} Size: {len}")
+        } else {
+            format!("Index: {index}, Size: {len}")
+        };
+        return Err(RuntimeError::ioobe(message).into());
     }
     Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
         ctx, snapshot, index,
@@ -49144,9 +50412,8 @@ fn cslm_arrays(
     let mut keys = match keys_opt {
         Some(k) => k,
         None => {
-            let (moved, k) = rooted_across1(ctx, this, |ctx| {
-                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
-            });
+            let (moved, k) =
+                rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY));
             this = moved;
             ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
             k
@@ -52761,9 +54028,7 @@ mod tests {
     /// already-marked owner.
     #[test]
     fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
-        use super::{
-            obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry,
-        };
+        use super::{obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry};
         // Tests the PREDICATE directly, not `gc_overlay_roots_for_collection`,
         // so it documents the defect regardless of whether enforcement is
         // enabled — which it is NOT by default; see
@@ -54457,7 +55722,11 @@ mod tests {
             }
 
             /// Allocate an object of `class_id` with `num_fields` slots.
-            pub(super) fn alloc_object_of(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+            pub(super) fn alloc_object_of(
+                &self,
+                class_id: ClassId,
+                num_fields: usize,
+            ) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
                 let obj = s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); num_fields],

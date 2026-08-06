@@ -20,6 +20,42 @@ claimable.
 
 ⚠ §11 collides with L4 and L11 in `vm_exec.rs`. Sequence it last.
 
+## The standing rule: gate, do not remove
+
+**Read `README.md`'s *The end state is two modes, and it is a rename* before
+removing anything.** It governs every section below.
+
+The three modes collapse to two by renaming, not by purging: today's
+`--jdk-only` becomes `--real-jdk`, today's `--real-jdk` becomes
+`--synthetic-jdk`. **A native that is load-bearing in either surviving mode
+must survive.** Strict mode declines to *admit* it; nothing deletes it.
+
+The distinction this lane keeps needing is between a *policy artefact* and an
+*implementation*:
+
+* **Policy artefacts** — hard-coded name lists, `matches!` chains, per-path
+  copies of a decision, `compat_native_wins = true`, the
+  `redefine_immune_*` predicates. These exist to answer "who wins dispatch".
+  Delete them and let `resolve_dispatch` answer from `NativeKind` +
+  `Method::code()`. That is the whole point of §9, §10 and §11.
+* **Implementations** — the Rust natives themselves. Never deleted by this
+  wave. If one is wrong in `Compatible` mode, fix it; if it must not run under
+  strict policy, tag it `NativeKind::SyntheticStub` and let the registry refuse
+  it. "It is unreachable in strict mode" is not a reason to delete it, because
+  it is reachable in the other mode.
+
+§11's 217-disjunct `check_override` chain is the sharpest case: it is a policy
+artefact of 2,650 lines, and collapsing it must not take out a single native it
+currently routes to.
+
+The two axes are independent, and conflating them is how a correct change gets
+argued about:
+
+| Axis | Question | Mechanism | Changed by the rename? |
+|---|---|---|---|
+| **Correctness** | is real bytecode present for this class, and does the synthetic surface corrupt its layout? | `set_drop_real_layout_synthetic` | **No.** A synthetic surface that corrupts a real object is dropped wherever the real class is loaded, in every mode. |
+| **Policy** | is synthetic behaviour admissible at all? | `CompatibilityMode` / `NativeKind` / `CRATONVM_NO_STUBS` | **Yes.** This is the axis the two surviving mode names describe. |
+
 ## Measure before rewriting — §4 especially
 
 **§1 is closed as *answered*, not implemented**, and it is the cautionary tale

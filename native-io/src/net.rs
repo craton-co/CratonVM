@@ -755,6 +755,11 @@ fn net_pending_nonblocking() -> &'static RwLock<FxHashMap<i32, bool>> {
 }
 
 /// Whether `IOUtil.configureBlocking(fd, false)` is in effect for this fd.
+///
+/// Unknown fd answers **false** (assume blocking) deliberately: `net_read0`
+/// uses this to decide whether a read can park, and guessing "cannot park" for
+/// a socket that can is the unsafe direction — it would drop the GC blocking
+/// region around a real wait, which is the deadlock this VM has fixed twice.
 fn net_fd_is_nonblocking(fd: i32) -> bool {
     net_pending_nonblocking()
         .read()
@@ -1537,6 +1542,53 @@ fn with_io_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     })
 }
 
+/// `CRATONVM_DBG_READ0LAT=1` — accumulate `net_read0`'s per-call cost by stage
+/// and print a running mean every 4096 calls.
+///
+/// A mean rather than a single sample because the thing being chased is FIXED
+/// overhead: one call tells you nothing about a cost that only matters because
+/// it is paid tens of thousands of times, and a byte-at-a-time protocol parser
+/// pays it per byte.
+fn read0_lat_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_READ0LAT").is_some())
+}
+
+static READ0_LAT: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn read0_lat_record(fd_ns: u128, lookup_ns: u128, begin_ns: u128, recv_ns: u128, end_ns: u128) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let add = |i: usize, v: u128| {
+        READ0_LAT[i].fetch_add(v as u64, Relaxed);
+    };
+    add(0, fd_ns);
+    add(1, lookup_ns);
+    add(2, begin_ns);
+    add(3, recv_ns);
+    add(4, end_ns);
+    let n = READ0_LAT[5].fetch_add(1, Relaxed) + 1;
+    if n % 4096 == 0 {
+        let g = |i: usize| READ0_LAT[i].load(Relaxed) / n;
+        eprintln!(
+            "[read0lat] n={n} mean ns: fd_field={} registry={} begin_region={} recv={} \
+             end_region={} total={}",
+            g(0),
+            g(1),
+            g(2),
+            g(3),
+            g(4),
+            g(0) + g(1) + g(2) + g(3) + g(4)
+        );
+    }
+}
+
 /// `read0(FileDescriptor fd, long address, int len) -> int`
 ///
 /// Reads up to `len` bytes from the stream into the raw memory at `address`.
@@ -1552,8 +1604,18 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if len_usize == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    // `CRATONVM_DBG_READ0LAT=1` -- where a socket read's FIXED per-call cost
+    // goes. Measured 2026-08-06 with the payload already in the receive buffer
+    // (no blocking, no wakeup, pure call cost): a single-byte
+    // `InputStream.read()` costs ~55 us on CratonVM against ~1.5 us on HotSpot
+    // (~35x), while BULK reads are comparable on both. That shape says fixed
+    // overhead per call; this splits it across the four candidates -- the
+    // FileDescriptor field read, the registry lookup, the blocking-region
+    // brackets, and the recv itself -- instead of guessing which.
+    let r0_t0 = read0_lat_enabled().then(std::time::Instant::now);
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
+    let r0_fd = r0_t0.map(|_| std::time::Instant::now());
     dbgnet!("read0 fd={fd:#x} len={len} addr={addr:#x}");
 
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
@@ -1567,6 +1629,7 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => return Err(ioex("read0: fd not a stream")),
         }
     };
+    let r0_lookup = r0_t0.map(|_| std::time::Instant::now());
     // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
     with_io_scratch(len_usize, |buf| {
         let read_result = {
@@ -1578,7 +1641,36 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // stop-the-world GC requested meanwhile doesn't deadlock
             // `wait_for_all` waiting for this thread to reach a safepoint. See
             // socket_channel::ssc_accept for the full rationale.
-            ctx.begin_blocking_region();
+            //
+            // ...but ONLY when the read can actually park. A NON-BLOCKING fd's
+            // `recv` returns `WouldBlock` immediately instead of waiting, so it
+            // can never hold up a stop-the-world — and the region is not free:
+            // `begin_blocking_region` retires the TLAB and calls
+            // `deposit_root_snapshot()`, which publishes this thread's whole
+            // Java root set, while `end_blocking_region` re-syncs refs against
+            // any GC that ran. Measured 2026-08-06 with
+            // `CRATONVM_DBG_READ0LAT=1`, means over 24 576 calls:
+            //
+            //   fd_field 91ns | registry 59ns | begin_region 9006ns
+            //   | recv 819ns | end_region 6892ns | total 16867ns
+            //
+            // i.e. the brackets are ~94% of the call, ~20x the recv they guard.
+            // That is the whole of the ~35x single-byte-read gap against
+            // HotSpot, and it is paid PER BYTE by any byte-at-a-time protocol
+            // parser. It is also paid on the JDK's own timed-read path:
+            // `NioSocketImpl.timedRead` flips the fd non-blocking and polls
+            // separately (in `Net.poll`, which keeps its region), so every
+            // `Socket.setSoTimeout(..)` reader was paying a full root snapshot
+            // per read for a call that cannot block.
+            //
+            // Safety rests on the mode, not on timing: there is no race where a
+            // non-blocking fd starts parking. If the mode is unknown, assume
+            // blocking and keep the region.
+            let can_park = !net_fd_is_nonblocking(fd);
+            if can_park {
+                ctx.begin_blocking_region();
+            }
+            let r0_begin = r0_t0.map(|_| std::time::Instant::now());
             // AUDIT 2026-07-26 (native-io-audit): retry EINTR. A signal
             // delivered while parked in the kernel (SIGCHLD from a
             // `process.rs`-spawned child without SA_RESTART, a profiler or
@@ -1602,7 +1694,22 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     other => break other,
                 }
             };
-            ctx.end_blocking_region();
+            let r0_recv = r0_t0.map(|_| std::time::Instant::now());
+            if can_park {
+                ctx.end_blocking_region();
+            }
+            if let (Some(t0), Some(fdt), Some(look), Some(beg), Some(recv)) =
+                (r0_t0, r0_fd, r0_lookup, r0_begin, r0_recv)
+            {
+                let end = std::time::Instant::now();
+                read0_lat_record(
+                    (fdt - t0).as_nanos(),
+                    (look - fdt).as_nanos(),
+                    (beg - look).as_nanos(),
+                    (recv - beg).as_nanos(),
+                    (end - recv).as_nanos(),
+                );
+            }
             res
         };
         // `NioSocketImpl.timedRead` puts the fd into non-blocking mode, then

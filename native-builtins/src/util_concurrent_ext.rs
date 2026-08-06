@@ -940,6 +940,22 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         register_synthetic_aqs_natives(registry);
     } // end if !real_aqs
 
+    // JDK-ONLY-CLASSIFY: stub — the CountDownLatch and CyclicBarrier blocks
+    // below (14 registrations). `java.util.concurrent` is pure Java: JDK 25
+    // declares no `ACC_NATIVE` method on either class, so contract §1.5 cannot
+    // call these bridges. `SyntheticStub` is also what they carry today — it is
+    // what the ambient category happened to hold when this function ran — so
+    // stating it changes no kind. What it changes is that the kind is no longer
+    // a property of whoever called us.
+    //
+    // These fourteen were among the 45 registrations that turned out to have NO
+    // category scope over them at all once `current_category` became an
+    // `Option`. Before that, `category_chosen` was sticky: it was set by the
+    // first `set_category` in boot and never cleared, so every later
+    // registration reported "chosen" and this hole was invisible.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+
     // --- CountDownLatch ---
     let cdl = "java/util/concurrent/CountDownLatch";
     registry.register(cdl, "<init>", "(I)V", native_cdl_init);
@@ -986,6 +1002,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
     registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
     registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---
     // Two supported layouts:
@@ -1244,15 +1261,33 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     ctx.set_array_element(snap, i, elem);
                 }
             }
-            // Return a self-contained snapshot iterator (3-field `HashMap$KeyItr`
-            // model: keys/cursor/total).  Unlike the previous `ArrayList$Itr`
-            // wrapper, this iterator's `remove()` throws
-            // `UnsupportedOperationException` — matching real COWAL's `COWIterator`,
-            // which never supports removal (MutablePropertySourcesTests
-            // `iteratorContainsPropertySource`).  The earlier wrapper reused the
-            // mutating `ArrayList$Itr.remove` native, so `it.remove()` silently
-            // succeeded instead of throwing.
-            cratonvm_native_collections::make_iterator_from_array(ctx, snap, size)
+            // Return the REAL `COWIterator` over that snapshot. It is the same
+            // array-plus-cursor shape the generic helper builds, so this is one
+            // allocation and two name-resolved field writes either way; the
+            // difference is that `getClass()` now says
+            // `java.util.concurrent.CopyOnWriteArrayList$COWIterator` instead of
+            // naming an iterator that belongs to a different collection
+            // (`probes/SnapshotIteratorShapeProbe`, line `cowal.class`).
+            //
+            // `remove()` still throws `UnsupportedOperationException` — now out
+            // of the real class's own body rather than by our arranging it —
+            // matching real COWAL, which never supports removal
+            // (MutablePropertySourcesTests `iteratorContainsPropertySource`).
+            // The wrapper before this one reused the mutating
+            // `ArrayList$Itr.remove` native, so `it.remove()` silently succeeded
+            // instead of throwing.
+            match cratonvm_native_collections::alloc_real_snapshot_iterator_of(
+                ctx,
+                "java/util/concurrent/CopyOnWriteArrayList$COWIterator",
+                "snapshot",
+                snap,
+            ) {
+                Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+                // No real `COWIterator` in this image (`synthetic-jdk`) — keep
+                // the generic snapshot iterator, which iterates correctly and
+                // also throws from `remove()`.
+                None => cratonvm_native_collections::make_iterator_from_array(ctx, snap, size),
+            }
         });
         // Writes — true copy-on-write: copy array, mutate copy, swap reference.
         // Uses `cowal_read_state` / `cowal_write_array` so both real and
@@ -4400,7 +4435,24 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(es, "execute", "(Ljava/lang/Runnable;)V", native_es_execute);
+    // JDK-ONLY-WAVE2 (2026-08-06): `native_es_execute` is adjudicated a
+    // `SyntheticStub`, not the ambient kind this registrar would otherwise give
+    // it. It is a compatibility stand-in for CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` receiver shape, and once the real
+    // `ThreadPoolExecutor.<init>` runs for every factory shortcut
+    // (`initialize_real_thread_pool_executor`) there is no receiver left for it
+    // to stand in for on a real-JDK image. The tag is what lets
+    // `real_protected_stub_class` yield it to the real `execute()` bytecode
+    // structurally, for every receiver, which is what replaced the eight
+    // hand-written receiver-shape probes in `vm`. See
+    // `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+    registry.register_with_kind(
+        es,
+        "execute",
+        "(Ljava/lang/Runnable;)V",
+        native_es_execute,
+        NativeKind::SyntheticStub,
+    );
     registry.register(es, "shutdown", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -4456,7 +4508,17 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(tp, "execute", "(Ljava/lang/Runnable;)V", native_es_execute);
+    // Same adjudication as the `ExecutorService` registration above — this is
+    // the copy that matters, because `java/util/concurrent/ThreadPoolExecutor`
+    // is the class whose real bytecode is always loaded and which
+    // `real_protected_stub_class` therefore protects.
+    registry.register_with_kind(
+        tp,
+        "execute",
+        "(Ljava/lang/Runnable;)V",
+        native_es_execute,
+        NativeKind::SyntheticStub,
+    );
     registry.register(tp, "shutdown", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -5707,7 +5769,29 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     register_stamped_lock_natives(registry);
 }
 
+/// JDK-ONLY-CLASSIFY: stub — all 31 registrations, and the reason is a
+/// measurement rather than a reading of the class.
+///
+/// This function sets its own category now. It did not, and the consequence was
+/// the ambient-category defect in its purest form: **the same registration site
+/// produced a `Bridge` row and a `SyntheticStub` row in one boot**, because
+/// this function is called from three places and the callers disagreed about
+/// what was in effect. `--dump-native-registry` on JDK 25 / linux, 2026-08-06:
+/// every one of the 25 `StampedLock` triples appears three times, twice
+/// `bridge` and once `synthetic-stub`, and registration is last-write-wins, so
+/// what actually shipped was decided by call ORDER.
+///
+/// `SyntheticStub` is what shipped, and it is also the right tag on the merits:
+/// `java.util.concurrent.locks.StampedLock` is pure Java and JDK 25 declares no
+/// `ACC_NATIVE` method on it or on its two view classes, so contract §1.5
+/// cannot call these bridges. Under `--jdk-only` the whole surface is refused
+/// together and the real class runs — which is the shape
+/// `stampedlock-surface-must-be-complete-not-partial` asks for; a *partial*
+/// surface is the failure mode there, and an ambient tag that depends on call
+/// order is exactly how you get one.
 pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let sl = "java/util/concurrent/locks/StampedLock";
     registry.register(sl, "<init>", "()V", native_stamped_init);
     registry.register(sl, "readLock", "()J", native_stamped_read_lock);
@@ -5804,6 +5888,7 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl_rv, "lock", "()V", native_stamped_read_view_lock);
     registry.register(sl_rv, "tryLock", "()Z", native_stamped_read_view_try_lock);
     registry.register(sl_rv, "unlock", "()V", native_stamped_read_view_unlock);
+    registry.set_category(__prev_cat);
 }
 
 // The four `native_rwl_*` stubs that used to sit here were dead code: nothing

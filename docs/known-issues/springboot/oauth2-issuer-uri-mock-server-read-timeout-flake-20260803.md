@@ -124,6 +124,118 @@ context, and MockWebServer, i.e. far more class loading and compilation churn
 than two HTTP requests generate. Keep the 6-lane class repro; do not spend more
 time trying to shrink it to a probe without a new idea about the mechanism.
 
+## ROOT CAUSE (2026-08-06): a young GC pause longer than the read budget
+
+`CRATONVM_DBG=gcpause` on the 6-lane repro, failing runs:
+
+```
+[gcpause] collection took 1538ms  scan_dirty_cards=22ms full_old_rset_scan=0ms
+          root_forward=17ms overlay_forward=125ms card_root_forward=0ms cheney_drain=872ms
+[gcpause] collection took  993ms  ... overlay_forward=94ms  cheney_drain=517ms
+[gcpause] collection took  989ms  ... overlay_forward=88ms  cheney_drain=525ms
+[gcpause] collection took  973ms  ... overlay_forward=101ms cheney_drain=505ms
+```
+
+**A stop-the-world young collection of 500–1538 ms, against a 500 ms per-read
+budget.** MockWebServer runs *inside the same VM*, so the pause freezes the
+thread that must write the response; the client's read then expires having
+genuinely received nothing. That is the whole mechanism, and it explains every
+established fact: the wait is real (this page's own finding), `--nojit` is clean
+(far less allocation and compilation, so far fewer and shorter collections),
+load matters (more lanes, more heap pressure), and HotSpot never does it —
+its young pauses on this workload are single-digit ms.
+
+Note the phases do **not** sum to the total (1036 of 1538 ms). The remainder is
+outside the instrumented span — lock acquisition, the young object-start bitmap
+build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
+
+### Two defects behind the pause
+
+1. **`cheney_drain` dominates — 283–872 ms**, i.e. the survivor copy/scan
+   itself. This is the one that has to come down for the flake to go away;
+   fixing anything else still leaves a pause over the budget.
+
+   `CRATONVM_DBG=gcpause` now prints the counts that say what "slow" means:
+
+   ```
+   [gcpause] collection took 563ms  … overlay_forward=51ms cheney_drain=306ms
+             objects_copied=994447 young_bytes_before=291741144 pointer_map_len=994447
+   ```
+
+   So **~994 000 objects copied out of a ~291 MB young gen, at ~300 ns each**.
+   The count is astonishingly stable across cycles (994 444 / 994 445 /
+   994 447 / 994 448 / 994 450).
+
+   **That stability is NOT "survivors are never tenured" — I checked, and
+   age-based promotion works.** `PROMOTION_AGE = 3`, and `forward_object_impl`
+   increments `gc_age` in the `else` branch of the promotion test, i.e. on every
+   young→young copy, so a survivor is tenured on its third cycle. The stable
+   count is a genuine steady state: a workload building 52 Spring contexts
+   allocates and retains a near-constant population. Worth stating because "the
+   tenuring counter only advances on the path that has already tenured" is
+   exactly what the shape of the number suggests, and it is wrong.
+
+   What is left is arithmetic: a young generation of that size, at that survival
+   rate and that per-object cost, cannot be collected inside a 500 ms budget.
+   Two independent levers, and they are not alternatives — both are real:
+
+   * **Young-gen sizing.** ~291 MB of young in a 2 GB heap is very large, and
+     nothing ties it to a pause goal. `VmConfig` already carries
+     `g1_max_gc_pause_ms` with no equivalent for this collector. Sizing young to
+     a pause target is the standard fix and the one that would actually clear
+     the 500 ms budget.
+   * **Redundant per-object work.** `pointer_map_len == objects_copied`
+     **exactly**, every cycle: one `FxHashMap` insert per copied object, on top
+     of the forwarding pointer that `forward_object_impl` already installs in
+     the source header two lines earlier. HotSpot pays only the forwarding
+     pointer. The map exists to serve `remap_external_roots` afterwards, so
+     removing it means teaching that pass to chase forwarding pointers instead
+     — a contained change, ~1M hash inserts and one large map per cycle saved.
+
+2. **`overlay_forward` is O(every overlay in the process), per minor GC** —
+   68–125 ms and growing with heap population. `gen_heap.rs` seeds it with
+   `external_roots_for_matching_owners(&|_| true)`: an always-true predicate
+   that materialises **every** overlay-backed root (LinkedList /
+   LinkedHashMap / TreeMap / TreeSet side tables) and only then filters with
+   `young_from.contains(...)`. A minor collection should be proportional to the
+   young set, not to the whole heap's overlay population.
+
+   Traced to the source, it is worse than "one big Vec". There is exactly one
+   provider (`native-collections`), and its
+   `gc_overlay_roots_for_matching_owners` does, per minor GC, for **N** overlay
+   owners (a Spring context has thousands):
+
+   ```rust
+   let owners = overlay_owner_keys().lock()… .keys().filter(|o| true).collect();  // 1 lock, 1 Vec
+   for owner in owners {
+       roots.extend(gc_overlay_roots_for_collection(owner, None));               // per owner:
+   }                                                                             //   re-lock + clone
+   ```
+
+   and `gc_overlay_roots_for_collection` re-takes that **same global mutex** and
+   does `index.get(&owner).cloned()` — so the cycle pays **1 + N lock/unlock
+   cycles on one global mutex, N key-set clones, N result `Vec` allocations**,
+   and then walks every element of every overlay collection. All of it to
+   discover which handful of refs happen to be in young.
+
+   Three fixes, cheapest first, none of them started:
+   * hold the mutex **once** and gather owner→keys in a single pass (removes N
+     locks and N clones; local to `native-collections`, no cross-crate API
+     change);
+   * append into one caller-owned buffer instead of returning a fresh `Vec` per
+     owner (removes N allocations);
+   * the real one — a **dirty/card flag on overlay side-table writes**, so a
+     minor GC visits only owners mutated since the last cycle. That is what
+     makes the phase proportional to the young set instead of to the heap, and
+     it mirrors what the card table already does for ordinary object fields.
+
+**Neither defect is fixed.** The moving-Cheney phase breakdown is new
+(`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection on this
+arm printed a bare total, because `gcphase` instruments only the non-moving
+sweep this workload never takes. `cheney_drain` is the one that decides whether
+the flake survives; `overlay_forward` alone cannot bring a 1538 ms pause under
+500 ms.
+
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 
 Not the cause of this flake — MockWebServer reads through buffered Okio segments
@@ -141,6 +253,33 @@ Bulk reads are fine on both; it is fixed overhead per `read()` call. Any Java
 code that parses a protocol byte-at-a-time off a raw socket — a hand-rolled
 header parser, `DataInputStream.readLine`, an unbuffered `InputStreamReader` —
 pays ~35x on CratonVM.
+
+**Cause, and FIXED 2026-08-06.** `CRATONVM_DBG_READ0LAT=1` splits `net_read0`'s
+per-call cost (means over 24 576 calls):
+
+| stage | ns/call |
+|---|---:|
+| FileDescriptor field read | 91 |
+| socket registry lookup | 59 |
+| **`begin_blocking_region`** | **9 006** |
+| the `recv` itself | 819 |
+| **`end_blocking_region`** | **6 892** |
+| total | 16 867 |
+
+The GC blocking-region brackets are **~94% of the call and ~20x the `recv` they
+guard**. `begin_blocking_region` retires the TLAB and calls
+`deposit_root_snapshot()` — publishing the thread's entire Java root set — and
+`end_blocking_region` re-syncs refs against any GC that ran meanwhile.
+
+They exist so a read that parks in the OS cannot deadlock a stop-the-world, and
+that is right — for a read that *can* park. It was being paid unconditionally,
+including on the JDK's own timed-read path: `NioSocketImpl.timedRead` flips the
+fd **non-blocking** and polls separately (in `Net.poll`, which keeps its own
+region), so every `Socket.setSoTimeout(...)` reader paid a full root snapshot
+per read for a call that returns `WouldBlock` instead of waiting. `net_read0`
+now skips the brackets when `net_fd_is_nonblocking(fd)`. Safety rests on the
+fd's mode, not on timing — there is no race in which a non-blocking fd starts
+parking — and an unknown fd answers "blocking", keeping the region.
 
 ## Where the 500 ms comes from — RESOLVED 2026-08-06, and HotSpot budgets it too
 

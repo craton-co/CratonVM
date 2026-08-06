@@ -2199,6 +2199,12 @@ fn key_types_from_sigschemes(schemes: &[SignatureScheme]) -> Vec<String> {
 /// the whole call — a partial issuer list is still useful context for
 /// `chooseClientAlias`, and none at all is a valid "send whatever you have"
 /// signal per the trait's own contract.
+/// GC NOTE: `arr` and each `princ` outlive allocating calls (`create_string`,
+/// `alloc_concurrent_synthetic`), so both are rooted in a handle scope and
+/// re-read. Same defect class as `attach_trust_managers_to_ctx`'s 2026-08-01
+/// fix — see the `SSLContext.init` comment in `net_phase_e.rs` for the
+/// measurement that showed a stale copy silently produces an anonymous client.
+/// The caller must root the returned array itself before allocating again.
 fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[u8]]) -> ObjectRef {
     let dn_strings: Vec<String> = root_hint_subjects
         .iter()
@@ -2207,26 +2213,37 @@ fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[
     let cls_id = ctx
         .ensure_class_initialized("java/security/Principal")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, dn_strings.len());
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, dn_strings.len());
+    let arr_h = scope.root(arr);
     for (i, dn) in dn_strings.iter().enumerate() {
-        let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
-        let s = ctx.create_string(dn);
-        ctx.set_field(princ, 0, Value::Object(Some(s)));
-        ctx.set_array_element(arr, i, Value::Object(Some(princ)));
+        let princ =
+            alloc_concurrent_synthetic(&mut *scope, "javax/security/auth/x500/X500Principal", 1);
+        let princ_h = scope.root(princ);
+        let s = scope.create_string(dn);
+        let princ = scope.get(&princ_h);
+        scope.set_field(princ, 0, Value::Object(Some(s)));
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(princ)));
     }
-    arr
+    scope.get(&arr_h)
 }
 
+/// GC NOTE: see [`build_issuer_principals`] — `arr` is rooted because
+/// `create_string` below can move it.
 fn materialize_java_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
     let cls_id = ctx
         .ensure_class_initialized("java/lang/String")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, items.len());
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, items.len());
+    let arr_h = scope.root(arr);
     for (i, s) in items.iter().enumerate() {
-        let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let js = scope.create_string(s);
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(js)));
     }
-    arr
+    scope.get(&arr_h)
 }
 
 /// True if `result` is an `Err(ExceptionThrown)` wrapping a real
@@ -2294,8 +2311,23 @@ impl JavaKeyManagerResolver {
                 key_types
             );
         }
-        let key_type_arr = materialize_java_string_array(ctx, &key_types);
-        let issuers_arr = build_issuer_principals(ctx, root_hint_subjects);
+        // GC: both arrays are handed to `chooseClientAlias` on every loop
+        // iteration below, and every `invoke_virtual` between here and there
+        // can move them. `key_type_arr` in particular is built BEFORE
+        // `build_issuer_principals`, which allocates one synthetic principal
+        // and one String per issuer hint. A stale `String[] keyType` makes a
+        // real `SunX509KeyManagerImpl.chooseClientAlias` return null, which is
+        // indistinguishable from "the application declined to present a
+        // certificate" — the client then sends an EMPTY Certificate and a
+        // server with `clientAuth=NEED` answers `CertificateRequired`. That is
+        // the reported failure; see the `SSLContext.init` comment in
+        // `net_phase_e.rs` for the measurement.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let key_type_arr = materialize_java_string_array(&mut *scope, &key_types);
+        let key_type_h = scope.root(key_type_arr);
+        let issuers_arr = build_issuer_principals(&mut *scope, root_hint_subjects);
+        let issuers_h = scope.root(issuers_arr);
+        let ctx = &mut scope;
 
         // Pin every KeyManager ObjectRef before any call that can allocate
         // (invoke_virtual below) — a moving GC triggered by that call could
@@ -2345,9 +2377,12 @@ impl JavaKeyManagerResolver {
                 // when it never fires) in case some OTHER, genuinely
                 // transient cause of the same symptom is hit by a future
                 // caller shape this session didn't exercise.
+                // Re-read both argument arrays through their handles on every
+                // iteration: the previous iteration's `invoke_virtual`s can
+                // have moved them.
                 let args = [
-                    Value::Object(Some(key_type_arr)),
-                    Value::Object(Some(issuers_arr)),
+                    Value::Object(Some(ctx.get(&key_type_h))),
+                    Value::Object(Some(ctx.get(&issuers_h))),
                     Value::Object(None),
                 ];
                 let mut choose_result = ctx.invoke_virtual(
@@ -2357,12 +2392,17 @@ impl JavaKeyManagerResolver {
                     &args,
                 );
                 let mut retry_attempt = 0;
-                while is_abstract_method_error(ctx, &choose_result) && retry_attempt < 3 {
+                while is_abstract_method_error(&mut **ctx, &choose_result) && retry_attempt < 3 {
                     retry_attempt += 1;
                     std::thread::yield_now();
                     std::thread::sleep(std::time::Duration::from_millis(5 * retry_attempt));
                     km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                     let km_obj = km_list[i];
+                    let args = [
+                        Value::Object(Some(ctx.get(&key_type_h))),
+                        Value::Object(Some(ctx.get(&issuers_h))),
+                        Value::Object(None),
+                    ];
                     choose_result = ctx.invoke_virtual(
                         km_obj,
                         "chooseClientAlias",
@@ -2397,6 +2437,10 @@ impl JavaKeyManagerResolver {
                 let Some(alias) = alias else { continue };
 
                 let pk_args = [Value::Object(Some(ctx.create_string(&alias)))];
+                // `create_string` above allocates, so the receiver is re-read
+                // AFTER it rather than before — the pre-`create_string` copy
+                // taken a few lines up is already potentially stale.
+                km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                 let pk_result = ctx.invoke_virtual(
                     km_list[i],
                     "getPrivateKey",
@@ -2416,7 +2460,7 @@ impl JavaKeyManagerResolver {
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                 let Some(pk_obj) = pk_obj else { continue };
 
-                let km_id = crate::x509_manager::km_id_from_private_key_mirror(ctx, pk_obj);
+                let km_id = crate::x509_manager::km_id_from_private_key_mirror(&**ctx, pk_obj);
                 if dbg {
                     eprintln!("[dbg-tls-auth] JavaKeyManagerResolver km_id_from_private_key_mirror -> {:?}", km_id);
                 }
@@ -2472,13 +2516,39 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
                 root_hint_subjects.len()
             );
         }
+        // A resolver that HAS key managers but produces nothing makes the
+        // client send an empty Certificate. That is legitimate when the
+        // application's own `chooseClientAlias` declines, but it is also how
+        // every internal failure in this path presents — and the far end then
+        // reports something that names neither this VM nor this decision
+        // (`received fatal alert: CertificateRequired` from a server with
+        // `clientAuth=NEED`, which is what
+        // `jdkclienthttprequestfactory-certificaterequired-alert-20260806`
+        // was opened on). Say so here, once per handshake, so a recurrence
+        // from a cause other than the stale-`ObjectRef` one fixed alongside
+        // this is diagnosable from an ordinary run's log.
+        let had_key_managers = self.has_certs();
         let out = with_active_native_context(|ctx| {
             self.resolve_via_java(ctx, root_hint_subjects, sigschemes)
         });
         if dbg && out.is_none() {
             eprintln!("[dbg-tls-auth] JavaKeyManagerResolver::resolve NO active native context");
         }
-        out.flatten()
+        let had_active_native_context = out.is_some();
+        let resolved = out.flatten();
+        if had_key_managers && resolved.is_none() {
+            tracing::warn!(
+                target: "tls",
+                km_ctx_key = self.km_ctx_key,
+                acceptable_issuers = root_hint_subjects.len(),
+                had_active_native_context,
+                "client certificate requested by the peer, but this SSLContext's \
+                 KeyManagers produced none — sending an empty certificate. A peer \
+                 requiring client auth will answer with a CertificateRequired alert. \
+                 Run with CRATONVM_DBG_TLS_AUTH=1 for the per-stage trace"
+            );
+        }
+        resolved
     }
 
     fn has_certs(&self) -> bool {

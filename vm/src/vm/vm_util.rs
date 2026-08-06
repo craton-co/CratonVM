@@ -2109,7 +2109,7 @@ fn initialize_class_shared(
             .class_manager
             .read()
             .get_class(class_id)
-            .map(|c| c.is_synthetic_stub)
+            .map(|c| c.origin.is_compatibility_stub())
             .unwrap_or(false);
         if is_synthetic_stub {
             post_clinit_fixup(shared, class_id, &class_name_for_jfr);
@@ -4459,7 +4459,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -4550,7 +4549,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,

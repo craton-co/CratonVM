@@ -7088,8 +7088,15 @@ pub enum JitNewSite {
 pub struct StringFieldLayout {
     /// Abstract field slot index of `String.value` (the backing array ref).
     pub value_field_index: usize,
-    /// Byte offset of `value`'s bare 8-byte pointer in a COMPACT instance.
+    /// Byte offset of `value`'s bare pointer in a COMPACT instance.
     pub value_compact_offset: i32,
+    /// Whether `value`'s COMPACT slot is a 4-byte **narrow** oop rather than a
+    /// bare 8-byte pointer. True exactly when compressed oops are on *and* a
+    /// `CompactLayout` was actually registered for `string_class_id` — the
+    /// no-registered-layout fallback below points `value_compact_offset` at
+    /// the LEGACY 8-byte cell payload, which must keep the wide load even
+    /// under narrow oops.
+    pub value_compact_is_narrow: bool,
     /// Byte offset of `value`'s 8-byte pointer payload in a LEGACY instance
     /// (`HEADER_SIZE + value_field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD64_OFFSET`).
     pub value_legacy_offset: i32,
@@ -7209,27 +7216,33 @@ impl StringFieldLayout {
         // predicate every collector's allocation path uses), so the compact
         // arm is unreachable, and pointing it at the legacy address keeps it
         // harmless rather than wild if that invariant ever slips.
-        let compact = |idx: usize, is_ref: bool| -> (i32, bool) {
+        // Returns `(address, is_byte_wide, storage_width)`; `storage_width` is
+        // 8 for the fallback so a reference there keeps its wide load.
+        let compact = |idx: usize, is_ref: bool| -> (i32, bool, u32) {
             if cratonvm_types::compact_ref_fields_enabled() {
                 if let Some((body_off, storage)) =
                     cratonvm_types::compact_field_storage(string_class_id, idx)
                 {
+                    let width = storage.size_runtime();
                     return (
                         (cratonvm_types::HEADER_SIZE + body_off) as i32,
-                        storage.size_runtime() == 1,
+                        width == 1,
+                        width,
                     );
                 }
             }
-            (legacy(idx, is_ref), false)
+            (legacy(idx, is_ref), false, 8)
         };
 
-        let (value_compact_offset, _) = compact(value_field_index, true);
-        let (hash_compact_offset, _) = compact(hash_field_index, false);
-        let (coder_compact_offset, coder_compact_is_byte) =
-            coder_field_index.map_or((0, false), |idx| compact(idx, false));
+        let (value_compact_offset, _, value_compact_width) = compact(value_field_index, true);
+        let (hash_compact_offset, _, _) = compact(hash_field_index, false);
+        let (coder_compact_offset, coder_compact_is_byte, _) =
+            coder_field_index.map_or((0, false, 4), |idx| compact(idx, false));
         StringFieldLayout {
             value_field_index,
             value_compact_offset,
+            value_compact_is_narrow: value_compact_width
+                == cratonvm_types::narrow_oop::NARROW_REF_SIZE as u32,
             value_legacy_offset: legacy(value_field_index, true),
             hash_field_index,
             hash_compact_offset,
@@ -7786,14 +7799,36 @@ fn record_jdk_only_ic_native_refusal() {
 #[inline]
 fn direct_native_helper(
     cell: &std::sync::atomic::AtomicUsize,
+    jdk_only: bool,
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
     class: &str,
     method: &str,
     descriptor: &str,
 ) -> usize {
     let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
-    if entry != 0 && jit_is_jdk_only() {
-        record_jdk_only_direct_native_refusal(class, method, descriptor);
-        return 0;
+    if entry != 0 && jdk_only {
+        // JDK-ONLY-WAVE2 §4. The question is no longer "is this one of seven
+        // hard-coded triples" — the seven are still how the RECOGNITION picks
+        // a cell, because that is a triple-to-helper-address map the registry
+        // does not have — but the POLICY answer now comes from the registry's
+        // own `NativeKind`, which is where §1.4's reviewed-exception verdict
+        // actually lives.
+        //
+        // Measured against `scripts/baselines/jdk-only-kind-map-25-linux.tsv`,
+        // the seven split 3/3/1: `StringLatin1.toLowerCase`,
+        // `Integer.valueOf(I)` and `Integer.intValue()` are `Intrinsic` and
+        // §1.4 permits them; `HashMap.put`, `HashMap.get` and
+        // `ConcurrentMap.get` are `Bridge` and it does not; and
+        // `String.toLowerCase(Locale)` is not registered at all, so there is
+        // nothing to audit and it stays refused — the same rule
+        // `admit_jit_fast_native` states for an unregistered fast path.
+        let approved = intrinsic_resolver.is_some_and(|is_intrinsic| {
+            is_intrinsic(class, method, descriptor)
+        });
+        if !approved {
+            record_jdk_only_direct_native_refusal(class, method, descriptor);
+            return 0;
+        }
     }
     entry
 }
@@ -8374,33 +8409,25 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
-    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
-    // one of these intrinsics reaches `emit_load_string_value_ptr`
-    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
-    // `String.value` reference field. That emitter is NOT gated on
-    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
-    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
-    // the adjacent coder/hash field and dereferences the result - a
-    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
-    // indexOf / hashCode / equals / compareTo.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes" used to
+    // be closed here, by refusing every String intrinsic under narrow oops:
+    // all of them reach `emit_load_string_value_ptr` (`jit/src/x64/objects.rs`),
+    // which emitted an unconditional 64-bit load of the `String.value`
+    // reference field and so, under narrow oops, loaded 4 bytes of narrow oop
+    // plus 4 bytes of the adjacent coder/hash field and dereferenced the
+    // result.
     //
-    // Refusing the intrinsic here is the unblock that module's header
-    // prescribes: it costs throughput (the calls fall back to native
-    // dispatch) and costs nothing when the gate is off, which is the default.
-    // The real fix is a narrow arm in that emitter, mirroring
-    // `emit_narrow_ref_aload_regs`.
+    // That emitter now has a proper narrow arm (`emit_load_narrow_ref_field`),
+    // selected per call site by `StringFieldLayout::value_compact_is_narrow`,
+    // so the refusal that used to stand here — and the throughput it cost —
+    // is gone. The intrinsics are admitted under both widths.
     //
     // Hole 2 — the conservative 8-byte-word rescan in `gen_heap`'s
-    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is CLOSED
-    // (2026-08-06): both now go through `for_each_conservative_ref_slot`, which
-    // visits narrow slots at 4 bytes as well. So the two holes that made the
-    // gate unsound are covered: this one by refusal, that one by a fix.
-    // `enable_for_live_heap` still warns, and the default stays off, because
-    // "no known unsoundness" is not the same as "measured sound" — nothing has
-    // yet run a corpus with the gate ON. See gc/src/compressed_oops.rs.
-    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
-        return None;
-    }
+    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is closed
+    // too (both go through `for_each_conservative_ref_slot`, which visits
+    // narrow slots at 4 bytes as well). The gate still defaults off; see
+    // `gc/src/compressed_oops.rs` for why, which is no longer "a known
+    // wrong-width slot access on this backend".
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
@@ -8509,7 +8536,7 @@ pub struct JitDirectCall {
 ///
 /// Hit/miss counters support adaptive recompilation decisions.
 ///
-/// # JDK-ONLY-WAVE2 — this cache stores an entry pointer and no `NativeKind`
+/// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06: no gap, and the prescription was wrong
 ///
 /// `cached_entry_ptr` is a raw address that generated code `CALL R11`s on a
 /// class-id guard hit. When the target is a native/builtin trampoline the slot
@@ -8528,12 +8555,35 @@ pub struct JitDirectCall {
 /// `vm/src/jit/helpers.rs`, which this wave's owner cannot edit; widening the
 /// `update` signature would break it.
 ///
-/// Wave 2 should append a `cached_native_kind: AtomicU8` **after** the
-/// generated-code-visible prefix (the tail, next to `compiled_owner`, so no
-/// baked offset moves), populate it from the `NativeKind` the helper already
-/// has at install time, and replace the wave-1 refusal with a kind check —
-/// which restores the native fast path under `JdkOnly` for reviewed bridges and
-/// intrinsics instead of forcing every native receiver onto the helper.
+/// **Do not do that.** The paragraph above used to prescribe appending a
+/// `cached_native_kind: AtomicU8` at the tail, populating it at install time
+/// and replacing the wave-1 refusal with a kind check. Checked 2026-08-06, it
+/// fails on both halves:
+///
+/// * **Nothing would read it.** The hit path is emitted machine code, not
+///   Rust: `ir_lower.rs` documents and emits
+///   `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11` after the class-id guard.
+///   A kind byte in the slot has no reader on the one path it is meant to fix.
+///   Consulting it would mean emitting the load, test and branch into the guard
+///   sequence — a throughput cost on the JIT's hottest path, to police a state
+///   the next point establishes cannot occur.
+/// * **A native is never in the slot to begin with — in EITHER mode.** Both
+///   population clusters in `vm/src/jit/helpers.rs` take their entry from
+///   `try_jit_compile_callee`, which yields a JIT-compiled callee held by a
+///   live `Arc<CompiledMethod>` pin. `jit_entry_publishable`'s
+///   `owner.is_some()` early return therefore fires before any policy branch,
+///   and that early return is **not policy-dependent**. So the strict refusal
+///   below is unreachable (measured: `jit_inline_cache_natives` 0), and the
+///   `Compatible` census gap this record also claimed is unreachable for
+///   exactly the same reason — there is no native in the slot to dispatch
+///   uncounted. The wave-2 record asserted both "a native trampoline never
+///   reaches the refusal from these sites" and "the missing kind leaves the
+///   census incomplete in `Compatible` mode as much as strict"; those cannot
+///   both be true, and it is the second that is wrong.
+///
+/// If a future change ever routes a native trampoline into these slots, the
+/// refusal below is what stops it, and THAT is the invariant to keep — not a
+/// kind byte.
 ///
 /// # Memory layout (CRIT-8 prerequisite)
 ///
@@ -8828,17 +8878,23 @@ pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 /// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 4
 /// entries, the site is deoptimized to a generic vtable dispatch.
 ///
-/// # JDK-ONLY-WAVE2 — same missing-`NativeKind` shape as [`JitMICSlot`]
+/// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06, with [`JitMICSlot`]; see the note there
 ///
 /// `entry_ptrs[i]` and `mega_entry_ptrs[i]` are raw addresses with no kind
 /// beside them, so a hit cannot re-check policy. Both install paths funnel
 /// through `jit_entry_publishable`, which under `JdkOnly` refuses unowned
 /// (native/builtin) targets, so wave 1 keeps them empty of natives rather than
-/// letting them hold an unverifiable one. Wave 2 should add a parallel
-/// `needs_context`-style `AtomicU8` kind array — appended at the TAIL, since
-/// `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` / `NEEDS_CONTEXT_OFFSETS` /
-/// `MEGA_*_OFFSET` are all baked into emitted code as immediates — and check
-/// the kind instead of refusing outright.
+/// letting them hold an unverifiable one.
+///
+/// This used to prescribe a wave-2 `AtomicU8` kind array appended at the TAIL,
+/// checked instead of refusing outright. **Do not do that** — see the same
+/// retraction on [`JitMICSlot`], which applies here unchanged and with one
+/// extra reason: the inline 4-way probe this struct exists for is
+/// `CMP EAX,[R10+CLASS_ID_OFFSETS[i]]` / `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]]` /
+/// `CALL R11`, so a kind array would need four more loads and branches inside
+/// the guard cascade, on the hottest dispatch shape in the JIT, to police a
+/// state `jit_entry_publishable`'s policy-independent `owner.is_some()` early
+/// return already makes unreachable in both modes.
 ///
 /// # Memory layout
 ///
@@ -13126,6 +13182,14 @@ pub fn try_compile(
         cp_invokedynamic_descriptor_resolver,
         None,
         None,
+        // No VM in scope here. The latch is what this wrapper's callers (this
+        // crate's tests, and any VM site not yet threading a policy) have
+        // always read, and no test latches it, so they keep reading
+        // `Compatible`.
+        jit_is_jdk_only(),
+        // No registry in scope from this wrapper. `None` refuses, which is
+        // what the blanket strict refusal did before §4.
+        None,
     )
 }
 
@@ -13273,6 +13337,32 @@ pub fn try_compile_with_invokespecial_resolver(
     // answer — refuses the speculation; it never falls back to the other
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
+    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
+    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
+    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
+    // and for a triple the registry has never heard of.
+    //
+    // This is the policy half of the seven thin direct-call ladders below.
+    // Before it existed those ladders were refused wholesale under `JdkOnly`,
+    // which is stricter than the contract: three of the seven are registered
+    // `Intrinsic` and §1.4 permits exactly those.
+    //
+    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
+    // fail-closed direction — a compile with no way to ask cannot bake a
+    // native in front of real bytes.
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -13380,6 +13470,8 @@ pub fn try_compile_with_invokespecial_resolver(
         &mut backend_attempted,
         self_call_identity_stable,
         &admission,
+        jdk_only,
+        intrinsic_resolver,
     );
 
     // Take once and use for all three sinks: the bail-list decision below, the
@@ -14000,6 +14092,32 @@ fn try_compile_inner(
     // backend call at the end of this function can require it. See
     // `x64::compile_with_param_slots`'s first parameter.
     admission: &compile_gate::CompileAdmission,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
+    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
+    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
+    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
+    // and for a triple the registry has never heard of.
+    //
+    // This is the policy half of the seven thin direct-call ladders below.
+    // Before it existed those ladders were refused wholesale under `JdkOnly`,
+    // which is stricter than the contract: three of the seven are registered
+    // `Intrinsic` and §1.4 permits exactly those.
+    //
+    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
+    // fail-closed direction — a compile with no way to ask cannot bake a
+    // native in front of real bytes.
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -15278,6 +15396,8 @@ fn try_compile_inner(
                             {
                                 let entry = direct_native_helper(
                                     &THREAD_CURRENT_THREAD_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
                                     direct_class,
                                     &mn,
                                     &desc,
@@ -16809,6 +16929,8 @@ fn try_compile_inner(
                         // frames can observe.
                         let entry = direct_native_helper(
                             &STRING_LATIN1_LOWER_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16846,6 +16968,8 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &THREAD_CURRENT_THREAD_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16880,6 +17004,8 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &INTEGER_VALUE_OF_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -17136,6 +17262,8 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &INTEGER_INT_VALUE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17165,6 +17293,8 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17221,6 +17351,8 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_PUT_DIRECT_FN,
+                                jdk_only,
+                                intrinsic_resolver,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -17235,6 +17367,8 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_GET_DIRECT_FN,
+                                jdk_only,
+                                intrinsic_resolver,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -18590,6 +18724,113 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Two VMs, two answers — the property JDK-ONLY-WAVE2 §2 was filed about.
+    ///
+    /// `direct_native_helper`'s policy input used to be the process-global
+    /// `JIT_COMPATIBILITY_MODE` latch, which only ever moved toward strict. A
+    /// `Compatible` VM sharing a process with a `JdkOnly` one therefore lost
+    /// the thin direct-call helpers: the strict VM latched, and every later
+    /// compilation in the process — whosever it was — got `0` back.
+    ///
+    /// This test could not have been written against that design. There was no
+    /// per-call policy to vary, and the module comment on
+    /// `set_jit_execution_policy` explicitly forbids latching from a unit test
+    /// in this crate precisely because it is irreversible and `mod tests`
+    /// shares one binary. Now the policy is an argument, so the two cases are
+    /// independent by construction and a test can simply ask for both.
+    #[test]
+    fn direct_native_helper_answers_per_vm_not_per_process() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // A registered helper address. `build_helpers` now publishes these
+        // unconditionally; whether they may be BOUND is the policy question
+        // below, and it is asked per compilation.
+        CELL.store(0xdead_beef, std::sync::atomic::Ordering::Relaxed);
+
+        // No resolver: strict refuses and records. This is also the §4
+        // fail-closed case — a compile with no way to ask the registry cannot
+        // bake a native in front of real bytes.
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper(&CELL, true, None, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0,
+            "a JdkOnly compilation with no resolver must not bind a thin direct-call helper"
+        );
+        assert!(
+            jdk_only_direct_native_refusals() > before,
+            "the refusal must be counted, not silent"
+        );
+
+        // Compatible still binds — and critically, does so AFTER the strict
+        // call above. Under the latch this is exactly the assertion that
+        // failed, because the strict answer poisoned the process.
+        assert_eq!(
+            direct_native_helper(&CELL, false, None, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0xdead_beef,
+            "a Compatible compilation lost its helper because another VM was strict"
+        );
+
+        // And the unset sentinel is still the unset sentinel in both modes.
+        CELL.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(direct_native_helper(&CELL, false, None, "c", "m", "()V"), 0);
+        assert_eq!(direct_native_helper(&CELL, true, None, "c", "m", "()V"), 0);
+    }
+
+    /// JDK-ONLY-WAVE2 §4: under `JdkOnly` the bind decision is the registry's
+    /// `NativeKind`, not a hard-coded triple list.
+    ///
+    /// §1.4 names `Intrinsic` as the reviewed exception that MAY shadow
+    /// concrete bytecode. The pre-2026-08-06 gate refused all seven ladders
+    /// wholesale, which is stricter than the contract: measured against
+    /// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, three of them
+    /// (`StringLatin1.toLowerCase`, `Integer.valueOf(I)`, `Integer.intValue`)
+    /// are registered `Intrinsic`.
+    #[test]
+    fn direct_native_helper_asks_the_registry_not_a_name_list() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CELL.store(0xfeed_face, std::sync::atomic::Ordering::Relaxed);
+
+        let intrinsic = |_c: &str, _m: &str, _d: &str| true;
+        let bridge = |_c: &str, _m: &str, _d: &str| false;
+
+        // Intrinsic: §1.4's reviewed exception, so it binds even under strict.
+        assert_eq!(
+            direct_native_helper(
+                &CELL,
+                true,
+                Some(&intrinsic),
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;"
+            ),
+            0xfeed_face,
+            "a reviewed Intrinsic must still bind under JdkOnly (§1.4)"
+        );
+
+        // Bridge (and SyntheticStub, and unregistered — the resolver answers
+        // `false` for all three): refused, and recorded.
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper(
+                &CELL,
+                true,
+                Some(&bridge),
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0,
+            "a Bridge must not shadow concrete bytecode under JdkOnly"
+        );
+        assert!(jdk_only_direct_native_refusals() > before);
+
+        // Compatible is unchanged by the kind either way — the resolver is
+        // only consulted on the strict arm.
+        assert_eq!(
+            direct_native_helper(&CELL, false, Some(&bridge), "java/util/HashMap", "put", "()V"),
+            0xfeed_face
+        );
+    }
     /// Poll `cond` until it holds, for up to ~1s.
     ///
     /// Several globals these tests observe are *eventually* consistent, not
@@ -23127,6 +23368,124 @@ mod tests {
 
         let result = cache.get(&class, &method, &desc, cratonvm_types::ClassId::new(1));
         assert!(result.is_some());
+    }
+
+    /// **Every publication advances `jit_cache_generation()`** — first-time
+    /// insertion, replacement, and OSR body alike.
+    ///
+    /// This is the load-bearing step of the recycled-`JitSiteKey` argument, and
+    /// until now it rested on a comment plus four hand-written `fetch_add`
+    /// calls. See
+    /// `docs/internal/site-alias-diagnostic-and-the-recycled-jitsitekey-question-CLOSED-20260806.md`.
+    ///
+    /// The chain it closes: a `JitInvokeInfo` box is owned by its
+    /// `CompiledMethod` (`_jit_invoke_infos`), so its ADDRESS — which is what a
+    /// `JitSiteKey` is — is freed and re-issued. Every per-thread memo keyed on
+    /// one is cleared by `flush_raw_entry_dispatch_caches`, which fires on a
+    /// generation change and runs before any memo probe. That only closes the
+    /// hole because a recycled address cannot become *dispatchable* without a
+    /// publication: compiled code referencing the new `JitInvokeInfo` has to be
+    /// published before it can run. So if a publication could land without
+    /// advancing the generation, the flush would not fire and one call site
+    /// would serve another's dispatch — the defect `383e7f5cf` fixed, in a new
+    /// disguise.
+    ///
+    /// **Non-vacuous:** each step asserts the body is actually REACHABLE
+    /// afterwards, not just that a counter moved. A `put` that silently
+    /// declined (stale publication epoch, `prepare_for_publication` refusal)
+    /// publishes nothing and correctly does not bump — so a test that only
+    /// watched the counter could pass while proving nothing about publication.
+    ///
+    /// **Strictly greater, not `+ 1`:** `JIT_CACHE_GENERATION` is a process
+    /// global and the test binary runs tests in parallel, so a concurrent
+    /// publication in another test may also bump it. `>` is the assertion that
+    /// is both true and stable; `== before + 1` would be a flake.
+    ///
+    /// **Verified as a negative control.** Deleting the `fetch_add` at the
+    /// first-time publication site turns this red on the first arm, with the
+    /// message it was written to produce — so it is pinning the bump, not
+    /// riding on a counter something else moves.
+    #[test]
+    fn every_publication_advances_the_jit_cache_generation() {
+        fn ret_body(osr: bool) -> CompiledMethod {
+            let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+            buf.emit(&[0xC3]); // RET
+            let mut cm = CompiledMethod::new(buf);
+            cm.compiled_via_osr = osr;
+            cm
+        }
+
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("GenerationClass");
+        let method: Arc<str> = Arc::from("hot");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+
+        // 1. First-time insertion. The comment at the bump site calls this out
+        //    specifically ("bump on EVERY publication, not just replacements"),
+        //    because it is the one a replacement-only bump would miss.
+        let before = jit_cache_generation();
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(false),
+        );
+        let first = cache
+            .get(&class, &method, &desc, cid)
+            .expect("first publication must be reachable");
+        assert!(
+            jit_cache_generation() > before,
+            "a first-time publication did not advance the JIT cache generation; \
+             a recycled JitInvokeInfo address could then inherit the previous \
+             site's memoized dispatch"
+        );
+
+        // 2. Replacement. The superseded artifact's `JitInvokeInfo` boxes are
+        //    what get freed and re-issued, so this is the case the whole
+        //    argument is about.
+        let before = jit_cache_generation();
+        let first_entry = first.entry_ptr();
+        drop(first);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(false),
+        );
+        let replaced = cache
+            .get(&class, &method, &desc, cid)
+            .expect("replacement must be reachable");
+        assert_ne!(
+            replaced.entry_ptr(),
+            first_entry,
+            "the second put must have superseded the first, or this arm proves nothing"
+        );
+        assert!(
+            jit_cache_generation() > before,
+            "a replacement publication did not advance the JIT cache generation"
+        );
+
+        // 3. OSR body. A separate entry point with its own bump; it publishes
+        //    alongside the method-entry body rather than superseding it.
+        let before = jit_cache_generation();
+        cache.put_osr(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(true),
+        );
+        assert!(
+            cache.get_osr(&class, &method, &desc, cid).is_some(),
+            "OSR publication must be reachable"
+        );
+        assert!(
+            jit_cache_generation() > before,
+            "an OSR publication did not advance the JIT cache generation"
+        );
     }
 
     #[test]

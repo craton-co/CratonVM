@@ -951,6 +951,48 @@ fn watchref_dbg() -> bool {
     gc_flags().dbg_watchref
 }
 
+thread_local! {
+    /// Phase marks recorded by the MOVING (Cheney) young cycle for the current
+    /// collection, drained by `collect_garbage_inner`'s pause timer.
+    ///
+    /// A thread-local rather than a value threaded through the cycle because
+    /// that function has many exit paths (young-skip backstops, the non-moving
+    /// diversion, promotion-OOM bailouts); a returned value would report only
+    /// the one that falls through, which is not the interesting case.
+    static MOVING_PHASE_MARKS: std::cell::RefCell<Vec<(&'static str, u128)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record one moving-young phase duration. Only ever called when
+/// `CRATONVM_DBG=gcpause` is on.
+fn moving_phase_marks_push(name: &'static str, ms: u128) {
+    MOVING_PHASE_MARKS.with(|m| m.borrow_mut().push((name, ms)));
+}
+
+/// Take and clear this thread's moving-young phase marks.
+fn moving_phase_marks_take() -> Vec<(&'static str, u128)> {
+    MOVING_PHASE_MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
+thread_local! {
+    /// Unit-less counts for the current moving-young cycle (objects copied,
+    /// bytes copied, …), reported beside the phase durations.
+    ///
+    /// A duration alone cannot say whether a slow `cheney_drain` means "too
+    /// many survivors" or "the copy loop is too slow per object", and those
+    /// have opposite fixes. The count is what separates them.
+    static MOVING_PHASE_COUNTS: std::cell::RefCell<Vec<(&'static str, u128)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn moving_phase_count_push(name: &'static str, value: u128) {
+    MOVING_PHASE_COUNTS.with(|m| m.borrow_mut().push((name, value)));
+}
+
+fn moving_phase_counts_take() -> Vec<(&'static str, u128)> {
+    MOVING_PHASE_COUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
 /// DBG (`CRATONVM_DBG_PROMO_SEED`): report how many of THIS cycle's young→old
 /// promotion destinations the in-place old sweep seeded its mark from, and how
 /// many `old_gen_mark_candidate_plausible` rejected. A nonzero rejection count
@@ -4996,8 +5038,26 @@ impl GenerationalHeap {
             fn drop(&mut self) {
                 if let Some(t0) = self.0 {
                     let ms = t0.elapsed().as_millis();
+                    // Drain unconditionally: marks from a fast cycle must not
+                    // survive to be reported against the next slow one.
+                    let marks = moving_phase_marks_take();
+                    let counts = moving_phase_counts_take();
                     if ms >= 100 {
-                        eprintln!("[gcpause] collection took {ms}ms");
+                        if marks.is_empty() {
+                            eprintln!("[gcpause] collection took {ms}ms");
+                        } else {
+                            let detail = marks
+                                .iter()
+                                .map(|(n, d)| format!("{n}={d}ms"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let tally = counts
+                                .iter()
+                                .map(|(n, v)| format!("{n}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("[gcpause] collection took {ms}ms  {detail}  {tally}");
+                        }
                     }
                 }
             }
@@ -5853,15 +5913,42 @@ impl GenerationalHeap {
         // old gen; popped by the alternating Cheney scan below.
         let mut promoted_worklist: Vec<*mut u8> = Vec::new();
 
+        // Phase timing for the MOVING (Cheney) young cycle, on the same
+        // `CRATONVM_DBG=gcpause` flag that already reports the total.
+        //
+        // `gcphase` instruments `sweep_young_non_moving` ONLY, so a workload
+        // that never diverts to the non-moving sweep reports a slow collection
+        // with no breakdown at all. That is exactly the state the OAuth2
+        // 500 ms read-timeout investigation hit: `[gcpause] collection took
+        // 566ms` with `gcphase` completely silent, because this arm ran
+        // instead. Printed only when the cycle is already slow, so the steady
+        // state pays two `Instant::now()` calls and nothing else.
+        // Marks go to a thread-local that `collect_garbage_inner`'s existing
+        // pause timer drains on drop, so the breakdown survives every exit path
+        // this function has rather than only the one that falls through.
+        let mv_phase_on = gc_flags().dbg_gcpause;
+        let mut mv_last = std::time::Instant::now();
+        macro_rules! mv_phase {
+            ($name:expr) => {
+                if mv_phase_on {
+                    let now = std::time::Instant::now();
+                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
+                    mv_last = now;
+                }
+            };
+        }
+
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
         Self::scan_dirty_cards(card_table, &old_gen, &young_from, &mut extra_roots);
+        mv_phase!("scan_dirty_cards");
         // Card marking is a fast path only. A missed barrier must retain an
         // object for one extra collection, never reclaim a reachable child.
         if Self::full_old_rset_scan_enabled() {
             Self::scan_all_old_to_young(&old_gen, &young_from, &mut extra_roots);
         }
+        mv_phase!("full_old_rset_scan");
 
         // Phase 1: Forward all root objects
         for root in roots.iter_mut() {
@@ -5884,6 +5971,8 @@ impl GenerationalHeap {
             // space in young_to or old_gen and copied a valid object there.
             *root = unsafe { ObjectRef::from_raw(new_ptr) };
         }
+
+        mv_phase!("root_forward");
 
         // Phase 1a: forward the overlay-backed collections' Rust-side edges.
         //
@@ -5938,6 +6027,8 @@ impl GenerationalHeap {
         // exactly one cycle (the promoting one) and the cycle after the dirty-
         // card fixup forgets it.
         let mut deferred_dirty_cards: Vec<usize> = Vec::new();
+
+        mv_phase!("overlay_forward");
 
         // Phase 1b: Forward old→young references from dirty cards
         // Ref arrays use compact 8-byte pointers; object fields use 16-byte Value.
@@ -6045,6 +6136,8 @@ impl GenerationalHeap {
                 }
             }
         }
+
+        mv_phase!("card_root_forward");
 
         // Phase 2 + 2b: Combined Cheney scan and promoted object scan.
         //
@@ -6227,6 +6320,19 @@ impl GenerationalHeap {
             if !made_progress {
                 break;
             }
+        }
+
+        mv_phase!("cheney_drain");
+        if mv_phase_on {
+            // The numbers that decide what a slow drain MEANS. `bytes_before`
+            // is the young occupancy the cycle started from, so
+            // copied/bytes_before is the survival rate: a drain that is slow
+            // with few survivors is a per-object cost problem, one that is slow
+            // with most of young surviving is a promotion/sizing problem, and
+            // the fixes have nothing in common.
+            moving_phase_count_push("objects_copied", objects_copied as u128);
+            moving_phase_count_push("young_bytes_before", bytes_before as u128);
+            moving_phase_count_push("pointer_map_len", pointer_map.len() as u128);
         }
 
         // Phase 2.5: Resurrect dead finalizable objects — forward any

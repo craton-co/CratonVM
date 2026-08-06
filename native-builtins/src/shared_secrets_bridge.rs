@@ -548,9 +548,7 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let len = ctx.array_length(byte_array);
     let bytes =
         crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(|_msg| {
-            cratonvm_types::error::MethodCallFailed::from(
-                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
-            )
+            cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(0))
         })?;
 
     let mut opts = cratonvm_native_api::DefineClassFull::default();
@@ -594,9 +592,7 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let len = ctx.array_length(byte_array);
     let bytes =
         crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(|_msg| {
-            cratonvm_types::error::MethodCallFailed::from(
-                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
-            )
+            cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(0))
         })?;
 
     let mut opts = cratonvm_native_api::DefineClassFull::default();

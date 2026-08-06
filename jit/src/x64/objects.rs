@@ -182,6 +182,17 @@ impl Compiler {
     /// for why neither may be derived from the other). Dispatches per-object
     /// via the `GC_FLAG_COMPACT` header bit, exactly mirroring the getfield
     /// 0xb4 inline path. No scratch register needed.
+    ///
+    /// # Compressed oops
+    ///
+    /// Only the **compact** arm is affected: `cratonvm_types::narrow_oop`
+    /// narrows compact reference *instance fields* and reference *array
+    /// elements* and nothing else, so a LEGACY-laid-out instance still carries
+    /// a full 64-bit pointer in its 16-byte tagged `Value` cell and its arm is
+    /// unchanged. This was hole 1 of `gc/src/compressed_oops.rs`'s "two
+    /// correctness holes": the compact arm used to be an unconditional 64-bit
+    /// load, which under narrow oops read 4 bytes of narrow oop plus 4 bytes of
+    /// the adjacent field and dereferenced the result.
     pub(super) fn emit_load_string_value_ptr(
         &mut self,
         dst: u8,
@@ -195,10 +206,65 @@ impl Compiler {
             cratonvm_types::GC_FLAG_COMPACT,
         );
         let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
-        self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
+        // The compact slot is narrow only when a `CompactLayout` was actually
+        // registered for this String class — `StringFieldLayout::new`'s
+        // fallback points `value_compact_offset` at the LEGACY cell payload,
+        // which stays 8 bytes wide. Matching the offset makes this
+        // self-checking rather than trusting the caller and the layout to
+        // agree.
+        let narrow = narrow_oops_enabled()
+            && self
+                .string_layout
+                .is_some_and(|l| l.value_compact_offset == compact_offset && l.value_compact_is_narrow);
+        if narrow {
+            self.emit_load_narrow_ref_field(dst, base, compact_offset);
+        } else {
+            self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
+        }
         let done = self.emit_jmp_rel32_patch();
         self.patch_rel32_to_here(legacy);
         self.emit_mov_r64_mem_disp32(dst, base, legacy_offset);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Load a **narrow** compact reference field at `[base + offset]` into
+    /// `dst` as a full 64-bit pointer, so every consumer downstream is
+    /// unchanged. `dst` may alias `base` (the field is read before the base is
+    /// clobbered).
+    ///
+    /// The slot holds `(addr - narrow_base) >> narrow_shift`, with 0 reserved
+    /// for null, so the decode is `narrow_base + (n << shift)` — except for
+    /// null, which must stay 0 rather than becoming the base. `SHL` sets ZF
+    /// from its result, so the null test is free at the shifts the live heap
+    /// actually uses; a pinned shift of 0 needs an explicit `TEST`.
+    ///
+    /// Unlike [`Self::emit_narrow_ref_aload_regs`], this emitter runs at sites
+    /// where the register allocator has already parked values in the extended
+    /// registers, so it cannot claim R11 outright. It borrows R11 inside the
+    /// non-null arm and restores it before falling through: the `PUSH`/`POP`
+    /// pair is balanced, straddles no `CALL` and no RSP-relative access, and is
+    /// only ever emitted when the (default-off) narrow-oop gate is on.
+    fn emit_load_narrow_ref_field(&mut self, dst: u8, base: u8, offset: i32) {
+        // MOV dst32, DWORD [base + offset] — writing a 32-bit GPR zero-extends.
+        self.emit_mov_r32_mem_disp32(dst, base, offset);
+        let shift = cratonvm_types::narrow_oop::narrow_shift();
+        if shift > 0 {
+            // SHL dst, shift — sets ZF from the result, so null stays testable.
+            self.buf.emit_byte(0x48 | ((dst >= 8) as u8));
+            self.buf.emit(&[0xC1, 0xE0 | (dst & 7)]);
+            // Truncation: `narrow_shift()` is <= 3 (`narrow_oop::enable`).
+            self.buf.emit_byte(shift as u8);
+        } else {
+            self.emit_test_r64_r64(dst);
+        }
+        let done = self.emit_jcc_rel32_patch(0x84); // JZ — a null oop stays 0.
+        self.buf.emit(&[0x41, 0x53]); // PUSH R11
+        self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+        self.buf.emit(&narrow_base().to_le_bytes());
+        // ADD dst, R11
+        self.buf.emit_byte(0x4C | ((dst >= 8) as u8));
+        self.buf.emit(&[0x01, 0xD8 | (dst & 7)]);
+        self.buf.emit(&[0x41, 0x5B]); // POP R11
         self.patch_rel32_to_here(done);
     }
 

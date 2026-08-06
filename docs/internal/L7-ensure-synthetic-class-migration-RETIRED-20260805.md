@@ -318,7 +318,7 @@ instead of a loud one. That is the collections reclassification wave
 > `Object[]` it was handed, not a `table[]`. `StreamCollector` went the other
 > way and needed no `Consumer` at all (`Spliterators.iterator`). Details and
 > measurements in
-> `docs/known-issues/jdk-only/strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`.
+> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
 > Worth recording as a process note: this page's premise was derived by reading
 > the code, and a probe that measured it instead
 > (`probes/StrictIterPrimitivesProbe`) found the actual cause was different —
@@ -398,4 +398,4 @@ above (collections reclassification wave), and `Enumeration$Impl` in
 `classloader.rs` (L1's file, and the only one of the set without a drop-in
 real-bytecode fallback).
 
-[r2]: ../known-issues/jdk-only/vm-internal-classes-mislabelled-compatibility-stub.md
+[r2]: jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md

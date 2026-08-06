@@ -193,7 +193,7 @@ stay, with evidence rather than a worry attached, and the probe is the
 regression test that keeps it true. (The one divergence this probe did show was
 `Map.entry`'s `toString`, above — not an interception at all.)
 
-### The 796 dead registrations: a list, not a guess
+### The 791 dead registrations: a list, not a guess
 
 `scripts/jdk-only-dead-sweep.py` intersects a census per image — JDK 21.0.12
 and 25.0.4, linux and windows — filters `UNDECL` through the hierarchy, and
@@ -202,13 +202,14 @@ subtracts everything three workloads dispatched (`JdkOnlyCensusLoadProbe`,
 them). What survives is committed at
 `scripts/baselines/jdk-only-dead-everywhere.tsv`:
 
-* **243** whose class no supported image contains;
-* **553** whose method is nowhere in its hierarchy on any of them;
+* **239** whose class no supported image contains;
+* **552** whose method is nowhere in its hierarchy on any of them;
 * concentrated in `lang_string.rs` (119), `plain_socket.rs` (51),
   `nio_native.rs` (45), `shared_secrets_bridge.rs` (44).
 
-**The dispatch filter removed nine, and every one was a VM-minted class wearing
-a JDK name** — `java/util/HashMap$KeyItr` (1,209 dispatches),
+**Five more were removed by rule rather than by measurement** — see *The
+fifth image* below. **The dispatch filter removed nine, and every one was a
+VM-minted class wearing a JDK name** — `java/util/HashMap$KeyItr` (1,209 dispatches),
 `java/util/TreeSet$Itr` (501), `AtomicIntegerFieldUpdater$RustJvmImpl`,
 `Function$Identity`. A census saying a `java.util` class does not exist can be
 right about the JDK and wrong about this VM, and that is the third distinct way
@@ -217,18 +218,166 @@ this measurement has been misread.
 Deleting them is the stub-removal wave's job, not this one's. What changed is
 that the wave now has a list with four images and three workloads behind it.
 
+## The fifth image: the synthetic JDK, which the sweep never asks
+
+The sweep censuses four **real** JDK images. It never censuses the one library
+whose shapes CratonVM controls — its own. That is not a gap in coverage; it is a
+question the instrument is structurally unable to answer, because the synthetic
+JDK is not a JDK image and `image_declaring_method` has nothing to parse.
+
+The consequence is a fourth way to misread this measurement, and it had already
+put five rows on the deletion list:
+
+| row | why the census called it dead |
+|---|---|
+| `java/util/Comparator$Native.compare`, `.writeReplace` | `$Native` is a class **this VM mints**. No JDK owes it. |
+| `java/util/function/Function$Identity.andThen`, `.compose` | likewise minted. Its `apply` *was* dispatched and the filter caught it; these two were not exercised, so they stayed |
+| `java/util/concurrent/locks/StampedLock.isLocked` | a real class, but the JDK declares no `isLocked()` — this is a deliberate completion of the synthetic surface, and `native-builtins/tests/registry_contracts.rs` pins it |
+
+All five carry `kind: synthetic-stub`, which is the tell: a *synthetic stub is
+CratonVM's own implementation*, so a census of JDK images can only ever report
+that the JDK does not have it. That is agreement, not evidence.
+
+**The rule: a synthetic stub is never a deletion candidate. Gate it, never
+delete it.** `scripts/jdk-only-dead-sweep.py` now enforces this rather than
+leaving it to whoever reads the list — `synthetic-stub` rows are routed to a
+separate *gated* section and never written to the deletion file.
+
+Nothing needed changing in the VM to satisfy the rule, which is worth stating
+plainly: `NativeKind::SyntheticStub` is **the one kind `--jdk-only` rejects**
+(`NativeKind::allowed_in`), so all five were already gated — strict mode drops
+them and the real bytecode wins. In real-JDK mode they are *inert* rather than
+wrong: nothing can reach a class that exists only when the VM minted it, and
+nothing can call a `StampedLock.isLocked()` the JDK never declared. The defect
+was never in the code. It was in the list.
+
+### Why "gate" and not "delete" is the load-bearing distinction
+
+`21cfa930f` is the worked example. It deleted `native_map_entry` — whose body
+was `alloc_synthetic(ctx, "java/util/Map$Entry", 2)` — and it was **right** to
+stop it running: the differential caught `toString` returning
+`java.util.Map$Entry@6c` instead of `k=7`, and `setValue` succeeding where the
+spec requires `UnsupportedOperationException`.
+
+But deletion satisfied one mode only. Under `--real-jdk` the JDK's bytecode
+takes over and the behaviour becomes correct. Under `--synthetic-jdk` there is
+no bytecode to take over, so the method may now be missing outright. A gate
+would have served both; deleting served one and silently cost the other.
+
+Note that `NativeKind::SyntheticStub` is **not** the right gate for that case:
+`allowed_in(Compatible)` is `true` for every kind, so the tag alone would let
+the native keep running in default real-JDK mode and reintroduce both
+divergences. The correct gate there is the compile-time one the repo already
+uses, `#[cfg(feature = "synthetic-jdk")]`.
+
+### Measured 2026-08-06: it was not hypothetical
+
+`21cfa930f` was verified against `--real-jdk` and the verification was sound
+there. `Map.entry("k",7).getClass()` reads `java.util.KeyValueHolder` on both
+HotSpot 25 and CratonVM, because the registry drops the two surviving
+registrations when the real image supplies the method and `java.base`'s
+bytecode runs. Both remaining natives are dead code in that mode.
+
+Run under `--synthetic-jdk`, nothing is dropped, and the record's own
+"before" column came back verbatim:
+
+| | HotSpot 25 | CratonVM `--synthetic-jdk`, before |
+|---|---|---|
+| `Map.entry("k",7).toString()` | `k=7` | `java.util.Map$Entry@6c` |
+| `.setValue(9)` | `UnsupportedOperationException` | succeeded |
+
+`ShadowDifferentialProbe` is the regression test for this exact surface, and it
+had only ever been pointed at one mode. Pointed at the other it diverged on 7
+of its 42 lines — from two ABSENCES rather than seven bugs. Entry `toString`
+was a placeholder printing the object's address (which is what
+`LinkedHashMap.entrySet().toString()` emitted instead of `one=1;two=2;`), and
+`equals`/`hashCode` were not registered at all, so entries fell back to
+identity and two entries with equal keys and values compared unequal.
+
+Registering the three specified methods on the entry classes took the synthetic
+differential from **14 diverging lines to 2**, with `--real-jdk` byte-identical
+to HotSpot throughout.
+
+**The residual is instructive and is left open deliberately.**
+`Map.entry(...).setValue(v)` still mutates instead of throwing, because
+`java/util/Map$Entry` is ALSO minted as a three-field entry — `key@0, value@1,
+sourceMap@2` — by the entry-set views in `native-collections` and
+`properties_sidetable`, precisely so `Entry.setValue` writes through to the
+backing map, which `entrySet()` iteration requires. `Map.entry`'s entry is
+2-field and must throw: one synthetic class name, two contradictory contracts,
+resolved by last-write-wins.
+
+An immutable `setValue` registered for the second contract loses that race
+today — and it must, since if it ever won, every `entrySet()` write-through
+would break. Registering a native whose correctness depends on losing a race is
+not a fix. The real fix is to give `Map.entry` a class of its own, which is why
+HotSpot has `KeyValueHolder`; re-pointing the allocation at
+`SimpleImmutableEntry` was measured as a regression (4 diverging lines to 6).
+
 ## What is still open
 
-1. **Delete the 796.** The list is measured and committed; removing the
+1. **Delete the 791.** The list is measured and committed; removing the
    registrations is a stub-removal change with its own subsystem-per-PR
    discipline, and it should re-run the sweep afterwards rather than trusting
-   this file.
-2. **The differential covers what it covers.** `ShadowDifferentialProbe`
+   this file. Two cautions the list itself cannot carry: its `registered_by`
+   line numbers are **already stale** against `dev`, so rows must be re-located
+   by content; and the largest cluster (`lang_string.rs`, 119) is a covariant
+   fan-out that registers each `append` under three return descriptors, of
+   which only some (class, descriptor) pairs exist in any JDK — those are
+   mechanical, but they are not representative of the rest.
+2. **Restore what earlier waves deleted instead of gating.** `14145d874`
+   removed five duplicate registrations that L7 R1's retag had missed;
+   retagging them `SyntheticStub` was the available tool and deletion was used
+   instead. `21cfa930f` deleted `native_map_entry` outright. Both should be
+   restored behind gates rather than left deleted — the second under
+   `#[cfg(feature = "synthetic-jdk")]`, so real-JDK mode keeps the
+   HotSpot-correct bytecode and synthetic mode regains the method.
+3. **`Map.entry(...).setValue()` is permissive under `--synthetic-jdk`** —
+   and the fix is blocked behind two deeper defects, measured 2026-08-06 and
+   recorded below rather than guessed at again.
+
+   Giving `Map.entry` its own class works exactly as intended: minting
+   `java/util/KeyValueHolder` (the JDK's own answer, and the class HotSpot
+   returns) makes `setValue` throw, makes `getClass()` agree with HotSpot, and
+   leaves `--real-jdk` byte-identical. It was **not landed**, because it trades
+   one contract violation for another and the probe count stays at 2: a
+   `SimpleEntry` compared against the new `KeyValueHolder` answers `false`
+   while the reverse answers `true`, which breaks the symmetry
+   `Object.equals` requires.
+
+   Chasing that asymmetry turned up two defects that have nothing to do with
+   `Map.entry`, both reproducible on `dev` with a four-line probe:
+
+   ```
+   new AbstractMap.SimpleEntry<>("a", 1)      HotSpot        --synthetic-jdk
+     .toString()                              a=1            null=null
+     .equals(an equal SimpleEntry)            true           false
+   ```
+
+   * **The public `SimpleEntry` constructor stores nothing.** Its key and value
+     both read `null`. Entries the *map* creates are unaffected
+     (`LinkedHashMap.entrySet()` reads its keys fine) — it is the
+     `(Object,Object)` constructor path alone.
+   * **A native `equals` does not take effect on `SimpleEntry`, while
+     `toString` and `hashCode` registered on the SAME class in the SAME call
+     do.** The evidence is that `toString` printed `null=null` — that is this
+     VM's format rendering this VM's nulls — and `hashCode` agreed across two
+     distinct objects (`0 ^ 0`), while `equals` fell back to identity. On
+     `KeyValueHolder`, which has no synthetic class definition, the same
+     `equals` native runs normally. So `equals` is being shadowed specifically
+     on classes that have a synthetic method table.
+
+   The second is the one to fix first: it silently disables an override that
+   the registry reports as registered, which makes every native `equals` in
+   the tree suspect. Until it is fixed, patching an `equals` body is patching
+   code that never runs — three attempts here did exactly that before the
+   probe above was written.
+4. **The differential covers what it covers.** `ShadowDifferentialProbe`
    exercises `java.util`'s factories and views. The other ~1,600 inherited
    shadows are unprobed, and the honest reading of "they match" is "the ones
    anybody looked at match". Widening that probe is the cheapest way to keep
    finding `Map.entry`-shaped defects.
-3. **`jdk-only-adjudicate.py` section 3 now prints the inherited shadows as a
+5. **`jdk-only-adjudicate.py` section 3 now prints the inherited shadows as a
    separate addend** rather than folding them in, because L6's ratchet counts
    `has_code` on the named class and that number must keep meaning exactly
    that. Prose calling it "the shadows" still understates by ~1,600; the script

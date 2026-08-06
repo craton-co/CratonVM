@@ -3333,16 +3333,12 @@ pub(crate) fn cl_define_class_basic(
     // Safe integer handling: reject negative offset/length (i32 → usize)
     let offset = match args.get(3) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => 0,
     };
     let length = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into())
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::aioobe_index_only(-1).into()),
         _ => array_len,
     };
 
@@ -3357,7 +3353,7 @@ pub(crate) fn cl_define_class_basic(
             "[define_class] bounds violation: offset={offset} length={length} \
              array_len={array_len} (name={name_str})"
         );
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+        return Err(RuntimeError::aioobe_index_only(-1).into());
     }
 
     // Read bytes from the array.
@@ -3943,21 +3939,19 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 3) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (off as i32).max(0),
-            },
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4010,13 +4004,13 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 3) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_buffer_slice(ctx, bb, off, len).map_err(|msg| {
@@ -4090,21 +4084,19 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let off = match read_nonneg_int(args, 4) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let len = match read_nonneg_int(args, 5) {
         Some(v) => v,
         None => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        cratonvm_types::error::MethodCallFailed::from(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (off as i32).max(0),
-            },
-        )
+        cratonvm_types::error::MethodCallFailed::from(RuntimeError::aioobe_index_only(
+            (off as i32).max(0),
+        ))
     })?;
 
     // cglib SEGV guard.
@@ -4353,9 +4345,9 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "Unsafe.defineClass({name_str}): offset/length out of bounds \
              (off={offset}, len={length}, array={array_len}) — throwing AIOOBE"
         );
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: offset.saturating_add(length).min(i32::MAX as usize) as i32,
-        }
+        return Err(RuntimeError::aioobe_index_only(
+            offset.saturating_add(length).min(i32::MAX as usize) as i32,
+        )
         .into());
     }
 
@@ -12039,6 +12031,223 @@ mod classloader_tests {
     /// model first makes `create_method_object` write `modifiers` to one slot
     /// and `method_modifiers_value` read it from another — measured, three
     /// tests red.
+    /// Harvest every class name the fabricated model could be asked about,
+    /// straight out of the model's own source. A hand-written list would go
+    /// stale silently, which is the failure mode this whole record is about.
+    fn harvested_model_class_names() -> Vec<String> {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../classloading/src/class_manager.rs"
+        ))
+        .expect("classloading/src/class_manager.rs must be readable from the test");
+        let bytes = src.as_bytes();
+        let mut names: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                if bytes[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            let lit = &src[start..j];
+            if lit.len() > 3
+                && lit.contains('/')
+                && lit
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '$')
+            {
+                names.push(lit.to_string());
+            }
+            i = j + 1;
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// THE GATE for this record's second half: **the mock's hand-written slot
+    /// tables must not shadow the table the VM itself resolves names against.**
+    ///
+    /// §3 fixed the direction where the mock answered "no such field" about a
+    /// field the VM resolves. This is the other direction, and it was live:
+    /// `mock_jdk_field_slot` — the deliberately arbitrary flat namespace for
+    /// the `Field`/`Method`/`Constructor`/`MemberName` mirrors — was consulted
+    /// **class-blind and ahead of the model**, so it answered for any modelled
+    /// class declaring one of its fifteen names. Measured across the 333
+    /// classes `synthetic_stub_field_model` models, it shadowed `name` on
+    /// twenty-seven of them (`java.lang.Enum`, `java.security.Permission`,
+    /// `java.util.logging.Logger`, `org.xnio.Xnio`, `org.jboss.modules.Module`,
+    /// …), each of which models `name` at slot 0 against the namespace's 1;
+    /// and `io.undertow.server.HttpServerExchange.responseHeaders` at the
+    /// mock's 3 against the model's 5.
+    ///
+    /// The reflect mirrors are the one exemption, and it is enumerated in
+    /// `mock_reflect_mirror_field_slot` rather than implied — production keeps
+    /// the same flat layout as `METHOD_LEGACY_SLOT_*` and allocates the mirror
+    /// at eight fields, so the model's slots for the later names are past the
+    /// end of the object.
+    #[test]
+    fn the_mock_slot_tables_do_not_shadow_the_fabricated_model() {
+        const MIRRORS: &[&str] = &[
+            "java/lang/reflect/Field",
+            "java/lang/reflect/Method",
+            "java/lang/reflect/Constructor",
+            "java/lang/reflect/Executable",
+            "java/lang/reflect/AccessibleObject",
+            "java/lang/invoke/MemberName",
+        ];
+
+        let names = harvested_model_class_names();
+        assert!(
+            names.len() > 300,
+            "the literal walker found only {} candidate class names in \
+             class_manager.rs — the walker is broken, not the model",
+            names.len()
+        );
+
+        let mut modelled = 0usize;
+        let mut shadowed: Vec<String> = Vec::new();
+        for cls in &names {
+            let model = cratonvm_classloading::synthetic_stub_field_model(cls);
+            let instance: Vec<_> = model.iter().filter(|f| !f.is_static()).collect();
+            if instance.is_empty() {
+                continue;
+            }
+            modelled += 1;
+            if MIRRORS.contains(&cls.as_str()) {
+                continue;
+            }
+            let mut ctx = MockNativeContext::new();
+            let Ok(cid) = ctx.ensure_class_initialized(cls) else {
+                continue;
+            };
+            for (want, f) in instance.iter().enumerate() {
+                // `_fN` asserts nothing about a name and `_vmN` is a slot this
+                // VM parks its own value in; neither is a name anybody resolves.
+                if f.name.starts_with("_f") || f.name.starts_with("_vm") {
+                    continue;
+                }
+                let got = ctx.resolve_field_index_by_class_id(cid, &f.name);
+                if got != Some(want) {
+                    shadowed.push(format!("{cls}.{} model={want} mock={got:?}", f.name));
+                }
+            }
+        }
+
+        assert!(
+            modelled > 250,
+            "only {modelled} of {} harvested names are modelled — the model or \
+             the harvest changed shape, and this gate is measuring nothing",
+            names.len()
+        );
+        assert!(
+            shadowed.is_empty(),
+            "{} modelled field(s) resolve to a slot the VM does not use, because \
+             a hand-written mock table answered first. Every one of these is a \
+             native tested against the wrong field:\n  {}",
+            shadowed.len(),
+            shadowed.join("\n  ")
+        );
+    }
+
+    /// `resolve_field_index` is the THIRD by-name entry point, and until this
+    /// change it consulted exactly one hand-written table
+    /// (`mock_undertow_exchange_field_slot`) — so it answered `None` for every
+    /// other class in the tree.
+    ///
+    /// Production reaches for it constantly: `java/lang/Enum.name`,
+    /// `java/lang/Throwable.detailMessage`,
+    /// `java/lang/StackTraceElement.declaringClass`, the whole
+    /// `jdk.internal.foreign` segment family. Every branch behind those calls
+    /// was unreachable under the mock — the same unfalsifiable-predicate shape
+    /// §3 fixed one entry point over, in the entry point §3 did not touch.
+    ///
+    /// It answers for every class the model models, which is not every class
+    /// production asks about: `java.lang.Throwable` has real bytes and no
+    /// fabricated model, so `detailMessage` is still `None` here and
+    /// `lang_misc`'s three `detailMessage` resolutions are still unfalsifiable
+    /// under the mock. That is a gap in the model's coverage, not in the
+    /// chain — a test that asserted otherwise was written first and went red.
+    #[test]
+    fn resolve_field_index_by_name_sees_the_fabricated_model() {
+        let ctx = MockNativeContext::new();
+        // `java.lang.Enum` models `name` first. Before this it was `None`, so
+        // `native_enum_name`'s resolved-slot branch could not be reached.
+        assert_eq!(ctx.resolve_field_index("java/lang/Enum", "name"), Some(0));
+        // And it is the model, not a hand-written table, that answers. The
+        // mock's `mock_undertow_exchange_field_slot` models the REAL Undertow
+        // class (~30 fields) and puts `responseHeaders` at 3; the fabricated
+        // model is a seven-field stand-in that puts it at 5, and 5 is what the
+        // VM resolves. This asserted 3 before the tables were reordered.
+        assert_eq!(
+            ctx.resolve_field_index("io/undertow/server/HttpServerExchange", "responseHeaders"),
+            Some(5)
+        );
+        // A name the model does NOT declare still falls through to the
+        // hand-written table, which is what that table is for.
+        assert_eq!(
+            ctx.resolve_field_index("io/undertow/server/HttpServerExchange", "requestURI"),
+            Some(21)
+        );
+        // Still falsifiable in the negative direction: a fallback that answered
+        // `Some` for everything would be as useless as one answering `None`.
+        assert_eq!(
+            ctx.resolve_field_index("java/lang/Enum", "nosuchfield"),
+            None
+        );
+    }
+
+    /// All the by-name entry points must answer ONE slot for one name.
+    ///
+    /// They did not. `java/lang/reflect/Parameter` was special-cased in
+    /// `get_field_by_name`/`set_field_by_name` and not in
+    /// `resolve_field_index_by_class_id`, so a writer put `name` in slot 0 and
+    /// a reader coming the other way looked in slot 1 — the exact
+    /// reader/writer split the chain's ordering exists to prevent, sitting in
+    /// the mock the whole time.
+    #[test]
+    fn every_by_name_entry_point_resolves_one_name_to_one_slot() {
+        for (class, field) in [
+            ("java/lang/reflect/Parameter", "name"),
+            ("java/lang/reflect/Field", "clazz"),
+            ("java/lang/Enum", "name"),
+            ("java/security/ProtectionDomain", "codesource"),
+        ] {
+            let mut ctx = MockNativeContext::new();
+            let cid = ctx
+                .ensure_class_initialized(class)
+                .expect("mock ensure_class_initialized must succeed");
+            let by_id = ctx.resolve_field_index_by_class_id(cid, field);
+            let by_name = ctx.resolve_field_index(class, field);
+            assert_eq!(
+                by_id, by_name,
+                "{class}.{field}: resolve_field_index_by_class_id says {by_id:?} \
+                 and resolve_field_index says {by_name:?}"
+            );
+            let slot = by_id.expect("all four pairs above are resolvable");
+
+            // And the write half lands where the read half looks.
+            let obj = ctx.alloc_object(cid, 16);
+            ctx.set_field_by_name(obj, field, Value::Int(0x5EED));
+            assert_eq!(
+                ctx.get_field(obj, slot),
+                Value::Int(0x5EED),
+                "{class}.{field}: set_field_by_name did not write slot {slot}"
+            );
+            assert_eq!(ctx.get_field_by_name(obj, field), Value::Int(0x5EED));
+        }
+    }
+
     #[test]
     fn the_hand_written_namespace_still_wins_for_the_reflect_mirrors() {
         let mut ctx = MockNativeContext::new();

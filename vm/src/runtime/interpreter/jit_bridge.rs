@@ -1100,7 +1100,7 @@ pub(super) fn compile_osr_artifact(
                 .class_manager
                 .read()
                 .get_class(class_id)
-                .map(|c| !c.is_synthetic_stub)
+                .map(|c| !c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
                 let new_class_names: Vec<(usize, u16, Option<String>)> = {
@@ -1806,7 +1806,7 @@ pub(super) fn try_osr(
         // in the catch block by returning `None`. Otherwise re-stash so the
         // exception survives the OSR→interpreter handoff and is surfaced by
         // the next JIT helper return drain rather than being silently lost.
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,
@@ -3557,6 +3557,19 @@ pub(super) fn try_jit_upgrade_with_gate(
                 shared,
                 callee_cached.declaring_class_id,
             ));
+            // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+            // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+            // and for anything unregistered, which is the fail-closed direction.
+            // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+            // for a triple whose helper cell is already non-zero.
+            let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+                let registry = &shared.natives.native_methods;
+                registry
+                    .resolve_id(class, method, descriptor)
+                    .and_then(|id| registry.kind_of_id(id))
+                    .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+            };
+            
             let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
                 &callee_cached,
                 Some(&c_resolver),
@@ -3621,6 +3634,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                 } else {
                     None
                 },
+                    // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+                    // latch the JIT read for itself, so a `Compatible` VM sharing a
+                    // process with a `JdkOnly` one lost the thin direct-call helpers.
+                    crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+                    // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+                    // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+                    // whether a thin direct-call helper may shadow real bytecode.
+
+                    Some(&intrinsic_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -3720,6 +3745,19 @@ pub(super) fn try_jit_upgrade_with_gate(
         shared,
         cached.declaring_class_id,
     ));
+    // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+    // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+    // and for anything unregistered, which is the fail-closed direction.
+    // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+    // for a triple whose helper cell is already non-zero.
+    let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+        let registry = &shared.natives.native_methods;
+        registry
+            .resolve_id(class, method, descriptor)
+            .and_then(|id| registry.kind_of_id(id))
+            .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+    };
+    
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
@@ -3779,6 +3817,18 @@ pub(super) fn try_jit_upgrade_with_gate(
         } else {
             None
         },
+            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+            // latch the JIT read for itself, so a `Compatible` VM sharing a
+            // process with a `JdkOnly` one lost the thin direct-call helpers.
+            crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+            // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+            // whether a thin direct-call helper may shadow real bytecode.
+
+            Some(&intrinsic_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -4900,6 +4950,19 @@ pub(super) fn try_jit_compile_callee_slow(
         shared,
         cached.declaring_class_id,
     ));
+    // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+    // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+    // and for anything unregistered, which is the fail-closed direction.
+    // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+    // for a triple whose helper cell is already non-zero.
+    let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+        let registry = &shared.natives.native_methods;
+        registry
+            .resolve_id(class, method, descriptor)
+            .and_then(|id| registry.kind_of_id(id))
+            .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+    };
+    
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -4955,6 +5018,18 @@ pub(super) fn try_jit_compile_callee_slow(
         } else {
             None
         },
+            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+            // latch the JIT read for itself, so a `Compatible` VM sharing a
+            // process with a `JdkOnly` one lost the thin direct-call helpers.
+            crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+            // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+            // whether a thin direct-call helper may shadow real bytecode.
+
+            Some(&intrinsic_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
@@ -5471,9 +5546,7 @@ pub fn jit_panic_to_exception(
 
     // Parse ArrayIndexOutOfBoundsException
     if msg.starts_with("ArrayIndexOutOfBoundsException") {
-        let error = RuntimeError::ArrayIndexOutOfBoundsException {
-            index: parse_aioobe_index(msg),
-        };
+        let error = RuntimeError::aioobe_index_only(parse_aioobe_index(msg));
         return crate::runtime::exceptions::throw_runtime_error(shared, thread, error);
     }
 
@@ -6697,7 +6770,7 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,
@@ -6861,9 +6934,10 @@ pub(super) fn execute_jit_call(
                 }
             }
             return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: index as i32, // Cast: bounds-check index
-                },
+                RuntimeError::aioobe(
+                    index as i32, // Cast: bounds-check index
+                    _length as i32,
+                ),
             )));
         }
         // Note: pending-NPE drain was hoisted above the i64::MIN branch
@@ -7148,7 +7222,7 @@ pub(super) fn execute_jit_call_decoded(
         }
     }
     if let Some((index, length)) = sig.aioobe {
-        let msg = format!("Index {index} out of bounds for length {length}");
+        let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
             thread,

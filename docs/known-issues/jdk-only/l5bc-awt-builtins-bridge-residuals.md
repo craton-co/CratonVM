@@ -6,6 +6,50 @@ What is open is that 7,748 registrations across the two crates are tagged
 `Bridge` while the JDK 25 image says their target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits every one of them on a claim nobody has checked.
 
+> **MOSTLY CLOSED 2026-08-06 — the statement pass this file calls "the obvious
+> next increment" is finished.**
+>
+> * L5's criterion now selects **zero** rows tree-wide (was one:
+>   `java/io/UnixFileSystem.list0`, in the very `nio_file.rs` double loop this
+>   file declined to restructure — it needed the existing `fs_reg` helper, not a
+>   restructure). The 21 mixed sites were split by
+>   [`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md);
+>   `hasDisplays0` and `ComponentSampleModel.initIDs` are both real bridges and
+>   state their kind.
+> * **The tree-wide totals this file quotes have moved and were overstated.**
+>   `bridge` is 10,434 (not 10,842) and `synthetic-stub` 755 (not 387) on
+>   2026-08-06; the unadjudicated `Bridge` population is 9,656 (L6's baseline was
+>   a stale 9,675 and is re-frozen here — it fell twice while this was being
+>   verified, 9,675 -> 9,660 -> 9,656, none of it this change's doing). More
+>   importantly the metric itself double-counts: **1,092 of those rows own no slot
+>   and can never dispatch**, so the live surface is **~8,564**. `owns_slot` is now a census
+>   column rather than something a reader had to infer from row order, and
+>   `jdk-only-adjudicate.py` breaks it out as a separate addend — L6's number is
+>   left whole on purpose, for the same reason section 3 keeps the shadows
+>   separate.
+> * `native-collections` **checks out as written**: 1,356 rows today (989
+>   `bridge` + 367 `synthetic-stub`) against the file's 1,350, and the image
+>   declares `ACC_NATIVE` on **exactly zero** of them — re-measured per row, not
+>   inherited. A statement lane still has nothing to do there.
+> * **Its stated blocker is measured inert.** This file gives "214 of the
+>   registrations are on abstract interface methods that decide dispatch for
+>   every *user* subclass" as the reason the crate cannot be reclassified. A
+>   probe that hands the VM `AbstractCollection`/`AbstractSet`/`AbstractList`/
+>   `AbstractMap` subclasses in a layout nothing models gets **byte-identical
+>   answers to HotSpot on all 42 observables** — and the census shows the natives
+>   *ran* (`AbstractCollection.contains` 8x, `AbstractSet.hashCode` 1x) rather
+>   than deferring. This family has the foreign-layout fallback. Also: **10**
+>   such rows are registered in real-JDK mode, not 97 or 214 — those are source
+>   grep counts. See
+>   [`abstract-collection-natives-are-inert-for-foreign-layouts.md`](abstract-collection-natives-are-inert-for-foreign-layouts.md),
+>   which also states the generalisable test: does the native ask the receiver,
+>   or index into a layout it assumes?
+>
+> **Still open from this file:** nothing in its own file ownership. The 83
+> tree-wide adjudicable rows it lists are gone (0 remain); what is left is
+> reclassification, which is contract §8's wave, plus the 796-row deletion list
+> now committed at `scripts/baselines/jdk-only-dead-everywhere.tsv`.
+
 > **PARTLY SUPERSEDED 2026-08-05.** This record's headline finding — that the
 > tree's only `bridge` marker outside `native-io` "is dead on this image" — was
 > half the story. `sun/awt/PlatformGraphicsInfo.hasDisplays0()Z` **is**
@@ -21,6 +65,27 @@ Sibling record for the crate L5 did first:
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md). The two
 share a method and a conclusion; this one is where the *scale* of the ambient
 default shows up.
+
+> **This record now owns the reclassification question, 2026-08-06.** The
+> retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up used
+> to carry it. That record is closed: `current_category` is an `Option` and is
+> scoped by the save/restore idiom the tree already used, so it restores the
+> *absence* of a choice as well as the kind; nine registrars that had no scope
+> at all now state theirs; no registration in a real boot runs on the
+> constructor default (`kind_chosen: false` on 0 of 11,876); and
+> `scripts/jdk-only-kind-map.py` freezes the kind of **every** registration, so
+> a one-line ambient edit is a reviewable per-row diff instead of a silent
+> thousand-row change. It also closed 58 triples `--jdk-only` was admitting
+> because the drop happens at registration and the *surviving* copy of a
+> twice-registered triple was whichever one was not tagged a stub.
+>
+> **None of that reclassified anything, and it could not have.** The 7,748 rows
+> below are unchanged in kind; what changed is that nothing can move them
+> quietly any more. The tree-wide figure is **9,571** `Bridge` registrations
+> with no `ACC_NATIVE` target (JDK 25 / linux, 2026-08-06), ratcheted slack-free
+> by `regression-suite/bridge-ratchet.sh`. Lowering it is this record's job and
+> contract §8's wave, one subsystem at a time, with the census re-taken after
+> each.
 
 ## What L5b/L5c did
 

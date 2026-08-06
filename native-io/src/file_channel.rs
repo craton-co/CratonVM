@@ -586,6 +586,24 @@ fn native_native_thread_set_signal_and_wait(
 /// the spec when the destination is not a socket; we apply it
 /// uniformly on Windows because `TransmitFile` requires a real
 /// `SOCKET` HANDLE which our `FdTable` does not currently expose.
+/// `transferFrom0(FileDescriptor src, FileDescriptor dst, long position,
+/// long count [, boolean append]) -> long`
+///
+/// Decline, with the JDK's own "no kernel-side copy here" answer.
+///
+/// `IOStatus.UNSUPPORTED` is what HotSpot's implementation returns whenever the
+/// platform or the fd kind has no `copy_file_range`-style primitive, and
+/// `FileChannelImpl.transferFrom` responds by falling back to
+/// `transferFromArbitraryChannel`, a `ByteBuffer` read/write loop. That loop
+/// works here, so the observable behaviour is a correct transfer.
+///
+/// Before this existed the method had no registration at all and
+/// `FileChannel.transferFrom` between two file channels raised
+/// `UnsatisfiedLinkError` — while `transferTo` in the same direction succeeded.
+fn native_fc_transfer_from0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Long(IOSTATUS_UNSUPPORTED)))
+}
+
 fn native_fc_transfer_to0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src_fd = match fd_id_arg(ctx, args, 0) {
         Some(fd) => fd,
@@ -988,6 +1006,35 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         native_fc_transfer_to0,
         &[],
     );
+    // `transferFrom0(srcFD, dstFD, position, count, append)` — the sibling of
+    // `transferTo0`, reached by `FileChannel.transferFrom(src, ...)` when the
+    // source is itself a FileChannel. It had NO registration at all, so
+    // `transferFrom` between two file channels died with
+    // `UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.transferFrom0` —
+    // while `transferTo` in the same direction worked. Found by
+    // `probes/NioBufferStampProbe`.
+    //
+    // The answer is `IOStatus.UNSUPPORTED`, which is a real answer, not a stub:
+    // it is exactly what HotSpot's own implementation returns on a platform or
+    // fd kind that has no kernel-side copy, and the JDK responds by falling
+    // back to `transferFromArbitraryChannel` — a `ByteBuffer` read/write loop
+    // that already works here. Implementing a kernel `copy_file_range` path
+    // would be faster but is a different piece of work; declining correctly
+    // beats declining by link error, and beats a guess at the fd semantics.
+    register_fd_native(
+        r,
+        "transferFrom0",
+        "(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJZ)J",
+        native_fc_transfer_from0,
+        &[FD_LEAF],
+    );
+    register_fd_native(
+        r,
+        "transferFrom0",
+        "(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJ)J",
+        native_fc_transfer_from0,
+        &[],
+    );
     register_fd_native(
         r,
         "maxDirectTransferSize0",
@@ -1041,6 +1088,10 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0);
     r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
     r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
+    // Raw-int-fd shapes of `transferFrom0`, for the JDKs that pass fd numbers
+    // rather than `FileDescriptor` objects. Same decline as the object forms.
+    r.register(fci, "transferFrom0", "(IIJJZ)J", native_fc_transfer_from0);
+    r.register(fci, "transferFrom0", "(IIJJ)J", native_fc_transfer_from0);
     r.register(
         fci,
         "maxDirectTransferSize0",

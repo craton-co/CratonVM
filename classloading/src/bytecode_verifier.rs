@@ -1130,7 +1130,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: crate::class_origin::ClassOrigin::VmInternal,
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,

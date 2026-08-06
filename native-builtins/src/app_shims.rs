@@ -657,12 +657,19 @@ mod tests {
     /// audit unsound. Grouping the call sequence must not disturb it: every
     /// family's registrars save and restore the category, so the ambient
     /// value a caller had before is the value it has after.
+    ///
+    /// `None` is in the seed list and is the interesting one. It is what the
+    /// registry now carries outside any scope, and "no scope covers this
+    /// registration" is a state a registrar can leak just as easily as a wrong
+    /// kind — leaking a *category* over it would make the census report those
+    /// rows as adjudicated by whoever the leak belonged to.
     #[test]
     fn grouping_does_not_leak_an_ambient_category() {
         for seed in [
-            NativeKind::SyntheticStub,
-            NativeKind::Bridge,
-            NativeKind::Intrinsic,
+            None,
+            Some(NativeKind::SyntheticStub),
+            Some(NativeKind::Bridge),
+            Some(NativeKind::Intrinsic),
         ] {
             for family in ShimFamily::ALL {
                 let mut registry = probe_registry();

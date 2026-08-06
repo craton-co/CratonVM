@@ -67,7 +67,6 @@ fn register_bench_class(
         hidden: false,
         module_name: None,
         origin: cratonvm_classloading::ClassOrigin::default(),
-        is_synthetic_stub: false,
         has_finalizer: false,
         signature: None,
         code_source: None,

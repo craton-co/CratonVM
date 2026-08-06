@@ -865,10 +865,7 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
 
         let arr_len = ctx.array_length(byte_arr);
         if offset + count > arr_len {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: (offset + count) as i32,
-            }
-            .into());
+            return Err(RuntimeError::aioobe_index_only((offset + count) as i32).into());
         }
 
         // Build chars: (hibyte << 8) | (byte & 0xFF)
@@ -1583,7 +1580,19 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
 // T8.2.13 / T8.2.14 — URLDecoder.decode(String) / URLEncoder.encode(String)
 // ---------------------------------------------------------------------------
 
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `java.net.URLEncoder` / `URLDecoder` are ordinary
+// bytecode in `java.base` and JDK 25 declares no `ACC_NATIVE` method on
+// either, so contract §1.5 cannot call these bridges.
 pub fn register_url_codec(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // URLDecoder.decode(String)String — deprecated single-arg form, uses UTF-8
     r.register(
         "java/net/URLDecoder",
@@ -1707,6 +1716,7 @@ pub fn register_url_codec(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(result))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

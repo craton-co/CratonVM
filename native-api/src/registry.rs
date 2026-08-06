@@ -4377,9 +4377,15 @@ pub fn dispatch_baos_event(
 ///   return values, fabricated objects, or "fake main" launcher short-circuits.
 ///   These shadow correct real bytecode and are the removal target. Gateable.
 ///
-/// The registry's `current_category` defaults to `SyntheticStub` — the
-/// conservative choice, so anything an author forgets to tag stays visible to
-/// the audit and gateable, never silently trusted.
+/// The registry has no default kind: `current_category` is `None` outside a
+/// `set_category` / `with_category` scope, and a registration made there falls
+/// back to `SyntheticStub` — the conservative choice, so anything an author
+/// forgets to tag stays visible to the audit and gateable, never silently
+/// trusted. `NativeMethodRegistry::effective_category` is the only place that
+/// fallback is applied, and every registration that takes it is counted:
+/// `category_chosen_log`, the census's `kind_chosen`, and the
+/// `no_registration_runs_on_the_ambient_default` gate in
+/// `native-builtins/tests/stub_ratchet.rs`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum NativeKind {
     Intrinsic,
@@ -4447,6 +4453,33 @@ pub struct NativeCensusEntry {
     /// Times this slot was dispatched through any path this run. `0` on a
     /// superseded row: the count belongs to whoever currently owns the slot.
     pub invocations: u64,
+    /// Whether this registration still **owns its slot**, i.e. whether a
+    /// dispatch of this triple would reach *this* row's callback.
+    ///
+    /// `false` means a later `register*` of the identical triple replaced it
+    /// (last-write-wins into the slot), so the row records that a registration
+    /// happened and nothing more: it can never be dispatched, and adjudicating
+    /// its kind decides nothing.
+    ///
+    /// # Why this is a column and not left to the reader
+    ///
+    /// Every consumer of this census was inferring it — or not inferring it.
+    /// Measured on `JdkOnlyCensusLoadProbe` (JDK 25, 2026-08-06): of 11,876
+    /// rows, **1,237 own no slot**, and **1,092 of the 9,660 rows the
+    /// adjudication reports as unadjudicated `Bridge` are among them**. So the
+    /// live unadjudicated surface is 8,568, and a reclassification wave sized
+    /// off the larger number would go looking for ~1,100 registrations that
+    /// cannot affect anything.
+    ///
+    /// It is derivable from census order (within a triple, the last row owns the
+    /// slot) — which is exactly why it belongs here instead: that is an
+    /// undocumented ordering guarantee for external scripts to depend on, and
+    /// [`NativeMethodRegistry::census`] already has the answer in hand.
+    ///
+    /// This is the fourth distinct way this census has been misread; the other
+    /// three are in
+    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
     /// some enclosing registrar (`register`).
@@ -4463,6 +4496,33 @@ pub struct NativeCensusEntry {
     /// default and can only have been inherited from a `set_category` line that
     /// covered more registrations than its author was thinking about.
     pub kind_stated: bool,
+    /// Whether ANYONE chose [`Self::kind`] — at the registration site
+    /// (`register_with_kind`) **or** in an enclosing `set_category` /
+    /// `with_category` scope — as opposed to the registration simply landing on
+    /// the constructor's `SyntheticStub` default.
+    ///
+    /// Deliberately wider than [`Self::kind_stated`], and it answers a
+    /// different question. `kind_stated` asks *"was this adjudicated here?"*;
+    /// this asks *"is this kind an opinion at all?"*. `with_category`'s own doc
+    /// calls itself "how a whole `register_*` function tags all of its
+    /// registrations" — that is an opinion expressed once for a group, and a
+    /// row covered by one is not on the default.
+    ///
+    /// This is the column step 3 of
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
+    /// is scored against: *"flip the default last — once every registration
+    /// states its kind, `current_category` can default to something that fails
+    /// loudly (or be deleted)"*. `kind_stated` cannot score it, because it is
+    /// `false` on the thousands of rows a `with_category` scope covers
+    /// deliberately. `kind_chosen: false` is the honest count of registrations
+    /// nobody has an opinion about, and the default cannot be made to fail
+    /// until it is zero.
+    ///
+    /// `false` does **not** mean the kind is `SyntheticStub`: `register`'s
+    /// downgrade rule preserves a prior *chosen* kind over an unchosen
+    /// re-registration of the same triple, so an unchosen row can carry any
+    /// kind the earlier registration chose.
+    pub kind_chosen: bool,
 }
 
 /// Registry of native method implementations.
@@ -4629,9 +4689,32 @@ pub struct NativeMethodRegistry {
     /// Category aligned with `registrations` (index-parallel), for
     /// `dump_registrations` / census output.
     categories: Vec<NativeKind>,
-    /// The category applied to subsequent `register()` calls. Scoped via
-    /// `with_category`. Defaults to `SyntheticStub` (conservative).
-    current_category: NativeKind,
+    /// The category applied to subsequent `register()` calls, or `None` when
+    /// no scope is in effect.
+    ///
+    /// `None` is what makes "nobody chose this" a *scoped* fact rather than a
+    /// sticky one. It used to be a plain `NativeKind` initialised to
+    /// `SyntheticStub`, with a separate `category_chosen: bool` alongside — and
+    /// that boolean was set by `set_category` and **never cleared**, because
+    /// the restore half of the ubiquitous
+    /// `let prev = registry.current_category(); … registry.set_category(prev);`
+    /// idiom put the kind back and left the flag true. So after the first
+    /// `set_category` anywhere in boot, every subsequent registration reported
+    /// "chosen" whether or not any scope covered it: measured on JDK 25 /
+    /// linux, 11,875 of 11,876 registrations, which is not a measurement of
+    /// anything.
+    ///
+    /// Carrying the "chosen" bit *inside* the value fixes that for free. The
+    /// idiom already saves and restores; an `Option` makes it restore the
+    /// absence too, so a registrar entered with no category leaves none behind.
+    /// `set_category` takes `impl Into<Option<NativeKind>>`, so both halves of
+    /// the idiom — and all 567 `set_category(NativeKind::…)` sites — compile
+    /// unchanged.
+    ///
+    /// Reads that need a kind rather than a question go through
+    /// [`Self::effective_category`], which is the one place the conservative
+    /// `SyntheticStub` default now lives.
+    current_category: Option<NativeKind>,
     /// The leaf claim applied to subsequent `register()` calls. Scoped via
     /// [`Self::set_leaf`] / [`Self::with_leaf`]. Defaults to `false`
     /// (conservative — every native pays the full funnel until it opts out).
@@ -4647,32 +4730,23 @@ pub struct NativeMethodRegistry {
     /// This is the discriminator the 157-entry reclassification needs: today
     /// the census can say a registration is a `SyntheticStub` and where it was
     /// written, but not whether anyone *decided* that. See
-    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
     next_kind_stated: bool,
     /// Per-registration copy of [`Self::next_kind_stated`], index-parallel with
     /// `registrations` and `categories`.
     kind_stated: Vec<bool>,
-    /// Whether ANYONE chose `current_category`, as opposed to it still being
-    /// the constructor's `SyntheticStub` default.
+    /// Per-registration answer to *"was a category scope in effect for this
+    /// call?"* — i.e. `current_category.is_some()` at the moment of the
+    /// `register`. Index-parallel with `registrations` and `categories`.
     ///
-    /// Deliberately **wider** than [`Self::next_kind_stated`], which the census
-    /// documents as "adjudicated at the registration site" and which only
-    /// `register_with_kind` sets. `set_category` and `with_category` are just
-    /// as much a choice — `with_category`'s own doc calls it "how a whole
-    /// `register_*` function tags all of its registrations" — they simply
-    /// express it once for a group instead of per call.
-    ///
-    /// The distinction is load-bearing for the downgrade rule in `register`.
-    /// A first cut keyed that rule on `kind_stated` alone and promptly
-    /// preserved a stated `Bridge` over a `with_category(Intrinsic)`
-    /// re-registration of `java/lang/Float.intBitsToFloat`, which is a
-    /// downgrade of exactly the kind the rule exists to prevent, in the
-    /// opposite direction. Caught by diffing `--dump-native-registry` across
-    /// the change; it is the only kind that moved, which is why a one-line
-    /// census diff was worth running before believing the rule.
-    category_chosen: bool,
-    /// Per-registration copy of [`Self::category_chosen`], index-parallel with
-    /// `registrations` and `categories`.
+    /// Load-bearing for the downgrade rule in `register`. A first cut keyed
+    /// that rule on `kind_stated` alone and promptly preserved a stated
+    /// `Bridge` over a `with_category(Intrinsic)` re-registration of
+    /// `java/lang/Float.intBitsToFloat` — a downgrade of exactly the kind the
+    /// rule exists to prevent, in the opposite direction. `with_category` is an
+    /// opinion; `kind_stated` deliberately does not record it, and this does.
+    /// Caught by diffing `--dump-native-registry` across the change; it was the
+    /// only kind that moved.
     category_chosen_log: Vec<bool>,
     /// Strict "no synthetic stubs" mode. When true, `register()` DROPS any
     /// registration whose `current_category` is `SyntheticStub` — it is never
@@ -4836,11 +4910,10 @@ impl NativeMethodRegistry {
                 Default::default(),
             ),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
-            current_category: NativeKind::SyntheticStub,
+            current_category: None,
             current_leaf: false,
             next_kind_stated: false,
             kind_stated: Vec::new(),
-            category_chosen: false,
             category_chosen_log: Vec::new(),
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
@@ -4985,28 +5058,43 @@ impl NativeMethodRegistry {
     /// Set the category applied to all subsequent `register()` calls until
     /// changed again. Prefer [`with_category`](Self::with_category) for a
     /// scoped set/restore.
-    pub fn set_category(&mut self, kind: NativeKind) {
-        self.current_category = kind;
-        self.category_chosen = true;
+    ///
+    /// Takes `impl Into<Option<NativeKind>>` so both halves of the
+    /// save/restore idiom this codebase uses in 564 places —
+    /// `set_category(NativeKind::Bridge)` and `set_category(__prev_cat)` —
+    /// compile unchanged while the restore now also restores the *absence* of
+    /// a choice. See [`Self::current_category`].
+    pub fn set_category(&mut self, kind: impl Into<Option<NativeKind>>) {
+        self.current_category = kind.into();
     }
 
-    /// The category currently applied to new registrations. Useful for a
-    /// save/restore around a nested registrar.
-    pub fn current_category(&self) -> NativeKind {
+    /// The category currently applied to new registrations, or `None` if no
+    /// scope covers them. Feed it straight back to [`Self::set_category`] to
+    /// restore around a nested registrar.
+    pub fn current_category(&self) -> Option<NativeKind> {
         self.current_category
+    }
+
+    /// The kind a registration made right now would carry: the scope's, or the
+    /// conservative `SyntheticStub` when none covers it.
+    ///
+    /// The ONE place that default lives. Its doc comment's promise — "anything
+    /// an author forgets to tag stays visible to the audit and gateable, never
+    /// silently trusted" — is only kept if something can see the forgetting,
+    /// which is what `category_chosen_log` and the census's `kind_chosen` are
+    /// for.
+    fn effective_category(&self) -> NativeKind {
+        self.current_category.unwrap_or(NativeKind::SyntheticStub)
     }
 
     /// Run `f` with `current_category` set to `kind`, restoring the previous
     /// category afterwards. This is how a whole `register_*` function tags all
     /// of its registrations without touching individual `register()` calls.
-    pub fn with_category(&mut self, kind: NativeKind, f: impl FnOnce(&mut Self)) {
+    pub fn with_category(&mut self, kind: impl Into<Option<NativeKind>>, f: impl FnOnce(&mut Self)) {
         let prev = self.current_category;
-        let prev_chosen = self.category_chosen;
-        self.current_category = kind;
-        self.category_chosen = true;
+        self.current_category = kind.into();
         f(self);
         self.current_category = prev;
-        self.category_chosen = prev_chosen;
     }
 
     /// Declare that subsequent `register()` calls install **leaf** natives.
@@ -5071,7 +5159,7 @@ impl NativeMethodRegistry {
     /// registrar last ran.
     ///
     /// This is the migration target for
-    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
     /// `register` takes four arguments, none of them a kind; the kind comes
     /// from a mutable field on the registry that some *ancestor* frame set. The
     /// consequence runs in both directions and is silent at the point of the
@@ -5109,14 +5197,11 @@ impl NativeMethodRegistry {
         // point exists to remove.
         let prev = self.current_category;
         let prev_stated = self.next_kind_stated;
-        let prev_chosen = self.category_chosen;
-        self.current_category = kind;
+        self.current_category = Some(kind);
         self.next_kind_stated = true;
-        self.category_chosen = true;
         self.register(class_name, method_name, descriptor, callback);
         self.current_category = prev;
         self.next_kind_stated = prev_stated;
-        self.category_chosen = prev_chosen;
     }
 
     /// The category a native was registered under, or `None` if no native is
@@ -5173,10 +5258,8 @@ impl NativeMethodRegistry {
             .enumerate()
             .map(|(reg_index, (class, name, descriptor))| {
                 let prov = self.provenance.get(reg_index);
-                let invocations = owner_slot
-                    .get(reg_index)
-                    .copied()
-                    .flatten()
+                let owning_slot = owner_slot.get(reg_index).copied().flatten();
+                let invocations = owning_slot
                     .and_then(|slot_idx| self.slot_invocations.get(slot_idx as usize))
                     .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(0);
@@ -5201,6 +5284,18 @@ impl NativeMethodRegistry {
                     // fallback direction) as `kind` above: a hypothetical
                     // desync reports "inherited", never a false "adjudicated".
                     kind_stated: self.kind_stated.get(reg_index).copied().unwrap_or(false),
+                    // Same index-parallel discipline. The conservative fallback
+                    // here is `true`, not `false`: this column exists to count
+                    // rows nobody chose, so a desync must never invent one.
+                    kind_chosen: self
+                        .category_chosen_log
+                        .get(reg_index)
+                        .copied()
+                        .unwrap_or(true),
+                    // The same `owner_slot` reverse index the invocation count
+                    // above is read through — a superseded registration has no
+                    // entry in it, which is precisely what "owns no slot" means.
+                    owns_slot: owning_slot.is_some(),
                 }
             })
             .collect()
@@ -5246,7 +5341,7 @@ impl NativeMethodRegistry {
         // Compatible mode pays exactly one field load plus a discriminant
         // compare here, and the `allowed_in` call is short-circuited away.
         if self.compatibility_mode == CompatibilityMode::JdkOnly
-            && !self.current_category.allowed_in(CompatibilityMode::JdkOnly)
+            && !self.effective_category().allowed_in(CompatibilityMode::JdkOnly)
         {
             // Reuse the existing `CRATONVM_DBG_DROPPED_STUBS` switch (added
             // 2026-07-14 for the mis-tagged-category bisection) with a distinct
@@ -5278,7 +5373,7 @@ impl NativeMethodRegistry {
         // the call falls through to real bytecode or a clear error instead of a
         // fake. Bridges and intrinsics are always registered. (See the
         // `drop_synthetic_stubs` field doc.)
-        if self.drop_synthetic_stubs && self.current_category == NativeKind::SyntheticStub {
+        if self.drop_synthetic_stubs && self.effective_category() == NativeKind::SyntheticStub {
             // CRATONVM_DBG_DROPPED_STUBS=1: list every registration this mode
             // silently drops. Added 2026-07-14 while chasing a real-JDK-mode
             // bootstrap regression (`InternalError: null property: java.home`)
@@ -5333,7 +5428,7 @@ impl NativeMethodRegistry {
                 // Keep P68's later Bridge registrations: they perform TLS and
                 // produce a layout-correct SSLSocket.
                 || (class_name == "javax/net/ssl/SSLSocketFactory"
-                    && self.current_category == NativeKind::SyntheticStub))
+                    && self.effective_category() == NativeKind::SyntheticStub))
         {
             return;
         }
@@ -5358,7 +5453,7 @@ impl NativeMethodRegistry {
         // synthetic layout shims; they are VM policy bridges registered by the
         // real-JDK native path and explicitly forced by the interpreter.
         let keep_real_forkjoinpool_bridge =
-            self.current_category == NativeKind::Bridge
+            self.effective_category() == NativeKind::Bridge
                 && class_name == "java/util/concurrent/ForkJoinPool"
                 && matches!(
                 (method_name, descriptor),
@@ -5449,7 +5544,7 @@ impl NativeMethodRegistry {
         // GC; letting `ForkJoinTask.fork()` fall through to bytecode reaches the
         // real WorkQueue/CAS path and reopens the residual timeout/corruption
         // face.
-        let keep_real_forkjointask_bridge = self.current_category == NativeKind::Bridge
+        let keep_real_forkjointask_bridge = self.effective_category() == NativeKind::Bridge
             && matches!(
                 class_name,
                 "java/util/concurrent/ForkJoinTask"
@@ -5587,7 +5682,7 @@ impl NativeMethodRegistry {
         // inherited field by name. They are required by Spring's
         // ThreadPoolTaskScheduler anonymous subclass. Every other STPE native
         // remains unsafe against real JDK objects and is dropped.
-        let keep_real_scheduled_executor_bridge = self.current_category == NativeKind::Bridge
+        let keep_real_scheduled_executor_bridge = self.effective_category() == NativeKind::Bridge
             && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
             && matches!(
                 (method_name, descriptor),
@@ -5602,11 +5697,68 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
+        // `java.util.concurrent.Executors` bytecode builds every executor.
+        //
+        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
+        // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
+        // factories were the ones still fabricating. What they did was subtler
+        // than a two-slot stub and is worth stating, because the obvious reading
+        // of the code says they were already fine:
+        //
+        //   `alloc_concurrent_synthetic(.., "java/util/concurrent/ThreadPoolExecutor", 2)`
+        //   followed by `initialize_real_thread_pool_executor`, which
+        //   `invoke_special`s the real `ThreadPoolExecutor.<init>`.
+        //
+        // On the happy path that does produce a genuinely real executor — which
+        // is why the fixed/cached transcripts already matched HotSpot. But it
+        // keeps TWO fallbacks (`stpe_legacy_slot_init`, taken when the
+        // `BlockingQueue` or the `TimeUnit` constant cannot be built) that write
+        // the historical two-slot shape onto a real-layout object and return it
+        // as if construction had succeeded. A fallback that silently hands back a
+        // half-constructed executor is exactly the state the eight
+        // `ThreadPoolExecutor.execute` receiver-shape dispatch sites exist to
+        // detect, so leaving it in place would keep the predicate they consult
+        // conditionally true — and "conditionally true" is what blocks deleting
+        // them (L11).
+        //
+        // And one of the three was observably wrong, not just fragile:
+        // `newSingleThreadExecutor()` returned a bare `ThreadPoolExecutor`, where
+        // the real JDK returns `Executors$AutoShutdownDelegatedExecutorService`
+        // wrapping one. Every `instanceof ThreadPoolExecutor` a caller writes
+        // flipped, and the pool was reconfigurable when the JDK guarantees it is
+        // not. Measured against HotSpot 25 by `probes/L10ThreadPoolInitProbe`:
+        // `single.class` and `single.isTpe` were the ONLY two divergent lines out
+        // of 62 in both `--real-jdk` and `--jdk-only`.
+        //
+        // Dropping is the whole fix, and it is a registration-time decision on
+        // purpose — the L11/item-3 precedent
+        // (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`)
+        // is that a policy expressed at dispatch has to be restated once per
+        // dispatch path, while a policy expressed here is invisible to all of
+        // them at once. With no native, `Executors.newFixedThreadPool` et al. run
+        // their own bytecode — `new ThreadPoolExecutor(...)`, or for the single-
+        // thread case the delegating wrapper — so a factory-built executor is
+        // real by CONSTRUCTION rather than by a fallback that happened not to be
+        // taken. `newSingleThreadExecutor(ThreadFactory)` was never registered
+        // and has always run that real path, which is what made this safe to do
+        // rather than merely desirable.
+        //
+        // Scoped to the pool factories by NAME. `Executors.callable`,
+        // `defaultThreadFactory`, `privilegedThreadFactory` and the
+        // `unconfigurable*` wrappers are not fabrications and keep whatever
+        // registration they have; and the synthetic-JDK build never sets this
+        // flag, so its own two-slot executor model is untouched.
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/Executors"
             && matches!(
                 method_name,
-                "newScheduledThreadPool" | "newSingleThreadScheduledExecutor"
+                "newScheduledThreadPool"
+                    | "newSingleThreadScheduledExecutor"
+                    | "newFixedThreadPool"
+                    | "newCachedThreadPool"
+                    | "newSingleThreadExecutor"
             )
         {
             return;
@@ -5651,7 +5803,7 @@ impl NativeMethodRegistry {
         // change this registration's category without re-auditing every
         // `set_category`/`with_category` call between both `register_regex_natives`
         // call sites and the top of `register_essential_natives`.
-        let keep_real_matcher_find_fastpath = self.current_category == NativeKind::Intrinsic
+        let keep_real_matcher_find_fastpath = self.effective_category() == NativeKind::Intrinsic
             && class_name == "java/util/regex/Matcher"
             && matches!(
                 (method_name, descriptor),
@@ -5669,7 +5821,7 @@ impl NativeMethodRegistry {
         // constructed real-JDK Pattern from a bounded cache; unlike the old
         // synthetic regex bridge they never fabricate or partially initialize
         // a Pattern/Matcher layout.
-        let keep_real_pattern_compile_cache = self.current_category == NativeKind::Intrinsic
+        let keep_real_pattern_compile_cache = self.effective_category() == NativeKind::Intrinsic
             && class_name == "java/util/regex/Pattern"
             && method_name == "compile"
             && matches!(
@@ -5694,7 +5846,7 @@ impl NativeMethodRegistry {
         // still need a small native surface.
         if self.drop_real_layout_synthetic
             && class_name == "java/util/StringJoiner"
-            && self.current_category != NativeKind::SyntheticStub
+            && self.effective_category() != NativeKind::SyntheticStub
         {
             return;
         }
@@ -5751,7 +5903,7 @@ impl NativeMethodRegistry {
         // for every out-of-range index's exception message, and for `null`.
         if self.drop_real_layout_synthetic
             && class_name == "java/lang/String"
-            && self.current_category == NativeKind::Bridge
+            && self.effective_category() == NativeKind::Bridge
             && !(method_name == "intern" && descriptor == "()Ljava/lang/String;")
         {
             return;
@@ -5920,12 +6072,12 @@ impl NativeMethodRegistry {
         // Re-registration under a new category — e.g. promoting a fixed stub to
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
         // -`or_insert` semantics of the removed `category_by_key` map.
-        self.categories.push(self.current_category);
+        self.categories.push(self.effective_category());
         // Index-parallel with `categories`: was that kind stated here, or
         // inherited? Only `register_with_kind` sets the flag, and only for the
         // duration of its own inner call.
         self.kind_stated.push(self.next_kind_stated);
-        self.category_chosen_log.push(self.category_chosen);
+        self.category_chosen_log.push(self.current_category.is_some());
         // Provenance, index-parallel with the two pushes above. `overwrote` is
         // read HERE — before the `match prior_slot` arm below rewrites
         // `slot.kind` in place — because that is the last moment the displaced
@@ -5999,13 +6151,13 @@ impl NativeMethodRegistry {
             })
             .and_then(|ri| self.categories.get(ri as usize).copied());
         let category = match prior_chosen_kind {
-            Some(prior) if !self.category_chosen => {
+            Some(prior) if self.current_category.is_none() => {
                 if let Some(slot) = self.categories.get_mut(reg_index) {
                     *slot = prior;
                 }
                 prior
             }
-            _ => self.current_category,
+            _ => self.effective_category(),
         };
         // The leaf claim is a property of the CALLBACK being registered, not of
         // the triple: it travels with `current_leaf` exactly like `category`
@@ -7865,6 +8017,113 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // JDK-only wave 2, L10 — real `ThreadPoolExecutor` field initialisation
+    // -----------------------------------------------------------------------
+
+    /// Every `Executors` pool factory, and the descriptor CratonVM registered
+    /// it under before the L10 drop.
+    const EXECUTOR_POOL_FACTORIES: &[(&str, &str)] = &[
+        (
+            "newFixedThreadPool",
+            "(I)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newCachedThreadPool",
+            "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newSingleThreadExecutor",
+            "()Ljava/util/concurrent/ExecutorService;",
+        ),
+        (
+            "newScheduledThreadPool",
+            "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+        (
+            "newSingleThreadScheduledExecutor",
+            "()Ljava/util/concurrent/ScheduledExecutorService;",
+        ),
+    ];
+
+    /// In real-JDK mode no `Executors` pool factory may be registered: the real
+    /// `java.util.concurrent.Executors` bytecode has to build every executor,
+    /// so a factory-made pool is genuinely `<init>`-constructed by construction
+    /// rather than by a fallback that happened not to be taken.
+    ///
+    /// That is what unblocks L11. The eight `ThreadPoolExecutor.execute`
+    /// receiver-shape dispatch sites exist to detect an executor CratonVM
+    /// fabricated; they are deletable only once no such executor can exist, and
+    /// a native here is the only thing that could make one.
+    ///
+    /// Asserted in BOTH directions. Without the `drop_real_layout_synthetic ==
+    /// false` half this test passes on a registry that refuses the triples
+    /// unconditionally — which would break the synthetic-JDK build, whose
+    /// two-slot executor model is exactly what those natives are for, while
+    /// this test went on reading green.
+    #[test]
+    fn real_jdk_mode_registers_no_executors_pool_factory() {
+        let exec = "java/util/concurrent/Executors";
+
+        let mut compatible = NativeMethodRegistry::new();
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            compatible.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                compatible.find(exec, name, descriptor).is_some(),
+                "synthetic-JDK mode must KEEP Executors.{name}{descriptor}: it is the \
+                 only implementation there, and dropping it would leave the synthetic \
+                 two-slot executor model with no factory at all"
+            );
+        }
+
+        let mut real = NativeMethodRegistry::new();
+        real.set_drop_real_layout_synthetic(true);
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            real.register(exec, name, descriptor, dummy_native);
+        }
+        for (name, descriptor) in EXECUTOR_POOL_FACTORIES {
+            assert!(
+                real.find(exec, name, descriptor).is_none(),
+                "real-JDK mode still registers Executors.{name}{descriptor}. A native here \
+                 can hand back an executor the real `<init>` never ran on, which is the \
+                 receiver shape the eight `ThreadPoolExecutor.execute` dispatch sites exist \
+                 to detect — and while one can exist, those sites cannot be deleted (L11)."
+            );
+        }
+
+        // Negative control: the drop is scoped to the pool factories by name.
+        // `callable`/`defaultThreadFactory`/`unconfigurable*` fabricate no
+        // executor and must be unaffected, or a future widening of the
+        // `matches!` arm would take them out silently.
+        for (name, descriptor) in [
+            (
+                "callable",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Callable;",
+            ),
+            (
+                "defaultThreadFactory",
+                "()Ljava/util/concurrent/ThreadFactory;",
+            ),
+            (
+                "unconfigurableExecutorService",
+                "(Ljava/util/concurrent/ExecutorService;)Ljava/util/concurrent/ExecutorService;",
+            ),
+        ] {
+            real.register(exec, name, descriptor, dummy_native);
+            assert!(
+                real.find(exec, name, descriptor).is_some(),
+                "the L10 drop must not reach Executors.{name}{descriptor} — it builds no \
+                 executor of its own"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // JDK-only mode (docs/feature-designs/jdk-only-mode.md §4), 2026-07-31
     // -----------------------------------------------------------------------
 
@@ -8043,12 +8302,23 @@ mod tests {
         assert_eq!(census[0].kind, NativeKind::SyntheticStub);
         assert_eq!(census[0].overwrote, None);
         assert_eq!(census[0].invocations, 0);
+        // ... and it owns no slot, which is the fact that makes the zero above
+        // mean "cannot be dispatched" rather than "was not dispatched yet".
+        // Adjudicating this row's kind decides nothing.
+        assert!(
+            !census[0].owns_slot,
+            "a superseded registration must not claim to own its slot"
+        );
 
         // Row 1: the current owner. `overwrote` is the history that was
         // previously unrecoverable — it is read before the in-place slot update.
         assert_eq!(census[1].kind, NativeKind::Bridge);
         assert_eq!(census[1].overwrote, Some(NativeKind::SyntheticStub));
         assert_eq!(census[1].invocations, 3);
+        assert!(
+            census[1].owns_slot,
+            "the surviving registration must own its slot"
+        );
 
         for row in &census {
             let site = row.registered_by.as_deref().expect("provenance recorded");

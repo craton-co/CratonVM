@@ -2215,7 +2215,19 @@ pub(crate) fn native_netty_event_executor_group_shutdown_gracefully(
 /// `io.netty.internal.tcnative`. Windows host DLLs + libffi dispatch AV
 /// (`0xC0000005`); `vm_exec` skips symbol lookup for this package — register
 /// minimal stubs so `Library.initialize` / `SSL` static constants can load.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `io.netty.internal.tcnative` is a third-party JNI
+// binding whose host DLL this VM refuses to load (see the fn doc above) —
+// the registrations exist to keep `Library.<clinit>` from throwing.
 pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let lib = "io/netty/internal/tcnative/Library";
 
     registry.register(lib, "version", "(I)I", |_ctx, args| {
@@ -2390,6 +2402,7 @@ pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMeth
             ))))
         },
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Register one `NativeStaticallyReferencedJniMethods.<name>()I` accessor with

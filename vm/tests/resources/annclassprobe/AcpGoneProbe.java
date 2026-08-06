@@ -18,6 +18,7 @@ import java.lang.reflect.Method;
 public class AcpGoneProbe {
 
     private static int nullTypes = 0;
+    private static int nonAnnotations = 0;
 
     private static void check(String where, Object o) {
         if (o == null) {
@@ -25,7 +26,17 @@ public class AcpGoneProbe {
             return;
         }
         if (!(o instanceof Annotation)) {
-            System.out.println("  " + where + ": non-annotation " + o.getClass().getName());
+            // Counted, not merely printed. This branch existed and stayed quiet
+            // while `org.infinispan.query.remote.client.impl.QueryRequest` was
+            // unmockable for exactly this reason: `getDeclaredAnnotations()`
+            // handed back a `Proxy` built over a fabricated stand-in for an
+            // annotation type that is on no classpath, and a proxy over a
+            // non-interface with no superinterfaces is not an `Annotation`.
+            // Byte Buddy's `AnnotationList$ForLoadedAnnotations` casts every
+            // element to `Annotation`, so this is a defect, not an observation.
+            System.out.println("  " + where + ": non-annotation " + o.getClass().getName()
+                    + "  [DEFECT]");
+            nonAnnotations++;
             return;
         }
         Class<? extends Annotation> t = ((Annotation) o).annotationType();
@@ -38,15 +49,26 @@ public class AcpGoneProbe {
     }
 
     public static void main(String[] args) {
+        container();
+        solo();
+        System.out.println("GONE-SUMMARY: nullTypes=" + nullTypes
+                + " nonAnnotations=" + nonAnnotations);
+    }
+
+    /// `AcpGoneTarget`: a LOADABLE `@Repeatable` container whose entries have an
+    /// unloadable type.
+    private static void container() {
         Annotation[] anns;
         try {
             anns = Class.forName("AcpGoneTarget").getDeclaredAnnotations();
         } catch (Throwable t) {
             // HotSpot's answer: NoClassDefFoundError before anything is built.
-            // Nothing with a null type ever reached the caller.
+            // Nothing with a null type ever reached the caller. This used to
+            // `return` from main, which skipped every later case AND printed
+            // the summary itself — so on HotSpot the solo case below never ran
+            // and the run still looked complete.
             System.out.println("getDeclaredAnnotations() threw " + t.getClass().getName()
                     + ": " + t.getMessage() + "  [no null-typed annotation escaped]");
-            System.out.println("GONE-SUMMARY: nullTypes=0");
             return;
         }
         System.out.println("getDeclaredAnnotations() count=" + anns.length);
@@ -85,6 +107,29 @@ public class AcpGoneProbe {
                         + "  [acceptable — deferred, nothing escaped]");
             }
         }
-        System.out.println("GONE-SUMMARY: nullTypes=" + nullTypes);
+    }
+
+    /// `AcpGoneSolo`: the shape that escaped. A DIRECTLY APPLIED annotation
+    /// whose own type is unresolvable, in an ENTERPRISE-PREFIXED package
+    /// (`org/jboss/`) — the prefix is load-bearing, because that is what makes
+    /// this VM fabricate a synthetic stand-in instead of simply not finding the
+    /// class. The same fixture in the default package passes on a broken
+    /// binary and proves nothing.
+    ///
+    /// `getDeclaredAnnotations()` may report it as absent (HotSpot's
+    /// `AnnotationParser` drops an annotation whose type will not resolve) or
+    /// throw; what it may not do is return an element that is not an
+    /// `Annotation`.
+    private static void solo() {
+        try {
+            Object[] solo = Class.forName("AcpGoneSolo").getDeclaredAnnotations();
+            System.out.println("AcpGoneSolo.getDeclaredAnnotations() count=" + solo.length);
+            for (Object a : solo) {
+                check("solo", a);
+            }
+        } catch (Throwable t) {
+            System.out.println("AcpGoneSolo.getDeclaredAnnotations() threw "
+                    + t.getClass().getName() + "  [no non-annotation escaped]");
+        }
     }
 }

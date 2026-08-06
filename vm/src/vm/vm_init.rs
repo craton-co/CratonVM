@@ -2629,13 +2629,18 @@ impl SharedVm {
             );
             // Real close() (see `quarkus_runner_class_loader_close`): closes each
             // distinct ClassLoadingResource once and skips the null map values
-            // the real bytecode NPEs on. Left at the default (SyntheticStub)
-            // category so `CRATONVM_NO_STUBS` still falls through to bytecode.
-            native_methods.register(
+            // the real bytecode NPEs on. `SyntheticStub` so `CRATONVM_NO_STUBS`
+            // still falls through to bytecode — the same intent this comment
+            // always stated, now stated to the registry instead of relying on
+            // the default. That reliance was the only one left in the VM crate,
+            // and a `set_category` anywhere upstream would have silently
+            // retagged it.
+            native_methods.register_with_kind(
                 "io/quarkus/bootstrap/runner/RunnerClassLoader",
                 "close",
                 "()V",
                 quarkus_runner_class_loader_close,
+                cratonvm_native_api::NativeKind::SyntheticStub,
             );
             cratonvm_native_builtins::classloader_real::register_classloader_real_natives(
                 &mut native_methods,
@@ -3340,6 +3345,7 @@ impl SharedVm {
                 native_libraries: parking_lot::Mutex::new(Vec::new()),
                 upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
                 jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
+                jni_native_methods: crate::native::jni::JniNativeMethodTable::default(),
             },
 
             threads: crate::vm::realms::ThreadRealm {
@@ -3836,7 +3842,7 @@ impl SharedVm {
 
         // Iterate all loaded classes and add non-synthetic ones with cached bytes
         for class in cm.class_store.iter() {
-            if class.is_synthetic_stub {
+            if class.origin.is_compatibility_stub() {
                 continue;
             }
             if let Some(bytes) = cm.class_bytes_cache.get(&class.id) {
@@ -4182,7 +4188,8 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
-    ///       "kind_stated": true,
+    ///       "kind_stated": true, "kind_chosen": true,
+    ///       "owns_slot": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
     ///                                  "acc_native": true, "has_code": false },
     ///       "image_declaring_method": { "image_has_class": true, "declared": true,
@@ -4427,6 +4434,16 @@ impl SharedVm {
             // `set_category`?" — the discriminator the 157-entry
             // reclassification needs. See `NativeCensusEntry::kind_stated`.
             out.push_str(&format!("      \"kind_stated\": {},\n", row.kind_stated));
+            // "…or did nobody have an opinion at all?" — `kind_stated` is false
+            // on every row a deliberate `with_category` scope covers, so it
+            // cannot answer that. See `NativeCensusEntry::kind_chosen`.
+            out.push_str(&format!("      \"kind_chosen\": {},\n", row.kind_chosen));
+            // "Would a dispatch of this triple reach THIS row?" A superseded
+            // registration answers `false` and can never be dispatched, so it
+            // is not a registration any reclassification wave has to decide.
+            // See `NativeCensusEntry::owns_slot` for the measured size of the
+            // difference.
+            out.push_str(&format!("      \"owns_slot\": {},\n", row.owns_slot));
 
             match cm {
                 Some(cm) => {
@@ -4662,6 +4679,7 @@ impl SharedVm {
             jit_inline_cache_natives: cratonvm_jit::jdk_only_ic_native_refusals(),
             jit_fastpath_admissions: crate::jit::helpers::jdk_only_jit_fastpath_refusals(),
             interpreter_bytecode_preferred: crate::vm::jdk_only_native_shadow_attempts(),
+            interpreter_shadow_unenforced: crate::vm::jdk_only_native_shadow_unenforced(),
         }
     }
 
@@ -4682,7 +4700,8 @@ impl SharedVm {
     ///   },
     ///   "refusals": {
     ///     "jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
-    ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0
+    ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0,
+    ///     "interpreter_shadow_unenforced": 0
     ///   }
     /// }
     /// ```
@@ -4957,8 +4976,15 @@ impl SharedVm {
             refusals.jit_fastpath_admissions
         ));
         out.push_str(&format!(
-            "    \"interpreter_bytecode_preferred\": {}\n",
+            "    \"interpreter_bytecode_preferred\": {},\n",
             refusals.interpreter_bytecode_preferred
+        ));
+        // §1.4 observed-but-not-enforced. Additive field: a reader that does
+        // not know it still parses the object, and one that does gets the half
+        // of §1.4 the report could not previously see at all.
+        out.push_str(&format!(
+            "    \"interpreter_shadow_unenforced\": {}\n",
+            refusals.interpreter_shadow_unenforced
         ));
         out.push_str("  }\n}\n");
 
@@ -5626,6 +5652,22 @@ pub struct JdkOnlyRefusalCounts {
     /// over a registered non-intrinsic native. Distinct triples appear in
     /// sink 2; this count is exact and uncapped.
     pub interpreter_bytecode_preferred: u64,
+    /// Times a registered `Bridge` stood in front of concrete bytecode at
+    /// `try_stackless_invoke` step 1 and **ran anyway** — §1.4 observed but not
+    /// enforced. The one field in this struct that counts something strict
+    /// policy did NOT stop, and it is here rather than in `counts` because it
+    /// is the same event class as its siblings measured on the other side.
+    ///
+    /// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement turns
+    /// each of these into an `interpreter_bytecode_preferred` instead. Distinct
+    /// triples appear in sink 2 tagged `bridge-ran-over-bytecode`. It is
+    /// deliberately excluded from [`Self::total`], which counts refusals.
+    ///
+    /// **The one field here that is a FLOOR rather than exact.** Discovering a
+    /// shadow costs a hierarchy walk, so the walk stops once the triple is
+    /// recorded and stops entirely once sink 2 saturates — see
+    /// `crate::vm::jdk_only_native_shadow_unenforced`. Quote it as "at least".
+    pub interpreter_shadow_unenforced: u64,
 }
 
 impl JdkOnlyRefusalCounts {
@@ -5888,7 +5930,7 @@ impl SharedVm {
                 .read()
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             if !is_synthetic {
                 return Ok(id);
@@ -5921,7 +5963,7 @@ impl SharedVm {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if !is_synthetic {
                     return Ok(id);
@@ -5944,7 +5986,7 @@ impl SharedVm {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if !is_synthetic {
                     return Ok(id);
@@ -9800,7 +9842,7 @@ mod tests {
 
         // Verify it's from real bytecode, not a synthetic stub
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Object should come from real bytecode, not a synthetic stub"
         );
 
@@ -9865,7 +9907,7 @@ mod tests {
             "java.lang.Object: {} methods, {} fields, synthetic={}",
             cls.methods.len(),
             cls.fields.len(),
-            cls.is_synthetic_stub
+            cls.origin.is_compatibility_stub()
         );
     }
 
@@ -10142,7 +10184,7 @@ mod tests {
                 .get(id.expect("class id should be loaded"))
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
         }
@@ -10172,7 +10214,7 @@ mod tests {
 
         // Must be loaded from real bytecode, not synthetic
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "String should be real, not synthetic"
         );
 
@@ -10236,7 +10278,7 @@ mod tests {
         let cls = cm.get_class(id).expect("Class not found");
 
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Class should be real, not synthetic"
         );
 
@@ -10457,7 +10499,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
             assert!(
@@ -10941,7 +10983,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
         }
@@ -11146,7 +11188,7 @@ mod tests {
         let number = cm
             .get_class(number_id)
             .expect("class should exist in class store");
-        assert!(!number.is_synthetic_stub);
+        assert!(!number.origin.is_compatibility_stub());
         let object_id = cm
             .get_loaded_class_id("java/lang/Object")
             .expect("class java/lang/Object should be loaded");
@@ -11208,7 +11250,7 @@ mod tests {
             .get_class(throwable_id)
             .expect("class should exist in class store");
         assert_eq!(throwable.superclass, Some(object_id));
-        assert!(!throwable.is_synthetic_stub);
+        assert!(!throwable.origin.is_compatibility_stub());
 
         // Exception extends Throwable
         let exception = cm
@@ -11242,7 +11284,7 @@ mod tests {
         let sys = cm
             .get_class(sys_id)
             .expect("class should exist in class store");
-        assert!(!sys.is_synthetic_stub);
+        assert!(!sys.origin.is_compatibility_stub());
 
         // System should have well-known methods
         let method_names: Vec<&str> = sys.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -11279,7 +11321,7 @@ mod tests {
         let int_cls = cm
             .get_class(int_id)
             .expect("class should exist in class store");
-        assert!(!int_cls.is_synthetic_stub);
+        assert!(!int_cls.origin.is_compatibility_stub());
 
         // Integer has one instance field: 'value' (int)
         let instance_fields: Vec<&str> = int_cls
@@ -11346,7 +11388,7 @@ mod tests {
         let thread = cm
             .get_class(thread_id)
             .expect("class should exist in class store");
-        assert!(!thread.is_synthetic_stub);
+        assert!(!thread.origin.is_compatibility_stub());
 
         // Thread should have many methods
         let method_names: Vec<&str> = thread.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -11932,7 +11974,7 @@ mod tests {
             .get_class(hm_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "HashMap should be from real bytecode"
         );
 
@@ -11984,7 +12026,7 @@ mod tests {
             .get_class(al_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "ArrayList should be from real bytecode"
         );
 
@@ -12036,7 +12078,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{name} should be from real bytecode"
             );
         }
@@ -12096,7 +12138,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{name} should be from real bytecode"
             );
         }
@@ -12233,7 +12275,7 @@ mod tests {
             .get_class(node_id)
             .expect("class should exist in class store");
         assert!(
-            !node.is_synthetic_stub,
+            !node.origin.is_compatibility_stub(),
             "HashMap$Node should be from real bytecode"
         );
 
@@ -12524,7 +12566,7 @@ mod tests {
             .get_class(ll_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "LinkedList should be from real bytecode"
         );
 
@@ -12562,7 +12604,7 @@ mod tests {
                 .get_class(hs_id)
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "HashSet should be from real bytecode"
             );
         }
@@ -12592,7 +12634,7 @@ mod tests {
                 .get_class(tm_id)
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "TreeMap should be from real bytecode"
             );
 
@@ -12624,7 +12666,7 @@ mod tests {
             .get_class(sp_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Spliterator should be from real bytecode"
         );
 
@@ -12898,7 +12940,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be from real JDK bytecode, not a synthetic stub"
             );
         }
@@ -13020,7 +13062,7 @@ mod tests {
         let aqs = cm
             .get_class(aqs_id)
             .expect("class should exist in class store");
-        assert!(!aqs.is_synthetic_stub, "AQS should be real bytecode");
+        assert!(!aqs.origin.is_compatibility_stub(), "AQS should be real bytecode");
 
         // AQS should have key methods
         let method_names: Vec<&str> = aqs.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -13052,7 +13094,7 @@ mod tests {
             .get_class(rl_id)
             .expect("class should exist in class store");
         assert!(
-            !rl.is_synthetic_stub,
+            !rl.origin.is_compatibility_stub(),
             "ReentrantLock should be real bytecode"
         );
 
@@ -13090,7 +13132,7 @@ mod tests {
             .get_class(ai_id)
             .expect("class should exist in class store");
         assert!(
-            !ai.is_synthetic_stub,
+            !ai.origin.is_compatibility_stub(),
             "AtomicInteger should be real bytecode"
         );
 
@@ -13382,7 +13424,7 @@ mod tests {
             .get_class(cdl_id)
             .expect("class should exist in class store");
         assert!(
-            !cdl.is_synthetic_stub,
+            !cdl.origin.is_compatibility_stub(),
             "CountDownLatch should be real bytecode"
         );
 
@@ -13414,7 +13456,7 @@ mod tests {
         let sem = cm
             .get_class(sem_id)
             .expect("class should exist in class store");
-        assert!(!sem.is_synthetic_stub, "Semaphore should be real bytecode");
+        assert!(!sem.origin.is_compatibility_stub(), "Semaphore should be real bytecode");
 
         let method_names: Vec<&str> = sem.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13449,7 +13491,7 @@ mod tests {
             .get_class(cb_id)
             .expect("class should exist in class store");
         assert!(
-            !cb.is_synthetic_stub,
+            !cb.origin.is_compatibility_stub(),
             "CyclicBarrier should be real bytecode"
         );
 
@@ -13483,7 +13525,7 @@ mod tests {
             .get_class(es_id)
             .expect("class should exist in class store");
         assert!(
-            !es.is_synthetic_stub,
+            !es.origin.is_compatibility_stub(),
             "ExecutorService should be real bytecode"
         );
         let es_methods: Vec<&str> = es.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -13500,7 +13542,7 @@ mod tests {
             .get_class(tpe_id)
             .expect("class should exist in class store");
         assert!(
-            !tpe.is_synthetic_stub,
+            !tpe.origin.is_compatibility_stub(),
             "ThreadPoolExecutor should be real bytecode"
         );
 
@@ -13512,7 +13554,7 @@ mod tests {
             .get_class(fjp_id)
             .expect("class should exist in class store");
         assert!(
-            !fjp.is_synthetic_stub,
+            !fjp.origin.is_compatibility_stub(),
             "ForkJoinPool should be real bytecode"
         );
 
@@ -13530,7 +13572,7 @@ mod tests {
             .get_class(fjt_id)
             .expect("class should exist in class store");
         assert!(
-            !fjt.is_synthetic_stub,
+            !fjt.origin.is_compatibility_stub(),
             "ForkJoinTask should be real bytecode"
         );
 
@@ -13550,7 +13592,7 @@ mod tests {
         let al = cm
             .get_class(al_id)
             .expect("class should exist in class store");
-        assert!(!al.is_synthetic_stub);
+        assert!(!al.origin.is_compatibility_stub());
 
         let method_names: Vec<&str> = al.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(method_names.contains(&"get"));
@@ -13572,7 +13614,7 @@ mod tests {
         let ar = cm
             .get_class(ar_id)
             .expect("class should exist in class store");
-        assert!(!ar.is_synthetic_stub);
+        assert!(!ar.origin.is_compatibility_stub());
 
         let method_names: Vec<&str> = ar.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(method_names.contains(&"get"));
@@ -13594,7 +13636,7 @@ mod tests {
         let sl = cm
             .get_class(sl_id)
             .expect("class should exist in class store");
-        assert!(!sl.is_synthetic_stub, "StampedLock should be real bytecode");
+        assert!(!sl.origin.is_compatibility_stub(), "StampedLock should be real bytecode");
 
         let method_names: Vec<&str> = sl.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13628,7 +13670,7 @@ mod tests {
         let ph = cm
             .get_class(ph_id)
             .expect("class should exist in class store");
-        assert!(!ph.is_synthetic_stub, "Phaser should be real bytecode");
+        assert!(!ph.origin.is_compatibility_stub(), "Phaser should be real bytecode");
 
         let method_names: Vec<&str> = ph.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13659,7 +13701,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode"
             );
         }
@@ -14002,7 +14044,7 @@ mod tests {
 
         // Connection should be from real bytecode
         assert!(
-            !conn.is_synthetic_stub,
+            !conn.origin.is_compatibility_stub(),
             "java.sql.Connection should be real bytecode"
         );
 

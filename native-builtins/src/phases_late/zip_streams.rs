@@ -262,13 +262,11 @@ fn native_inflater_input_stream_read(
     let requested = args.get(3).and_then(Value::as_int).unwrap_or(0);
     let target_len = ctx.array_length(target) as i64;
     if off < 0 || requested < 0 || (off as i64) + (requested as i64) > target_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 {
-                off
-            } else {
-                off.wrapping_add(requested)
-            },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(requested)
+        })
         .into());
     }
     if requested == 0 {
@@ -697,9 +695,11 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let arr_len = ctx.array_length(*src) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: if off < 0 { off } else { off.wrapping_add(len) },
-                }
+                return Err(RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into());
             }
             let off = off as usize;
@@ -942,7 +942,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 /// InputStream/OutputStream contract, but use
 /// a reusable 16 MiB Java byte array so the concrete stream implementations
 /// retain ownership of their I/O and ZIP semantics.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `InputStream.transferTo` is ordinary bytecode and
+// `cratonvm/internal/StreamCollector` is a class this VM mints, so neither
+// can be what an `ACC_NATIVE` method binds to.
 pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for class in ["java/io/InputStream", "java/io/FileInputStream"] {
         r.register(
             class,
@@ -951,13 +963,26 @@ pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
             native_input_stream_transfer_to,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// Register real-JDK `ZipOutputStream`'s private little-endian primitive
 /// writers. A ZIP64 central directory invokes these helpers millions of times;
 /// appending directly to a `ByteArrayOutputStream` avoids one interpreter call
 /// for every individual byte while retaining the generic stream fallback.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `java.util.zip.ZipOutputStream`'s entry bookkeeping is
+// pure Java; only the `Deflater` underneath it is native, and that is
+// registered elsewhere and states its own kind.
 pub fn register_p59_zip_output_primitives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let zo = "java/util/zip/ZipOutputStream";
     r.register(zo, "writeShort", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1018,6 +1043,7 @@ pub fn register_p59_zip_output_primitives(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;J)I",
         native_sb_file_data_block_read,
     );
+    r.set_category(__prev_cat);
 }
 
 static SB_FILE_DATA_CACHE: std::sync::OnceLock<StdMutex<ZoHashMap<u64, std::sync::Arc<Vec<u8>>>>> =
@@ -1732,9 +1758,11 @@ pub(crate) fn p58_gzip_in_read_bytes(
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let buf_len = ctx.array_length(buf) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > buf_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let (off, len) = (off as usize, len as usize);
@@ -1921,9 +1949,11 @@ pub(crate) fn p58_gzip_out_write_bytes(
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(src) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut bytes = vec![0u8; len as usize];
@@ -2576,9 +2606,11 @@ pub(crate) fn iis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(dst) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     if len == 0 {
@@ -2718,9 +2750,11 @@ pub(crate) fn dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let arr_len = ctx.array_length(src) as i64;
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut bytes = vec![0u8; len as usize];
@@ -3161,9 +3195,11 @@ fn copy_java_bytes(
         _ => (0, arr_len as i32),
     };
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     let mut buf = vec![0u8; len as usize];
@@ -3188,9 +3224,11 @@ fn output_target(
         _ => (0, arr_len as i32),
     };
     if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if off < 0 { off } else { off.wrapping_add(len) },
-        }
+        return Err(RuntimeError::aioobe_index_only(if off < 0 {
+            off
+        } else {
+            off.wrapping_add(len)
+        })
         .into());
     }
     Ok(Some((dst, off as usize, len as usize)))

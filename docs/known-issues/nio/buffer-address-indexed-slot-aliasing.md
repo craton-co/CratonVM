@@ -129,12 +129,105 @@ CharBuffer.wrap(chars).slice()
 where HotSpot returns a buffer with `address = 216, offset = 100`. Fixed by
 stamping `HeapCharBuffer` at both `wrap` sites.
 
-**Still open:** `alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", …)` and
-`…"java/nio/CharBuffer"…` appear at ~18 further sites (`servlet.rs`,
-`xnio_conduits.rs`, `phases_late/nio_file.rs`, `lib.rs`). Each is a stand-in for
-a specific internal flow rather than a general-purpose factory, so they are not
-swept here — but every one of them has the same exposure the moment real-JDK
-bytecode calls an unoverridden method on the result.
+**Was still open, now measured (2026-08-06):** `alloc_concurrent_synthetic(ctx,
+"java/nio/ByteBuffer", …)` and `…"java/nio/CharBuffer"…` appear at ~18 further
+sites (`servlet.rs`, `xnio_conduits.rs`, `phases_late/nio_file.rs`, `lib.rs`).
+The paragraph above said each "has the same exposure the moment real-JDK
+bytecode calls an unoverridden method on the result" and left it there.
+`probes/NioBufferStampProbe` asked the question directly, against a HotSpot
+control. The answer splits cleanly in two — see the next section.
+
+## The CharBuffer view half: three live defects, fixed 2026-08-06
+
+`ByteBuffer.asCharBuffer()` was the live one, and it was wrong three ways at
+once. `probes/NioBufferStampProbe`, `--real-jdk`, against HotSpot 25:
+
+```text
+HotSpot   asCharBuffer kind=ByteBufferAsCharBufferB  slice=…B dup=…B ro=…RB
+                       sub=…B put=ok str=32 bulk=ok
+before    asCharBuffer kind=CharBuffer               slice=throw-AbstractMethodError
+                       dup=throw-AbstractMethodError  ro=throw-AbstractMethodError
+                       sub=throw-AbstractMethodError  put=throw-AbstractMethodError
+                       str=throw-AbstractMethodError  bulk=throw-AbstractMethodError
+after     identical to HotSpot
+```
+
+1. **The abstract stamp.** Seven of the eight methods the probe calls threw
+   `AbstractMethodError`. `--dump-native-registry` says why: the abstract
+   `java/nio/CharBuffer` carries 32 registrations, and `slice`, `duplicate`,
+   `asReadOnlyBuffer`, `put(int,char)` and bulk `put(CharBuffer)` are not among
+   them. Adding a native per method is whack-a-mole; a concrete receiver gets
+   all of them from the JDK's own bodies.
+2. **It was a copy, not a view.** `s2_bb_as_char_buffer` transcoded the bytes
+   into a fresh `char[]`. So `bb.asCharBuffer().put('A')` left the backing
+   ByteBuffer at `0,0,0,0` where HotSpot writes `0,65,0,66`. **A lost write is
+   the worse of the two failures**, because nothing reports it — the
+   `AbstractMethodError` at least names itself.
+3. **`hasArray()` answered `true`** off that copy. A char view over a ByteBuffer
+   has no accessible array.
+
+The fix is one class name and one seeded field. `java/nio/ByteBufferAsCharBuffer{B,L}`
+*already had* a native surface here (`charAt`/`get`/`hasArray`/`order`/`toString`,
+reading through `bb`) — it was simply never what `asCharBuffer` returned. Two
+notes worth keeping:
+
+* **`class_id_by_name` is not an availability test.** The first attempt gated on
+  it and silently kept the copying path, because nothing loads
+  `ByteBufferAsCharBufferB` before the first `asCharBuffer` call. Drive the load
+  with `ensure_class_initialized` — and then *still* check
+  `is_class_synthetic_stub`, because that call fabricates a stub rather than
+  failing (`ensure-class-initialized-fabricates-instead-of-failing`). A stub
+  would trade `AbstractMethodError` for a buffer whose every method is a silent
+  no-op.
+* **`address` is the aliasing mechanism.** The JDK computes each element's byte
+  offset as `(i << 1) + address` and seeds `address` to the source's address plus
+  its position. `bbacb_read_underlying_bytes` was reading `bb.offset` instead,
+  which drops the source's position (`bb.position(4).asCharBuffer().get(0)`
+  decoded byte 0) and follows the source's position after the view is taken
+  rather than freezing it.
+
+The `subSequence` override on those two classes was **deleted** rather than
+fixed: it existed to add the `Objects.checkFromToIndex` bounds check, and the
+JDK's own body has that check by construction — now that the receiver is
+concrete, the override could only shadow it.
+
+## The ByteBuffer half: latent, and that is a measurement
+
+`ByteBuffer.allocate` / `wrap` still stamp the abstract `java/nio/ByteBuffer`.
+Every method the probe calls behaves **identically to HotSpot** — `slice`,
+`duplicate`, `asReadOnlyBuffer` (read-only *is* enforced: `put` throws
+`ReadOnlyBufferException` and `array()` throws), `compact`, `getInt`,
+`equals`/`compareTo`/`hashCode`, bulk `put(Buffer)`, `mismatch`,
+`alignedSlice`, `slice(int,int)`, `get(int,byte[])`, and
+`StandardCharsets.UTF_8.decode(bb)`. The only divergence is `getClass()`:
+
+```text
+HotSpot   allocate kind=HeapByteBuffer   wrapSlice kind=HeapByteBuffer arrayOffset=8 address=base+off
+CratonVM  allocate kind=ByteBuffer       wrapSlice kind=ByteBuffer     arrayOffset=8 address=base+off
+```
+
+That is not an accident — `register_essential_natives` says so out loud, and
+registers the S2 ByteBuffer surface in real-JDK mode precisely so those abstract
+methods have bodies. The exposure is real but conditional: it costs nothing
+until someone reaches a ByteBuffer method nobody has written a native for.
+
+**Not swept, deliberately.** Stamping `HeapByteBuffer` is the right end state,
+but it hands the whole ByteBuffer surface over to real JDK bodies at once, and
+`ByteBuffer` is reached by nearly everything. The CharBuffer half above is the
+template for doing it: build the concrete class, seed `address` honestly, delete
+the overrides that then only shadow. Anyone picking this up should start from
+`probes/NioBufferStampProbe` — it already prints the `kind=` line that will flip.
+
+## A missing native the probe found on the way
+
+`FileChannel.transferFrom` between two file channels raised
+`UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.transferFrom0` and copied
+nothing, while `transferTo` in the same direction transferred all 4096 bytes —
+`transferFrom0` simply had no registration. It now answers
+`IOStatus.UNSUPPORTED`, which is what HotSpot's own implementation returns where
+there is no kernel-side copy; `FileChannelImpl` falls back to
+`transferFromArbitraryChannel`, a ByteBuffer loop that already works here, and
+the probe reports `bytes=4096 identical=true` in both arms.
 
 ## The rule
 
