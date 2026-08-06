@@ -1,6 +1,53 @@
+# RESOLVED 2026-08-06: `isPrimitive()` was answering with another call site's boolean
+
+**Status: RESOLVED.** The 2026-08-05 regression recorded below is the
+recycled-`JitInvokeInfo` dispatch defect fixed by `383e7f5cf`, which landed
+*after* the full-suite run that sighting came from. Full evidence — the
+aliased-pair census, the pre-fix/post-fix A/B, and the disassembly — is in
+[`spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`](spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md).
+This page is kept for its tooling and its eliminations, both of which stay
+valid.
+
+**The one thing worth carrying forward.** This page's own "where to look next"
+ranked *"`Class.isPrimitive()` answering true for something that is not
+primitive"* **first**. That was correct. What it got wrong was the layer: it
+looked at the mirror's `primitive` slot, and the defect was in the dispatch
+that delivered the answer. `CRATONVM_DBG_SITE_ALIAS=1` on
+`DataCouchbaseReactiveRepositoriesAutoConfigurationTests` prints, among ~1000
+site keys, both of these:
+
+```
+key=... WAS org/springframework/core/annotation/AnnotationTypeMapping.getDistance()I
+        NOW java/lang/Class.isPrimitive()Z
+key=... WAS java/lang/Class.isAssignableFrom(Ljava/lang/Class;)Z
+        NOW java/lang/Class.isPrimitive()Z
+```
+
+A freed `JitInvokeInfo` address re-issued to the `isPrimitive()` site let it
+return `getDistance()`'s non-zero `int` as its boolean. So
+`resolvePrimitiveIfNecessary` asked `primitiveTypeToWrapperMap` for a class
+that is **not** primitive, and the map correctly missed — which is exactly the
+"one bad lookup, not a broken map" this page could never explain, and exactly
+why ~1030 instrumented hunt runs caught nothing: both detectors watched the
+map, and the map was innocent throughout.
+
+The two fixes below are still good on their own merits (the `IdentityHashMap`
+one is a genuine spec violation, provable without ever seeing this bug), but
+neither was the cause of the sighting.
+
+The original 2026-07-31 sighting is *consistent* with the same cause — the
+site-keyed memo family dates to `fc012ab1b`, 07-31 — but was not re-measured
+here and is not claimed as proven.
+
+Verified green on current `dev`: `DataCouchbaseReactiveRepositoriesAutoConfigurationTests`
+0 failures in 20 runs (4 lanes concurrent), against 1 in 24 on a `1078f6f05c`
+anchor built from the pre-fix tree.
+
+---
+
 # Rare: `@Bean` attribute resolution fails because a primitive return type is unmappable
 
-**Status: OPEN — REGRESSED 2026-08-05.**
+*(page as it stood while open)*
 
 ## Regression note (2026-08-05)
 

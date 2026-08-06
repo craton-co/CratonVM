@@ -4,36 +4,17 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: first baseline for 25-linux: four filed defects (PKCS12 setEntry, ConcurrentHashMap.newKeySet, JNI marshalling, agent transformer) plus L7 refusing five classes the corpus needs
+# note: PKCS12 setEntry fixed: JdkOnlyPlatformProbe security no longer diverges in either arm (p12=true)
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that
 # measured it — re-freeze afterwards to keep the ratchet tight.
 JdkOnlyBreadthProbe/strict/PROBE2
-JdkOnlyBreadthProbe/strict/SECTION-FAILED:regex
 JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
-JdkOnlyBreadthProbe/strict/SECTION-FAILED:textformat
-JdkOnlyBreadthProbe/strict/SECTION-FAILED:time
-JdkOnlyBreadthProbe/strict/regex
 JdkOnlyBreadthProbe/strict/serialization
-JdkOnlyBreadthProbe/strict/textformat
-JdkOnlyBreadthProbe/strict/time
-JdkOnlyCensusLoadProbe/strict/CENSUSLOAD
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:collections
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:concurrent
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:interfaces
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:net
-JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:text
-JdkOnlyCensusLoadProbe/strict/collections
-JdkOnlyCensusLoadProbe/strict/interfaces
-JdkOnlyCensusLoadProbe/strict/net
-JdkOnlyCensusLoadProbe/strict/text
 JdkOnlyPlatformProbe/real/agent
 JdkOnlyPlatformProbe/real/jni
-JdkOnlyPlatformProbe/real/security
 JdkOnlyPlatformProbe/real/vthreads
 JdkOnlyPlatformProbe/strict/agent
 JdkOnlyPlatformProbe/strict/jni
-JdkOnlyPlatformProbe/strict/process
-JdkOnlyPlatformProbe/strict/security
 JdkOnlyPlatformProbe/strict/vthreads
