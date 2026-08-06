@@ -75,7 +75,22 @@ pub(crate) struct MockNativeContext {
     /// Global roots handed out by `add_global_root`.
     global_roots: HashMap<usize, ObjectRef>,
     next_gref: usize,
+    /// When set, indexed slots 0..=4 ALIAS the real-JDK `java.nio.Buffer`
+    /// fields, exactly as they do on a loaded `Buffer` subclass:
+    /// `mark(0) position(1) limit(2) capacity(3) address(4)`.
+    ///
+    /// The mock normally keeps indexed and by-name fields in two independent
+    /// maps, which is the one thing that makes the nio `address` defect
+    /// invisible to a test: the bug IS that a synthetic indexed write lands on
+    /// a real by-name field. Without this, a test for it passes whether or not
+    /// the fix is present. Off by default — every other test relies on the two
+    /// maps staying independent.
+    buffer_field_aliasing: bool,
 }
+
+/// The real-JDK `java.nio.Buffer` field order, by declaration index.
+pub(crate) const BUFFER_ALIASED_FIELDS: [&str; 5] =
+    ["mark", "position", "limit", "capacity", "address"];
 
 impl MockNativeContext {
     pub(crate) fn new() -> Self {
@@ -97,7 +112,15 @@ impl MockNativeContext {
             stream_scripted: false,
             global_roots: HashMap::new(),
             next_gref: 1,
+            buffer_field_aliasing: false,
         }
+    }
+
+    /// Model a real-JDK `java.nio.Buffer` layout: indexed slots 0..=4 and the
+    /// by-name fields `mark`/`position`/`limit`/`capacity`/`address` become the
+    /// same storage. See [`MockNativeContext::buffer_field_aliasing`].
+    pub(crate) fn alias_nio_buffer_fields(&mut self) {
+        self.buffer_field_aliasing = true;
     }
 
     /// Make `invoke_virtual(_, "read", "([BII)I", ...)` behave like a real
@@ -566,6 +589,12 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
                 fields.resize(index + 1, Value::Int(0));
             }
             fields[index] = value;
+        }
+        if self.buffer_field_aliasing {
+            if let Some(name) = BUFFER_ALIASED_FIELDS.get(index) {
+                self.named_fields_mut()
+                    .insert((obj.as_ptr() as usize, (*name).to_string()), value);
+            }
         }
     }
     /// Allocate an object of `class`, tagged so `class_id_of_object` /

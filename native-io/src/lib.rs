@@ -68,6 +68,10 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
+// EINTR-transparent socket I/O — the shared retry primitive the blocking
+// socket and TLS paths funnel through. See the module docs for why
+// `SA_RESTART` does not cover the sockets CratonVM actually uses.
+pub mod eintr;
 pub mod nio_native;
 pub mod random_access_file;
 // T16.5: MulticastSocket overrides + shared helpers for async channels.
@@ -7066,9 +7070,36 @@ fn buf_set_limit(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
 }
 
 /// Write just `mark`, dual-targeted.
+///
+/// AUDIT 2026-08-05: index 4 on a REAL-JDK `java.nio.Buffer` is `address`, not
+/// `mark` — the hierarchy-wide order is `mark(0) position(1) limit(2)
+/// capacity(3) address(4)`. The other three indices line up with their by-name
+/// twins by luck; this one does not, so the synthetic-mode write silently
+/// stamped the mark value onto `address`.
+///
+/// That is not cosmetic. `Buffer.address` is what `ScopedMemoryAccess` /
+/// `Unsafe.copyMemory` read for every bulk `put(<same-kind>Buffer)`; with
+/// `address = -1` the offset falls below `arrayBaseOffset` and the copy throws
+/// `ArrayIndexOutOfBoundsException`. The CharBuffer half of this defect broke
+/// every source file javac read (`BaseFileManager.decode` grows a CharBuffer
+/// and copies the old one in) and was fixed separately; this is the same bug in
+/// the ByteBuffer / typed-buffer family, where EVERY mutator routes here —
+/// `position`, `limit`, `mark`, `reset`, `clear`, `flip`, `rewind`, `compact`,
+/// `duplicate`.
+///
+/// Save and restore rather than recompute: a heap buffer's address is
+/// `arrayBaseOffset + offset * scale` (so a slice's is NOT the bare base
+/// offset), and a DIRECT buffer's is a real native pointer that must never be
+/// synthesised. Preserving whatever the object already carries is correct for
+/// all three. Synthetic-mode objects have no `address` field, the read yields a
+/// non-`Long`, and nothing is restored.
 fn buf_set_mark(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
+    let saved_address = ctx.get_field_by_name(obj, "address");
     ctx.set_field(obj, BB_FIELD_MARK, Value::Int(v));
     ctx.set_field_by_name(obj, "mark", Value::Int(v));
+    if let Value::Long(_) = saved_address {
+        ctx.set_field_by_name(obj, "address", saved_address);
+    }
 }
 
 /// Read `position`, preferring real JDK slot when present.
@@ -13970,6 +14001,14 @@ fn alloc_typed_buffer(
     // Real JDK Heap*Buffer backing array is named `hb`
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    // A real `Heap*Buffer` sets `address = ARRAY_<T>_BASE_OFFSET + offset *
+    // scale`, and every primitive array's base offset is 16 here (matching
+    // `unsafe_array_read_bytes`'s `ABASE`). This buffer is freshly allocated
+    // with `offset = 0`, so 16 is the whole of it. `alloc_byte_buffer` already
+    // did this; the typed families (Short/Int/Long/Float/Double/Char) never
+    // did, which left `address` reading as the mark (-1) and made every bulk
+    // `put(<same-kind>Buffer)` throw AIOOBE out of `Unsafe.copyMemory`.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     obj
 }
 
@@ -15452,6 +15491,12 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    // Same as `alloc_byte_buffer`: this stand-in is heap-backed (`hb` is a real
+    // byte[]), so `Buffer.address` must be the array base offset, not the mark
+    // that the indexed slot-4 write would otherwise leave behind. The separate
+    // `MBB_FIELD_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
+    // NOT the JDK's `address` field.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     ctx.set_field(obj, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
     obj
 }
@@ -22796,5 +22841,118 @@ mod abs_path_tests {
         // The default delimiter never touches the LRU and always compiles.
         let r = cached_regex(r"\s+").unwrap();
         assert!(r.is_match("a b"));
+    }
+}
+
+// ===========================================================================
+// java.nio `Buffer.address` — the indexed-slot aliasing guard
+// ===========================================================================
+
+/// `BB_FIELD_MARK` is index 4, and index 4 on a real-JDK `java.nio.Buffer` is
+/// `address`, not `mark`. These tests pin the two halves of the fix: mutators
+/// must not disturb an address the object already carries, and every allocator
+/// that hands back a heap-backed buffer must give it one.
+#[cfg(test)]
+mod nio_buffer_address_tests {
+    use super::*;
+    use crate::test_support::MockNativeContext;
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+
+    #[test]
+    fn buf_set_mark_preserves_a_real_jdk_buffer_address() {
+        let mut ctx = MockNativeContext::new();
+        ctx.alias_nio_buffer_fields();
+        let buf = ctx.alloc_object_with_class(8, "java/nio/HeapCharBuffer");
+        // A SLICE: address is arrayBaseOffset + offset * scale, not the bare
+        // base offset, so a fix that rewrites a constant 16 would corrupt it.
+        ctx.set_field_by_name(buf, "address", Value::Long(116));
+
+        buf_set_mark(&mut ctx, buf, -1);
+
+        assert_eq!(
+            ctx.get_field_by_name(buf, "address"),
+            Value::Long(116),
+            "the mark write must not land on `address`"
+        );
+        assert_eq!(ctx.get_field_by_name(buf, "mark"), Value::Int(-1));
+        assert_eq!(
+            ctx.get_field(buf, BB_FIELD_MARK),
+            Value::Int(-1),
+            "the synthetic indexed slot still has to be written"
+        );
+    }
+
+    #[test]
+    fn buf_set_mark_leaves_a_synthetic_buffer_without_an_address() {
+        let mut ctx = MockNativeContext::new();
+        // Synthetic mode: no by-name `address` field exists at all. Nothing
+        // should be fabricated for it.
+        let buf = ctx.alloc_object(BB_NUM_FIELDS);
+
+        buf_set_mark(&mut ctx, buf, 7);
+
+        assert_eq!(ctx.get_field(buf, BB_FIELD_MARK), Value::Int(7));
+        assert_eq!(
+            ctx.get_field_by_name(buf, "address"),
+            Value::Object(None),
+            "no address field means no address write"
+        );
+    }
+
+    #[test]
+    fn buf_set_mark_survives_a_whole_mutator_sequence() {
+        let mut ctx = MockNativeContext::new();
+        ctx.alias_nio_buffer_fields();
+        let buf = ctx.alloc_object_with_class(8, "java/nio/HeapByteBuffer");
+        ctx.set_field_by_name(buf, "address", Value::Long(16));
+
+        // flip / clear / rewind / mark / reset all funnel through buf_set_mark;
+        // before the fix each one of them reset `address` to the mark value.
+        for v in [-1, 5, -1, 0, -1] {
+            buf_set_mark(&mut ctx, buf, v);
+            assert_eq!(
+                ctx.get_field_by_name(buf, "address"),
+                Value::Long(16),
+                "address survives mark={}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn allocators_give_every_heap_buffer_family_an_address() {
+        let mut ctx = MockNativeContext::new();
+        ctx.alias_nio_buffer_fields();
+
+        let bb = alloc_byte_buffer(&mut ctx, 32);
+        assert_eq!(ctx.get_field_by_name(bb, "address"), Value::Long(16));
+
+        // The typed families used to skip this entirely, which left `address`
+        // reading as the mark (-1) and made every bulk put throw AIOOBE.
+        for (cls, et) in [
+            ("java/nio/HeapCharBuffer", ArrayElementType::Char),
+            ("java/nio/HeapShortBuffer", ArrayElementType::Short),
+            ("java/nio/HeapIntBuffer", ArrayElementType::Int),
+            ("java/nio/HeapLongBuffer", ArrayElementType::Long),
+            ("java/nio/HeapFloatBuffer", ArrayElementType::Float),
+            ("java/nio/HeapDoubleBuffer", ArrayElementType::Double),
+        ] {
+            let b = alloc_typed_buffer(&mut ctx, cls, et, 16);
+            assert_eq!(
+                ctx.get_field_by_name(b, "address"),
+                Value::Long(16),
+                "{} must carry the array base offset",
+                cls
+            );
+            assert_ne!(
+                ctx.get_field_by_name(b, "address"),
+                Value::Long(-1),
+                "{} must not read back the mark",
+                cls
+            );
+        }
+
+        let mbb = alloc_mapped_byte_buffer(&mut ctx, 32);
+        assert_eq!(ctx.get_field_by_name(mbb, "address"), Value::Long(16));
     }
 }
