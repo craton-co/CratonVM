@@ -469,6 +469,33 @@ impl VmHeap {
         dispatch!(self, class_id_of(obj))
     }
 
+    /// [`Self::class_id_of`] for a caller that has **just** obtained `obj` from
+    /// [`Self::is_object_address`] and still holds it.
+    ///
+    /// The KINDOF-SENTINEL guard above is a full conservative header validation
+    /// — region containment, kind/element tags, header plausibility, and an
+    /// extent-fits-the-arena re-scan of the region table. It costs ~3 ns, which
+    /// is nothing against a corrupted read, and everything when it is the third
+    /// time the same address has been through it in one call.
+    ///
+    /// That is exactly what a compiled-code native call was doing:
+    /// `try_jit_site_cached_native_dispatch` validates the receiver, then calls
+    /// `class_id_of` (which validates it again), then `decode_dispatch_values`
+    /// validates it a third time — measured in
+    /// `jit::helpers::jit_native_dispatch_profile` at 3.2 ns for the validator
+    /// and 5.0 ns for `class_id_of`, on a ~100 ns call.
+    ///
+    /// # Contract
+    ///
+    /// The caller must hold an `ObjectRef` that `is_object_address` returned
+    /// `Some` for, on this heap, with no intervening safepoint. `ObjectRef`
+    /// alone is not enough: the codebase constructs them from raw JIT slots and
+    /// from JNI handles, and the sentinel above is the record of one arriving
+    /// unvalidated. Anything less certain must keep using `class_id_of`.
+    pub fn class_id_of_validated(&self, obj: ObjectRef) -> ClassId {
+        dispatch!(self, class_id_of(obj))
+    }
+
     /// NEW-1.5 conservative validity check for a *raw stack-spill address*.
     ///
     /// Used by JIT frame root scanning to filter spurious values: returns
