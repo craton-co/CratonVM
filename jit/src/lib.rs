@@ -7786,12 +7786,13 @@ fn record_jdk_only_ic_native_refusal() {
 #[inline]
 fn direct_native_helper(
     cell: &std::sync::atomic::AtomicUsize,
+    jdk_only: bool,
     class: &str,
     method: &str,
     descriptor: &str,
 ) -> usize {
     let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
-    if entry != 0 && jit_is_jdk_only() {
+    if entry != 0 && jdk_only {
         record_jdk_only_direct_native_refusal(class, method, descriptor);
         return 0;
     }
@@ -13126,6 +13127,11 @@ pub fn try_compile(
         cp_invokedynamic_descriptor_resolver,
         None,
         None,
+        // No VM in scope here. The latch is what this wrapper's callers (this
+        // crate's tests, and any VM site not yet threading a policy) have
+        // always read, and no test latches it, so they keep reading
+        // `Compatible`.
+        jit_is_jdk_only(),
     )
 }
 
@@ -13273,6 +13279,18 @@ pub fn try_compile_with_invokespecial_resolver(
     // answer — refuses the speculation; it never falls back to the other
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -13380,6 +13398,7 @@ pub fn try_compile_with_invokespecial_resolver(
         &mut backend_attempted,
         self_call_identity_stable,
         &admission,
+        jdk_only,
     );
 
     // Take once and use for all three sinks: the bail-list decision below, the
@@ -14000,6 +14019,18 @@ fn try_compile_inner(
     // backend call at the end of this function can require it. See
     // `x64::compile_with_param_slots`'s first parameter.
     admission: &compile_gate::CompileAdmission,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -15278,6 +15309,7 @@ fn try_compile_inner(
                             {
                                 let entry = direct_native_helper(
                                     &THREAD_CURRENT_THREAD_DIRECT_FN,
+                                    jdk_only,
                                     direct_class,
                                     &mn,
                                     &desc,
@@ -16809,6 +16841,7 @@ fn try_compile_inner(
                         // frames can observe.
                         let entry = direct_native_helper(
                             &STRING_LATIN1_LOWER_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16846,6 +16879,7 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &THREAD_CURRENT_THREAD_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16880,6 +16914,7 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &INTEGER_VALUE_OF_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -17136,6 +17171,7 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &INTEGER_INT_VALUE_DIRECT_FN,
+                        jdk_only,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17165,6 +17201,7 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
+                        jdk_only,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17221,6 +17258,7 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_PUT_DIRECT_FN,
+                                jdk_only,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -17235,6 +17273,7 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_GET_DIRECT_FN,
+                                jdk_only,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -18590,6 +18629,58 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Two VMs, two answers — the property JDK-ONLY-WAVE2 §2 was filed about.
+    ///
+    /// `direct_native_helper`'s policy input used to be the process-global
+    /// `JIT_COMPATIBILITY_MODE` latch, which only ever moved toward strict. A
+    /// `Compatible` VM sharing a process with a `JdkOnly` one therefore lost
+    /// the thin direct-call helpers: the strict VM latched, and every later
+    /// compilation in the process — whosever it was — got `0` back.
+    ///
+    /// This test could not have been written against that design. There was no
+    /// per-call policy to vary, and the module comment on
+    /// `set_jit_execution_policy` explicitly forbids latching from a unit test
+    /// in this crate precisely because it is irreversible and `mod tests`
+    /// shares one binary. Now the policy is an argument, so the two cases are
+    /// independent by construction and a test can simply ask for both.
+    #[test]
+    fn direct_native_helper_answers_per_vm_not_per_process() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // A registered helper address. `build_helpers` now publishes these
+        // unconditionally; whether they may be BOUND is the policy question
+        // below, and it is asked per compilation.
+        CELL.store(0xdead_beef, std::sync::atomic::Ordering::Relaxed);
+
+        // Strict refuses and records.
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper(&CELL, true, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0,
+            "a JdkOnly compilation must not bind a thin direct-call helper"
+        );
+        assert!(
+            jdk_only_direct_native_refusals() > before,
+            "the refusal must be counted, not silent"
+        );
+
+        // Compatible still binds — and critically, does so AFTER the strict
+        // call above. Under the latch this is exactly the assertion that
+        // failed, because the strict answer poisoned the process.
+        assert_eq!(
+            direct_native_helper(&CELL, false, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0xdead_beef,
+            "a Compatible compilation lost its helper because another VM was strict"
+        );
+
+        // And the unset sentinel is still the unset sentinel in both modes.
+        CELL.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            direct_native_helper(&CELL, false, "c", "m", "()V"),
+            0
+        );
+        assert_eq!(direct_native_helper(&CELL, true, "c", "m", "()V"), 0);
+    }
     /// Poll `cond` until it holds, for up to ~1s.
     ///
     /// Several globals these tests observe are *eventually* consistent, not

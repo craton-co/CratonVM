@@ -3621,6 +3621,10 @@ pub(super) fn try_jit_upgrade_with_gate(
                 } else {
                     None
                 },
+                    // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+                    // latch the JIT read for itself, so a `Compatible` VM sharing a
+                    // process with a `JdkOnly` one lost the thin direct-call helpers.
+                    crate::vm::dispatch_policy(shared).is_jdk_only(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -3779,6 +3783,10 @@ pub(super) fn try_jit_upgrade_with_gate(
         } else {
             None
         },
+            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+            // latch the JIT read for itself, so a `Compatible` VM sharing a
+            // process with a `JdkOnly` one lost the thin direct-call helpers.
+            crate::vm::dispatch_policy(shared).is_jdk_only(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -4955,6 +4963,10 @@ pub(super) fn try_jit_compile_callee_slow(
         } else {
             None
         },
+            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+            // latch the JIT read for itself, so a `Compatible` VM sharing a
+            // process with a `JdkOnly` one lost the thin direct-call helpers.
+            crate::vm::dispatch_policy(shared).is_jdk_only(),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
