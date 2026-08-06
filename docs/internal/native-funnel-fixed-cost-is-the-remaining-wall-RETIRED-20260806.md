@@ -279,6 +279,25 @@ test result: FAILED. 0 passed; 1 failed; 4053 filtered out
 Two independent branches, two pristine differentials, one pre-existing failure.
 See also `synthetic-jdk-vm-gate-red-on-dev-20260805.md`.
 
+### After merging `origin/dev` (59 commits, `83af58878`)
+
+Re-run on the merged tree, because a merge is its own experiment and "both halves
+passed alone" is not a result about the combination:
+
+| | |
+|---|---|
+| `cargo check --workspace` | rc=0 |
+| `cargo test --release -p cratonvm-vm --lib` | 2428 / 0 |
+| `cargo test --release -p cratonvm-gc --lib` | 977 / 0 |
+| `cargo test -p cratonvm-vm --lib --features synthetic-jdk` | 3949 / **2** |
+
+The count went from 1 to 2: `vm::tests::preferences_name_and_path` joined
+(`assertion failed: tss.contains("myNode")`, `vm.rs:54454`). It arrived with the
+59 commits, and both were checked rather than argued about — a pristine detached
+worktree at exactly `83af58878` fails **both**, 0 passed / 2 failed. So neither
+is this change and neither is an interaction with it; the gate is red on that dev
+tip for two reasons that predate this branch.
+
 ## The two inherited items were already closed
 
 The retired record's header claims to inherit
