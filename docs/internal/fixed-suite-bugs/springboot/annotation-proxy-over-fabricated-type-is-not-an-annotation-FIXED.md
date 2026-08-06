@@ -105,6 +105,17 @@ with the annotation in `org/jboss/…`, which is why `AcpGoneSolo` now uses
 | `AnnotationProxyIsAnnotationProbe` | `checked=9 bad=1` | **`checked=8 bad=0`** (identical to HotSpot) |
 | `annotation_class_element_null` e2e | FAILED | **ok** |
 | `cargo test -p cratonvm-native-builtins --lib` | — | 3292 passed, 0 failed |
+| `cargo test -p cratonvm-classloading --lib` | — | 765 passed, 0 failed |
+| `CacheAutoConfigurationTests` (59 tests, annotation-driven) | — | **PASS, 0 failed** |
+
+The Spring Boot class is the load-bearing regression check: the fix makes the VM
+*drop* annotations it used to surface, and Spring is entirely annotation-driven,
+so a guard that rejected real annotation types would collapse it.
+
+`vm --lib` reports one failure, `hot_files_have_no_production_panics`, which is
+already red on `dev` from `d37f29824` ("a defect switch so the stripped-live
+check can be shown going red") in `jit/src/x64/osr.rs` — a file this change does
+not touch.
 
 The mock sweep that found it, same classpath, `MockManyProbe` over 1901 classes:
 
