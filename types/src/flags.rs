@@ -1150,6 +1150,16 @@ pub struct IoFlags {
     pub dbg_sc_read: bool,
     /// `CRATONVM_DBG_SC_WRITE`
     pub dbg_sc_write: bool,
+    /// `CRATONVM_DBG_EINTR_INJECT` — synthesise an `EINTR` on every *n*-th
+    /// socket operation that passes through `cratonvm_native_io::eintr`.
+    /// Test-only; the defect it reproduces is documented on that module.
+    /// [`parse::u64_positive`].
+    pub dbg_eintr_inject: Option<u64>,
+    /// `CRATONVM_DBG_EINTR_NO_RETRY` — do *not* absorb `EINTR` in
+    /// `cratonvm_native_io::eintr`, i.e. behave as the code did before that
+    /// module existed. Test-only, and the other half of the A/B above.
+    /// [`parse::non_empty_non_zero_non_false`].
+    pub dbg_eintr_no_retry: bool,
 }
 
 impl IoFlags {
@@ -1183,6 +1193,11 @@ impl IoFlags {
             dbg_sc_close: present(src, "CRATONVM_DBG_SC_CLOSE"),
             dbg_sc_read: present(src, "CRATONVM_DBG_SC_READ"),
             dbg_sc_write: present(src, "CRATONVM_DBG_SC_WRITE"),
+            dbg_eintr_inject: u64_positive(src, "CRATONVM_DBG_EINTR_INJECT"),
+            dbg_eintr_no_retry: non_empty_non_zero_non_false(
+                src,
+                "CRATONVM_DBG_EINTR_NO_RETRY",
+            ),
         }
     }
 }

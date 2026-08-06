@@ -68,6 +68,10 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
+// EINTR-transparent socket I/O — the shared retry primitive the blocking
+// socket and TLS paths funnel through. See the module docs for why
+// `SA_RESTART` does not cover the sockets CratonVM actually uses.
+pub mod eintr;
 pub mod nio_native;
 pub mod random_access_file;
 // T16.5: MulticastSocket overrides + shared helpers for async channels.

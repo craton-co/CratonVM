@@ -45,6 +45,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
+use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
+
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // We read HPACK static-table indices and the RFC 7541 Huffman decoder from
@@ -355,16 +357,21 @@ fn open_connection(
             if Instant::now() > deadline {
                 return Err("TLS handshake timed out".into());
             }
+            // `EintrIo`: the socket carries `SO_RCVTIMEO`/`SO_SNDTIMEO` (set
+            // just above), which Linux excludes from `SA_RESTART`, so a
+            // CratonVM cross-thread JIT root-scan `SIGUSR2` landing on a parked
+            // handshake used to escape as `handshake read: Interrupted system
+            // call`. See `cratonvm_native_io::eintr`.
             if stream.conn.wants_write() {
                 stream
                     .conn
-                    .write_tls(&mut stream.sock)
+                    .write_tls(&mut EintrIo::new(&mut stream.sock))
                     .map_err(|e| format!("handshake write: {e}"))?;
             }
             if stream.conn.wants_read() {
                 stream
                     .conn
-                    .read_tls(&mut stream.sock)
+                    .read_tls(&mut EintrIo::new(&mut stream.sock))
                     .map_err(|e| format!("handshake read: {e}"))?;
                 stream
                     .conn
@@ -740,7 +747,7 @@ fn http2_request(
     stream
         .write_all(&build_h2_settings_frame())
         .map_err(|e| format!("h2 settings write: {e}"))?;
-    stream.flush().map_err(|e| format!("h2 flush: {e}"))?;
+    retry_eintr(|| stream.flush()).map_err(|e| format!("h2 flush: {e}"))?;
 
     // 2. Build HPACK header block.
     let mut hpack: Vec<u8> = Vec::with_capacity(64);
@@ -807,7 +814,7 @@ fn http2_request(
             .write_all(&data)
             .map_err(|e| format!("h2 DATA write: {e}"))?;
     }
-    stream.flush().map_err(|e| format!("h2 flush: {e}"))?;
+    retry_eintr(|| stream.flush()).map_err(|e| format!("h2 flush: {e}"))?;
 
     // 4. Read frames until we get HEADERS+DATA(END_STREAM) on stream 1.
     let mut header_block: Vec<u8> = Vec::new();
@@ -1165,14 +1172,14 @@ pub(crate) fn perform_request(
                 let req =
                     build_http1_request(&current_method, &parsed, &current_headers, &current_body);
                 s.write_all(&req).map_err(|e| format!("write: {e}"))?;
-                s.flush().map_err(|e| format!("flush: {e}"))?;
+                retry_eintr(|| s.flush()).map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(s.as_mut())
             }
             (ConnKind::Plain(t), _) => {
                 let req =
                     build_http1_request(&current_method, &parsed, &current_headers, &current_body);
                 t.write_all(&req).map_err(|e| format!("write: {e}"))?;
-                t.flush().map_err(|e| format!("flush: {e}"))?;
+                retry_eintr(|| t.flush()).map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(t)
             }
         }?;
