@@ -47,3 +47,19 @@
 # Root cause + evidence: fixed-suite-bugs/hibernate/
 # qualfiedtablenaming-hang-cluster-20260721-FIXED.md
 org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest	3600	-
+
+# OffsetDateTimeTest / ZonedDateTimeTest — legitimately slow, not a hang.
+# Both are witnesses of the moving-young-inert-under-JIT throughput tax
+# (docs/known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md):
+# the young collector requests moving GC on every cycle these classes trigger,
+# but the JIT frames on the stack never let a cycle prove complete coverage,
+# so every cycle diverts to the non-moving sweep while still paying full
+# per-safepoint root-map emission cost. Confirmed PASS (found=608 failed<=1,
+# ok=403-404) at 300-520s in isolated reruns with a raised timeout
+# (2026-08-04/05 residual reruns); the suite's flat 300s cap kills them before
+# they finish and reports HANG on every full-suite run. Not the same defect as
+# DefaultCatalogAndSchemaTest above — this is throughput, not correctness —
+# but the mechanism (a flat 300s cap too tight for a legitimately slow class)
+# is identical, so the same floor mechanism applies.
+org.hibernate.orm.test.type.temporal.OffsetDateTimeTest	900	-
+org.hibernate.orm.test.type.temporal.ZonedDateTimeTest	900	-

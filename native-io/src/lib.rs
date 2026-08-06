@@ -7380,6 +7380,47 @@ fn tb_index_in_bounds(idx: i32, bound: i32) -> bool {
     idx >= 0 && idx < bound
 }
 
+/// What an out-of-range ABSOLUTE buffer accessor raises.
+///
+/// `java.nio.Buffer.checkIndex` hands `Preconditions` a formatter of its own
+/// whose whole body is `new IndexOutOfBoundsException()`, so the class is
+/// `IndexOutOfBoundsException` and `getMessage()` is null — verified against
+/// HotSpot in `probes/PreconditionsFormatterProbe`.
+///
+/// These sites used to raise `IllegalArgumentException` carrying the *string*
+/// `"IndexOutOfBoundsException"`, a stand-in from when `RuntimeError` had no
+/// way to express the real class. `IllegalArgumentException` is not in the
+/// `IndexOutOfBoundsException` hierarchy at all, so `catch
+/// (IndexOutOfBoundsException)` around a buffer access did not see it and the
+/// throw escaped as an unrelated failure.
+fn buffer_index_out_of_bounds() -> MethodCallFailed {
+    RuntimeError::ioobe_no_message().into()
+}
+
+/// `Objects.checkFromIndexSize(from, size, length)` for the buffer natives
+/// that shadow the bytecode which would have called it — `slice(index, length)`
+/// and the array-side check of the bulk accessors.
+///
+/// Unlike [`buffer_index_out_of_bounds`], these DO carry the
+/// `Preconditions.outOfBoundsMessage` text: their real callers reach
+/// `Preconditions` through `Objects`, whose `null` formatter puts that text on
+/// the exception.
+fn buffer_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), MethodCallFailed> {
+    let bad =
+        from < 0 || size < 0 || length < 0 || i64::from(from) + i64::from(size) > i64::from(length);
+    if !bad {
+        return Ok(());
+    }
+    Err(RuntimeError::ioobe(
+        cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+            i64::from(from),
+            i64::from(size),
+            i64::from(length),
+        ),
+    )
+    .into())
+}
+
 fn register_nio_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8139,10 +8180,10 @@ fn native_bb_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let pos = view.pos;
     let lim = view.lim;
     if pos >= lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferUnderflowException".to_string(),
-        }
-        .into());
+        // `BufferUnderflowException` is a real `RuntimeError` variant; an
+        // `IllegalStateException` carrying its *name* is not catchable as what
+        // the relative `get` documents.
+        return Err(RuntimeError::BufferUnderflowException.into());
     }
     let byte = Value::Int(bb_read_byte(ctx, view, pos as usize)? as i8 as i32);
     buf_set_position(ctx, this, pos + 1);
@@ -8161,10 +8202,7 @@ fn native_bb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let view = bb_storage_view(ctx, this)?;
     let cap = view.cap;
     if index < 0 || index >= cap {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     let byte = Value::Int(bb_read_byte(ctx, view, index as usize)? as i8 as i32);
     Ok(Some(byte))
@@ -8220,10 +8258,9 @@ fn native_bb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let pos = view.pos;
     let lim = view.lim;
     if pos >= lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        // Same shape as the underflow sites: raise the documented class, not
+        // an `IllegalStateException` naming it.
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     bb_write_byte(ctx, view, pos as usize, byte.as_int().unwrap_or(0) as u8)?;
     buf_set_position(ctx, this, pos + 1);
@@ -8243,10 +8280,7 @@ fn native_bb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let view = bb_storage_view(ctx, this)?;
     let cap = view.cap;
     if index < 0 || index >= cap {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     bb_write_byte(ctx, view, index as usize, byte.as_int().unwrap_or(0) as u8)?;
     Ok(Some(Value::Object(Some(this))))
@@ -8303,6 +8337,13 @@ fn native_bb_put_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
+    // Specified: `IllegalArgumentException` when the source is this buffer.
+    if src == this {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "The source buffer is this buffer".to_string(),
+        }
+        .into());
+    }
     let src_view = bb_storage_view(ctx, src)?;
     let src_pos = src_view.pos;
     let src_lim = src_view.lim;
@@ -8312,10 +8353,10 @@ fn native_bb_put_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if src_remaining > remaining {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        // `BufferOverflowException` is a real `RuntimeError` variant; raising
+        // an `IllegalStateException` carrying its *name* — as this did — is
+        // not catchable as what `ByteBuffer.put` documents.
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     for i in 0..src_remaining {
         let v = bb_read_byte(ctx, src_view, src_pos as usize + i)?;
@@ -8337,10 +8378,10 @@ fn native_bb_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let pos = view.pos;
     let lim = view.lim;
     if pos + 4 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferUnderflowException".to_string(),
-        }
-        .into());
+        // `BufferUnderflowException` is a real `RuntimeError` variant; an
+        // `IllegalStateException` carrying its *name* is not catchable as what
+        // the relative `get` documents.
+        return Err(RuntimeError::BufferUnderflowException.into());
     }
     let mut bytes = [0u8; 4];
     bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
@@ -8360,10 +8401,7 @@ fn native_bb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let view = bb_storage_view(ctx, this)?;
     let cap = view.cap;
     if !abs_access_in_bounds(index, 4, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     let mut bytes = [0u8; 4];
     bb_read_bytes(ctx, view, index as usize, &mut bytes)?;
@@ -8383,10 +8421,9 @@ fn native_bb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let pos = view.pos;
     let lim = view.lim;
     if pos + 4 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        // Same shape as the underflow sites: raise the documented class, not
+        // an `IllegalStateException` naming it.
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     let bytes = val.to_be_bytes();
     bb_write_bytes(ctx, view, pos as usize, &bytes)?;
@@ -8410,10 +8447,7 @@ fn native_bb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let view = bb_storage_view(ctx, this)?;
     let cap = view.cap;
     if !abs_access_in_bounds(index, 4, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     let bytes = val.to_be_bytes();
     bb_write_bytes(ctx, view, index as usize, &bytes)?;
@@ -8429,10 +8463,10 @@ fn native_bb_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let pos = view.pos;
     let lim = view.lim;
     if pos + 8 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferUnderflowException".to_string(),
-        }
-        .into());
+        // `BufferUnderflowException` is a real `RuntimeError` variant; an
+        // `IllegalStateException` carrying its *name* is not catchable as what
+        // the relative `get` documents.
+        return Err(RuntimeError::BufferUnderflowException.into());
     }
     let mut bytes = [0u8; 8];
     bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
@@ -8453,10 +8487,9 @@ fn native_bb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let pos = view.pos;
     let lim = view.lim;
     if pos + 8 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        // Same shape as the underflow sites: raise the documented class, not
+        // an `IllegalStateException` naming it.
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     let bytes = val.to_be_bytes();
     bb_write_bytes(ctx, view, pos as usize, &bytes)?;
@@ -8473,10 +8506,10 @@ fn native_bb_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pos = view.pos;
     let lim = view.lim;
     if pos + 2 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferUnderflowException".to_string(),
-        }
-        .into());
+        // `BufferUnderflowException` is a real `RuntimeError` variant; an
+        // `IllegalStateException` carrying its *name* is not catchable as what
+        // the relative `get` documents.
+        return Err(RuntimeError::BufferUnderflowException.into());
     }
     let mut bytes = [0u8; 2];
     bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
@@ -8497,10 +8530,9 @@ fn native_bb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let pos = view.pos;
     let lim = view.lim;
     if pos + 2 > lim {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        // Same shape as the underflow sites: raise the documented class, not
+        // an `IllegalStateException` naming it.
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     let bytes = val.to_be_bytes();
     bb_write_bytes(ctx, view, pos as usize, &bytes)?;
@@ -14044,12 +14076,7 @@ macro_rules! tb_abstract_view_fns {
                 _ => 0,
             };
             let (arr, _, _, cap) = bb_state(ctx, this)?;
-            if index < 0 || length < 0 || index.checked_add(length).map_or(true, |e| e > cap) {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "IndexOutOfBoundsException".to_string(),
-                }
-                .into());
-            }
+            buffer_check_from_index_size(index, length, cap)?;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, length as usize);
             let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
             for i in 0..length as usize {
@@ -14266,10 +14293,7 @@ fn native_cb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14306,10 +14330,7 @@ fn native_cb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, Value::Int(ch));
     Ok(Some(Value::Object(Some(this))))
@@ -14468,10 +14489,7 @@ fn native_tb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14502,10 +14520,7 @@ fn native_tb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
@@ -14561,10 +14576,7 @@ fn native_tb_get_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14595,10 +14607,7 @@ fn native_tb_put_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let val = args.get(2).cloned().unwrap_or(Value::Long(0));
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
@@ -14654,10 +14663,7 @@ fn native_tb_get_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14688,10 +14694,7 @@ fn native_tb_put_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let val = args.get(2).cloned().unwrap_or(Value::Float(0.0));
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
@@ -14747,10 +14750,7 @@ fn native_tb_get_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14781,10 +14781,7 @@ fn native_tb_put_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let val = args.get(2).cloned().unwrap_or(Value::Double(0.0));
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
@@ -14840,10 +14837,7 @@ fn native_tb_get_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
@@ -14874,10 +14868,7 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
     let (arr, _, _, cap) = bb_state(ctx, this)?;
     if !tb_index_in_bounds(idx, cap) {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "IndexOutOfBoundsException".to_string(),
-        }
-        .into());
+        return Err(buffer_index_out_of_bounds());
     }
     ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))

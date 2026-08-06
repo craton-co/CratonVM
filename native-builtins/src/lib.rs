@@ -4110,6 +4110,9 @@ pub mod lang_misc;
 pub mod lang_system;
 pub mod phases_early;
 pub mod phases_late;
+/// `jdk.internal.util.Preconditions` — bounds checks that honour the exception
+/// formatter their caller passed, rather than throwing one class for everyone.
+pub mod preconditions;
 pub mod stamped_lock;
 pub mod tzdb;
 pub mod uncaught_handlers;
@@ -11170,174 +11173,15 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- jdk/internal/util/Preconditions overrides ---
-    // The only state `Preconditions.<clinit>` creates is the set of
-    // `BiFunction` exception formatters, built with invokedynamic +
-    // LambdaMetafactory. EVERY method that reads them
-    // (checkIndex/checkFromToIndex/checkFromIndexSize, both the plain and the
-    // BiFunction-taking overloads) is natively implemented immediately below
-    // and formats its own exception, so the statics are never observed. That
-    // matters because this class is initialized from `String.charAt` at the
-    // very bottom of bootstrap — before `java.lang.invoke` is usable — so
-    // running the real <clinit> there would be a bootstrap-ordering hazard for
-    // no behavioural gain. Suppressing it is therefore spec-neutral here.
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "<clinit>",
-        "()V",
-        native_noop,
-    );
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "checkIndex",
-        "(II)I",
-        |_ctx, args| {
-            let index = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let length = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            if index < 0 || index >= length {
-                // `Preconditions.outOfBounds` with a null formatter throws the
-                // SUPERCLASS, `IndexOutOfBoundsException` -- never
-                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
-                // wrong in the direction that breaks a `catch`. The message is
-                // `checkIndex`'s, verbatim.
-                //
-                // The `BiFunction` formatter is still not invoked here; the
-                // String-domain callers are intercepted upstream by the three
-                // `java/lang/String.check*` natives. See
-                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
-                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
-                    "Index {index} out of bounds for length {length}"
-                ))
-                .into())
-            } else {
-                Ok(Some(Value::Int(index)))
-            }
-        },
-    );
-    // checkIndex with 3 args (index, length, oobef) — JDK 25 variant
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "checkIndex",
-        "(IILjava/util/function/BiFunction;)I",
-        |_ctx, args| {
-            let index = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let length = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            if index < 0 || index >= length {
-                // `Preconditions.outOfBounds` with a null formatter throws the
-                // SUPERCLASS, `IndexOutOfBoundsException` -- never
-                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
-                // wrong in the direction that breaks a `catch`. The message is
-                // `checkIndex`'s, verbatim.
-                //
-                // The `BiFunction` formatter is still not invoked here; the
-                // String-domain callers are intercepted upstream by the three
-                // `java/lang/String.check*` natives. See
-                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
-                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
-                    "Index {index} out of bounds for length {length}"
-                ))
-                .into())
-            } else {
-                Ok(Some(Value::Int(index)))
-            }
-        },
-    );
-    // checkFromToIndex — used by substring, etc.
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "checkFromToIndex",
-        "(IIILjava/util/function/BiFunction;)I",
-        |_ctx, args| {
-            let from = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let to = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let length = match args.get(2) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            if from < 0 || from > to || to > length {
-                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
-                    "Range [{from}, {to}) out of bounds for length {length}"
-                ))
-                .into())
-            } else {
-                Ok(Some(Value::Int(from)))
-            }
-        },
-    );
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "checkFromToIndex",
-        "(III)I",
-        |_ctx, args| {
-            let from = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let to = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let length = match args.get(2) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            if from < 0 || from > to || to > length {
-                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
-                    "Range [{from}, {to}) out of bounds for length {length}"
-                ))
-                .into())
-            } else {
-                Ok(Some(Value::Int(from)))
-            }
-        },
-    );
-    // checkFromIndexSize — used by array operations
-    registry.register(
-        "jdk/internal/util/Preconditions",
-        "checkFromIndexSize",
-        "(IIILjava/util/function/BiFunction;)I",
-        |_ctx, args| {
-            let from = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let size = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let length = match args.get(2) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            // Overflow-safe: `from + size` can wrap for large arguments, which
-            // is why the JDK's own message prints the addition unevaluated.
-            if from < 0 || size < 0 || (from as i64 + size as i64) > length as i64 {
-                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
-                    "Range [{from}, {from} + {size}) out of bounds for length {length}"
-                ))
-                .into())
-            } else {
-                Ok(Some(Value::Int(from)))
-            }
-        },
-    );
+    // These honour the `BiFunction` exception formatter every four-argument
+    // overload takes, which is the whole reason those overloads exist:
+    // `String` passes `SIOOBE_FORMATTER` and is entitled to a
+    // `StringIndexOutOfBoundsException`, `Objects.check*` passes `null` and is
+    // entitled to a plain `IndexOutOfBoundsException`. Throwing
+    // `ArrayIndexOutOfBoundsException` for both — as this block used to —
+    // breaks `catch` in two different directions. `preconditions.rs` has the
+    // full contract, including why it must NOT suppress `<clinit>`.
+    preconditions::register(registry);
 
     // --- jdk/internal/util/ByteArray — big-endian byte-array accessors ---
     // The real JDK uses VarHandle with byteArrayViewVarHandle which is
@@ -32446,6 +32290,22 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             cb_set_pos(ctx, this, pos + 1);
             Ok(Some(Value::Object(Some(this))))
         });
+        /// What `CharBuffer.charAt(int)` raises out of range.
+        ///
+        /// `CharBuffer.charAt` is `get(position() + index)`, so it lands in
+        /// `Buffer.checkIndex`, whose formatter builds an
+        /// `IndexOutOfBoundsException` with **no** detail message. These
+        /// natives used to raise `IllegalArgumentException("charAt index: N")`
+        /// — not a subclass of what the caller catches, not even in the same
+        /// hierarchy, so `catch (IndexOutOfBoundsException)` around a
+        /// `CharSequence` walk missed it entirely and the exception escaped as
+        /// an unrelated failure. See
+        /// `native-builtins/src/preconditions.rs` for the formatter contract
+        /// and `probes/PreconditionsFormatterProbe` for the HotSpot rows.
+        fn char_buffer_index_out_of_bounds() -> RuntimeError {
+            RuntimeError::ioobe_no_message()
+        }
+
         // ByteBufferAsCharBuffer{B,L} — the JDK's view-buffer class
         // created by `HeapByteBuffer.asCharBuffer()`. Unlike our
         // synthetic CharBuffer (slot 0 = char[] / `hb` set), the JDK
@@ -32516,9 +32376,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             )?;
             let real = pos + idx;
             if idx < 0 || real >= lim {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("charAt index: {idx}"),
-                });
+                return Err(char_buffer_index_out_of_bounds());
             }
             let byte_idx = (bb_off + 2 * real) as usize;
             let hi = ctx
@@ -32723,17 +32581,11 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             if let Some((chars, pos, lim, off)) = string_cb_state(ctx, this) {
                 let real = pos + idx;
                 if idx < 0 || real >= lim {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("charAt index: {idx}"),
-                    }
-                    .into());
+                    return Err(char_buffer_index_out_of_bounds().into());
                 }
                 let str_idx = real + off;
                 if str_idx < 0 || str_idx as usize >= chars.len() {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("charAt index: {idx}"),
-                    }
-                    .into());
+                    return Err(char_buffer_index_out_of_bounds().into());
                 }
                 return Ok(Some(Value::Int(chars[str_idx as usize] as i32)));
             }
@@ -32748,10 +32600,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             };
             let real = pos + idx;
             if idx < 0 || real >= lim {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("charAt index: {idx}"),
-                }
-                .into());
+                return Err(char_buffer_index_out_of_bounds().into());
             }
             Ok(Some(ctx.get_array_element(arr, (real + off) as usize)))
         });
@@ -37048,7 +36897,7 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         // getMessage/getLocalizedMessage/toString across every class in these
         // two lists; it and `NullPointerException` were the only two left after
         // PatternSyntaxException. See
-        // `docs/internal/a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
+        // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",

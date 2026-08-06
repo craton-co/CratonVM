@@ -638,23 +638,55 @@ fn bits_reserve_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Err(first_failure) = try_reserve(size) else {
         return Ok(None);
     };
+    if dm_dbg_enabled() {
+        eprintln!(
+            "[dm] reserveMemory REFUSED size={} reserved={} max={} thread={:?}",
+            size,
+            bits().reserved.load(Ordering::Acquire),
+            bits().max.load(Ordering::Relaxed),
+            std::thread::current().id()
+        );
+    }
     // Reclaim-and-retry. Each round forces a collection — which runs reference
     // processing and, through it, the `jdk.internal.ref.Cleaner` every
     // `DirectByteBuffer` registers — and then re-attempts the reservation.
     // Bounded so a genuinely exhausted cap still surfaces the OOM promptly
     // rather than spinning; the JDK bounds its own retry the same way.
     const RECLAIM_ROUNDS: u32 = 3;
-    for _ in 0..RECLAIM_ROUNDS {
+    for round in 0..RECLAIM_ROUNDS {
         let before = bits().reserved.load(Ordering::Acquire);
         ctx.force_gc();
+        let after = bits().reserved.load(Ordering::Acquire);
+        if dm_dbg_enabled() {
+            eprintln!(
+                "[dm] reserveMemory round={} before={} after={} freed={}",
+                round,
+                before,
+                after,
+                before as i64 - after as i64
+            );
+        }
         if try_reserve(size).is_ok() {
+            if dm_dbg_enabled() {
+                eprintln!("[dm] reserveMemory GRANTED after round={}", round);
+            }
             return Ok(None);
         }
         // No progress at all from a full collection means nothing is
         // reclaimable; further rounds would only add latency to the OOM.
-        if bits().reserved.load(Ordering::Acquire) >= before {
+        if after >= before {
+            if dm_dbg_enabled() {
+                eprintln!("[dm] reserveMemory no progress, breaking at round={}", round);
+            }
             break;
         }
+    }
+    if dm_dbg_enabled() {
+        eprintln!(
+            "[dm] reserveMemory GIVING UP size={} reserved={}",
+            size,
+            bits().reserved.load(Ordering::Acquire)
+        );
     }
     Err(first_failure)
 }
@@ -2125,4 +2157,11 @@ mod tests {
             "pooled entry must record canonical alloc size, not logical request"
         );
     }
+}
+
+/// DBG (CRATONVM_DBG_DM) -- see `gc_and_alloc::dm_dbg_enabled`. Cached gate.
+fn dm_dbg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DM").is_some())
 }

@@ -1864,7 +1864,25 @@ pub fn make_iterator_from_array(
     // through their pins. Covered by
     // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
     let array_pin = ctx.pin_native_root(snapshot_array);
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
+    // Fallible since 2026-08-05: this was the LAST infallible `HashMap$KeyItr`
+    // fabrication, and while it stood the refusal at the other three sites was
+    // order-dependent rather than a policy. `probes/StrictIterPrimitivesProbe`
+    // caught it under `--jdk-only`: `Arrays.asList(a).iterator()` reaches this
+    // helper, fabricates the class, and every LATER `try_alloc_synthetic` for
+    // the same name then finds it and succeeds — so
+    // `linkedhashset.iterator()` passed in a probe that had called
+    // `Arrays.asList` first and threw `NoClassDefFoundError` in one that had
+    // not. Route the refusal here too, so no snapshot iterator anywhere wears
+    // a fabricated class name in strict mode.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
+            let real = real_snapshot_iterator(ctx, snapshot_array, size);
+            ctx.unpin_native_roots(array_pin);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
@@ -1876,6 +1894,84 @@ pub fn make_iterator_from_array(
     let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.unpin_native_roots(array_pin);
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// The `--jdk-only` stand-in for a snapshot iterator, built out of real JDK
+/// classes only.
+///
+/// Every snapshot iterator this crate hands back wears the class name
+/// `java.util.HashMap$KeyItr` or `java.util.TreeSet$Itr`. No JDK declares
+/// either — the real ones are `HashMap$KeyIterator` and `TreeMap$KeyIterator`
+/// — so under `--jdk-only` the fabrication is refused and the iteration dies
+/// with `NoClassDefFoundError` before it starts. That was six of the seven
+/// strict-mode divergences left in `probes/JdkOnlyCollectionViewProbe`:
+/// `Collections.unmodifiable{Set,Map,SortedSet,NavigableSet}`, `Map.of` and
+/// `Map.copyOf` all reach a set/entry-set iterator.
+///
+/// The snapshot itself needs nothing fabricated: it is an `Object[]`, and the
+/// JDK already ships the fixed-size list for exactly that shape. Wrapping it in
+/// a real `Arrays$ArrayList` and asking THAT for its iterator yields a real
+/// `java.util.Arrays$ArrayItr` running real bytecode — same elements, same
+/// order, and a `getClass()` that finally tells the truth.
+///
+/// `invoke_virtual_bytecode_only`, not `invoke_virtual`: this crate registers a
+/// native over `Arrays$ArrayList.iterator` that routes straight back into
+/// [`make_iterator_from_array`], i.e. back to the fabricated class this
+/// function exists to avoid.
+///
+/// One behaviour genuinely differs, and it is loud rather than silent:
+/// `remove()` on the fabricated iterator writes through to the backing
+/// collection (`native_map_key_itr_remove` / `native_ts_itr_remove`), while a
+/// fixed-size list's iterator raises `UnsupportedOperationException` from real
+/// JDK bytecode. On the strict path the alternative is not a working
+/// `remove()` — it is an iteration that never reaches `next()`.
+fn real_snapshot_iterator(
+    ctx: &mut dyn NativeContext,
+    elems: ObjectRef,
+    count: usize,
+) -> MethodCallResult {
+    // `Arrays$ArrayList` derives `size()` from `a.length`, so the array it is
+    // handed has to be exactly the logical length. Callers over-allocate:
+    // `native_ts_iterator` snapshots into `size.max(1)` slots, which would
+    // otherwise report an empty TreeSet as a one-element list of `null`.
+    let arr = if ctx.array_length(elems) == count {
+        elems
+    } else {
+        let (elems, exact) = rooted_across1(ctx, elems, |ctx| alloc_ref_array(ctx, count));
+        // Neither accessor allocates, so no GC point separates the read from
+        // the store and both refs stay live for the whole copy.
+        for i in 0..count {
+            let v = ctx.get_array_element(elems, i);
+            ctx.set_array_element(exact, i, v);
+        }
+        exact
+    };
+    let arr_pin = ctx.pin_native_root(arr);
+    let list = ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(arr))],
+    );
+    ctx.unpin_native_roots(arr_pin);
+    match list? {
+        Some(Value::Object(Some(list))) => {
+            ctx.invoke_virtual_bytecode_only(list, "iterator", "()Ljava/util/Iterator;", &[])
+        }
+        // No real `Arrays$ArrayList` to wrap it in. Nothing is left to fall
+        // back TO — returning the fabricated shape here would defeat the whole
+        // point — so surface a refusal naming the class that is actually
+        // missing, rather than the synthetic one the caller asked for.
+        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+            ctx,
+            cratonvm_native_api::ClassIdentityError::Refused {
+                name: "java/util/Arrays$ArrayList".to_string(),
+                reason: "--jdk-only: a snapshot iterator needs the real \
+                         fixed-size list to stand in for the refused \
+                         `java.util.HashMap$KeyItr`, and this image has none"
+                    .to_string(),
+            },
+        )),
+    }
 }
 
 fn native_unsorted_set_comparator(
@@ -12318,11 +12414,16 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // of the real bytecode. Refuse there, naming the class.
     // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
     // `unpin_native_roots` below would strand it and everything pinned above it.
+    // A refusal is not the end of the road: `real_snapshot_iterator` hands back
+    // the same elements through a real `Arrays$ArrayItr`. Only `remove()`
+    // differs, and loudly (see that function).
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
         Ok(itr) => itr,
-        Err(err) => {
+        Err(_refused) => {
+            let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
+            let real = real_snapshot_iterator(ctx, keys_arr, total);
             ctx.unpin_native_roots(this_pin);
-            return Err(err);
+            return real;
         }
     };
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
@@ -16098,6 +16199,108 @@ fn stream_lazy_spliterator(ctx: &dyn NativeContext, stream: ObjectRef) -> Option
     }
 }
 
+/// Drain a real `Spliterator` into an `Object[]` without fabricating anything —
+/// the `--jdk-only` path for every `cratonvm/internal/StreamCollector` drain in
+/// the workspace.
+///
+/// The collector those drains hand to `tryAdvance` is a VM-internal object that
+/// exists only to BE a `Consumer`, and strict mode refuses to fabricate it. It
+/// stands in for no JDK class, so unlike the refused iterator shapes there is
+/// nothing to substitute for it — which is why this takes the other road and
+/// removes the need for a `Consumer` at all.
+///
+/// `java.util.Spliterators.iterator(Spliterator)` is public JDK API and returns
+/// a real `java.util.Spliterators$1Adapter` that is *itself* both the `Iterator`
+/// and the `Consumer`, driving `tryAdvance` from real bytecode.
+/// `probes/StrictIterPrimitivesProbe` measures that adapter working under
+/// `--jdk-only` (`adapter.class=java.util.Spliterators$1Adapter`), which is what
+/// makes this viable where a hand-built Consumer is not. `Spliterators` carries
+/// no native override for `iterator`, so the call reaches the real method.
+///
+/// The accumulator is a real `java.util.ArrayList` rather than a Rust `Vec`:
+/// every `next()` re-enters Java and may move the heap, and elements parked in
+/// a Rust local across that are exactly the stale-ObjectRef family this file
+/// keeps paying for. Growth is the JDK's problem, and only the iterator and the
+/// list need pinning.
+///
+/// `safety_cap` keeps the guarantee the fabricated path had: an infinite
+/// spliterator (`Stream.iterate`, a hand-rolled generator) stops rather than
+/// exhausting the heap.
+pub fn drain_spliterator_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    safety_cap: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let spl_pin = ctx.pin_native_root(spl);
+    let spl_cur = ctx.read_native_pin(spl_pin, spl);
+    let adapter = ctx.invoke(
+        "java/util/Spliterators",
+        "iterator",
+        "(Ljava/util/Spliterator;)Ljava/util/Iterator;",
+        &[Value::Object(Some(spl_cur))],
+    );
+    ctx.unpin_native_roots(spl_pin);
+    let it = match adapter? {
+        Some(Value::Object(Some(it))) => it,
+        _ => return Ok(alloc_ref_array(ctx, 0)),
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let list = ctx.new_object_initialized("java/util/ArrayList", "()V", &[]);
+    let list = match list {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        Ok(_) => {
+            ctx.unpin_native_roots(it_pin);
+            return Ok(alloc_ref_array(ctx, 0));
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(it_pin);
+            return Err(e);
+        }
+    };
+    // Pinned ABOVE `it_pin`, so the single `unpin_native_roots(it_pin)` below
+    // releases both — the pins are a stack, and unwinding to the lower base
+    // drops everything above it.
+    let list_pin = ctx.pin_native_root(list);
+    let mut n = 0usize;
+    let outcome = loop {
+        if n >= safety_cap {
+            break Ok(());
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let has_next = match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            Ok(_) => false,
+            Err(e) => break Err(e),
+        };
+        if !has_next {
+            break Ok(());
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let elem = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Object(None),
+            Err(e) => break Err(e),
+        };
+        // `elem` goes straight into the next Java call, whose argument list is
+        // rooted for it — no allocation separates the two.
+        let list_cur = ctx.read_native_pin(list_pin, list);
+        if let Err(e) = ctx.invoke_virtual(list_cur, "add", "(Ljava/lang/Object;)Z", &[elem]) {
+            break Err(e);
+        }
+        n += 1;
+    };
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    let arr = match outcome {
+        Ok(()) => ctx.invoke_virtual(list_cur, "toArray", "()[Ljava/lang/Object;", &[]),
+        Err(e) => Err(e),
+    };
+    ctx.unpin_native_roots(it_pin);
+    match arr? {
+        Some(Value::Object(Some(a))) => Ok(a),
+        _ => Ok(alloc_ref_array(ctx, 0)),
+    }
+}
+
 /// Drain a real `Spliterator` into an exact-sized `Object[]` via its
 /// `tryAdvance(Consumer)` contract with a `cratonvm/internal/StreamCollector`
 /// (the accept native, registered globally, appends + grows). Pins both objects
@@ -16122,8 +16325,13 @@ fn drain_spliterator_to_array_capped(
     spl: ObjectRef,
     safety_cap: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7).
-    let collector = try_alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2)?;
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). The refusal is not
+    // fatal: `drain_spliterator_via_real_iterator` gets the same elements out
+    // through public JDK API and keeps the same cap.
+    let collector = match try_alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2) {
+        Ok(c) => c,
+        Err(_refused) => return drain_spliterator_via_real_iterator(ctx, spl, safety_cap),
+    };
     let storage = alloc_ref_array(ctx, 16);
     ctx.set_field(collector, 0, Value::Object(Some(storage)));
     ctx.set_field(collector, 1, Value::Int(0));
@@ -39439,10 +39647,15 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // contract) rather than throwing UnsupportedOperationException.
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
-    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
-    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class
+    // — and then hand back the snapshot through a real iterator anyway.
+    let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
         try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    })?;
+    });
+    let itr = match refused {
+        Ok(itr) => itr,
+        Err(_) => return real_snapshot_iterator(ctx, snap, size as usize),
+    };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -40010,9 +40223,15 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
     // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
-    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+    let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
         try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    })?;
+    });
+    let itr = match refused {
+        Ok(itr) => itr,
+        // The snapshot is already reversed, so the real iterator walks it in
+        // descending order without further work.
+        Err(_) => return real_snapshot_iterator(ctx, snap, n),
+    };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));

@@ -787,9 +787,38 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
         // queued until shutdown and the peer sees a truncated GOAWAY frame.
         // Do not set the sticky `woken` bit: this is a readiness re-check, not
         // a public Selector.wakeup() request.
-        if let Some(wfd) = st.wakeup_pipe_write {
-            let byte: u8 = b'I';
-            let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
+        //
+        // ONLY while a select is actually parked — the same gate the non-Linux
+        // branch below has always carried, for the reason it states: "Sending a
+        // nudge before select starts would make that next select return
+        // spuriously with zero ready keys." The byte does not expire. Written
+        // with nobody in `epoll_wait`, it sits in the pipe until the NEXT
+        // select, whose `epoll_wait` finds the wakeup fd readable and returns
+        // at once having selected nothing.
+        //
+        // A Netty event loop sets interest ops BETWEEN selects, so it hit that
+        // case every iteration: `select(1000)` returning in 0 ms with no keys,
+        // indefinitely. Netty counts exactly that condition — no keys, and the
+        // timeout had not elapsed — and after 512 in a row logs "Selector
+        // .select() returned prematurely 512 times in a row; rebuilding
+        // Selector", then rebuilds; the rebuild re-registers every channel,
+        // which sets more interest ops, which queues more nudges, so the storm
+        // sustains itself. 268 rebuilds in one
+        // `ReactorClientHttpRequestFactoryBuilderTests` run on 2026-08-05.
+        // `probes/SelectorInterestNudgeProbe.java` reduces it to 6 premature
+        // selects out of 6, against 0 on HotSpot and 0 with the `interestOps`
+        // call removed.
+        //
+        // Losing a nudge to the race (interest set just as a select claims
+        // `in_flight_selects`) is benign: the `epoll_ctl(MOD)` above has
+        // already published the new mask, so the `epoll_wait` that thread is
+        // about to enter evaluates it. The nudge exists only for a select that
+        // is ALREADY parked.
+        if st.in_flight_selects != 0 {
+            if let Some(wfd) = st.wakeup_pipe_write {
+                let byte: u8 = b'I';
+                let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
+            }
         }
     }
     // Windows/non-Linux equivalent of the epoll self-pipe nudge above: a
@@ -4117,6 +4146,84 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "should not block >> 50ms, got {elapsed:?}"
+        );
+        selector_close(id);
+    }
+
+    /// REGRESSION: `interestOps()` with no select parked must not make the
+    /// NEXT `select(timeout)` return immediately.
+    ///
+    /// The interest-change nudge writes a byte into the wakeup pipe so a
+    /// select ALREADY blocked in `epoll_wait` re-evaluates. The byte does not
+    /// expire, so writing it with nobody parked leaves it for the next select,
+    /// which returns at once having selected nothing. A Netty event loop sets
+    /// interest ops between selects — it hit that on every iteration, and after
+    /// 512 in a row Netty rebuilds the selector, re-registers every channel,
+    /// sets more interest ops, and the storm feeds itself (268 rebuilds in one
+    /// `ReactorClientHttpRequestFactoryBuilderTests` run, 2026-08-05).
+    ///
+    /// The assertion is on the WALL CLOCK, not on the return value: a correct
+    /// select and the defective one both answer 0 ready keys, and only the
+    /// elapsed time tells them apart. That is also exactly the condition Netty
+    /// counts.
+    #[test]
+    fn set_interest_before_a_select_does_not_shorten_it() {
+        let id = selector_open();
+        let (_client, server) = make_stream_pair();
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, None, 0, Some(SelectableKind::Stream(server)))
+            .unwrap();
+
+        // Nothing is ever written to the pair, so OP_READ cannot fire and each
+        // select must wait out its timeout — with or without this call.
+        selector_set_interest(id, fd, OP_READ).unwrap();
+
+        let start = Instant::now();
+        let n = selector_select(id, 200).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(n, 0, "no channel is readable");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "interestOps() before select must not shorten it: returned after \
+             {elapsed:?} of a 200ms timeout. This is the 'Selector.select() \
+             returned prematurely' storm."
+        );
+        selector_close(id);
+    }
+
+    /// The other half of the gate: a select that IS parked must still be woken
+    /// by an interest change.
+    ///
+    /// This is what the nudge was added for on 2026-07-18 — Tomcat arms
+    /// OP_WRITE after a partial gathering write, and without a wakeup the last
+    /// HTTP/2 frame sat queued until shutdown and the peer saw a truncated
+    /// GOAWAY (`dohead-post-fix-sporadic-residuals-FIXED`). Gating the nudge on
+    /// `in_flight_selects` could have deleted that fix instead of the storm, so
+    /// the two tests are written together and neither is meaningful alone.
+    #[test]
+    fn set_interest_wakes_a_select_that_is_already_parked() {
+        let id = selector_open();
+        let (_client, server) = make_stream_pair();
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, None, 0, Some(SelectableKind::Stream(server)))
+            .unwrap();
+
+        let handle = thread::spawn(move || {
+            // Long enough that the main thread is parked in the kernel wait.
+            thread::sleep(Duration::from_millis(100));
+            selector_set_interest(id, fd, OP_READ | OP_WRITE).unwrap();
+        });
+
+        let start = Instant::now();
+        let _ = selector_select(id, 5000).unwrap();
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "an interest change must wake a PARKED select: waited {elapsed:?} of \
+             a 5000ms timeout. Gating the nudge must not delete the Tomcat \
+             OP_WRITE wakeup it exists for."
         );
         selector_close(id);
     }

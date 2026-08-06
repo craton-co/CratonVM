@@ -45,60 +45,83 @@ install, no `rt.jar`, one self-contained binary.
 
 ## Performance
 
-CPU, vs HotSpot JDK 25 C2, re-measured **2026-08-05** on `dev` (`ded183df8`):
+CPU, vs HotSpot JDK 25 C2, re-measured **2026-08-06** on `dev` (`5428367c0`):
 same flags both sides (`-Xmx8g`), one phase per fresh process pinned to one
 core, arms **alternated with the order flipped on alternate pairs**, 9 pairs
-per phase, no sample discarded, and every run's checksum verified against
-HotSpot's on every run — zero mismatches. Measured in a quiet window (1-minute
-load 1.9–3.7, checked for a competitor co-pinned to the measuring core before
-the window opened). Full methodology in [BENCHMARK.md](BENCHMARK.md).
+per phase, no sample discarded, and **every one of the 18 samples per phase**
+checksum-verified on both arms — not just the medians, so a mid-series drift
+cannot hide behind a matching median. Zero mismatches. All seven phases come
+from **one binary in one window**, 1-minute load 1.8–3.8 throughout, with the
+series aborted and retried if load left the band mid-run. Full methodology in
+[BENCHMARK.md](BENCHMARK.md).
 
 | Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
 |-------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)     | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
-| Fibonacci(44)           | 1,444 ms  | 8,503 ms‡ | 5.89x‡    | 3.5% | 2.79x |
-| Sieve (100K × 20K)      | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
-| Matrix 1280×1280        | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
-| HashMap (10M put/get)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | 1.75x |
-| String/Regex (100K)     | 51 ms     | 274 ms    | 5.37x     | 1.1% | 7.7x  |
-| Binary Trees (depth 18) | 177 ms    | 1,674 ms  | 9.46x     | 0.4% | 8.34x |
+| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
+| Fibonacci(44)           | 1,449 ms  | 5,059 ms‡ | 3.49x‡    | 0.6% | 2.79x |
+| Sieve (100K × 20K)      | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
+| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
+| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | 1.75x |
+| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | 0.9% | 7.7x  |
+| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% | 8.34x |
 
 CratonVM's run-to-run spread is under 1% on five of the seven rows. Ratios are
 the durable content; absolute times are this host on this day.
 
-**Two rows are now at parity with HotSpot C2** — Matrix (from 2.93x) and Sieve.
-Arithmetic and String/Regex also closed materially against the July figures.
-HashMap and Binary Trees moved the other way against numbers taken in July on a
-since-re-provisioned host, and those July absolutes were never re-measured
+**Two rows are at parity with HotSpot C2** — Matrix (from 2.93x) and Sieve.
+**String/Regex moved most this cycle, 5.37x → 4.00x** (274 → 200 ms), the
+largest single-row improvement since July. Fibonacci is 3.49x, down from a
+5.89x that was a real regression and is now fixed — see ‡. Arithmetic is
+unchanged within noise.
+
+HashMap and Binary Trees remain above their July figures, and those July
+absolutes were taken on a since-re-provisioned host and were never re-measured
 under the current protocol — see BENCHMARK.md before reading the two as
-regressions.
+regressions. Fibonacci is deliberately *not* in that sentence any more: it was
+checked against a same-host interleaved control and was genuinely a regression.
 
-‡ **Fibonacci was a real regression, and this row predates its fix.** Unlike
-HashMap and Binary Trees, it does not need the caveat above: it was confirmed
-on *one* host in *one* interleaved window — 4,240 ms on a 2026-07-23 build
-against 8,400 ms on `dev`, same JDK, same classes, **1.96x**. The cause was
-found on 2026-08-05 and is not a tiering or optimizer decision. Both JIT
-backends erase the dead shadow-stack thread fetch from the prologue; the
-single-pass backend has jumped over the erased ~46-byte span since June, while
-the IR backend only overwrote it with one-byte `NOP`s. So every IR method that
-published nothing **retired 46 NOPs on entry, on every invocation** — and
-`fib`, a two-line static method entered 2.27e9 times, paid it 2.27e9 times.
-Fixed 2026-08-05: **1.74x** recovered against its own parent commit (8
-interleaved pairs, user CPU time, disjoint ranges), all seven phase checksums
-unchanged
+‡ **Fibonacci briefly reached 5.89x, and that was a real regression.** Unlike
+HashMap and Binary Trees it does not need the caveat above — it was confirmed
+on *one* host in *one* interleaved window: 4,240 ms on a 2026-07-23 build
+against 8,400 ms on `dev`, same JDK, same classes, **1.96x**.
+
+The cause was not a tiering or optimizer decision. Both JIT backends erase the
+dead shadow-stack thread fetch from the prologue; the single-pass backend has
+jumped over the erased ~46-byte span since June, while the IR backend only
+overwrote it with one-byte `NOP`s. So every IR method that published nothing
+**retired 46 NOPs on entry, on every invocation** — and `fib`, a two-line
+static method entered 2.27e9 times, paid it 2.27e9 times. Fixed 2026-08-05:
+**1.74x** recovered against its own parent commit (8 interleaved pairs, user
+CPU time, disjoint ranges), all seven phase checksums unchanged
 (`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`).
-The number above is the **pre-fix** measurement and is refreshed on the next
-quiet-window run; the fix is on `dev`, this row is not yet.
 
-† **Sieve's HotSpot column is pooled across two runs, and that is not a
-convenience.** HotSpot on this phase is *bimodal*: across 18 samples it lands
-either at ~2,369 ms (10) or ~2,739 ms (8), with nothing in between, so a
-9-sample median falls wherever the split happens to go — one run read 2,386 ms
-and the next 2,734 ms on an unchanged binary. CratonVM's samples over the same
-18 runs are unimodal (2,276–2,498). Pooling both arms gives 2,376 vs 2,402;
-either mode read on its own puts the two within 15%. Parity is the honest
-reading, and 0.87x — which the single cleanest run would have supported — would
-not be.
+The row above is post-fix and, unlike the two earlier attempts at it, comes
+from the same binary and the same window as the other six. It reproduced
+independently on the way there: 3.51x measured on the fix branch on 2026-08-05,
+3.49x on `5428367c0` here.
+
+The remaining gap to the 2026-07 figure is not the same defect. The
+pre-regression single-pass body sits near 2.9x here, so roughly a fifth of the
+original gap is still open, and it is precise-root and deopt metadata the IR
+tier emits and the single-pass backend did not: the safepoint-id slot the
+collector reads to pick an oop map, and the innermost-RBP mirror the stack
+walker reads. That is `perf-01`'s open policy question — nothing today compares
+an IR body against the C1 body it replaces before keeping it — not a defect to
+be fixed by deleting metadata.
+
+† **HotSpot is *bimodal* on Sieve, which is why this row's HotSpot CV is the
+worst in the table and why the ratio should be read as parity, not as a
+number.** Across an earlier 18-sample characterisation it landed either at
+~2,369 ms (10 samples) or ~2,739 ms (8), with nothing in between — one run read
+2,386 ms and the next 2,734 ms on an unchanged binary. CratonVM's samples over
+the same 18 runs were unimodal (2,276–2,498).
+
+The 2026-08-06 series shows the same shape: eight HotSpot samples fall in
+2,279–2,357 and one lands at 2,755, which is the entire reason CV_HotSpot is
+5.8% against CratonVM's 2.0%. The median (2,333 ms) therefore sits in the low
+mode, and the 1.01x above is a low-mode-vs-CratonVM reading. Had the split gone
+the other way the same binaries would have printed something nearer 0.9x. Both
+are parity; neither is a 10% claim in either direction.
 
 Sieve was **6.50x** on 2026-08-04 and is not any more. That was a live
 regression: `CratonBench.sieve([ZI)I` had begun getting a body from the

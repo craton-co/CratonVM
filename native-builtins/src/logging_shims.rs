@@ -1071,14 +1071,48 @@ pub(crate) fn native_printstream_write_string(
     Ok(None)
 }
 
+/// The text of a `CharSequence` argument, by `String.valueOf` rules: the string
+/// itself when it is one, otherwise whatever `toString()` returns.
+///
+/// [`NativeContext::read_string`] reads a `java.lang.String` and nothing else,
+/// so using it alone on a `CharSequence` parameter silently turns every
+/// `StringBuilder`, `StringBuffer` and `CharBuffer` into the four characters
+/// `null`.
+fn char_sequence_text(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    if let Some(s) = ctx.read_string(obj) {
+        return s;
+    }
+    match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        // A CharSequence whose `toString()` fails or returns null has no text
+        // to contribute. Appending the literal "null" here would be the very
+        // bug this function exists to fix, so append nothing.
+        _ => String::new(),
+    }
+}
+
 /// `PrintStream.append(CharSequence)` — appends the text and returns `this`.
 fn native_printstream_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0]=this (PrintStream), args[1]=CharSequence
+    //
+    // The real method is `write(String.valueOf(csq))`, and `String.valueOf`
+    // means `csq.toString()` for anything non-null. This used to be
+    // `read_string(obj).unwrap_or("null")`, which recognises a
+    // `java.lang.String` and nothing else — so every non-String
+    // `CharSequence` appended `null`.
+    //
+    // Not a corner case: `java.util.Formatter` appends a `StringBuilder` for
+    // the numeric conversions (`printInteger`/`printFloat` →
+    // `appendJustified(a, sb)`) and a `String` for `%s`. So
+    // `PrintStream.printf(Locale, …)` — the overload with no native of its
+    // own, hence the only one reaching real `Formatter` bytecode — printed
+    // `[x|null|null]` where HotSpot prints `[x|7|01.50]`: `%s` right, every
+    // numeric conversion lost. `probes/PrintStreamAppendProbe` pins that down,
+    // and it is why `regression-suite` was uniformly red — its classes assert
+    // through `printf`.
     let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => {
-            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
-        }
-        Some(Value::Object(None)) => "null".to_string(),
+        Some(Value::Object(Some(obj))) => char_sequence_text(ctx, *obj),
+        // `append((CharSequence) null)` is specified to append "null".
         _ => "null".to_string(),
     };
     ctx.record_printed_line(text.clone());

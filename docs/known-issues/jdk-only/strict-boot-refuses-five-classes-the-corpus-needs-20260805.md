@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN, NARROWED 2026-08-05 — three of the five classes are fixed and the gate is down from 9 failed sections to 6. Two families remain, both named below |
+| **Status** | CLOSED 2026-08-05 — all five classes fixed, in two changes. `probes/JdkOnlyCollectionViewProbe` is byte-identical to HotSpot 25 in BOTH modes. See "What was fixed" and "The second half" below |
 | **Severity** | high — the first genuine **strict-only** regression this corpus has produced, and it is nine probe sections wide |
 | **Modes** | `--jdk-only` ONLY. `--real-jdk` is byte-identical to HotSpot 25 on both probes |
 | **Found** | 2026-08-05 by `scripts/jdk-only-strict-probes.sh`, on its first run against a merged `dev` |
@@ -120,24 +120,117 @@ as a pass.
 The bridge ratchet moved in the good direction and was re-frozen in the same
 change, as it demands: 9705 → 9697 and 4696 → 4688.
 
-## What remains, and why neither is the same fix
+## The second half, 2026-08-05 — and why both deferrals were wrong
 
-* **`java/util/HashMap$KeyItr` and `java/util/TreeSet$Itr` — 4 of the 6 sections.**
-  L7 R1 deferred this family explicitly and gave the reason: the real iterator
-  reads the real `table[]`, which CratonVM's `HashMap.put` native never fills,
-  so retagging it returns a silently EMPTY iteration instead of a loud error.
-  That is worse than the current failure, and the fix is the collections
-  reclassification wave, not a retag.
-* **`cratonvm/internal/StreamCollector` — `interfaces`, and
-  `cratonvm/internal/SystemLogger` — `serialization`.** Neither is a stand-in
-  for a JDK class, so no retag can remove them. `StreamCollector` is a
-  VM-internal `Consumer` handed to a REAL `Spliterator.tryAdvance` by
-  `drain_spliterator_to_array` — the JDK needs an object of a `Consumer` type
-  and a side table cannot be one. Draining through
-  `StreamSupport.stream(spl, false).toArray()` instead would need no fabricated
-  class, but it also discards the safety cap that function exists to enforce
-  against an infinite spliterator, so it is a stream-subsystem change with its
-  own evidence, not a line edit.
+The two families above were filed as needing separate waves. Both reasons were
+derived by reading the code. `probes/StrictIterPrimitivesProbe` measures the
+same claims under `--jdk-only` instead, and neither survived.
+
+**The iterator family had nothing to do with `table[]`.** The deferral said a
+real iterator would read a `table[]` that `HashMap.put` never fills and return
+a silently EMPTY iteration. What the probe found is that the refusal was not a
+policy at all — it was *order-dependent*:
+
+```
+asList.iterator.class=java.util.HashMap$KeyItr     <- host JDK: java.util.Arrays$ArrayItr
+linkedhashset.iterator=[s1|s2]/2                   <- passes here, NoClassDefFoundError elsewhere
+```
+
+`make_iterator_from_array` minted `java/util/HashMap$KeyItr` through the
+INFALLIBLE `alloc_synthetic`, while three sibling sites used the fallible one.
+So `Arrays.asList(a).iterator()` created the class, and every later
+`try_alloc_synthetic` for that name then *found* it and succeeded. That is why
+`linkedhashset.iterator()` passed in a probe that had called `Arrays.asList`
+first and threw in one that had not — and why the section list above looks
+arbitrary.
+
+The fix routes all four sites through the refusal and gives the refusal
+somewhere to land. The snapshot is already an `Object[]`, and the JDK ships the
+fixed-size list for exactly that shape: wrap it in a real `Arrays$ArrayList` and
+ask THAT for its iterator — with `invoke_virtual_bytecode_only`, so the
+`Arrays$ArrayList.iterator` override does not hand back the fabricated class
+again. The result is a real `java.util.Arrays$ArrayItr`.
+
+**`StreamCollector` did not need a `Consumer` substitute — it needed no
+`Consumer`.** The deferral was right that nothing can stand in for it (it is
+VM-internal and a side table cannot be a `Consumer`) and right that
+`StreamSupport.stream(spl, false).toArray()` would discard the safety cap. It
+missed the third option: `java.util.Spliterators.iterator(Spliterator)` is
+public API, carries no native override, and returns a real
+`Spliterators$1Adapter` that is *itself* both the iterator and the consumer.
+The probe measures that adapter working under `--jdk-only`
+(`adapter.class=java.util.Spliterators$1Adapter`), which is what makes it
+viable where a hand-built consumer is not. Driving `hasNext`/`next` from the
+native keeps the 1,000,000-element cap exactly as it was, so the objection does
+not apply. The accumulator is a real `ArrayList`, not a Rust `Vec`, because
+every `next()` re-enters Java and may move the heap.
+
+All three `StreamCollector` mint sites now ask the policy first, including the
+two that went through the infallible funnel — leaving any one of them unguarded
+is precisely what made the iterator refusal order-dependent.
+
+Measured, Windows / Temurin 25.0.3, diffed against the host JDK:
+
+| probe | mode | before | after |
+|---|---|---:|---:|
+| `JdkOnlyCollectionViewProbe` | `--jdk-only` | 7 diverging lines | **0** |
+| `JdkOnlyCollectionViewProbe` | `--real-jdk` | 0 | 0 |
+| `StrictIterPrimitivesProbe` | `--jdk-only` | 4 | **0** |
+
+`--real-jdk` is untouched by design: both fallbacks fire only on a policy
+refusal, which only happens under `--jdk-only`.
+
+One behaviour genuinely changes, and loudly rather than silently: `remove()` on
+a strict-mode snapshot iterator now raises `UnsupportedOperationException` from
+real JDK bytecode instead of writing through to the backing collection. On the
+strict path the alternative was never a working `remove()` — it was an
+iteration that did not reach `next()`.
+
+### Still true, and not fixed here
+
+`StrictIterPrimitivesProbe` records one divergence that remains under
+`--real-jdk`: `Arrays.asList(a).iterator().getClass()` reports
+`java.util.HashMap$KeyItr` where HotSpot says `java.util.Arrays$ArrayItr`.
+Default mode still fabricates the iterator, because the fallback is reached
+only through the refusal. Converting the idiom outright would change every
+snapshot iterator in the VM, which is a measured decision of its own and not
+this change.
+
+## Verification, on both platforms
+
+The strict gate on Azure Linux went from 9 failed sections to a PASS with
+**17 sections reported as no longer diverging**, and the baseline was re-frozen
+as the gate demands. The bridge ratchet is unchanged at its baseline (9697 /
+4688) — no registration was added or removed.
+
+Regression corpus, Windows / Temurin 25.0.3, with each change measured
+separately:
+
+| corpus | before | + iterator & collector | + `PrintStream.append` |
+|---|---:|---:|---:|
+| default | 28 / 0 | 28 / 0 | 28 / 0 |
+| `--jdk-only` | 24 passed, 25 failed | 31 / 18 | **32 / 17** |
+
+Every failure list is a strict subset of the one before it — nothing newly
+fails. The eight recovered classes are `RExecutorShutdown`,
+`RChannelInterrupt`, `RMapResizeGc`, `RMapGcStress`, `ROverlaySystemGcStress`,
+`RFileTimes`, `RJdkRecords` (the iterator families) and `RJdkHello` (the
+`PrintStream.append` defect filed alongside this one). Azure Linux lands on the
+same 32 / 17 with the same list.
+
+`RSerial` still fails under `--jdk-only` on `cratonvm/internal/SystemLogger`.
+It failed identically before this change, so it is not a regression from it;
+it is the `serialization` row, which no snapshot iterator is involved in.
+
+### One measurement trap this ran into
+
+A first pass reported the corpus as 0 passed for EVERY class, in both modes,
+for every binary — and that was the harness, not the VM. Passing
+`JDK=/c/Program Files/...` puts an MSYS-style path in front of a native Windows
+binary, and because `regression-suite/run.sh` invokes it through `timeout`,
+MSYS does not rewrite the argument. `--java-home` never resolved and every
+class exited 1 identically. Use `JDK=C:/Program Files/...` on Windows. A
+uniform zero across unrelated tests is a harness signature, not a VM one.
 
 ## Reproducing
 
@@ -146,8 +239,8 @@ JAVA_HOME=/path/to/jdk25 CV=target/release/cratonvm \
     bash scripts/jdk-only-strict-probes.sh
 ```
 
-Exit 5, and `target/jdk-only-strict-probes/logs/*.strict.diff` carries the nine
-sections. A single class is enough to see it:
+Before the fix: exit 5, and `target/jdk-only-strict-probes/logs/*.strict.diff`
+carries the nine sections. A single class is enough to see it:
 
 ```sh
 cratonvm --jdk-only --java-home $JDK25 -cp <probes> JdkOnlyCensusLoadProbe
