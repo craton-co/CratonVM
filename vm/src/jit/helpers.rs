@@ -139,6 +139,37 @@ fn ic_publish_trace_filter() -> &'static Option<String> {
     CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_IC_PUBLISH").ok())
 }
 
+/// `CRATONVM_JIT_MIC_PUBLISH_IR_CALLEES=0` — keep bodies produced by the
+/// optimizing IR backend OFF the MIC/PIC, the way `callee_barred_by_table`
+/// keeps handler-bearing ones off it.
+///
+/// The inline cascade `CALL`s a published entry raw. The helper reaches the
+/// same entry through `try_call_compiled_entry_reentrant`, which pins the
+/// artifact, re-derives its ABI flag, registers a `JitEntryGuard`, and declines
+/// (falling back to the interpreter) whenever its register tables cannot carry
+/// the arguments. None of that is available to generated code, so "the helper
+/// is green and the inline cascade is red on the same entry" is a question
+/// about what the artifact needs that only the helper supplies. This lever
+/// answers it for one class of artifact at a time.
+fn mic_publish_ir_backend_callees() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MIC_PUBLISH_IR_CALLEES").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+fn callee_barred_as_ir_backend(entry_ptr: u64) -> bool {
+    if entry_ptr == 0 || mic_publish_ir_backend_callees() {
+        return false;
+    }
+    cratonvm_jit::pin_jit_code_range_owner(entry_ptr as usize)
+        .as_deref()
+        .is_some_and(|c| c.used_ir_backend)
+}
+
 fn ic_publish_trace(
     site: &str,
     info: &JitInvokeInfo,
@@ -162,9 +193,13 @@ fn ic_publish_trace(
         .map(|c| c.needs_context().to_string())
         .unwrap_or_else(|| "<unowned>".to_string());
     let owner_entry = owner.as_deref().map_or(0, |c| c.entry_ptr() as usize);
+    let owner_backend = owner
+        .as_deref()
+        .map_or("<unowned>", |c| if c.used_ir_backend { "ir" } else { "sp" });
     eprintln!(
         "[IC_PUBLISH] {site} {}.{}{} recv={receiver_class}(cid={receiver_cid}) \
          entry={entry_ptr:#x} needs_ctx={needs_ctx} owner_needs_ctx={owner_ctx} \
+         owner_backend={owner_backend} \
          owner_entry={owner_entry:#x} mic={mic_ptr:#x} pic={pic_ptr:#x}",
         info.class_name,
         info.method_name,
@@ -11886,8 +11921,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
             // sentinel + stashed frame bail through the compiled caller's
             // epilogue past the only point able to resume it precisely.
-            let callee_barred_by_table = !mic_publish_exception_table_callees()
-                && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+            let callee_barred_by_table = (!mic_publish_exception_table_callees()
+                && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info))
+                || callee_barred_as_ir_backend(entry_ptr as u64);
             let callee_has_indy_trap =
                 compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
             if callee_barred_by_table
@@ -12081,8 +12117,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A machine-code MIC/PIC call has no interpreter boundary at which the
     // callee's local handler can be resumed. Leave such callees on the checked
     // helper path; ordinary handler-free callees retain the raw-entry fast path.
-    let callee_barred_by_table = !mic_publish_exception_table_callees()
-        && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+    let callee_barred_by_table = (!mic_publish_exception_table_callees()
+        && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info))
+        || callee_barred_as_ir_backend(entry_ptr);
     // jit-invokedynamic-groovy-regression fix — see the matching gate in the
     // cache-hit branch above: an indy-trap-bearing artifact must stay on the
     // dispatch helper, never in a machine-called MIC/PIC entry.

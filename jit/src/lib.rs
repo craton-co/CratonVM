@@ -15970,6 +15970,33 @@ fn try_compile_inner(
                         // bailed out of IR to single-pass never reaches here, so it
                         // keeps the constructor default `false`.
                         compiled.used_ir_backend = true;
+                        // `CRATONVM_DBG_JIT_CODE` dumped only single-pass
+                        // bodies, so a method the optimizing tier claimed was
+                        // invisible to it — and "dump the code the inline cache
+                        // actually CALLs" silently handed back a DIFFERENT,
+                        // single-pass artifact for the same method. Same dump,
+                        // same format, tagged with the backend that produced it.
+                        if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE")
+                        {
+                            let full = format!(
+                                "{}.{}{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            );
+                            if full.contains(&want) {
+                                let slice = compiled._buffer_slice_for_debug();
+                                let mut hex = String::new();
+                                for b in slice {
+                                    hex.push_str(&format!("{:02x}", b));
+                                }
+                                eprintln!(
+                                    "[JIT_CODE] backend=ir {} entry={:p} len={}\n{}",
+                                    full,
+                                    compiled.entry,
+                                    slice.len(),
+                                    hex
+                                );
+                            }
+                        }
                         // `used_ir_backend` was written and never read at
                         // runtime, so "did the optimizing tier produce any body
                         // in this run?" had no answer outside `cfg(test)`. That
