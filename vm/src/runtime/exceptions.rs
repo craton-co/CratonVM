@@ -1887,14 +1887,14 @@ pub fn raise_no_class_def_found_with_cause(
 fn dbg_rterr_filter() -> Option<&'static str> {
     static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FILTER
-        .get_or_init(|| std::env::var("CRATONVM_DBG_RTERR").ok())
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_RTERR").ok())
         .as_deref()
 }
 
 /// Cached `CRATONVM_DBG_LINKAGE_BT` flag (see `linkage_throwable`).
 fn dbg_linkage_bt() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_LINKAGE_BT").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some())
 }
 
 fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {

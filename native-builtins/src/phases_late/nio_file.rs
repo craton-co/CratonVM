@@ -7011,7 +7011,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let letter = (b'A' + (drive - 1) as u8) as char;
                 // Windows keeps each drive's working directory in a hidden
                 // `=X:` environment variable; that IS what `_wgetdcwd` reads.
-                let dir = std::env::var(format!("={letter}:"))
+                let dir = cratonvm_types::flags::runtime_var(format!("={letter}:"))
                     .ok()
                     .or_else(|| {
                         let cwd = std::env::current_dir().ok()?;

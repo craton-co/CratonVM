@@ -71,6 +71,11 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "apps", "node_modules"];
 ///    and live `std::env` semantics are the correct ones. Declaring them would
 ///    put harness plumbing into `docs/CONFIG.md` and into `CRATONVM_TEST=…`,
 ///    which is the surface growth this whole exercise is undoing.
+/// 4. **Part of the configuration mechanism itself**, read while that
+///    mechanism is running. The snapshot cannot serve these because it is
+///    latched before the step that would populate them — see the row for
+///    `CRATONVM_ALLOW_UNKNOWN_TOKENS` for the only current instance, which
+///    names the two lines that establish the ordering.
 ///
 /// A flag read by anything under a crate's `src/` does **not** qualify. If one
 /// is added here, the reason string has to say why the snapshot cannot serve
@@ -142,6 +147,23 @@ const ALLOWED: &[(&str, &str)] = &[
         "CRATONVM_TEST_CLASSES_DIR",
         "kind 3: set by `vm/build.rs` via `cargo:rustc-env` and read with \
          `option_env!`, so it is a compile-time constant, not a runtime flag",
+    ),
+    (
+        "CRATONVM_REQUIRE_E2E",
+        "kind 3: `vm/tests/common/mod.rs` - promotes a SKIPPED end-to-end \
+         prerequisite to a failure. Read by the harness while it decides \
+         whether to stand a VM up at all, so there is no snapshot to \
+         serve it.",
+    ),
+    (
+        "CRATONVM_ALLOW_UNKNOWN_TOKENS",
+        "kind 4: `vm-cli/src/main.rs` - makes an unrecognised token \
+         non-fatal. It is read from the result of \
+         `flag_groups::expand_process_env()`, and `install_flags` latches \
+         the snapshot fifteen lines EARLIER - so a token spelling of this \
+         knob could not be in the snapshot at the moment it is needed. A \
+         scalar is not available either: the surface is pinned at fifteen \
+         names by `the_whole_surface_is_fifteen_variables`.",
     ),
     (
         "CRATONVM_TEST_JAVA_HOME",

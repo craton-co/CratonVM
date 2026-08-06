@@ -12558,7 +12558,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // victim only sees a flag), so the only way to attribute one is to
         // record the producer. Kept permanently and env-gated for the same
         // reason CRATONVM_DBG_CCE_BT is.
-        if std::env::var_os("CRATONVM_DBG_INTERRUPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INTERRUPT").is_some() {
             eprintln!(
                 "CRATONVM_DBG_INTERRUPT: target_obj=0x{:x} target_tid={:?} by_tid={}",
                 thread_obj.as_ptr() as usize,
@@ -25716,7 +25716,6 @@ mod tests {
     /// `docs/known-issues/vm/compact-layout-registry-is-process-global-20260805.md`
     /// — including two fixes that were tried and are NOT sufficient.
     #[test]
-    #[ignore = "documents an OPEN defect: the compact-layout registry is process-global but ClassIds are per-VM"]
     fn two_vms_must_not_share_a_compact_layout_for_the_same_class_id() {
         let vm_a = test_shared();
         let vm_b = test_shared();

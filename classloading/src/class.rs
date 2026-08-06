@@ -1144,6 +1144,11 @@ const MAX_HIERARCHY_DEPTH: usize = 1024;
 /// Lookup is O(1) by `ClassId`.
 #[derive(Debug)]
 pub struct ClassStore {
+    /// This store's compact-layout domain. `class_id` is a per-store INDEX, so
+    /// it does not identify a class in the process-global layout registry; the
+    /// domain is what does. Allocated once per store, in `ClassStore::new`, so
+    /// it is in force before the first class is added.
+    layout_domain: u32,
     /// Monotonic ClassId slots. An unloaded class leaves a tombstone so a
     /// stale ClassId can never alias a subsequently loaded class.
     classes: Vec<Option<Class>>,
@@ -1162,6 +1167,7 @@ impl ClassStore {
     /// Create an empty class store.
     pub fn new() -> Self {
         Self {
+            layout_domain: cratonvm_types::next_layout_domain(),
             classes: Vec::new(),
             live_count: 0,
             subclasses: rustc_hash::FxHashMap::default(),
@@ -1172,6 +1178,13 @@ impl ClassStore {
     ///
     /// Useful when you need the id before constructing the `Class` (e.g.
     /// to fill in `class.id`).
+    /// This store's compact-layout domain. The VM's heap must be told the same
+    /// value or it will refuse every compact allocation — see
+    /// `Heap::set_layout_domain` and `compact_object_body_size`.
+    pub fn layout_domain(&self) -> u32 {
+        self.layout_domain
+    }
+
     pub fn next_id(&self) -> ClassId {
         ClassId::new(self.classes.len() as u32)
     }
@@ -1338,7 +1351,11 @@ impl ClassStore {
             }
         }
         if let Some(layout) = built {
-            cratonvm_types::register_class_layout(id.as_u32(), Arc::new(layout));
+            cratonvm_types::register_class_layout(
+                self.layout_domain,
+                id.as_u32(),
+                Arc::new(layout),
+            );
         }
     }
 
