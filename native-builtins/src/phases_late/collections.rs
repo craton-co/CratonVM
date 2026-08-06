@@ -899,6 +899,23 @@ fn entry_component_hash(ctx: &mut dyn NativeContext, v: Value) -> i32 {
     }
 }
 
+/// `true` iff `obj` is a `java.util.Map.Entry` — the type half of
+/// `Map.Entry.equals`'s contract.
+///
+/// The fabricated `AbstractMap$SimpleEntry` / `$SimpleImmutableEntry` did not
+/// declare the interface at all until `jdk_interfaces` grew an arm for them,
+/// which is why adding this test is safe now and would have made every entry
+/// comparison answer false before.
+fn entry_is_map_entry(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    match ctx.class_id_by_name("java/util/Map$Entry") {
+        Some(target) => {
+            let cid = ctx.class_id_of_object(obj);
+            cid == target || ctx.is_subclass(cid, target)
+        }
+        None => false,
+    }
+}
+
 /// `Objects.equals(a, b)` for entry components.
 fn entry_component_eq(ctx: &mut dyn NativeContext, a: Value, b: Value) -> bool {
     match (a, b) {
@@ -957,6 +974,16 @@ fn register_entry_value_semantics(r: &mut NativeMethodRegistry, cls: &'static st
         };
         if this == other {
             return Ok(Some(Value::Int(1)));
+        }
+        // ANY Map.Entry, and ONLY a Map.Entry. The type test is half of the
+        // specified contract and it was missing here: without it an entry
+        // compares equal to any object that merely answers `getKey` and
+        // `getValue`. `native_entry_equals` in `native-collections` — which
+        // registers the SAME triple for `SimpleEntry` and wins the
+        // last-write-wins race — has always had it, so the two spellings only
+        // agree with this present.
+        if !entry_is_map_entry(ctx, other) {
+            return Ok(Some(Value::Int(0)));
         }
         // Compare against ANY Map.Entry, as the contract requires — via the
         // interface accessors, not by reaching into the other object's slots,
@@ -1081,11 +1108,6 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
     // at `SimpleImmutableEntry` moved the differential from 4 diverging lines
     // to 6.
     register_entry_value_semantics(r, "java/util/Map$Entry");
-    r.register(sie, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));
-        Ok(Some(Value::Object(Some(s))))
-    });
     r.set_category(__prev_cat);
 }
 
