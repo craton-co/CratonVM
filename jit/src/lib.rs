@@ -7800,14 +7800,35 @@ fn record_jdk_only_ic_native_refusal() {
 fn direct_native_helper(
     cell: &std::sync::atomic::AtomicUsize,
     jdk_only: bool,
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
     class: &str,
     method: &str,
     descriptor: &str,
 ) -> usize {
     let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
     if entry != 0 && jdk_only {
-        record_jdk_only_direct_native_refusal(class, method, descriptor);
-        return 0;
+        // JDK-ONLY-WAVE2 §4. The question is no longer "is this one of seven
+        // hard-coded triples" — the seven are still how the RECOGNITION picks
+        // a cell, because that is a triple-to-helper-address map the registry
+        // does not have — but the POLICY answer now comes from the registry's
+        // own `NativeKind`, which is where §1.4's reviewed-exception verdict
+        // actually lives.
+        //
+        // Measured against `scripts/baselines/jdk-only-kind-map-25-linux.tsv`,
+        // the seven split 3/3/1: `StringLatin1.toLowerCase`,
+        // `Integer.valueOf(I)` and `Integer.intValue()` are `Intrinsic` and
+        // §1.4 permits them; `HashMap.put`, `HashMap.get` and
+        // `ConcurrentMap.get` are `Bridge` and it does not; and
+        // `String.toLowerCase(Locale)` is not registered at all, so there is
+        // nothing to audit and it stays refused — the same rule
+        // `admit_jit_fast_native` states for an unregistered fast path.
+        let approved = intrinsic_resolver.is_some_and(|is_intrinsic| {
+            is_intrinsic(class, method, descriptor)
+        });
+        if !approved {
+            record_jdk_only_direct_native_refusal(class, method, descriptor);
+            return 0;
+        }
     }
     entry
 }
@@ -8515,7 +8536,7 @@ pub struct JitDirectCall {
 ///
 /// Hit/miss counters support adaptive recompilation decisions.
 ///
-/// # JDK-ONLY-WAVE2 — this cache stores an entry pointer and no `NativeKind`
+/// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06: no gap, and the prescription was wrong
 ///
 /// `cached_entry_ptr` is a raw address that generated code `CALL R11`s on a
 /// class-id guard hit. When the target is a native/builtin trampoline the slot
@@ -8534,12 +8555,35 @@ pub struct JitDirectCall {
 /// `vm/src/jit/helpers.rs`, which this wave's owner cannot edit; widening the
 /// `update` signature would break it.
 ///
-/// Wave 2 should append a `cached_native_kind: AtomicU8` **after** the
-/// generated-code-visible prefix (the tail, next to `compiled_owner`, so no
-/// baked offset moves), populate it from the `NativeKind` the helper already
-/// has at install time, and replace the wave-1 refusal with a kind check —
-/// which restores the native fast path under `JdkOnly` for reviewed bridges and
-/// intrinsics instead of forcing every native receiver onto the helper.
+/// **Do not do that.** The paragraph above used to prescribe appending a
+/// `cached_native_kind: AtomicU8` at the tail, populating it at install time
+/// and replacing the wave-1 refusal with a kind check. Checked 2026-08-06, it
+/// fails on both halves:
+///
+/// * **Nothing would read it.** The hit path is emitted machine code, not
+///   Rust: `ir_lower.rs` documents and emits
+///   `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11` after the class-id guard.
+///   A kind byte in the slot has no reader on the one path it is meant to fix.
+///   Consulting it would mean emitting the load, test and branch into the guard
+///   sequence — a throughput cost on the JIT's hottest path, to police a state
+///   the next point establishes cannot occur.
+/// * **A native is never in the slot to begin with — in EITHER mode.** Both
+///   population clusters in `vm/src/jit/helpers.rs` take their entry from
+///   `try_jit_compile_callee`, which yields a JIT-compiled callee held by a
+///   live `Arc<CompiledMethod>` pin. `jit_entry_publishable`'s
+///   `owner.is_some()` early return therefore fires before any policy branch,
+///   and that early return is **not policy-dependent**. So the strict refusal
+///   below is unreachable (measured: `jit_inline_cache_natives` 0), and the
+///   `Compatible` census gap this record also claimed is unreachable for
+///   exactly the same reason — there is no native in the slot to dispatch
+///   uncounted. The wave-2 record asserted both "a native trampoline never
+///   reaches the refusal from these sites" and "the missing kind leaves the
+///   census incomplete in `Compatible` mode as much as strict"; those cannot
+///   both be true, and it is the second that is wrong.
+///
+/// If a future change ever routes a native trampoline into these slots, the
+/// refusal below is what stops it, and THAT is the invariant to keep — not a
+/// kind byte.
 ///
 /// # Memory layout (CRIT-8 prerequisite)
 ///
@@ -8834,17 +8878,23 @@ pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 /// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 4
 /// entries, the site is deoptimized to a generic vtable dispatch.
 ///
-/// # JDK-ONLY-WAVE2 — same missing-`NativeKind` shape as [`JitMICSlot`]
+/// # JDK-ONLY-WAVE2 — CLOSED 2026-08-06, with [`JitMICSlot`]; see the note there
 ///
 /// `entry_ptrs[i]` and `mega_entry_ptrs[i]` are raw addresses with no kind
 /// beside them, so a hit cannot re-check policy. Both install paths funnel
 /// through `jit_entry_publishable`, which under `JdkOnly` refuses unowned
 /// (native/builtin) targets, so wave 1 keeps them empty of natives rather than
-/// letting them hold an unverifiable one. Wave 2 should add a parallel
-/// `needs_context`-style `AtomicU8` kind array — appended at the TAIL, since
-/// `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` / `NEEDS_CONTEXT_OFFSETS` /
-/// `MEGA_*_OFFSET` are all baked into emitted code as immediates — and check
-/// the kind instead of refusing outright.
+/// letting them hold an unverifiable one.
+///
+/// This used to prescribe a wave-2 `AtomicU8` kind array appended at the TAIL,
+/// checked instead of refusing outright. **Do not do that** — see the same
+/// retraction on [`JitMICSlot`], which applies here unchanged and with one
+/// extra reason: the inline 4-way probe this struct exists for is
+/// `CMP EAX,[R10+CLASS_ID_OFFSETS[i]]` / `MOV R11,[R10+ENTRY_PTR_OFFSETS[i]]` /
+/// `CALL R11`, so a kind array would need four more loads and branches inside
+/// the guard cascade, on the hottest dispatch shape in the JIT, to police a
+/// state `jit_entry_publishable`'s policy-independent `owner.is_some()` early
+/// return already makes unreachable in both modes.
 ///
 /// # Memory layout
 ///
@@ -13137,6 +13187,9 @@ pub fn try_compile(
         // always read, and no test latches it, so they keep reading
         // `Compatible`.
         jit_is_jdk_only(),
+        // No registry in scope from this wrapper. `None` refuses, which is
+        // what the blanket strict refusal did before §4.
+        None,
     )
 }
 
@@ -13296,6 +13349,20 @@ pub fn try_compile_with_invokespecial_resolver(
     // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
     // policy bit is not an address).
     jdk_only: bool,
+    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
+    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
+    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
+    // and for a triple the registry has never heard of.
+    //
+    // This is the policy half of the seven thin direct-call ladders below.
+    // Before it existed those ladders were refused wholesale under `JdkOnly`,
+    // which is stricter than the contract: three of the seven are registered
+    // `Intrinsic` and §1.4 permits exactly those.
+    //
+    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
+    // fail-closed direction — a compile with no way to ask cannot bake a
+    // native in front of real bytes.
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -13404,6 +13471,7 @@ pub fn try_compile_with_invokespecial_resolver(
         self_call_identity_stable,
         &admission,
         jdk_only,
+        intrinsic_resolver,
     );
 
     // Take once and use for all three sinks: the bail-list decision below, the
@@ -14036,6 +14104,20 @@ fn try_compile_inner(
     // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
     // policy bit is not an address).
     jdk_only: bool,
+    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
+    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
+    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
+    // and for a triple the registry has never heard of.
+    //
+    // This is the policy half of the seven thin direct-call ladders below.
+    // Before it existed those ladders were refused wholesale under `JdkOnly`,
+    // which is stricter than the contract: three of the seven are registered
+    // `Intrinsic` and §1.4 permits exactly those.
+    //
+    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
+    // fail-closed direction — a compile with no way to ask cannot bake a
+    // native in front of real bytes.
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -15315,6 +15397,7 @@ fn try_compile_inner(
                                 let entry = direct_native_helper(
                                     &THREAD_CURRENT_THREAD_DIRECT_FN,
                                     jdk_only,
+                                    intrinsic_resolver,
                                     direct_class,
                                     &mn,
                                     &desc,
@@ -16847,6 +16930,7 @@ fn try_compile_inner(
                         let entry = direct_native_helper(
                             &STRING_LATIN1_LOWER_DIRECT_FN,
                             jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16885,6 +16969,7 @@ fn try_compile_inner(
                         let entry = direct_native_helper(
                             &THREAD_CURRENT_THREAD_DIRECT_FN,
                             jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16920,6 +17005,7 @@ fn try_compile_inner(
                         let entry = direct_native_helper(
                             &INTEGER_VALUE_OF_DIRECT_FN,
                             jdk_only,
+                            intrinsic_resolver,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -17177,6 +17263,7 @@ fn try_compile_inner(
                     let entry = direct_native_helper(
                         &INTEGER_INT_VALUE_DIRECT_FN,
                         jdk_only,
+                        intrinsic_resolver,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17207,6 +17294,7 @@ fn try_compile_inner(
                     let entry = direct_native_helper(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
                         jdk_only,
+                        intrinsic_resolver,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17264,6 +17352,7 @@ fn try_compile_inner(
                             direct_native_helper(
                                 &HASHMAP_PUT_DIRECT_FN,
                                 jdk_only,
+                                intrinsic_resolver,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -17279,6 +17368,7 @@ fn try_compile_inner(
                             direct_native_helper(
                                 &HASHMAP_GET_DIRECT_FN,
                                 jdk_only,
+                                intrinsic_resolver,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -18657,12 +18747,14 @@ mod tests {
         // below, and it is asked per compilation.
         CELL.store(0xdead_beef, std::sync::atomic::Ordering::Relaxed);
 
-        // Strict refuses and records.
+        // No resolver: strict refuses and records. This is also the §4
+        // fail-closed case — a compile with no way to ask the registry cannot
+        // bake a native in front of real bytes.
         let before = jdk_only_direct_native_refusals();
         assert_eq!(
-            direct_native_helper(&CELL, true, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            direct_native_helper(&CELL, true, None, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
             0,
-            "a JdkOnly compilation must not bind a thin direct-call helper"
+            "a JdkOnly compilation with no resolver must not bind a thin direct-call helper"
         );
         assert!(
             jdk_only_direct_native_refusals() > before,
@@ -18673,18 +18765,71 @@ mod tests {
         // call above. Under the latch this is exactly the assertion that
         // failed, because the strict answer poisoned the process.
         assert_eq!(
-            direct_native_helper(&CELL, false, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            direct_native_helper(&CELL, false, None, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
             0xdead_beef,
             "a Compatible compilation lost its helper because another VM was strict"
         );
 
         // And the unset sentinel is still the unset sentinel in both modes.
         CELL.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(direct_native_helper(&CELL, false, None, "c", "m", "()V"), 0);
+        assert_eq!(direct_native_helper(&CELL, true, None, "c", "m", "()V"), 0);
+    }
+
+    /// JDK-ONLY-WAVE2 §4: under `JdkOnly` the bind decision is the registry's
+    /// `NativeKind`, not a hard-coded triple list.
+    ///
+    /// §1.4 names `Intrinsic` as the reviewed exception that MAY shadow
+    /// concrete bytecode. The pre-2026-08-06 gate refused all seven ladders
+    /// wholesale, which is stricter than the contract: measured against
+    /// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, three of them
+    /// (`StringLatin1.toLowerCase`, `Integer.valueOf(I)`, `Integer.intValue`)
+    /// are registered `Intrinsic`.
+    #[test]
+    fn direct_native_helper_asks_the_registry_not_a_name_list() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CELL.store(0xfeed_face, std::sync::atomic::Ordering::Relaxed);
+
+        let intrinsic = |_c: &str, _m: &str, _d: &str| true;
+        let bridge = |_c: &str, _m: &str, _d: &str| false;
+
+        // Intrinsic: §1.4's reviewed exception, so it binds even under strict.
         assert_eq!(
-            direct_native_helper(&CELL, false, "c", "m", "()V"),
-            0
+            direct_native_helper(
+                &CELL,
+                true,
+                Some(&intrinsic),
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;"
+            ),
+            0xfeed_face,
+            "a reviewed Intrinsic must still bind under JdkOnly (§1.4)"
         );
-        assert_eq!(direct_native_helper(&CELL, true, "c", "m", "()V"), 0);
+
+        // Bridge (and SyntheticStub, and unregistered — the resolver answers
+        // `false` for all three): refused, and recorded.
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper(
+                &CELL,
+                true,
+                Some(&bridge),
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0,
+            "a Bridge must not shadow concrete bytecode under JdkOnly"
+        );
+        assert!(jdk_only_direct_native_refusals() > before);
+
+        // Compatible is unchanged by the kind either way — the resolver is
+        // only consulted on the strict arm.
+        assert_eq!(
+            direct_native_helper(&CELL, false, Some(&bridge), "java/util/HashMap", "put", "()V"),
+            0xfeed_face
+        );
     }
     /// Poll `cond` until it holds, for up to ~1s.
     ///
