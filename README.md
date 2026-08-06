@@ -56,15 +56,16 @@ the window opened). Full methodology in [BENCHMARK.md](BENCHMARK.md).
 | Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
 |-------------------------|-----------|-----------|-----------|---------------|---------------|
 | Arithmetic (2B ops)     | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
-| Fibonacci(44)           | 1,444 ms  | 8,503 ms‡ | 5.89x‡    | 3.5% | 2.79x |
+| Fibonacci(44)           | 1,679 ms‡ | 6,013 ms‡ | 3.58x‡    | 14.5%‡ | 5.89x |
 | Sieve (100K × 20K)      | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
 | Matrix 1280×1280        | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
 | HashMap (10M put/get)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | 1.75x |
 | String/Regex (100K)     | 51 ms     | 274 ms    | 5.37x     | 1.1% | 7.7x  |
 | Binary Trees (depth 18) | 177 ms    | 1,674 ms  | 9.46x     | 0.4% | 8.34x |
 
-CratonVM's run-to-run spread is under 1% on five of the seven rows. Ratios are
-the durable content; absolute times are this host on this day.
+CratonVM's run-to-run spread is under 1% on five of the seven rows —
+Fibonacci is the exception and its footnote says why. Ratios are the durable
+content; absolute times are this host on this day.
 
 **Two rows are now at parity with HotSpot C2** — Matrix (from 2.93x) and Sieve.
 Arithmetic and String/Regex also closed materially against the July figures.
@@ -73,22 +74,40 @@ since-re-provisioned host, and those July absolutes were never re-measured
 under the current protocol — see BENCHMARK.md before reading the two as
 regressions.
 
-‡ **Fibonacci was a real regression, and this row predates its fix.** Unlike
-HashMap and Binary Trees, it does not need the caveat above: it was confirmed
-on *one* host in *one* interleaved window — 4,240 ms on a 2026-07-23 build
-against 8,400 ms on `dev`, same JDK, same classes, **1.96x**. The cause was
-found on 2026-08-05 and is not a tiering or optimizer decision. Both JIT
-backends erase the dead shadow-stack thread fetch from the prologue; the
-single-pass backend has jumped over the erased ~46-byte span since June, while
-the IR backend only overwrote it with one-byte `NOP`s. So every IR method that
+‡ **Fibonacci was a real regression; it was fixed, and this row is re-measured
+in a worse window than the other six.** Both halves of that matter.
+
+*It was real.* Unlike HashMap and Binary Trees it does not need the caveat
+above: it was confirmed on *one* host in *one* interleaved window — 4,240 ms on
+a 2026-07-23 build against 8,400 ms on `dev`, same JDK, same classes,
+**1.96x**. The cause is not a tiering or optimizer decision. Both JIT backends
+erase the dead shadow-stack thread fetch from the prologue; the single-pass
+backend has jumped over the erased ~46-byte span since June, while the IR
+backend only overwrote it with one-byte `NOP`s. So every IR method that
 published nothing **retired 46 NOPs on entry, on every invocation** — and
 `fib`, a two-line static method entered 2.27e9 times, paid it 2.27e9 times.
 Fixed 2026-08-05: **1.74x** recovered against its own parent commit (8
 interleaved pairs, user CPU time, disjoint ranges), all seven phase checksums
 unchanged
 (`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`).
-The number above is the **pre-fix** measurement and is refreshed on the next
-quiet-window run; the fix is on `dev`, this row is not yet.
+It was 5.89x (8,503 ms) before the fix, which is what the "was" column now
+holds; the 2026-07 figure it displaced was 2.79x.
+
+*The window was worse.* The other six rows were taken at 1-minute load 1.9–3.7.
+The quietest window available for this re-measure opened at 4.59 and had drifted
+to 7.65 by the seventh pair, where two samples landed at 7,908 and 8,200 ms
+against a 5,706–6,059 ms body — hence **CV 14.5%**, against 0.2–3.5% elsewhere.
+No sample was discarded, which is the protocol. **Both columns in this row come
+from that window**, including the JDK 25 C2 figure: HotSpot read 1,679 ms there
+against the 1,444 ms it records in the quiet window the other rows used, so the
+two arms are paired and the 3.58x ratio is sound even though neither absolute
+is comparable across rows. A stricter re-measure (load < 4.0, aborting if it
+rises mid-series) is queued and this row will tighten when the host allows.
+
+For scale, the pre-regression single-pass body would sit near 2.9x on this
+benchmark, so roughly a fifth of the original gap is still open — precise-root
+and deopt metadata the IR tier emits and the single-pass backend did not. That
+is `perf-01`'s open policy question, not a defect.
 
 † **Sieve's HotSpot column is pooled across two runs, and that is not a
 convenience.** HotSpot on this phase is *bimodal*: across 18 samples it lands
