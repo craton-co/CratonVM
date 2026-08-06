@@ -218,12 +218,21 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    `StrictBoot` reaches `main` with **zero** fabricated compatibility classes.
 3. ~~Retag the unmodifiable / factory / comparator natives, then migrate their
    allocators~~ — done 2026-08-05; all three measured workloads are at zero.
-4. The four shapes that are still refused rather than removed —
+4. ~~The four shapes that are still refused rather than removed —
    `java/util/HashMap$KeyItr`, `cratonvm/internal/ArrayListSubList`,
-   `StreamCollector`, `SystemLogger` — plus `java/util/Enumeration$Impl` in
-   `classloader.rs`'s `getResources` helpers. Each needs its native retagged
-   first, and each is blocked on state that lives in a CratonVM native rather
-   than in the real object's fields (see the delegate-vs-read test above).
+   `StreamCollector`, `SystemLogger`~~ — all four now have somewhere for the
+   refusal to LAND, which the note above was wrong to think impossible: the
+   first three on 2026-08-05 (real `Arrays$ArrayList` iterator,
+   `Spliterators.iterator`), `SystemLogger` on 2026-08-06 (a real
+   `jdk.internal.logger.SimpleConsoleLogger`, built through its own `<init>`).
+   That last one was reached from `ObjectInputFilter$Config.<clinit>`, so
+   refusing it had been costing every `ObjectInputStream` construction in the
+   VM. See
+   `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
+   **Still open here:** `java/util/Enumeration$Impl` in `classloader.rs`'s
+   `getResources` helpers, which has no such landing yet. And the refusals are
+   landings, not removals — the natives themselves are still registered, which
+   is item 5's business.
 5. Make the three allocation funnels fallible (~2,300 call sites), then delete
    `ensure_synthetic_class`.
 
