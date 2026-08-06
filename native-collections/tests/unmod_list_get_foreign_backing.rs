@@ -36,6 +36,8 @@ use cratonvm_types::Value;
 const COLLECTIONS: &str = "java/util/Collections";
 const UNMOD_LIST: &str = "cratonvm/internal/UnmodifiableList";
 const GET: &str = "(I)Ljava/lang/Object;";
+/// Slot 1 of the wrapper — `freeze_result` stamps it for the `List.of` family.
+const UNMOD_FIELD_IMMUTABLE: usize = 1;
 
 /// Wrap `backing` with the real `Collections.unmodifiableList` native.
 fn wrap(
@@ -104,25 +106,49 @@ fn get_over_a_linkedlist_backing_delegates_instead_of_throwing() {
 }
 
 #[test]
-fn get_over_an_arraylist_backing_still_bounds_checks() {
+fn a_readable_arraylist_backing_still_bounds_checks() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
 
-    // The ArrayList backing IS readable, so the pre-check stays in force and
-    // keeps raising ArrayIndexOutOfBoundsException — the behaviour measured
-    // against HotSpot for `List.of()` and `List.of(a,b,c,d)`.
+    // An ArrayList backing IS readable, so the pre-check computes a real size
+    // (0) — but for a `Collections.unmodifiable*` VIEW it still defers the
+    // exception to the delegate, because on HotSpot the backing decides both
+    // class and wording. `unmod_list_oob_error` owns that split and is tested
+    // next to itself; what is pinned here is that the call reaches the backing
+    // rather than being answered from a size the wrapper invented.
     let backing = new_arraylist(&reg, &mut ctx);
     let wrapper = wrap(&reg, &mut ctx, backing);
-
-    let err = call(
+    ctx.clear_invoke_virtual_log();
+    let _ = call(
         &reg,
         &mut ctx,
         UNMOD_LIST,
         "get",
         GET,
         &[Value::Object(Some(wrapper)), Value::Int(0)],
+    );
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .any(|(recv, name, ..)| *recv == backing.as_ptr() as usize && name == "get"),
+        "an unmodifiable VIEW must let its backing raise the bounds error",
+    );
+
+    // The same wrapper marked immutable is a `List.of`-flavoured receiver, and
+    // `ImmutableCollections.ListN` indexes its array directly — so at 0 or 3+
+    // elements the subclass is the right answer and the pre-check raises it
+    // without a delegate round trip.
+    let immutable = wrap(&reg, &mut ctx, backing);
+    ctx.set_field(immutable, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
+    let err = call(
+        &reg,
+        &mut ctx,
+        UNMOD_LIST,
+        "get",
+        GET,
+        &[Value::Object(Some(immutable)), Value::Int(0)],
     )
-    .expect_err("get(0) on an empty ArrayList backing must raise");
+    .expect_err("get(0) on an empty List.of-shaped receiver must raise");
     assert!(
         format!("{err:?}").contains("ArrayIndexOutOfBounds"),
         "expected ArrayIndexOutOfBoundsException, got {err:?}",
