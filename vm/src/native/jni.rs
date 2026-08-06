@@ -1407,11 +1407,16 @@ unsafe fn jvalues_to_values(args: *const JValue, types: &[u8]) -> Vec<Value> {
 /// always dropped (a separate, pre-existing gap; see the JDK-ONLY-NOTE below) —
 /// takes precisely the path it took before.
 ///
-/// JDK-ONLY-NOTE (pre-existing, orthogonal to this feature, not fixed here): the
-/// JNI `Call*Method` helpers silently swallow
-/// `MethodCallFailed::ExceptionThrown`, so a Java exception thrown by a
-/// JNI-initiated call never becomes a pending JNI exception. Fixing it would
-/// alter `Compatible` behaviour, which this wave may not do.
+/// JDK-ONLY-NOTE — **CLOSED.** This used to read "the JNI `Call*Method` helpers
+/// silently swallow `MethodCallFailed::ExceptionThrown`, so a Java exception
+/// thrown by a JNI-initiated call never becomes a pending JNI exception. Fixing
+/// it would alter `Compatible` behaviour, which this wave may not do." The
+/// `ExceptionThrown` arm below has published the pending exception since the
+/// bare-varargs `Call<T>Method` slots started dispatching, so the note has been
+/// contradicted by the code thirty lines under it. Corrected 2026-08-06.
+///
+/// What is still dropped is every OTHER `Err(_)`, which is the honest residual:
+/// an internal VM failure has no JNI representation short of inventing one.
 #[inline]
 fn jni_surface_jdk_only(
     shared: &SharedVm,
@@ -1460,10 +1465,25 @@ fn jni_surface_jdk_only(
 /// sites are *inside* that closure. Cold: only ever reached on a refusal, so the
 /// `String` the message needs is never built on the fast path.
 ///
-/// ORCHESTRATOR: the exception class is `java/lang/InternalError`. If agent B's
-/// `--explain-jdk-only` rendering settles on a different Java-visible type for
-/// violations, this should follow it — the message body is
-/// `JdkOnlyViolation::summary()` either way.
+/// The exception class is `java/lang/InternalError`, and as of 2026-08-06 that
+/// is a decision rather than a placeholder. The open question this comment used
+/// to carry — "if `--explain-jdk-only`'s rendering settles on a different
+/// Java-visible type, follow it" — was checked and has no answer to follow:
+/// `JdkOnlyViolation::render` produces a text/JSON report and names no Java
+/// type, so nothing else in the tree materialises a violation as a throwable.
+///
+/// `InternalError` satisfies the constraint that actually matters, which is
+/// that a policy refusal must be **catchable**: this builds a real exception
+/// object and leaves it pending, so a native's `ExceptionCheck` sees it and a
+/// `catch (Throwable)` can observe it. That is the opposite of the bare
+/// `MethodCallFailed::InternalError` the other refusal sites return, whose own
+/// doc says it is "not catchable by Java code" and aborts the run — this JNI
+/// path is the one place a `--jdk-only` refusal is already the right shape.
+/// Contract §5's spec-appropriate types (`NoClassDefFoundError` and friends,
+/// via `native_api::refusal_to_java_failure`) apply to class-identity
+/// refusals; a dispatch-policy refusal is not one of those, so it does not
+/// inherit their type. Revisit only if a Java-visible type is chosen elsewhere.
+/// The message body is `JdkOnlyViolation::summary()` either way.
 #[cold]
 #[inline(never)]
 fn raise_jdk_only_violation(
@@ -5098,37 +5118,35 @@ struct JNINativeMethod {
 // caller's guarantee that they're valid (they're passed in from C). The struct
 // itself is never stored.
 
-/// Global table of JNI native function pointers registered via `RegisterNatives`.
-/// Key = FNV-1a hash of "class_name.method_nameDescriptor".
-/// Value = raw function pointer (to be called with `dispatch_jni_native`).
+/// The table type behind `SharedVm::natives::jni_native_methods`.
 ///
-/// JDK-only mode (`docs/feature-designs/jdk-only-mode.md`): this table is a
-/// **second, parallel native registry** and is deliberately left as one.
-/// Everything in it is a real function pointer inside a real `.so`/`.dll` that
-/// a real JNI library published — i.e. exactly the "native code may cross VM
-/// boundaries" case §11 sanctions. There is no `NativeKind` to attach because
-/// there is no CratonVM-authored implementation to classify: a
-/// `NativeKind::SyntheticStub` cannot get in here, so this table cannot be the
-/// §1.3 bypass the single-resolver rule targets. Its dispatch sites
-/// (`vm/src/vm/vm_exec.rs`, agent E) already consult `resolve_dispatch` before
-/// falling through to `find_jni_native`.
+/// Key = FNV-1a hash of `"class_name.method_nameDescriptor"`, value = the raw
+/// `fn` address inside the host library, called through `dispatch_jni_native`.
 ///
-/// Two consequences the orchestrator should know:
+/// This was the process global `static JNI_NATIVE_METHODS` here until
+/// 2026-08-06 — `JDK-ONLY-WAVE2` §6 of
+/// `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`.
+/// Contract §2 forbids process globals for this feature's state, and the
+/// concrete hazard was that two VMs in one process saw each other's
+/// `RegisterNatives`: a library loaded by VM A bound its pointers for VM B too.
 ///
-/// * These invocations are **not** in the §4 census. `record_invocation` keys on
-///   a `NativeMethodId`, which only `NativeMethodRegistry` issues. The census's
-///   `synthetic_stub_invocations` count is therefore still exact (a stub can
-///   never be here), but `bridge_invocations` under-counts genuine JNI bridges.
+/// JDK-only mode: this remains a **second, parallel native registry** and is
+/// deliberately left as one. Everything in it is a real function pointer inside
+/// a real `.so`/`.dll` that a real JNI library published — exactly the "native
+/// code may cross VM boundaries" case §11 sanctions. There is no `NativeKind`
+/// to attach because there is no CratonVM-authored implementation to classify:
+/// a `NativeKind::SyntheticStub` cannot get in here, so this table cannot be
+/// the §1.3 bypass the single-resolver rule targets. Its dispatch sites in
+/// `vm/src/vm/vm_exec.rs` consult `resolve_dispatch` before falling through to
+/// [`find_jni_native`].
 ///
-/// * JDK-ONLY-WAVE2: this is a **process global**, which contract §2 forbids for
-///   this feature's state ("no process globals … a process global would break
-///   multi-VM-in-one-process runs"). It predates the feature and holds only
-///   dlsym results, so it is not JDK-only state; it should nonetheless move into
-///   `SharedVm::natives` alongside `native_methods` so two VMs in one process
-///   cannot see each other's `RegisterNatives`. NOT moved this wave — it is
-///   touched by `vm_exec.rs`, owned by another agent.
-static JNI_NATIVE_METHODS: std::sync::LazyLock<parking_lot::RwLock<HashMap<u64, usize>>> =
-    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+/// The census gap the move does NOT close: these invocations are still outside
+/// the §4 per-kind totals, because `record_invocation` keys on a
+/// `NativeMethodId` and only `NativeMethodRegistry` issues one — there is no
+/// honest way to mint one for a `dlsym` result. `synthetic_stub_invocations`
+/// stays exact (a stub can never be here); `bridge_invocations` under-counts
+/// genuine JNI bridges by exactly the number of dispatches through this table.
+pub type JniNativeMethodTable = parking_lot::RwLock<HashMap<u64, usize>>;
 
 /// Compute a hash key for a (class, method, descriptor) triple.
 /// Identical algorithm to `NativeMethodRegistry::native_method_hash`.
@@ -5153,10 +5171,20 @@ fn jni_native_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 
     h
 }
 
-/// Store a JNI function pointer registered via `RegisterNatives` or symbol lookup.
-pub fn register_jni_native(class_name: &str, method_name: &str, descriptor: &str, fn_ptr: usize) {
+/// Store a JNI function pointer in a specific table.
+///
+/// The `_in` pair is where the logic lives so a test can hand in a table
+/// without standing up a whole `NativeRealm` — and, more usefully, so the
+/// per-VM isolation this move exists for is directly testable with two of them.
+pub fn register_jni_native_in(
+    table: &JniNativeMethodTable,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    fn_ptr: usize,
+) {
     let key = jni_native_key(class_name, method_name, descriptor);
-    let mut table = JNI_NATIVE_METHODS.write();
+    let mut table = table.write();
     if let Some(&existing) = table.get(&key) {
         if existing != fn_ptr {
             tracing::warn!(
@@ -5168,11 +5196,49 @@ pub fn register_jni_native(class_name: &str, method_name: &str, descriptor: &str
     table.insert(key, fn_ptr);
 }
 
-/// Look up a JNI function pointer for the given method.
-/// Returns `None` if no pointer was registered.
-pub fn find_jni_native(class_name: &str, method_name: &str, descriptor: &str) -> Option<usize> {
+/// Look up a JNI function pointer in a specific table.
+pub fn find_jni_native_in(
+    table: &JniNativeMethodTable,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<usize> {
     let key = jni_native_key(class_name, method_name, descriptor);
-    JNI_NATIVE_METHODS.read().get(&key).copied()
+    table.read().get(&key).copied()
+}
+
+/// Store a JNI function pointer registered via `RegisterNatives` or symbol
+/// lookup, in **this VM's** table.
+pub fn register_jni_native(
+    natives: &crate::vm::realms::NativeRealm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    fn_ptr: usize,
+) {
+    register_jni_native_in(
+        &natives.jni_native_methods,
+        class_name,
+        method_name,
+        descriptor,
+        fn_ptr,
+    );
+}
+
+/// Look up a JNI function pointer for the given method in **this VM's** table.
+/// Returns `None` if no pointer was registered.
+pub fn find_jni_native(
+    natives: &crate::vm::realms::NativeRealm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<usize> {
+    find_jni_native_in(
+        &natives.jni_native_methods,
+        class_name,
+        method_name,
+        descriptor,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -5255,7 +5321,7 @@ pub fn jni_long_name(class_name: &str, method_name: &str, descriptor: &str) -> S
 /// Tries the short name first, then the long name (JNI spec §11.3 resolution order).
 /// If found, the function pointer is cached in `JNI_NATIVE_METHODS` for future lookups.
 pub fn resolve_jni_native_in_libraries(
-    native_libraries: &parking_lot::Mutex<Vec<libloading::Library>>,
+    natives: &crate::vm::realms::NativeRealm,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
@@ -5263,7 +5329,7 @@ pub fn resolve_jni_native_in_libraries(
     let short = jni_short_name(class_name, method_name);
     let long = jni_long_name(class_name, method_name, descriptor);
 
-    let libs = native_libraries.lock();
+    let libs = natives.native_libraries.lock();
     for symbol_name in [&short, &long] {
         let c_name = match std::ffi::CString::new(symbol_name.as_bytes()) {
             Ok(c) => c,
@@ -5276,7 +5342,7 @@ pub fn resolve_jni_native_in_libraries(
                 if fn_ptr != 0 {
                     // Cache for future lookups
                     drop(libs);
-                    register_jni_native(class_name, method_name, descriptor, fn_ptr);
+                    register_jni_native(natives, class_name, method_name, descriptor, fn_ptr);
                     tracing::info!(
                         symbol = %symbol_name,
                         method = %format!("{}.{}{}", class_name, method_name, descriptor),
@@ -5925,7 +5991,12 @@ extern "C" fn jni_register_natives(
         let name = unsafe { CStr::from_ptr(m.name).to_string_lossy().into_owned() };
         let sig = unsafe { CStr::from_ptr(m.signature).to_string_lossy().into_owned() };
         let fn_ptr = m.fn_ptr as usize;
-        register_jni_native(&class_name, &name, &sig, fn_ptr);
+        // Bind into the CALLING VM's table. `with_shared_vm` is the same handle
+        // the class name above was read through, so a `RegisterNatives` driven
+        // by a library another VM in this process loaded cannot land here.
+        with_shared_vm(|shared| {
+            register_jni_native(&shared.natives, &class_name, &name, &sig, fn_ptr);
+        });
     }
     JNI_OK
 }
@@ -5974,10 +6045,16 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
         .unwrap_or_default();
 
         if !methods_to_remove.is_empty() {
-            let mut table = JNI_NATIVE_METHODS.write();
-            for key in &methods_to_remove {
-                table.remove(key);
-            }
+            // Unbind from the CALLING VM's table only — the mirror image of
+            // `RegisterNatives` above. While this was a process global, an
+            // `UnregisterNatives` in one VM tore down another VM's bindings for
+            // the same class.
+            with_shared_vm(|shared| {
+                let mut table = shared.natives.jni_native_methods.write();
+                for key in &methods_to_remove {
+                    table.remove(key);
+                }
+            });
             tracing::debug!(
                 "UnregisterNatives: removed {} native methods for {}",
                 methods_to_remove.len(),
@@ -8528,15 +8605,54 @@ mod tests {
             42
         }
         let fn_ptr = fake_native as *const () as usize;
-        register_jni_native("com/example/Foo", "bar", "()J", fn_ptr);
+        let table = JniNativeMethodTable::default();
+        register_jni_native_in(&table, "com/example/Foo", "bar", "()J", fn_ptr);
         assert_eq!(
-            find_jni_native("com/example/Foo", "bar", "()J"),
+            find_jni_native_in(&table, "com/example/Foo", "bar", "()J"),
             Some(fn_ptr)
         );
         // Different class → not found
-        assert!(find_jni_native("com/example/Other", "bar", "()J").is_none());
+        assert!(find_jni_native_in(&table, "com/example/Other", "bar", "()J").is_none());
         // Different descriptor → not found
-        assert!(find_jni_native("com/example/Foo", "bar", "()V").is_none());
+        assert!(find_jni_native_in(&table, "com/example/Foo", "bar", "()V").is_none());
+    }
+
+    /// The point of moving this table off a process global (JDK-ONLY-WAVE2 §6,
+    /// 2026-08-06): two VMs in one process must not see each other's
+    /// `RegisterNatives`. While the table was a `static`, this test could not
+    /// even be written — there was one table and the second `register` would
+    /// have been visible to the first lookup.
+    #[test]
+    fn jni_native_tables_are_isolated_per_vm() {
+        extern "C" fn a(_env: JNIEnv, _this: JObject) -> u64 {
+            1
+        }
+        extern "C" fn b(_env: JNIEnv, _this: JObject) -> u64 {
+            2
+        }
+        let (vm_a, vm_b) = (
+            JniNativeMethodTable::default(),
+            JniNativeMethodTable::default(),
+        );
+
+        register_jni_native_in(&vm_a, "com/example/Iso", "m", "()J", a as *const () as usize);
+
+        // VM B has not bound it, and must not inherit VM A's binding.
+        assert!(
+            find_jni_native_in(&vm_b, "com/example/Iso", "m", "()J").is_none(),
+            "VM B saw a RegisterNatives that only VM A performed"
+        );
+
+        // And once B binds its own, the two answer differently for one triple.
+        register_jni_native_in(&vm_b, "com/example/Iso", "m", "()J", b as *const () as usize);
+        assert_eq!(
+            find_jni_native_in(&vm_a, "com/example/Iso", "m", "()J"),
+            Some(a as *const () as usize)
+        );
+        assert_eq!(
+            find_jni_native_in(&vm_b, "com/example/Iso", "m", "()J"),
+            Some(b as *const () as usize)
+        );
     }
 
     /// JNI spec 11.3 name mangling, pinned against symbols a real toolchain
@@ -8592,10 +8708,11 @@ mod tests {
         extern "C" fn v2(_env: JNIEnv, _this: JObject) -> u64 {
             2
         }
-        register_jni_native("com/example/Baz", "quux", "()I", v1 as *const () as usize);
-        register_jni_native("com/example/Baz", "quux", "()I", v2 as *const () as usize);
+        let table = JniNativeMethodTable::default();
+        register_jni_native_in(&table, "com/example/Baz", "quux", "()I", v1 as *const () as usize);
+        register_jni_native_in(&table, "com/example/Baz", "quux", "()I", v2 as *const () as usize);
         assert_eq!(
-            find_jni_native("com/example/Baz", "quux", "()I"),
+            find_jni_native_in(&table, "com/example/Baz", "quux", "()I"),
             Some(v2 as *const () as usize)
         );
     }

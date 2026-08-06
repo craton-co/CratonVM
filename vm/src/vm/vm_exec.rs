@@ -23846,7 +23846,12 @@ fn invoke_on_class_shared_inner(
         } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
             None
         } else {
-            crate::native::jni::find_jni_native(&class_name, method_name, descriptor)
+            crate::native::jni::find_jni_native(
+                &shared.natives,
+                &class_name,
+                method_name,
+                descriptor,
+            )
         } {
             // JNI function pointer registered via RegisterNatives or symbol lookup.
             // Set TLS context so that JNI callbacks (e.g. FindClass, CallMethod)
@@ -23942,7 +23947,7 @@ fn invoke_on_class_shared_inner(
             None
         } else {
             crate::native::jni::resolve_jni_native_in_libraries(
-                &shared.natives.native_libraries,
+                &shared.natives,
                 &class_name,
                 method_name,
                 descriptor,
