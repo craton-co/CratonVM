@@ -2046,14 +2046,44 @@ impl Compiler {
                     } else {
                         let a_slot = self.peek_stack();
                         let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let before = self.stack.len();
                         self.load_slot_to_reg(RAX, a_slot);
                         self.push_from_rax(); // […, b, a, aC]
+                        // `push_from_rax` is silent when `push_stack` cannot
+                        // reserve a spill slot: it emits nothing and does NOT
+                        // grow the model. The rotate below indexes `n - 3`, so
+                        // a missed push rotates the WRONG three entries and
+                        // leaves the operand stack one short — silent wrong
+                        // code rather than a bail.
+                        if self.stack.len() != before + 1 {
+                            self.fail("singlepass-codegen/dup_x1-copy-not-pushed");
+                            pc += 1;
+                            continue;
+                        }
                         if a_oop {
                             self.mark_top_as_oop();
                         }
                         let n = self.stack.len();
+                        if dupx_trace() {
+                            eprintln!(
+                                "[DUPX1-TRACE] {} pc={} before={:?} marks={:?}",
+                                self.method_key,
+                                pc,
+                                &self.stack[n - 3..],
+                                &self.stack_oop_marks[n - 3..]
+                            );
+                        }
                         self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
                         self.stack_oop_marks[n - 3..].rotate_right(1);
+                        if dupx_trace() {
+                            eprintln!(
+                                "[DUPX1-TRACE] {} pc={} after ={:?} marks={:?}",
+                                self.method_key,
+                                pc,
+                                &self.stack[n - 3..],
+                                &self.stack_oop_marks[n - 3..]
+                            );
+                        }
                         if dupx_eager_canon() {
                             self.canonicalize_stack();
                         }
@@ -8709,17 +8739,42 @@ impl Compiler {
                             // complete caller state before entering its handler.
                             let protected_precise_handler_call = self.precise_exception_frames
                                 && self.pc_is_protected(pc);
+                            // Per-site bisect levers (`CRATONVM_JIT_SP_IC_ONLY`
+                            // / `_DENY`). Inert unless one is set: the whole
+                            // cascade is a program-wide switch otherwise, which
+                            // localises a defect to this edge but not to a site.
+                            let site_allowed = sp_ic_site_allowed(
+                                &self.method_label,
+                                info_ref.class_name,
+                                info_ref.method_name,
+                            );
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
                                     && sp_inline_ic_enabled()
+                                    && site_allowed
                                     && !regex_backtracking_frame
                                     && !protected_precise_handler_call;
-                            let pic_inline =
-                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let pic_inline = inline_virtual_ic_allowed
+                                && sp_inline_pic_enabled()
+                                && pic_ptr.is_some()
+                                && args_fit;
                             let mic_inline = inline_virtual_ic_allowed
+                                && sp_inline_mic_enabled()
                                 && !pic_inline
                                 && mic_ptr.is_some()
                                 && args_fit;
+                            if sp_ic_site_trace() {
+                                eprintln!(
+                                    "[SP_IC_SITE] {}||{}.{}{} pc={} pic={} mic={}",
+                                    self.method_label,
+                                    info_ref.class_name,
+                                    info_ref.method_name,
+                                    info_ref.descriptor,
+                                    pc,
+                                    pic_inline,
+                                    mic_inline,
+                                );
+                            }
                             // `.done` patches collected from each emitted
                             // fast-path. Multiple in PIC's case (one per
                             // slot), one in MIC's, none if neither inline
@@ -9388,7 +9443,9 @@ impl Compiler {
                             // megamorphic misses through this exact library.
                             // It reloads arg0, performs two lock-free probes,
                             // and falls through here only on a real miss.
-                            if let Some(pic) = pic_ptr.filter(|_| inline_virtual_ic_allowed) {
+                            if let Some(pic) = pic_ptr
+                                .filter(|_| inline_virtual_ic_allowed && sp_inline_mega_enabled())
+                            {
                                 let arg_offsets: Vec<i32> = (0..n)
                                     .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
                                     .collect();

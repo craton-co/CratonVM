@@ -10976,6 +10976,24 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let ref_addr = reference_obj.as_ptr() as usize;
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
+        // processor is told about, not just its numeric type tag. The tag
+        // cannot distinguish an ordinary `PhantomReference` from a
+        // `jdk.internal.ref.Cleaner`, because a `Cleaner` IS a phantom: its
+        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
+        // native and arrives here as `2`. This is the instrument that answered
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md`'s open question
+        // ("find where a real-JDK `jdk.internal.ref.Cleaner` is actually
+        // discovered"), and it is placed BEFORE the type-4 branch below so it
+        // reports whichever wire value a given build's discovery site chose.
+        if crate::runtime::interpreter::dbg_refdisc_enabled() {
+            let cn = self
+                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[refdisc] wire={ref_type} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
+            );
+        }
         // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
         // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
