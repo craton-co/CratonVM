@@ -1306,7 +1306,7 @@ fn native_antlr_atn_state_transition(
         _ => 0,
     };
     if index < 0 {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
 
     let transitions = antlr_atn_state_transitions(ctx, this)?;
@@ -1320,7 +1320,7 @@ fn native_antlr_atn_state_transition(
         let index_usize = index as usize;
         let size = antlr_arraylist_size(ctx, transitions);
         if index_usize >= size || index_usize >= ctx.array_length(data) {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            return Err(RuntimeError::aioobe_index_only(index).into());
         }
         return Ok(Some(ctx.get_array_element(data, index_usize)));
     }
@@ -1726,10 +1726,7 @@ fn antlr_list_get(
             .into());
         };
         if index >= antlr_arraylist_size(ctx, list) || index >= ctx.array_length(data) {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: index as i32,
-            }
-            .into());
+            return Err(RuntimeError::aioobe_index_only(index as i32).into());
         }
         return Ok(ctx.get_array_element(data, index));
     }

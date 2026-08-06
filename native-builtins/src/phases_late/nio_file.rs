@@ -10817,9 +10817,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: if off < 0 { off } else { off.wrapping_add(len) },
-                }
+                cratonvm_types::error::RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into(),
             );
         }
@@ -10926,9 +10928,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: if off < 0 { off } else { off.wrapping_add(len) },
-                }
+                cratonvm_types::error::RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into(),
             );
         }
@@ -10987,9 +10991,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: if off < 0 { off } else { off.wrapping_add(len) },
-                }
+                cratonvm_types::error::RuntimeError::aioobe_index_only(if off < 0 {
+                    off
+                } else {
+                    off.wrapping_add(len)
+                })
                 .into(),
             );
         }

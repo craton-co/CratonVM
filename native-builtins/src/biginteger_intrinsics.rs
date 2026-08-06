@@ -64,7 +64,7 @@ fn read_int(
     len: usize,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }.into());
+        return Err(RuntimeError::aioobe_index_only(idx as i32).into());
     }
     match ctx.get_array_element(arr, idx) {
         Value::Int(v) => Ok(v),
@@ -86,7 +86,7 @@ fn write_int(
     val: i32,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }.into());
+        return Err(RuntimeError::aioobe_index_only(idx as i32).into());
     }
     ctx.set_array_element(arr, idx, Value::Int(val));
     Ok(())
@@ -421,10 +421,7 @@ fn write_int_array(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let n = ctx.array_length(arr);
     if src.len() > n {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: src.len() as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only(src.len() as i32).into());
     }
     for (i, v) in src.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(*v));
@@ -505,17 +502,11 @@ fn native_shift_left_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let new_len = ctx.array_length(new_arr);
     let old_len = ctx.array_length(old_arr);
     if num_iter > old_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: num_iter as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only(num_iter as i32).into());
     }
     // Worker writes to (numIter - 1) cells starting at new_idx; ensure room.
     if num_iter > 0 && new_idx + (num_iter - 1) > new_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (new_idx + num_iter) as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only((new_idx + num_iter) as i32).into());
     }
 
     // Materialise; if newArr is the same array as oldArr, we still need the
@@ -554,10 +545,7 @@ fn native_shift_right_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) -
     let new_len = ctx.array_length(new_arr);
     let old_len = ctx.array_length(old_arr);
     if num_iter > old_len || num_iter > new_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: num_iter as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only(num_iter as i32).into());
     }
 
     let old = read_int_array(ctx, old_arr)?;
@@ -591,15 +579,12 @@ fn native_impl_mul_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let out_len = ctx.array_length(out_ref);
     let in_len = ctx.array_length(in_ref);
     if len > in_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: len as i32 }.into());
+        return Err(RuntimeError::aioobe_index_only(len as i32).into());
     }
     // Per JDK: writes go to out[out.len() - offset - 1] downward through
     // out[out.len() - offset - len]. Both must be in-range.
     if offset + 1 > out_len || offset + len > out_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: (offset + len) as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only((offset + len) as i32).into());
     }
 
     let in_vec = read_int_array(ctx, in_ref)?;
