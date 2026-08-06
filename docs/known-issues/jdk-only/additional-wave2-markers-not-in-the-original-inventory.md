@@ -137,8 +137,52 @@ record's own count was 39% low.
   reaches these ladders (`jit_direct_native_binds = 0`), so it could not tell a
   gate that refuses from one that is never asked.
 
-**Still open:** §8, the bulk of §11, §3's Matcher-leaf residual, and the
-`jit_entry_publishable` half of §2 (which refuses nothing — see §1 above).
+### Fourth pass, same day — §8 and §11, measured
+
+Both sections describe a per-family deletion exercise and neither had been
+measured; "each entry is load-bearing for a real boot today" was an assumption.
+`CRATONVM_DBG_CHECK_OVERRIDE=1` now records, at CLI shutdown: every triple the
+§11 chain admits (with whether `is_abstract()` alone would have sufficed),
+the site's `reached=`/`chain_true=` counts, and every §8 substitution.
+
+| workload | reached | chain_true | triples | classes | §8 substitutions |
+|---|---:|---:|---:|---:|---:|
+| corpus `--real-jdk` (53 classes) | 11,648,908 | 917 | 20 | 14 | **0** |
+| corpus `--jdk-only` | 11,650,412 | 453 | 13 | 9 | **0** |
+| 16 `org.h2.test` classes | — | — | 21 | 16 | **0** |
+| **union** | | | **27** | **19** | **0** |
+
+* **§8 — FIXED under strict.** The map fires **zero** times in either mode,
+  including on real H2 application code. So the record's "under `JdkOnly` the
+  map should become unreachable rather than conditional" is now enforced: under
+  strict the substitution is refused and recorded as an `interface-substitution`
+  violation instead of silently running `HashMap$KeyItr`'s native against a
+  receiver that is not one. `Compatible` is untouched — a corpus that never
+  reaches the path cannot license removing it there, and the record warns that
+  removing shim mappings has regressed real-JDK boot before.
+* **§11 — 19 families identified, and the deletion still is not licensed.**
+  Every admitted row is earned by a NAME disjunct; `is_abstract()` alone
+  sufficed for none, so the chain cannot be reduced to its one contract-legal
+  disjunct. Two of the 19 are H2's *own* classes
+  (`org/h2/expression/condition/Comparison`, `org/h2/value/ValueBigint`), so a
+  deletion pass cannot reason about `java.*` alone.
+  Baseline checked in at
+  `scripts/baselines/jdk-only-check-override-admissions.tsv`. **It is not a
+  deletion list** — the chain was built from Spring, Tomcat, WildFly and H2
+  boots and only H2 is represented. Extend it from the app suites before
+  deleting anything; the instrument makes that one run rather than a fresh
+  investigation.
+
+Three measurement traps hit on the way, all of which produced a confident and
+false zero: the regression suite swallows per-class output into a shell
+variable (drive the classes directly); the frozen binary was swept out of
+`/tmp` mid-run so every invocation failed instantly; and the first "distinct
+triples" counts included the per-process hit column, inflating 20/13 to 37/28.
+The `reached=` counter exists so the first two are visible in the output.
+
+**Still open:** the bulk of §11 (the deletion itself, pending an app-suite
+census), §3's Matcher-leaf residual, and the `jit_entry_publishable` half of §2
+— which refuses nothing, per §1 above.
 
 ## 2026-08-04 status
 
