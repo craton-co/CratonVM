@@ -173,7 +173,12 @@ CratonVM's own `java.nio` natives shadow the bytecode that would have reached
   answer, and a silent out-of-range write. Twelve accessors
   (`get`/`put`/`getShort`/`putShort`/`getChar`/`putChar`/`getInt`/`putInt`/
   `getLong`/`putLong`/`getFloat` …) now go through one
-  `Buffer.checkIndex(i, nb)` helper.
+  `Buffer.checkIndex(i, nb)` helper (`s2_bb_check_index`). **A concurrent
+  session found and fixed this same hole the same day** from
+  `probes/NioBufferBoundsProbe` — the two implementations were the same check
+  with different names, theirs landed first, and their record has the
+  typed-accessor evidence and the containment proof:
+  [`bytebuffer-absolute-accessors-had-no-bounds-check-FIXED-20260805.md`](bytebuffer-absolute-accessors-had-no-bounds-check-FIXED-20260805.md).
 * `slice(index, length)` and the bulk `get`/`put(byte[], off, len)` raised
   `ArrayIndexOutOfBoundsException` with a comment arguing it was fine "because
   it is a subclass and still satisfies `catch (IndexOutOfBoundsException)`".
@@ -228,22 +233,32 @@ the 18 NIO buffer rows.
 every exception type thrown — goes from `2662755913314845620` to
 **`7040159201000546794`, byte-identical to HotSpot**.
 
-`probes/StringPolicyMatrixProbe` sits at **8 divergences from HotSpot**, none
-of them a bounds or exception-class row: 4 regex, 3 HotSpot helpful-NPE
-messages, 1 `"US-ASCII"` decoding as Latin-1. Those are the same 8 the
-`String`-policy lane left, so this change fixed rows and regressed none.
+`probes/StringPolicyMatrixProbe` sits at **3 divergences of 392**, and all
+three are HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke
+… because … is null") — VM-wide message synthesis, not a `String` defect and
+not a bounds row. Every `String`-domain bounds row the `String`-policy lane
+began with is closed.
 
-Suites, all 0 failures:
+Suites:
 
 | | |
 |---|---|
-| `cargo test -p cratonvm-native-builtins --lib` | 3277 |
-| `… --features synthetic-jdk` | 3452 |
-| `cargo test -p cratonvm-vm --lib` | 2411 |
-| `… --features synthetic-jdk` (the blocking gate) | 3928 |
-| `cargo test -p cratonvm-native-io --lib` | 390 |
-| `cargo test -p cratonvm-types --lib` | 492 |
-| `cargo test -p cratonvm-vm --test wp8_10_9_string_contains_native` | 6 |
+| `cargo test -p cratonvm-native-builtins --lib` | 3279 / 0 |
+| `cargo test -p cratonvm-vm --lib` | 2418 / 0 |
+| `cargo test -p cratonvm-native-io --lib` | 390 / 0 |
+| `cargo test -p cratonvm-types --lib` | 492 / 0 |
+| `cargo test -p cratonvm-vm --test wp8_10_9_string_contains_native` | 6 / 0 |
+| `cargo test -p cratonvm-vm --lib --features synthetic-jdk` | 3934 / **1** |
+
+That one is `vm::tests::logger_get_and_info`, and it is **not this change**:
+it fails identically on a pristine `origin/dev` worktree at the same tip
+(`Logger.getName` returns a non-string). Recorded here rather than left for the
+next person to bisect.
+
+Two Windows-only test failures that WERE fixed here, both pre-existing on dev
+and both the same shape — a source-witness test searching LF needles in a CRLF
+checkout: `lang_class.rs`'s `the_populator_writes_no_raw_slot_indices` and
+`native_override.rs`'s `layout_immunity_is_not_open_coded`.
 
 ## What is deliberately NOT fixed here
 

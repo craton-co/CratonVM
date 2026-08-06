@@ -102,13 +102,24 @@ building `probes/PreconditionsFormatterProbe` walked straight into this family.
 
 **1 — absolute accessors not bounds-checked.** Every absolute accessor on
 `java/nio/ByteBuffer` in `native-builtins/src/servlet.rs` now calls one
-`s2_bb_check_abs(ctx, buf, index, width)` helper implementing
+`s2_bb_check_index(ctx, buf, index, width)` helper implementing
 `Buffer.checkIndex(i, nb)`: in range iff `0 <= index` and
-`index + width <= limit`, checked arithmetic. Twelve accessors
+`index + width <= limit`, widened arithmetic. Twelve accessors
 (`get`/`put`/`getShort`/`putShort`/`getChar`/`putChar`/`getInt`/`putInt`/
 `getLong`/`putLong`/`getFloat`) were affected; the probe showed
 `ByteBuffer.allocate(8).get(-1)` returning `0` and `put(8, b)` being dropped on
 the floor, so this was a silent out-of-range **write** as well as a read.
+
+**Two sessions found and fixed this independently on 2026-08-05** — this one
+from the `Preconditions` verification requirement, the other from
+`probes/NioBufferBoundsProbe`, which additionally proved the hole is *contained*
+(a neighbouring buffer and the backing array are untouched after every
+out-of-range read and write, so it was a correctness hole and never a
+memory-safety one) and carries the typed-accessor evidence that is worth
+reading:
+[`bytebuffer-absolute-accessors-had-no-bounds-check-FIXED-20260805.md`](bytebuffer-absolute-accessors-had-no-bounds-check-FIXED-20260805.md).
+The landed helper is theirs; the two implementations were the same check with
+different names.
 
 The concern recorded above — "the leniency is load-bearing by design in at
 least one place" — turned out to be about the wrong layer. It lives in
