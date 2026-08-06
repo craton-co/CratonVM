@@ -38530,6 +38530,199 @@ fn reflect_array_index(
     Ok(idx as usize)
 }
 
+/// JLS §5.1.2 widening primitive conversion, as `java.lang.reflect.Array`
+/// applies it: `true` when a value of `from` may be read as / stored as `to`.
+///
+/// Both directions of the API use this one table. `Array.getX(a, i)` asks
+/// `widens_to(element_type, X)` -- reading an `int[]` as a `long` is fine, the
+/// reverse is not -- and `Array.setX(a, i, v)` asks `widens_to(X, element_type)`,
+/// which is the same relation with the arguments swapped. Getting the direction
+/// wrong is invisible for the eight same-type cells and wrong for every other
+/// one, so the two call sites below name their direction explicitly.
+///
+/// `boolean` converts to nothing and from nothing, and `char` is the usual
+/// asymmetry: `char` widens to `int` but `short` does not widen to `char`,
+/// because neither of those two ranges contains the other. Measured cell by
+/// cell in `probes/ReflectArrayContractProbe`.
+fn widens_to(from: cratonvm_types::ArrayElementType, to: cratonvm_types::ArrayElementType) -> bool {
+    use cratonvm_types::ArrayElementType as T;
+    if from == to {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (T::Byte, T::Short | T::Int | T::Long | T::Float | T::Double)
+            | (T::Short, T::Int | T::Long | T::Float | T::Double)
+            | (T::Char, T::Int | T::Long | T::Float | T::Double)
+            | (T::Int, T::Long | T::Float | T::Double)
+            | (T::Long, T::Float | T::Double)
+            | (T::Float, T::Double)
+    )
+}
+
+/// The element type of an array a PRIMITIVE accessor was handed, or the
+/// `IllegalArgumentException` HotSpot throws when it is a reference array.
+///
+/// This check runs BEFORE the bounds check, which is observable:
+/// `Array.getInt(new Object[4], 9)` is an `IllegalArgumentException` on HotSpot
+/// while `Array.getInt(new long[4], 9)` is an `ArrayIndexOutOfBoundsException`.
+/// The widening check, in contrast, runs AFTER bounds. Three checks, three
+/// positions; `probes/ReflectArrayContractProbe`'s "bounds vs type" rows pin
+/// each one.
+fn reflect_array_primitive_elem(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+) -> Result<cratonvm_types::ArrayElementType, MethodCallFailed> {
+    let elem = ctx.heap_element_type_of(arr);
+    if elem == cratonvm_types::ArrayElementType::Reference {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Argument is not an array of primitive type".to_string(),
+        }
+        .into());
+    }
+    Ok(elem)
+}
+
+/// HotSpot's wording for a conversion the widening table refuses.
+fn reflect_array_type_mismatch() -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: "argument type mismatch".to_string(),
+    }
+    .into()
+}
+
+/// Reinterpret a primitive element as `want`, which `widens_to` has already
+/// allowed. The `Value` shape follows the Java RETURN type, not the array's:
+/// `getLong` on an `int[]` must hand back a `Value::Long`, or the caller reads
+/// half a slot.
+fn reflect_widen_value(
+    v: Value,
+    from: cratonvm_types::ArrayElementType,
+    want: cratonvm_types::ArrayElementType,
+) -> Value {
+    use cratonvm_types::ArrayElementType as T;
+    // Every source that can reach a wider type is integral except f32->f64.
+    let as_i64 = match v {
+        Value::Int(i) => i64::from(i),
+        Value::Long(l) => l,
+        Value::Float(f) => f as i64,
+        Value::Double(d) => d as i64,
+        _ => 0,
+    };
+    let as_f64 = match v {
+        Value::Int(i) => f64::from(i),
+        Value::Long(l) => l as f64,
+        Value::Float(f) => f64::from(f),
+        Value::Double(d) => d,
+        _ => 0.0,
+    };
+    match want {
+        // Same-width integral reads keep the stored bits; `from == want` here
+        // in every case the table allows.
+        T::Boolean | T::Byte | T::Char | T::Short | T::Int => Value::Int(as_i64 as i32),
+        T::Long => Value::Long(as_i64),
+        T::Float => Value::Float(if from == T::Float {
+            match v {
+                Value::Float(f) => f,
+                _ => as_f64 as f32,
+            }
+        } else {
+            as_f64 as f32
+        }),
+        T::Double => Value::Double(as_f64),
+        T::Reference => v,
+    }
+}
+
+/// `Array.getBoolean/getByte/getChar/getShort/getInt/getLong/getFloat/getDouble`.
+///
+/// One body per requested type, bound at registration, because the requested
+/// type IS the contract: five of these used to share `native_array_get_int`,
+/// which returned the raw element whatever the array held, so
+/// `Array.getInt(new long[4], 0)` answered `0` instead of throwing.
+fn reflect_array_get_primitive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want: cratonvm_types::ArrayElementType,
+) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
+    let elem = reflect_array_primitive_elem(&*ctx, arr)?;
+    let idx = reflect_array_index(&*ctx, arr, args)?;
+    if !widens_to(elem, want) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let raw = ctx.get_array_element(arr, idx);
+    Ok(Some(reflect_widen_value(raw, elem, want)))
+}
+
+/// `Array.setBoolean/setByte/setChar/setShort/setInt/setLong/setFloat/setDouble`.
+///
+/// The widening direction is the mirror of the getter's: a `setInt` may store
+/// into a `long[]` but not into a `short[]`.
+fn reflect_array_set_primitive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    have: cratonvm_types::ArrayElementType,
+) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
+    let elem = reflect_array_primitive_elem(&*ctx, arr)?;
+    let idx = reflect_array_index(&*ctx, arr, args)?;
+    if !widens_to(have, elem) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let raw = args.get(2).copied().unwrap_or(Value::Int(0));
+    ctx.set_array_element(arr, idx, reflect_widen_value(raw, have, elem));
+    Ok(None)
+}
+
+/// The primitive a wrapper class boxes, or `None` for anything else.
+fn reflect_boxed_primitive(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+) -> Option<cratonvm_types::ArrayElementType> {
+    use cratonvm_types::ArrayElementType as T;
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
+    Some(match class_name.as_str() {
+        "java/lang/Boolean" => T::Boolean,
+        "java/lang/Byte" => T::Byte,
+        "java/lang/Character" => T::Char,
+        "java/lang/Short" => T::Short,
+        "java/lang/Integer" => T::Int,
+        "java/lang/Long" => T::Long,
+        "java/lang/Float" => T::Float,
+        "java/lang/Double" => T::Double,
+        _ => return None,
+    })
+}
+
+/// Whether `value` may be stored into a reference array whose component class
+/// is `component`.
+///
+/// `null` is always storable; `Object[]` takes everything. Anything this cannot
+/// prove assignable is refused with HotSpot's "array element type mismatch" --
+/// a FOURTH distinct `IllegalArgumentException` wording, separate from the
+/// "argument type mismatch" a primitive array uses.
+fn reflect_array_element_assignable(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    value: ObjectRef,
+) -> bool {
+    let arr_class = ctx.class_id_of_object(arr);
+    // `array_component_class_id` is the direct answer; some array objects carry
+    // the component class as their own class id instead (primitive arrays are
+    // allocated with a synthetic id), so fall back rather than refusing.
+    let component = ctx
+        .array_component_class_id(arr_class)
+        .unwrap_or(arr_class);
+    if let Some(object_class) = ctx.class_id_by_name("java/lang/Object") {
+        if component == object_class {
+            return true;
+        }
+    }
+    let value_class = ctx.class_id_of_object(value);
+    value_class == component || ctx.is_subclass(value_class, component)
+}
+
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
     Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
@@ -38702,15 +38895,68 @@ fn unbox_for_array_set(
 }
 
 fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType as T;
     let arr = reflect_array_arg(ctx, args)?;
+    // Bounds BEFORE the value check: `Array.set(new int[4], 9, "x")` is an
+    // `ArrayIndexOutOfBoundsException` on HotSpot even though the value is also
+    // wrong. (The primitive GETTERS order these the other way round; see
+    // `reflect_array_primitive_elem`.)
     let idx = reflect_array_index(&*ctx, arr, args)?;
     let raw = args.get(2).cloned().unwrap_or(Value::Object(None));
-    // If the target array is a primitive array, unbox the wrapper Object
-    // into the matching primitive Value before writing.  For reference
-    // arrays the value is passed through as-is.
     let elem = ctx.heap_element_type_of(arr);
-    let val = unbox_for_array_set(ctx, elem, raw)?;
-    ctx.set_array_element(arr, idx, val);
+    if elem == T::Reference {
+        // A reference array takes null unconditionally and otherwise wants an
+        // assignable element -- and says so with its own wording.
+        if let Value::Object(Some(value)) = raw {
+            if !reflect_array_element_assignable(ctx, arr, value) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "array element type mismatch".to_string(),
+                }
+                .into());
+            }
+        }
+        ctx.set_array_element(arr, idx, raw);
+        return Ok(None);
+    }
+    // A primitive array takes a BOX whose primitive widens to the element type.
+    // `Array.set(new int[4], 0, Long.valueOf(1))` is refused even though the
+    // reverse (`set(long[], Integer)`) is fine, because the direction is the
+    // same one `setLong`/`setInt` use.
+    let value = match raw {
+        Value::Object(Some(o)) => o,
+        Value::Object(None) => {
+            // HotSpot's message here is NULL, not text -- `Array.set` reaches
+            // `IllegalArgumentException()` with no argument for a null stored
+            // into a primitive array.
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+        // Already-unboxed primitives arrive from internal callers that never
+        // went through a wrapper; keep serving them, widening-checked.
+        other => {
+            let have = match other {
+                Value::Long(_) => T::Long,
+                Value::Float(_) => T::Float,
+                Value::Double(_) => T::Double,
+                _ => T::Int,
+            };
+            if !widens_to(have, elem) {
+                return Err(reflect_array_type_mismatch());
+            }
+            ctx.set_array_element(arr, idx, reflect_widen_value(other, have, elem));
+            return Ok(None);
+        }
+    };
+    let Some(have) = reflect_boxed_primitive(&*ctx, value) else {
+        return Err(reflect_array_type_mismatch());
+    };
+    if !widens_to(have, elem) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let unboxed = ctx.get_field(value, 0);
+    ctx.set_array_element(arr, idx, reflect_widen_value(unboxed, have, elem));
     Ok(None)
 }
 
@@ -38825,7 +39071,39 @@ fn array_new_instance_for_component(
     }
 }
 
+/// The three `Array.newInstance(Class, ...)` argument checks HotSpot makes
+/// before it allocates anything, measured on Temurin 25:
+///
+/// ```text
+/// Array.newInstance(null, 1)            NullPointerException
+/// Array.newInstance(void.class, 1)      IllegalArgumentException (null message)
+/// Array.newInstance(int.class, new int[0])  IllegalArgumentException (null message)
+/// ```
+///
+/// All three used to allocate and return an array instead — a null component
+/// type quietly became `Object[]`, and `void.class` did too.
+fn reflect_array_component_ok(
+    ctx: &mut dyn NativeContext,
+    mirror_arg: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    let mirror = match mirror_arg {
+        Some(Value::Object(Some(m))) => *m,
+        // A null `Class` argument. HotSpot dereferences it, so: NPE, no message.
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+    };
+    let name = crate::lang_class::mirror_class_name(&*ctx, mirror).unwrap_or_default();
+    if name == "void" {
+        // There is no `void[]`. Empty message = null `getMessage()`.
+        return Err(RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    reflect_array_component_ok(ctx, args.first())?;
     // `.max(0)` CLAMPED a negative length and returned an empty array, so
     // `Array.newInstance(int.class, -1)` handed back an `int[0]` where HotSpot
     // throws. Measured on Temurin 25: `NegativeArraySizeException` whose detail
@@ -38849,6 +39127,16 @@ fn native_array_new_instance_multi(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    reflect_array_component_ok(ctx, args.first())?;
+    // Zero dimensions is not a zero-length array, it is a bad argument.
+    if let Some(Value::Object(Some(dims))) = args.get(1) {
+        if ctx.array_length(*dims) == 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+    }
     // `Array.newInstance(Class, int[])` must fully materialize ALL dimensions
     // with the precise nested array type (`String[2][2]` → `[[Ljava/lang/String;`).
     // The previous body read only `dims[0]` and built a one-dimensional array,
