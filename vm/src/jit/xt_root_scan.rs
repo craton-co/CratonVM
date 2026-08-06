@@ -1260,12 +1260,20 @@ mod imp {
                 continue;
             }
             let resignals_before = XT_PEER_RESIGNALS.load(Ordering::Relaxed);
-            match wait_for_response_retrying(slot, tid) {
+            let answer = wait_for_response_retrying(slot, tid);
+            // Any DEFINITIVE answer that needed a re-signal would have been an
+            // UNCLASSIFIED peer before the retry — `STATE_NOT_JIT` counts, it
+            // means the peer reached the handler with its `Rip` outside JIT
+            // code and is a cooperative barrier participant publishing its own
+            // roots. Counting only `STATE_PARKED` reported zero on a run where
+            // the retry had just converted sixteen.
+            if answer != STATE_CANCELLED
+                && XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before
+            {
+                XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
+            }
+            match answer {
                 STATE_PARKED => {
-                    if XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before {
-                        // Would have been an UNCLASSIFIED peer before the retry.
-                        XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
-                    }
                     let found = scan_slot(slot, is_obj, roots);
                     taken.handles.push(0);
                     taken.tids.push(tid);
@@ -1382,12 +1390,20 @@ mod imp {
                 continue;
             }
             let resignals_before = XT_PEER_RESIGNALS.load(Ordering::Relaxed);
-            match wait_for_response_retrying(slot, tid) {
+            let answer = wait_for_response_retrying(slot, tid);
+            // Any DEFINITIVE answer that needed a re-signal would have been an
+            // UNCLASSIFIED peer before the retry — `STATE_NOT_JIT` counts, it
+            // means the peer reached the handler with its `Rip` outside JIT
+            // code and is a cooperative barrier participant publishing its own
+            // roots. Counting only `STATE_PARKED` reported zero on a run where
+            // the retry had just converted sixteen.
+            if answer != STATE_CANCELLED
+                && XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before
+            {
+                XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
+            }
+            match answer {
                 STATE_PARKED => {
-                    if XT_PEER_RESIGNALS.load(Ordering::Relaxed) != resignals_before {
-                        // Would have been an UNCLASSIFIED peer before the retry.
-                        XT_PEERS_CLASSIFIED_AFTER_RETRY.fetch_add(1, Ordering::Relaxed);
-                    }
                     candidates.clear();
                     let has_jit = classify_slot_helper_window(
                         slot,
