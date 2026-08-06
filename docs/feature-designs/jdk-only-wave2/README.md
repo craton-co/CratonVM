@@ -146,7 +146,8 @@ CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home $JDK -cp probes
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=ClassName cratonvm ...
 # the ThreadPoolExecutor receiver-shape predicate, one line per call.
 # Universally-true is TWO claims: no `real=false` AND at least one `real=true`.
-CRATONVM_DBG_TPE_SHAPE=1 cratonvm --jdk-only --java-home $JDK -cp probes L10ThreadPoolInitProbe 2>&1 | grep tpe-shape | sort | uniq -c
+# (CRATONVM_DBG_TPE_SHAPE was removed 2026-08-06 with the predicate it measured)
+cratonvm --jdk-only --java-home $JDK -cp probes L10ThreadPoolInitProbe
 # native adjudication
 cratonvm --real-jdk --java-home $JDK --explain-jdk-only --dump-native-registry c.json -cp probes JdkOnlyCensusLoadProbe
 python3 scripts/jdk-only-adjudicate.py c.json     # section 7 is the ratchet's block
@@ -472,6 +473,19 @@ demanded — is byte-identical to HotSpot 25 in **both** modes, and the new
 unblocked; the retired lane doc is
 `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
 
+**L11 item 7 spent that on 2026-08-06, the same day.** All eight receiver-shape
+sites, the ninth receiver-blind `force_native_over_real_jdk_bytecode` arm and
+the `threadpool_executor_has_real_workers` predicate are deleted;
+`native_es_execute` is tagged `NativeKind::SyntheticStub` and
+`java/util/concurrent/ThreadPoolExecutor` is on
+`real_protected_stub_class_common`'s allow-list, which answers the same
+question class-scoped on both dispatch paths. `CRATONVM_DBG_TPE_SHAPE` and
+`probes/L10ShapeInstrumentControlProbe` went with the predicate they measured:
+an instrument for a decision the VM no longer makes can only ever print
+nothing, which is the same silence-is-not-zero trap the flag was designed
+around. The readings themselves are kept in the L10 record. Outcome record:
+`docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+
 **That last reading is identical on the pre-L10 binary, and saying so is the
 point.** The predicate already answered `true` for the receivers those workloads
 produce. L10 changed its *domain*, not its answer: real-JDK mode no longer has a
@@ -519,5 +533,6 @@ document:
   never took it — but "we measured `false=0`" was never the evidence it looked
   like. **A universal claim needs an argument about reachability; a counter only
   ever samples.** Pair every such reading with a negative control that makes the
-  other branch fire (`probes/L10ShapeInstrumentControlProbe` does it with
-  `Unsafe.allocateInstance`), or the zero is unfalsifiable.
+  other branch fire — `probes/L10ShapeInstrumentControlProbe` did it with
+  `Unsafe.allocateInstance` until both it and the flag were retired with the
+  predicate on 2026-08-06 — or the zero is unfalsifiable.

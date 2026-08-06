@@ -25,30 +25,40 @@ sites across four files, overriding a **ninth**, receiver-blind
 
 ## What was done
 
-### 1. The per-instance question was already gone — measured, not assumed
+### 1. The per-instance question is gone — L10, and at registration
 
 The record's step 4 ("the real fix underneath") is
 `docs/jdk-only-runtime-services.md`'s P1: make `Executors.new*ThreadPool()`
-return objects built by the real `<init>`. That work had landed incrementally
-(`initialize_real_thread_pool_executor`, ES-FAIL-20260710) and nobody had
-re-measured whether it was complete. It is.
+return objects built by the real `<init>`. **L10 landed that on 2026-08-06**
+(`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`), and did it in
+the one place a dispatch-side policy never has to be restated:
+`NativeMethodRegistry::register` drops every `java/util/concurrent/Executors`
+pool factory when `drop_real_layout_synthetic` is set. On a real-JDK image the
+real `java.util.concurrent.Executors` bytecode constructs every executor and
+CratonVM has **no code path** that can mint a half-built one.
 
-`probes/ExecProbe.java` (six factory shapes: fixed, cached, single, scheduled,
-single-scheduled, and a direct `new ThreadPoolExecutor`) submits one task per
-executor and asserts the executing thread differs from the submitting thread —
-the record's own **async-degradation guard**, which an inline fallback fails and
-a "did the task run?" assertion does not. Against a real JDK 25 image:
+That is the form of the claim that matters here. The three plain-pool factories
+had driven the real `<init>` since 2026-07-10, but kept two
+`stpe_legacy_slot_init` fallbacks that wrote the historical two-slot shape onto
+a real-layout object and returned it as if construction had succeeded — so the
+receiver-shape predicate was CONDITIONALLY true, and conditionally true is
+exactly what blocks deleting the sites. L10 also recorded, in terms, that its
+own `CRATONVM_DBG_TPE_SHAPE` reading (`true=62 false=0` / `true=38 false=0`,
+both modes) was **identical on the pre-fix binary**: the predicate's answer did
+not change, its domain did. These sites are deleted because a fabricated
+receiver cannot be built — a statement about the code — not because two
+workloads never produced one.
 
-| arm | six shapes async? | classes returned |
-|---|---|---|
-| HotSpot 25 | yes | matches |
-| `cratonvm` default (`--real-jdk`) | yes | matches, except `newSingleThreadExecutor` returns the `ThreadPoolExecutor` rather than the `AutoShutdownDelegatedExecutorService` wrapper (pre-existing, unrelated) |
-| `cratonvm --jdk-only` | yes | same |
+The behavioural oracle is `probes/L10ThreadPoolInitProbe`: public API only, so
+the host JDK is the oracle, and it carries the three guards this record's own
+*How to verify a fix* section demands (async, self-recursion, cache
+poisoning). It is byte-identical to HotSpot 25 under `--real-jdk` and
+`--jdk-only`, before and after this change.
 
-The `--dump-native-registry` census agrees: `ThreadPoolExecutor.execute` had
-**0 invocations** on every probe run. `native_es_execute` was already dead on a
-real-JDK image before this change; the eight probes were keeping it that way one
-dispatch route at a time.
+One corroborating reading of its own: `--dump-native-registry` shows
+`ThreadPoolExecutor.execute` at **0 invocations** on every probe run. On a real
+JDK image `native_es_execute` was already unreachable; the eight probes were
+keeping it that way one dispatch route at a time.
 
 ### 2. `native_es_execute` reclassified `NativeKind::SyntheticStub`
 
@@ -126,18 +136,23 @@ Everything the record's *How to verify a fix* section asked for.
 
 * **Coverage.** `rg 'ThreadPoolExecutor' vm/src | rg 'workers|has_real_workers'`
   → zero dispatch sites. Enforced by the gate above rather than by a grep.
-* **The self-recursion guard.** `probes/AsyncProbe.java` drives
-  `CompletableFuture.supplyAsync`, a three-stage `thenApplyAsync` chain, and
-  `ForkJoinPool.commonPool().submit` — the route through
-  `spawn_runnable_on_real_thread`, i.e. native code calling `.execute()` on a
-  real `ThreadPoolExecutor` via `ctx.invoke_virtual`. That is the case that used
+* **The self-recursion guard, the async-degradation guard and the
+  cache-poisoning guard** are all three carried by
+  `probes/L10ThreadPoolInitProbe`, which L10 built for exactly this list:
+  a task that calls `execute()` again from inside a worker (the case that used
   to be a native stack overflow and a **process abort**, not a catchable
-  `StackOverflowError`. Green in both modes, matching HotSpot.
-* **The async-degradation guard.** `ExecProbe` and `AsyncProbe` both assert the
-  executing thread differs from the submitting thread.
-* **The cache-poisoning guard.** `AsyncProbe` routes four different executors
-  through **one** `execute()` call site, three times each. A monomorphic cache
-  poisoned by the first receiver fails this; all twelve are async in both modes.
+  `StackOverflowError`); "the executing thread is not the submitter" asserted
+  as an identity rather than a timing measurement, which an inline fallback
+  fails and a "did the task run?" assertion does not; and several executor
+  shapes alternating through one call site, which a monomorphic inline cache
+  gets wrong. Byte-identical to HotSpot 25 in both modes, before and after.
+* **The `CompletableFuture` / `ForkJoinPool` route** through
+  `spawn_runnable_on_real_thread` — native code calling `.execute()` on the
+  singleton async pool via `ctx.invoke_virtual`, the concrete instance of the
+  recursion above — is exercised by `JdkOnlyCensusLoadProbe`'s `concurrent`
+  section and was checked directly during this change (`supplyAsync`, a
+  three-stage `thenApplyAsync` chain, `ForkJoinPool.commonPool().submit`):
+  green in both modes, matching HotSpot.
 * **`scripts/jdk-only-strict-probes.sh`** (HotSpot + `--real-jdk` + `--jdk-only`,
   one image, one set of class files): `RESULT: PASS`, 5 observed / 5 baselined.
   The first run reported a sixth section, a `[site-alias]` JIT

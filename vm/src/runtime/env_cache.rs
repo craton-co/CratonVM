@@ -867,19 +867,14 @@ cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
 // environment on every dispatch.
 cached_is_set!(dbg_vdisp, "CRATONVM_DBG_VDISP");
 cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
-/// `CRATONVM_DBG_TPE_SHAPE` — report every outcome of the
-/// `ThreadPoolExecutor.execute` receiver-shape probe
-/// (`threadpool_executor_has_real_workers`), one line per call, as
-/// `[tpe-shape] real=<bool> class=<receiver class>`.
-///
-/// The lane this exists for (jdk-only wave 2, L10) has to prove the predicate
-/// is **universally true**, and that is two claims, not one: no `real=false`
-/// line, and at least one `real=true` line. Printing only the failures would
-/// make "the probe never ran" — a probe that stopped reaching the sites at all,
-/// or a workload that never built an executor — indistinguishable from "the
-/// probe ran and always said yes", which is the exact shape of a guard that
-/// reads green because it is dead.
-cached_is_set!(dbg_tpe_shape, "CRATONVM_DBG_TPE_SHAPE");
+// `CRATONVM_DBG_TPE_SHAPE` was removed 2026-08-06 together with the predicate
+// it instrumented. It reported every outcome of
+// `threadpool_executor_has_real_workers`, the `ThreadPoolExecutor.execute`
+// receiver-shape probe, for L10's "is this predicate universally true?"
+// question. L11 item 7 answered that question by deleting the eight call sites
+// and the predicate: there is no receiver-shape decision left to report, so a
+// flag that can only ever print nothing is worse than no flag. The measurement
+// it took is kept in `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
 // `CRATONVM_DBG_HANG_SAMPLE` -- temporary diagnostic for the AOT
 // bean-registration hang investigation (2026-07-13). Periodically samples
 // the method being invoked in `execute_invoke_kind` (every Nth call) so a
