@@ -11857,8 +11857,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // natives look implemented and store nothing.
         "java/net/DatagramSocket" => instance_fields(4),
         // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
-        // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
-        // map=0, name=1, parent=2, children=3, removed=4) per
+        // `net_channels::register_p72_datagram`, and Preferences = 6 (backing
+        // map=0, name=1, parent=2, children=3, removed=4, user=5) per
         // `beans_jndi::register_p72_preferences`.
         //
         // Both were ABSENT and fell to the `_ => vec![]` arm below, so a
@@ -11868,7 +11868,11 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // drops the write rather than erroring, so the natives looked
         // implemented while storing nothing.
         "java/net/DatagramPacket" => instance_fields(5),
-        "java/util/prefs/Preferences" => instance_fields(5),
+        // 6, not 5, since `isUserNode()` gained slot 5. A `new` that allocated
+        // 5 would drop the write silently — exactly the failure the comment
+        // above describes — and every node would then answer `isUserNode()`
+        // with the default rather than the tree it was created for.
+        "java/util/prefs/Preferences" => instance_fields(6),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -14010,7 +14014,7 @@ fn native_constant_surface_raw_slot_layout_audit() {
     for (class, minimum_slots) in [
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),
-        ("java/util/prefs/Preferences", 5),
+        ("java/util/prefs/Preferences", 6),
         ("com/sun/net/httpserver/HttpServer", 6),
         ("com/sun/net/httpserver/HttpServerImpl", 6),
         ("sun/net/httpserver/HttpServerImpl", 6),

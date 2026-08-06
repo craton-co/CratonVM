@@ -149,6 +149,18 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     // and is recorded as a residual in the audit doc — but it reads real state
     // and `vm/src/vm.rs` has a test pinned to it, so it is not changed here.
     ("java/util/AbstractMap", "toString", "residual: `{size=N}`, see audit doc"),
+    // `AbstractPreferences.toString` is now the JDK's own definition —
+    // `(isUserNode() ? "User" : "System") + " Preference Node: " +
+    // absolutePath()` — composed through VIRTUAL calls, so a subclass that
+    // overrides either accessor is rendered with ITS answer. It reads no slot
+    // index of its own, which is what makes inheriting it correct rather than
+    // merely tolerated. `abstract_preferences_to_string_composes_from_virtual_accessors`
+    // below pins that property.
+    (
+        "java/util/prefs/AbstractPreferences",
+        "toString",
+        "JDK's own formula via virtual isUserNode()/absolutePath()",
+    ),
 ];
 
 fn production_registry() -> NativeMethodRegistry {
@@ -288,6 +300,37 @@ fn abstract_map_refuses_equals_and_hash_code_but_keeps_its_state_readers() {
         assert!(
             registry.find(am, method, descriptor).is_some(),
             "AbstractMap.{method}{descriptor} is still needed for synthetic maps"
+        );
+    }
+}
+
+/// The allowlist row for `AbstractPreferences.toString` claims it composes
+/// from the receiver's own accessors rather than from a slot index. That claim
+/// is the entire justification for letting an identity-semantics native sit on
+/// an inheritance-intercepting base, so pin the two accessors it composes from:
+/// if a future edit deletes `isUserNode` or `absolutePath`, the shim silently
+/// goes back to rendering something it invented, and the allowlist row would
+/// still say otherwise.
+#[cfg(feature = "synthetic-jdk")]
+#[test]
+fn abstract_preferences_to_string_composes_from_virtual_accessors() {
+    let mut registry = NativeMethodRegistry::new();
+    cratonvm_native_builtins::register_builtins(&mut registry);
+    for cls in [
+        "java/util/prefs/Preferences",
+        "java/util/prefs/AbstractPreferences",
+    ] {
+        assert!(
+            registry.find(cls, "isUserNode", "()Z").is_some(),
+            "{cls}.toString renders the User/System half from a virtual \
+             isUserNode() call — it must resolve"
+        );
+        assert!(
+            registry
+                .find(cls, "absolutePath", "()Ljava/lang/String;")
+                .is_some(),
+            "{cls}.toString renders the path half from a virtual absolutePath() \
+             call — it must resolve"
         );
     }
 }
