@@ -45,10 +45,20 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   row count. `owns_slot` is now a census column and
 >   `scripts/jdk-only-adjudicate.py` prints the split.
 >
-> **Still open from this file:** the `cratonvm/synthetic/Process*` cluster (item
-> 1), which is **37 rows and not 25** — the count below omits
-> `cratonvm/synthetic/AnonymousObject$2` (4) and miscounts the pipe streams. All
-> 37 are `bridge`, all with zero invocations on the census workload.
+> **Item 1 is now adjudicated** —
+> [`synthetic-process-cluster-and-the-supertype-lie.md`](synthetic-process-cluster-and-the-supertype-lie.md).
+> The cluster is **37 rows and not 25** (the count below omits
+> `cratonvm/synthetic/AnonymousObject$2`, 4 rows, and miscounts the pipe
+> streams); the `Bridge` tag is wrong by §1.5's own definition since no image on
+> either platform declares these classes at all; and retagging them cannot come
+> first, because `--jdk-only` **fabricates the receiver anyway** and subprocess
+> spawning currently depends on it. That record also carries a second, mode-
+> independent defect found on the way: the class is not in its own
+> `getSuperclass()` chain while `isAssignableFrom` says it is.
+>
+> **Still open from this file:** nothing else. Item 5's model was wrong (see
+> above), items 2-4 are answered, and item 1 now has a verdict and an ordered
+> plan rather than a question.
 
 > **PARTLY SUPERSEDED 2026-08-05 by a wider measurement.** Three verdicts
 > below rest on a census that asks one class in one image, and two of them do
