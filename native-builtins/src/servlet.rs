@@ -2928,12 +2928,16 @@ fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 ///
 /// Unlike [`s2_bb_check_index`], these DO carry a detail message: the real
 /// callers reach `Preconditions` through `Objects`, whose `null` formatter
-/// makes `outOfBoundsMessage` text part of the exception. The class is
-/// `IndexOutOfBoundsException` exactly — not the
-/// `ArrayIndexOutOfBoundsException` these sites used to raise "because it is a
-/// subclass and still satisfies `catch (IndexOutOfBoundsException)`". A
-/// subclass satisfies the wide catch and breaks every narrower one, which is
-/// the direction that changes behaviour.
+/// makes `outOfBoundsMessage` text part of the exception.
+///
+/// The class is `IndexOutOfBoundsException` exactly — not the
+/// `ArrayIndexOutOfBoundsException` these sites used to raise, which was filed
+/// at the time as benign because `catch (IndexOutOfBoundsException)` still
+/// matched. It is not benign: the SUBCLASS direction is the one that breaks a
+/// `catch`, so `catch (ArrayIndexOutOfBoundsException)` around one of these
+/// calls matched here and missed on a real JVM — and while it stood, a
+/// type-exact differential could never agree with HotSpot, so it could detect
+/// nothing new either.
 fn s2_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), MethodCallFailed> {
     let bad =
         from < 0 || size < 0 || length < 0 || i64::from(from) + i64::from(size) > i64::from(length);
@@ -4739,19 +4743,27 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if s2_bb_is_read_only(ctx, this) {
-                return Err(RuntimeError::ReadOnlyBufferException.into());
-            }
             let src = obj_arg(args, 1)?;
-            // `ByteBuffer.put(ByteBuffer src)` specifies
-            // `IllegalArgumentException` when the source is this buffer. Any
-            // code doing it is already broken on HotSpot, so copying instead
-            // of throwing hides the caller's bug rather than tolerating it.
+            // `ByteBuffer.put(ByteBuffer src)` rejects a self-copy outright:
+            // `if (src == this) throw createSameBufferException()`. Checked
+            // FIRST, ahead of the read-only test, matching the JDK's own order
+            // — a read-only buffer put into itself reports the
+            // IllegalArgumentException, not ReadOnlyBufferException.
+            //
+            // CratonVM used to perform the copy. Since the 2026-07-31 bulk
+            // rewrite that copy at least went through an owned intermediate,
+            // so it was well defined rather than an overlapping element-wise
+            // walk — but `ByteBuffer.wrap(new byte[16]).put(b)` still left
+            // pos=16 where HotSpot throws, and any code doing it is already
+            // broken on a real JVM.
             if src == this {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "The source buffer is this buffer".to_string(),
                 }
                 .into());
+            }
+            if s2_bb_is_read_only(ctx, this) {
+                return Err(RuntimeError::ReadOnlyBufferException.into());
             }
             let src_pos = s2_bb_pos(ctx, src);
             let src_lim = s2_bb_limit(ctx, src);

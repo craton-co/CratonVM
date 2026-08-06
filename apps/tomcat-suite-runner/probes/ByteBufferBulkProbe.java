@@ -32,10 +32,13 @@ public class ByteBufferBulkProbe {
         // Read the WHOLE backing store, but through a duplicate that has been
         // cleared so every index is inside the limit. Absolute `get(int)` is
         // bounds-checked against the LIMIT, not the capacity, so reading to
-        // capacity on the original throws on a flipped buffer — and CratonVM
-        // returns 0 there instead of throwing, which made an earlier version of
-        // this probe report a divergence in `put([BII)` that does not exist.
-        // See docs/known-issues/repros/bytebuffer-jdk-contract-divergences-20260731.md.
+        // capacity on the original throws on a flipped buffer. (Until
+        // 2026-08-05 CratonVM returned 0 there instead of throwing, which made
+        // an earlier version of this probe report a divergence in `put([BII)`
+        // that does not exist. The `absGetPastLimit` family at the bottom of
+        // `main` now tests that behaviour deliberately; this helper must stay
+        // inside the limit so it keeps measuring the bulk paths only.)
+        // See fixed-suite-bugs/bytebuffer-jdk-contract-divergences-20260731-FIXED.md.
         ByteBuffer all = b.duplicate();
         all.clear();
         for (int i = 0; i < all.capacity(); i++) {
@@ -193,6 +196,75 @@ public class ByteBufferBulkProbe {
         guarded("selfPut", () -> {
             ByteBuffer b = ByteBuffer.wrap(pattern(16, 13));
             b.put(b);
+        });
+
+        // --- ABSOLUTE accessors are bounds-checked against the LIMIT, not the
+        // capacity (`java.nio.Buffer.checkIndex`). Every case below sits inside
+        // the capacity and outside the limit, so a capacity-only check — or no
+        // check at all — reads back a plausible zero instead of throwing. That
+        // silent-wrong-answer shape is the whole reason these are here; see
+        // fixed-suite-bugs/bytebuffer-jdk-contract-divergences-20260731-FIXED.md.
+        guarded("absGetPastLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.put(new byte[] { 1, 2, 3, 4 });
+            b.flip(); // limit=4, capacity=8
+            mix(b.get(6));
+        });
+        guarded("absPutPastLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.put(new byte[] { 1, 2, 3, 4 });
+            b.flip();
+            b.put(6, (byte) 9);
+        });
+        guarded("absGetNegative", () -> mix(ByteBuffer.allocate(8).get(-1)));
+        guarded("absPutNegative", () -> ByteBuffer.allocate(8).put(-1, (byte) 1));
+        guarded("absGetAtLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.limit(4);
+            mix(b.get(4)); // index == limit is already out of range
+        });
+        // The multi-byte absolute forms check `index + width <= limit`, so an
+        // index that is itself in range still throws when the read would run
+        // off the end.
+        guarded("absGetIntStraddlingLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.limit(6);
+            mix(b.getInt(4)); // needs [4,8), limit is 6
+        });
+        guarded("absGetShortStraddlingLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.limit(5);
+            mix(b.getShort(4)); // needs [4,6), limit is 5
+        });
+        guarded("absGetLongStraddlingLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(16);
+            b.limit(12);
+            mix(b.getLong(8)); // needs [8,16), limit is 12
+        });
+        guarded("absPutIntStraddlingLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.limit(6);
+            b.putInt(4, 0x01020304);
+        });
+        // ...and the in-range forms must still WORK, so the new gate cannot be
+        // "throw on everything absolute".
+        guarded("absInRangeRoundTrip", () -> {
+            ByteBuffer b = ByteBuffer.allocate(8);
+            b.putInt(0, 0x01020304);
+            b.putInt(4, 0x05060708);
+            mix(b.getInt(0));
+            mix(b.getInt(4));
+            mix(b.get(7));
+            mixBuf(b);
+        });
+        // A DIRECT receiver takes a different storage path through the same
+        // accessors; it must agree.
+        guarded("absDirectPastLimit", () -> {
+            ByteBuffer b = ByteBuffer.allocateDirect(8);
+            b.putInt(0, 0x0a0b0c0d);
+            b.limit(4);
+            mix(b.getInt(0));
+            mix(b.get(6));
         });
 
         System.out.println("ByteBufferBulkProbe checksum=" + h);
