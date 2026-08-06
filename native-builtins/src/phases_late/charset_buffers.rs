@@ -858,6 +858,95 @@ pub(crate) fn cb_native_order(_ctx: &dyn NativeContext, _buf: ObjectRef) -> i32 
     }
 }
 
+/// Read one of `java.nio.Buffer`'s `int` fields, preferring the real-JDK named
+/// slot and falling back to the synthetic indexed one.
+///
+/// These natives are registered on the ABSTRACT `java/nio/CharBuffer`, so a
+/// receiver can be either a synthetic five-field object or a real
+/// `StringCharBuffer` / `HeapCharBuffer` the JDK's own factory built. Reading
+/// (or writing) the indexed slot on a real one lands wherever that index
+/// happens to fall — for `StringCharBuffer` that is not `position` at all.
+fn cb_read_int_field(
+    ctx: &dyn NativeContext,
+    buf: ObjectRef,
+    name: &str,
+    slot: usize,
+) -> i32 {
+    match ctx.get_field_by_name(buf, name) {
+        Value::Int(v) => v,
+        _ => match ctx.get_field(buf, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+    }
+}
+
+/// Companion to [`cb_read_int_field`]: write both spellings, so whichever the
+/// reader picks agrees.
+fn cb_write_int_field(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    name: &str,
+    slot: usize,
+    value: i32,
+) {
+    ctx.set_field_by_name(buf, name, Value::Int(value));
+    ctx.set_field(buf, slot, Value::Int(value));
+}
+
+/// `Buffer.limit()`, tolerant of both layouts.
+fn cb_read_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
+    cb_read_int_field(ctx, buf, "limit", CB_FIELD_LIMIT)
+}
+
+/// Read the `CharSequence` a `java.nio.StringCharBuffer` wraps, as text.
+///
+/// `NativeContext::read_string` only understands a real `java.lang.String`,
+/// and `CharBuffer.wrap(CharSequence)` accepts anything — Tomcat's `CharChunk`
+/// (`MessageBytes.toBytes` is `encoder.encode(CharBuffer.wrap(charChunk))`), a
+/// `StringBuilder`, any application type. A native that stood in front of
+/// `wrap` used to do this fallback at construction time and store the result
+/// in a `char[]`; with `wrap` handed back to its own bytecode there is no
+/// `char[]`, so the fallback belongs here, where the sequence is read.
+///
+/// Without it every non-`String` `CharSequence` reads back as empty, which is
+/// silent: `encode(CharBuffer.wrap(charChunk))` produces zero bytes and
+/// reports success.
+pub(crate) fn read_wrapped_char_sequence(ctx: &mut dyn NativeContext, seq: ObjectRef) -> String {
+    let direct = ctx.read_string(seq).unwrap_or_default();
+    if !direct.is_empty() {
+        return direct;
+    }
+    match ctx.invoke_virtual(seq, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text).unwrap_or_default(),
+        _ => direct,
+    }
+}
+
+/// `Objects.checkFromToIndex(from, to, length)`, the range check
+/// `HeapCharBuffer.subSequence` opens with.
+///
+/// The class is `IndexOutOfBoundsException` and the message is
+/// `Preconditions.outOfBoundsMessage`'s `checkFromToIndex` shape — verified
+/// against HotSpot 25 in `probes/CharBufferWrapProbe`, which also records the
+/// case this does NOT cover: `StringCharBuffer.subSequence` reaches
+/// `Buffer.checkIndex` instead, whose formatter builds the exception with no
+/// detail message at all. Both are the same class, so a `catch` cannot tell
+/// them apart; only a message-exact differential can.
+fn cb_check_from_to_index(from: i32, to: i32, length: i32) -> Result<(), MethodCallFailed> {
+    if from >= 0 && from <= to && to <= length {
+        return Ok(());
+    }
+    Err(RuntimeError::ioobe(
+        cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+            i64::from(from),
+            i64::from(to),
+            i64::from(length),
+        ),
+    )
+    .into())
+}
+
 pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     use crate::servlet::s2_byte_order_object;
     let __prev_cat = r.current_category();
@@ -871,74 +960,104 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         let buf = p62_alloc_char_buffer(ctx, cap.max(0) as usize);
         Ok(Some(Value::Object(Some(buf))))
     });
-    r.register(cb, "wrap", "([C)Ljava/nio/CharBuffer;", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        // Pin across the buffer alloc below — a moving young GC there would
-        // relocate the backing array (native stale-local family).
-        let arr_pin = ctx.pin_native_root(arr);
-        // HeapCharBuffer, NOT the abstract `java/nio/CharBuffer`. Stamping the
-        // abstract class means any real-JDK method WITHOUT a native override
-        // dispatches to its abstract declaration: `CharBuffer.wrap(a).slice()`
-        // threw `AbstractMethodError: method java/nio/CharBuffer.slice
-        // ()Ljava/nio/CharBuffer; has no Code attribute` where HotSpot returns
-        // a buffer. `allocate` (via `p62_alloc_char_buffer`) and `subSequence`
-        // in this same file already stamp HeapCharBuffer; `wrap` was the odd
-        // one out. Repro: docs/known-issues/repros/charbuffer-address/CBSLICE.java
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
-        let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.unpin_native_roots(arr_pin);
-        cb_write_hb(ctx, buf, arr, len as i32);
-        Ok(Some(Value::Object(Some(buf))))
-    });
-    r.register(
-        cb,
-        "wrap",
-        "(Ljava/lang/CharSequence;)Ljava/nio/CharBuffer;",
-        |ctx, args| {
-            // The arg is any CharSequence, not necessarily a String. For a
-            // real String `read_string` works; for other implementations
-            // (e.g. Tomcat's `CharChunk`, StringBuilder, CharBuffer) it
-            // returns None/empty, so fall back to a virtual `toString()`.
-            // Without this fallback `CharBuffer.wrap(charChunk)` produced an
-            // empty buffer, so `MessageBytes.toBytes` (which does
-            // `encoder.encode(CharBuffer.wrap(charC))`) encoded nothing —
-            // 144 Tomcat MessageBytes-conversion failures.
-            let s = match args.first() {
-                Some(Value::Object(Some(s))) => {
-                    let direct = ctx.read_string(*s).unwrap_or_default();
-                    if !direct.is_empty() {
-                        direct
-                    } else {
-                        match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[]) {
-                            Ok(Some(Value::Object(Some(strref)))) => {
-                                ctx.read_string(strref).unwrap_or_default()
-                            }
-                            _ => direct,
-                        }
-                    }
-                }
-                _ => String::new(),
+    // `CharBuffer.wrap(char[])` and `CharBuffer.wrap(CharSequence)` are
+    // DELIBERATELY not registered in real-JDK mode.
+    //
+    // These stamped the ABSTRACT `java/nio/CharBuffer`, so every `CharBuffer`
+    // method without a native override dispatched to an abstract declaration
+    // and threw `AbstractMethodError` (`slice()`, `duplicate()`,
+    // `asReadOnlyBuffer()`), and `subSequence(int,int)` fell to the native
+    // below, which bounds-checked nothing:
+    // `CharBuffer.wrap("Hello, World").subSequence(0, 99)` handed back a
+    // 99-character buffer, 87 code units of it read past the end of the
+    // wrapped sequence. An earlier fix changed the stamp to the concrete
+    // `java/nio/HeapCharBuffer`, which closes the `AbstractMethodError` half.
+    //
+    // Not registering them at all closes the rest. Their bytecode is
+    // `wrap(array, 0, array.length)` / `wrap(csq, 0, csq.length())`, and the
+    // THREE-argument forms have never been intercepted here — so they already
+    // build a real `HeapCharBuffer` / `StringCharBuffer` and already match
+    // HotSpot exactly, `capacity` and null message included
+    // (`probes/CharBufferWrapProbe` rows 17-18). Letting the JDK's own factory
+    // run additionally gets `wrap(String)` its real `StringCharBuffer`:
+    // read-only, `hasArray() == false`, `put` refused, and the wrapped
+    // sequence held rather than copied.
+    //
+    // Contrast `allocate` just above, which stamps the concrete class and is
+    // correct on every one of those shapes for exactly that reason. The class
+    // to stamp is the one the JDK builds, and the cheapest way to stamp it
+    // right is not to stamp it at all.
+    //
+    // Synthetic-JDK mode keeps them: there is no `CharBuffer` bytecode there
+    // to fall back to.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        r.register(cb, "wrap", "([C)Ljava/nio/CharBuffer;", |ctx, args| {
+            let arr = match args.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Object(None))),
             };
-            let chars: Vec<u16> = s.encode_utf16().collect();
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, chars.len());
-            for (i, &ch) in chars.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(ch as i32));
-            }
-            // Pin across the buffer alloc below — a moving young GC there
-            // would relocate the backing array (native stale-local family).
+            let len = ctx.array_length(arr);
+            // Pin across the buffer alloc below — a moving young GC there would
+            // relocate the backing array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            // HeapCharBuffer for the same reason as `wrap([C)` above.
+            // HeapCharBuffer, NOT the abstract `java/nio/CharBuffer` — see the
+            // comment above. Repro:
+            // docs/known-issues/repros/charbuffer-address/CBSLICE.java
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
-            cb_write_hb(ctx, buf, arr, chars.len() as i32);
+            cb_write_hb(ctx, buf, arr, len as i32);
             Ok(Some(Value::Object(Some(buf))))
-        },
-    );
+        });
+        r.register(
+            cb,
+            "wrap",
+            "(Ljava/lang/CharSequence;)Ljava/nio/CharBuffer;",
+            |ctx, args| {
+                // The arg is any CharSequence, not necessarily a String. For a
+                // real String `read_string` works; for other implementations
+                // (e.g. Tomcat's `CharChunk`, StringBuilder, CharBuffer) it
+                // returns None/empty, so fall back to a virtual `toString()`.
+                // Without this fallback `CharBuffer.wrap(charChunk)` produced an
+                // empty buffer, so `MessageBytes.toBytes` (which does
+                // `encoder.encode(CharBuffer.wrap(charC))`) encoded nothing —
+                // 144 Tomcat MessageBytes-conversion failures. Real-JDK mode
+                // needs none of this: `StringCharBuffer` holds the
+                // `CharSequence` itself and indexes it directly.
+                let s = match args.first() {
+                    Some(Value::Object(Some(s))) => {
+                        let direct = ctx.read_string(*s).unwrap_or_default();
+                        if !direct.is_empty() {
+                            direct
+                        } else {
+                            match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[]) {
+                                Ok(Some(Value::Object(Some(strref)))) => {
+                                    ctx.read_string(strref).unwrap_or_default()
+                                }
+                                _ => direct,
+                            }
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let chars: Vec<u16> = s.encode_utf16().collect();
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, chars.len());
+                for (i, &ch) in chars.iter().enumerate() {
+                    ctx.set_array_element(arr, i, Value::Int(ch as i32));
+                }
+                // Pin across the buffer alloc below — a moving young GC there
+                // would relocate the backing array (native stale-local family).
+                let arr_pin = ctx.pin_native_root(arr);
+                // HeapCharBuffer for the same reason as `wrap([C)` above.
+                let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
+                cb_write_hb(ctx, buf, arr, chars.len() as i32);
+                Ok(Some(Value::Object(Some(buf))))
+            },
+        );
+    }
     // hasArray()Z — JDK bytecode reads `hb != null && !isReadOnly`.
     // Mirror that with a robust slot/name lookup so synthetic-mode
     // CharBuffers (where slot 0 may have been overwritten by
@@ -1082,7 +1201,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
             };
-            let text = ctx.read_string(str_obj).unwrap_or_default();
+            let text = read_wrapped_char_sequence(ctx, str_obj);
             let units: Vec<u16> = text.encode_utf16().collect();
             // StringCharBuffer.toString(int,int) receives absolute buffer
             // indexes (CharBuffer.toString() calls it with position..limit),
@@ -1193,6 +1312,13 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     // an unbacked synthetic instance would AbstractMethodError. Allocate
     // a fresh CharBuffer with the same backing array and adjusted
     // position/limit (start..end relative to current position).
+    //
+    // Only reachable for receivers stamped with the ABSTRACT
+    // `java/nio/CharBuffer` — anything concrete (`HeapCharBuffer` from
+    // `allocate`, `StringCharBuffer` / `HeapCharBuffer` from the real `wrap`)
+    // runs its own bytecode instead and gets these checks from
+    // `Objects.checkFromToIndex` for free. `ByteBufferAsCharBuffer
+    // .subSequence` still produces abstract-stamped receivers, so this stays.
     r.register(
         cb,
         "subSequence",
@@ -1210,13 +1336,17 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let cur_pos = match ctx.get_field_by_name(this, "position") {
-                Value::Int(v) => v,
-                _ => match ctx.get_field(this, CB_FIELD_POS) {
-                    Value::Int(v) => v,
-                    _ => 0,
-                },
-            };
+            let cur_pos = cb_read_int_field(ctx, this, "position", CB_FIELD_POS);
+            let cur_lim = cb_read_limit(ctx, this);
+            let cur_cap = cb_read_int_field(ctx, this, "capacity", CB_FIELD_CAPACITY);
+            // `HeapCharBuffer.subSequence` opens with
+            // `Objects.checkFromToIndex(start, end, limit() - position())`,
+            // and this checked NOTHING: `wrap("Hello, World").subSequence(0,
+            // 99)` returned a 99-character buffer, 87 code units of it read
+            // past the end of the backing array and handed back as content.
+            // A negative `start` was worse still — it produced a buffer whose
+            // own `position()` was negative.
+            cb_check_from_to_index(start, end, cur_lim.saturating_sub(cur_pos))?;
             let cur_off = match ctx.get_field_by_name(this, "offset") {
                 Value::Int(v) => v,
                 _ => 0,
@@ -1236,12 +1366,17 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
             ctx.set_field_by_name(buf, "position", Value::Int(new_pos));
             ctx.set_field_by_name(buf, "limit", Value::Int(new_lim));
-            ctx.set_field_by_name(buf, "capacity", Value::Int(new_lim));
+            // The slice keeps the PARENT's capacity, not its own limit — the
+            // JDK passes `capacity()` straight through, and `capacity()` is
+            // observable (`CharBuffer.clear()` widens the limit back out to
+            // it). Writing `new_lim` here made every subsequence look like a
+            // buffer that had been allocated at exactly its own length.
+            ctx.set_field_by_name(buf, "capacity", Value::Int(cur_cap));
             ctx.set_field_by_name(buf, "mark", Value::Int(-1));
             ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
             ctx.set_field(buf, CB_FIELD_POS, Value::Int(new_pos));
             ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
-            ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(new_lim));
+            ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(cur_cap));
             ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
             cb_write_heap_address(ctx, buf, cur_off);
             Ok(Some(Value::Object(Some(buf))))
@@ -1284,10 +1419,13 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if idx < 0 || idx >= lim {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("index: {idx}"),
-            }
-            .into());
+            // `CharBuffer.get(int)` lands in `Buffer.checkIndex`, whose
+            // formatter builds an `IndexOutOfBoundsException` with no detail
+            // message. `IllegalArgumentException("index: N")` — what this
+            // raised — is not in that hierarchy at all, so a
+            // `catch (IndexOutOfBoundsException)` around a buffer read did not
+            // see it and the throw escaped as an unrelated failure.
+            return Err(RuntimeError::ioobe_no_message().into());
         }
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
@@ -1389,12 +1527,35 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        ctx.set_field(this, CB_FIELD_POS, Value::Int(new_pos));
+        // `Buffer.position(int)` is `if (newPosition > limit | newPosition < 0)
+        // throw createPositionException(...)`, an IllegalArgumentException.
+        // Validating is not pedantry here: `StringCharBuffer.subSequence`
+        // builds its result through the `Buffer` constructor and CATCHES that
+        // IAE to raise `IndexOutOfBoundsException`, so an unchecked write is
+        // one reason `wrap("Hello, World").subSequence(3, 2)` returned a
+        // buffer with position 3 and limit 2 instead of throwing.
+        let lim = cb_read_limit(ctx, this);
+        if new_pos > lim {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("newPosition > limit: ({new_pos} > {lim})"),
+            }
+            .into());
+        }
+        if new_pos < 0 {
+            // `createPositionException` distinguishes the two causes; a
+            // negative index reported as "> limit" reads as nonsense
+            // (`newPosition > limit: (-1 > 5)`).
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("newPosition < 0: ({new_pos} < 0)"),
+            }
+            .into());
+        }
+        cb_write_int_field(ctx, this, "position", CB_FIELD_POS, new_pos);
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "limit", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, CB_FIELD_LIMIT)))
+        Ok(Some(Value::Int(cb_read_limit(ctx, this))))
     });
     r.register(cb, "limit", "(I)Ljava/nio/CharBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1402,7 +1563,25 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        ctx.set_field(this, CB_FIELD_LIMIT, Value::Int(new_lim));
+        // `Buffer.limit(int)`: `if (newLimit > capacity | newLimit < 0) throw
+        // createLimitException(...)`, and the position follows the limit down.
+        let cap = cb_read_int_field(ctx, this, "capacity", CB_FIELD_CAPACITY);
+        if new_lim > cap {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("newLimit > capacity: ({new_lim} > {cap})"),
+            }
+            .into());
+        }
+        if new_lim < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("newLimit < 0: ({new_lim} < 0)"),
+            }
+            .into());
+        }
+        cb_write_int_field(ctx, this, "limit", CB_FIELD_LIMIT, new_lim);
+        if cb_read_int_field(ctx, this, "position", CB_FIELD_POS) > new_lim {
+            cb_write_int_field(ctx, this, "position", CB_FIELD_POS, new_lim);
+        }
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "capacity", "()I", |ctx, args| {

@@ -94,6 +94,8 @@ use cratonvm_native_api::{
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
+use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
+
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
@@ -1935,7 +1937,7 @@ fn try_pooled_request(
     stream.flush().map_err(|e| format!("pooled flush: {e}"))?;
     let _ = stream.set_read_timeout(Some(POOL_PROBE_TIMEOUT));
     let mut probe = [0u8; 4096];
-    let n = stream
+    let n = EintrIo::new(stream)
         .read(&mut probe)
         .map_err(|e| format!("pooled probe read: {e}"))?;
     if n == 0 {
@@ -2214,7 +2216,7 @@ fn https_post_handshake_exchange(
              rejected the handshake: write: {e}"
         )
     })?;
-    stream.flush().map_err(|e| {
+    retry_eintr(|| stream.flush()).map_err(|e| {
         format!(
             "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
              TLS handshake, before the request could be sent — the peer likely \
@@ -2267,7 +2269,7 @@ fn https_post_handshake_exchange(
         .set_read_timeout(Some(Duration::from_millis(100)));
     let mut drain_err: Option<String> = None;
     while stream.conn.wants_read() {
-        match stream.conn.read_tls(&mut stream.sock) {
+        match stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)) {
             Ok(0) => break,
             Ok(_) => {
                 if let Err(e) = stream.conn.process_new_packets() {
@@ -2556,7 +2558,7 @@ fn perform(
                 if stream.conn.wants_write() {
                     let mut blocked_refs = [Value::Object(connection)];
                     ctx.begin_blocking_region();
-                    let written = stream.conn.write_tls(&mut stream.sock);
+                    let written = stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock));
                     ctx.end_blocking_region_refs(&mut blocked_refs);
                     if let Value::Object(o) = blocked_refs[0] {
                         connection = o;
@@ -2579,7 +2581,7 @@ fn perform(
                     // actually cause a server to reject and close.
                     let mut blocked_refs = [Value::Object(connection)];
                     ctx.begin_blocking_region();
-                    let read = stream.conn.read_tls(&mut stream.sock);
+                    let read = stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock));
                     ctx.end_blocking_region_refs(&mut blocked_refs);
                     if let Value::Object(o) = blocked_refs[0] {
                         connection = o;

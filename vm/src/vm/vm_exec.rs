@@ -7478,6 +7478,37 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .check_deep_reflection_access(accessor_mod, target_mod, target_pkg)
     }
 
+    fn reflective_export_to_accessor(
+        &self,
+        accessor_class_id: ClassId,
+        target_class_id: ClassId,
+    ) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        // No modules registered -> classpath-only mode. `check_deep_reflection_
+        // access` short-circuits to allow there, so this widening query is
+        // never reached; answer consistently anyway.
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        let (Some(accessor), Some(target)) = (
+            cm.get_class(accessor_class_id),
+            cm.get_class(target_class_id),
+        ) else {
+            return false;
+        };
+        let accessor_mod = accessor
+            .module_name
+            .as_deref()
+            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
+        let target_mod = target
+            .module_name
+            .as_deref()
+            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
+        let target_pkg = crate::classloading::module::package_of(&target.name);
+        cm.module_registry
+            .is_package_exported_to(target_mod, target_pkg, accessor_mod)
+    }
+
     fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
         self.shared.classes.class_manager.read().find_resource(name)
     }
