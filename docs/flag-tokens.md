@@ -59,12 +59,21 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-409 tokens.
+418 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
+| `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
+| `check-override` | `CRATONVM_DBG_CHECK_OVERRIDE` |
+| `direct-memory` | `CRATONVM_DBG_DM` |
+| `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
+| `read0-latency` | `CRATONVM_DBG_READ0LAT` |
+| `refdisc` | `CRATONVM_DBG_REFDISC` |
+| `site-alias` | `CRATONVM_DBG_SITE_ALIAS` |
+| `sp-ic-sites` | `CRATONVM_DBG_SP_IC_SITES` |
+| `stub-yield` | `CRATONVM_DBG_STUB_YIELD` |
 | `access` | `CRATONVM_DBG_ACCESS` |
 | `active-profiles-identity-trace` | `CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE` |
 | `aio` | `CRATONVM_DBG_AIO` |
@@ -475,13 +484,21 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-160 tokens.
+168 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
+| `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
+| `sp-ic-deopt-check` | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` |
+| `sp-ic-only` | `CRATONVM_JIT_SP_IC_ONLY` |
+| `sp-inline-mega` | `CRATONVM_JIT_SP_INLINE_MEGA` |
+| `sp-inline-mic` | `CRATONVM_JIT_SP_INLINE_MIC` |
+| `sp-inline-pic` | `CRATONVM_JIT_SP_INLINE_PIC` |
+| `unreg-memo-gc-reset` | `CRATONVM_JIT_UNREG_MEMO_GC_RESET` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
+| `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |
 | `arith-licm` | `CRATONVM_DISABLE_ARITH_LICM` |
 | `bce` | `CRATONVM_JIT_NO_BCE` |
 | `bg-compile` | `CRATONVM_BG_COMPILE` |
@@ -642,7 +659,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-34 tokens.
+36 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -665,6 +682,7 @@ export inherited from a parent shell.
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
+| `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
 | `oldgen-coalesce` | `CRATONVM_NO_OLDGEN_COALESCE` |
 | `oldgen-compact` | `CRATONVM_OLDGEN_COMPACT` |
@@ -680,6 +698,7 @@ export inherited from a parent shell.
 | `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
 | `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
+| `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 
 ## `CRATONVM_REAL`
 
@@ -714,11 +733,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-12 tokens.
+13 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
+| `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
 | `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |
