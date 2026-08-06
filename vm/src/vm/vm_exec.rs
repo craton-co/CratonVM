@@ -3302,7 +3302,7 @@ fn resolve_field_descriptor_byte_cached(
     let desc_byte = {
         let cm = shared.classes.class_manager.read();
         if let Some(concrete_cls) = cm.get_class(class_id) {
-            if concrete_cls.is_synthetic_stub {
+            if concrete_cls.origin.is_compatibility_stub() {
                 // Transient: stub may be promoted to the real class later.
                 None
             } else {
@@ -3340,7 +3340,7 @@ fn resolve_field_descriptor_byte_cached(
                         break;
                     };
                     if let Some(cls) = cm.get_class(cid) {
-                        if cls.is_synthetic_stub {
+                        if cls.origin.is_compatibility_stub() {
                             // Transient: an ancestor stub's descriptors are
                             // unreliable and may change on promotion. Do NOT
                             // memoize вЂ” `cacheable` stays false.
@@ -6400,7 +6400,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 .class_manager
                 .read()
                 .get_class(class_id)
-                .is_some_and(|c| c.is_synthetic_stub),
+                .is_some_and(|c| c.origin.is_compatibility_stub()),
             Err(_) => false,
         }
     }
@@ -6434,7 +6434,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // Also check if it's a synthetic stub (native-only class) вЂ” methods
                 // are registered in the native registry, not in the class file
-                if class.is_synthetic_stub {
+                if class.origin.is_compatibility_stub() {
                     return true; // assume native methods exist
                 }
                 current = class.superclass;
@@ -11722,7 +11722,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             let cm = self.shared.classes.class_manager.read();
             cm.class_store
                 .get(header.class_id)
-                .map(|c| !c.is_synthetic_stub)
+                .map(|c| !c.origin.is_compatibility_stub())
                 .unwrap_or(false)
         };
         if !is_real_jdk_thread && header.num_slots() >= 3 {
@@ -12619,7 +12619,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let (is_real_jdk, num_fields) = {
             let cm = self.shared.classes.class_manager.read();
             match cm.class_store.get(class_id) {
-                Some(c) if !c.is_synthetic_stub => (true, c.num_total_fields.max(3)),
+                Some(c) if !c.origin.is_compatibility_stub() => (true, c.num_total_fields.max(3)),
                 Some(c) => (false, c.num_total_fields.max(3)),
                 _ => (false, 3usize),
             }
@@ -15730,13 +15730,13 @@ pub fn invoke_or_native(
         let name_cid = cm.get_loaded_class_id(effective_class);
         let recv_stub = recv_cid
             .and_then(|c| cm.get_class(c))
-            .map(|c| c.is_synthetic_stub);
+            .map(|c| c.origin.is_compatibility_stub());
         let recv_has_method = recv_cid
             .and_then(|c| cm.get_class(c))
             .map(|c| c.find_method(method_name, descriptor).is_some());
         let name_stub = name_cid
             .and_then(|c| cm.get_class(c))
-            .map(|c| c.is_synthetic_stub);
+            .map(|c| c.origin.is_compatibility_stub());
         let name_has_method = name_cid
             .and_then(|c| cm.get_class(c))
             .map(|c| c.find_method(method_name, descriptor).is_some());
@@ -15746,57 +15746,20 @@ pub fn invoke_or_native(
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
-    // `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)`: the
-    // registered native (`native_es_execute`) assumes CratonVM's synthetic
-    // 2-field `Executors.new*ThreadPool()` receiver. It is NOT disambiguated
-    // by the general SyntheticStub/CRATONVM_REAL `real_protected_stub` logic
-    // below, because that check is CLASS-scoped and the real
-    // `ThreadPoolExecutor` *class* bytecode is always loaded regardless of
-    // whether a given *instance* is genuinely real or one of our synthetic
-    // stand-ins. A genuinely real, bytecode-constructed `ThreadPoolExecutor`
-    // (its own real `<init>` ran, so its real `workers` field is populated --
-    // e.g. `spawn_runnable_on_real_thread`'s own singleton async pool) must
-    // run its own real `execute()` bytecode here too, or calling `.execute()`
-    // on it from native code (via `ctx.invoke_virtual`) recurses back into
-    // this same native forever (a real stack overflow, confirmed via gdb).
-    // See fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
-    //
-    // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
-    // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
-    // `vm/src/runtime/interpreter/native_override.rs` for the full census, for
-    // the ninth (receiver-blind) site these eight exist to override, and for
-    // why all nine have to go together.
-    //
-    // The wave-1 markers named four of eight, and got one of those wrong. The
-    // hazard that undercount creates is specific: a mechanical "delete every
-    // marked `ThreadPoolExecutor` site" sweep leaves the four unmarked ones
-    // enforcing a policy the other four no longer apply, which is the same
-    // cold-path/warm-path split as the forced-native `String` lists.
-    //
-    // This copy also used to inline the `workers`-field probe by hand rather
-    // than calling `threadpool_executor_has_real_workers`, making three
-    // implementations of one predicate — and it took a plain `read()` where the
-    // helper documents why `read_recursive()` is required at these call sites.
-    if effective_class == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        if let Some(recv_value @ Value::Object(Some(recv))) = args.first() {
-            if crate::runtime::interpreter::threadpool_executor_has_real_workers(
-                shared, recv_value,
-            ) {
-                return invoke_on_class_shared(
-                    shared,
-                    thread,
-                    shared.mem.heap.class_id_of(*recv),
-                    method_name,
-                    descriptor,
-                    args,
-                );
-            }
-        }
-    }
-
+    // JDK-ONLY-WAVE2, RETIRED 2026-08-06: a `ThreadPoolExecutor.execute`
+    // receiver-shape probe used to run here, ahead of the registry lookup,
+    // because the registered native (`native_es_execute`) assumed CratonVM's
+    // synthetic 2-field `Executors.new*ThreadPool()` receiver and the general
+    // `real_protected_stub` logic below is CLASS-scoped while the question was
+    // per-INSTANCE. It is no longer per-instance: every `Executors.*` factory
+    // shortcut drives the real `ThreadPoolExecutor.<init>`
+    // (`initialize_real_thread_pool_executor`), so on an image with the real
+    // class bytes there is no synthetic receiver left. The native is tagged
+    // `SyntheticStub` and the class is on `real_protected_stub_class`'s
+    // allow-list, so the `has_real` arm below answers it — for every receiver,
+    // with no field probe, and it is what keeps `ctx.invoke_virtual(pool,
+    // "execute", ...)` from recursing into the same native forever (a real
+    // stack overflow, confirmed via gdb, in the bug this probe was born from).
     if let Some((callback, native_kind)) =
         shared
             .natives
@@ -15844,7 +15807,7 @@ pub fn invoke_or_native(
             cm.get_loaded_class_id(effective_class)
                 .and_then(|cid| {
                     cm.get_class(cid).and_then(|cls| {
-                        if cls.is_synthetic_stub {
+                        if cls.origin.is_compatibility_stub() {
                             None
                         } else {
                             crate::classloading::find_method_recursive(
@@ -16087,7 +16050,12 @@ pub fn invoke_or_native(
             receiver_class_id.or_else(|| cm.get_loaded_class_id(effective_class))
         {
             if let Some(class) = cm.class_store.get(class_id) {
-                if !class.is_synthetic_stub {
+                // Question (2): only route to bytecode-style dispatch on a
+                // class that HAS a method table to dispatch on. A class whose
+                // only entries are NATIVE-flagged synthetic ctors has nothing
+                // for `invoke_on_class_shared` to find, and must fall through
+                // to `invoke_shared`. See `Class::dispatch_lacks_class_file`.
+                if !class.dispatch_lacks_class_file() {
                     drop(cm);
                     super::ensure_class_initialized_shared(shared, thread, class_id)?;
                     return invoke_on_class_shared(
@@ -19525,8 +19493,16 @@ fn invoke_on_class_shared_inner(
         // performs on the SAME cache line — the identical contention this
         // coalescing exists to reduce (the JIT's dispatch memo holds its names
         // as `Rc<str>` for the same reason).
+        // `dispatch_lacks_class_file`, NOT `is_synthetic_stub`: this branch is
+        // asking question (2) — "does this class have no bytecode of its own,
+        // so a native registered under its exact name is the only thing that
+        // can answer?" — not question (1), "is this a compatibility
+        // substitution?". They gave the same answer for every class until
+        // `java/lang/reflect/Proxy$Instance` was correctly reclassified
+        // `VmInternal`; it still needs this branch, and now says so
+        // structurally. See `Class::dispatch_lacks_class_file`.
         let stub_or_interface = class
-            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .map(|c| c.dispatch_lacks_class_file() || c.is_interface())
             .unwrap_or(false);
         let prefer = stub_or_interface || class_name.starts_with("cratonvm/internal/");
         (class_name, prefer)
@@ -23383,7 +23359,7 @@ fn invoke_on_class_shared_inner(
                     .class_manager
                     .read()
                     .get_class(class_id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false)
                 {
                     " [class not found on any classpath entry — synthetic stub, add the missing jar]"
@@ -23694,37 +23670,20 @@ fn invoke_on_class_shared_inner(
             .get_class(declaring_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        // See the identical guard + comment in `invoke_or_native` above: a
-        // genuinely real, bytecode-constructed `ThreadPoolExecutor` (real
-        // `workers` field populated) must keep running its own real
-        // `execute()` bytecode -- only CratonVM's synthetic 2-field
-        // `Executors.new*ThreadPool()` objects need the forced native. This
-        // call site (`invoke_on_class_shared_inner`) is a SEPARATE dispatch
-        // path from `invoke_or_native` (e.g. reached from the interpreter's
-        // reflection/initial-invoke routes) that independently consults
-        // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See fixed-suite-bugs/
-        // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
+        // (`ThreadPoolExecutor.execute` receiver-shape check deleted
+        // 2026-08-06 — see `invoke_or_native` above and
+        // `force_native_over_real_jdk_bytecode` in `native_override.rs`. This
+        // site consults `should_force_registered_native_over_bytecode`, whose
+        // receiver-blind `ThreadPoolExecutor.execute` arm went with it, so
+        // there is no longer anything here to exempt.)
         //
-        // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
-        // COPY 2 OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
-        // `vm/src/runtime/interpreter/native_override.rs` for the census.
-        //
-        // This one re-inlined the `workers`-field probe rather than calling
-        // `threadpool_executor_has_real_workers` — with a plain `read()`, where
-        // the helper documents why `read_recursive()` is needed.
-        let force_native_receiver_exempt = class_name_for_force
-            == "java/util/concurrent/ThreadPoolExecutor"
-            && method_name == "execute"
-            && matches!(args.first(), Some(recv) if
-                crate::runtime::interpreter::threadpool_executor_has_real_workers(shared, recv));
         // §7 routing. This site's whole purpose is "force the registered native
         // in front of real JDK bytecode", so the pre-existing condition IS
         // `compat_native_wins` and `bytecode_available` is `true`. Evaluated
         // before the registry lookup, exactly as before, so a call that does
         // not force a native still pays no hash.
-        let compat_native_wins = !force_native_receiver_exempt
-            && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+        let compat_native_wins =
+            crate::runtime::interpreter::should_force_registered_native_over_bytecode(
                 shared,
                 &class_name_for_force,
                 method_name,
@@ -26668,7 +26627,7 @@ mod tests {
         {
             let cm = shared.classes.class_manager.read();
             let cls = cm.get_class(cid).expect("stub registered");
-            assert!(cls.is_synthetic_stub, "expected a synthetic stub");
+            assert!(cls.origin.is_compatibility_stub(), "expected a synthetic stub");
         }
         // Resolution must return None so the caller falls back to raw read.
         assert_eq!(resolve_field_descriptor_byte_cached(&shared, cid, 0), None);
@@ -26737,7 +26696,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,

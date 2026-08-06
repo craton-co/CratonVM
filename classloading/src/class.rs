@@ -333,9 +333,13 @@ pub struct Class {
 
     /// Provenance of this class — where its definition actually came from.
     ///
-    /// **Authoritative.** [`is_synthetic_stub`](Self::is_synthetic_stub) is a
-    /// derived mirror of `origin.is_compatibility_stub()`; this field is the
-    /// source of truth. Written only through [`Class::set_origin`].
+    /// **Authoritative, and now the only answer.** Ask
+    /// `origin.is_compatibility_stub()` for the census / `--jdk-only` policy
+    /// question, and [`Class::dispatch_lacks_class_file`] for the dispatch one.
+    /// The derived `is_synthetic_stub` bool that used to mirror this field —
+    /// and conflate those two questions — was deleted 2026-08-06 (contract §5:
+    /// "Convert it to a pure derived mirror now, delete it in a later wave").
+    /// Written only through [`Class::set_origin`].
     ///
     /// `--jdk-only` rejects exactly one variant of this enum
     /// ([`ClassOrigin::CompatibilityStub`]); every other way a class can come
@@ -343,24 +347,6 @@ pub struct Class {
     /// hidden class, lambda, proxy, reflection accessor — is legitimate in both
     /// modes. See `docs/feature-designs/jdk-only-mode.md` §1 and §5.
     pub origin: ClassOrigin,
-
-    /// `true` if this class was created as a synthetic stub (no `.class` file found).
-    /// Synthetic stubs have zero methods and rely entirely on native registrations.
-    /// When a real `.class` file is available, this is `false` and bytecode methods
-    /// take precedence over native registrations in dispatch.
-    ///
-    /// **DERIVED — do not write this field directly.** It is `true` if and only
-    /// if `self.origin.is_compatibility_stub()`, and both fields are written
-    /// together by [`Class::set_origin`]. It survives only because ~160 read
-    /// sites across 17 files still consult it; those are migrated to
-    /// [`Class::origin`] and this field is deleted in a later wave (contract
-    /// §5: "Convert it to a pure derived mirror now, delete it in a later
-    /// wave"). Until then a divergence between the two means half the VM sees a
-    /// stub where the other half sees a real class.
-    ///
-    /// Do not use this path for types the JDK or application exposes as real classfiles;
-    /// see `docs/jvm-no-synthetic-stubs.md`.
-    pub is_synthetic_stub: bool,
 
     /// `true` if this class (or an ancestor) overrides `Object.finalize()`.
     /// Objects of such classes are registered with the `FinalizerThread` at
@@ -526,21 +512,83 @@ pub fn class_origin_epoch() -> u64 {
 impl Class {
     // ----- Provenance ------------------------------------------------------
 
-    /// Record where this class came from, keeping the derived
-    /// [`is_synthetic_stub`](Self::is_synthetic_stub) mirror in sync.
+    /// **Question (2), and only question (2):** does this class have no class
+    /// file behind it, so dispatch must look for a native registered under its
+    /// **own exact name** instead of walking the hierarchy to an inherited
+    /// `java/lang/Object` body?
     ///
-    /// **Every write to either field must go through here.** `is_synthetic_stub`
-    /// is `true` if and only if the origin is a
-    /// [`ClassOrigin::CompatibilityStub`], so setting one without the other
-    /// splits the VM's view of the class: the ~160 sites still reading the bool
-    /// would disagree with the census and with the `--jdk-only` policy check.
+    /// The `is_synthetic_stub` bool this replaced (deleted 2026-08-06) answered two
+    /// unrelated questions at once:
+    ///
+    /// 1. *is this a compatibility substitution?* — the census and `--jdk-only`
+    ///    policy question. [`Class::origin`] is authoritative for that one, and
+    ///    `origin.is_compatibility_stub()` is how you ask it.
+    /// 2. *does this class have no bytecode of its own?* — this one, which the
+    ///    dispatch sites were actually asking.
+    ///
+    /// The two coincided only because every class the VM fabricated was tagged
+    /// `CompatibilityStub`, including ones that are not compatibility
+    /// substitutions at all. `java/lang/reflect/Proxy$Instance` — the shared
+    /// synthetic supertype of every generated `$ProxyN` — is
+    /// [`ClassOrigin::VmInternal`]: a generation artefact, not a stand-in for
+    /// absent bytes. Correcting its census row must not silently move it off
+    /// the dispatch branches it needs.
+    ///
+    /// # Why not `!origin.has_real_bytes()`
+    ///
+    /// Because [`ClassOrigin::VmInternal`] and [`ClassOrigin::VmArray`] both
+    /// answer "no real bytes", so that spelling would ALSO move every
+    /// `cratonvm/synthetic/AnonymousObject$N` (the allocation shape behind every
+    /// `HashMap` node in the VM) and every `cratonvm/synthetic/AmbiguousName$…`
+    /// stand-in onto branches they take today's non-stub arm of. That is a
+    /// `Compatible`-mode behaviour change on the busiest allocation shape there
+    /// is.
+    ///
+    /// # Why the method table is the discriminator
+    ///
+    /// A fabricated class's *only* callable surface is the native registered
+    /// under its own name; `synthetic_stub_ctor_methods` declares NATIVE-flagged
+    /// entries for exactly the fabricated names that have one. An
+    /// `AnonymousObject$N` has an empty method table and no registration —
+    /// nothing to find under its own name, so it belongs on the non-stub arm,
+    /// which is where it already is. `Proxy$Instance` has a NATIVE-flagged
+    /// `<init>` and native registrations in `reflect_annotations.rs`, so it
+    /// belongs on the stub arm, which is also where it already is.
+    ///
+    /// This predicate is therefore **equal to `is_synthetic_stub` for every
+    /// class in the store today**, before and after the `Proxy$Instance` flip —
+    /// which is the property `jdk_only_class_origin.rs`'s
+    /// `dispatch_predicate_matches_the_stub_bit` pins.
+    ///
+    /// Cost: one enum discriminant test for every real class (the common case
+    /// returns on the `_` arm without touching `methods`). Only the fabricated
+    /// and VM-internal classes, whose method tables hold 0–12 entries, pay the
+    /// scan.
+    pub fn dispatch_lacks_class_file(&self) -> bool {
+        match &self.origin {
+            // Fabricated: no class file was ever found, by definition.
+            ClassOrigin::CompatibilityStub { .. } => true,
+            // VM-invented: only the ones that carry native-backed methods under
+            // their own name need the exact-name lookup.
+            ClassOrigin::VmInternal => self.methods.iter().any(|m| m.is_native()),
+            _ => false,
+        }
+    }
+
+    /// Record where this class came from.
+    ///
+    /// **Every write to `origin` must go through here**, because it also bumps
+    /// [`class_origin_epoch`] — the invalidation signal for every memo derived
+    /// from provenance. Assigning the field directly leaves those memos serving
+    /// a pre-upgrade answer.
     ///
     /// The in-place "a real `.class` turned up, upgrade the stub" path in
     /// `ClassManager::upgrade_synthetic_class` is the case that matters most —
-    /// it must clear the mirror as it installs the real origin, or real bytes
-    /// keep losing to a fabricated stand-in.
+    /// it installs the real origin here, and until 2026-08-06 it also had to
+    /// clear a derived `is_synthetic_stub` mirror in the same breath or real
+    /// bytes kept losing to a fabricated stand-in. There is no mirror left to
+    /// forget.
     pub fn set_origin(&mut self, origin: ClassOrigin) {
-        self.is_synthetic_stub = origin.is_compatibility_stub();
         self.origin = origin;
         // Invalidate every memo derived from provenance — see
         // [`class_origin_epoch`]. Unconditional rather than gated on the
@@ -1916,7 +1964,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,

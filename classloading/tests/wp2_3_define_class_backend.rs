@@ -743,7 +743,7 @@ fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
     let stub_id = cm.load_class(name).expect("stub fallback must succeed");
     {
         let stub = cm.class_store.get(stub_id).expect("stub registered");
-        assert!(stub.is_synthetic_stub, "must be fabricated as a stub");
+        assert!(stub.origin.is_compatibility_stub(), "must be fabricated as a stub");
         assert!(
             stub.methods.is_empty(),
             "synthetic stub must have no real methods"
@@ -772,7 +772,7 @@ fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
 
     let real = cm.class_store.get(real_id).expect("class exists");
     assert!(
-        !real.is_synthetic_stub,
+        !real.origin.is_compatibility_stub(),
         "class must no longer be a synthetic stub after upgrade"
     );
     assert!(
@@ -785,7 +785,7 @@ fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
     let relooked = cm.get_loaded_class_id(name).expect("still loaded");
     assert_eq!(relooked, real_id);
     let relooked_class = cm.class_store.get(relooked).unwrap();
-    assert!(!relooked_class.is_synthetic_stub);
+    assert!(!relooked_class.origin.is_compatibility_stub());
 }
 
 /// BUG-10 — a PRIVILEGED define (`Unsafe.defineClass`) bypasses the H5 guard,

@@ -1058,7 +1058,7 @@ pub(super) fn populate_invoke_cache(
                 && real_protected_stub_class(declaring_name)
                 && store
                     .get(declaring_id)
-                    .is_some_and(|c| !c.is_synthetic_stub)
+                    .is_some_and(|c| !c.origin.is_compatibility_stub())
                 && !method.is_native()
                 && method.code().is_some();
         if !stub_yields {

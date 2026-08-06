@@ -3014,7 +3014,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,
@@ -3069,7 +3068,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,
@@ -55092,7 +55090,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -55176,7 +55173,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -55223,7 +55219,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -55325,7 +55320,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -55364,7 +55358,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -55403,7 +55396,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -58070,7 +58062,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,
@@ -59150,7 +59141,7 @@ mod tests {
     }
 
     #[test]
-    fn is_synthetic_stub_flag_set_correctly() {
+    fn compatibility_stub_origin_set_correctly() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // Load a synthetic class by requesting a JDK class that doesn't have
@@ -59164,7 +59155,7 @@ mod tests {
         let cm = shared.classes.class_manager.read();
         let class = cm.class_store.get(class_id).unwrap();
         assert!(
-            class.is_synthetic_stub,
+            class.origin.is_compatibility_stub(),
             "StringBuilder should be synthetic in test env (no JDK on classpath)"
         );
         assert!(
@@ -59210,7 +59201,7 @@ mod tests {
             .expect("Object should be loaded");
         let obj_class = cm.class_store.get(obj_id).unwrap();
         assert!(
-            !obj_class.is_synthetic_stub,
+            !obj_class.origin.is_compatibility_stub(),
             "Object should be loaded from real .class file"
         );
         assert!(
@@ -59224,7 +59215,7 @@ mod tests {
             .expect("String should be loaded");
         let str_class = cm.class_store.get(str_id).unwrap();
         assert!(
-            !str_class.is_synthetic_stub,
+            !str_class.origin.is_compatibility_stub(),
             "String should be loaded from real .class file"
         );
         assert!(
@@ -59238,7 +59229,7 @@ mod tests {
             .get_loaded_class_id("java/lang/Throwable")
             .expect("Throwable should be loaded");
         let thr_class = cm.class_store.get(thr_id).unwrap();
-        assert!(!thr_class.is_synthetic_stub);
+        assert!(!thr_class.origin.is_compatibility_stub());
 
         // Verify total loaded class count is substantial (Object pulls in many deps)
         let total = cm.loaded_count();
@@ -59689,7 +59680,7 @@ mod tests {
             if let Some(bool_id) = cm.get_loaded_class_id("java/lang/Boolean") {
                 let cls = cm.class_store.get(bool_id).unwrap();
                 eprintln!("[real_jdk] Boolean: is_synthetic={}, fields={}, first_field_index={}, num_total_fields={}, methods={}",
-                    cls.is_synthetic_stub, cls.fields.len(), cls.first_field_index, cls.num_total_fields, cls.methods.len());
+                    cls.origin.is_compatibility_stub(), cls.fields.len(), cls.first_field_index, cls.num_total_fields, cls.methods.len());
                 for f in &cls.fields {
                     eprintln!(
                         "[real_jdk]   field: {} {} static={}",
@@ -60052,7 +60043,7 @@ mod tests {
             let int_id = cm.get_loaded_class_id("java/lang/Integer").unwrap();
             let int_class = cm.class_store.get(int_id).unwrap();
             assert!(
-                !int_class.is_synthetic_stub,
+                !int_class.origin.is_compatibility_stub(),
                 "Integer class should be loaded from real .class file, not synthetic stub"
             );
             let bytecode_with_code = int_class
@@ -63779,7 +63770,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -64754,7 +64744,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -64839,7 +64828,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -64976,7 +64964,6 @@ mod tests {
                 hidden: false,
                 module_name: None,
                 origin: cratonvm_classloading::ClassOrigin::default(),
-                is_synthetic_stub: false,
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
@@ -69681,19 +69668,19 @@ mod tests {
         // --- Verify classes are NOT synthetic stubs ---
         let arraylist = cm.class_store.get(arraylist_id).unwrap();
         assert!(
-            !arraylist.is_synthetic_stub,
+            !arraylist.origin.is_compatibility_stub(),
             "ArrayList should be loaded from real .class file, not synthetic stub"
         );
 
         let collections = cm.class_store.get(collections_id).unwrap();
         assert!(
-            !collections.is_synthetic_stub,
+            !collections.origin.is_compatibility_stub(),
             "Collections should be loaded from real .class file, not synthetic stub"
         );
 
         let hashmap = cm.class_store.get(hashmap_id).unwrap();
         assert!(
-            !hashmap.is_synthetic_stub,
+            !hashmap.origin.is_compatibility_stub(),
             "HashMap should be loaded from real .class file, not synthetic stub"
         );
 
@@ -69783,12 +69770,12 @@ mod tests {
         let real_count = cm
             .class_store
             .iter()
-            .filter(|c| !c.is_synthetic_stub)
+            .filter(|c| !c.origin.is_compatibility_stub())
             .count();
         let synthetic_count = cm
             .class_store
             .iter()
-            .filter(|c| c.is_synthetic_stub)
+            .filter(|c| c.origin.is_compatibility_stub())
             .count();
         eprintln!("[real_jdk_collections_e2e] Total classes loaded: {}", total);
         eprintln!(

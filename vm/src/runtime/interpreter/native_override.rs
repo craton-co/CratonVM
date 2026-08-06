@@ -3058,44 +3058,41 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    // THE NINTH SITE. `Executors.newSingleThreadExecutor()`/
-    // `newFixedThreadPool()`/`newCachedThreadPool()` (native-builtins/src/lib.rs's
-    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
-    // allocate their return value under the REAL class name
-    // `java/util/concurrent/ThreadPoolExecutor`. When this arm was written they
-    // never ran it through the real `<init>`, so real fields like
-    // `ctl`/`workQueue`/`mainLock` stayed null: once `execute(Runnable)`
-    // (invoked via `invokeinterface Executor.execute`/`ExecutorService.execute`)
-    // resolved to the concrete class's own real bytecode, that bytecode read the
-    // never-initialized `ctl` AtomicInteger and NPE'd immediately
+    // DELETED 2026-08-06 (JDK-ONLY-WAVE2, L11 item 7): the ninth,
+    // receiver-blind `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)`
+    // arm, together with the eight receiver-shape probes that existed only to
+    // undo it for a genuinely real receiver.
+    //
+    // It forced `native_es_execute` to win unconditionally because
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` allocated their return value under the REAL class
+    // name and did not run it through the real `<init>` -- so real `execute()`
+    // bytecode read a null `ctl` and NPE'd
     // (fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md).
-    // Force the registered native (`native_es_execute`) to win for this triple;
-    // `intercept_force_registered_native` additionally checks the receiver's
-    // real `workers` field so a genuinely real, bytecode-constructed
-    // `ThreadPoolExecutor` still runs its own real `execute()` bytecode.
     //
-    // JDK-ONLY-WAVE2 L10, 2026-08-06 — THIS ARM IS NOW DEAD IN REAL-JDK MODE,
-    // and that is what makes it deletable. `NativeMethodRegistry::register`
-    // drops every `Executors` pool factory when `drop_real_layout_synthetic` is
-    // set, so the real `java.util.concurrent.Executors` bytecode builds every
-    // executor and there is no fabricated receiver left for this arm to protect.
-    // The three closures named above still exist and still run — but only in the
-    // `--features synthetic-jdk` build, which is also the only build where the
-    // real `ThreadPoolExecutor` bytecode this arm overrides is absent.
+    // Why it is gone, in the order the removal required:
     //
-    // It is NOT deleted here. Deleting it before `native_es_execute` is
-    // reclassified restores the `ctx.invoke_virtual` self-recursion the FIXED
-    // record above documents — a native stack overflow and a process abort, not
-    // a catchable `StackOverflowError` — and it has to go together with the
-    // eight receiver-shape sites that exist to override it. That is L11's
-    // sequenced removal; see `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` below for
-    // the order and for what has to be true first.
-    if class_name == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && method_descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        return true;
-    }
+    //  1. L10 (2026-08-06): `NativeMethodRegistry::register` drops every
+    //     `Executors` pool factory when `drop_real_layout_synthetic` is set, so
+    //     the real `java.util.concurrent.Executors` bytecode builds every
+    //     executor on a real-JDK image and no code path can mint a half-built
+    //     one. The fabricated receiver this arm protected does not exist there.
+    //  2. `native_es_execute` is tagged `NativeKind::SyntheticStub` and
+    //     `java/util/concurrent/ThreadPoolExecutor` is on
+    //     `real_protected_stub_class_common`'s allow-list, so the one
+    //     centralised arbitration yields it to the real `execute()` body --
+    //     class-scoped, for every receiver, on both the warm and the cold
+    //     dispatch path. That is what keeps `ctx.invoke_virtual(pool,
+    //     "execute", ...)` from recursing into the same native forever.
+    //  3. Only then the nine sites.
+    //
+    // The native is NOT deleted, and must not be: strict mode declines to ADMIT
+    // a native, it does not remove it, and the `--features synthetic-jdk` build
+    // -- the only build where the real `ThreadPoolExecutor` bytecode this arm
+    // overrode is absent -- still registers and still runs it.
+    //
+    // Do NOT re-add a name here without also re-adding the eight probes. This
+    // arm has no receiver awareness and never had any.
 
     if class_name == "java/nio/ByteBuffer"
         && matches!(
@@ -5413,171 +5410,36 @@ fn admit_forced_native_id(
     }
 }
 
-/// Every dispatch site that carries the `ThreadPoolExecutor.execute`
-/// receiver-shape check, as `(file, enclosing function)`.
-///
-/// JDK-ONLY-WAVE2. `native_es_execute` is a compatibility stand-in for
-/// CratonVM's synthetic 2-field `Executors.new*ThreadPool()` objects, but it is
-/// registered on `ThreadPoolExecutor.execute`, whose real class bytecode is
-/// **always** loaded — so the general `SyntheticStub` / `CRATONVM_REAL` yield
-/// logic cannot disambiguate it: that logic is *class*-scoped and the question
-/// here is per-*instance*. Hence the receiver-shape probe, once per dispatch
-/// route.
-///
-/// # Why this list exists
-///
-/// The wave-1 markers named **four** of these eight, and misplaced one of the
-/// four. That undercount is the actual hazard: a mechanical "delete every
-/// marked `ThreadPoolExecutor` site" sweep leaves the unmarked half enforcing a
-/// policy the marked half no longer applies — the same cold-path/warm-path
-/// split as the forced-native `String` lists, with a worse failure mode.
-///
-/// # The ninth site
-///
-/// `force_native_over_real_jdk_bytecode` returns `true` for the
-/// `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)` triple with **no
-/// receiver awareness at all**. That is the unconditional decision the eight
-/// exist to override, and it has to be deleted in the same change or the
-/// overrides cannot be.
-///
-/// # What must replace all nine
-///
-/// Per the wave-1 marker, in this order — the order matters, and getting it
-/// wrong aborts the process rather than throwing:
-///
-/// 1. ~~give real `ThreadPoolExecutor` objects correct Java field
-///    initialisation so `Executors.new*ThreadPool()` returns objects built by
-///    the real `<init>`~~ (`docs/jdk-only-runtime-services.md` P1)
-///    — **DONE 2026-08-06, L10.** `NativeMethodRegistry::register` drops every
-///    `Executors` pool factory in real-JDK mode, so the real
-///    `java.util.concurrent.Executors` bytecode builds every executor and
-///    CratonVM has no way to mint a fabricated one. Measured, not argued:
-///    `probes/L10ThreadPoolInitProbe` is byte-identical to HotSpot 25 in both
-///    modes, and `CRATONVM_DBG_TPE_SHAPE` reports the predicate below `true`
-///    on every call and `false` on none across both strict-corpus workloads.
-///
-///    **What that reading does and does not say.** The same reading was taken
-///    on a pre-L10 binary and is IDENTICAL — the predicate already answered
-///    `true` for the receivers those workloads produce. What L10 changed is the
-///    domain, not the answer: real-JDK mode no longer has a code path that
-///    constructs an executor, so there is no input the predicate can be false
-///    for. Do not delete the sites below on the strength of a `false=0`
-///    reading; that is a statement about two workloads. Delete them on the
-///    strength of "nothing can build a fabricated receiver", which is a
-///    statement about the code. (The instrument's `false` branch is live and
-///    shown so by `probes/L10ShapeInstrumentControlProbe`, which allocates a
-///    constructor-less `ThreadPoolExecutor` — the shape a Mockito mock has.)
-///
-///    **This is the step that gated the rest**; the remaining three are L11's;
-/// 2. reclassify `native_es_execute` as `NativeKind::SyntheticStub` — it is
-///    currently tagged such that the general yield logic does not apply to it.
-///    Safe now that step 1 has landed: under `CRATONVM_NO_STUBS` / `--jdk-only`
-///    the reclassification drops the registration, and what it used to be the
-///    only implementation for no longer exists in that build;
-/// 3. delete the ninth site;
-/// 4. delete these eight. Contract §7 step 3 ("concrete bytecode beats a
-///    registered `Bridge` or `SyntheticStub`") then produces the same answer
-///    structurally, for every receiver, with no field probe and no class-name
-///    list.
-///
-/// Deleting the eight *before* step 2 restores the `ctx.invoke_virtual`
-/// self-recursion that step 1's `FIXED` doc records: a native stack overflow
-/// and process abort, not a catchable `StackOverflowError`.
-///
-/// # Not in this list
-///
-/// `native-builtins`' own `executor_has_real_workers` (~8 call sites there,
-/// plus a deliberately-separate twin in `native-collections` to avoid a
-/// cross-crate dependency) is defence in depth *inside the callee*, not a
-/// dispatch decision. It is listed here only so a wave-2 grep does not mistake
-/// it for one — and so nobody deletes the check and its backstop in one change.
-#[cfg(test)]
-pub(crate) const THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES: &[(&str, &str)] = &[
-    ("vm/src/vm/vm_exec.rs", "invoke_or_native"),
-    ("vm/src/vm/vm_exec.rs", "invoke_on_class_shared_inner"),
-    (
-        "vm/src/runtime/interpreter/invoke.rs",
-        "try_stackless_invoke step 1",
-    ),
-    (
-        "vm/src/runtime/interpreter/invoke.rs",
-        "try_stackless_invoke step 6",
-    ),
-    (
-        "vm/src/runtime/interpreter/native_override.rs",
-        "intercept_force_registered_native",
-    ),
-    (
-        "vm/src/runtime/interpreter/native_override.rs",
-        "intercept_force_registered_native_cached",
-    ),
-    (
-        "vm/src/runtime/interpreter/dispatch_virtual.rs",
-        "populate_virtual_invoke_cache",
-    ),
-    (
-        "vm/src/runtime/interpreter/dispatch_virtual.rs",
-        "populate_virtual_invoke_cache force-native arm",
-    ),
-];
-
-/// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
-/// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
-/// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
-/// Mirrors `native-builtins::executor_has_real_workers` (same check, same
-/// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
-/// -- not a `NativeContext` -- available at this dispatch point.
-///
-/// **The single implementation.** Two sites in `vm_exec.rs` used to re-inline
-/// the `workers`-field probe by hand, giving three copies of one predicate —
-/// and both inlined copies took a plain `read()` where the note below explains
-/// why `read_recursive()` is required. They call this now.
-///
-/// (The `#[inline]` here was previously attached to an orphaned doc comment —
-/// *"Dispatch a force-native override via `safe_native_call`"* — describing a
-/// function that no longer exists next to it. Restored onto its real subject.)
-#[inline]
-pub(crate) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
-    let Value::Object(Some(recv)) = recv else {
-        return false;
-    };
-    let class_id = shared.mem.heap.class_id_of(*recv);
-    // read_recursive() instead of read() -- populate_virtual_invoke_cache
-    // already holds class_manager.read() across its own native-shadow
-    // exemption check (the is_real_tpe_execute call site) when it calls into
-    // this helper. A plain nested read() panics the lock-order tracker
-    // (debug builds) or can deadlock under parking_lot once a writer is
-    // queued (release builds) -- same fix as resolve_method_ref /
-    // surefire_lazy_launcher_discover_native.
-    let cm = shared.classes.class_manager.read_recursive();
-    let dbg = crate::runtime::env_cache::dbg_tpe_shape();
-    // Read the name while the guard is held; only under the flag, so the
-    // un-instrumented path is unchanged.
-    let dbg_name = dbg
-        .then(|| cm.get_class(class_id).map(|c| c.name.to_string()))
-        .flatten()
-        .unwrap_or_else(|| format!("<class id {}>", class_id.as_u32()));
-    let Some(index) =
-        crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
-    else {
-        if dbg {
-            // No `workers` field anywhere in the hierarchy: this receiver was
-            // not built by real `ThreadPoolExecutor` bytecode at all.
-            eprintln!("[tpe-shape] real=false reason=no-workers-field class={dbg_name}");
-        }
-        return false;
-    };
-    drop(cm);
-    let real = matches!(
-        shared.mem.heap.get_field(*recv, index),
-        Value::Object(Some(_))
-    );
-    if dbg {
-        let reason = if real { "populated" } else { "null-workers" };
-        eprintln!("[tpe-shape] real={real} reason={reason} class={dbg_name}");
-    }
-    real
-}
+// JDK-ONLY-WAVE2, RETIRED 2026-08-06. `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES`
+// (the census of the eight dispatch sites that carried the
+// `ThreadPoolExecutor.execute` receiver-shape probe) and
+// `threadpool_executor_has_real_workers` (the probe itself) lived here.
+//
+// All eight are gone, together with the ninth, receiver-blind arm in
+// `force_native_over_real_jdk_bytecode` that they existed to override. What
+// replaced them: `native_es_execute` is tagged `NativeKind::SyntheticStub`
+// (`native-builtins/src/util_concurrent_ext.rs`) and
+// `java/util/concurrent/ThreadPoolExecutor` is on
+// `real_protected_stub_class_common`'s allow-list, so the one centralised
+// arbitration yields the stub to the real `execute()` body class-scoped, for
+// every receiver, on both the warm and the cold dispatch path.
+//
+// That is only sound because the per-INSTANCE distinction was eliminated
+// first, by L10 (2026-08-06) and at REGISTRATION rather than in dispatch:
+// `NativeMethodRegistry::register` drops every `Executors` pool factory when
+// `drop_real_layout_synthetic` is set, so on a real-JDK image the real
+// `java.util.concurrent.Executors` bytecode builds every executor and CratonVM
+// has no code path that can mint a fabricated one. The sites are deletable
+// because the fabricated receiver CANNOT EXIST -- a statement about the code,
+// not the `false=0` reading two workloads produced, which L10 measured as
+// already identical before it landed. `every_threadpool_receiver_shape_site_is_gone` below is the gate that
+// keeps a copy from growing back.
+//
+// `native-builtins`' own `executor_has_real_workers` (and the deliberately
+// separate twin in `native-collections`) is NOT part of this: it is defence in
+// depth *inside the callee*, re-checking and redirecting a genuinely-real
+// receiver that reached the native anyway. It stays, and is listed here only so
+// a grep does not mistake it for a dispatch site.
 
 /// CratonVM's own HTTP carrier classes — the concrete classes its
 /// `URL.openConnection()` hands back, and the ones
@@ -5919,17 +5781,9 @@ pub(super) fn intercept_force_registered_native(
     ) {
         return None;
     }
-    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
-    // real `<init>` ran, so its real `workers` field is populated) must keep
-    // running its own real `execute()` -- only CratonVM's synthetic 2-field
-    // `Executors.new*ThreadPool()` objects need the forced native. See
-    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
-    if class_name == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && threadpool_executor_has_real_workers(shared, &args[0])
-    {
-        return None;
-    }
+    // (Receiver-shape probe deleted 2026-08-06 — see
+    // `force_native_over_real_jdk_bytecode`. The ninth, receiver-blind arm this
+    // one existed to undo went with it, so there is nothing left to undo.)
     // §7 routing. This was a bare `find`, so the dispatch below ran with no
     // policy check and no census count — see `admit_forced_native` for why
     // that made this one of seven unguarded strict-mode holes. `None` here
@@ -6103,17 +5957,9 @@ pub(super) fn intercept_force_registered_native_cached(
     ) {
         return None;
     }
-    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
-    // real `<init>` ran, so its real `workers` field is populated) must keep
-    // running its own real `execute()` -- only CratonVM's synthetic 2-field
-    // `Executors.new*ThreadPool()` objects need the forced native. See
-    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
-    if class_name == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && threadpool_executor_has_real_workers(shared, &args[0])
-    {
-        return None;
-    }
+    // (Receiver-shape probe deleted 2026-08-06 — see
+    // `force_native_over_real_jdk_bytecode`. The ninth, receiver-blind arm this
+    // one existed to undo went with it, so there is nothing left to undo.)
     // Site A1 of `arch-2026-07-26/native-dispatch-memoization.md`
     // §3 Step 2. Perf (2026-07-19, TestResponsePerformance residual): memoize
     // the resolved callback per invoke-cache entry, same shape as
@@ -6542,11 +6388,37 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
     }
 
     let cm = shared.classes.class_manager.read();
+    synthetic_stub_yields_with_cm(&cm, class_name, method_name, descriptor)
+}
+
+/// The class-manager half of [`synthetic_stub_kind_should_yield_to_real_bytecode`],
+/// for callers that are **already holding** the read guard.
+///
+/// `populate_virtual_invoke_cache` is one: it takes `class_manager.read()` to
+/// resolve the receiver's name and must ask this question before it publishes a
+/// `VirtualNative` target. Re-acquiring the lock there would be a nested
+/// `read()` — a lock-order panic in debug builds and a possible deadlock in
+/// release once a writer is queued (the same trap
+/// `threadpool_executor_has_real_workers` documented before it was deleted).
+///
+/// Split out rather than copied: this predicate has five terms and five
+/// different remedies, and the whole point of the 2026-08-04 centralisation is
+/// that no dispatch path gets to answer it differently from another.
+///
+/// The `kind`/allow-list gate is the CALLER's, deliberately: both terms are
+/// string/enum work that must short-circuit before anyone touches the class
+/// manager at all.
+pub(super) fn synthetic_stub_yields_with_cm(
+    cm: &crate::classloading::ClassManager,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
     let (verdict, why) = match cm.get_loaded_class_id(class_name) {
         None => (false, "class not loaded"),
         Some(cid) => match cm.get_class(cid) {
             None => (false, "class id not in the store"),
-            Some(cls) if cls.is_synthetic_stub => (false, "loaded class is itself a synthetic stub"),
+            Some(cls) if cls.origin.is_compatibility_stub() => (false, "loaded class is itself a synthetic stub"),
             Some(_) => match crate::classloading::find_method_recursive(
                 cid,
                 method_name,
@@ -6603,7 +6475,7 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
         || real_protected_stub_class_common(class_name)
 }
 
-/// The eleven classes **both** dispatch paths yield to real bytecode.
+/// The twelve classes **both** dispatch paths yield to real bytecode.
 ///
 /// Kept as a `matches!` over string literals rather than a slice scan: this is
 /// on the native-dispatch path, and `matches!` compiles to a length-bucketed
@@ -6616,6 +6488,28 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             | "java/util/concurrent/LinkedBlockingDeque"
             | "java/util/concurrent/atomic/AtomicBoolean"
             | "java/util/EnumSet"
+            // JDK-ONLY-WAVE2, 2026-08-06. `native_es_execute` (retagged
+            // `SyntheticStub` in `native-builtins/src/util_concurrent_ext.rs`)
+            // is the compatibility stand-in for CratonVM's synthetic 2-field
+            // `Executors.new*ThreadPool()` receiver. Every factory shortcut now
+            // drives the real `ThreadPoolExecutor.<init>`
+            // (`initialize_real_thread_pool_executor`), so on an image where
+            // the real class bytes are loaded there is no synthetic receiver
+            // left and the real `execute()` body is right for ALL of them.
+            //
+            // This entry is what replaced eight hand-written receiver-shape
+            // probes ("does the receiver's `workers` field hold an object?")
+            // spread across four files in `vm`. It answers the same question
+            // class-scoped instead of per-instance, which is only sound
+            // *because* the per-instance distinction was eliminated first —
+            // reinstating a synthetic-layout `ThreadPoolExecutor` producer
+            // without also reinstating those probes would send it to real
+            // bytecode that dereferences a null `ctl`/`mainLock`.
+            //
+            // On a synthetic-JDK image the class IS a compatibility stub, the
+            // predicate below finds no real `execute()` body, and the native
+            // still runs — which is the only mode that still needs it.
+            | "java/util/concurrent/ThreadPoolExecutor"
             // The fallback bridge is needed only if bootstrap had to
             // synthesize Instant.  With a loaded real JDK Instant, every
             // factory must run its real bytecode so the result has the
@@ -6668,6 +6562,7 @@ pub(crate) const REAL_PROTECTED_STUB_CORPUS: &[&str] = &[
     "java/util/concurrent/LinkedBlockingDeque",
     "java/util/concurrent/atomic/AtomicBoolean",
     "java/util/EnumSet",
+    "java/util/concurrent/ThreadPoolExecutor",
     "java/time/Instant",
     "java/time/ZonedDateTime",
     "java/io/FileInputStream",
@@ -6698,7 +6593,7 @@ mod real_protected_stub_tests {
     #[test]
     fn every_allowlisted_class_is_protected() {
         assert!(
-            REAL_PROTECTED_STUB_CORPUS.len() >= 11,
+            REAL_PROTECTED_STUB_CORPUS.len() >= 12,
             "the corpus shrank to {} entries; a class was removed from the \
              real-protected-stub allow-list. That hands its `SyntheticStub` natives \
              back to a synthetic field layout over the real JDK class — for \
@@ -6719,88 +6614,95 @@ mod real_protected_stub_tests {
 
 #[cfg(test)]
 mod threadpool_receiver_shape_tests {
-    use super::THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES;
-
     /// The `vm` crate's source root, for the scan below.
     fn vm_src(rel: &str) -> String {
-        // `rel` is repo-relative (`vm/src/...`) so the census constant reads
-        // the way a `rg` invocation would; strip the crate prefix to get a
-        // path under this crate's manifest dir.
-        let under_crate = rel.strip_prefix("vm/").expect("census paths are vm-crate paths");
+        // `rel` is repo-relative (`vm/src/...`) so the paths read the way an
+        // `rg` invocation would; strip the crate prefix to get a path under
+        // this crate's manifest dir.
+        let under_crate = rel
+            .strip_prefix("vm/")
+            .expect("scan paths are vm-crate paths");
         let path = format!("{}/{under_crate}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
     }
 
-    /// Exactly eight dispatch sites consult the receiver-shape probe, and a
-    /// partial deletion fails here rather than silently leaving half the
-    /// duplication enforcing a policy the other half no longer applies.
-    ///
-    /// Counts calls to the probe helper, which is now the *only*
-    /// implementation — the two hand-inlined copies in `vm_exec.rs` were folded
-    /// into it, so a site cannot hide from this scan by writing the `workers`
-    /// lookup out longhand without also tripping
-    /// `no_hand_inlined_workers_probe_outside_the_helper` below.
-    ///
-    /// Deliberately an equality, not a floor: this list only ever shrinks, and
-    /// it shrinks all at once. See
-    /// [`THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES`] for the order the removal
-    /// has to happen in.
-    #[test]
-    fn exactly_eight_dispatch_sites_probe_the_threadpool_receiver_shape() {
-        let mut files: Vec<&str> = THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES
-            .iter()
-            .map(|(f, _)| *f)
-            .collect();
-        files.sort_unstable();
-        files.dedup();
+    /// The four files that carried the eight `ThreadPoolExecutor.execute`
+    /// receiver-shape probes, retired 2026-08-06.
+    const FORMER_SITE_FILES: &[&str] = &[
+        "vm/src/vm/vm_exec.rs",
+        "vm/src/runtime/interpreter/invoke.rs",
+        "vm/src/runtime/interpreter/native_override.rs",
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+    ];
 
+    /// **Zero** dispatch sites probe the receiver's shape, and none of them
+    /// re-inlines the `workers` lookup by hand either.
+    ///
+    /// This replaces `exactly_eight_dispatch_sites_probe_the_threadpool_receiver_shape`
+    /// and `no_hand_inlined_workers_probe_outside_the_helper` (2026-08-04 →
+    /// 2026-08-06), which pinned the count at eight so that a *partial* sweep
+    /// would fail. The sweep happened; what can regress now is a copy growing
+    /// back, one site at a time, the way the original eight did — each for a
+    /// real observed failure, each locally reasonable.
+    ///
+    /// If you are here because this test failed: a receiver-shape probe is the
+    /// wrong fix. The class-scoped arbitration
+    /// (`real_protected_stub_class_common` + `NativeKind::SyntheticStub` on
+    /// `native_es_execute`) is only correct while every
+    /// `ThreadPoolExecutor`-tagged object on a real-JDK image is genuinely
+    /// real. If something reintroduced a synthetic-layout producer, fix THAT —
+    /// make it drive `initialize_real_thread_pool_executor` — rather than
+    /// teaching one dispatch path to tell the two apart again.
+    #[test]
+    fn every_threadpool_receiver_shape_site_is_gone() {
         // Assembled at runtime so this scanner's own source does not contain
-        // the string it looks for. Spelling the needle as a literal made the
-        // first version of this test count itself — twice, once for the
-        // `match_indices` argument and once for a doc-comment mention. That is
-        // a fine demonstration that the scan works and a poor gate.
-        let needle = format!("{}(", "threadpool_executor_has_real_workers");
-
-        let mut total = 0usize;
-        for file in &files {
-            let src = vm_src(file);
-            // Skip the definition itself; every other occurrence is a call,
-            // and doc-comment mentions of the name carry no `(`.
-            total += src
-                .match_indices(needle.as_str())
-                .filter(|(i, _)| !src[..*i].ends_with("fn "))
-                .count();
-        }
-        assert_eq!(
-            total,
-            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len(),
-            "found {total} call(s) to the ThreadPoolExecutor receiver-shape probe across {files:?}, \
-             but THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES lists {}. If you deleted some sites, \
-             delete ALL of them together with the receiver-blind ninth site in \
-             `force_native_over_real_jdk_bytecode` — and only after `native_es_execute` is \
-             reclassified, or a native calling `.execute()` on a real executor recurses into \
-             itself and aborts the process. If you ADDED one, add it to the census constant.",
-            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len()
+        // the strings it looks for.
+        let probe_call = format!("{}(", "threadpool_executor_has_real_workers");
+        let hand_inlined = format!(
+            r#"{}(recv_class_id, "workers""#,
+            "resolve_field_index_in_hierarchy"
         );
-    }
 
-    /// Nobody re-inlines the `workers`-field probe by hand.
-    ///
-    /// Two sites used to, which is how the predicate came to have three
-    /// implementations, two of which took a plain `read()` where the helper
-    /// documents that a nested `read_recursive()` is required — a lock-order
-    /// panic in debug builds and a potential deadlock in release.
-    #[test]
-    fn no_hand_inlined_workers_probe_outside_the_helper() {
-        for file in ["vm/src/vm/vm_exec.rs"] {
+        for file in FORMER_SITE_FILES {
             let src = vm_src(file);
             assert!(
-                !src.contains(r#"resolve_field_index_in_hierarchy(recv_class_id, "workers""#),
-                "{file} hand-inlines the ThreadPoolExecutor `workers` probe again; call \
-                 `threadpool_executor_has_real_workers` instead — it is the one implementation, \
-                 and it takes `read_recursive()` for the reason its doc comment gives"
+                !src.contains(probe_call.as_str()),
+                "{file} calls the deleted ThreadPoolExecutor receiver-shape probe again. \
+                 All eight sites and the probe itself were removed on 2026-08-06 together \
+                 with the receiver-blind ninth arm in `force_native_over_real_jdk_bytecode`; \
+                 re-adding one alone recreates the cold-path/warm-path split the census \
+                 constant existed to prevent."
+            );
+            assert!(
+                !src.contains(hand_inlined.as_str()),
+                "{file} hand-inlines the ThreadPoolExecutor `workers` probe. That is how \
+                 the predicate came to have three implementations, two of which took a \
+                 plain `read()` where a nested `read_recursive()` is required."
             );
         }
+    }
+
+    /// The class-scoped replacement is actually in place.
+    ///
+    /// Two independent facts, and the pair is the whole fix: without the
+    /// allow-list entry the retagged native would win over real bytecode for
+    /// every receiver (the recursion the eight probes prevented); without the
+    /// retag the allow-list entry is inert, because the arbitration only fires
+    /// for `NativeKind::SyntheticStub`.
+    ///
+    /// The `NativeKind` half is pinned in
+    /// `native-builtins/tests/stub_ratchet.rs`, which builds the real boot
+    /// registry; this half pins the allow-list, which is `vm`'s.
+    #[test]
+    fn threadpool_executor_is_real_protected() {
+        assert!(
+            super::real_protected_stub_class("java/util/concurrent/ThreadPoolExecutor"),
+            "`java/util/concurrent/ThreadPoolExecutor` left the real-protected-stub \
+             allow-list. `native_es_execute` is tagged `SyntheticStub`, so without this \
+             entry it wins over the real `execute()` body for every receiver — including \
+             the async worker pool a native calls `.execute()` on, which recurses into \
+             the same native and aborts the process rather than throwing."
+        );
     }
 }
 

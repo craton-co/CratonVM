@@ -332,10 +332,46 @@ HotSpot has `KeyValueHolder`; re-pointing the allocation at
    restored behind gates rather than left deleted — the second under
    `#[cfg(feature = "synthetic-jdk")]`, so real-JDK mode keeps the
    HotSpot-correct bytecode and synthetic mode regains the method.
-3. **`Map.entry(...).setValue()` is permissive under `--synthetic-jdk`.**
-   Needs `Map.entry` to mint its own class rather than sharing
-   `java/util/Map$Entry` with the write-through entry-set views. See *Measured
-   2026-08-06* above for why the one-line fixes do not work.
+3. **`Map.entry(...).setValue()` is permissive under `--synthetic-jdk`** —
+   and the fix is blocked behind two deeper defects, measured 2026-08-06 and
+   recorded below rather than guessed at again.
+
+   Giving `Map.entry` its own class works exactly as intended: minting
+   `java/util/KeyValueHolder` (the JDK's own answer, and the class HotSpot
+   returns) makes `setValue` throw, makes `getClass()` agree with HotSpot, and
+   leaves `--real-jdk` byte-identical. It was **not landed**, because it trades
+   one contract violation for another and the probe count stays at 2: a
+   `SimpleEntry` compared against the new `KeyValueHolder` answers `false`
+   while the reverse answers `true`, which breaks the symmetry
+   `Object.equals` requires.
+
+   Chasing that asymmetry turned up two defects that have nothing to do with
+   `Map.entry`, both reproducible on `dev` with a four-line probe:
+
+   ```
+   new AbstractMap.SimpleEntry<>("a", 1)      HotSpot        --synthetic-jdk
+     .toString()                              a=1            null=null
+     .equals(an equal SimpleEntry)            true           false
+   ```
+
+   * **The public `SimpleEntry` constructor stores nothing.** Its key and value
+     both read `null`. Entries the *map* creates are unaffected
+     (`LinkedHashMap.entrySet()` reads its keys fine) — it is the
+     `(Object,Object)` constructor path alone.
+   * **A native `equals` does not take effect on `SimpleEntry`, while
+     `toString` and `hashCode` registered on the SAME class in the SAME call
+     do.** The evidence is that `toString` printed `null=null` — that is this
+     VM's format rendering this VM's nulls — and `hashCode` agreed across two
+     distinct objects (`0 ^ 0`), while `equals` fell back to identity. On
+     `KeyValueHolder`, which has no synthetic class definition, the same
+     `equals` native runs normally. So `equals` is being shadowed specifically
+     on classes that have a synthetic method table.
+
+   The second is the one to fix first: it silently disables an override that
+   the registry reports as registered, which makes every native `equals` in
+   the tree suspect. Until it is fixed, patching an `equals` body is patching
+   code that never runs — three attempts here did exactly that before the
+   probe above was written.
 4. **The differential covers what it covers.** `ShadowDifferentialProbe`
    exercises `java.util`'s factories and views. The other ~1,600 inherited
    shadows are unprobed, and the honest reading of "they match" is "the ones

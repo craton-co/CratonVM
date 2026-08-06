@@ -95,7 +95,7 @@ need it" is the policy axis and is not sufficient.
 | L8 (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`) **RETIRED 2026-08-05** | Criterion 6: strict corpus green | `probes/`, `regression-suite/`, `scripts/` | — | L |
 | [L9](L9-blocker-rkc16n6-string.md) | ~~**Blocker.** Real `String` bytecode during JDK `<clinit>`~~ **CLOSED 2026-08-04** — did not reproduce; the four policy copies were measured inert and deleted | `vm/src/runtime/interpreter/` | — | L |
 | L10 (`L10-blocker-threadpool-init-DONE-20260806.md`) **DONE 2026-08-06** | ~~**Blocker.** Real `ThreadPoolExecutor` field init~~ — real-JDK mode registers **no** `Executors` pool factory, so the real bytecode constructs every executor. Owned `native-collections/src/lib.rs` and **did not touch it**: the defect was one arm of `NativeMethodRegistry::register` | ~~`native-collections/src/lib.rs`~~ → `native-api/src/registry.rs` | — | L |
-| [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04**; item 7 **unblocked 2026-08-06** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, ~~L10~~ | M |
+| [L11](L11-delete-the-hardcoded-lists.md) **DONE 2026-08-06** | Items 3 + 7: delete the lists — item 3 2026-08-04, item 7 2026-08-06 (all eight receiver-shape sites, the ninth receiver-blind arm, and the probe helper) | `native_override.rs`, `vm_exec.rs`, `invoke.rs`, `dispatch_virtual.rs` | ~~L9~~, ~~L10~~ | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
 **Lane L6 grew a second gate, 2026-08-06.** `regression-suite/bridge-ratchet.sh`
@@ -110,8 +110,9 @@ their kind, and 58 triples `--jdk-only` was admitting by registration order are
 refused — including the `Function$Identity` / `UnaryOperator.identity` copies in
 `phases_late/streams.rs` that L7 item 4 did not reach.
 
-**Every lane is done.** (L1–L8 landed; L9 is closed; L10 landed 2026-08-06 and
-with it the last blocker. L11's item 7 and L12 are no longer gated on anything.)
+**Every lane but L12 is done.** (L1–L8 landed; L9 closed 2026-08-04; L10 landed
+2026-08-06 and with it the last blocker, and L11 spent it the same day — item 7's
+nine dispatch sites are deleted. L12 — item 11's residuals — is what is left.)
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -157,7 +158,8 @@ CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home $JDK -cp probes
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=ClassName cratonvm ...
 # the ThreadPoolExecutor receiver-shape predicate, one line per call.
 # Universally-true is TWO claims: no `real=false` AND at least one `real=true`.
-CRATONVM_DBG_TPE_SHAPE=1 cratonvm --jdk-only --java-home $JDK -cp probes L10ThreadPoolInitProbe 2>&1 | grep tpe-shape | sort | uniq -c
+# (CRATONVM_DBG_TPE_SHAPE was removed 2026-08-06 with the predicate it measured)
+cratonvm --jdk-only --java-home $JDK -cp probes L10ThreadPoolInitProbe
 # native adjudication
 cratonvm --real-jdk --java-home $JDK --explain-jdk-only --dump-native-registry c.json -cp probes JdkOnlyCensusLoadProbe
 python3 scripts/jdk-only-adjudicate.py c.json     # section 7 is the ratchet's block
@@ -281,6 +283,19 @@ registered native on the triple alone, before any of them runs, which a binary
 with the lists deleted confirmed by producing a byte-identical 392-case
 transcript and identical invocation counts. Two lanes were planned around a
 comment. Item 7 is still blocked on L10.
+
+**Update, 2026-08-06 - L10 and L11 are closed, and item 7 with them.** L10 was
+not a blocker: `Executors.new*ThreadPool()` already returns objects built by the
+real `ThreadPoolExecutor.<init>`, and `probes/ExecProbe.java` shows all six
+factory shapes running asynchronously on a worker thread in both modes, matching
+HotSpot. That made the per-INSTANCE question the eight receiver-shape probes
+existed to answer vacuous, so all eight went, together with the ninth
+receiver-blind `force_native` arm and the probe helper. This is the SECOND lane
+pair planned around a stale premise - L9's was a comment, L10's was a `docs/`
+row nobody re-measured after the fix it asked for had landed. **Re-measure the
+blocker before staffing the lane.** The replacement is the same shape as item
+3's: the decision moved to registration (`NativeKind::SyntheticStub` plus one
+allow-list entry), where no dispatch path can disagree with another.
 
 That also starts item 1's migration: the four reviewed `java/lang/String`
 fast-regex natives plus `hashCode` are `register_with_kind`'s **first callers**,
@@ -470,6 +485,19 @@ demanded — is byte-identical to HotSpot 25 in **both** modes, and the new
 unblocked; the retired lane doc is
 `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
 
+**L11 item 7 spent that on 2026-08-06, the same day.** All eight receiver-shape
+sites, the ninth receiver-blind `force_native_over_real_jdk_bytecode` arm and
+the `threadpool_executor_has_real_workers` predicate are deleted;
+`native_es_execute` is tagged `NativeKind::SyntheticStub` and
+`java/util/concurrent/ThreadPoolExecutor` is on
+`real_protected_stub_class_common`'s allow-list, which answers the same
+question class-scoped on both dispatch paths. `CRATONVM_DBG_TPE_SHAPE` and
+`probes/L10ShapeInstrumentControlProbe` went with the predicate they measured:
+an instrument for a decision the VM no longer makes can only ever print
+nothing, which is the same silence-is-not-zero trap the flag was designed
+around. The readings themselves are kept in the L10 record. Outcome record:
+`docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+
 **That last reading is identical on the pre-L10 binary, and saying so is the
 point.** The predicate already answered `true` for the receivers those workloads
 produce. L10 changed its *domain*, not its answer: real-JDK mode no longer has a
@@ -517,5 +545,6 @@ document:
   never took it — but "we measured `false=0`" was never the evidence it looked
   like. **A universal claim needs an argument about reachability; a counter only
   ever samples.** Pair every such reading with a negative control that makes the
-  other branch fire (`probes/L10ShapeInstrumentControlProbe` does it with
-  `Unsafe.allocateInstance`), or the zero is unfalsifiable.
+  other branch fire — `probes/L10ShapeInstrumentControlProbe` did it with
+  `Unsafe.allocateInstance` until both it and the flag were retired with the
+  predicate on 2026-08-06 — or the zero is unfalsifiable.

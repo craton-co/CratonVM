@@ -1,4 +1,18 @@
-# L11 — Items 3 + 7: delete the hard-coded lists — **item 3 DONE 2026-08-04**
+# L11 — Items 3 + 7: delete the hard-coded lists — **DONE** (item 3 2026-08-04, item 7 2026-08-06)
+
+> **Item 7 closed 2026-08-06.** All eight `ThreadPoolExecutor.execute`
+> receiver-shape sites, the ninth receiver-blind `force_native_over_real_jdk_bytecode`
+> arm, the `threadpool_executor_has_real_workers` helper and the
+> `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` census constant are deleted.
+> L10 turned out not to be a blocker — it was already satisfied, and measuring
+> that is what unblocked this. What replaced the lists is the same move item 3
+> made: the decision went to REGISTRATION. `native_es_execute` is tagged
+> `NativeKind::SyntheticStub` and `java/util/concurrent/ThreadPoolExecutor` is
+> on `real_protected_stub_class_common`'s allow-list, so the one centralised
+> arbitration yields it to the real `execute()` body class-scoped, on both the
+> warm and the cold path. Outcome record:
+> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+
 
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
 `vm/src/vm/vm_exec.rs` (dispatch regions ~14700 and ~22700)
@@ -110,8 +124,20 @@ condition that required it is provably gone — which is what L9 and L10 deliver
    is not evidence for step 2's precondition. Run the flag.
 3. Delete item 3's lists; run the 29-shape verdict table — it should now be
    uniform, and if it is not, the deletion is premature.
-4. Delete item 7's eight sites and the ninth arm; the partial-sweep gate must go
-   green *because there is nothing left to sweep*, not because it was relaxed.
+4. ~~Delete item 7's eight sites and the ninth arm~~ **- done 2026-08-06.** The
+   partial-sweep gate went green because there was nothing left to sweep, and
+   was then replaced by `every_threadpool_receiver_shape_site_is_gone`, which
+   asserts ZERO call sites and zero hand-inlined `workers` lookups across the
+   four files that carried them - what can regress now is a copy growing back,
+   not a partial removal. What replaced the sites is the same move step 3
+   made: `native_es_execute` is tagged `NativeKind::SyntheticStub` and
+   `java/util/concurrent/ThreadPoolExecutor` is on
+   `real_protected_stub_class_common`'s allow-list, so the one centralised
+   arbitration answers the question class-scoped for every receiver on both
+   dispatch paths. `CRATONVM_DBG_TPE_SHAPE` and
+   `probes/L10ShapeInstrumentControlProbe` were retired with the predicate
+   they instrumented. Outcome record:
+   `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
 5. Replace both with `resolve_dispatch`. §7 step 3 already fires ~3,344 times per
    short run, so this path is exercised — but see the caution below.
 
