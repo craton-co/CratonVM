@@ -6749,6 +6749,71 @@ mod tests {
         assert!(pending.is_none(), "server engines do not identify endpoints");
     }
 
+    /// REGRESSION (`NettyReactiveWebServerFactoryTests.whenSslBundleIsUpdatedThenSslIsReloaded`):
+    /// which TrustManager is in force decides WHO identifies the endpoint, and
+    /// getting that wrong rejects a connection a real JDK accepts.
+    ///
+    /// The three cases are the three branches of `SSLContextImpl.chooseTrustManager`,
+    /// and they must not collapse into each other: an empty array is JSSE's own
+    /// default manager (identifies), a plain `X509TrustManager` is wrapped by
+    /// `AbstractTrustManagerWrapper` (JSSE identifies AFTER it — the
+    /// CVE-2018-8034 case Tomcat's `TesterSupport.TrustAllCerts` exercises),
+    /// and an `X509ExtendedTrustManager` is used as-is (JSSE adds nothing, and
+    /// Netty's `X509TrustManagerWrapper` is one).
+    #[test]
+    fn an_extended_trust_manager_owns_endpoint_identification() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let extended = ctx
+            .ensure_class_initialized("javax/net/ssl/X509ExtendedTrustManager")
+            .expect("mock class");
+        let tm_iface = ctx
+            .ensure_class_initialized("javax/net/ssl/X509TrustManager")
+            .expect("mock class");
+        ctx.set_superclass(extended, tm_iface);
+
+        // 1. No application TrustManager: JSSE's own default identifies.
+        assert!(
+            super::jsse_owns_endpoint_identification(&mut ctx, &[]),
+            "with no application manager, JSSE's default X509TrustManagerImpl identifies"
+        );
+
+        // 2. A PLAIN X509TrustManager — the accept-everything test shape.
+        //    JSSE wraps it and still identifies, so this must stay strict or
+        //    `TestSecurity2018.testCVE_2018_8034` regresses.
+        let plain_cls = ctx
+            .ensure_class_initialized("org/example/TrustAllCerts")
+            .expect("mock class");
+        let plain = ctx.alloc_object(plain_cls, 1);
+        assert!(
+            super::jsse_owns_endpoint_identification(&mut ctx, &[plain]),
+            "a plain X509TrustManager is wrapped by JSSE, which then identifies"
+        );
+
+        // 3. An X509ExtendedTrustManager subclass — Netty's
+        //    `X509TrustManagerWrapper`. JSSE uses it as-is and adds no check.
+        let netty_cls = ctx
+            .ensure_class_initialized("io/netty/handler/ssl/util/X509TrustManagerWrapper")
+            .expect("mock class");
+        ctx.set_superclass(netty_cls, extended);
+        let netty = ctx.alloc_object(netty_cls, 1);
+        assert!(
+            !super::jsse_owns_endpoint_identification(&mut ctx, &[netty]),
+            "an X509ExtendedTrustManager owns identification; JSSE adds no check of its own"
+        );
+
+        // 3b. The class itself, not only a subclass.
+        let direct = ctx.alloc_object(extended, 1);
+        assert!(!super::jsse_owns_endpoint_identification(&mut ctx, &[direct]));
+
+        // 4. `chooseTrustManager` takes the FIRST manager, so a plain one ahead
+        //    of an extended one still means JSSE identifies.
+        let plain2 = ctx.alloc_object(plain_cls, 1);
+        assert!(
+            super::jsse_owns_endpoint_identification(&mut ctx, &[plain2, netty]),
+            "the FIRST manager decides, matching SSLContextImpl.chooseTrustManager"
+        );
+    }
+
     #[test]
     fn wrap_consumes_no_app_data_before_finished_is_reported() {
         // REGRESSION (websocket-jsse-ssl-bytes-consumed-during-write): rustls
@@ -8540,6 +8605,10 @@ fn engine_run_trust_check(
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    // Whether JSSE performs the identity check ITSELF is decided by WHICH
+    // TrustManager is in force, so it is decided here rather than inside
+    // `engine_check_endpoint_identity`. See `jsse_owns_endpoint_identification`.
+    let jsse_identifies = jsse_owns_endpoint_identification(ctx, &trust_managers);
     if trust_managers.is_empty() {
         // No custom TrustManager/TrustManagerFactory installed on this
         // context — rustls's own chain-of-trust check is the only chain
@@ -8547,7 +8616,7 @@ fn engine_run_trust_check(
         // identification still applies: in real JSSE it is the DEFAULT
         // `X509TrustManagerImpl` that performs it, so "no custom manager" is
         // the case where it is most certainly enforced.
-        return engine_check_endpoint_identity(ctx, &pending);
+        return engine_check_endpoint_identity(ctx, &pending, jsse_identifies);
     }
 
     // Real JSSE authType is the key-exchange/signature algorithm; we don't
@@ -8681,30 +8750,120 @@ fn engine_run_trust_check(
             &format!("TrustManager rejected the peer certificate chain: {detail}"),
         ));
     }
-    engine_check_endpoint_identity(ctx, &pending)
+    engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
+}
+
+/// Would real JSSE perform endpoint identification itself for this
+/// `TrustManager[]`, or has the application taken the job?
+///
+/// `SSLContextImpl.chooseTrustManager` picks the FIRST element that is an
+/// `X509TrustManager` and then splits on its type:
+///
+/// * an `X509ExtendedTrustManager` is used **as-is**. JSSE calls its
+///   `checkServerTrusted(chain, authType, SSLEngine)` and does nothing further:
+///   the extended interface exists precisely so that an implementation can see
+///   the engine/session and take responsibility for identification. JSSE adds
+///   no check of its own — if the extended manager does not identify, NOTHING
+///   identifies.
+/// * a plain `X509TrustManager` is wrapped in
+///   `SSLContextImpl$AbstractTrustManagerWrapper`, whose `checkAdditionalTrust`
+///   runs `X509TrustManagerImpl.checkIdentity` AFTER the application's
+///   `checkServerTrusted` returns. A plain manager that accepts everything
+///   therefore does NOT switch hostname verification off — Tomcat's
+///   `TesterSupport.TrustAllCerts` is exactly that, and treating its "yes" as
+///   the end of the story is the CVE-2018-8034 bypass
+///   (`TestSecurity2018.testCVE_2018_8034`).
+///
+/// The 2026-08-03 fix that first gave the `SSLEngine` lane an identity check
+/// implemented the second bullet and applied it to both. That is stricter than
+/// JSSE, and it rejects a connection a real JDK accepts: Netty wraps every
+/// `TrustManagerFactory`'s managers in `io.netty.handler.ssl.util.X509TrustManagerWrapper`,
+/// an `X509ExtendedTrustManager`, and Netty 4.2 clients default
+/// `endpointIdentificationAlgorithm` to `HTTPS`
+/// (`SslContext.defaultEndpointVerificationAlgorithm`). So every Netty client
+/// asks for identification and then supplies an extended manager that performs
+/// none — which on a real JDK means no identification at all. Verified against
+/// HotSpot 25 with the same jars: `newEngine(alloc, "localhost", 4443)` reports
+/// `alg=HTTPS`, and the manager reports `X509TrustManagerWrapper
+/// extended=true`, and the handshake succeeds against a `CN=1` certificate.
+///
+/// `X509ExtendedTrustManager` is an abstract CLASS, so a SUPERCLASS WALK BY
+/// NAME is the exact test — and it is deliberately not `is_subclass` against a
+/// `class_id_by_name` lookup. That lookup answers `None` both for "no loader
+/// has this name" and for "several do", and a `None` there would silently
+/// degrade to the strict answer and look exactly like a working check. Walking
+/// the receiver's own chain asks the object, which cannot be ambiguous.
+///
+/// Anything unresolvable falls back to `true` — the stricter, pre-existing
+/// behaviour. `CRATONVM_DBG=tls-auth` names the chain that was walked, because
+/// "returned true" and "never found the class" are the two answers that must
+/// not be confused when this is next investigated.
+fn jsse_owns_endpoint_identification(
+    ctx: &mut dyn NativeContext,
+    trust_managers: &[ObjectRef],
+) -> bool {
+    let Some(first) = trust_managers.first() else {
+        // JSSE's own default `X509TrustManagerImpl` is in force, and it is the
+        // one that identifies.
+        return true;
+    };
+    let dbg = crate::nbflags().dbg_tls_auth_ok;
+    let mut chain: Vec<String> = Vec::new();
+    let mut cid = Some(ctx.class_id_of_object(*first));
+    // Bounded: a JDK trust-manager hierarchy is a handful of links, and an
+    // unbounded walk over a corrupted `superclass_of` would hang the handshake.
+    for _ in 0..32 {
+        let Some(c) = cid else { break };
+        let name = ctx.class_name_of_id(c);
+        if dbg {
+            chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
+        }
+        if name.as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
+            if dbg {
+                eprintln!(
+                    "[dbg-tls-auth] trust manager is an X509ExtendedTrustManager ({}) — \
+                     it owns endpoint identification, JSSE adds none",
+                    chain.join(" -> ")
+                );
+            }
+            return false;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    if dbg {
+        eprintln!(
+            "[dbg-tls-auth] trust manager is NOT an X509ExtendedTrustManager ({}) — \
+             JSSE wraps it and identifies the endpoint itself",
+            chain.join(" -> ")
+        );
+    }
+    true
 }
 
 /// RFC 2818 / RFC 6125 endpoint identification for a client engine, run after
 /// the chain has been accepted.
 ///
-/// ## Why this cannot be folded into the TrustManager consultation
+/// ## Why this is a separate gate from the TrustManager consultation
 ///
-/// In real JSSE the two are genuinely independent. A plain `X509TrustManager`
-/// supplied by an application is wrapped by
+/// In real JSSE the two are genuinely independent for a PLAIN
+/// `X509TrustManager`: it is wrapped by
 /// `SSLContextImpl$AbstractTrustManagerWrapper`, which calls the application's
 /// `checkServerTrusted` and THEN `checkAdditionalTrust` →
 /// `X509TrustManagerImpl.checkIdentity`. So an application TrustManager that
-/// accepts everything — the standard test shape, and precisely what Tomcat's
-/// `TestSecurity2018` installs (`TesterSupport.TrustAllCerts`) — does not and
-/// cannot switch hostname verification off. Treating "the TrustManager said
-/// yes" as the end of the story is the CVE-2018-8034 bypass itself: a
-/// certificate issued for `localhost` was accepted for a connection to
-/// `127.0.0.1`.
+/// accepts everything — precisely what Tomcat's `TestSecurity2018` installs
+/// (`TesterSupport.TrustAllCerts`) — does not and cannot switch hostname
+/// verification off. Treating "the TrustManager said yes" as the end of the
+/// story is the CVE-2018-8034 bypass itself: a certificate issued for
+/// `localhost` was accepted for a connection to `127.0.0.1`.
 ///
 /// Symmetrically, when NO application TrustManager is installed, JSSE's own
 /// default `X509TrustManagerImpl` performs the identity check — so this must
 /// run on that path too, which is why the early return in
 /// `engine_run_trust_check` calls here rather than returning `Ok(())`.
+///
+/// `jsse_identifies` is the third case and the one this signature exists for:
+/// an application `X509ExtendedTrustManager` OWNS identification, and JSSE adds
+/// nothing. See [`jsse_owns_endpoint_identification`].
 ///
 /// A failure aborts the handshake as `SSLHandshakeException`, wrapping the same
 /// text JSSE uses ("No subject alternative names matching ..." shape), which is
@@ -8713,10 +8872,20 @@ fn engine_run_trust_check(
 fn engine_check_endpoint_identity(
     ctx: &mut dyn NativeContext,
     pending: &PendingTrustCheck,
+    jsse_identifies: bool,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let Some((alg, host)) = pending.endpoint_identity.as_ref() else {
         return Ok(());
     };
+    if !jsse_identifies {
+        if crate::nbflags().dbg_tls_auth_ok {
+            eprintln!(
+                "[dbg-tls-auth] endpoint identification ({alg}) for host {host:?} is the \
+                 application X509ExtendedTrustManager's job — JSSE adds no check of its own"
+            );
+        }
+        return Ok(());
+    }
     match crate::x509_manager::check_endpoint_identity(&pending.peer_chain_der, host) {
         Ok(()) => Ok(()),
         Err(e) => {
