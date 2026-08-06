@@ -470,7 +470,6 @@ fn try_forward_object(
         owned.shape = std::ptr::addr_of!((*h).shape).read();
         owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
         owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
-        owned.forwarding_ptr = std::ptr::addr_of!((*h).forwarding_ptr).read();
         // `mark_word` is an `AtomicU64`: read it through an atomic load.
         owned.mark_word.store(
             (*h).mark_word.load(std::sync::atomic::Ordering::Relaxed),
@@ -551,17 +550,17 @@ fn try_forward_object(
     // Clear the forwarding pointer in the NEW copy (it's a fresh object).
     // Write through a raw pointer so no `&mut ObjectHeader` is ever live
     // alongside any other reference to this header.
-    unsafe {
-        std::ptr::addr_of_mut!((*(new_ptr as *mut ObjectHeader)).forwarding_ptr)
-            .write(std::ptr::null_mut());
-    }
+    // (The destination needs no forwarding clear: forwarding now lives in the
+    // mark word, and the copy above carried the source's PRE-forward mark word,
+    // which by construction is not in the `FORWARDED` state — the source is
+    // clobbered only below, after this copy.)
 
     // SAFETY: old_ptr is still valid in from_space (not freed yet) and we have
     // exclusive access during STW GC. Install forwarding pointer for future
     // lookups. Written through a raw pointer to avoid aliasing the shared
     // header view used earlier in this function.
     unsafe {
-        std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr).write(new_ptr);
+        (*(old_ptr as *const ObjectHeader)).set_forwarding_address(new_ptr);
     }
 
     // Track the mapping

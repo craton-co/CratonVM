@@ -1,7 +1,7 @@
 # PGO-02 — retired 2026-08-04: the residuals, and the miscompile hiding in them
 
 Branch `fix/pgo-02-residuals-20260804`, merged to `dev` and pushed. Retires
-[`docs/known-issues/c2/archive/pgo-02-guarded-inlining.md`](../known-issues/c2/archive/pgo-02-guarded-inlining.md)
+[`docs/known-issues/c2/archive/pgo-02-guarded-inlining.md`](../feature-designs/c2/archive/pgo-02-guarded-inlining.md)
 for good. The living document is
 [`docs/feature-designs/profile-guided-inlining.md`](../feature-designs/profile-guided-inlining.md).
 

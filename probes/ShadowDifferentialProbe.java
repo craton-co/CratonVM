@@ -43,6 +43,27 @@ public class ShadowDifferentialProbe {
             line("Map.entry.setValue", t.getClass().getName());
         }
 
+        // --- the entry classes a user can construct directly ------------
+        // `Map.entry` above is minted by a native; these two are what
+        // ordinary bytecode reaches with `new`, and that is a different
+        // allocation path (`num_total_fields` on the fabricated class, not
+        // the slot count a native passes to `alloc_object`). It went unprobed
+        // and was broken in synthetic mode: both slots read null.
+        AbstractMap.SimpleEntry<String, Integer> se = new AbstractMap.SimpleEntry<>("k", 7);
+        entryLike("new SimpleEntry", se);
+        entryLike("new SimpleImmutableEntry", new AbstractMap.SimpleImmutableEntry<>("k", 7));
+        line("new SimpleEntry.equalsEqualPeer", se.equals(new AbstractMap.SimpleEntry<>("k", 7)));
+        line("new SimpleEntry.equalsSymmetric",
+                new AbstractMap.SimpleEntry<>("k", 7).equals(se) == se.equals(new AbstractMap.SimpleEntry<>("k", 7)));
+        se.setValue(8);
+        line("new SimpleEntry.afterSetValue", se.getValue());
+        try {
+            new AbstractMap.SimpleImmutableEntry<>("k", 7).setValue(8);
+            line("new SimpleImmutableEntry.setValue", "returned");
+        } catch (Throwable t) {
+            line("new SimpleImmutableEntry.setValue", t.getClass().getName());
+        }
+
         // --- immutable factories ---------------------------------------
         List<String> l = List.of("a", "b", "c");
         line("List.of.toString", l);

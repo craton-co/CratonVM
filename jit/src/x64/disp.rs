@@ -697,10 +697,16 @@ mod tests {
             assert_eq!(encoded.value(), value);
         }
         // The load-bearing half of the previous block: a legacy object with
-        // seven or more fields already addresses past 127, so the field
-        // accessors can never be narrowed to a literal disp8.
+        // enough fields already addresses past 127, so the field accessors can
+        // never be narrowed to a literal disp8.
+        //
+        // The bound moved from six fields to seven when HEADER_SIZE went
+        // 32 -> 24 on 2026-08-06 (24 + 6*16 = 120 now FITS disp8; 24 + 7*16 =
+        // 136 does not). This tripwire is what caught that, which is its whole
+        // purpose — it made the shrink re-derive the claim instead of letting
+        // "the accessors must be disp32" quietly stop being true.
         assert!(
-            i8::try_from(HEADER_SIZE as i64 + 6 * SLOT_SIZE as i64).is_err(),
+            i8::try_from(HEADER_SIZE as i64 + 7 * SLOT_SIZE as i64).is_err(),
             "if this ever fits disp8 the disp32 field accessors stopped being load-bearing; \
              re-derive the bound before shrinking them"
         );
