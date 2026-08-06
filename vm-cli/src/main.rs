@@ -4305,7 +4305,15 @@ fn run() -> Result<()> {
             // told apart from an audit that never ran.
             let sc = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
             let sup = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED.load(O::Relaxed);
-            eprintln!("[GC] unreg_memo: shortcircuits={sc} SUPPRESSED={sup}");
+            let supa = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED_AUTHORITATIVE
+                .load(O::Relaxed);
+            // `SUPPRESSED_AUTHORITATIVE` is the one that judges the fix: total
+            // suppressions are dominated by ordinary per-native-call snapshots,
+            // which no collector marks from.
+            eprintln!(
+                "[GC] unreg_memo: shortcircuits={sc} SUPPRESSED={sup} \
+                 SUPPRESSED_AUTHORITATIVE={supa}"
+            );
         }
     }
 
