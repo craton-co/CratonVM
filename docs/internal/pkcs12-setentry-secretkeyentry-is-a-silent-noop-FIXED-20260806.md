@@ -159,35 +159,46 @@ wrong password; the refusal of an unencodable algorithm; the read-side and
 dotted-OID name forms that `load` → `store` of somebody else's keystore depends
 on; and that JKS still omits secret keys while preserving insertion order.
 
-`cargo test -p cratonvm-native-builtins` is green (3292 lib tests + the
-integration ratchets). One unrelated test,
-`lock_discipline_ratchet::raw_lock_constructions_do_not_grow`, fails identically
-on pristine `dev` — 432 raw lock constructions against a baseline of 438; it
-*fell*, and the ratchet asks whoever lowered it to re-freeze in the same change.
-This change adds no lock and leaves the count at 432.
+`cargo test -p cratonvm-native-builtins --lib` is green in BOTH feature
+configurations: 3292 tests with default features, 3467 with
+`--features synthetic-jdk`. Two integration ratchets are red, and both are red
+on `dev` without this change:
+
+* `lock_discipline_ratchet::raw_lock_constructions_do_not_grow` — 432 raw lock
+  constructions against a baseline of 438. The count *fell*, and the ratchet
+  asks whoever lowered it to re-freeze in the same change. Confirmed identical
+  with this change stashed. It adds no lock and leaves the count at 432.
+* `shim_inheritance_guard::synthetic_registry_has_no_unlisted_identity_shim_on_an_intercepting_base`
+  (`--features synthetic-jdk` only) — names exactly one offender,
+  `java/util/prefs/AbstractPreferences.toString()`, registered in
+  `phases_late/beans_jndi.rs` on `origin/dev`. This change's registrations are
+  all on the four keystore engine FQNs plus `java/util/IteratorEnumeration`.
 
 ### The strict-corpus gate
 
 `scripts/jdk-only-strict-probes.sh` over the full three-probe corpus, three
-arms, **passes**, and reports both
+arms, **passes**. `JdkOnlyPlatformProbe`'s `--real-jdk` transcript is now
+byte-identical to HotSpot's; the sections still diverging under `--jdk-only`
+are the three other defects filed alongside this one (vthreads, agent, jni).
+
+The baseline was re-frozen in this change, and the regenerated file differs by
+exactly two deletions:
 
 ```
-JdkOnlyPlatformProbe/real/security
-JdkOnlyPlatformProbe/strict/security
+-JdkOnlyPlatformProbe/real/security
+-JdkOnlyPlatformProbe/strict/security
 ```
 
-as NO LONGER DIVERGING — the section that opened this record now matches
-HotSpot in both modes, `p12=true` included.
-
-The baseline was deliberately **not** re-frozen. That run also found six other
-sections (`regex`, `textformat`, `text`) no longer diverging; those belong to
-other in-flight work, not to this change, and `--update-baseline` regenerates
-the file wholesale rather than per line. Freezing eight lines whose stability
-this change did not measure would risk turning a blocking gate red on somebody
-else's next run, and the script itself warns that at least one class of section
-is intermittent by nature. A baselined line that stops diverging never fails
-the gate, so leaving them is a looser ratchet, not a broken one; the re-freeze
-belongs with whoever lands the other six.
+Nothing else moved — in particular `JdkOnlyPlatformProbe/*/vthreads` and
+`JdkOnlyBreadthProbe/strict/serialization` are retained. That mattered: both
+are genuinely intermittent (`serialization` diverged with
+`NoClassDefFoundError: cratonvm/internal/SystemLogger` in one full run and not
+in the previous one, twenty minutes apart on the same binary), and the
+baseline's own note records that an earlier re-freeze already landed on a lucky
+run and wrote a file too tight to hold. `--update-baseline` regenerates
+wholesale from a single run, so the diff was checked line by line before being
+kept, and the gate was then re-run without the flag to confirm it passes
+against the file it just wrote.
 
 ## Residual, stated rather than hidden
 
