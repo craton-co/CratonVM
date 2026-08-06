@@ -880,7 +880,15 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         // Pin across the buffer alloc below — a moving young GC there would
         // relocate the backing array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+        // HeapCharBuffer, NOT the abstract `java/nio/CharBuffer`. Stamping the
+        // abstract class means any real-JDK method WITHOUT a native override
+        // dispatches to its abstract declaration: `CharBuffer.wrap(a).slice()`
+        // threw `AbstractMethodError: method java/nio/CharBuffer.slice
+        // ()Ljava/nio/CharBuffer; has no Code attribute` where HotSpot returns
+        // a buffer. `allocate` (via `p62_alloc_char_buffer`) and `subSequence`
+        // in this same file already stamp HeapCharBuffer; `wrap` was the odd
+        // one out. Repro: docs/known-issues/repros/charbuffer-address/CBSLICE.java
+        let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.unpin_native_roots(arr_pin);
         cb_write_hb(ctx, buf, arr, len as i32);
@@ -923,7 +931,8 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             // Pin across the buffer alloc below — a moving young GC there
             // would relocate the backing array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            // HeapCharBuffer for the same reason as `wrap([C)` above.
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
             cb_write_hb(ctx, buf, arr, chars.len() as i32);

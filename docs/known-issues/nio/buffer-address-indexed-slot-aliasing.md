@@ -68,6 +68,58 @@ The audit that followed found the rest of it:
    `address = ARRAY_CHAR_BASE_OFFSET + offset * 2`, so a **slice** carries a
    larger address and the flat constant corrupted it.
 
+## Which of those actually execute — measure before believing
+
+Two corrections to the paragraph above, both found by running the probe against
+a binary that did **not** have the fix and getting `fails=0`:
+
+* **`native-io`'s whole nio block is `#[cfg(feature = "synthetic-jdk")]`.**
+  `register_nio_natives` is gated off in real-JDK mode on purpose — the comment
+  at the gate says calling these overrides on a real instance "panics with a
+  layout mismatch". So items 1–3 above are **latent**: `buf_set_mark` never sees
+  a real-JDK `Buffer` today, and in synthetic mode there is no by-name `address`
+  field for it to damage. They are fixed as hardening, so that the module's own
+  dual-write intent holds if the gate is ever opened — not because they fail
+  anything now. Do not quote them as a live bug.
+* **The CharBuffer natives in `native-builtins` DO run in real-JDK mode**, which
+  is why that half was a live defect (it broke every source file javac read).
+  Item 4, the slice/offset half, is live for the same reason.
+
+**The probe was wrong twice before it measured anything.** `BUFALL.java` took a
+`java.nio.Buffer` parameter, so `b.flip()` compiled to `invokevirtual
+java/nio/Buffer.flip()Ljava/nio/Buffer;` — and the natives are registered on the
+CONCRETE class with the concrete return descriptor
+(`java/nio/CharBuffer.flip()Ljava/nio/CharBuffer;`), which that call site does
+not match. It reported OK for every family because it was exercising the real
+JDK throughout. It also only ever built buffers with `offset == 0`, which cannot
+distinguish "preserved the real address" from "wrote the constant 16".
+`CBSLICE.java` fixes both: concrete static types, and `slice()`/`wrap(a,off,len)`
+sources with a non-zero offset.
+
+## A separate defect the corrected probe found: `wrap` stamped the abstract class
+
+`CharBuffer.wrap([C)` and `wrap(CharSequence)` allocated
+`java/nio/CharBuffer` — the **abstract** class — while `allocate` (via
+`p62_alloc_char_buffer`) and `subSequence` in the same file allocate
+`java/nio/HeapCharBuffer`. Stamping the abstract class means any real-JDK method
+*without* a native override dispatches to its abstract declaration:
+
+```
+CharBuffer.wrap(chars).slice()
+  -> AbstractMethodError: method java/nio/CharBuffer.slice()Ljava/nio/CharBuffer;
+     has no Code attribute
+```
+
+where HotSpot returns a buffer with `address = 216, offset = 100`. Fixed by
+stamping `HeapCharBuffer` at both `wrap` sites.
+
+**Still open:** `alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", …)` and
+`…"java/nio/CharBuffer"…` appear at ~18 further sites (`servlet.rs`,
+`xnio_conduits.rs`, `phases_late/nio_file.rs`, `lib.rs`). Each is a stand-in for
+a specific internal flow rather than a general-purpose factory, so they are not
+swept here — but every one of them has the same exposure the moment real-JDK
+bytecode calls an unoverridden method on the result.
+
 ## The rule
 
 * **Mutators save and restore.** They run on buffers CratonVM did not allocate,
