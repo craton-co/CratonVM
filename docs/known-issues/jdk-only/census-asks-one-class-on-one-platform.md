@@ -270,6 +270,50 @@ the native keep running in default real-JDK mode and reintroduce both
 divergences. The correct gate there is the compile-time one the repo already
 uses, `#[cfg(feature = "synthetic-jdk")]`.
 
+### Measured 2026-08-06: it was not hypothetical
+
+`21cfa930f` was verified against `--real-jdk` and the verification was sound
+there. `Map.entry("k",7).getClass()` reads `java.util.KeyValueHolder` on both
+HotSpot 25 and CratonVM, because the registry drops the two surviving
+registrations when the real image supplies the method and `java.base`'s
+bytecode runs. Both remaining natives are dead code in that mode.
+
+Run under `--synthetic-jdk`, nothing is dropped, and the record's own
+"before" column came back verbatim:
+
+| | HotSpot 25 | CratonVM `--synthetic-jdk`, before |
+|---|---|---|
+| `Map.entry("k",7).toString()` | `k=7` | `java.util.Map$Entry@6c` |
+| `.setValue(9)` | `UnsupportedOperationException` | succeeded |
+
+`ShadowDifferentialProbe` is the regression test for this exact surface, and it
+had only ever been pointed at one mode. Pointed at the other it diverged on 7
+of its 42 lines — from two ABSENCES rather than seven bugs. Entry `toString`
+was a placeholder printing the object's address (which is what
+`LinkedHashMap.entrySet().toString()` emitted instead of `one=1;two=2;`), and
+`equals`/`hashCode` were not registered at all, so entries fell back to
+identity and two entries with equal keys and values compared unequal.
+
+Registering the three specified methods on the entry classes took the synthetic
+differential from **14 diverging lines to 2**, with `--real-jdk` byte-identical
+to HotSpot throughout.
+
+**The residual is instructive and is left open deliberately.**
+`Map.entry(...).setValue(v)` still mutates instead of throwing, because
+`java/util/Map$Entry` is ALSO minted as a three-field entry — `key@0, value@1,
+sourceMap@2` — by the entry-set views in `native-collections` and
+`properties_sidetable`, precisely so `Entry.setValue` writes through to the
+backing map, which `entrySet()` iteration requires. `Map.entry`'s entry is
+2-field and must throw: one synthetic class name, two contradictory contracts,
+resolved by last-write-wins.
+
+An immutable `setValue` registered for the second contract loses that race
+today — and it must, since if it ever won, every `entrySet()` write-through
+would break. Registering a native whose correctness depends on losing a race is
+not a fix. The real fix is to give `Map.entry` a class of its own, which is why
+HotSpot has `KeyValueHolder`; re-pointing the allocation at
+`SimpleImmutableEntry` was measured as a regression (4 diverging lines to 6).
+
 ## What is still open
 
 1. **Delete the 791.** The list is measured and committed; removing the
@@ -288,12 +332,16 @@ uses, `#[cfg(feature = "synthetic-jdk")]`.
    restored behind gates rather than left deleted — the second under
    `#[cfg(feature = "synthetic-jdk")]`, so real-JDK mode keeps the
    HotSpot-correct bytecode and synthetic mode regains the method.
-3. **The differential covers what it covers.** `ShadowDifferentialProbe`
+3. **`Map.entry(...).setValue()` is permissive under `--synthetic-jdk`.**
+   Needs `Map.entry` to mint its own class rather than sharing
+   `java/util/Map$Entry` with the write-through entry-set views. See *Measured
+   2026-08-06* above for why the one-line fixes do not work.
+4. **The differential covers what it covers.** `ShadowDifferentialProbe`
    exercises `java.util`'s factories and views. The other ~1,600 inherited
    shadows are unprobed, and the honest reading of "they match" is "the ones
    anybody looked at match". Widening that probe is the cheapest way to keep
    finding `Map.entry`-shaped defects.
-4. **`jdk-only-adjudicate.py` section 3 now prints the inherited shadows as a
+5. **`jdk-only-adjudicate.py` section 3 now prints the inherited shadows as a
    separate addend** rather than folding them in, because L6's ratchet counts
    `has_code` on the named class and that number must keep meaning exactly
    that. Prose calling it "the shadows" still understates by ~1,600; the script
