@@ -231,10 +231,27 @@ pub fn forget_vm_transformers(vm: usize) {
     chains.remove(&vm);
 }
 
+/// Set once any VM in this process registers a transformer, and never cleared.
+///
+/// This is a **fast-path negative test only**, which is what makes a
+/// process-global sound here despite the per-VM chains: `false` proves no VM has
+/// a transformer, so the load path can skip the chain lock entirely; `true` only
+/// sends the caller on to the per-VM check ([`transformers_armed`]), which is
+/// the authoritative one. A stale `true` after a VM shuts down costs one map
+/// probe, never a wrong answer.
+///
+/// It exists because [`pre_transform_for_load`] sits on the constant-pool
+/// resolution path — every `new`, `checkcast`, `getfield` owner and method owner
+/// in the VM — and taking an `RwLock` + hash probe there on every run that has
+/// no agent at all is not a cost that fix should impose.
+static ANY_TRANSFORMER_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Append `(transformer, canRetransform)` to `vm`'s chain. Used by both the
 /// `addTransformer0` native and the `addTransformer` helper on
 /// `cratonvm/Instrument`.  Order: appended at the end.
 pub fn add_transformer_entry(vm: usize, entry: TransformerEntry) {
+    ANY_TRANSFORMER_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
     with_chain_mut(vm, |chain| chain.push(entry));
 }
 
@@ -991,29 +1008,6 @@ fn run_transformer_chain(
     retransform_only: bool,
     inst_receiver: Option<ObjectRef>,
 ) -> Vec<u8> {
-    let rust_chain = snapshot_transformer_chain(ctx.vm_identity());
-    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
-        eprintln!(
-            "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
-            rust_chain.len(),
-            initial_bytes.len()
-        );
-    }
-    if rust_chain.is_empty() && inst_receiver.is_none() {
-        return initial_bytes.to_vec();
-    }
-    // Resolve constants used on every iteration once.
-    let class_name_str = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| String::new());
-    let class_name_obj = ctx.create_string(&class_name_str);
-    let mirror_arg = match class_mirror {
-        Some(m) => Value::Object(Some(m)),
-        None => Value::Object(None),
-    };
-
-    let mut bytes_vec = initial_bytes.to_vec();
-
     // 1. (Removed) — calling InstrumentationImpl.transform(Module,
     //    ClassLoader, String, Class, ProtectionDomain, byte[], boolean)
     //    Java-side currently panics deep inside the JDK 25 transformer
@@ -1031,6 +1025,64 @@ fn run_transformer_chain(
     //    it explicitly.
     let _ = inst_receiver;
 
+    let class_name_str = ctx.class_name_of_id(class_id).unwrap_or_default();
+    // Redefine/retransform: the loader argument is the one HotSpot passes for
+    // the class being redefined. We do not track a per-class loader OBJECT for
+    // every class, so this path keeps the historical `null`; the load-time path
+    // ([`run_load_time_transform_chain`]) does resolve it, because that is the
+    // one an agent uses to decide whether a class is its to instrument.
+    run_chain_over_bytes(
+        ctx,
+        &class_name_str,
+        class_mirror,
+        None,
+        initial_bytes,
+        retransform_only,
+    )
+}
+
+/// The transformer-chain walk itself, over a class identified by NAME rather
+/// than by `ClassId`.
+///
+/// Split out from [`run_transformer_chain`] because the load-time hook has no
+/// `ClassId` to name the class with: the whole point is that the transformer
+/// runs *before* the class is defined, exactly as `java.lang.instrument`
+/// specifies. `class_mirror` is `None` and `loader` is the defining loader on
+/// that path; on the redefine/retransform path the mirror is the live class and
+/// `loader` is `None`.
+fn run_chain_over_bytes(
+    ctx: &mut dyn NativeContext,
+    class_name_str: &str,
+    class_mirror: Option<ObjectRef>,
+    loader: Option<ObjectRef>,
+    initial_bytes: &[u8],
+    retransform_only: bool,
+) -> Vec<u8> {
+    let rust_chain = snapshot_transformer_chain(ctx.vm_identity());
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+        eprintln!(
+            "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
+            rust_chain.len(),
+            initial_bytes.len()
+        );
+    }
+    if rust_chain.is_empty() {
+        return initial_bytes.to_vec();
+    }
+    // Resolve constants used on every iteration once.
+    //
+    // All three live across `alloc_byte_array` and the `transform` call below,
+    // both of which allocate and can therefore move a young object. Pin them:
+    // an unpinned `ObjectRef` held across an allocating call is the native
+    // stale-local family, and here it would hand the transformer a relocated
+    // (i.e. garbage) class name.
+    let class_name_obj = ctx.create_string(class_name_str);
+    let name_pin = ctx.pin_native_root(class_name_obj);
+    let mirror_pin = class_mirror.map(|m| ctx.pin_native_root(m));
+    let loader_pin = loader.map(|l| ctx.pin_native_root(l));
+
+    let mut bytes_vec = initial_bytes.to_vec();
+
     // 2. Rust-side chain: every registered transformer (whether the
     //    agent registered it via the public Java `addTransformer` (now
     //    a native, see [`register_instrumentation_natives`]), or via
@@ -1041,13 +1093,21 @@ fn run_transformer_chain(
             continue;
         }
         let bytes_obj = alloc_byte_array(ctx, &bytes_vec);
+        let class_name_obj = ctx.read_native_pin(name_pin, class_name_obj);
+        let mirror_arg = match (class_mirror, mirror_pin) {
+            (Some(m), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, m))),
+            _ => Value::Object(None),
+        };
+        let loader_arg = match (loader, loader_pin) {
+            (Some(l), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, l))),
+            _ => Value::Object(None),
+        };
         // NOTE: invoke_virtual prepends the receiver itself, so args
         // here must NOT include the receiver. Pass only the 5 user args.
         let args = [
-            // loader: use null — matches what HotSpot does when the
-            // class was loaded by the bootstrap or when we don't have
-            // a per-class ClassLoader instance to surface.
-            Value::Object(None),
+            // loader: the class's defining loader on the load-time path, and
+            // `null` (the bootstrap loader) when we have none to surface.
+            loader_arg,
             Value::Object(Some(class_name_obj)),
             mirror_arg,
             // protectionDomain: null is spec-legal.
@@ -1100,7 +1160,54 @@ fn run_transformer_chain(
             }
         }
     }
+    ctx.unpin_native_roots(name_pin);
     bytes_vec
+}
+
+/// Offer a class file to this VM's transformer chain **before it is defined** —
+/// the `java.lang.instrument` transform-on-load contract.
+///
+/// `class_mirror` is `null` and `isRetransform` is false, which is what the spec
+/// says a first definition looks like to a transformer. `loader_id` names the
+/// class's defining loader; it is turned into the `ClassLoader` argument the
+/// transformer receives, because that argument is how agents decide whether a
+/// class is theirs to instrument (JaCoCo and most APM agents skip
+/// `loader == null`, i.e. bootstrap classes, outright — passing `null` for
+/// everything would make them silently skip the whole application).
+///
+/// Returns the possibly-rewritten bytes; a chain that declines every class
+/// returns `initial_bytes` unchanged.
+pub fn run_load_time_transform_chain(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    loader_id: cratonvm_types::ClassLoaderId,
+    initial_bytes: &[u8],
+) -> Vec<u8> {
+    use cratonvm_types::ClassLoaderId;
+    let loader = match loader_id {
+        // The bootstrap loader IS `null` in the Java API — not "unknown".
+        ClassLoaderId::Bootstrap => None,
+        // Extension/platform and application classes are reached through the
+        // system class loader, which is what HotSpot passes for both.
+        ClassLoaderId::Extension | ClassLoaderId::Application => {
+            Some(cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx))
+        }
+        // A user-defined loader defines its classes through
+        // `ClassLoader.defineClass`, which carries its own receiver; this arm
+        // is only reached if one is ever routed through the built-in delegation
+        // chain, and the system loader is the closest true answer.
+        ClassLoaderId::UserDefined(_) => Some(
+            cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx),
+        ),
+    };
+    run_chain_over_bytes(
+        ctx,
+        class_name,
+        /* class_mirror = */ None,
+        loader,
+        initial_bytes,
+        /* retransform_only = */ false,
+    )
 }
 
 /// Original bytes for `class_id`, used by retransformClasses0 to seed
@@ -1245,6 +1352,252 @@ fn class_file_this_class(bytes: &[u8]) -> Option<String> {
     let start = utf8_entry + 3;
     let raw = bytes.get(start..start.checked_add(len)?)?;
     std::str::from_utf8(raw).ok().map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Load-time transform (`java.lang.instrument` transform-on-load)
+// ---------------------------------------------------------------------------
+//
+// `addTransformer` used to be accepted and then do nothing: the chain was only
+// ever walked by `redefineClasses`/`retransformClasses`, so a transformer was
+// never offered a class *being defined*. That is the worst shape a failure can
+// take — `isRetransformClassesSupported()` answered `true`, `addTransformer`
+// returned normally, and every bytecode-rewriting agent (JaCoCo, APM, tracing,
+// most profilers) reported that it had installed and then instrumented nothing.
+// See `docs/internal/vm/java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`.
+//
+// The transform has to run where two things are true at once: the raw class file
+// is in hand, and no class-manager lock is held (the transformer is Java code
+// and will itself load classes). Neither is true inside `ClassManager`, so the
+// work is split:
+//
+//   [`SharedVm::load_class_transformed`]  (this file, VM side, no lock held)
+//        find bytes -> run the chain -> `ClassManager::stage_transformed_class`
+//                                              |
+//   `ClassManager::load_class`  <--------------+  consumes the staged entry in
+//        place of the bytes parent delegation would have read
+//
+// so the definition the VM installs and the definition the agent produced are
+// the same object by construction, and every downstream step (class-bytes cache,
+// `ClassLoad`/`ClassPrepare`, the JIT's view) sees only the final bytes.
+
+thread_local! {
+    /// Names whose load-time transform is in flight **on this thread**.
+    ///
+    /// A transformer is Java: `transform()` allocates, calls library code, and
+    /// loads classes — including, on its very first call, its own dependencies.
+    /// Each of those loads re-enters the hook. Without this guard a transformer
+    /// that touches a class it is itself being asked about recurses forever, and
+    /// the first `-javaagent:` run dies in a stack overflow instead of an
+    /// instrumented class.
+    ///
+    /// Skipping the nested offer costs coverage of exactly the classes the
+    /// transformer pulled in while transforming, which is also what HotSpot's
+    /// own re-entrancy rules produce.
+    static TRANSFORM_IN_FLIGHT: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How deep the supertype pre-stage walk may go. A class hierarchy deeper than
+/// this is pathological; the bound keeps a malformed or cyclic class file from
+/// turning the walk into an unbounded recursion.
+const SUPERTYPE_STAGE_DEPTH: u32 = 24;
+
+/// True when this VM has at least one registered `ClassFileTransformer`.
+///
+/// The load path consults this before doing anything else. The relaxed global
+/// pre-check makes the no-agent answer a single atomic load — see
+/// [`ANY_TRANSFORMER_REGISTERED`] for why a process-global is sound as a
+/// negative test in front of the per-VM chain.
+#[inline]
+pub fn transformers_armed(vm: usize) -> bool {
+    ANY_TRANSFORMER_REGISTERED.load(std::sync::atomic::Ordering::Acquire)
+        && transformer_count(vm) > 0
+}
+
+/// Run the load-time transformer chain for `name` and stage the result for the
+/// load that follows. Best-effort throughout: anything that cannot be answered
+/// leaves the ordinary load completely unchanged.
+///
+/// Recurses into the class's supertypes first — see [`class_file_supertypes`]
+/// for why they are unreachable otherwise — but only *stages* them. It never
+/// forces a load, so the VM's class-loading order is not perturbed: a supertype
+/// whose staged bytes are never asked for is simply never used.
+pub fn pre_transform_for_load(
+    shared: &crate::vm::SharedVm,
+    thread: &mut crate::threading::JvmThread,
+    name: &str,
+    depth: u32,
+) {
+    if !transformers_armed(shared.vm_identity) {
+        return;
+    }
+    // Array classes are synthesised from their component (JVMS §5.3.3) — there
+    // is no class file to offer.
+    if depth > SUPERTYPE_STAGE_DEPTH || name.starts_with('[') || name.is_empty() {
+        return;
+    }
+    let reentrant = TRANSFORM_IN_FLIGHT.with(|s| s.borrow().iter().any(|n| n == name));
+    if reentrant {
+        return;
+    }
+    // Already defined: transform-on-load is over for this class. (A retransform
+    // is the API for changing it now, and that path is separately wired.)
+    {
+        let cm = shared.classes.class_manager.read();
+        if let Some(id) = cm.resolve_fast_path_class_id(name) {
+            // A synthetic stub is not a real definition — but upgrading one is
+            // `ClassManager::load_class`'s own business and it does not route
+            // through the staged-bytes seam, so leave that case alone rather
+            // than half-transform it.
+            let _ = id;
+            return;
+        }
+    }
+    let found = {
+        let cm = shared.classes.class_manager.read();
+        cm.find_class_bytes_for_transform(name)
+    };
+    let (bytes, loader_id) = match found {
+        Ok(pair) => pair,
+        // Not on the built-in delegation chain (a user loader will supply it,
+        // or it does not exist). The `ClassLoader.defineClass` hook covers the
+        // former; either way there is nothing to transform here.
+        Err(_) => return,
+    };
+
+    TRANSFORM_IN_FLIGHT.with(|s| s.borrow_mut().push(name.to_string()));
+    // Everything below must run to the `pop` — including the early returns —
+    // so the guard is released by a scope guard rather than by hand.
+    struct InFlightGuard;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            TRANSFORM_IN_FLIGHT.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
+    let _in_flight = InFlightGuard;
+
+    for supertype in class_file_supertypes(&bytes) {
+        pre_transform_for_load(shared, thread, &supertype, depth + 1);
+    }
+
+    let transformed = {
+        let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+        run_load_time_transform_chain(&mut ctx, name, loader_id, &bytes)
+    };
+    if transformed == bytes {
+        // Every transformer declined. Staging identical bytes would only make
+        // the load take a different route to the same definition.
+        return;
+    }
+    // A transformer that returns something that is not a class file for THIS
+    // class would install a wrong class body under the right name — the same
+    // hazard `original_class_bytes` refuses on the retransform path. Refuse it
+    // here for the same reason, and say so: a silently-wrong definition is far
+    // harder to diagnose than a transform that visibly did not apply.
+    match class_file_this_class(&transformed) {
+        Some(found) if found == name => {}
+        other => {
+            tracing::warn!(
+                "load-time transform of `{name}` produced bytes that define {:?}; \
+                 keeping the original class file",
+                other
+            );
+            return;
+        }
+    }
+    shared
+        .classes
+        .class_manager_write()
+        .stage_transformed_class(name, transformed, loader_id);
+}
+
+/// The `super_class` and `interfaces` entries of a class file, in internal form.
+///
+/// Used by the load-time transform ([`pre_transform_for_load`]) to reach the
+/// supertypes a definition will pull in on its own. Those loads happen *inside*
+/// `define_class_shared_with_options`, under the class-manager write lock, so
+/// they can never call a Java transformer themselves — without this walk a
+/// coverage agent would be offered `class Foo` and never `Foo`'s abstract base.
+///
+/// Returns an empty vec for anything it cannot parse; the caller treats that as
+/// "no supertypes to pre-stage", which is a coverage limit, never a failure.
+fn class_file_supertypes(bytes: &[u8]) -> Vec<String> {
+    fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(off)?, *b.get(off + 1)?]))
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Vec<String>> {
+        if bytes.len() < 10 || bytes[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        let cp_count = u16_at(bytes, 8)? as usize;
+        if cp_count == 0 {
+            return None;
+        }
+        // Same constant-pool walk as `class_file_this_class`; see there for why
+        // long/double consuming two indices has to be honoured.
+        let mut offsets: Vec<usize> = vec![0; cp_count];
+        let mut pos = 10usize;
+        let mut idx = 1usize;
+        while idx < cp_count {
+            offsets[idx] = pos;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let (payload, slots) = match tag {
+                1 => (2 + u16_at(bytes, pos)? as usize, 1),
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => (4, 1),
+                5 | 6 => (8, 2),
+                7 | 8 | 16 | 19 | 20 => (2, 1),
+                15 => (3, 1),
+                _ => return None,
+            };
+            pos = pos.checked_add(payload)?;
+            if pos > bytes.len() {
+                return None;
+            }
+            idx += slots;
+        }
+
+        // `pos` is now at access_flags. Layout: access_flags, this_class,
+        // super_class, interfaces_count, interfaces[].
+        let class_name_at = |cp_idx: usize| -> Option<String> {
+            if cp_idx == 0 {
+                // `super_class == 0` is legal and means java/lang/Object's own
+                // class file, which has no super to stage.
+                return None;
+            }
+            let entry = *offsets.get(cp_idx)?;
+            if entry == 0 || *bytes.get(entry)? != 7 {
+                return None;
+            }
+            let name_idx = u16_at(bytes, entry + 1)? as usize;
+            let utf8 = *offsets.get(name_idx)?;
+            if utf8 == 0 || *bytes.get(utf8)? != 1 {
+                return None;
+            }
+            let len = u16_at(bytes, utf8 + 1)? as usize;
+            let start = utf8 + 3;
+            let raw = bytes.get(start..start.checked_add(len)?)?;
+            std::str::from_utf8(raw).ok().map(|s| s.to_string())
+        };
+
+        let mut out = Vec::new();
+        if let Some(sup) = class_name_at(u16_at(bytes, pos + 4)? as usize) {
+            out.push(sup);
+        }
+        let iface_count = u16_at(bytes, pos + 6)? as usize;
+        for i in 0..iface_count {
+            if let Some(iface) = class_name_at(u16_at(bytes, pos + 8 + i * 2)? as usize) {
+                out.push(iface);
+            }
+        }
+        Some(out)
+    }
+
+    parse(bytes).unwrap_or_default()
 }
 
 /// Inspect a `Class<?>` mirror and return `(is_primitive, is_array, is_hidden)`.

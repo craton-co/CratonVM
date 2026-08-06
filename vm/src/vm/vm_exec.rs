@@ -6050,6 +6050,14 @@ impl<'a> NativeContextImpl<'a> {
     /// either fake or absent, so this can only ever resolve MORE classes --
     /// it never overrides a class a built-in loader really defined.
     fn resolve_class_loader_faithful(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        // The native-side twin of the constant-pool hook in
+        // `resolve_class_loader_aware`: `Class.forName`, JNI `FindClass` and
+        // every native that resolves a class by name land here, and this is the
+        // last point that has a Java thread and no class-manager lock. See
+        // `runtime::instrument::pre_transform_for_load`.
+        if crate::runtime::instrument::transformers_armed(self.shared.vm_identity) {
+            crate::runtime::instrument::pre_transform_for_load(self.shared, self.thread, name, 0);
+        }
         if let Some(cid) = self.class_via_caller_loader_before_stub(name) {
             return Ok(cid);
         }
