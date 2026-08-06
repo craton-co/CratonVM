@@ -149,9 +149,30 @@ evidence.
 
 ## Verification
 
-* `HazelcastAutoConfigurationClientTests` — PASS 12/12, three consecutive runs.
-* `cargo test -p cratonvm-jit` — green.
-* Regression test verified RED with the single emit line removed
-  (`void=0, value=0`) and GREEN with it restored.
-* Spring Boot A/B sample, pre-fix vs post-fix binaries interleaved in both
-  orders across 13 classes from 13 different modules — no change.
+* `HazelcastAutoConfigurationClientTests` — PASS 12/12, three consecutive runs
+  on Azure Linux.
+* `cargo test -p cratonvm-jit` — green, all targets (1956 lib tests).
+* `cargo test -p cratonvm-vm` — green except two **pre-existing** failures in
+  `class_loader_unload_regression`
+  (`custom_loader_metadata_is_reclaimed_{with,without}_jit`). Confirmed
+  pre-existing by re-running that target with the one emit line reverted: both
+  fail identically. `…_without_jit` cannot be reached by a codegen change at
+  all, which is the first tell.
+* Regression test verified RED with the emit line removed (`void=0, value=0`)
+  and GREEN with it restored.
+* Spring Boot A/B, pre-fix vs post-fix binaries **interleaved in both orders**,
+  13 classes from 13 different modules, 4 runs each — no change. Four cells
+  came back verdict-less during a load-100 window and were re-run at load ~15;
+  the blanks fell on both arms, so they were host noise, not a signal.
+
+### Attribution warning for the residual sweep
+
+The 2026-08-05 full-suite table records 39 FAIL / 4 HANG / 2 CRASH, and many of
+those classes pass on a binary carrying this fix. **That table is not a control
+for this change.** It was produced by a binary that predates several
+intervening fixes — the recycled-`JitInvokeInfo` family (`383e7f5cf`,
+`9d0636e73`) and the annotation-`Class`-element cluster among them — so a flip
+against it attributes to "everything since 08-05", not to this commit. The only
+valid baseline is a binary carrying every one of those and lacking only the
+void-return write.
+
