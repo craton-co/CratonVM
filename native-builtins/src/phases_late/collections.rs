@@ -856,6 +856,126 @@ pub(crate) fn natural_compare_values(a: Value, b: Value) -> i32 {
 // AbstractMap.SimpleEntry / SimpleImmutableEntry = 2-field (key=0, value=1)
 // =============================================================================
 
+/// `String.valueOf(o)` for an entry component: `"null"`, the string itself, or
+/// the object's own `toString`.
+///
+/// `Map.Entry`'s contract spells its rendering out — the entry's string form is
+/// `getKey() + "=" + getValue()` — so the components have to be rendered the
+/// way Java renders them, not summarised.
+fn entry_component_string(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => {
+            if let Some(s) = ctx.read_string(o) {
+                return s;
+            }
+            match ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
+        Value::Object(None) => "null".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        // Neither can be an entry component: they are interpreter-internal
+        // operand shapes, never a Java reference or primitive value.
+        Value::ReturnAddress(_) | Value::Uninitialized => String::new(),
+    }
+}
+
+/// `Object.hashCode()` of an entry component, with the null-is-zero rule
+/// `Map.Entry.hashCode` depends on.
+fn entry_component_hash(ctx: &mut dyn NativeContext, v: Value) -> i32 {
+    match v {
+        Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[]) {
+            Ok(Some(Value::Int(h))) => h,
+            _ => 0,
+        },
+        Value::Object(None) => 0,
+        Value::Int(i) => i,
+        Value::Long(l) => (l ^ ((l as u64) >> 32) as i64) as i32,
+        _ => 0,
+    }
+}
+
+/// `Objects.equals(a, b)` for entry components.
+fn entry_component_eq(ctx: &mut dyn NativeContext, a: Value, b: Value) -> bool {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => true,
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return true;
+            }
+            matches!(
+                ctx.invoke_virtual(
+                    x,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(y))]
+                ),
+                Ok(Some(Value::Int(1)))
+            )
+        }
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Long(x), Value::Long(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Register the three `Map.Entry` methods whose behaviour the interface
+/// SPECIFIES, on a 2-field (key=0, value=1) entry class.
+///
+/// These were absent, and absence is not neutral here: `toString` fell back to
+/// a placeholder that printed the object's address, and `equals`/`hashCode`
+/// fell back to identity — so two entries with equal keys and values compared
+/// unequal and hashed differently, which is precisely what `Map.Entry`'s
+/// contract forbids and what any code putting entries in a set relies on.
+fn register_entry_value_semantics(r: &mut NativeMethodRegistry, cls: &'static str) {
+    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let k = ctx.get_field(this, 0);
+        let v = ctx.get_field(this, 1);
+        let ks = entry_component_string(ctx, k);
+        let vs = entry_component_string(ctx, v);
+        let s = ctx.create_string(&format!("{ks}={vs}"));
+        Ok(Some(Value::Object(Some(s))))
+    });
+    r.register(cls, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let k = ctx.get_field(this, 0);
+        let v = ctx.get_field(this, 1);
+        // Map.Entry.hashCode() is specified as key.hashCode() ^ value.hashCode().
+        let h = entry_component_hash(ctx, k) ^ entry_component_hash(ctx, v);
+        Ok(Some(Value::Int(h)))
+    });
+    r.register(cls, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        if this == other {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Compare against ANY Map.Entry, as the contract requires — via the
+        // interface accessors, not by reaching into the other object's slots,
+        // which would assume it has this class's layout.
+        let ok = match ctx.invoke_virtual(other, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let ov = match ctx.invoke_virtual(other, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let k = ctx.get_field(this, 0);
+        let v = ctx.get_field(this, 1);
+        let eq = entry_component_eq(ctx, k, ok) && entry_component_eq(ctx, v, ov);
+        Ok(Some(Value::Int(i32::from(eq))))
+    });
+}
+
 pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -890,11 +1010,9 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
             Ok(Some(old))
         },
     );
-    r.register(se, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // `entry@<address>` was a placeholder, and it is what
+    // `LinkedHashMap.entrySet().toString()` printed instead of `one=1;two=2;`.
+    register_entry_value_semantics(r, se);
 
     // SimpleImmutableEntry (same layout, setValue throws)
     let sie = "java/util/AbstractMap$SimpleImmutableEntry";
@@ -928,6 +1046,41 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
             .into())
         },
     );
+    register_entry_value_semantics(r, sie);
+
+    // `Map.entry(k, v)` (phases_late.rs) mints an instance whose class is
+    // literally `java/util/Map$Entry`, and that class had NO natives at all,
+    // so `toString` fell through to `Object`'s: `java.util.Map$Entry@6c`
+    // where the contract says `k=7`.
+    //
+    // Registering on the interface name is safe for exactly these three and
+    // was checked rather than assumed. `LinkedHashMap`'s entry views are
+    // `AbstractMap$SimpleEntry` instances — giving `se` its `toString` above
+    // is what fixed `LinkedHashMap.entrySet().toString()` — so they resolve
+    // their own class's natives. And all three read only slots 0 and 1, which
+    // both shapes of this class agree on.
+    //
+    // `setValue` is deliberately NOT registered here, and that is the
+    // interesting half. `java/util/Map$Entry` is also minted as a THREE-field
+    // entry — `key@0, value@1, sourceMap@2` — by the entry-set views in
+    // native-collections and properties_sidetable, precisely so that
+    // `Entry.setValue` WRITES THROUGH to the backing map, which
+    // `entrySet()` iteration requires. `Map.entry`'s entry is 2-field and
+    // must throw. One synthetic class name, two contradictory contracts,
+    // resolved by last-write-wins.
+    //
+    // An immutable `setValue` registered here loses that race today — and it
+    // must: if it ever won, every `entrySet()` write-through would break,
+    // which is far worse than `Map.entry(...).setValue(v)` being permissive.
+    // Registering a native whose correctness depends on losing a race is the
+    // landmine this lane keeps stepping on, so it is not registered at all.
+    //
+    // Fixing the residual properly means giving `Map.entry` a class of its
+    // own — HotSpot returns `java.util.KeyValueHolder` for exactly this
+    // reason. Measured and rejected as a drive-by: re-pointing the allocation
+    // at `SimpleImmutableEntry` moved the differential from 4 diverging lines
+    // to 6.
+    register_entry_value_semantics(r, "java/util/Map$Entry");
     r.register(sie, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));

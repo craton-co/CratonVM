@@ -2971,6 +2971,7 @@ pub(super) fn try_stackless_invoke(
             class_name,
             method_name,
             descriptor,
+            dispatch_class_override,
             &mut step1_native_id,
             &mut step1_refusal,
         )

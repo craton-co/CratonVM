@@ -4,9 +4,23 @@
 #
 # bridge-ratchet.sh — THE L6 GATE, run where a JDK exists.
 #
+# It scores TWO gates over ONE census, and that is deliberate. The second is
+# `scripts/jdk-only-kind-map.py`, a per-registration freeze of `NativeKind`
+# which exists because this file's own ratchet cannot see the dangerous
+# direction: flipping a `with_category` line from `Bridge` to `SyntheticStub`
+# takes a registrar's worth of rows OUT of the `Bridge` population, so both
+# numbers below FALL and this gate prints "IMPROVED — lock it in". That is the
+# 2026-07-14 `java.util.Properties` regression reading as a win.
+#
+# Taking a second census for it was the obvious alternative and is the wrong
+# one: two boots are two objects, and `native-builtins/tests/stub_ratchet.rs`
+# already records what happens when two ratchets over "the same" VM turn out to
+# be measuring different ones — they disagreed by 364 registrations for weeks.
+# One census, both verdicts, and the script exits non-zero if either fires.
+#
 # See L6-unadjudicated-bridge-ratchet-DONE-20260805.md (the lane
 # brief, retired 2026-08-05 when this landed) and
-# docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md.
+# the retired native-kind-is-ambient-and-defaults-to-syntheticstub write-up.
 #
 # Contract §1.5 defines a `Bridge` as what an `ACC_NATIVE` method binds to.
 # 10,084 of the 10,844 `Bridge` registrations have no such target, every one of
@@ -29,6 +43,8 @@
 #   sh regression-suite/bridge-ratchet.sh
 #   sh regression-suite/bridge-ratchet.sh --selftest      # hermetic; no VM, no JDK
 #   sh regression-suite/bridge-ratchet.sh --update-baseline --note "why"
+#     (re-freezes BOTH baselines from the same census — they are two readings
+#      of one measurement and must never be frozen from different runs)
 #   CV=<cratonvm> JAVA_HOME=<jdk25> sh regression-suite/bridge-ratchet.sh
 #
 # Environment:
@@ -43,8 +59,9 @@
 # are the evidence for whatever the gate just said.
 #
 # Exit codes — deliberately the gate script's own, passed through unchanged:
-#   0  the ratchet passed
-#   1  THE GATE FIRED — an unadjudicated Bridge registration was added
+#   0  both gates passed
+#   1  A GATE FIRED — an unadjudicated Bridge registration was added, or a
+#      registration changed kind
 #   2  refused to adjudicate (no baseline for this JDK, census not adjudicated,
 #      wrong policy) — never a silent pass
 #   3  a prerequisite is missing (no cratonvm binary, no JDK, no python)
@@ -53,6 +70,7 @@ set -eu
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$ROOT" ] || ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GATE="$ROOT/scripts/jdk-only-bridge-ratchet.py"
+KINDMAP="$ROOT/scripts/jdk-only-kind-map.py"
 
 # MSYS/Git Bash rewrites arguments that look like POSIX paths; cratonvm needs
 # them verbatim. Same reason as scripts/jdk-only-census.sh and run.sh.
@@ -100,6 +118,11 @@ echo "== bridge-ratchet self-test (hermetic) =="
 "$PY" "$(winpath "$GATE")" --selftest || {
     echo "ERROR: the gate's own self-test failed — the census result below would" >&2
     echo "       be meaningless, so it was not taken." >&2
+    exit 3
+}
+echo ""
+"$PY" "$(winpath "$KINDMAP")" --selftest || {
+    echo "ERROR: the kind-map gate's own self-test failed — see above." >&2
     exit 3
 }
 [ "$SELFTEST_ONLY" -eq 0 ] || exit 0
@@ -166,6 +189,17 @@ else
     echo "       by feature version; guessing it would score against the wrong image." >&2
     exit 3
 fi
+
+# --- the platform half of both baseline keys -------------------------------
+# Derived once and passed to both gates. The bridge ratchet computes the same
+# value internally; handing the kind map a different one would key two readings
+# of one census to two different baselines.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    Linux*)  KM_OS=linux ;;
+    Darwin*) KM_OS=macos ;;
+    MINGW*|MSYS*|CYGWIN*|Windows*) KM_OS=windows ;;
+    *)       KM_OS=unknown ;;
+esac
 
 # --- the workload ----------------------------------------------------------
 # DELIBERATELY TRIVIAL, and the reason is a measurement, not taste.
@@ -273,7 +307,28 @@ set +e
 gate_rc=$?
 set -e
 
+# --- gate 2: the per-registration kind map ---------------------------------
+# Runs even when gate 1 fired: when both have something to say, seeing both is
+# what tells you whether a count moved because rows were ADDED or because
+# existing rows were RE-TAGGED, and those want opposite responses.
+echo ""
+set -- \
+    --census      "$(winpath "$OUT/census.json")" \
+    --baseline-dir "$(winpath "$ROOT/scripts/baselines")" \
+    --jdk-feature "$FEATURE" \
+    --jdk-version "${JDK_FULL:-}" \
+    --os          "$KM_OS" \
+    --workload    "$WORKLOAD"
+if [ "$UPDATE" -eq 1 ]; then set -- "$@" --update-baseline; fi
+if [ -n "$NOTE" ]; then set -- "$@" --note "$NOTE"; fi
+
+set +e
+"$PY" "$(winpath "$KINDMAP")" "$@"
+km_rc=$?
+set -e
+
 echo ""
 echo "   census        : $OUT/census.json"
 echo "   adjudication  : $OUT/adjudication.json"
-exit "$gate_rc"
+if [ "$gate_rc" -ne 0 ]; then exit "$gate_rc"; fi
+exit "$km_rc"

@@ -1,35 +1,35 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4675,
-      "bridge_without_acc_native": 9656,
-      "jdk_version": "",
+      "bridge_shadows_bytecode": 4604,
+      "bridge_without_acc_native": 9597,
+      "jdk_version": "25.0.3",
       "mode": "compatible",
-      "note": "Re-freeze to the merged landing tree. The count fell 9675->9660->9656 as dev moved during verification; none of it is this change, which is inert on both counters (a kind-statement pass cannot alter whether the image backs a target). Frozen here so the gate is tight for the tree that actually lands.",
+      "note": "Re-freeze on the dev merge (owns_slot column, L10, and the springboot/tls landings). Ambient-category work: current_category is an Option and scoped, nine unscoped registrars state SyntheticStub, and 58 triples --jdk-only was admitting by registration order are refused.",
       "observed": {
         "bridge": {
           "abstract_method": 1322,
-          "acc_native": 774,
+          "acc_native": 775,
           "class_absent": 1191,
-          "class_present_method_undeclared": 2468,
-          "rows": 10430,
-          "shadows_bytecode": 4675,
-          "without_acc_native": 9656
+          "class_present_method_undeclared": 2480,
+          "rows": 10372,
+          "shadows_bytecode": 4604,
+          "without_acc_native": 9597
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10430,
-          "intrinsic": 683,
-          "synthetic-stub": 755
+          "bridge": 10372,
+          "intrinsic": 681,
+          "synthetic-stub": 844
         },
         "schema": 1,
-        "total_rows": 11868
+        "total_rows": 11897
       },
       "os": "linux",
-      "workload": ""
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
     }
   },
   "min_total_rows": 8000,

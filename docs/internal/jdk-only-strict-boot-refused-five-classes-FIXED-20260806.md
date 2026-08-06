@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | CLOSED 2026-08-05 — all five classes fixed, in two changes. `probes/JdkOnlyCollectionViewProbe` is byte-identical to HotSpot 25 in BOTH modes. See "What was fixed" and "The second half" below |
+| **Status** | **RETIRED 2026-08-06.** Four of five were fixed on 2026-08-05 in two changes; the header then said "all five", which was wrong — `cratonvm/internal/SystemLogger` was still refused, and this record's own verification section said so two paragraphs later. The fifth is fixed now. See "The fifth class" at the bottom |
 | **Severity** | high — the first genuine **strict-only** regression this corpus has produced, and it is nine probe sections wide |
 | **Modes** | `--jdk-only` ONLY. `--real-jdk` is byte-identical to HotSpot 25 on both probes |
 | **Found** | 2026-08-05 by `scripts/jdk-only-strict-probes.sh`, on its first run against a merged `dev` |
@@ -284,6 +284,90 @@ carries the nine sections. A single class is enough to see it:
 ```sh
 cratonvm --jdk-only --java-home $JDK25 -cp <probes> JdkOnlyCensusLoadProbe
 ```
+
+## The fifth class, 2026-08-06 — `cratonvm/internal/SystemLogger`, and it was all of deserialization
+
+The header above said "all five classes fixed" and the verification section
+five paragraphs later said `RSerial` still fails on
+`cratonvm/internal/SystemLogger`. Both were written the same day. **Read the
+verification, not the header** — this is the second time in this record that a
+claim derived by reading was contradicted by a measurement inside the same
+document.
+
+`RSerial` failing was not the size of it. The class is reached from
+`java.io.ObjectInputFilter$Config.<clinit>`:
+
+```text
+java.lang.NoClassDefFoundError: cratonvm/internal/SystemLogger
+    at java.io.ObjectInputFilter$Config.<clinit>(ObjectInputFilter.java:628)
+    at java.io.ObjectInputStream.<init>(ObjectInputStream.java:376)
+```
+
+Line 628 is `configLog = System.getLogger("java.io.serialization")`, and it is
+**unconditional** — before the `jdk.serialFilter` property is even read. So the
+refusal did not cost one probe section; it cost every `ObjectInputStream`
+construction in the VM, i.e. all of deserialization, under `--jdk-only`.
+
+### The fallback, and how it was chosen
+
+The block comment above `register_system_logger_methods` had already ruled out
+the obvious repair, by reading the JDK sources:
+
+> NOT fixed by deleting the shadow and letting the real JDK chain run:
+> `System.getLogger` first needs `Reflection.getCallerClass()` (which returns
+> null on CratonVM boot frames …), then the `LoggerFinderLoader` →
+> `ServiceLoader` → `BootstrapLogger` chain, of which this crate has not one
+> native or shim.
+
+That is correct about `System.getLogger`, and it is not correct about the
+surface. `probes/LoggerRoutes` asks all four routes under `--jdk-only` instead
+of reasoning about them, against a HotSpot control:
+
+| route | HotSpot 25 | `--jdk-only` |
+|---|---|---|
+| `System.getLogger` | `LoggingProviderImpl$JULWrapper` | `NoClassDefFoundError` |
+| `new SimpleConsoleLogger(name, false)` | `SimpleConsoleLogger` | **`SimpleConsoleLogger`** |
+| `LazyLoggers.getLogger` | `LoggingProviderImpl$JULWrapper` | `NoClassDefFoundError` |
+| `PlatformLogger.getLogger` | `PlatformLogger` | `PlatformLogger` |
+
+The two that diverge are the two CratonVM registers a native for; the two that
+agree are the two it does not. `jdk.internal.logger.SimpleConsoleLogger`
+constructs, and answers `getName()`, `isLoggable(INFO)=true` and
+`isLoggable(DEBUG)=false` identically to HotSpot and to the shim it replaces.
+
+So `craton_alloc_system_logger`'s refusal path now builds one, through its real
+`(String, boolean)` constructor. It satisfies the rule the iterator and
+collector fallbacks established two sections up — **a real class is usable as a
+stand-in when its fields are declared and writable, so filling it is
+construction rather than fabrication** — and it satisfies it in the strongest
+form available, by not filling any field itself: real `<init>`, real bytecode,
+real object. Every `System.Logger` call on it then resolves to its own class, so
+the interface-name registrations cannot shadow it. §1.1 forbids substituting a
+FAKE for a refused class; handing back the real thing is what it asks for.
+
+`usePlatformLevel=false` is deliberate: it keeps the INFO default the CratonVM
+shim published at, rather than reading `sun.util.logging`'s platform level.
+
+It is NOT what HotSpot's `System.getLogger` returns when `java.logging` resolves
+(`LoggingProviderImpl$JULWrapper`). Reaching that still needs the
+`LoggerFinderLoader`/`ServiceLoader` chain the block comment describes, and
+nothing here changes that. No probe in the corpus prints the logger's class, and
+the one that could — `LoggerRoutes` — is not in `PROBE_LIST` for exactly that
+reason: freezing this class name would lock in a divergence rather than measure
+one.
+
+### Measured, Azure Linux, Temurin 25.0.3
+
+| | before | after |
+|---|---|---|
+| `probes/JdkOnlyBreadthProbe` `--jdk-only` | `SECTION-FAILED serialization: NoClassDefFoundError`, `PROBE2 … failed=1` | `serialization bytes=true n=5 s=five l=[a, b]`, **`failed=0`** |
+| gate, `JdkOnlyBreadthProbe` strict arm | 3 baselined divergent sections | **byte-identical to HotSpot in both modes** |
+| regression corpus, `--jdk-only` | 32 passed / 17 failed | **33 / 16** — `RSerial` recovered, nothing else moved |
+
+The baseline is re-frozen by hand rather than by `--update-baseline`, for the
+reason its own header already records: a regenerate rewrites the whole set from
+ONE run, and `*/vthreads` is documented-intermittent, so it would drop that pair
+on a coin flip. Three lines removed, nothing added.
 
 ## Why it was caught
 

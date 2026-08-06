@@ -11593,7 +11593,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // `flush_raw_entry_dispatch_caches`.
     flush_raw_entry_dispatch_caches();
     // Diagnostic (`CRATONVM_DBG_SITE_ALIAS`): does this key still name its site?
-    note_site_identity(jit_site_key(vm.vm_identity, info_ptr as usize), info);
+    // The gate is here rather than inside, for the same reason as the sibling
+    // call site above: an all-off run must not make the call at all. This was
+    // the ONE of the three call sites that had the comment but not the `if`, so
+    // the "diagnostic" printed `[site-alias]` lines on stderr and grew the
+    // unbounded `SITE_IDENTITY` map on every raw-entry native dispatch in an
+    // ordinary run — caught by `scripts/jdk-only-strict-probes.sh`, which saw
+    // the lines in BOTH CratonVM arms of `JdkOnlyPlatformProbe`.
+    if site_alias_detect_enabled() {
+        note_site_identity(jit_site_key(vm.vm_identity, info_ptr as usize), info);
+    }
     if let Some(result) = try_jit_site_cached_native_dispatch(
         vm,
         info,
@@ -15049,14 +15058,15 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     //
     // The latch itself only ever moves toward strict, so this call can never
     // relax a policy another VM in the same process already installed.
-    let jdk_only = match vm_for_helpers {
-        Some(shared) => {
-            let policy = shared.config.execution_policy();
-            cratonvm_jit::set_jit_execution_policy(policy);
-            policy.is_jdk_only()
-        }
-        None => false,
-    };
+    // The latch is still published, because `jit_entry_publishable` (the
+    // inline-cache publication refusal) has no VM handle and still reads it.
+    // That one is measured to never fire — every MIC/PIC publication takes its
+    // entry from `try_jit_compile_callee`, which has a live owner and returns
+    // early — so leaving it process-global refuses nothing in either VM.
+    // Everything the compile path decides is now threaded per-VM instead.
+    if let Some(shared) = vm_for_helpers {
+        cratonvm_jit::set_jit_execution_policy(shared.config.execution_policy());
+    }
 
     // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
     // same no-ABI-change registration pattern as the savebase watch helpers
@@ -15090,7 +15100,15 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         jit_monitor_enter as *const () as usize,
         jit_monitor_exit as *const () as usize,
     );
-    if !jdk_only {
+    // Registered UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2). These
+    // are process-invariant Rust `fn` addresses — the same code whatever a
+    // given VM's policy is — so withholding them was never per-VM protection,
+    // it was a process-wide side effect: whichever VM built helpers under
+    // `JdkOnly` left the cells at `0` for every other VM in the process, and
+    // once the latch went strict `direct_native_helper` refused for all of
+    // them too. Binding is now decided per compilation from the threaded
+    // policy, which is the only place that knows whose compile it is.
+    {
         cratonvm_jit::set_integer_value_of_direct_fn(
             jit_integer_value_of_direct as *const () as usize,
         );

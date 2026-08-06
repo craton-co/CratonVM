@@ -266,7 +266,7 @@ was already wrong in Compatible mode and had simply never been executed.
 Merging `origin/dev` at the end of this lane brought L3–L7 with it, and the
 gate immediately went from "two probes byte-identical in both modes" to **nine
 sections failing under `--jdk-only` and zero under `--real-jdk`**:
-[record](../known-issues/jdk-only/strict-boot-refuses-five-classes-the-corpus-needs-20260805.md).
+[record](jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md).
 Five classes are being refused that the corpus needs, `java/util/HashMap$KeyItr`
 among them — which is on the path of any `for (K k : map.keySet())`.
 

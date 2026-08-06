@@ -98,9 +98,21 @@ need it" is the policy axis and is not sufficient.
 | [L11](L11-delete-the-hardcoded-lists.md) **DONE 2026-08-06** | Items 3 + 7: delete the lists — item 3 2026-08-04, item 7 2026-08-06 (all eight receiver-shape sites, the ninth receiver-blind arm, and the probe helper) | `native_override.rs`, `vm_exec.rs`, `invoke.rs`, `dispatch_virtual.rs` | ~~L9~~, ~~L10~~ | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
+**Lane L6 grew a second gate, 2026-08-06.** `regression-suite/bridge-ratchet.sh`
+now scores `scripts/jdk-only-kind-map.py` over the same census: a per-registration
+freeze of `NativeKind`, because L6's two counts cannot see the dangerous
+direction — a `Bridge`→`SyntheticStub` mass re-tag takes rows *out* of the
+`Bridge` population, so both numbers fall and the gate says "IMPROVED". Landed
+with the ambient-category fix that retired
+`known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`:
+`current_category` is an `Option` and scoped, nine unscoped registrars state
+their kind, and 58 triples `--jdk-only` was admitting by registration order are
+refused — including the `Function$Identity` / `UnaryOperator.identity` copies in
+`phases_late/streams.rs` that L7 item 4 did not reach.
+
 **Every lane but L12 is done.** (L1–L8 landed; L9 closed 2026-08-04; L10 landed
-2026-08-06 and with it the last blocker, and L11 spent it the same day. L12 —
-item 11's residuals — is what is left.)
+2026-08-06 and with it the last blocker, and L11 spent it the same day — item 7's
+nine dispatch sites are deleted. L12 — item 11's residuals — is what is left.)
 
 ## Conflict matrix — read before claiming a second lane
 

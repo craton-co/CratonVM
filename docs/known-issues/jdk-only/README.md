@@ -36,6 +36,43 @@ below it is the original filing.
 | 10 — `System.exit` bypasses the census | `jdk-only-system-exit-census-FIXED-20260804.md` |
 | 8 — the real-protected-stub allow-lists | `jdk-only-real-protected-stub-allowlists-FIXED-20260804.md` |
 
+## 2026-08-06 — two records left this directory
+
+| Was | Now |
+|---|---|
+| `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md` | [`../../internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`](../../internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md) |
+| `step1-bytecode-available-attempted-and-reverted.md` | [`../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`](../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md) |
+
+The first was marked CLOSED on 2026-08-05 with four of its five classes fixed
+and a header that said five; its own verification section said otherwise two
+paragraphs later. The fifth, `cratonvm/internal/SystemLogger`, is reached from
+`java.io.ObjectInputFilter$Config.<clinit>` — unconditionally, before any
+property is read — so refusing it cost every `ObjectInputStream` construction in
+the VM, i.e. all of deserialization, not one probe section. The refusal now
+lands on a real `jdk.internal.logger.SimpleConsoleLogger` built through its own
+constructor. `scripts/jdk-only-strict-probes.sh` PASSES with **no divergent
+strict-arm section left** in either of the two probes that carried them, the
+baseline is re-frozen, and the corpus is 33/16 under `--jdk-only` against 32/17.
+
+The second is the more useful of the two to read before working item 4. Its own
+proposal — resolve `bytecode_available` at step 1 the way the invoke will — was
+implemented and **measured**: arming it takes the `--jdk-only` corpus from
+**32 passed / 17 failed to 3 / 46**, because `Charset.forName` hands out an
+instance of the ABSTRACT `java.nio.charset.Charset`, `System.props` is null,
+`SharedSecrets.javaLangAccess` is null, and `String`'s coder does not match its
+`value[]`. §1.4's lever is registration, not dispatch. What landed is the
+observation (step 1 now records every `Bridge` that runs in front of real bytes;
+it recorded nothing before) plus a dial,
+`CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1`, so item 4 can re-take that measurement one
+subsystem at a time.
+
+**Found on the way, fixed, not filed here:** `vm/src/jit/helpers.rs`'s third
+`note_site_identity` call site had the `CRATONVM_DBG_SITE_ALIAS` comment but not
+the `if`, so an ordinary run printed `[site-alias]` lines to stderr and grew an
+unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
+`dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
+which is the gate's third arm doing exactly what it is for.
+
 ## 2026-08-05 — three records added
 
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
@@ -210,7 +247,7 @@ behaviour** — no exception, no log line, no failing test.
 
 | # | Record | Why it is dangerous |
 |---|---|---|
-| 1 | [`NativeKind` is ambient and defaults to `SyntheticStub`](native-kind-is-ambient-and-defaults-to-syntheticstub.md) | `register()` takes no kind; it is inherited from a mutable registry field defaulting to `SyntheticStub`. The dominant defect is the **opposite** of under-tagging: 1,195 `native-collections` registrations are tagged `Bridge` by a single `set_category` line, and **not one** of them targets an `ACC_NATIVE` method. Under-tagging is real too and already caused one boot regression (2026-07-14, `java.util.Properties`). Both directions are silent at the point of the mistake. |
+| 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: 9,571 unadjudicated `Bridge` registrations, now in [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md). |
 | 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
 | 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
 

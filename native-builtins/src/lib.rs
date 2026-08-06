@@ -6722,7 +6722,16 @@ pub fn register_essential_natives_with_shims(
     // identity and can receive option instances crossing that namespace at a
     // parent/default-interface boundary. Compare the stable enum names here so
     // CLASS_TO_STRING continues to request Class[] -> String[] adaptation.
-    registry.register(
+    //
+    // `SyntheticStub`, stated. This was the ONE registration in the whole boot
+    // that ran on the registry's constructor default — it is the first
+    // `register` call the VM makes, before any `set_category` anywhere — so it
+    // got the right kind for the wrong reason, which is exactly the state
+    // `no_registration_runs_on_the_ambient_default` exists to end. The kind is
+    // right on its own terms too: `Adapt.isIn` is ordinary Spring bytecode that
+    // this VM shadows to work around a loader-identity problem, not a boundary
+    // anything must cross, so `--jdk-only` should and does refuse it.
+    registry.register_with_kind(
         "org/springframework/core/annotation/MergedAnnotation$Adapt",
         "isIn",
         "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z",
@@ -6749,6 +6758,7 @@ pub fn register_essential_natives_with_shims(
             }
             Ok(Some(Value::Int(0)))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
@@ -10361,17 +10371,42 @@ pub fn register_essential_natives_with_shims(
     // Surefire command bootstrap uses j.u.c synchronizers in CommandReader
     // initialization paths. Ensure these core concurrency natives are present
     // in minimal real-JDK bootstrap runs before later phase registrars execute.
+    //
+    // `SyntheticStub`, stated: these are the SAME five callbacks
+    // `util_concurrent_ext::register_concurrent_natives` installs, and that
+    // registrar states `SyntheticStub` for them. Left on this function's
+    // ambient `Bridge` they became a second copy that `--jdk-only` kept —
+    // strict mode refuses the stub at the door, so the surviving row was
+    // whichever copy was NOT a stub, and `CountDownLatch` went on being served
+    // by the synthetic implementation in the mode that exists to remove it.
+    // Measured 2026-08-06 by diffing a `--jdk-only` census against a
+    // `--real-jdk` one: five triples, plus the two `CyclicBarrier` constructors
+    // below. `java.util.concurrent` is pure Java; JDK 25 declares no
+    // `ACC_NATIVE` method on either class.
     let surefire_cdl = "java/util/concurrent/CountDownLatch";
-    registry.register(surefire_cdl, "<init>", "(I)V", native_cdl_init);
-    registry.register(surefire_cdl, "countDown", "()V", native_cdl_count_down);
-    registry.register(surefire_cdl, "await", "()V", native_cdl_await);
-    registry.register(
+    registry.register_with_kind(surefire_cdl, "<init>", "(I)V", native_cdl_init, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
+        surefire_cdl,
+        "countDown",
+        "()V",
+        native_cdl_count_down,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
+    registry.register_with_kind(surefire_cdl, "await", "()V", native_cdl_await, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
         surefire_cdl,
         "await",
         "(JLjava/util/concurrent/TimeUnit;)Z",
         native_cdl_await_timeout,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
-    registry.register(surefire_cdl, "getCount", "()J", native_cdl_get_count);
+    registry.register_with_kind(
+        surefire_cdl,
+        "getCount",
+        "()J",
+        native_cdl_get_count,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
     // Keep Semaphore's real JDK constructor and methods when real AQS is in
     // use.  The synthetic representation stores its permit state in an int[]
     // in Semaphore.sync, which is safe only while every Semaphore operation is
@@ -10429,13 +10464,15 @@ pub fn register_essential_natives_with_shims(
     }
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
+    // `SyntheticStub` for the same reason as the latch above.
     let surefire_cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(surefire_cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
+    registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
         surefire_cb,
         "<init>",
         "(ILjava/lang/Runnable;)V",
         native_cb_init_action,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     // If CommandReader.<clinit> still fails, surefire wraps the cause in
     // UnsatisfiedLinkError / ExceptionInInitializerError very early.
@@ -26137,13 +26174,79 @@ fn system_logger_emit(
     );
 }
 
+/// The real `java.base` class the strict-mode fallback constructs instead of
+/// fabricating [`CRATON_SYSTEM_LOGGER_CLASS`].
+///
+/// Chosen by the rule the iterator/collector fallbacks established: a real
+/// class is only usable as a stand-in when **its fields are declared and
+/// writable, so filling it is construction rather than fabrication**.
+/// `SimpleConsoleLogger(String name, boolean usePlatformLevel)` is a public
+/// constructor's worth of state — `name`, `usePlatformLevel`, and a `level`
+/// that defaults to INFO — and it is the class `DefaultLoggerFinder` itself
+/// hands out when no `LoggerFinder` service and no `java.logging` module are
+/// available, which is exactly the situation a strict CratonVM boot is in.
+///
+/// Measured under `--jdk-only` before it was wired in (`probes/LoggerRoutes`,
+/// Azure Linux, JDK 25): constructing it reflectively already worked, and
+/// `getName()`, `isLoggable(INFO)=true` and `isLoggable(DEBUG)=false` matched
+/// both HotSpot and the shim this replaces. So the object runs its OWN
+/// bytecode for the whole `System.Logger` surface — the interface-name
+/// registrations cannot shadow a concrete implementation, which is the same
+/// property the block comment above `register_system_logger_methods` relies on.
+///
+/// It is NOT what HotSpot's `System.getLogger` returns when `java.logging` is
+/// resolved (that is `LoggingProviderImpl$JULWrapper`). Reaching THAT needs the
+/// `LoggerFinderLoader` → `ServiceLoader` chain, which
+/// `Reflection.getCallerClass()` returning null on CratonVM boot frames is
+/// still enough to break — see the block comment above.
+const REAL_SYSTEM_LOGGER_CLASS: &str = "jdk/internal/logger/SimpleConsoleLogger";
+
+/// Build a real `System.Logger` for `name`, or `None` if this image has no
+/// [`REAL_SYSTEM_LOGGER_CLASS`].
+///
+/// A construction that FAILS is propagated rather than folded into `None`: a
+/// half-run `<init>` can leave a pending Java exception, and replacing it with
+/// the original fabrication refusal would report the wrong cause.
+fn real_jdk_system_logger(
+    ctx: &mut dyn NativeContext,
+    name: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if ctx.class_id_by_name(REAL_SYSTEM_LOGGER_CLASS).is_none()
+        && ctx.ensure_class_initialized(REAL_SYSTEM_LOGGER_CLASS).is_err()
+    {
+        return Ok(None);
+    }
+    // `usePlatformLevel = false`: the CratonVM shim published at INFO with no
+    // logging configuration, `SimpleConsoleLogger`'s `System.Logger` default is
+    // INFO too, and `true` would instead read `sun.util.logging`'s platform
+    // level. Keeping INFO is what makes this a drop-in.
+    match ctx.new_object_initialized(
+        REAL_SYSTEM_LOGGER_CLASS,
+        "(Ljava/lang/String;Z)V",
+        &[name, Value::Int(0)],
+    )? {
+        Some(Value::Object(Some(logger))) => Ok(Some(logger)),
+        _ => Ok(None),
+    }
+}
+
 /// Allocate a `System.Logger` receiver named `name`.
 ///
-/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7). This stands in for
-/// whatever `System.LoggerFinder` would have produced from real bytecode, so
-/// under `--jdk-only` the fabrication is refused and the refusal propagates as
-/// a `ClassNotFoundException` naming `cratonvm/internal/SystemLogger` — rather
-/// than being recorded as a violation and then performed anyway.
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under `--jdk-only` the
+/// fabrication of [`CRATON_SYSTEM_LOGGER_CLASS`] is refused rather than being
+/// recorded as a violation and then performed anyway.
+///
+/// **The refusal now has somewhere to land (2026-08-06).** Refusing alone was
+/// measured, and it took out `java.io.ObjectInputFilter$Config.<clinit>` — which
+/// calls `System.getLogger("java.io.serialization")` unconditionally — and with
+/// it *every* `ObjectInputStream` construction, i.e. all of deserialization.
+/// That was the last of the five classes in
+/// `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`, the
+/// `serialization` row, and it is the reason `RSerial` and
+/// `JdkOnlyBreadthProbe/strict/serialization` stayed red after the other four
+/// were fixed. §1.1 forbids substituting a FAKE for the refused class; it does
+/// not forbid — it requires — handing back the real thing, so the fallback
+/// constructs [`REAL_SYSTEM_LOGGER_CLASS`].
 pub(crate) fn craton_alloc_system_logger(
     ctx: &mut dyn NativeContext,
     name: Value,
@@ -26160,14 +26263,28 @@ pub(crate) fn craton_alloc_system_logger(
         {
             Ok(id) => id,
             Err(err) => {
+                // Strict mode refused the fabrication. Build the real class
+                // instead — see this function's doc comment for what refusing
+                // alone cost. The pin is still held here on purpose: `name` is
+                // about to be handed to a real `<init>` that allocates, and the
+                // young generation can move underneath it.
+                let name_now = match name_pin {
+                    Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+                    None => Value::Object(None),
+                };
+                let real = real_jdk_system_logger(ctx, name_now);
                 // Release the pin taken above before unwinding: an early
                 // return past `unpin_native_roots` leaks the frame.
                 if let Some((handle, _)) = name_pin {
                     ctx.unpin_native_roots(handle);
                 }
-                // Catchable `NoClassDefFoundError`, not the uncatchable
-                // `InternalError` the `?` conversion would give.
-                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+                return match real? {
+                    Some(logger) => Ok(logger),
+                    // No real class to stand in, so the refusal stands. A
+                    // catchable `NoClassDefFoundError`, not the uncatchable
+                    // `InternalError` the `?` conversion would give.
+                    None => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+                };
             }
         },
     };
@@ -32354,10 +32471,26 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     _ => 0,
                 },
             };
-            // address / byte_offset — the JDK uses `bb.offset()` + 2*index.
-            let bb_off = match ctx.get_field_by_name(bb_obj, "offset") {
-                Value::Int(v) => v,
-                _ => 0,
+            // Byte index of the view's element 0 inside `bb.hb`.
+            //
+            // The JDK's own answer is the view's `address`: every accessor on
+            // `ByteBufferAsCharBuffer*` computes `(i << 1) + address`, and the
+            // ctor seeds `address` to the SOURCE buffer's address plus its
+            // position at the moment the view was made. So the view's element 0
+            // is at `address - ARRAY_BYTE_BASE_OFFSET` bytes into `hb`, which
+            // folds in both the source's array-base `offset` AND its position.
+            //
+            // Reading `bb.offset` instead — what this did — drops the source's
+            // position: `bb.position(4).asCharBuffer().get(0)` decoded byte 0
+            // rather than byte 4. It also goes stale, because the source's
+            // position moves after the view is taken and the view must not
+            // follow it.
+            let bb_off = match ctx.get_field_by_name(this, "address") {
+                Value::Long(addr) if addr >= 16 => (addr - 16) as i32,
+                _ => match ctx.get_field_by_name(bb_obj, "offset") {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
             };
             // Class name suffix tells us endianness: `B` = big-endian,
             // `L` = little-endian.
@@ -32461,84 +32594,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             registry.register(bbacb, "hasArray", "()Z", |_ctx, _args| {
                 Ok(Some(Value::Int(0)))
             });
-            // subSequence(II) — return a fresh CharBuffer with copied chars.
-            // The JDK returns a slice of the same BBACB type, but copying
-            // into a flat char[] backed CharBuffer is sufficient for
-            // `subSequence(...).toString()` and `subSequence(...).charAt(i)`.
-            registry.register(
-                bbacb,
-                "subSequence",
-                "(II)Ljava/nio/CharBuffer;",
-                |ctx, args| {
-                    let this = match args.first() {
-                        Some(Value::Object(Some(o))) => *o,
-                        _ => {
-                            return Err(RuntimeError::NullPointerException {
-                                message: Some("ByteBufferAsCharBuffer.subSequence on null".into()),
-                            }
-                            .into())
-                        }
-                    };
-                    let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                    let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-                    let (byte_arr, pos, lim, bb_off, big_endian) = bbacb_read_underlying_bytes(
-                        ctx, this,
-                    )
-                    .ok_or(RuntimeError::IllegalStateException {
-                        message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
-                    })?;
-                    // `ByteBufferAsCharBuffer.subSequence` opens with
-                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
-                    // `lim` was read and then explicitly discarded here, so the
-                    // range was never checked: `subSequence(0, 99)` on a
-                    // six-char view decoded 93 code units from past the end of
-                    // the underlying `byte[]` and handed them back as content.
-                    // Same defect, same day, as `CharBuffer.subSequence` —
-                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
-                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
-                        return Err(RuntimeError::ioobe(
-                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
-                                i64::from(start),
-                                i64::from(end),
-                                i64::from(lim.saturating_sub(pos)),
-                            ),
-                        )
-                        .into());
-                    }
-                    let n = (end - start).max(0) as usize;
-                    let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
-                    for i in 0..n {
-                        let real = pos + start + i as i32;
-                        let bi = (bb_off + 2 * real) as usize;
-                        let hi = ctx.get_array_element(byte_arr, bi).as_int().unwrap_or(0) & 0xFF;
-                        let lo = ctx
-                            .get_array_element(byte_arr, bi + 1)
-                            .as_int()
-                            .unwrap_or(0)
-                            & 0xFF;
-                        let ch = if big_endian {
-                            (hi << 8) | lo
-                        } else {
-                            (lo << 8) | hi
-                        };
-                        ctx.set_array_element(chars_arr, i, Value::Int(ch));
-                    }
-                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
-                    ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars_arr)));
-                    ctx.set_field_by_name(buf, "offset", Value::Int(0));
-                    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-                    ctx.set_field_by_name(buf, "position", Value::Int(0));
-                    ctx.set_field_by_name(buf, "limit", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "capacity", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-                    ctx.set_field(buf, 0, Value::Object(Some(chars_arr)));
-                    ctx.set_field(buf, 1, Value::Int(0));
-                    ctx.set_field(buf, 2, Value::Int(n as i32));
-                    ctx.set_field(buf, 3, Value::Int(n as i32));
-                    ctx.set_field(buf, 4, Value::Int(-1));
-                    Ok(Some(Value::Object(Some(buf))))
-                },
-            );
+            // subSequence(II) -- DELETED, deliberately.
+            //
+            // This used to return a fresh char[]-backed buffer stamped with
+            // the ABSTRACT `java/nio/CharBuffer`, on the reasoning that a
+            // copy is "sufficient for `subSequence(...).toString()`". It is
+            // not: the JDK returns a slice of the same BBACB type over the
+            // same bytes, so a copy loses write-through, reports
+            // `hasArray() == true`, and -- the part that actually broke --
+            // leaves every method with no native on the abstract class
+            // throwing `AbstractMethodError`.
+            //
+            // Now that `asCharBuffer` hands back a real
+            // `ByteBufferAsCharBuffer{B,L}` (see `s2_bb_as_char_buffer`),
+            // the JDK's own `subSequence` body is present and correct,
+            // including the `Objects.checkFromToIndex` bounds check this
+            // override was originally written to add. Leaving the override
+            // in place would shadow it and re-introduce all three
+            // divergences.
             // toString() — read all chars between pos..lim.
             registry.register(bbacb, "toString", "()Ljava/lang/String;", |ctx, args| {
                 let this = match args.first() {
@@ -32683,7 +32756,19 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
 /// RegisterNatives + libffi dispatch is unsafe on Windows; `vm_exec` also refuses
 /// `find_jni_native` / `resolve_jni_native_in_libraries` for this package.
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `org.apache.tomcat.jni.*` is a third-party APR binding
+// this VM fakes rather than links; there is no CratonVM boundary here to
+// cross, only a `<clinit>` to satisfy.
 fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let lib = "org/apache/tomcat/jni/Library";
 
     registry.register(lib, "version", "(I)I", |_ctx, args| {
@@ -32827,6 +32912,7 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });
+    registry.set_category(__prev_cat);
 }
 
 /// Public wrapper so vm_init.rs can register charset natives in real-JDK mode.

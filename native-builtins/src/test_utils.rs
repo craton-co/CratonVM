@@ -225,6 +225,103 @@ fn mock_jdk_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+/// The one family for which `mock_jdk_field_slot` must OUTRANK the fabricated
+/// model — and the reason it is a family and not "every class".
+///
+/// `mock_jdk_field_slot` used to be consulted class-blind and ahead of
+/// [`mock_stub_model_field_slot`], so it answered for **any** modelled class
+/// that happens to declare one of its fifteen names. Measured over the 333
+/// classes `synthetic_stub_field_model` models: it shadowed `name` on
+/// twenty-seven of them — `java.lang.Enum`, `java.security.Permission`,
+/// `java.util.logging.Logger`, `org.xnio.Xnio`, `org.jboss.modules.Module`, … —
+/// every one of which models `name` at slot 0 while the mirror namespace
+/// answers 1. A native that writes `name` by name on any of those was tested
+/// against a slot the VM does not use, which is this record's defect with the
+/// sign flipped: not a silent no-op, a silently *wrong* field.
+///
+/// The mirrors themselves keep the flat namespace, because **production keeps
+/// it too**: `create_method_object` writes the `METHOD_LEGACY_SLOT_*` indices
+/// (`native-builtins/src/lang_class.rs`) — `clazz` 0, `name` 1, `returnType`
+/// 2, `modifiers` 3, `slot` 4, `override` 6, `parameterTypes` 7 … — and every
+/// reader goes through `method_*_field_value_or_legacy`, which falls back to
+/// exactly those indices. The mirror is allocated at
+/// `METHOD_NUM_FIELDS_LEGACY_FLOOR = 8`, so the model's slot for `modifiers`
+/// (10) is past the end of the object and `set_field` discards the write in
+/// silence. Reordering these two gives a reader and a writer different answers
+/// for one name; that was measured, three tests red, and it is what
+/// `the_hand_written_namespace_still_wins_for_the_reflect_mirrors` pins.
+///
+/// `None` is in the family so a mirror a test built without registering a
+/// class name keeps resolving: every other table needs a class name, and
+/// `mock_stub_model_field_slot` answers `None` without one anyway.
+fn mock_reflect_mirror_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    let is_mirror = matches!(
+        class_name,
+        None | Some(
+            "java/lang/reflect/Field"
+                | "java/lang/reflect/Method"
+                | "java/lang/reflect/Constructor"
+                | "java/lang/reflect/Executable"
+                | "java/lang/reflect/AccessibleObject"
+                | "java/lang/invoke/MemberName"
+        )
+    );
+    if is_mirror {
+        mock_jdk_field_slot(name)
+    } else {
+        None
+    }
+}
+
+/// **The** name -> slot chain. All three by-name entry points
+/// (`get_field_by_name`, `set_field_by_name`, `resolve_field_index`,
+/// `resolve_field_index_by_class_id`) resolve through this one function, and
+/// that is the whole point: a reader and a writer that answer one name with
+/// two slots is worse than either mapping being "wrong", and the mock had
+/// three separate chains that could drift.
+///
+/// They already had. `java/lang/reflect/Parameter.name` answered slot 0 to a
+/// writer going through `set_field_by_name` (which special-cased the class)
+/// and slot 1 to a reader coming through `resolve_field_index_by_class_id`
+/// (which did not). And `resolve_field_index` consulted **one** table —
+/// `mock_undertow_exchange_field_slot` — so it answered `None` for every other
+/// class in the tree, including `java/lang/Enum.name` and
+/// `java/lang/Throwable.detailMessage`, which production resolves through it.
+/// Every branch those guard was unreachable under the mock: the same
+/// unfalsifiable-predicate shape §3 of this record fixed one entry point over.
+///
+/// ORDER IS LOAD-BEARING:
+///
+///  1. the reflect mirrors' flat namespace (see
+///     [`mock_reflect_mirror_field_slot`]);
+///  2. `ClassManager::synthetic_stub_fields` — what the VM itself resolves a
+///     name against for a class with no real bytes, so the mock agrees with
+///     the VM wherever the VM has an answer;
+///  3. the hand-written per-class tables, which model *real* library classes
+///     the fabricated model does not describe (a real Undertow exchange has
+///     ~30 fields; the model is a seven-field stand-in);
+///  4. `mock_jdk_field_slot`, class-blind and last — a name the model does not
+///     declare is exactly the gap it was written to fill, and filling it can
+///     no longer displace a modelled slot.
+fn mock_field_slot(class_name: Option<&str>, field_name: &str) -> Option<usize> {
+    if class_name == Some("java/lang/reflect/Parameter") {
+        return mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name));
+    }
+    mock_reflect_mirror_field_slot(class_name, field_name)
+        .or_else(|| mock_stub_model_field_slot(class_name, field_name))
+        .or_else(|| mock_classloader_field_slot(class_name, field_name))
+        .or_else(|| mock_buffer_field_slot(class_name, field_name))
+        .or_else(|| mock_charset_field_slot(class_name, field_name))
+        .or_else(|| mock_lucene_field_slot(class_name, field_name))
+        .or_else(|| mock_concurrent_field_slot(class_name, field_name))
+        .or_else(|| mock_infinispan_dcm_field_slot(class_name, field_name))
+        .or_else(|| mock_h2_field_slot(class_name, field_name))
+        .or_else(|| mock_liquibase_field_slot(class_name, field_name))
+        .or_else(|| mock_stamped_lock_field_slot(class_name, field_name))
+        .or_else(|| mock_undertow_exchange_field_slot(class_name, field_name))
+        .or_else(|| mock_jdk_field_slot(field_name))
+}
+
 fn mock_parameter_field_slot(name: &str) -> Option<usize> {
     match name {
         "name" => Some(0),
@@ -1852,23 +1949,11 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         // absent (returning `Int(0)` rather than silently shadowing slot
         // 0, which would corrupt slot-0 test state).
         let class_name = self.class_name_of_id(self.class_id_of_object(obj));
-        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
-            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
-        } else {
-            self.declared_field_slot(obj, field_name)
-                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_jdk_field_slot(field_name))
-                .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
-        };
+        // A field the test declared outranks every table; everything after it
+        // is `mock_field_slot`, the single chain all four entry points share.
+        let slot = self
+            .declared_field_slot(obj, field_name)
+            .or_else(|| mock_field_slot(class_name.as_deref(), field_name));
         match slot {
             Some(slot) => self.get_field(obj, slot),
             None => Value::Int(0),
@@ -1877,23 +1962,11 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let class_name = self.class_name_of_id(self.class_id_of_object(obj));
-        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
-            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
-        } else {
-            self.declared_field_slot(obj, field_name)
-                .or_else(|| mock_classloader_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_jdk_field_slot(field_name))
-                .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
-        };
+        // A field the test declared outranks every table; everything after it
+        // is `mock_field_slot`, the single chain all four entry points share.
+        let slot = self
+            .declared_field_slot(obj, field_name)
+            .or_else(|| mock_field_slot(class_name.as_deref(), field_name));
         if let Some(slot) = slot {
             self.set_field(obj, slot, value);
         }
@@ -1901,8 +1974,19 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         // the field doesn't exist in the class hierarchy).
     }
 
+    /// Resolve by class NAME. Production reaches for this one constantly —
+    /// `java/lang/Enum.name`, `java/lang/Throwable.detailMessage`,
+    /// `java/lang/StackTraceElement.declaringClass`, the whole
+    /// `jdk.internal.foreign` segment family — and it used to consult a single
+    /// hand-written table, so it answered `None` for all of them and every
+    /// branch behind it was dead code under the mock.
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
-        mock_undertow_exchange_field_slot(Some(class_name), field_name)
+        // Route through the class-id form when the mock knows the class, so a
+        // field a test declared via `set_declared_fields` wins here too.
+        if let Some(&id) = self.name_to_id.get(class_name) {
+            return self.resolve_field_index_by_class_id(ClassId::new(id), field_name);
+        }
+        mock_field_slot(Some(class_name), field_name)
     }
 
     fn resolve_field_index_by_class_id(
@@ -1934,21 +2018,10 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         // has>" unfalsifiable, and a test of it vacuous.
         // (`classloader::cl_has_synthetic_layout` is such a predicate.)
         //
-        // ORDER IS LOAD-BEARING. `mock_jdk_field_slot` is a deliberately
-        // arbitrary shared name->slot namespace for the Field/Method/
-        // Constructor/MemberName mirrors, and it disagrees with the fabricated
-        // model on every one of those names. It stays authoritative here for
-        // exactly the same reason it is authoritative in the by-name chains: a
-        // reader and a writer that resolve the same name differently is worse
-        // than either mapping being "wrong", and putting the model first makes
-        // `create_method_object` write `modifiers` to one slot and
-        // `method_modifiers_value` read it from another. The model fills the
-        // genuine gaps — classes the hand-written tables never covered — which
-        // is what this fallback is for.
+        // Then the SAME chain the by-name entry points use — see
+        // `mock_field_slot`, which is the only place the order is written down.
         let class_name = self.class_name_of_id(class_id);
-        mock_undertow_exchange_field_slot(class_name.as_deref(), field_name)
-            .or_else(|| mock_jdk_field_slot(field_name))
-            .or_else(|| mock_stub_model_field_slot(class_name.as_deref(), field_name))
+        mock_field_slot(class_name.as_deref(), field_name)
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
