@@ -504,6 +504,33 @@ observe, and a thread that returns above the verified point and re-descends
 entirely between two root-snapshot calls never presents one. It is not the fix
 and is not claimed as one.
 
+#### The hi-water A/B, and what it does not show
+
+Same binary, same class, same heap, arms run CONCURRENTLY so host load (which
+ranged 20-124 during this session) hits both:
+
+| arm | hi-water | short-circuits | SUPPRESSED |
+|-----|----------|----------------|------------|
+| AU  | ON       | 222 869        | 972        |
+| AU  | ON       | 228 108        | 431        |
+| AU  | ON       | 277 271        | 754        |
+| AU2 | OFF      | 276 145        | 790        |
+
+**No measurable effect on either column.** The ON runs straddle the OFF run on
+both metrics and their own spread (431-972 suppressed, 223 K-277 K
+short-circuits) is wider than any gap to the control.
+
+An intermediate reading of the first two ON samples looked like a ~19% reduction
+in short-circuits; the third sample (277 271, with the rule ON) removed it. Two
+points against one is not a measurement on a host whose load ranged 20-124
+during this session — see the standing note on interleaved A/B here.
+
+The rule is kept anyway, described for what it is: a sound tightening of an
+argument that was plainly wrong as written (`verified_lo` alone claims the
+verdict holds for the life of the thread), with no demonstrated effect on this
+workload. It is **not** credited with fixing anything, and the correctness
+argument rests entirely on the authoritative reset below.
+
 ### Two caches, one invalidation hook (2026-08-05) — the load-bearing fix
 
 `conservative_roots.rs` memoizes two different per-native-call scans:
