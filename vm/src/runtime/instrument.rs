@@ -569,11 +569,10 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             let ob = original_class_bytes(ctx, class_id);
             eprintln!("[RETRANSFORM]   [{i}] {nm} original_bytes={}", ob.len());
         }
-        // Look up the original bytes via the application classpath
-        // resource finder using `<name>.class` — we always cache them
-        // under that path on define. For real hidden classes / proxy
-        // classes this fails and we fall back to an empty buffer; the
-        // transformer is still given a chance to swap in fresh bytes.
+        // The JVMTI retransformation base: the class-bytes cache first (the
+        // only source that knows dynamically-defined, hidden and
+        // agent-redefined classes), then `<name>.class` off the classpath if
+        // the cache's soft cap evicted it.
         let original = original_class_bytes(ctx, class_id);
         // No trustworthy base, no retransformation.
         //
