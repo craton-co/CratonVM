@@ -263,7 +263,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   Futures, so an `HqlLexer.<clinit>` NPE makes it report `ok=1` in 15 s having
   executed nothing. The ~1-in-13 crash seen while measuring is **not** this
   page: it is the `ClassId(0)` family, now recorded as a fifth reproduction on
-  `../h2/bug-h2-classid0-stale-address-family.md`.
+  `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 
 - ~~`OffsetDateTimeTest` — SIGSEGV during JUnit discovery~~ — **FIXED 2026-08-05**,
   retired to
