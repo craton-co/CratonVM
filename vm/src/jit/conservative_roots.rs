@@ -234,8 +234,10 @@ thread_local! {
     /// perpetually-growing recursion depth, as in Hibernate/JUnit5's nested
     /// call chains, previously paid a full stack rescan on every single
     /// per-native-call root snapshot).
-    static UNREG_JIT_VERIFIED_LO: std::cell::Cell<(usize, usize)> =
-        const { std::cell::Cell::new((usize::MAX, 0)) };
+    static UNREG_JIT_MEMO: std::cell::Cell<UnregMemo> =
+        const { std::cell::Cell::new(UnregMemo::new()) };
+
+
 }
 
 thread_local! {
@@ -1174,9 +1176,52 @@ pub fn note_jit_boundary() {
 /// native calls); we only need the *authoritative* GC root scans to be fresh.
 /// Bumping the generation here discards the stale snapshot so the immediately
 /// following `scan_active_jit_frames` performs a full, current scan.
+///
+/// ## H2-CID0 (2026-08-05) — there are TWO caches here, and this used to reset one
+///
+/// [`UNREG_JIT_MEMO`] memoizes the *other* per-native-call scan: the detection
+/// of a JIT frame that is live without having pushed an entry guard. It is not
+/// keyed on the boundary generation, so bumping the generation left it intact —
+/// and it is the cache that decides whether such a frame's oops are marked at
+/// all. Miss the frame and the young non-moving sweep frees objects it alone
+/// holds.
+///
+/// The argument above applies to it verbatim, and more sharply: a stale root
+/// snapshot drops references, while a stale unregistered-frame verdict drops
+/// an entire frame's worth of them AND leaves the collector believing it may
+/// relocate. Reset it here so the authoritative scan cannot inherit a verdict
+/// about a stack that has since been rewritten.
+///
+/// Cost is one full band rescan per GC-authoritative root collection, not per
+/// native call — which is exactly the trade this function already documents.
+/// The `UnregMemo::hiwater` rule still does the between-collections tightening;
+/// it cannot replace this, because it only reacts to stack-pointer rises it
+/// happens to OBSERVE, and a return-and-re-descend that falls entirely between
+/// two snapshots is invisible to it (measured: 972 suppressed detections in one
+/// run with hi-water enabled).
+///
+/// `CRATONVM_JIT_UNREG_MEMO_GC_RESET=0` restores the pre-fix behaviour (the
+/// memo surviving authoritative scans) so the fix can be A/B'd against the
+/// failure in one binary. Without a switch this would be the only change here
+/// that could never be shown to work.
 #[inline]
 pub fn invalidate_scan_cache_for_gc() {
     note_jit_boundary();
+    if unreg_memo_gc_reset_enabled() {
+        UNREG_JIT_MEMO.with(|c| c.set(UnregMemo::new()));
+    }
+}
+
+/// `CRATONVM_JIT_UNREG_MEMO_GC_RESET=0` — kill switch for the authoritative
+/// reset above.
+fn unreg_memo_gc_reset_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_MEMO_GC_RESET").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
 }
 
 fn jit_scan_cache_enabled() -> bool {
@@ -1211,6 +1256,125 @@ fn dbg_no_prune() -> bool {
 /// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
 /// per-native-call hot-path rationale as [`dbg_no_prune`].
 #[cfg(any(target_os = "windows", target_os = "linux"))]
+/// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
+/// while a real scan of the same range found a frame.
+///
+/// Only counted under `CRATONVM_DBG_UNREG_MEMO_AUDIT=1`. Non-zero means the
+/// memo suppressed a detection that was true: that frame's oops went
+/// unmarked and the collector was never told to avoid moving them.
+pub static UNREG_MEMO_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
+/// Times the memo short-circuited a scan at all (the audit's denominator — a
+/// zero numerator is only meaningful beside a non-zero denominator).
+pub static UNREG_MEMO_SHORTCIRCUITS: AtomicUsize = AtomicUsize::new(0);
+
+/// `CRATONVM_DBG_UNREG_MEMO_AUDIT=1` — verify the memo instead of trusting it.
+///
+/// Runs the detection scan even on the fast path and only COUNTS the
+/// disagreement. It marks nothing and changes no collector decision, so unlike
+/// most instruments on this bug it cannot perturb the thing it measures; the
+/// only cost is the scan itself.
+fn dbg_unreg_memo_audit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNREG_MEMO_AUDIT").is_some()
+    })
+}
+
+/// H2-CID0 (2026-08-05) — the unregistered-JIT-frame memo, as a value.
+///
+/// Stack addresses grow DOWN, so "deeper" is numerically smaller and the
+/// verified region is `[floor, stack_high)`.
+///
+/// * `verified_lo` — the depth at which a scan last came back clean.
+/// * `hiwater` — the SHALLOWEST stack pointer observed since that scan.
+///
+/// The memo's justification is "nothing above our current stack pointer can
+/// change while we are nested below it". Rising to `hiwater` pops every frame
+/// below it, so only `[hiwater, stack_high)` is provably untouched; combined
+/// with the scan's own reach the clean floor is `max(verified_lo, hiwater)`.
+///
+/// Using `verified_lo` alone — the pre-fix rule — claims the verdict holds for
+/// the whole life of the thread, because `verified_lo` only ever moves deeper.
+/// A thread that returns above it, enters an already-compiled method (no new
+/// code range, no entry guard, so neither existing staleness check fires) and
+/// descends again never scans that band again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnregMemo {
+    verified_lo: usize,
+    verified_ranges: usize,
+    hiwater: usize,
+}
+
+/// What the memo says to do for a root scan at `search_lo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnregScan {
+    /// The range is covered by a still-valid earlier verdict.
+    AlreadyClean,
+    /// Detect over `[search_lo, hi)`; `hi` is `stack_high` for a full rescan.
+    Detect { hi: Option<usize> },
+}
+
+impl UnregMemo {
+    const fn new() -> Self {
+        Self {
+            verified_lo: usize::MAX,
+            verified_ranges: 0,
+            hiwater: 0,
+        }
+    }
+
+    /// Clean floor: the deepest address the memo still vouches for.
+    fn floor(&self, hiwater_on: bool) -> usize {
+        if hiwater_on {
+            self.verified_lo.max(self.hiwater)
+        } else {
+            self.verified_lo
+        }
+    }
+
+    /// Record this observation and decide what to scan.
+    ///
+    /// `Detect { hi: Some(floor) }` is the incremental band — only the stack
+    /// that has appeared (or been rewritten) since the last clean verdict.
+    fn observe(&mut self, search_lo: usize, code_ranges: usize, hiwater_on: bool) -> UnregScan {
+        if hiwater_on {
+            self.hiwater = self.hiwater.max(search_lo);
+        }
+        let floor = self.floor(hiwater_on);
+        if code_ranges == self.verified_ranges {
+            if search_lo >= floor {
+                return UnregScan::AlreadyClean;
+            }
+            return UnregScan::Detect { hi: Some(floor) };
+        }
+        // A new compilation invalidates the verdict outright: a slot that held
+        // a plain value at the last scan can now sit where a new JIT code range
+        // claims to start.
+        UnregScan::Detect { hi: None }
+    }
+
+    /// A scan starting at `search_lo` came back clean.
+    fn mark_clean(&mut self, search_lo: usize, code_ranges: usize) {
+        self.verified_lo = search_lo;
+        self.verified_ranges = code_ranges;
+        // The verdict is fresh as of here, so the peak restarts from this
+        // depth — otherwise an old peak would force rescans forever.
+        self.hiwater = search_lo;
+    }
+}
+
+/// `CRATONVM_JIT_UNREG_MEMO_HIWATER=0` — restore the pre-fix memo (kill switch
+/// for A/B-ing the fix in one binary).
+fn unreg_memo_hiwater_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_MEMO_HIWATER").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
@@ -2742,8 +2906,23 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                 .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
                 .unwrap_or(scanner_sp);
             let search_lo = scanner_sp.max(cover_hi);
-            let (verified_lo, verified_ranges) = UNREG_JIT_VERIFIED_LO.with(std::cell::Cell::get);
-            let already_clean = code_ranges == verified_ranges && search_lo >= verified_lo;
+            let hiwater_on = unreg_memo_hiwater_enabled();
+            let decision = UNREG_JIT_MEMO.with(|c| {
+                let mut m = c.get();
+                let d = m.observe(search_lo, code_ranges, hiwater_on);
+                c.set(m);
+                d
+            });
+            let already_clean = decision == UnregScan::AlreadyClean;
+            if already_clean && dbg_unreg_memo_audit() {
+                // Pure observer: scan the range the memo just vouched for and
+                // count the disagreement. Marks nothing, decides nothing.
+                UNREG_MEMO_SHORTCIRCUITS.fetch_add(1, Ordering::Relaxed);
+                let high = current_thread_stack_high();
+                if high > search_lo && native_stack_has_jit_frame(search_lo, high).is_some() {
+                    UNREG_MEMO_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if !already_clean {
                 let high = current_thread_stack_high();
                 if high > search_lo {
@@ -2789,13 +2968,12 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                     // `verified_lo`, or a new compilation since the last check
                     // (`code_ranges != verified_ranges`) — identical to
                     // pre-fix behavior in all of those cases.
-                    let scan_hi = if code_ranges == verified_ranges
-                        && search_lo < verified_lo
-                        && verified_lo <= high
-                    {
-                        verified_lo
-                    } else {
-                        high
+                    // H2-CID0: the band the memo asked for — bounded by the
+                    // clean FLOOR, not by `verified_lo`, so stack rewritten
+                    // while this thread was shallower is rescanned.
+                    let scan_hi = match decision {
+                        UnregScan::Detect { hi: Some(floor) } if floor <= high => floor,
+                        _ => high,
                     };
                     if native_stack_has_jit_frame(search_lo, scan_hi).is_some() {
                         // A hit anywhere in the checked band still conservatively
@@ -2811,7 +2989,11 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                             cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
                         );
                     } else {
-                        UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                        UNREG_JIT_MEMO.with(|c| {
+                            let mut m = c.get();
+                            m.mark_clean(search_lo, code_ranges);
+                            c.set(m);
+                        });
                     }
                 }
             }
@@ -3632,6 +3814,111 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H2-CID0 (2026-08-05) — the sequence the pre-fix memo got wrong.
+    ///
+    /// Stack grows down. Verify deep, RETURN shallow, descend again: the band
+    /// the thread rose through was rewritten while it was up there, and an
+    /// already-compiled method entered in that window leaves an unregistered
+    /// JIT frame in it without changing `code_ranges` or pushing a guard. The
+    /// old rule (`search_lo >= verified_lo`) reported that band clean forever.
+    #[test]
+    fn unreg_memo_rescans_the_band_a_returning_thread_rewrote() {
+        let ranges = 7usize;
+        let mut m = UnregMemo::new();
+
+        // First check at depth 1000 must scan everything.
+        assert_eq!(m.observe(1000, ranges, true), UnregScan::Detect { hi: None });
+        m.mark_clean(1000, ranges);
+
+        // Still nested below 1000 and deeper: only the new band is unscanned.
+        assert_eq!(
+            m.observe(800, ranges, true),
+            UnregScan::Detect { hi: Some(1000) },
+        );
+        m.mark_clean(800, ranges);
+
+        // The thread RETURNS to 1900 — everything below that was popped.
+        assert_eq!(m.observe(1900, ranges, true), UnregScan::AlreadyClean);
+
+        // …and descends again to 1500. The band [1500, 1900) is stack the
+        // thread rewrote after the last clean verdict, so it MUST be rescanned.
+        assert_eq!(
+            m.observe(1500, ranges, true),
+            UnregScan::Detect { hi: Some(1900) },
+            "a band rewritten while the thread was shallower must not inherit \
+             an older clean verdict — this is the H2-CID0 hole",
+        );
+
+        // The pre-fix rule is what the kill switch restores, and it is wrong
+        // here: 1500 >= verified_lo (800), so it short-circuits.
+        let mut old = UnregMemo::new();
+        old.mark_clean(800, ranges);
+        assert_eq!(old.observe(1900, ranges, false), UnregScan::AlreadyClean);
+        assert_eq!(
+            old.observe(1500, ranges, false),
+            UnregScan::AlreadyClean,
+            "documents the defect the hi-water rule fixes",
+        );
+    }
+
+    /// H2-CID0 (2026-08-05) — a reset memo vouches for nothing.
+    ///
+    /// `invalidate_scan_cache_for_gc` resets the memo so the GC-authoritative
+    /// scan cannot inherit a verdict about a stack that has since been
+    /// rewritten. The property that matters is that a freshly-reset memo
+    /// demands a FULL rescan (`hi: None`) at any depth, not an incremental
+    /// band — an incremental band would still trust the missing prefix.
+    #[test]
+    fn a_reset_memo_demands_a_full_rescan_at_any_depth() {
+        let mut m = UnregMemo::new();
+        m.mark_clean(1000, 5);
+        assert_eq!(m.observe(1200, 5, true), UnregScan::AlreadyClean);
+
+        m = UnregMemo::new();
+        for depth in [10usize, 1000, 100_000, usize::MAX - 1] {
+            assert_eq!(
+                m.observe(depth, 5, true),
+                UnregScan::Detect { hi: None },
+                "a reset memo must force a full rescan at depth {depth}, not an \
+                 incremental band over a prefix nothing has verified",
+            );
+        }
+    }
+
+    /// A new compilation invalidates the verdict regardless of depth — a slot
+    /// that held a plain value can now sit inside a brand-new code range.
+    #[test]
+    fn unreg_memo_new_code_range_forces_a_full_rescan() {
+        let mut m = UnregMemo::new();
+        m.mark_clean(1000, 3);
+        assert_eq!(m.observe(1200, 3, true), UnregScan::AlreadyClean);
+        assert_eq!(m.observe(1200, 4, true), UnregScan::Detect { hi: None });
+    }
+
+    /// The throughput case the incremental path exists for must be unchanged:
+    /// a thread that only ever descends scans each new band exactly once and
+    /// never rescans what it already covered.
+    #[test]
+    fn unreg_memo_monotonic_descent_is_unchanged_by_the_fix() {
+        let ranges = 2usize;
+        for hiwater_on in [false, true] {
+            let mut m = UnregMemo::new();
+            m.mark_clean(5000, ranges);
+            for depth in [4000usize, 3000, 2000, 1000] {
+                let prev = m.verified_lo;
+                assert_eq!(
+                    m.observe(depth, ranges, hiwater_on),
+                    UnregScan::Detect { hi: Some(prev) },
+                    "descending must scan only the newly-exposed band \
+                     (hiwater_on={hiwater_on})",
+                );
+                m.mark_clean(depth, ranges);
+            }
+            // Re-checking at the same depth is free.
+            assert_eq!(m.observe(1000, ranges, hiwater_on), UnregScan::AlreadyClean);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // JIT-scan cache keying (docs/vm-jit-cache-keying.md)

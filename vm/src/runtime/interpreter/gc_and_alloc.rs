@@ -1023,6 +1023,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             maybe_concurrent_gc(shared, thread);
             // Run any pending finalizers
             run_finalizers(shared, thread);
+            // ...and any pending Cleaner actions. Until 2026-08-05 this was
+            // called ONLY from the forced `System.gc()` path, so a cleanable
+            // whose referent died during an ordinary allocation-triggered
+            // collection stayed queued indefinitely — its native memory (a
+            // direct `ByteBuffer`'s backing block, a mapped region, a file
+            // descriptor) held until something happened to call `System.gc()`.
+            // `run_finalizers` was already called from here; this is the
+            // missing half of that symmetry, and lead 2 of
+            // `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
+            // Both are cheap no-ops when nothing is pending.
+            run_cleaner_actions(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
             let mut counted_os_tids: Vec<u32> = Vec::new();
@@ -1147,6 +1158,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 maybe_concurrent_gc(shared, thread);
                 // Run any pending finalizers
                 run_finalizers(shared, thread);
+                // ...and any pending Cleaner actions — see the single-threaded
+                // arm above for why an allocation-triggered GC must do this
+                // too, not only the forced `System.gc()` path.
+                run_cleaner_actions(shared, thread);
             } else {
                 // Another thread is already doing GC — just participate
                 safepoint_check(shared, thread);
@@ -1721,6 +1736,11 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Each entry is the address of a `java/lang/ref/Cleaner$Cleanable`
 /// synthetic. Field 0 holds the Runnable action; field 1 is the cleaned
 /// flag (idempotency guard, also set by user-triggered Cleanable.clean()).
+///
+/// A real-JDK `jdk.internal.ref.Cleaner` also arrives here — the reference
+/// processor emits it as an action rather than enqueuing it onto its
+/// reader-less `dummyQueue` (see `ReferenceEntry::runs_cleaner`). It has a
+/// completely different layout and is handled by invoking its own `clean()`.
 ///
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.

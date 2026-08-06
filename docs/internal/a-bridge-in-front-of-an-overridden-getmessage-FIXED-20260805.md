@@ -89,5 +89,25 @@ that remain.
 override the method it is registering.** Any class in those lists that overrides
 `getMessage`, `getLocalizedMessage` or `toString` has the same defect. This one
 surfaced because a differential probe read the message; the others would surface
-only the same way. Worth a sweep: for each class in the two lists, does the real
-JDK class declare its own `getMessage`/`toString`?
+only the same way.
+
+## The sweep, done 2026-08-05
+
+`javap -p` over all 68 classes in the two lists, looking for a declared
+`getMessage` / `getLocalizedMessage` / `toString`. Exactly **two** besides
+`PatternSyntaxException`:
+
+* **`java.io.InvalidClassException`** overrides `getMessage()` to prepend the
+  offending class name. Confirmed broken and **FIXED**: ours returned
+  "bad serialVersionUID" where HotSpot returns
+  "com.example.Foo; bad serialVersionUID", so a deserialization failure lost the
+  one field naming WHICH class failed. Removed from both lists.
+* **`java.lang.NullPointerException`** overrides `getMessage()` to compute the
+  helpful "Cannot invoke ... because ... is null" text lazily. Checked and
+  **already correct**: `probes/ThrowableAccessorOverrideProbe` shows this VM
+  producing HotSpot's exact text, `<local1>` placeholder included, for both a
+  null method call and a null array length. Left in place; the bridge is not
+  hurting it, because the JDK only consults the override when
+  `detailMessage` is null and our own throw path fills that in.
+
+`probes/ThrowableAccessorOverrideProbe` now matches HotSpot on every row.

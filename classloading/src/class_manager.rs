@@ -520,7 +520,7 @@ pub fn loader_aware_resolution() -> bool {
 fn dbg_stub_bt_filter() -> Option<&'static str> {
     static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FILTER
-        .get_or_init(|| std::env::var("CRATONVM_DBG_STUB_BT").ok())
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_STUB_BT").ok())
         .as_deref()
 }
 

@@ -6405,24 +6405,44 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
     }
 
     let cm = shared.classes.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+    let (verdict, why) = match cm.get_loaded_class_id(class_name) {
+        None => (false, "class not loaded"),
+        Some(cid) => match cm.get_class(cid) {
+            None => (false, "class id not in the store"),
+            Some(cls) if cls.is_synthetic_stub => (false, "loaded class is itself a synthetic stub"),
+            Some(_) => match crate::classloading::find_method_recursive(
+                cid,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            ) {
+                None => (false, "method not found on the real class or its supers"),
+                Some((m, _)) if m.is_native() => (false, "real method is ACC_NATIVE"),
+                Some((m, _)) if m.is_abstract() => (false, "real method is ACC_ABSTRACT"),
+                Some((m, _)) if m.code().is_none() => (false, "Code attribute NOT YET DECODED"),
+                Some(_) => (true, "real bytecode wins"),
+            },
+        },
+    };
+    if dbg_stub_yield() {
+        eprintln!("[STUB-YIELD] {class_name}.{method_name}{descriptor} yield={verdict} — {why}");
+    }
+    verdict
 }
+
+/// `CRATONVM_DBG_STUB_YIELD` — trace every allow-listed `SyntheticStub`
+/// arbitration and the term that decided it.
+///
+/// A refusal here is silent (the stub simply runs), so "the allow-list says
+/// protect this class, and the census says its stub ran anyway" had no way to
+/// name which of the five terms disagreed — and those five have five different
+/// fixes.
+pub(crate) fn dbg_stub_yield() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_YIELD").is_some())
+}
+
 
 
 /// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
@@ -6946,6 +6966,40 @@ pub(super) fn revalidate_cached_native(
     let callback = registry.callback_of(id).unwrap_or(cached_callback);
     let kind = registry.kind_of_id(id).unwrap_or(cached_kind);
     if !policy.is_jdk_only() {
+        // REVALIDATE MEANS REVALIDATE. A warmed target is published once and
+        // then redeemed forever, and until 2026-08-05 the Compatible arm
+        // redeemed it without ever re-asking whether a `SyntheticStub` should
+        // now yield to real bytecode. The arbitration answers "yield" every
+        // time it is ASKED — measured, on both an isolated probe and a Spring
+        // Boot run — and the census still counted 2 889
+        // `AtomicBoolean.compareAndSet` stub dispatches, because the warmed
+        // path is the one that never asked.
+        //
+        // `AtomicBoolean` and `java/time/Instant` are on
+        // `real_protected_stub_class_common`'s allow-list, so the stated policy
+        // is that their real bytecode wins once loaded. A target published
+        // before that class finished loading pinned the stub for the rest of
+        // the run.
+        //
+        // Returning `None` is the eviction signal every caller already
+        // implements (`invoke_cache.evict(...)` then `CacheMiss`), so the site
+        // re-resolves through a path that does arbitrate. Cost on the hot path
+        // is one integer compare: only a `SyntheticStub` gets as far as
+        // materialising its triple, and only the eleven allow-listed classes
+        // reach the class manager.
+        if kind == cratonvm_native_api::NativeKind::SyntheticStub {
+            if let Some((class_name, method_name, descriptor)) = registry.triple_of(id) {
+                if synthetic_stub_kind_should_yield_to_real_bytecode(
+                    shared,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    Some(kind),
+                ) {
+                    return None;
+                }
+            }
+        }
         registry.record_invocation(id);
         return Some(callback);
     }

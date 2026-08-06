@@ -1,9 +1,9 @@
 # Two VMs in one process corrupt each other's field reads: the compact-layout registry is keyed on a per-VM ClassId
 
-**Status: OPEN, root cause PROVEN, deterministic reproducer landed
-(`#[ignore]`d). Two candidate fixes were implemented and measured, and BOTH
-are insufficient — see "What does not work". The fix that remains is
-architectural.**
+**Status: FIXED 2026-08-05 by `0c8d67697` — the registry now records which
+domain owns each `class_id` slot, and allocation refuses a slot it does not
+own. The reproducer below is un-ignored and passes. Kept for the two fixes
+that did NOT work, because both look correct and neither is.**
 
 Impact: any process holding two live `Vm`/`SharedVm` instances reads wrong
 field values. Production embeddings today create one VM per process and are
@@ -86,10 +86,22 @@ what is ambiguous.** `compact_object_field_storage(header, index)` and
 count, and no VM. Any scheme that privileges "the first VM" also breaks every
 test that needs a compact object in a later one.
 
-## The fix that remains
+## The fix that landed
 
-Make the layout domain explicit: key the registry on `(vm_domain, class_id)`
-and thread the domain to the lookup. `Heap` belongs to exactly one VM and is
+Make the layout domain explicit — done in `0c8d67697`, and it turned out far
+smaller than this section first estimated (5 allocation sites and 1
+registration site, not ~60), because **reads need no domain at all**:
+`compact_object_field_storage` and `object_body_size` both gate on
+`is_compact_object`, so only an object ALLOCATED compact consults the registry
+and it was allocated under the owning domain. The hot path is unchanged.
+
+Each `ClassStore` takes a domain at construction; `register_class_layout`
+leaves another domain's slot alone; `compact_object_body_size` refuses to
+allocate against a slot it does not own. Allocation pays one relaxed load
+while a single `ClassStore` exists, with the `RwLock` read `#[cold]`.
+
+The original sketch below is kept because its reasoning about WHERE the domain
+should live still holds. `Heap` belongs to exactly one VM and is
 the receiver of `alloc_object`/`get_field`/`set_field`, and the GC scans are
 per-heap, so the domain can travel on the `Heap` rather than being widened into
 every `ObjectHeader`.

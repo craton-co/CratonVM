@@ -8374,6 +8374,27 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
+    // one of these intrinsics reaches `emit_load_string_value_ptr`
+    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
+    // `String.value` reference field. That emitter is NOT gated on
+    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
+    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
+    // the adjacent coder/hash field and dereferences the result - a
+    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
+    // indexOf / hashCode / equals / compareTo.
+    //
+    // Refusing the intrinsic here is the unblock that module's header
+    // prescribes: it costs throughput (the calls fall back to native
+    // dispatch) and costs nothing when the gate is off, which is the default.
+    // The real fix is a narrow arm in that emitter, mirroring
+    // `emit_narrow_ref_aload_regs`. This does NOT make `-XX:+UseCompressedOops`
+    // sound on its own - hole 2 (the conservative 8-byte-word rescan in
+    // `gen_heap`'s `mark_young_to_old_refs` / `rewrite_stretch_conservatively`)
+    // is still open, and `enable_for_live_heap` still warns.
+    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+        return None;
+    }
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
@@ -10396,7 +10417,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -10488,7 +10509,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -12846,6 +12867,32 @@ pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
             .map(|s| s.to_string())
     };
     Some((n, label))
+}
+
+/// How the direct-entry arms should treat a compiled callee's raw return
+/// register — see `emit_inline_callee_deopt_check`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpIcDeoptCheck {
+    /// Compare against `i64::MIN` at every direct-entry call (the default).
+    On,
+    /// Emit no comparison at all.
+    Off,
+    /// Emit it except where the callee's descriptor returns `void`, which is
+    /// exactly where the compared register holds no return value.
+    SkipVoid,
+}
+
+/// `CRATONVM_JIT_SP_IC_DEOPT_CHECK` = `0` | `void` | anything else (default).
+pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
+    use std::sync::OnceLock;
+    static G: OnceLock<SpIcDeoptCheck> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SP_IC_DEOPT_CHECK").as_deref() {
+            Ok("0") => SpIcDeoptCheck::Off,
+            Ok("void") => SpIcDeoptCheck::SkipVoid,
+            _ => SpIcDeoptCheck::On,
+        }
+    })
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
@@ -15970,6 +16017,33 @@ fn try_compile_inner(
                         // bailed out of IR to single-pass never reaches here, so it
                         // keeps the constructor default `false`.
                         compiled.used_ir_backend = true;
+                        // `CRATONVM_DBG_JIT_CODE` dumped only single-pass
+                        // bodies, so a method the optimizing tier claimed was
+                        // invisible to it — and "dump the code the inline cache
+                        // actually CALLs" silently handed back a DIFFERENT,
+                        // single-pass artifact for the same method. Same dump,
+                        // same format, tagged with the backend that produced it.
+                        if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE")
+                        {
+                            let full = format!(
+                                "{}.{}{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            );
+                            if full.contains(&want) {
+                                let slice = compiled._buffer_slice_for_debug();
+                                let mut hex = String::new();
+                                for b in slice {
+                                    hex.push_str(&format!("{:02x}", b));
+                                }
+                                eprintln!(
+                                    "[JIT_CODE] backend=ir {} entry={:p} len={}\n{}",
+                                    full,
+                                    compiled.entry,
+                                    slice.len(),
+                                    hex
+                                );
+                            }
+                        }
                         // `used_ir_backend` was written and never read at
                         // runtime, so "did the optimizing tier produce any body
                         // in this run?" had no answer outside `cfg(test)`. That
