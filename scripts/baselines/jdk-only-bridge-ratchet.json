@@ -1,35 +1,35 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4686,
-      "bridge_without_acc_native": 9675,
-      "jdk_version": "25.0.3",
+      "bridge_shadows_bytecode": 4679,
+      "bridge_without_acc_native": 9660,
+      "jdk_version": "",
       "mode": "compatible",
-      "note": "Re-freeze: dev drifted 22/2 below the previous freeze before this change (verified by scoring the PRISTINE d676f1c12 binary, which measures the same 9675/4686). This change deletes one registration, java.util.Map.entry, and that one was SyntheticStub \u2014 it moves stub_ratchet 554->553, not these two.",
+      "note": "Re-freeze after dev drift: 9675->9660 and 4686->4679 both predate this change (an identical census from the pristine dev tip scores the same), so this only stops a slack-free gate from silently re-admitting 15+7. This change itself is inert on both counters, which is the expected result for a kind-statement pass: stating Bridge does not alter whether the image backs the target.",
       "observed": {
         "bridge": {
-          "abstract_method": 1321,
+          "abstract_method": 1322,
           "acc_native": 774,
           "class_absent": 1191,
-          "class_present_method_undeclared": 2477,
-          "rows": 10449,
-          "shadows_bytecode": 4686,
-          "without_acc_native": 9675
+          "class_present_method_undeclared": 2468,
+          "rows": 10434,
+          "shadows_bytecode": 4679,
+          "without_acc_native": 9660
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10449,
-          "intrinsic": 690,
-          "synthetic-stub": 756
+          "bridge": 10434,
+          "intrinsic": 687,
+          "synthetic-stub": 755
         },
         "schema": 1,
-        "total_rows": 11895
+        "total_rows": 11876
       },
       "os": "linux",
-      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+      "workload": ""
     }
   },
   "min_total_rows": 8000,
