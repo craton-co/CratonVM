@@ -5730,7 +5730,18 @@ pub(crate) fn render_class_origins_json(rows: &mut [ClassOriginEntry], verbose: 
             "      \"real_bytes_found\": {},\n",
             row.real_bytes_found
         ));
-        out.push_str(&format!("      \"loader_id\": {}\n", row.loader_id));
+        out.push_str(&format!("      \"loader_id\": {},\n", row.loader_id));
+        // Direct supertypes, in declaration order (superclass, then
+        // interfaces). Never redacted: these are JDK/application type names,
+        // not paths, and the interception join is useless without them.
+        out.push_str("      \"supertypes\": [");
+        for (i, s) in row.supertypes.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&json_escape(s));
+        }
+        out.push_str("]\n");
         out.push_str("    }");
     }
     if !rows.is_empty() {
@@ -8640,6 +8651,7 @@ mod tests {
             requested_by: None,
             real_bytes_found: false,
             loader_id,
+            supertypes: Vec::new(),
         }
     }
 
@@ -8677,6 +8689,7 @@ mod tests {
                 requested_by: Some("/home/ci-agent/work/app.jar".into()),
                 real_bytes_found: false,
                 loader_id: 0,
+                supertypes: vec!["java/lang/Object".into()],
             },
             origin_row("com/example/Main", "application-class-path", 2),
             origin_row("java/lang/String", "boot-image", 0),

@@ -88,14 +88,16 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 // 2. **`SetUnhandledExceptionFilter(unhandled_filter)`** — catches
 //    the `0xC0000005` fired during libtest's result-collection
 //    phase. `main` never returned, so `atexit` cannot run; the
-//    SEH filter is the one remaining trap-door. Calls `ExitProcess(0)`.
+//    SEH filter is the one remaining trap-door. Calls
+//    `ExitProcess(101)` — it used to report success here, which is
+//    the change described under "The panic tripwire" below.
 //
 // Both hooks are installed from a `.CRT$XCU` section entry so they
 // are live before libtest's `main` begins running tests. The ctor
 // also records `CTOR_RAN = true` so the regression test can verify
 // the wiring without triggering the failure path.
 //
-// ## Why exit 0 is correct
+// ## Why the two hooks report what they do
 //
 // libtest on Windows uses `std::process::exit` to propagate test
 // failures (`ERROR_EXIT_CODE = 101`). Rust's `std::process::exit`
@@ -105,56 +107,73 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 // of our hooks can fire. The hooks are therefore only reached on:
 //
 //   (a) the clean-success path where libtest's `main` returned 0
-//       (every test passed), and
-//   (b) the teardown-crash path where libtest's post-test
-//       cleanup SIGV'd after every test already reported `ok`
-//       (again, every test passed).
+//       (every test passed) — `atexit`, exit **0**; and
+//   (b) the teardown-crash path where libtest's post-test cleanup
+//       faulted — the SEH filter, exit **101**.
 //
-// In both cases every test passed, so unconditional `ExitProcess(0)`
-// is the correct answer. **We cannot silently mask a genuine test
-// failure because the failure path never hits our hooks** — it
-// terminates earlier through libtest's own `process::exit(101)`.
-//
-// That last claim is not just a reading of libtest: measured
-// 2026-08-05, a run with one genuinely failing test exited **101
-// with no shim message at all**, proving `atexit` never ran. A run
+// (a) is a certainty rather than an inference: **we cannot silently
+// mask a genuine test failure, because the failure path never hits
+// our hooks** — it terminates earlier through libtest's own
+// `process::exit(101)`. Measured, not merely read out of libtest: on
+// 2026-08-05 a run with one genuinely failing test exited 101 with
+// no shim message at all, proving `atexit` never ran, while a run
 // with every test passing printed the shim's own line and exited
 // through `on_exit`.
 //
-// ## The panic tripwire, and why `atexit` no longer consults it
+// (b) used to report success too, on the theory that a crash arriving
+// after every test said `ok` still means every test passed. It does
+// not: the fault can equally arrive before the summary is written, or
+// on a worker with tests still queued behind it. A crash is not a
+// pass. Verified by injecting a read of address `0x10` on the
+// `atexit` path — the filter's `main` arm fires and the run exits
+// 101, where the previous code exited 0.
 //
-// `exit_code()` answers "was a failure in flight when teardown hit
-// us" by comparing a global panic count against a compile-time
-// budget. The `atexit` path used to consult it too, and that was a
-// pure liability: `atexit` only runs when `main` RETURNED, which per
-// the paragraph above already means every test passed. Consulting a
-// heuristic to second-guess a certainty can only produce false reds
-// — and did. The budget was 32 while a clean run panicked 33 times,
-// so `cargo test -p cratonvm-vm --lib` reported
+// ## The panic tripwire that used to live here (deleted 2026-08-05)
+//
+// An `exit_code()` helper answered "was a failure in flight when
+// teardown hit us" by comparing a process-wide panic count against a
+// compile-time budget, and both exit paths consulted it. It was
+// removed, in two steps, and the reasoning is worth keeping because
+// the shape recurs.
+//
+// On the `atexit` path it was a pure liability. `atexit` runs only
+// when `main` RETURNED, which already means every test passed, so a
+// heuristic there could only ever overturn a certainty with a guess.
+// It did: the budget was 32 while a clean run panicked 33 times, so
+// `cargo test -p cratonvm-vm --lib` printed
 // `test result: ok. 2410 passed; 0 failed` and then exited 1, on
-// every run, silently. `on_exit` now exits 0 unconditionally.
+// every run, silently.
 //
-// The tripwire survives only on the SEH path, where libtest never
-// got to decide anything. Be aware of what it is worth there: of the
-// 28 `#[should_panic]` attributes only ~25 actually fire (the rest
-// sit in `#[ignore]`d or unreached tests), while ambient panics have
-// grown from the 4 originally recorded to 9. A single failing test
-// adds one panic to a count that already drifts by several, so the
-// signal does not really separate "a failure was pending" from "the
-// ambient set moved again". It is kept because a crash-path
-// heuristic that is sometimes right beats none, and because the
-// alternative — reporting every teardown crash as failure — is a
-// policy change this fix does not need to make. If the 0xC0000005
-// stays gone, delete the tripwire and the SEH main-thread arm with
-// it.
+// The budget was unmaintainable in principle, not merely stale. Its
+// drift guard counted only the `#[should_panic]` half; the ambient
+// half had grown 4 -> 9 unwatched, while 3 of the 28 `#[should_panic]`
+// attributes never fire at all. Two errors of opposite sign that
+// happened to sum across the line. And a single failing test
+// contributes ONE panic to a count that drifts by several — so even
+// maintained, it could not separate "a failure was pending" from "the
+// ambient set moved again".
+//
+// On the SEH path it is now gone too, because that path does not
+// happen. Measured over 20 consecutive runs on dev: the filter fired
+// **0 times**; all 15 green runs exited through `atexit` (the other 5
+// were ordinary test failures, exit 101 via libtest). The
+// `0xC0000005` this shim was built for does not reproduce, and no
+// history of it survives — the shim arrived in the squashed
+// open-source import.
+//
+// So the filter no longer guesses an exit code. **Any unhandled SEH
+// exception is now reported and exits 101**, on whichever thread it
+// fires. If the teardown crash ever returns it will be a loud red
+// naming itself, which is the correct outcome for a crash and is what
+// the old code's "report success if fewer than N panics happened"
+// could not deliver.
 //
 // ## Regression coverage
 //
 // `harness_exit_shim_tests::shim_installed_at_startup` asserts the
 // `.CRT$XCU` constructor fired. A deliberately-failing test gated
-// on `--cfg test_harness_exit_code` exercises the exit-1 path so a
-// future CRT-init refactor that disables the shim is noticed
-// immediately.
+// on `--cfg test_harness_exit_code` asserts that a genuine failure
+// still reaches cargo as 101 rather than being rewritten by a hook.
 //
 // No-op outside `#[cfg(all(test, windows))]`: Linux / macOS
 // `cargo test` teardowns are clean, and release binaries never
@@ -163,57 +182,7 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 #[cfg(all(test, windows))]
 #[doc(hidden)]
 pub mod harness_exit_shim {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    /// Count of panics observed by the installed hook. `#[should_panic]`
-    /// tests bump this too; see [`EXPECTED_PANIC_COUNT`] for how we
-    /// subtract those out.
-    pub static PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    /// Compile-time baseline for the panic-count tripwire. The
-    /// regression test in `harness_exit_shim_tests` greps the
-    /// source tree to assert the `#[should_panic]` attribute count
-    /// matches the 28 we expect; the other four panics observed on
-    /// a clean run are ambient (e.g. internal `panic!()` fired from
-    /// `SharedVm::new` recovery paths that are immediately
-    /// caught). The shim treats any count *greater* than this
-    /// number as a signal that a genuine test failure reached our
-    /// hook path and flags the run as failed.
-    ///
-    /// Currently sourced from:
-    ///   - 28 `#[should_panic]` attributes:
-    ///     - vm/src/runtime/frame.rs        (4)
-    ///     - vm/src/runtime/gpu_marshal.rs  (1)
-    ///     - vm/src/runtime/lock_order.rs   (15) // +7: top-of-hierarchy wiring
-    ///     - vm/src/runtime/value_stack.rs  (6)
-    ///     - vm/src/vm/vm_init.rs           (2)
-    ///   - 9 ambient-panic slots, ENUMERATED from a clean
-    ///     `--no-capture` run on 2026-08-05 rather than estimated:
-    ///     `vm/src/vm/vm_exec.rs`, `vm/src/threading/thread_registry.rs`
-    ///     ("intentional panic for K1 test"),
-    ///     `vm/src/threading/event_loop.rs`, `vm/src/runtime/jvmti.rs`
-    ///     (3), `vm/src/native/jni.rs`,
-    ///     `vm/src/jit/conservative_roots.rs`, and
-    ///     `native-api/src/native_id.rs`. Each panics and is caught
-    ///     immediately, so each still bumps the hook's counter.
-    ///
-    /// The previous value of 32 assumed 4 ambient slots. It was wrong
-    /// in BOTH directions at once and nothing noticed, because the
-    /// drift guard below counts only the `#[should_panic]` half:
-    /// ambient panics had grown 4 -> 9, while 3 of the 28
-    /// `#[should_panic]` attributes never fire (their tests are
-    /// `#[ignore]`d or unreached), so a clean run lands at 33 against
-    /// a budget of 32 -- a permanent, silent exit-1.
-    ///
-    /// Only the SEH crash path reads this now; see the module header
-    /// for why `atexit` must not, and for how weak the signal is.
-    pub const EXPECTED_PANIC_COUNT: usize = 37;
-
-    /// Only the true `#[should_panic]` attributes that the
-    /// source-drift regression test counts. Kept separate from
-    /// [`EXPECTED_PANIC_COUNT`] so the numbers have clear
-    /// provenance.
-    pub const SHOULD_PANIC_ATTR_COUNT: usize = 28;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // Windows ExitProcess(u32) — unconditional process termination.
     // Calling this bypasses any further CRT teardown that would
@@ -231,42 +200,6 @@ pub mod harness_exit_shim {
     // original crash is what we would have hit anyway.
     extern "C" {
         fn atexit(cb: extern "C" fn()) -> i32;
-    }
-
-    /// Compute the exit code the shim should hand back to cargo.
-    ///
-    /// The mainline flow:
-    /// - libtest uses `std::process::exit(ERROR_EXIT_CODE = 101)`
-    ///   when *all tests finish normally and at least one failed*.
-    ///   On Windows that call compiles to `ExitProcess(101)`, which
-    ///   bypasses both our atexit handler AND the SEH filter —
-    ///   cargo sees 101 directly and our shim never runs.
-    /// - The shim's hooks therefore only fire on (a) a clean
-    ///   success path where `main` returned 0, or (b) a teardown
-    ///   crash that fired **before** libtest could decide on a
-    ///   final exit code.
-    ///
-    /// Case (b) is the dangerous one: if a test had already failed
-    /// and libtest was about to print `test result: FAILED`, a
-    /// crash during the summary write means our hook fires while
-    /// a failure is pending. We detect that by comparing the
-    /// observed panic count to the source-level tripwire: every
-    /// test that genuinely fails panics at least once, so
-    /// `observed > EXPECTED_PANIC_COUNT` is the sentinel for
-    /// "a real failure was in flight when the teardown hit us".
-    pub fn exit_code() -> u32 {
-        let observed = PANIC_COUNT.load(Ordering::SeqCst);
-        if observed > EXPECTED_PANIC_COUNT {
-            report(&format!(
-                "panic tripwire: observed {observed} panics, expected at most \
-                 {EXPECTED_PANIC_COUNT} ({SHOULD_PANIC_ATTR_COUNT} #[should_panic] + \
-                 {} ambient). Reporting failure (1).",
-                EXPECTED_PANIC_COUNT - SHOULD_PANIC_ATTR_COUNT,
-            ));
-            1
-        } else {
-            0
-        }
     }
 
     /// One line to stderr, bypassing `eprintln!`.
@@ -290,53 +223,42 @@ pub mod harness_exit_shim {
         // atexit path: runs when `main` returns cleanly. Bypasses the
         // subsequent CRT static-destructor pass.
         //
-        // Unconditionally 0, and NOT `exit_code()`. Reaching here means
-        // libtest's `main` returned; libtest terminates a failing run
-        // through `process::exit(ERROR_EXIT_CODE)`, which on Windows is
+        // Unconditionally 0. Reaching here means libtest's `main`
+        // returned; libtest terminates a failing run through
+        // `process::exit(ERROR_EXIT_CODE)`, which on Windows is
         // `ExitProcess` and does not run `atexit` handlers. So arriving
-        // here is already proof that every test passed, and consulting
-        // the panic heuristic could only ever overturn that proof with a
-        // guess. It did: budget 32, clean run 33, permanent silent
-        // exit-1 behind a `test result: ok` line.
+        // here is already proof that every test passed. This used to
+        // consult a panic-count heuristic instead, which could only
+        // overturn that proof with a guess — and did, for a permanent
+        // silent exit-1 behind a `test result: ok` line.
         unsafe { ExitProcess(0) }
     }
 
     /// Windows unhandled-exception filter. Fires when the harness
-    /// trips an SEH exception such as `STATUS_ACCESS_VIOLATION` —
-    /// this catches the post-test teardown crash that the atexit
-    /// path misses because libtest's `main` never returns.
+    /// trips an SEH exception such as `STATUS_ACCESS_VIOLATION`.
     ///
-    /// Calls `ExitProcess` with the shim's computed exit code so
-    /// cargo sees a clean success/failure rather than `0xC0000005`.
+    /// **Always reports failure (101).** An unhandled hardware fault
+    /// means some part of this run did not happen: either a test died
+    /// mid-run and everything queued behind it never executed, or the
+    /// harness faulted during teardown. Neither is a passing run, and
+    /// neither can be distinguished from a real failure by anything
+    /// observable from inside this filter.
     ///
-    /// ## Why a mid-run fault must not reach `exit_code()`
+    /// It used to guess instead, routing a fault on `main` through a
+    /// panic-count heuristic that could answer **success**. That is
+    /// not hypothetical: before the `widened_obj_key` VM-scoping fix,
+    /// `cargo test -p cratonvm-vm --lib --features synthetic-jdk
+    /// vm::tests::linked_hashmap_` crashed in `lhm_link_tail` and
+    /// exited **0** — a green run with the remaining tests unexecuted.
+    /// The heuristic is gone (see the module header); the thread name
+    /// now only selects which explanation to print.
     ///
-    /// `exit_code()` answers "did a test failure look pending when
-    /// teardown hit us", and it answers it by counting panics. That
-    /// question only makes sense once every test has *run*. A fault
-    /// raised while tests are still executing is a different event:
-    /// `ExitProcess` pre-empts libtest's summary, so the tests that
-    /// had not started yet never will, and the panic count says
-    /// nothing about them. Routed through `exit_code()`, such a
-    /// crash reports **success** whenever fewer than
-    /// `EXPECTED_PANIC_COUNT` panics happened to have occurred
-    /// first — a green run with a thousand tests unexecuted. That
-    /// is not hypothetical: before the `widened_obj_key` VM-scoping
-    /// fix, `cargo test -p cratonvm-vm --lib --features
-    /// synthetic-jdk vm::tests::linked_hashmap_` crashed in
-    /// `lhm_link_tail` and exited **0**.
-    ///
-    /// The two cases are told apart by which thread faulted.
-    /// libtest runs each concurrent test on its own thread named
-    /// after the test, and does its result collection — the
-    /// teardown crash this shim exists for — on `main`. So a fault
-    /// on any other thread is a test dying mid-run, and is reported
-    /// as a failure with libtest's own `ERROR_EXIT_CODE`.
-    ///
-    /// Limitation: under `--test-threads=1` libtest runs tests
-    /// inline on `main`, so a mid-run crash there is
-    /// indistinguishable from a teardown crash and stays masked.
-    /// The CI step runs concurrently, where the distinction holds.
+    /// This is a deliberate policy change from the shim's original
+    /// intent, which was to convert a teardown `0xC0000005` into a
+    /// green run. That crash no longer reproduces — 20 consecutive
+    /// runs, filter never fired — so what remains is a trap-door that
+    /// only ever fires on something genuinely wrong. If it returns, it
+    /// should be fixed, not painted green.
     unsafe extern "system" fn unhandled_filter(_info: *mut ()) -> i32 {
         // The filter runs on the crashing thread. `ExitProcess` is the
         // one Win32 call that's always safe here: it never unwinds, it
@@ -346,47 +268,52 @@ pub mod harness_exit_shim {
         // `thread::current()` allocates on first call for an *unnamed*
         // thread; libtest's workers and `main` are both already named,
         // so on the paths that matter here this is a cached TLS read.
+        //
+        // libtest runs each concurrent test on its own thread named
+        // after the test, and does result collection on `main` — so the
+        // name says which of the two stories to tell. Under
+        // `--test-threads=1` tests run inline on `main` and the two are
+        // indistinguishable; the exit code is 101 either way, so the
+        // worst case is a slightly wrong explanation, not a wrong verdict.
         let thread = std::thread::current();
         let on_worker = matches!(thread.name(), Some(name) if name != "main");
+        // The hardware-fault handler installed alongside this filter has
+        // already printed the faulting PC, the thread name and a
+        // symbolized backtrace.
         if on_worker {
-            // Write through `std::io::stderr()` rather than `eprintln!`:
-            // libtest redirects the print macros per test thread, so a
-            // macro here would land in the crashed test's captured
-            // buffer and die with the process. The hardware-fault
-            // handler installed alongside this filter has already
-            // printed the faulting PC, the thread name and a
-            // symbolized backtrace by the same reasoning.
-            use std::io::Write;
-            let mut err = std::io::stderr();
-            let _ = err.write_all(
-                b"\n[harness-exit-shim] a test crashed mid-run; tests after it never \
-                  executed. Reporting failure (101) - see the fatal-error report above \
-                  for the faulting test and PC.\n",
+            report(
+                "a test crashed mid-run; tests after it never executed. \
+                 Reporting failure (101) - see the fatal-error report above \
+                 for the faulting test and PC.",
             );
-            let _ = err.flush();
-            // libtest's own ERROR_EXIT_CODE, so cargo reports this
-            // exactly as it would an ordinary test failure.
-            ExitProcess(101)
+        } else {
+            report(
+                "the harness faulted on `main`, after tests ran but before it \
+                 could finish reporting. Reporting failure (101) - the run is \
+                 not trustworthy, see the fatal-error report above.",
+            );
         }
-        ExitProcess(exit_code())
+        // libtest's own ERROR_EXIT_CODE, so cargo reports this exactly as
+        // it would an ordinary test failure.
+        ExitProcess(101)
     }
 
     /// Records whether the one-shot `install` path has already run.
     /// Used by the regression test to assert the shim is wired in.
     pub static CTOR_RAN: AtomicBool = AtomicBool::new(false);
 
-    /// Install the panic counter + atexit handler + unhandled-exception
-    /// filter. Safe to call more than once — `std::sync::Once` guards
-    /// against double-install.
+    /// Install the atexit handler + unhandled-exception filter. Safe to
+    /// call more than once — `std::sync::Once` guards against
+    /// double-install.
+    ///
+    /// No longer wraps the panic hook. The wrapper existed solely to
+    /// feed a panic-count tripwire, which is gone; leaving it would keep
+    /// a `set_hook` in the path of every panicking test for a counter
+    /// nobody reads.
     pub fn install() {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let prev = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
-                prev(info);
-            }));
             unsafe {
                 atexit(on_exit);
                 // Install the unhandled-exception filter. This is the
@@ -411,8 +338,8 @@ pub mod harness_exit_shim {
     // CRT init hook: MSVC walks the `.CRT$XCU` section at process
     // startup and calls every function pointer there before `main`.
     // This is the same mechanism the `ctor` crate uses and it
-    // guarantees our panic counter + atexit registration are in place
-    // before libtest's `main` begins running tests.
+    // guarantees our atexit registration and exception filter are in
+    // place before libtest's `main` begins running tests.
     #[used]
     #[allow(non_upper_case_globals)]
     #[link_section = ".CRT$XCU"]
@@ -464,63 +391,6 @@ mod harness_exit_shim_tests {
             super::harness_exit_shim::ctor_ran(),
             "CRT init hook did not run — \
              atexit shim is not in place; Windows teardown crash will resurface",
-        );
-    }
-
-    /// Walk the crate source tree at test time and count
-    /// `#[should_panic]` occurrences so the shim's compile-time
-    /// constant [`EXPECTED_PANIC_COUNT`] stays honest. Adding a new
-    /// should_panic test without bumping the constant would make the
-    /// shim treat the new test as a real failure on the crash path;
-    /// this test forces an update in the same PR.
-    #[cfg(windows)]
-    #[test]
-    fn expected_panic_count_matches_source() {
-        use std::fs;
-        use std::path::Path;
-
-        fn walk(root: &Path, out: &mut Vec<(String, String)>) {
-            if let Ok(entries) = fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                        if let Ok(s) = fs::read_to_string(&p) {
-                            out.push((p.to_string_lossy().into_owned(), s));
-                        }
-                    }
-                }
-            }
-        }
-
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-
-        // Only count `#[should_panic` at the start of a line (after
-        // trimming whitespace) AND skip this file itself: the shim
-        // source uses the literal string in code + comments, and
-        // they are not actual test attributes.
-        let this_file_basename = "lib.rs";
-        let code_count: usize = files
-            .iter()
-            .filter(|(path, _)| !path.ends_with(this_file_basename))
-            .flat_map(|(_, body)| body.lines())
-            .filter(|l| {
-                let trim = l.trim_start();
-                trim.starts_with("#[should_panic")
-            })
-            .count();
-
-        assert_eq!(
-            code_count,
-            super::harness_exit_shim::SHOULD_PANIC_ATTR_COUNT,
-            "#[should_panic] count drift: source has {code_count}, \
-             shim expects {} — update SHOULD_PANIC_ATTR_COUNT and \
-             (if you added a new attribute) bump EXPECTED_PANIC_COUNT \
-             accordingly so the teardown exit-code path stays accurate",
-            super::harness_exit_shim::SHOULD_PANIC_ATTR_COUNT,
         );
     }
 

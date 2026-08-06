@@ -170,8 +170,7 @@ None of these strings appears anywhere in the fixed arms' stdout or stderr.
   `java.lang.Integer` (or any ubiquitous class) as the receiver or the value in
   code that never mentions it, suspect dispatch before suspecting the data.
 * **Isolation reruns understate it 4:1.** Reproduce a suite-run failure under
-  the suite's own concurrency before concluding it is not reproducible. See
-  `negative-control-before-declaring-not-reproducible`.
+  the suite's own concurrency before concluding it is not reproducible.
 * **"Different crash sites, same impossible invariant" is one bug, not several.**
   This page and its three siblings split one defect four ways because each
   grouped by *where* it landed. The grouping that would have worked is *what

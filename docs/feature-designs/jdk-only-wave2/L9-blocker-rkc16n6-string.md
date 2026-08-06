@@ -5,7 +5,7 @@
 item 3.
 **Effort:** L as scoped. The work that closed it was a different shape; see
 below.
-**Outcome:** [`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
+**Outcome:** `forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`
 
 ## Closed, and the premise was false
 
@@ -87,14 +87,15 @@ The lane took the matrix from **57 -> 8** divergences in four steps, each with a
 | drop the forced-native `String` policy | 57 -> 37 | 20 | 0 |
 | UTF-16 `hashCode` + concat surrogates | 37 -> 21 | 16 | 0 |
 | out-of-bounds class and message | 21 -> 8 | 13 | 0 |
+| regex errors, US-ASCII decode | 8 -> 3 | 5 | 0 |
 
-The 8 that remain are three problems, none of them a `java/lang/String` defect:
-
-| rows | cause |
-|---:|---|
-| 4 | regex: `PatternSyntaxException` message text, and `replaceAll` with a bad group reference does not throw at all |
-| 3 | HotSpot's *helpful* `NullPointerException` messages ("Cannot invoke ... because ... is null"). VM-wide message synthesis, not `String`. |
-| 1 | `new String(bytes, "US-ASCII")` decodes as Latin-1 instead of replacing non-ASCII bytes with U+FFFD |
+**The 3 that remain are one problem, and it is not a `String` defect**: HotSpot's
+*helpful* `NullPointerException` messages ("Cannot invoke
+\"String.isEmpty()\" because \"this.pattern\" is null") against our own
+wording, on rows 241 / 259 / 275. That is `NullPointerException` message
+synthesis for the whole VM -- it needs the bytecode operand that was null, which
+is a interpreter/JIT feature, not anything `java/lang/String` does. Every
+`String`-domain divergence this lane began with is closed.
 
 ## Three defects the removal surfaced
 
@@ -104,7 +105,7 @@ first looked like it had to be, and did not:
 
 * `String.hashCode()` was **wrong for UTF-16 strings** — it hashed the backing
   BYTES sign-extended, not the code units. **Root-caused and FIXED 2026-08-05**
-  ([record](../../internal/string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md)).
+  (record (`string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md`)).
   The defect was never in `String` or `StringUTF16` bytecode: it was the
   `ArraysSupport.vectorizedHashCode` **native**, which read one array slot per
   element for every `BasicType`. `StringUTF16.hashCode` calls it with `T_CHAR`
@@ -131,7 +132,7 @@ first looked like it had to be, and did not:
   callers of `Preconditions` still get `ArrayIndexOutOfBoundsException` where
   the JDK throws `IndexOutOfBoundsException`.
 * `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
-  ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
+  (record (`string-concat-loses-unpaired-surrogates-FIXED-20260805.md`)).
   `execute_string_concat` accumulated into a Rust `String`, which cannot
   represent one. It now accumulates `Vec<u16>`. It was **three** loss points,
   not the one the record named — the argument, the folded recipe literal, and
@@ -142,7 +143,20 @@ first looked like it had to be, and did not:
 
 `resolve_step1_native` still passes `bytecode_available: false`. That is the
 actual §1.4 hole, and it is why the lists could be inert while the natives kept
-winning. Closing it sends **4,796** shadowing `Bridge` registrations to the
-bytecode under `--jdk-only` at once — far outside this lane, and precisely why
-the fix here is scoped to one class at the registration boundary. It belongs
-with L11 / L12 §11 and needs its own measurement.
+winning.
+
+**Attempted and reverted 2026-08-05, with numbers** —
+[record](../../known-issues/jdk-only/step1-bytecode-available-attempted-and-reverted.md).
+Two of this paragraph's original claims turned out to be wrong: **4,796** is a
+static count of registrations, not of dispatches (the observed change is 10 → 24
+shadow observations on the matrix workload), and the default `--real-jdk` path
+costs nothing because both consumers of the flag are `is_jdk_only()`-gated — the
+392-case matrix stayed byte-identical.
+
+It fails for a different reason than cost: step 1 runs BEFORE method resolution,
+so it has the class name but not the resolved method, and `has_code` derived
+from access flags on the named class is the wrong question when the hierarchy is
+involved. `CharsetDecoder.decodeLoop` is abstract on the named class and
+concrete on its subclasses; `--jdk-only` then dies with `AbstractMethodError:
+... has no Code attribute`. The record proposes two restructurings and states
+the acceptance test that this attempt failed.

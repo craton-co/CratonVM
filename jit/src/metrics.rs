@@ -1498,7 +1498,7 @@ pub fn record_osr_event(event: &str) {
 /// `loop_xform_not_armed` equals `loop_xform_compiles` and the rest are zero,
 /// which is the honest answer rather than a gap.
 ///
-/// See `docs/known-issues/c2/archive/loop-02-planner-admission-gates.md`.
+/// See `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
 pub const LOOP_XFORM_EVENTS: [&str; 12] = [
     // Denominator: compiles that reached the planner at all.
     "loop_xform_compiles",

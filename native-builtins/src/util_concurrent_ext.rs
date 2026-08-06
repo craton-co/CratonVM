@@ -99,7 +99,7 @@ pub(crate) fn register_atomic_integer_natives(r: &mut NativeMethodRegistry) {
     // of field 0 (`private volatile int value`) — no allocation, no safepoint,
     // no collection, no JNI exception. See `NativeMethodRegistry::set_leaf`.
     //
-    // This is item 2 of `docs/internal/aqs-thread-handoff-latency-RETIRED-20260805.md`:
+    // This is item 2 of `aqs-thread-handoff-latency-RETIRED-20260805.md`:
     // `AtomicInteger.get()` measured **969 ns**, more than an empty bytecode
     // call, for a body that is `return value;`. Being native it can never be
     // compiled or inlined, so the whole cost was the funnel around it.
