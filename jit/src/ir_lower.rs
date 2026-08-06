@@ -12197,6 +12197,68 @@ mod tests {
         (graph, schedule)
     }
 
+    /// `void f(int a) { a + 1; }` — the same shape as [`add_one_graph`] with the
+    /// value dropped from the `Return`, so the only difference between the two
+    /// lowerings is the void exit itself.
+    fn void_return_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let _sum = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// A VOID return must leave a defined value in the return register.
+    ///
+    /// `i64::MIN` there is the VM-wide "the callee trapped" sentinel, and every
+    /// consumer reads the raw register: the single-pass inline MIC/PIC
+    /// cascade's `emit_inline_callee_deopt_check`, the megamorphic hashed
+    /// stub's, `jit_invoke_virtual_mic`'s `rc == i64::MIN`, and the
+    /// interpreter's post-JIT drain. A void method has no return value, so
+    /// unless the exit writes one, RAX carries whatever the last operation left
+    /// there and can equal the sentinel by accident — on behalf of a call that
+    /// neither threw nor deopted. The single-pass backend has always zeroed it
+    /// (`x64/bytecode_walk.rs`, the `0xb1` arm); this backend did not.
+    ///
+    /// Asserted on the BYTES, and as a DIFFERENCE against the value-returning
+    /// twin, so it cannot pass by accident: `try_call` returning 0 would be
+    /// satisfied by an undefined register that merely happened to hold 0.
+    #[test]
+    fn a_void_return_writes_the_return_register() {
+        const XOR_EAX_EAX: [u8; 2] = [0x31, 0xC0];
+
+        let (vg, vs) = void_return_graph();
+        let void_method = lower(&vg, &vs, 1, 1, &no_helpers()).expect("void method must lower");
+        let (ag, as_) = add_one_graph();
+        let value_method = lower(&ag, &as_, 1, 1, &no_helpers()).expect("a+1 must lower");
+
+        let void_zeroes = count_seq(void_method._buffer_slice_for_debug(), &XOR_EAX_EAX);
+        let value_zeroes = count_seq(value_method._buffer_slice_for_debug(), &XOR_EAX_EAX);
+        assert_eq!(
+            void_zeroes,
+            value_zeroes + 1,
+            "the void exit must contribute exactly one `XOR EAX,EAX` the \
+             value-returning exit does not (void={void_zeroes}, value={value_zeroes})",
+        );
+        assert_eq!(
+            unsafe { void_method.try_call(&[41]) },
+            Ok(0),
+            "a void method must not hand its caller the deopt sentinel",
+        );
+    }
+
     /// The verifier must not refuse a graph the lowerer handles — otherwise the
     /// "bail before emission" fix would silently cost JIT coverage.
     #[test]
