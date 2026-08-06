@@ -2504,6 +2504,39 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // `ConcurrentHashMap$KeySetView` — the object `newKeySet()` / `keySet(V)`
+    // hands back is a real KeySetView over a native-backed ConcurrentHashMap,
+    // whose entries live in CratonVM's segmented layout rather than the `table`
+    // field. Every method listed here has a real body that reads `table`
+    // directly (`add` via `putVal`, `iterator`/`forEach`/`spliterator` via a
+    // `Traverser`, `hashCode`/`equals` via the iterator), so it must run the
+    // native instead. The methods NOT listed are the ones `CollectionView`
+    // declares in terms of `map` or `iterator()` — `size`/`isEmpty`/`clear`/
+    // `toArray`/`toString`/`containsAll`/`removeAll`/`retainAll`; their real
+    // bodies are correct once these are native, and forcing them here would
+    // also capture `ValuesView`/`EntrySetView`, which share that declaring
+    // class but not these semantics. See the retired
+    // `concurrenthashmap-newkeyset-returns-a-plain-hashset` write-up.
+    if class_name == "java/util/concurrent/ConcurrentHashMap$KeySetView"
+        && matches!(
+            method_name,
+            "add"
+                | "addAll"
+                | "remove"
+                | "contains"
+                | "iterator"
+                | "forEach"
+                | "spliterator"
+                | "stream"
+                | "hashCode"
+                | "equals"
+                | "removeIf"
+                | "getMappedValue"
+                | "getMap"
+        )
+    {
+        return true;
+    }
     // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
     // entries in a segmented native layout, so the real JDK `writeObject`
     // (which walks the always-null `table`) serialised every CHM as empty and
@@ -3025,22 +3058,40 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    // DELETED 2026-08-06 (JDK-ONLY-WAVE2): the receiver-blind
-    // `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)` arm. It forced
-    // `native_es_execute` to win unconditionally because
-    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
-    // `newCachedThreadPool()` used to allocate their return value under the
-    // real class name and never run it through the real `<init>` — so real
-    // `execute()` bytecode read a null `ctl` and NPE'd. Eight separate
-    // receiver-shape probes across four files existed only to *undo* this arm
-    // for a genuinely real receiver, and all eight went with it.
+    // DELETED 2026-08-06 (JDK-ONLY-WAVE2, L11 item 7): the ninth,
+    // receiver-blind `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)`
+    // arm, together with the eight receiver-shape probes that existed only to
+    // undo it for a genuinely real receiver.
     //
-    // What replaced it: every factory shortcut drives the real
-    // `ThreadPoolExecutor.<init>` (`initialize_real_thread_pool_executor`), so
-    // there is no synthetic receiver left to force a native for; the native is
-    // tagged `SyntheticStub` and `real_protected_stub_class` yields it to the
-    // real body class-scoped, for every receiver, in both dispatch paths.
-    // Do NOT re-add a name here without also re-adding the eight probes — this
+    // It forced `native_es_execute` to win unconditionally because
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` allocated their return value under the REAL class
+    // name and did not run it through the real `<init>` -- so real `execute()`
+    // bytecode read a null `ctl` and NPE'd
+    // (fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md).
+    //
+    // Why it is gone, in the order the removal required:
+    //
+    //  1. L10 (2026-08-06): `NativeMethodRegistry::register` drops every
+    //     `Executors` pool factory when `drop_real_layout_synthetic` is set, so
+    //     the real `java.util.concurrent.Executors` bytecode builds every
+    //     executor on a real-JDK image and no code path can mint a half-built
+    //     one. The fabricated receiver this arm protected does not exist there.
+    //  2. `native_es_execute` is tagged `NativeKind::SyntheticStub` and
+    //     `java/util/concurrent/ThreadPoolExecutor` is on
+    //     `real_protected_stub_class_common`'s allow-list, so the one
+    //     centralised arbitration yields it to the real `execute()` body --
+    //     class-scoped, for every receiver, on both the warm and the cold
+    //     dispatch path. That is what keeps `ctx.invoke_virtual(pool,
+    //     "execute", ...)` from recursing into the same native forever.
+    //  3. Only then the nine sites.
+    //
+    // The native is NOT deleted, and must not be: strict mode declines to ADMIT
+    // a native, it does not remove it, and the `--features synthetic-jdk` build
+    // -- the only build where the real `ThreadPoolExecutor` bytecode this arm
+    // overrode is absent -- still registers and still runs it.
+    //
+    // Do NOT re-add a name here without also re-adding the eight probes. This
     // arm has no receiver awareness and never had any.
 
     if class_name == "java/nio/ByteBuffer"
@@ -5374,10 +5425,14 @@ fn admit_forced_native_id(
 // every receiver, on both the warm and the cold dispatch path.
 //
 // That is only sound because the per-INSTANCE distinction was eliminated
-// first: every `Executors.*` factory shortcut drives the real
-// `ThreadPoolExecutor.<init>` via `initialize_real_thread_pool_executor`, so a
-// `ThreadPoolExecutor`-tagged object on a real-JDK image is always genuinely
-// real. `every_threadpool_receiver_shape_site_is_gone` below is the gate that
+// first, by L10 (2026-08-06) and at REGISTRATION rather than in dispatch:
+// `NativeMethodRegistry::register` drops every `Executors` pool factory when
+// `drop_real_layout_synthetic` is set, so on a real-JDK image the real
+// `java.util.concurrent.Executors` bytecode builds every executor and CratonVM
+// has no code path that can mint a fabricated one. The sites are deletable
+// because the fabricated receiver CANNOT EXIST -- a statement about the code,
+// not the `false=0` reading two workloads produced, which L10 measured as
+// already identical before it landed. `every_threadpool_receiver_shape_site_is_gone` below is the gate that
 // keeps a copy from growing back.
 //
 // `native-builtins`' own `executor_has_real_workers` (and the deliberately
@@ -7257,8 +7312,54 @@ mod redefine_immunity_tests {
         //
         // Same fix, same reason, as `jit::ir_lower`'s `declared_op_variants`
         // and `vm::runtime::env_cache`'s flags scan.
-        let src = include_str!("native_override.rs").replace("\r\n", "\n");
-        let src = src.as_str();
+        // A FIFTH staleness mode, found 2026-08-06: this gate policed exactly
+        // one file. The rule it states — "an arm may be named only inside the
+        // two aggregators" — is a rule about the override policy, not about a
+        // file, and the aggregators are `pub(super)`, so every sibling module
+        // can name an arm and none of them were being read.
+        //
+        // `vm/src/runtime/interpreter.rs` did: its no-`Code` dispatch arm
+        // hand-rolled `reflection && string_builder && path`, the aggregate
+        // minus five arms including `synthetic_collection`. That is the same
+        // open-coding whose 2026-07-31 instance took the collection probe to 18
+        // rather than 0 — the incident written up on
+        // `redefine_immune_forced_native` as the reason this gate exists. It
+        // sat in a sibling file for as long as the gate has been green.
+        //
+        // Scanning the whole `runtime` subtree is the fix. `include_str!` needs
+        // literal paths, so the sibling list is explicit; a new module that
+        // names an arm is not covered until it is added here, which is the
+        // remaining hole and is at least a hole in one obvious place.
+        let sources: [(&str, String); 6] = [
+            (
+                "native_override.rs",
+                include_str!("native_override.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../interpreter.rs",
+                include_str!("../interpreter.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "invoke.rs",
+                include_str!("invoke.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "dispatch_virtual.rs",
+                include_str!("dispatch_virtual.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../instrument.rs",
+                include_str!("../instrument.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../../vm/vm_exec.rs",
+                include_str!("../../vm/vm_exec.rs").replace("\r\n", "\n"),
+            ),
+        ];
+
+        // The aggregators live in THIS file, so the exemption range is computed
+        // from this file's text and applies only while scanning it.
+        let src = sources[0].1.as_str();
 
         // The exemption is the RULE, located in the source: an arm may be named
         // only inside the two aggregators, whose entire job is to compose them.
@@ -7306,31 +7407,41 @@ mod redefine_immunity_tests {
         );
 
         let mut offenders = Vec::new();
-        let mut offset = 0usize;
-        for (n, line) in src.lines().enumerate() {
-            let line_start = offset;
-            offset += line.len() + 1; // `lines()` strips a single `\n`
-            let code = line.trim_start();
-            // Comments, and this test's own list of names (string literals).
-            if code.starts_with("//") || code.starts_with('"') {
-                continue;
-            }
-            let inside_aggregator = aggregator_bodies
-                .iter()
-                .any(|&(start, end)| line_start >= start && line_start < end);
-            if inside_aggregator {
-                continue;
-            }
-            for part in [
-                "redefine_immune_string_builder_native(",
-                "redefine_immune_path_native(",
-                "redefine_immune_jfr_native(",
-                "redefine_immune_synthetic_collection_native(",
-                "redefine_immune_thread_local_native(",
-            ] {
-                // An arm's own `fn` declaration is not a call site.
-                if code.contains(part) && !code.contains(&format!("fn {part}")) {
-                    offenders.push(format!("line {}: {}", n + 1, code));
+        for (file, text) in &sources {
+            // The aggregator exemption is a byte range in `native_override.rs`
+            // only. In any other file there is nothing to exempt — naming an
+            // arm there is the offence, wherever in the file it sits.
+            let exempt: &[(usize, usize)] = if *file == "native_override.rs" {
+                &aggregator_bodies
+            } else {
+                &[]
+            };
+            let mut offset = 0usize;
+            for (n, line) in text.lines().enumerate() {
+                let line_start = offset;
+                offset += line.len() + 1; // `lines()` strips a single `\n`
+                let code = line.trim_start();
+                // Comments, and this test's own list of names (string literals).
+                if code.starts_with("//") || code.starts_with('"') {
+                    continue;
+                }
+                if exempt
+                    .iter()
+                    .any(|&(start, end)| line_start >= start && line_start < end)
+                {
+                    continue;
+                }
+                for part in [
+                    "redefine_immune_string_builder_native(",
+                    "redefine_immune_path_native(",
+                    "redefine_immune_jfr_native(",
+                    "redefine_immune_synthetic_collection_native(",
+                    "redefine_immune_thread_local_native(",
+                ] {
+                    // An arm's own `fn` declaration is not a call site.
+                    if code.contains(part) && !code.contains(&format!("fn {part}")) {
+                        offenders.push(format!("{}:{}: {}", file, n + 1, code));
+                    }
                 }
             }
         }

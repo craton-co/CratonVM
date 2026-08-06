@@ -10211,6 +10211,12 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/TreeSet" => "java/util/AbstractSet",
         "java/util/EnumSet" => "java/util/AbstractSet",
         "java/util/concurrent/CopyOnWriteArraySet" => "java/util/AbstractSet",
+        // `ConcurrentHashMap.newKeySet()` / `keySet(V)`. The real JDK parent is
+        // the package-private `CollectionView`, which contributes the same one
+        // field (`map`) the stub layout below already declares by name; naming
+        // `AbstractSet` here instead gives the synthetic stub the `Set` dispatch
+        // chain without a second stub class whose only job is to hold `map`.
+        "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
         // Concrete List/Queue hierarchy:
@@ -10323,7 +10329,11 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         | "java/util/TreeSet"
         | "java/util/EnumSet"
         | "java/util/concurrent/CopyOnWriteArraySet"
-        | "java/util/concurrent/ConcurrentSkipListSet" => &[
+        | "java/util/concurrent/ConcurrentSkipListSet"
+        // `newKeySet()`'s product. Without `Set` here the synthetic stub is not
+        // `instanceof Set`, and `AbstractSet.equals`'s "a Set equals only
+        // another Set" guard answers false for a set that is plainly equal.
+        | "java/util/concurrent/ConcurrentHashMap$KeySetView" => &[
             "java/util/Set",
             "java/util/Collection",
             "java/lang/Iterable",
@@ -11144,6 +11154,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/util/EnumMap"
         | "java/util/Hashtable"
         | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
+        // `ConcurrentHashMap$KeySetView` — the JDK's own two fields, named, so
+        // `resolve_field_index_by_class_id` finds the same slots in synthetic
+        // mode that it finds against the real class (`CollectionView.map` and
+        // `KeySetView.value`).
+        "java/util/concurrent/ConcurrentHashMap$KeySetView" => vec![
+            named_field("map", "Ljava/util/concurrent/ConcurrentHashMap;"),
+            named_field("value", "Ljava/lang/Object;"),
+        ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields

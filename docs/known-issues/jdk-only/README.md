@@ -1,7 +1,9 @@
 # JDK-only mode — open wave-2 work list
 
-**Status:** OPEN, reduced 2026-08-04. Filed 2026-07-31 from wave-1
-implementation findings; re-verified against the re-landed tree the same day.
+**Status:** OPEN, reduced 2026-08-04 and again 2026-08-06. Filed 2026-07-31
+from wave-1 implementation findings; re-verified against the re-landed tree the
+same day. **Two of the five tier-1 rows (items 5 and 7) closed 2026-08-06** — see
+the pass note below the table.
 
 > ## Looking for the plan? It is not here.
 >
@@ -220,13 +222,16 @@ L11 item 7:
 | 5 — VM-internal classes mislabelled `CompatibilityStub` | `jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md` |
 | 7 — the `ThreadPoolExecutor.execute` receiver-shape copies | `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md` |
 
-Item 7 needed its blocker measured rather than done: every `Executors.*` factory
-shortcut already drove the real `ThreadPoolExecutor.<init>`, so the
-per-**instance** question the eight receiver-shape probes existed to answer had
-no receivers left. `native_es_execute` is tagged `SyntheticStub` and
-`ThreadPoolExecutor` is on the real-protected-stub allow-list, which answers it
-class-scoped on both dispatch paths; all nine sites and the probe helper are
-deleted, and a gate fails if one grows back.
+Item 7 came down to the per-**instance** question the eight receiver-shape
+probes existed to answer having no receivers left. L10 landed that at
+registration the same day: real-JDK mode registers no `Executors` pool factory,
+so the real `Executors` bytecode builds every executor and a fabricated receiver
+CANNOT be minted — a statement about the code, not about a `false=0` reading.
+`native_es_execute` is then tagged `SyntheticStub` and `ThreadPoolExecutor` is
+on the real-protected-stub allow-list, which answers the question class-scoped
+on both dispatch paths; all nine sites and the probe helper are deleted, and a
+gate fails if one grows back. The native itself is NOT deleted — strict mode
+declines to admit it, and the `--features synthetic-jdk` build still runs it.
 
 Item 5 needed the prerequisite the record named: `is_synthetic_stub` was
 answering two different questions, so `Class::dispatch_lacks_class_file` now
@@ -324,11 +329,11 @@ the whole tree. Do not size anything here from a `rg` count.
      2026-08-04. It did not reproduce under the exact merge that was supposed to
      trigger it, and the merge is landed.
    * ~~**Real `ThreadPoolExecutor` field initialisation**~~ — retired
-     2026-08-06. It was already done: every `Executors.*` factory shortcut
-     drives the real `<init>` via `initialize_real_thread_pool_executor`, and
-     `probes/ExecProbe.java` shows all six factory shapes running asynchronously
-     on a worker thread in both modes, matching HotSpot. `native_es_execute` is
-     reclassified and item 7 is closed.
+     2026-08-06 by L10, at REGISTRATION: real-JDK mode registers no
+     `java/util/concurrent/Executors` pool factory at all, so the real
+     `Executors` bytecode constructs every executor and CratonVM has no code
+     path that can mint a half-built one. Item 7 spent that the same day —
+     `native_es_execute` is reclassified and all nine sites are gone.
 4. **Item 11 §4/§8/§9/§11** — delete the hard-coded lists, each with its own
    regression corpus. Items 3, 7 and 8 are done (2026-08-04 / 2026-08-06).
 5. **Item 4** — migrate the remaining `ensure_synthetic_class` callers. Drive

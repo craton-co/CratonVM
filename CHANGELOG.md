@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-08-06 `Executors.new*` returns real JDK executors in real-JDK mode
+
+`java.util.concurrent.Executors`' pool factories are no longer intercepted when
+CratonVM runs against a real JDK image: the real `Executors` bytecode constructs
+every executor, so a factory-made pool is built by the genuine
+`ThreadPoolExecutor.<init>` rather than by a native that allocated the object and
+then tried to reproduce the constructor.
+
+**User-visible fix.** `Executors.newSingleThreadExecutor()` returned a bare
+`ThreadPoolExecutor` where the JDK returns
+`Executors$AutoShutdownDelegatedExecutorService` wrapping one. Every
+`instanceof ThreadPoolExecutor` on the result flipped, and the pool the JDK
+guarantees is unconfigurable accepted `setCorePoolSize`. It now matches HotSpot.
+
+Also removed: two fallbacks in the old construction path that wrote a
+two-slot placeholder shape onto a real-layout object and returned it as if
+construction had succeeded. Nothing observed them firing, but while they existed
+an executor could be half-built, which is the receiver shape nine dispatch sites
+in the interpreter exist to detect.
+
+`probes/L10ThreadPoolInitProbe` (new) is byte-identical to HotSpot 25 under both
+`--real-jdk` and `--jdk-only`. New diagnostic: `CRATONVM_DBG_TPE_SHAPE=1` reports
+every `ThreadPoolExecutor.execute` receiver-shape decision. The
+`--features synthetic-jdk` build is unaffected — it has no real `Executors`
+bytecode to fall back to and keeps its own factories.
+
+See `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
+
 ### 2026-08-05 CPU benchmark table re-measured in a quiet window; Sieve at parity
 
 All seven CratonBench rows re-taken in one interleaved series on `dev`

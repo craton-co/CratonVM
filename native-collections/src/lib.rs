@@ -138,6 +138,18 @@ const CF_HAS_NAME: u16 = 1 << 9;
 /// entirely for an identity-map receiver — see `map_hash_key_identity`
 /// and `map_keys_equal_identity`.
 const CF_IDENTITY_MAP: u16 = 1 << 10;
+/// Exact class is `java/util/concurrent/ConcurrentHashMap$KeySetView` — the
+/// object `newKeySet()` / `keySet(V)` hands back.
+///
+/// It is neither HashSet-shaped nor ArrayList-shaped: slot 0 is the backing
+/// `ConcurrentHashMap`, whose own slot 0 is a segments array rather than a
+/// bucket table. The interface-level natives (`java/util/Set.size`,
+/// `java/util/Collection.iterator`, …) would read those slots as their own
+/// layout and answer 0 / null, so they consult this bit and reroute — see
+/// `ksv_route`. A memoized bit rather than a `class_name_of_id` call because
+/// those natives are on the hot path for every ordinary HashSet and ArrayList
+/// too (see the `collections-classification-cost` notes above).
+const CF_KEY_SET_VIEW: u16 = 1 << 11;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +300,13 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
                 _ => break,
             }
         }
+    }
+    // `ConcurrentHashMap$KeySetView` decides no family question the
+    // `WellKnownClass` chain walk above answers — it is an exact-class test on
+    // one name — so it gets the same one-name treatment as `IdentityHashMap`
+    // rather than a 17th variant. Paid once per `ClassId`, then cached forever.
+    if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+        flags |= CF_KEY_SET_VIEW;
     }
     ClassFacts(flags)
 }
@@ -4115,6 +4134,9 @@ fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i3
 }
 
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -4138,6 +4160,9 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -4534,6 +4559,9 @@ pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_contains) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -4657,6 +4685,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_to_array) {
+        return r;
+    }
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}",
@@ -4854,6 +4885,9 @@ fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Ve
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -4981,6 +5015,9 @@ fn native_collection_to_array_generator(
 }
 
 pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
     let input = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -11910,6 +11947,9 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// `containsAll`/`retainAll`/`removeAll` — which falls back to the
 /// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_hash_code) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -12153,6 +12193,9 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -12176,6 +12219,9 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -12578,6 +12624,9 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -13092,7 +13141,16 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // iterator itself rooted across that nested native call: its `lastRet`
     // update below must use the post-GC address, not a from-space reference.
     let this_pin = ctx.pin_native_root(this);
-    let removed = native_hs_remove(ctx, &[Value::Object(Some(backing)), key]);
+    // A `ConcurrentHashMap.newKeySet()` view is not HashSet-shaped: its slot 0
+    // is the backing ConcurrentHashMap, not a bucket-table HashMap, so
+    // `native_hs_remove` would read the segments array as buckets. Route it to
+    // the view's own remove, which takes the segment monitor.
+    // `CollectionView.retainAll`/`removeAll` reach here through `it.remove()`.
+    let removed = if is_key_set_view(ctx, backing) {
+        native_ksv_remove(ctx, &[Value::Object(Some(backing)), key])
+    } else {
+        native_hs_remove(ctx, &[Value::Object(Some(backing)), key])
+    };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let _ = removed?;
@@ -14627,6 +14685,9 @@ fn native_collections_unmodifiable_list(
 // ===========================================================================
 
 fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -14777,6 +14838,9 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -18971,6 +19035,9 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = ksv_route(ctx, args, native_ksv_stream) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
@@ -34145,6 +34212,14 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // zero elements and the auto-configuration pipeline collapses.
     let cid = ctx.class_id_of_object(coll);
     if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        // `ConcurrentHashMap.newKeySet()` / `keySet(V)`: the elements are the
+        // backing CHM's keys, held in the segmented native layout. None of the
+        // slot heuristics below model that — slot 0 is the map object, not a
+        // bucket array — so `new HashSet<>(view)` / `addAll(view)` /
+        // `containsAll(view)` would silently see nothing.
+        if cls_name == KSV_CLASS {
+            return ksv_collect(ctx, coll);
+        }
         if cls_name == "java/util/EnumSet" {
             if let Value::Object(Some(backing)) = ctx.get_field(coll, 0) {
                 return collect_collection_elements(ctx, backing);
@@ -41815,6 +41890,10 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "keys", "()Ljava/util/Enumeration;", native_chm_keys);
 
+    // The `newKeySet()` / `keySet(V)` product's own surface — see the module
+    // comment above `KSV_CLASS`.
+    register_chm_key_set_view_natives(r);
+
     // Bulk operations — snapshot under per-segment locks
     r.register(
         c,
@@ -43722,33 +43801,959 @@ fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
 }
 
+/// `ConcurrentHashMap.newKeySet()` — a real `KeySetView` over a real
+/// native-backed `ConcurrentHashMap`, mapped value `Boolean.TRUE`.
+///
+/// This used to return a `java/util/HashSet` because a real `KeySetView`'s
+/// Java-side `add()` runs `CHM.putVal`, which walks the `table` field
+/// CratonVM's segmented layout never populates. The answer to that is not to
+/// hand back a different class — a `HashSet` takes no lock, so the JDK's
+/// canonical concurrent set corrupted under concurrent mutation and its
+/// `size()` could go negative — it is to give `KeySetView` its own natives, so
+/// no method of the view is left running `table`-walking bytecode. See the
+/// module comment above `KSV_CLASS`.
 fn native_chm_new_key_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // GC-safety: three allocations in a row, each a potential moving young GC,
-    // with the previous results held in bare Rust locals that nothing roots —
-    // a freshly allocated object no bucket/field yet points at is reclaimed
-    // outright by a collection here. Root each result across the next
-    // allocation.
-    let mut set = alloc_synthetic(ctx, "java/util/HashSet", 1);
-    let mut backing = rooted_across(ctx, &mut [&mut set], |ctx| alloc_backing_map(ctx));
-    let buckets = rooted_across(ctx, &mut [&mut set, &mut backing], |ctx| {
-        alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY)
+    let map = alloc_backing_chm(ctx, None);
+    // `Boolean.valueOf` is arbitrary Java and can complete a moving GC, so the
+    // fresh map — which nothing points at yet — has to stay rooted across it.
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    let view = make_key_set_view(ctx, map, mapped);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `ConcurrentHashMap.newKeySet(int initialCapacity)`. Static, so the capacity
+/// is the first argument — but the dispatch path can shift argument positions
+/// (see `newSetFromMap`), hence the search rather than a fixed index.
+fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cap = args.iter().find_map(|v| match v {
+        Value::Int(n) if *n > 0 => Some(*n),
+        _ => None,
     });
-    publish_map_table(ctx, backing, buckets, MAP_DEFAULT_CAPACITY as i32);
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    Ok(Some(Value::Object(Some(set))))
+    let map = alloc_backing_chm(ctx, cap);
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    let view = make_key_set_view(ctx, map, mapped);
+    Ok(Some(Value::Object(Some(view))))
 }
 
-fn native_chm_new_key_set_cap(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Ignore capacity hint; behave identically to no-arg newKeySet().
-    // KeySetView's Java-side add() calls CHM.putVal which uses the native
-    // CHM's segment fields that we don't populate, so we must back this with
-    // our HashSet synthetic instead of letting a real KeySetView form.
-    native_chm_new_key_set(ctx, _args)
-}
-
+/// `ConcurrentHashMap.keySet(V mappedValue)` — a LIVE, add-able view of this
+/// map's keys, exactly as the JDK's `new KeySetView<>(this, mappedValue)`.
+///
+/// Previously this delegated to `keySet()`, whose product has no `add` (a
+/// `keySet()` view must not be add-able) and is not a `KeySetView`, so the one
+/// thing this overload exists for did not work.
 fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_chm_key_set(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mapped = args.get(1).copied().unwrap_or(Value::Object(None));
+    if matches!(mapped, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap.keySet(null)".to_string()),
+        }
+        .into());
+    }
+    let view = make_key_set_view(ctx, this, mapped);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+// ===========================================================================
+// ConcurrentHashMap$KeySetView — the object `newKeySet()` / `keySet(V)` returns
+// ===========================================================================
+//
+// `newKeySet()` used to hand back a plain `java/util/HashSet`. Two things were
+// wrong with that. It is not the class the JDK promises, so
+// `(ConcurrentHashMap.KeySetView<K,?>) set` threw `ClassCastException` and
+// `getMappedValue()` was a `NoSuchMethodError`. And, far worse, a `HashSet`'s
+// `add`/`remove`/`size` run the `HashMap` natives, which take no lock — so
+// `ConcurrentHashMap.newKeySet()`, the JDK's canonical "give me a concurrent
+// set", was answered with a structure that corrupts under concurrent mutation.
+// Balanced churn (every `add` followed by its own `remove`, correct final size
+// 0 on any interleaving) left the size at 18, at -3, at 131; a real
+// `ConcurrentHashMap.size()` cannot even go negative. `isEmpty()` is
+// `size() == 0`, and `ThreadPerTaskExecutor.tryTerminate()` only advances
+// SHUTDOWN → TERMINATED when its `newKeySet()` of live threads reports empty —
+// so `Executors.newVirtualThreadPerTaskExecutor()` in a try-with-resources hung
+// forever on the closing brace. See the retired
+// `concurrenthashmap-newkeyset-returns-a-plain-hashset` write-up.
+//
+// The view is now a real `ConcurrentHashMap$KeySetView` over a real
+// native-backed `ConcurrentHashMap`, so every mutation inherits the per-segment
+// monitor that already makes `native_chm_put` / `native_chm_remove` safe, and
+// `size()` is the sum of per-segment counts that a writer only ever updates
+// under that segment's lock.
+//
+// The surface below is deliberately COMPLETE rather than "the methods the
+// reproducer needs". In real-JDK mode the methods `CollectionView` declares
+// (`size` / `isEmpty` / `clear` / `toArray` / `toString` / `containsAll` /
+// `removeAll` / `retainAll`) are written in terms of `map` — already native —
+// or of `iterator()`, native below, so their real bytecode is correct and
+// these registrations are simply never consulted for them. In synthetic-jdk
+// mode there is no `CollectionView` bytecode at all and the same registrations
+// are the only implementation. Leaving any of them out would reproduce the
+// partial-surface trap the known-issue doc warns about: a method left to real
+// bytecode walks the `table` field CratonVM's segmented layout never
+// populates, and quietly answers empty.
+
+const KSV_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$KeySetView";
+const CHM_CLASS: &str = "java/util/concurrent/ConcurrentHashMap";
+/// `CollectionView.map`, slot 0 in the JDK's layout. Also the fallback when the
+/// field cannot be resolved by name — synthetic-jdk mode fabricates the class,
+/// so there is no declared field list to resolve against.
+const KSV_FIELD_MAP: usize = 0;
+/// `KeySetView.value` — the value `add(e)` maps `e` to.
+const KSV_FIELD_VALUE: usize = 1;
+const KSV_NUM_FIELDS: usize = 2;
+
+/// Slot index of `name` on `this`, preferring the class's own declared layout
+/// and falling back to the synthetic slot. Resolved by `ClassId` rather than by
+/// class name so a redefined/duplicate-loader `ConcurrentHashMap` still
+/// resolves (see `resolve_field_index_by_class_id`).
+fn ksv_slot(ctx: &dyn NativeContext, this: ObjectRef, name: &str, fallback: usize) -> usize {
+    let n = ctx.object_num_fields(this);
+    let cid = ctx.class_id_of_object(this);
+    match ctx.resolve_field_index_by_class_id(cid, name) {
+        Some(i) if i < n => i,
+        _ => fallback,
+    }
+}
+
+/// The backing `ConcurrentHashMap` of a `KeySetView`.
+fn ksv_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let slot = ksv_slot(ctx, this, "map", KSV_FIELD_MAP);
+    if slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// `this`'s mapped value — what `add(e)` stores against `e`. `Object(None)` for
+/// a view that has none, which is exactly the JDK's `add` → `UnsupportedOperation`
+/// condition. Deliberately allocation-free: callers read it next to a
+/// `ksv_map` read and must not have a GC in between.
+fn ksv_mapped_value(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    let slot = ksv_slot(ctx, this, "value", KSV_FIELD_VALUE);
+    if slot >= ctx.object_num_fields(this) {
+        return Value::Object(None);
+    }
+    ctx.get_field(this, slot)
+}
+
+/// True when `obj`'s runtime class is `ConcurrentHashMap$KeySetView`.
+#[inline]
+fn is_key_set_view(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    receiver_facts(ctx, obj).has(CF_KEY_SET_VIEW)
+}
+
+/// Reroute a `KeySetView` receiver that arrived through a generic
+/// `HashSet`/`ArrayList`-shaped native to the view's own implementation.
+///
+/// Needed because the *interface* registrations — `java/util/Set.size`,
+/// `java/util/Collection.iterator`, `java/util/AbstractSet.hashCode`, … — are
+/// what a call site resolves to when the receiver's class declares no such
+/// method, which in synthetic-jdk mode is every method of the fabricated
+/// `KeySetView` class. Those natives win over the exact-class registrations,
+/// and a `KeySetView` matches neither layout they read, so `size()` answered 0
+/// and `iterator()` answered null (a `for (x : set)` NPE) while `add` /
+/// `contains` / `remove` — which have no interface-level registration and so
+/// fall through to the exact-class natives — worked. Guarding at the generic
+/// entry points is what keeps that split from existing at all.
+#[inline]
+fn ksv_route(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    imp: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+) -> Option<MethodCallResult> {
+    match args.first() {
+        Some(Value::Object(Some(o))) if is_key_set_view(ctx, *o) => Some(imp(ctx, args)),
+        _ => None,
+    }
+}
+
+/// `Boolean.TRUE` — `newKeySet()`'s mapped value in the JDK. Falls back to the
+/// unboxed truth so a fabricated view still has a non-null mapped value (the
+/// CHM natives reject a null value per JDK spec, so `add` would otherwise NPE).
+fn ksv_boxed_true(ctx: &mut dyn NativeContext) -> Value {
+    match ctx.invoke(
+        "java/lang/Boolean",
+        "valueOf",
+        "(Z)Ljava/lang/Boolean;",
+        &[Value::Int(1)],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Int(1),
+    }
+}
+
+/// Allocate a `KeySetView` instance with no constructor run.
+///
+/// In real-JDK mode allocate with the class's OWN field count rather than the
+/// hard-coded two: `set_field` past the end of an under-sized object is dropped
+/// silently, so a JDK that ever adds a field would leave `map` unset and every
+/// method below answering empty.
+fn alloc_key_set_view_object(ctx: &mut dyn NativeContext) -> ObjectRef {
+    // `ensure_class_initialized` can report success having FABRICATED a
+    // stand-in, so check the resolved name rather than trusting `Ok`.
+    let mut real_cid = None;
+    if let Ok(cid) = ctx.ensure_class_initialized(KSV_CLASS) {
+        if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+            real_cid = Some(cid);
+        }
+    }
+    match real_cid {
+        Some(cid) => {
+            let n = ctx.class_num_total_fields(cid).max(KSV_NUM_FIELDS);
+            ctx.alloc_object(cid, n)
+        }
+        None => alloc_synthetic(ctx, KSV_CLASS, KSV_NUM_FIELDS),
+    }
+}
+
+/// Allocate a fresh, fully segmented native `ConcurrentHashMap` with no
+/// constructor run — the backing store for a `newKeySet()` view.
+///
+/// `initial_capacity` mirrors `newKeySet(int)`; `None` reproduces the no-arg
+/// `ConcurrentHashMap()` shape so iteration order matches a default map.
+fn alloc_backing_chm(ctx: &mut dyn NativeContext, initial_capacity: Option<i32>) -> ObjectRef {
+    let mut real_cid = None;
+    if let Ok(cid) = ctx.ensure_class_initialized(CHM_CLASS) {
+        if ctx.class_name_of_id(cid).as_deref() == Some(CHM_CLASS) {
+            real_cid = Some(cid);
+        }
+    }
+    let chm = match real_cid {
+        Some(cid) => {
+            let n = ctx.class_num_total_fields(cid).max(_CHM_NUM_FIELDS);
+            ctx.alloc_object(cid, n)
+        }
+        None => alloc_synthetic(ctx, CHM_CLASS, _CHM_NUM_FIELDS),
+    };
+    // Segment construction is 2N+1 allocations deep; keep the fresh map rooted
+    // across it, since nothing points at it yet.
+    let chm_pin = ctx.pin_native_root(chm);
+    match initial_capacity {
+        Some(cap) => {
+            let _ = native_chm_init_capacity(ctx, &[Value::Object(Some(chm)), Value::Int(cap)]);
+        }
+        None => chm_init_segments(
+            ctx,
+            chm,
+            CHM_DEFAULT_INIT_SEGMENTS,
+            CHM_DEFAULT_SEGMENT_CAP,
+        ),
+    }
+    let chm = ctx.read_native_pin(chm_pin, chm);
+    ctx.unpin_native_roots(chm_pin);
+    chm
+}
+
+/// Build a `KeySetView` over `map` with mapped value `mapped`.
+fn make_key_set_view(ctx: &mut dyn NativeContext, map: ObjectRef, mapped: Value) -> ObjectRef {
+    // The view allocation can move both operands; `map_pin` is the unpin base.
+    let map_pin = ctx.pin_native_root(map);
+    let mapped_pin = pin_value(ctx, mapped);
+    let view = alloc_key_set_view_object(ctx);
+    let view_pin = ctx.pin_native_root(view);
+    let map = ctx.read_native_pin(map_pin, map);
+    let mapped = read_pinned_elem(ctx, mapped_pin, mapped);
+    let view = ctx.read_native_pin(view_pin, view);
+    let map_slot = ksv_slot(ctx, view, "map", KSV_FIELD_MAP);
+    let value_slot = ksv_slot(ctx, view, "value", KSV_FIELD_VALUE);
+    ctx.set_field(view, map_slot, Value::Object(Some(map)));
+    ctx.set_field(view, value_slot, mapped);
+    ctx.unpin_native_roots(map_pin);
+    view
+}
+
+/// The view's current elements. Weakly consistent, exactly like the JDK's own
+/// `KeySetView` iterator: a concurrent writer's effect may or may not be seen.
+fn ksv_collect(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    match ksv_map(ctx, this) {
+        Some(m) => chm_collect_all_keys(ctx, m),
+        None => Vec::new(),
+    }
+}
+
+/// `ksv_collect` into a fresh `Object[]`, GC-safely.
+///
+/// The array allocation can move every ref the first collection returned, so
+/// count first, allocate, then RE-collect from the live map and store with
+/// nothing allocating in between — the `native_hs_iterator` / `native_hs_to_array`
+/// idiom. Returns the array and its live element count; a concurrent removal
+/// between the two passes trims the array rather than leaving null holes, which
+/// is what `CollectionView.toArray`'s own `Arrays.copyOf(r, i)` does.
+fn ksv_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, usize) {
+    let this_pin = ctx.pin_native_root(this);
+    let len = ksv_collect(ctx, this).len();
+    let this = ctx.read_native_pin(this_pin, this);
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elems = ksv_collect(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let n = len.min(elems.len());
+    for (i, e) in elems.iter().enumerate().take(n) {
+        ctx.set_array_element(arr, i, *e);
+    }
+    ctx.unpin_native_roots(this_pin);
+    if n == len {
+        return (arr, n);
+    }
+    let arr_pin = ctx.pin_native_root(arr);
+    let trimmed = alloc_ref_array(ctx, n);
+    let trimmed_pin = ctx.pin_native_root(trimmed);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let trimmed = ctx.read_native_pin(trimmed_pin, trimmed);
+    for i in 0..n {
+        let v = ctx.get_array_element(arr, i);
+        ctx.set_array_element(trimmed, i, v);
+    }
+    ctx.unpin_native_roots(arr_pin);
+    (trimmed, n)
+}
+
+fn native_ksv_get_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(match ksv_map(ctx, this) {
+        Some(m) => Value::Object(Some(m)),
+        None => Value::Object(None),
+    }))
+}
+
+fn native_ksv_get_mapped_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ksv_mapped_value(ctx, this)))
+}
+
+fn native_ksv_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match ksv_map(ctx, this) {
+        Some(m) => native_chm_size(ctx, &[Value::Object(Some(m))]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_ksv_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = match native_ksv_size(ctx, args)? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
+}
+
+fn native_ksv_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    match ksv_map(ctx, this) {
+        Some(m) => native_chm_clear(ctx, &[Value::Object(Some(m))]),
+        None => Ok(None),
+    }
+}
+
+fn native_ksv_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    match ksv_map(ctx, this) {
+        // `containsKey` carries the JDK's null-key NPE, which is also
+        // `KeySetView.contains(null)`'s contract.
+        Some(m) => native_chm_contains_key(ctx, &[Value::Object(Some(m)), elem]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_ksv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // JDK: `if ((v = value) == null) throw new UnsupportedOperationException();`
+    // — a view from `keySet()` (no mapped value) cannot be added to.
+    let mapped = match ksv_mapped_value(ctx, this) {
+        Value::Object(None) => return Err(unsupported_op()),
+        v => v,
+    };
+    let map = match ksv_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // `putIfAbsent` takes the target segment's monitor, so concurrent adds are
+    // safe and the per-segment count stays exact. Its null-key guard is
+    // `add(null)`'s NPE.
+    let prior = native_chm_put_if_absent(ctx, &[Value::Object(Some(map)), elem, mapped])?;
+    Ok(Some(Value::Int(i32::from(matches!(
+        prior,
+        None | Some(Value::Object(None))
+    )))))
+}
+
+fn native_ksv_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let map = match ksv_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // JDK: `return map.remove(o) != null;` — a CHM never holds a null value, so
+    // the returned value doubles as the membership answer.
+    let prior = native_chm_remove(ctx, &[Value::Object(Some(map)), elem])?;
+    Ok(Some(Value::Int(i32::from(matches!(
+        prior,
+        Some(Value::Object(Some(_)))
+    )))))
+}
+
+fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let (arr, total) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
+    // Wire the view itself as the removal target: `CollectionView.retainAll`
+    // and `removeAll` are written in terms of `it.remove()`, so an iterator
+    // without a backing silently makes both no-ops.
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_ksv_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (arr, _) = ksv_snapshot_array(ctx, this);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `toArray(T[])` — fill the caller's array when it is large enough (writing
+/// the spec's null terminator), otherwise allocate a fresh array of the
+/// template's runtime component type so `Set<String>.toArray(new String[0])`
+/// stays a `String[]`.
+fn native_ksv_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match args.get(1).copied() {
+        Some(Value::Object(Some(t))) => Some(t),
+        _ => None,
+    };
+    let target_pin = match target {
+        Some(t) => ctx.pin_native_root(t),
+        None => usize::MAX,
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let (src, n) = ksv_snapshot_array(ctx, this);
+    let src_pin = ctx.pin_native_root(src);
+    let target = target.map(|t| ctx.read_native_pin(target_pin, t));
+    if let Some(t) = target {
+        if ctx.array_length(t) >= n {
+            let len = ctx.array_length(t);
+            let src = ctx.read_native_pin(src_pin, src);
+            for i in 0..n {
+                let v = ctx.get_array_element(src, i);
+                ctx.set_array_element(t, i, v);
+            }
+            if len > n {
+                ctx.set_array_element(t, n, Value::Object(None));
+            }
+            ctx.unpin_native_roots(if target_pin == usize::MAX {
+                this_pin
+            } else {
+                target_pin
+            });
+            return Ok(Some(Value::Object(Some(t))));
+        }
+    }
+    let out = match target {
+        Some(t) => {
+            let comp = ctx.class_id_of_object(t);
+            ctx.new_ref_array(comp, n)
+        }
+        None => alloc_ref_array(ctx, n),
+    };
+    let out_pin = ctx.pin_native_root(out);
+    let src = ctx.read_native_pin(src_pin, src);
+    let out = ctx.read_native_pin(out_pin, out);
+    for i in 0..n {
+        let v = ctx.get_array_element(src, i);
+        ctx.set_array_element(out, i, v);
+    }
+    ctx.unpin_native_roots(if target_pin == usize::MAX {
+        this_pin
+    } else {
+        target_pin
+    });
+    Ok(Some(Value::Object(Some(out))))
+}
+
+fn native_ksv_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = ksv_collect(ctx, this);
+    // `obj_to_display_string` dispatches `toString()`, which allocates — pin
+    // every element and re-read it at the point of use.
+    let (elems_pin, handles) = pin_value_slice(ctx, &elems);
+    let mut parts = Vec::with_capacity(elems.len());
+    for i in 0..elems.len() {
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        parts.push(obj_to_display_string(ctx, &e));
+    }
+    if elems_pin != usize::MAX {
+        ctx.unpin_native_roots(elems_pin);
+    }
+    let text = format!("[{}]", parts.join(", "));
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_ksv_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = ksv_collect(ctx, this);
+    let (elems_pin, handles) = pin_value_slice(ctx, &elems);
+    let mut h: i32 = 0;
+    for i in 0..elems.len() {
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        // `Set.hashCode` contract: the sum of the elements' hash codes.
+        h = h.wrapping_add(element_hash_code(ctx, &e));
+    }
+    if elems_pin != usize::MAX {
+        ctx.unpin_native_roots(elems_pin);
+    }
+    Ok(Some(Value::Int(h)))
+}
+
+fn native_ksv_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    // `AbstractSet.equals`: a Set equals only another Set. The guard must
+    // precede the `size()` dispatch, or `set.equals("text")` raises
+    // NoSuchMethodError instead of answering false.
+    if !obj_is_instance_of(ctx, other, "java/util/Set") {
+        return Ok(Some(Value::Int(0)));
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| -> MethodCallResult {
+        let other = ctx.read_native_pin(other_pin, other);
+        let other_size = match ctx.invoke_virtual(other, "size", "()I", &[])? {
+            Some(Value::Int(n)) => n,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let elems = ksv_collect(ctx, this);
+        if elems.len() as i32 != other_size {
+            return Ok(Some(Value::Int(0)));
+        }
+        let (_, handles) = pin_value_slice(ctx, &elems);
+        for i in 0..elems.len() {
+            let other = ctx.read_native_pin(other_pin, other);
+            let e = read_pinned_elem(ctx, handles[i], elems[i]);
+            let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[e])?;
+            if !matches!(contains, Some(Value::Int(1))) {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn native_ksv_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let elems = ksv_collect(ctx, this);
+    // `accept` is arbitrary Java: it allocates, so `action` and every element
+    // must be pinned and re-read per dispatch.
+    let action_pin = ctx.pin_native_root(action);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut result = Ok(None);
+    for i in 0..elems.len() {
+        let a = ctx.read_native_pin(action_pin, action);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        if let Err(err) = ctx.invoke_virtual(a, "accept", "(Ljava/lang/Object;)V", &[e]) {
+            result = Err(err);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(action_pin);
+    result
+}
+
+fn native_ksv_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (arr, _) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+fn native_ksv_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (arr, n) = ksv_snapshot_array(ctx, this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(spl))))
+}
+
+fn native_ksv_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut answer = 1;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_contains(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(r) => {
+                if !matches!(r, Some(Value::Int(1))) {
+                    answer = 0;
+                    break;
+                }
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(answer))),
+    }
+}
+
+fn native_ksv_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_add(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, coll);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let coll = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let keep = collect_collection_elements_or_real(ctx, coll);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let current = ksv_collect(ctx, this_now);
+    let (_, keep_handles) = pin_value_slice(ctx, &keep);
+    let (_, cur_handles) = pin_value_slice(ctx, &current);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..current.len() {
+        let mut e = read_pinned_elem(ctx, cur_handles[i], current[i]);
+        let mut should_keep = false;
+        for j in 0..keep.len() {
+            let k = read_pinned_elem(ctx, keep_handles[j], keep[j]);
+            let matched = list_element_matches(ctx, &k, &e);
+            e = read_pinned_elem(ctx, cur_handles[i], e);
+            if matched {
+                should_keep = true;
+                break;
+            }
+        }
+        if should_keep {
+            continue;
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+fn native_ksv_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let elems = ksv_collect(ctx, this_now);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    let mut failure = None;
+    for i in 0..elems.len() {
+        let p = ctx.read_native_pin(pred_pin, pred);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        let verdict = match ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e]) {
+            Ok(v) => matches!(v, Some(Value::Int(1))),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        if !verdict {
+            continue;
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        match native_ksv_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(Some(Value::Int(i32::from(modified)))),
+    }
+}
+
+/// Public builder for a live, add-able, concurrency-safe `Set` view over an
+/// existing native-backed `ConcurrentHashMap`, mapped value `Boolean.TRUE`.
+///
+/// `Collections.newSetFromMap(new ConcurrentHashMap<>())` — the other canonical
+/// spelling of "give me a concurrent set" — used to answer with a plain
+/// `HashSet` for exactly the same reason `newKeySet()` did, and with exactly
+/// the same consequence: `add`/`remove`/`size` on the result ran the unlocked
+/// `HashMap` natives. A `newSetFromMap` over an empty map is definitionally the
+/// same object as `map.keySet(Boolean.TRUE)`, so it is built here rather than
+/// duplicated. See `native-builtins`' `newSetFromMap` registration.
+pub fn make_concurrent_key_set_view(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+    let (map, mapped) = rooted_across1(ctx, map, ksv_boxed_true);
+    make_key_set_view(ctx, map, mapped)
+}
+
+fn register_chm_key_set_view_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = KSV_CLASS;
+    r.register(c, "size", "()I", native_ksv_size);
+    r.register(c, "isEmpty", "()Z", native_ksv_is_empty);
+    r.register(c, "clear", "()V", native_ksv_clear);
+    r.register(c, "contains", "(Ljava/lang/Object;)Z", native_ksv_contains);
+    r.register(c, "add", "(Ljava/lang/Object;)Z", native_ksv_add);
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_ksv_remove);
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_ksv_iterator);
+    r.register(c, "toArray", "()[Ljava/lang/Object;", native_ksv_to_array);
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_ksv_to_array_typed,
+    );
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        native_collection_to_array_generator,
+    );
+    r.register(c, "toString", "()Ljava/lang/String;", native_ksv_to_string);
+    r.register(c, "hashCode", "()I", native_ksv_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_ksv_equals);
+    r.register(
+        c,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_ksv_for_each,
+    );
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_ksv_stream);
+    r.register(
+        c,
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        native_ksv_spliterator,
+    );
+    r.register(
+        c,
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_contains_all,
+    );
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ksv_add_all);
+    r.register(
+        c,
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_remove_all,
+    );
+    r.register(
+        c,
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        native_ksv_retain_all,
+    );
+    r.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_ksv_remove_if,
+    );
+    r.register(
+        c,
+        "getMappedValue",
+        "()Ljava/lang/Object;",
+        native_ksv_get_mapped_value,
+    );
+    r.register(
+        c,
+        "getMap",
+        "()Ljava/util/concurrent/ConcurrentHashMap;",
+        native_ksv_get_map,
+    );
+    r.set_category(__prev_cat);
 }
 
 fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
