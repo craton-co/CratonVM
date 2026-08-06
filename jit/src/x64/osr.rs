@@ -345,7 +345,21 @@ pub(super) fn publish_entry_metadata(
         // is masked if (and only if) its register is genuinely shared.
         let kinds = classify_local_kinds(code, code_len, num_locals);
         let high_halves = wide_local_high_halves(code, code_len);
-        for hh in pure_high_halves(&kinds, &high_halves) {
+        // Defect switch, default OFF. `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES=1`
+        // restores the pre-`14a2740859` strip — every slot the whole-method scan
+        // calls a high half, including the ones that are a live cat-1 local in a
+        // disjoint range. That is the `Arrays.sort(long[])` miscompile, and it
+        // exists so `[osr-seed-stripped]` can be shown going RED on a known
+        // defect before any run of it is read as a clean bill of health.
+        let strip: Vec<usize> =
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES")
+                .is_some()
+            {
+                (0..num_locals).filter(|&i| high_halves.contains(&i)).collect()
+            } else {
+                pure_high_halves(&kinds, &high_halves)
+            };
+        for hh in strip {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
             }
