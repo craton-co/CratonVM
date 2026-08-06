@@ -518,6 +518,85 @@ fn strict_census() -> (usize, usize, Vec<(String, String, String)>) {
     (synthetic, total, refused)
 }
 
+/// Every registration the strict boot makes, as `census_rows` does for the
+/// compatible one.
+fn strict_rows() -> Vec<(String, String, String, NativeKind)> {
+    let mut registry = NativeMethodRegistry::new();
+    registry.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_boot_path(&mut registry);
+    registry
+        .dump_registrations()
+        .into_iter()
+        .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
+        .collect()
+}
+
+/// **A fake must not outlive `--jdk-only` because a SECOND file called it a
+/// bridge.** Contract §11's "zero synthetic-stub invocations through any path",
+/// asserted per triple instead of per row count.
+///
+/// `strict_registry_drops_only_the_stubs` bounds row *counts*, and its own
+/// comment names the reason that cannot express this: "a triple can be
+/// registered with two different kinds". When it is, the drop happening **at
+/// registration** decides the outcome — strict mode refuses the `SyntheticStub`
+/// row at the door, so the `Bridge` row registered by the other file survives to
+/// own the slot, and the method the mode exists to remove goes on being served
+/// by the fake. Compatible mode, where nothing is refused, keeps the stub
+/// instead: **the two modes run different implementations of the same method**,
+/// and which is which is a property of the order two files happen to run in.
+///
+/// Measured on JDK 25 / linux, 2026-08-06, by diffing a `--jdk-only` census
+/// against a `--real-jdk` one: 58 triples, in two families —
+/// `StampedLock`/`ServiceLoader`/`URLCodec` (the registrar had no category at
+/// all, so its callers disagreed) and `Function$Identity.apply` /
+/// `UnaryOperator.identity` / `CountDownLatch` / `CyclicBarrier` /
+/// `InputStream.transferTo` (a second file under a `Bridge` scope). The first
+/// two of those are the successor defect the retired
+/// `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up names: a
+/// surviving `Bridge` whose receiver class contract §5 forbids fabricating.
+///
+/// `Intrinsic` is not flagged. A triple that is a stub in compatible mode and an
+/// intrinsic in strict is a *different implementation*, not a surviving fake —
+/// `java.util.Set.of` is the whole of that set today — and an intrinsic
+/// shadowing concrete bytecode is what an intrinsic is.
+#[test]
+fn no_fake_survives_strict_mode_as_someone_elses_bridge() {
+    let mut compat: std::collections::BTreeMap<(String, String, String), NativeKind> =
+        std::collections::BTreeMap::new();
+    for (c, m, d, k) in census_rows() {
+        // Last write wins, exactly as the registry's slot does.
+        compat.insert((c, m, d), k);
+    }
+
+    let mut survivors: Vec<String> = Vec::new();
+    for (c, m, d, k) in strict_rows() {
+        if k != NativeKind::Bridge {
+            continue;
+        }
+        if compat.get(&(c.clone(), m.clone(), d.clone())) == Some(&NativeKind::SyntheticStub) {
+            survivors.push(format!("{c}.{m}{d}"));
+        }
+    }
+    survivors.sort();
+    survivors.dedup();
+
+    println!(
+        "stub-ratchet(strict): {} triple(s) are a SyntheticStub in compatible mode \
+         and a Bridge in strict",
+        survivors.len()
+    );
+    assert!(
+        survivors.is_empty(),
+        "{} triple(s) are tagged `SyntheticStub` where compatible mode dispatches \
+         them and `Bridge` where strict mode does, so `--jdk-only` runs the fake \
+         the mode exists to remove — and it does so only because the stub \
+         registration is refused at the door, leaving the other file's `Bridge` \
+         row to own the slot. Decide the kind ONCE, at both sites:\n  {}",
+        survivors.len(),
+        survivors.join("\n  ")
+    );
+}
+
 /// Acceptance criterion (contract §11): **the final native registry in strict
 /// mode contains zero `SyntheticStub` entries.**
 ///
