@@ -229,7 +229,56 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
      makes the phase proportional to the young set instead of to the heap, and
      it mirrors what the card table already does for ordinary object fields.
 
-**Neither defect is fixed.** The moving-Cheney phase breakdown is new
+### Fix 1 landed (default OFF): pause-goal feedback on the young trigger
+
+`CRATONVM_GC_YOUNG_PAUSE_MS=N` feedback-sizes the young collection trigger
+against a pause goal — halve on overshoot, give back additively when
+comfortably inside, floored at capacity/16. Default `0` = off, because the right
+default is a policy question one workload does not settle and this collector has
+a documented history of young-sizing changes that helped one workload and cost
+another (`with_capacity`'s note: capping the initial semi was a **net
+regression** for large-`-Xmx` workloads, which fall back to the non-moving sweep
+and just fire it more often). Reacting to a measured pause cannot repeat that:
+a workload already inside its goal is never touched.
+
+Measured, 6 lanes × 2 rounds, arms interleaved OFF → ON → OFF:
+
+| arm | runs | failed |
+|---|---:|---:|
+| goal off | 12 | **12** |
+| **goal on, 250 ms** | 12 | **4** |
+| goal off (repeat) | 12 | **12** |
+
+Worst pause **1016 ms → 550 ms**. The trigger adapts as designed:
+`262144KB → 131072KB → 65536KB → 32768KB`.
+
+**It is an improvement, not a cure — 4/12 still fail, and the reason is worth
+more than the fix.** Shrinking young cut the drain exactly as intended but did
+not cut the pause proportionally, because three phases do *not* scale with young
+occupancy and now dominate:
+
+| phase | goal off | goal on |
+|---|---:|---:|
+| `cheney_drain` | 266–341 ms | **33–76 ms** |
+| `objects_copied` | 857k–994k | **116k–236k** |
+| `scan_dirty_cards` | 12–13 ms | 32–37 ms |
+| `full_old_rset_scan` | **0 ms** | **39–48 ms** |
+| `overlay_forward` | 57–66 ms | 36–46 ms |
+
+So the drain is down 5–8x and the fixed-cost phases — now ~105–130 ms per cycle,
+paid on *many more* cycles — are what is left. Two new leads, neither
+investigated:
+
+* **`full_old_rset_scan` switched from never firing to firing every cycle**
+  (0 → 39–48 ms). It is a full O(old-gen) scan for old→young references, used
+  as a fallback when card marking cannot be trusted. Something about the
+  smaller/more frequent cycles turns it on; that is the single biggest
+  remaining item and it may be pure waste.
+* `overlay_forward` barely moves (57→40 ms) because it is proportional to the
+  whole heap's overlay population, not to young — the 1+N global-mutex defect
+  below. Its *share* of the pause is now much larger.
+
+**Neither of the two defects below is fixed.** The moving-Cheney phase breakdown is new
 (`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection on this
 arm printed a bare total, because `gcphase` instruments only the non-moving
 sweep this workload never takes. `cheney_drain` is the one that decides whether
