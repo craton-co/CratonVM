@@ -121,7 +121,19 @@ delegates every call to the map it was handed, and that map's CratonVM natives
 still answer, so it works. A real `HashMap$KeyIterator` reads the real
 `table[]`, which CratonVM's `HashMap.put` native never fills, so retagging
 `HashSet.iterator()` would return a silently EMPTY iteration instead of a loud
-error. That family stays a refusal until the collections reclassification wave.
+error.
+
+> **Updated 2026-08-05.** That reasoning about *retagging* still holds, and
+> `HashSet.iterator()` still must not be retagged. The conclusion drawn from it
+> did not hold: the family did not have to stay a refusal. A third option
+> existed — keep the native, and when the policy refuses the fabricated
+> iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
+> own iterator, which reads only the `Object[]` it was given. All six sections
+> are fixed; see
+> `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`. The rule is
+> narrower than "delegates vs reads its own fields": what matters is whether
+> SOME real class exists whose fields we can legitimately fill, not whether the
+> obvious one can.
 
 ## What is wrong (unchanged in shape)
 
