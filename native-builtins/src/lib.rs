@@ -37802,7 +37802,20 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Object(None))),
     };
     if cursor >= native_arraylist_size(ctx, list) {
-        return Ok(Some(Value::Object(None)));
+        // The JDK contract, and what the sibling `ArrayList$Itr.next()` native
+        // in native-collections already does. A `null` here is not a harmless
+        // "nothing left": `AbstractSequentialList.get(index)` is
+        // `listIterator(index).next()` wrapped in
+        // `catch (NoSuchElementException) -> IndexOutOfBoundsException`, so
+        // swallowing it made `get(size())` answer `null` on EVERY list that
+        // inherits `get` -- directly and through a
+        // `Collections.unmodifiableList` view. See the identical reasoning on
+        // the `Collections$EmptyIterator` natives in this file.
+        return Err(MethodCallFailed::from(
+            RuntimeError::NoSuchElementException {
+                message: "ArrayList$ListItr.next".to_string(),
+            },
+        ));
     }
     let value = cratonvm_native_collections::native_al_get(
         ctx,
@@ -37832,7 +37845,12 @@ fn native_snapshot_list_itr_previous(
     let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
     let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
     if cursor <= 0 {
-        return Ok(Some(Value::Object(None)));
+        // Same contract as `next()` above, at the other end.
+        return Err(MethodCallFailed::from(
+            RuntimeError::NoSuchElementException {
+                message: "ArrayList$ListItr.previous".to_string(),
+            },
+        ));
     }
     let list = match native_arraylist_list_itr_list(ctx, this) {
         Some(list) => list,
@@ -38732,7 +38750,32 @@ fn reflect_array_element_assignable(
         }
     }
     let value_class = ctx.class_id_of_object(value);
-    value_class == component || ctx.is_subclass(value_class, component)
+    if value_class == component || ctx.is_subclass(value_class, component) {
+        return true;
+    }
+    // DIAG (`CRATONVM_DBG=coerce`): the refusal carries no detail of its own --
+    // HotSpot's wording is the bare "array element type mismatch" and source
+    // witnesses pin it -- so name both sides here instead. The recurring cause
+    // is NOT a real type error but one class NAME resolved to two `ClassId`s
+    // under two loaders; the same lever already exists for the sibling
+    // "argument type mismatch" in `lang_class.rs`. See
+    // `field-set-argument-type-mismatch-is-a-loader-split-use-dbg-coerce`.
+    if crate::nbflags().dbg_coerce {
+        let comp_name = ctx
+            .class_name_of_id(component)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let value_name = ctx
+            .class_name_of_id(value_class)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let arr_name = ctx
+            .class_name_of_id(arr_class)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        eprintln!(
+            "[DBG_COERCE] Array.set: rejecting -- array={arr_name} component={comp_name} \
+(cid={component:?}) value_class={value_name} (cid={value_class:?})"
+        );
+    }
+    false
 }
 
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

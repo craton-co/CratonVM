@@ -1159,14 +1159,28 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let idx = match args.get(1) {
-                Some(Value::Int(i)) => *i as usize,
+            let raw_idx = match args.get(1) {
+                Some(Value::Int(i)) => *i,
                 _ => return Ok(Some(Value::Object(None))),
             };
             let (data, size) = cowal_read_state(ctx, this);
-            if idx >= size {
-                return Ok(Some(Value::Object(None)));
+            // HotSpot 25 measured (`repro/ListItrEndRepro.java`): every
+            // out-of-range absolute accessor on this class throws
+            // `ArrayIndexOutOfBoundsException` -- it indexes its `array`
+            // directly. Returning `null` instead let `get(size())` and
+            // `get(-1)` read as "the element there is null"; the `as usize`
+            // this replaces also wrapped a negative index to a huge value, so
+            // both took the same silent path.
+            if raw_idx < 0 || raw_idx as usize >= size {
+                return Err(
+                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                        index: raw_idx,
+                        message: Some(format!("Index {raw_idx} out of bounds for length {size}")),
+                    }
+                    .into(),
+                );
             }
+            let idx = raw_idx as usize;
             Ok(Some(
                 data.map(|a| ctx.get_array_element(a, idx))
                     .unwrap_or(Value::Object(None)),
@@ -1301,17 +1315,28 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
-                let idx = match args.get(1) {
-                    Some(Value::Int(i)) => *i as usize,
+                let raw_idx = match args.get(1) {
+                    Some(Value::Int(i)) => *i,
                     _ => return Ok(Some(Value::Object(None))),
                 };
                 let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
                 ctx.monitor_enter(this);
                 let (old_arr, size) = cowal_read_state(ctx, this);
-                if idx >= size {
+                // See the `get` registration above for why this throws rather
+                // than answering `null`.
+                if raw_idx < 0 || raw_idx as usize >= size {
                     ctx.monitor_exit(this);
-                    return Ok(Some(Value::Object(None)));
+                    return Err(
+                        cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: raw_idx,
+                            message: Some(format!(
+                                "Index {raw_idx} out of bounds for length {size}"
+                            )),
+                        }
+                        .into(),
+                    );
                 }
+                let idx = raw_idx as usize;
                 let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
                 let mut old_val = Value::Object(None);
                 if let Some(old) = old_arr {
@@ -1387,13 +1412,27 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            let idx = match args.get(1) {
-                Some(Value::Int(i)) => *i as usize,
+            let raw_idx = match args.get(1) {
+                Some(Value::Int(i)) => *i,
                 _ => return Ok(None),
             };
             let elem = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
             let (old_arr, size) = cowal_read_state(ctx, this);
+            // `add(int, E)` uses `rangeCheckForAdd`, so `index == size` is
+            // legal and the exception is the PLAIN `IndexOutOfBoundsException`
+            // (measured on HotSpot 25), unlike the absolute accessors above.
+            // This clamped with `idx.min(size)` instead and silently APPENDED:
+            // `cowal.add(9, "z")` on a 2-element list returned normally and
+            // left `[a, b, z]`.
+            if raw_idx < 0 || raw_idx as usize > size {
+                ctx.monitor_exit(this);
+                return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index: {raw_idx}, Size: {size}"
+                ))
+                .into());
+            }
+            let idx = raw_idx as usize;
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
             if let Some(old) = old_arr {
                 for i in 0..idx.min(size) {
@@ -1415,16 +1454,24 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let idx = match args.get(1) {
-                Some(Value::Int(i)) => *i as usize,
+            let raw_idx = match args.get(1) {
+                Some(Value::Int(i)) => *i,
                 _ => return Ok(Some(Value::Object(None))),
             };
             ctx.monitor_enter(this);
             let (old_arr, size) = cowal_read_state(ctx, this);
-            if idx >= size {
+            // See the `get` registration above.
+            if raw_idx < 0 || raw_idx as usize >= size {
                 ctx.monitor_exit(this);
-                return Ok(Some(Value::Object(None)));
+                return Err(
+                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                        index: raw_idx,
+                        message: Some(format!("Index {raw_idx} out of bounds for length {size}")),
+                    }
+                    .into(),
+                );
             }
+            let idx = raw_idx as usize;
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
             let mut removed = Value::Object(None);
             if let Some(old) = old_arr {
