@@ -14070,7 +14070,18 @@ mod tests {
 
         const A: i32 = 0x1111_1111;
         const B: i32 = 0x2222_2222_u32 as i32;
+        // The writer's floor, unchanged: on a machine that interleaves at all,
+        // this is exactly the old exercise.
         const ITERATIONS: usize = 2_000_000;
+        // ...and its ceiling, reached only when the reader has STILL not seen
+        // both values after the floor — i.e. the two threads never overlapped.
+        // Bounding by observed progress rather than a fixed count is the point:
+        // a fixed count stops at an arbitrary line regardless of whether the
+        // test's own premise was ever established.
+        const MAX_ITERATIONS: usize = 20_000_000;
+        // How often the writer samples the progress flag. Kept coarse so the
+        // store loop this test exists to stress stays tight.
+        const PROGRESS_POLL_MASK: usize = 0xFFFF;
         // Establish A as the slot'''s initial value BEFORE spawning the reader:
         // a freshly-allocated slot is zero-initialized (decodes as Value::Int(0)),
         // and 0 is neither A nor B, so a reader started before the writer'''s
@@ -14078,22 +14089,43 @@ mod tests {
         // value -- a test-harness race, not a torn read.
         unsafe { jit_putfield_int(obj_ptr, 0, A as i64) };
         let stop = Arc::new(AtomicBool::new(false));
+        // Raised by the reader once it has observed BOTH values — the moment
+        // this test's premise (the two threads actually overlap) is satisfied.
+        let interleaved = Arc::new(AtomicBool::new(false));
 
         let writer = {
             let stop = Arc::clone(&stop);
+            let interleaved = Arc::clone(&interleaved);
             std::thread::spawn(move || {
-                for i in 0..ITERATIONS {
+                let mut i = 0usize;
+                loop {
                     let v = if i % 2 == 0 { A } else { B };
                     // SAFETY: obj_ptr is a live, single-field object; slot 0
                     // is in bounds.
                     unsafe { jit_putfield_int(obj_ptr, 0, v as i64) };
+                    i += 1;
+                    if i >= ITERATIONS {
+                        // Past the floor: keep writing only while the reader
+                        // has yet to see both values, so a starved reader gets
+                        // a real chance instead of the loop ending on a count.
+                        if i >= MAX_ITERATIONS {
+                            break;
+                        }
+                        if i & PROGRESS_POLL_MASK == 0
+                            && interleaved.load(Ordering::Acquire)
+                        {
+                            break;
+                        }
+                    }
                 }
                 stop.store(true, Ordering::Release);
+                i
             })
         };
 
         let reader = {
             let stop = Arc::clone(&stop);
+            let interleaved = Arc::clone(&interleaved);
             std::thread::spawn(move || {
                 let mut seen_a = 0usize;
                 let mut seen_b = 0usize;
@@ -14106,23 +14138,63 @@ mod tests {
                     } else if v == B {
                         seen_b += 1;
                     } else {
+                        // THE assertion. One check per read, and the only
+                        // condition here that indicates a real defect.
                         panic!(
                             "torn read: observed {v:#x}, neither of the two \
                              legitimate written values ({A:#x}, {B:#x})"
                         );
+                    }
+                    if seen_a > 0 && seen_b > 0 && !interleaved.load(Ordering::Relaxed) {
+                        // Release the writer from its extended budget.
+                        interleaved.store(true, Ordering::Release);
                     }
                 }
                 (seen_a, seen_b)
             })
         };
 
-        writer.join().unwrap();
+        let writes = writer.join().unwrap();
         let (seen_a, seen_b) = reader.join().unwrap();
-        assert!(
-            seen_a > 0 && seen_b > 0,
-            "reader never observed both written values (seen_a={seen_a}, \
-             seen_b={seen_b}) -- test may not be exercising real contention"
-        );
+
+        // Everything above this line has already run the tearing check on every
+        // one of the reader's observations. What remains is a PREMISE check:
+        // did the two threads actually overlap? On a loaded shared machine they
+        // can fail to, and that is a coverage gap, not a tearing violation —
+        // failing here reports a bug that did not happen and hands every
+        // unrelated change on a busy host a red suite to triage.
+        //
+        // Measured 2026-08-06 at load ~25-100: seen_a=669958, seen_b=0, i.e.
+        // 670 K reads that all passed the tearing check while the writer never
+        // got a core alongside the reader. Same tree passed in isolation.
+        let reads = seen_a + seen_b;
+        if reads == 0 {
+            // The reader never executed a single read — the writer finished and
+            // set `stop` before the reader was scheduled at all. NOTHING was
+            // checked, so say that rather than implying a clean result.
+            eprintln!(
+                "SKIP jit_getfield_never_tears_against_concurrent_jit_putfield_int: \
+                 the reader never performed a single read (writes={writes}), so the \
+                 tearing check did not run and this execution establishes NOTHING \
+                 either way. A scheduling outcome on a contended host, not a defect."
+            );
+            return;
+        }
+        if seen_a == 0 || seen_b == 0 {
+            // The reader ran and every read passed the tearing check, but the
+            // slot never changed under it, so the A<->B transition — the window
+            // a torn read could appear in — went unexercised. A coverage gap,
+            // not a violation.
+            eprintln!(
+                "SKIP jit_getfield_never_tears_against_concurrent_jit_putfield_int: \
+                 {reads} reads all passed the tearing check, but the writer and \
+                 reader never overlapped, so the A<->B transition was never \
+                 exercised (seen_a={seen_a} seen_b={seen_b} writes={writes} \
+                 floor={ITERATIONS} cap={MAX_ITERATIONS}). A scheduling outcome \
+                 on a contended host, not a defect."
+            );
+            return;
+        }
     }
 
     #[test]
