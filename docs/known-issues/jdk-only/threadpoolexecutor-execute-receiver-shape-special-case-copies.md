@@ -7,6 +7,13 @@ mechanical "delete every `JDK-ONLY-WAVE2` ThreadPoolExecutor site" sweep leaves
 half the duplication behind. **The re-land did not change the undercount**;
 that is why this item moved up the ranking rather than down.
 
+**Unblocked 2026-08-06.** The prerequisite — real field initialisation, listed
+below as step 1 of *What is still open* and confusingly as step 4 of *What
+specifically must change* — has landed (L10). Nothing here is deleted and the
+count is still eight plus one; what has changed is that the deletion is now
+allowed to start. Read *What changed on 2026-08-06* before *Why each copy
+exists*, which describes a tree that no longer exists.
+
 ## What changed on 2026-08-04 — the undercount is gone, the sites are not
 
 The ranking hazard is retired. What made this item tier-1 was not the
@@ -37,18 +44,40 @@ The record's own *Coverage first* verification step said not to rely on the
 markers because they cover four of eight. The census constant and the gate are
 what replace that instruction.
 
-## What is still open — all four steps
+## What changed on 2026-08-06 — step 1 is done, and the sites are still there
+
+**L10 landed.** `NativeMethodRegistry::register` now drops every
+`java/util/concurrent/Executors` pool factory in real-JDK mode, so the real
+`Executors` bytecode builds every executor and CratonVM has no code path left
+that can mint a fabricated one. The receiver-shape predicate the eight sites
+consult is therefore true **by construction** rather than by a fallback that
+happened not to be taken — measured with `CRATONVM_DBG_TPE_SHAPE` across both
+strict-corpus workloads in both modes, and pinned behaviourally against HotSpot
+25 by `probes/L10ThreadPoolInitProbe`. See
+[`L10-blocker-threadpool-init-DONE-20260806.md`](../../internal/L10-blocker-threadpool-init-DONE-20260806.md).
+
+That closes the gate on step 2 and leaves this record's own subject — the eight
+copies plus the ninth — exactly where it was. **This record stays OPEN.**
+
+One correction it forces on the *Why each copy exists* section below: the
+premise "`Executors.new*ThreadPool()` allocates a synthetic 2-field object" was
+already only half-true before L10 (the three plain-pool factories had driven the
+real `<init>` since 2026-07-10, keeping a two-slot **fallback**), and is now not
+true at all in real-JDK mode. The history is kept because it is why the copies
+accumulated; it is no longer a description of the tree.
+
+## What is still open — three steps, not four
 
 Nothing above deletes a site, and deleting one early is the failure mode with
 the worst blast radius in this directory (a native stack overflow and process
 abort, not a catchable `StackOverflowError`). The order is unchanged:
 
-1. give real `ThreadPoolExecutor` objects correct Java field initialisation so
+1. ~~give real `ThreadPoolExecutor` objects correct Java field initialisation so
    `Executors.new*ThreadPool()` returns objects built by the real `<init>`
-   (`docs/jdk-only-runtime-services.md` P1). **This is the real work, and it
-   gates everything else** — reclassifying before it lands drops
-   `native_es_execute` under `CRATONVM_NO_STUBS` / `--jdk-only` and
-   synthetic-receiver executors lose their only implementation;
+   (`docs/jdk-only-runtime-services.md` P1)~~ — **DONE 2026-08-06, L10.** It was
+   the gate on everything else, and reclassifying before it landed would have
+   dropped `native_es_execute` under `CRATONVM_NO_STUBS` / `--jdk-only` while
+   synthetic-receiver executors still existed;
 2. reclassify `native_es_execute` as `NativeKind::SyntheticStub`;
 3. delete the ninth, receiver-blind site;
 4. delete the eight.
@@ -156,12 +185,13 @@ Per the wave-1 marker, all of them collapse into one structural rule:
    bytecode beats a registered `Bridge` or `SyntheticStub`") then produces the
    same answer **structurally, for every receiver, with no field probe and no
    class-name list**.
-4. The real fix underneath, per `docs/jdk-only-runtime-services.md`'s P1 entry:
+4. ~~The real fix underneath, per `docs/jdk-only-runtime-services.md`'s P1 entry:
    *"Give real `ThreadPoolExecutor` objects correct Java field initialisation
-   and execute their bytecode. No receiver-shape heuristics."* Once
-   `Executors.new*ThreadPool()` returns objects built by the real `<init>`,
-   there is no synthetic receiver to distinguish and `native_es_execute` can go
-   away entirely.
+   and execute their bytecode. No receiver-shape heuristics."*~~ **DONE
+   2026-08-06 (L10)** — and note the numbering: this is listed fourth but had to
+   land **first**, which is the trap the *Blast radius* section below spells
+   out. In real-JDK mode there is no synthetic receiver left to distinguish, so
+   steps 1–3 above are now unblocked and `native_es_execute` can go away.
 
 ## How to verify a fix
 
@@ -192,10 +222,17 @@ Per the wave-1 marker, all of them collapse into one structural rule:
   policy the other four no longer apply, i.e. the same cold-path/warm-path split
   documented in
   the forced-native `String` policy, FIXED 2026-08-04 (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`).
-* Reclassifying `native_es_execute` to `SyntheticStub` while
+* ~~Reclassifying `native_es_execute` to `SyntheticStub` while
   `CRATONVM_NO_STUBS` / `--jdk-only` is in play **drops the registration
   entirely** (see
   [`NativeKind` is ambient](native-kind-is-ambient-and-defaults-to-syntheticstub.md)),
   so synthetic-receiver executors lose their only implementation. Step 4 (real
   field initialisation) must land first, or strict mode loses
-  `Executors.new*ThreadPool()`.
+  `Executors.new*ThreadPool()`.~~ **Retired 2026-08-06 — the precondition is
+  met.** Reclassifying still drops the registration under
+  `CRATONVM_NO_STUBS` / `--jdk-only`; what changed is that there is nothing left
+  for it to strand. Real-JDK mode registers no `Executors` pool factory, so
+  every executor in that build comes from real bytecode. Do NOT read this as
+  "the sequencing no longer matters": steps 2, 3 and 4 above still have to
+  happen together and in that order, and the first bullet of this section is
+  unchanged.
