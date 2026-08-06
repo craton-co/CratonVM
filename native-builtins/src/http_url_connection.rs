@@ -2209,7 +2209,7 @@ fn https_post_handshake_exchange(
     // .testMissingClientCertificate` asserts exactly that type. Only this
     // first write is reclassified: any later write failure happens on a
     // connection the server already accepted and is a genuine transport error.
-    retry_eintr(|| stream.write_all(req)).map_err(|e| {
+    stream.write_all(req).map_err(|e| {
         format!(
             "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
              TLS handshake, before the request could be sent — the peer likely \

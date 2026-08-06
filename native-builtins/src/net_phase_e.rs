@@ -6479,7 +6479,7 @@ fn http_exchange_tls(
         std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}"))
     })?;
     let req = http_build_request(method, host, port, path, headers, body, 443);
-    retry_eintr(|| tls.write_all(&req))?;
+    tls.write_all(&req)?;
     retry_eintr(|| tls.flush())?;
     http_read_response(
         HttpDeadlineReader {
@@ -6562,9 +6562,14 @@ fn http_exchange_rustls(
     let request = http_build_request(method, host, port, path, headers, body, 443);
     tls.sock
         .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
-    // `rustls`' `Stream::write`/`flush` drive `complete_io` internally, so the
-    // socket's EINTR reaches us from a method no `EintrIo` above is wrapping.
-    retry_eintr(|| tls.write_all(&request))?;
+    // `write_all` is left bare on purpose: `std`'s default impl already
+    // reissues on `Interrupted` AND advances past the bytes it did place, which
+    // a `retry_eintr` wrapper around the whole call could not do — it would
+    // restart from offset 0. `flush` has no partial state, so wrapping it is
+    // safe, and it needs the wrapper: `rustls`' `Stream::flush` drives
+    // `complete_io` internally, where the socket's EINTR reaches us from a
+    // method no `EintrIo` above is wrapping.
+    tls.write_all(&request)?;
     retry_eintr(|| tls.flush())?;
     http_read_response(
         HttpDeadlineReader {

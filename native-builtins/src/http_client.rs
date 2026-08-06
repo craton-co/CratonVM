@@ -1171,14 +1171,14 @@ pub(crate) fn perform_request(
             (ConnKind::Tls(s), false) => {
                 let req =
                     build_http1_request(&current_method, &parsed, &current_headers, &current_body);
-                retry_eintr(|| s.write_all(&req)).map_err(|e| format!("write: {e}"))?;
+                s.write_all(&req).map_err(|e| format!("write: {e}"))?;
                 retry_eintr(|| s.flush()).map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(s.as_mut())
             }
             (ConnKind::Plain(t), _) => {
                 let req =
                     build_http1_request(&current_method, &parsed, &current_headers, &current_body);
-                retry_eintr(|| t.write_all(&req)).map_err(|e| format!("write: {e}"))?;
+                t.write_all(&req).map_err(|e| format!("write: {e}"))?;
                 retry_eintr(|| t.flush()).map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(t)
             }
