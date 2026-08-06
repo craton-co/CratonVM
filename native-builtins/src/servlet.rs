@@ -2875,6 +2875,47 @@ fn s2_bb_pos(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 fn s2_bb_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_LIMIT).as_int().unwrap_or(0)
 }
+/// `Buffer.checkIndex` for the ABSOLUTE accessors: `index` must admit `width`
+/// bytes within the buffer's **limit**.
+///
+/// This did not exist until 2026-08-05 and none of the twelve absolute
+/// accessors below bounds-checked at all. `ByteBuffer.wrap(new byte[8]).get(99)`
+/// returned **0** where HotSpot throws; `getInt(6)` on the same buffer returned
+/// `117964800`, i.e. the two real bytes at 6 and 7 followed by two fabricated
+/// zeroes. Silently wrong DATA is worse than an exception, because a
+/// computation consumes it.
+///
+/// `s2_bb_get_byte` already refuses to read out of range -- it returns a benign
+/// 0 and says so in its comment -- but it returns `i8` and so has no way to
+/// raise a Java exception. That defensiveness is the right thing for a helper
+/// and the wrong thing for the API contract, so the check belongs HERE, at the
+/// registration sites, where `MethodCallResult` can carry the throw. The
+/// helper's zero stays as the panic guard it was written to be.
+///
+/// **`limit`, not `capacity`** -- `ByteBuffer.get(int)` is `Objects.checkIndex(i,
+/// limit)`. A buffer whose limit has been pulled in must refuse an absolute read
+/// past it even though the storage is still there.
+///
+/// HotSpot's message here is null (`Buffer.checkIndex` throws the no-arg
+/// `IndexOutOfBoundsException`), which is why this passes `None` rather than
+/// inventing text -- checked against a HotSpot 25 control, not assumed.
+fn s2_bb_check_index(
+    ctx: &dyn NativeContext,
+    buf: ObjectRef,
+    index: i32,
+    width: i32,
+) -> Result<(), MethodCallFailed> {
+    let limit = s2_bb_limit(ctx, buf);
+    // Widened so `index + width` cannot overflow for an index near i32::MAX.
+    let end = index as i64 + width as i64;
+    if index < 0 || end > limit as i64 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message: None }.into(),
+        );
+    }
+    Ok(())
+}
+
 #[inline]
 fn s2_bb_cap(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     ctx.get_field(buf, BB_CAP).as_int().unwrap_or(0)
@@ -4446,6 +4487,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "get", "(I)B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 1)?;
         Ok(Some(Value::Int(s2_bb_get_byte(ctx, this, idx) as i32)))
     });
     r.register(bb, "get", "([BII)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4579,6 +4621,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let b = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i8;
+        s2_bb_check_index(ctx, this, idx, 1)?;
         s2_bb_put_byte(ctx, this, idx, b);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -4778,6 +4821,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getShort", "(I)S", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 2)?;
         Ok(Some(Value::Int(s2_bb_read2(ctx, this, idx) as i32)))
     });
     r.register(bb, "putShort", "(S)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4801,6 +4845,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+        s2_bb_check_index(ctx, this, idx, 2)?;
         s2_bb_write2(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -4819,6 +4864,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getChar", "(I)C", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 2)?;
         Ok(Some(Value::Int(s2_bb_read2(ctx, this, idx) as u16 as i32)))
     });
     r.register(bb, "putChar", "(C)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4842,6 +4888,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+        s2_bb_check_index(ctx, this, idx, 2)?;
         s2_bb_write2(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -4860,6 +4907,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getInt", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 4)?;
         Ok(Some(Value::Int(s2_bb_read4(ctx, this, idx))))
     });
     r.register(bb, "putInt", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4883,6 +4931,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 4)?;
         s2_bb_write4(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -4901,6 +4950,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getLong", "(I)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 8)?;
         Ok(Some(Value::Long(s2_bb_read8(ctx, this, idx))))
     });
     r.register(bb, "putLong", "(J)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4932,6 +4982,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i as i64,
             _ => 0,
         };
+        s2_bb_check_index(ctx, this, idx, 8)?;
         s2_bb_write8(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -4950,6 +5001,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getFloat", "(I)F", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        s2_bb_check_index(ctx, this, idx, 4)?;
         Ok(Some(Value::Float(f32::from_bits(
             s2_bb_read4(ctx, this, idx) as u32,
         ))))

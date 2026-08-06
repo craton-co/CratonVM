@@ -3901,6 +3901,31 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     if let Some(b) = unmod_receiver_backing(ctx, this) {
+        // Bounds-check HERE, before delegating, and keep the
+        // `ArrayIndexOutOfBoundsException` this path has always thrown.
+        //
+        // `native_al_get` below now throws the plain `IndexOutOfBoundsException`
+        // that HotSpot's `ArrayList` throws -- correct for a real `ArrayList`
+        // receiver and WRONG for most of the receivers that arrive here.
+        // Measured against a HotSpot 25 control with
+        // `probes/ListOutOfBoundsProbe`:
+        //
+        //   List.of()            -> ArrayIndexOutOfBoundsException
+        //   List.of(a)/(a,b)     -> IndexOutOfBoundsException "Index: 3 Size: 1"
+        //   List.of(a,b,c,d)     -> ArrayIndexOutOfBoundsException
+        //
+        // i.e. the JDK splits on `ImmutableCollections.List12` vs `ListN`, which
+        // index their storage differently. Two of those three want the subclass,
+        // and this VM funnels every unmodifiable/immutable list through ONE
+        // synthetic class, so there is no discriminator here that would let the
+        // 1-2 element case be told from `Collections.unmodifiableList` over a
+        // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
+        // split would mean guessing; keeping the status quo for this path is the
+        // honest option, and it is right for 0 and 3+ elements.
+        let (_, n) = al_state(ctx, b);
+        if index < 0 || index >= n {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        }
         return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
     }
     // `Collections$SingletonList` keeps its one element in a field, not in an
@@ -3918,12 +3943,15 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException
-        // (ArrayIndexOutOfBoundsException is a subclass, so `catch
-        // (IndexOutOfBoundsException)` still catches it).
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index N out of bounds for
+        // length M". NOT the ArrayIndexOutOfBoundsException subclass -- that is
+        // the direction that breaks a `catch`, and it is what this threw until
+        // 2026-08-05 even though the comment already named the right class.
+        // There was no plain variant in `RuntimeError` before then.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -3953,10 +3981,12 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException with the same wording as
+        // `get`; see the note there for why this is not the Array... subclass.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -4013,9 +4043,13 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     if index < 0 || index as usize > size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, and note the wording is NOT the
+        // one `get`/`set` use -- `ArrayList.add(int,E)` goes through
+        // `rangeCheckForAdd`, which builds "Index: 9, Size: 2" (comma, and
+        // "Size" rather than "length"). Measured, not assumed:
+        // probes/ListOutOfBoundsProbe against a HotSpot 25 control shows four
+        // different OOB wordings across the List API.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into());
     }
     let index = index as usize;
     // GC-SAFETY: same hazard as `native_al_add` -- `al_ensure_capacity` can
@@ -4049,10 +4083,12 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException with the same wording as
+        // `get`; see the note there for why this is not the Array... subclass.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -5219,9 +5255,13 @@ fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     asl_check_comod(ctx, parent, expected)?;
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index 1 out of bounds for
+        // length 1" -- a subList reports the SUBLIST's length, not the
+        // parent's. Not the Array... subclass; see native_al_get.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     // Write-through READ: index straight into the parent's live backing array.
     let (data, _) = al_state(ctx, parent);
@@ -5247,9 +5287,13 @@ fn native_asl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     asl_check_comod(ctx, parent, expected)?;
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot: IndexOutOfBoundsException, "Index 1 out of bounds for
+        // length 1" -- a subList reports the SUBLIST's length, not the
+        // parent's. Not the Array... subclass; see native_al_get.
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index {index} out of bounds for length {size}"
+        ))
+        .into());
     }
     // Write-through SET: the element write lands in the PARENT's backing array.
     let (data, _) = al_state(ctx, parent);
@@ -45412,6 +45456,33 @@ fn native_unmod_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Bounds-check BEFORE delegating, and keep the
+    // `ArrayIndexOutOfBoundsException` this path has always thrown.
+    //
+    // The delegate is a real `java/util/ArrayList`, so it now answers with the
+    // plain `IndexOutOfBoundsException` that HotSpot's `ArrayList` throws --
+    // right for that receiver, wrong for this one. Measured against HotSpot 25
+    // with `probes/ListOutOfBoundsProbe`: `List.of()` and `List.of(a,b,c,d)`
+    // throw `ArrayIndexOutOfBoundsException` (`ImmutableCollections.ListN`
+    // indexes its array directly), while the 1-2 element `List12` throws the
+    // plain class with a different wording again ("Index: 3 Size: 1").
+    //
+    // Two of the three want the subclass, and this VM funnels every
+    // unmodifiable/immutable list through ONE synthetic class -- there is no
+    // discriminator here that separates a 1-2 element `List.of` from
+    // `Collections.unmodifiableList` over a 1-2 element `ArrayList`, which
+    // wants the plain class. Reproducing the JDK's split would be guessing;
+    // holding this path where it was is right for 0 and 3+ elements and is the
+    // status quo for the rest.
+    if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
+    {
+        if let Some(backing) = unmod_receiver_backing(ctx, *this) {
+            let (_, n) = al_state(ctx, backing);
+            if *index < 0 || *index >= n {
+                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+            }
+        }
+    }
     unmod_delegate(ctx, args, "get", "(I)Ljava/lang/Object;")
 }
 
