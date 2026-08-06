@@ -7,8 +7,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.spi.FileSystemProvider;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Map;
-import java.util.TreeSet;
 
 /**
  * The name-keyed half of the NIO file-attribute surface:
@@ -35,7 +36,7 @@ public class NioAttrProbe {
         FileSystem fs = FileSystems.getDefault();
         FileSystemProvider provider = fs.provider();
         System.out.println("provider scheme=" + provider.getScheme()
-                + " views=" + new TreeSet<>(fs.supportedFileAttributeViews()));
+                + " views=" + sorted(fs.supportedFileAttributeViews()));
 
         Path path = Paths.get(System.getProperty("java.io.tmpdir", "/tmp"));
 
@@ -66,12 +67,34 @@ public class NioAttrProbe {
     private static String keysOf(Path path, String spec) {
         try {
             Map<String, Object> m = Files.readAttributes(path, spec);
-            return m.isEmpty() ? "empty" : new TreeSet<>(m.keySet()).toString();
+            return m.isEmpty() ? "empty" : sorted(m.keySet());
         } catch (UnsupportedOperationException e) {
             return "unsupported";
         } catch (Throwable t) {
             return "throw-" + t.getClass().getSimpleName();
         }
+    }
+
+    /**
+     * Render a collection of names sorted, without going through a sorted
+     * collection's own {@code toString}.
+     *
+     * <p>The obvious {@code new TreeSet<>(c).toString()} makes this probe report
+     * a {@code TreeSet$Itr} gap under {@code --jdk-only} instead of whatever it
+     * was asked about — a probe that fails for a reason unrelated to its subject
+     * measures the wrong thing.
+     */
+    private static String sorted(Collection<String> c) {
+        String[] names = c.toArray(new String[0]);
+        Arrays.sort(names);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(names[i]);
+        }
+        return sb.append(']').toString();
     }
 
     private static String verdict(Path path, String spec) {
