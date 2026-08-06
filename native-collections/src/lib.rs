@@ -45474,11 +45474,33 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // wants the plain class. Reproducing the JDK's split would be guessing;
     // holding this path where it was is right for 0 and 3+ elements and is the
     // status quo for the rest.
+    //
+    // The check may only be applied to a backing whose size `al_state` can
+    // actually read. For every other backing — a real-JDK `java/util/LinkedList`
+    // (`Collections.unmodifiableList` over one is the shape QDox's
+    // `DefaultJavaSource.getClasses()` returns), a `cratonvm/internal/ArrayListSubList`,
+    // any foreign `AbstractSequentialList` — `al_state` returns its
+    // `(None, 0)` "layout I cannot read" sentinel, which is indistinguishable
+    // from a genuinely empty ArrayList. Treating that 0 as the size threw
+    // `ArrayIndexOutOfBoundsException` for EVERY index, on a list whose
+    // `size()`, `iterator()`, `toString()` and `indexOf()` all answered
+    // correctly (spring-framework `BeanRegistrationsAotContributionTests`
+    // `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`, via
+    // `SourceFile.getClassName`). Delegating instead lets the backing's own
+    // `get` raise the bounds error it would raise on HotSpot.
     if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
     {
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
-            let (_, n) = al_state(ctx, backing);
-            if *index < 0 || *index >= n {
+            if al_is_list_layout(ctx, backing) {
+                let (_, n) = al_state(ctx, backing);
+                if *index < 0 || *index >= n {
+                    return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+                }
+            } else if *index < 0 {
+                // A negative index never reaches a delegate that would report
+                // it faithfully (`LinkedList.get(-1)` is an
+                // IndexOutOfBoundsException on HotSpot, but several backings
+                // here answer through natives that clamp), so keep this arm.
                 return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
             }
         }
