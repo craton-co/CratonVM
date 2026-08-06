@@ -73,6 +73,85 @@ public class ListOutOfBoundsProbe {
         t("List.of().get(0)   ", () -> List.of().get(0));
         t("new ArrayList.get(0)", () -> new ArrayList<>().get(0));
 
+        System.out.println("List.of size 3 -- ListN boundary");
+        List<String> three = List.of("a", "b", "c");
+        t("three.get(3)       ", () -> three.get(3));
+        t("three.get(-1)      ", () -> three.get(-1));
+        t("List.copyOf size 2 ", () -> List.copyOf(Arrays.asList("a", "b")).get(2));
+        t("List.copyOf size 3 ", () -> List.copyOf(Arrays.asList("a", "b", "c")).get(3));
+
+        System.out.println("Collections.unmodifiableList -- delegates to its backing");
+        List<String> uOne = java.util.Collections.unmodifiableList(
+                new ArrayList<>(List.of("a")));
+        t("unmod(ArrayList 1).get(3)", () -> uOne.get(3));
+        t("unmod(ArrayList 1).get(-1)", () -> uOne.get(-1));
+        List<String> uTwo = java.util.Collections.unmodifiableList(
+                new ArrayList<>(List.of("a", "b")));
+        t("unmod(ArrayList 2).get(5)", () -> uTwo.get(5));
+        List<String> uArrays = java.util.Collections.unmodifiableList(
+                Arrays.asList("a", "b"));
+        t("unmod(Arrays.asList).get(5)", () -> uArrays.get(5));
+        List<String> uLinked = java.util.Collections.unmodifiableList(
+                new java.util.LinkedList<>(List.of("a", "b")));
+        t("unmod(LinkedList).get(5)", () -> uLinked.get(5));
+        t("unmod(LinkedList).get(0) ok", () -> uLinked.get(0));
+        List<String> uEmpty = java.util.Collections.unmodifiableList(new ArrayList<>());
+        t("unmod(empty).get(0)", () -> uEmpty.get(0));
+
+        System.out.println("LinkedList direct");
+        List<String> linked = new java.util.LinkedList<>(List.of("a", "b"));
+        t("linked.get(5)      ", () -> linked.get(5));
+        t("linked.get(-1)     ", () -> linked.get(-1));
+
+        System.out.println("negative indices");
+        t("Arrays.asList.get(-1)", () -> al.get(-1));
+        t("ArrayList.get(-1)  ", () -> arr.get(-1));
+        t("sub.get(-1)        ", () -> sub.get(-1));
+
+        // The concrete classes. This VM funnels `List.of` and
+        // `Collections.unmodifiableList` through one synthetic class, but it
+        // already reports these two names apart -- so whatever tells them
+        // apart for `getClass()` is available to the throw site as well.
+        System.out.println("LinkedList positional mutators");
+        t("linked.set(5,\"z\")   ", () -> new java.util.LinkedList<>(List.of("a", "b")).set(5, "z"));
+        t("linked.add(9,\"z\")   ", () -> {
+            new java.util.LinkedList<>(List.of("a", "b")).add(9, "z");
+            return "ok";
+        });
+        t("linked.remove(9)     ", () -> new java.util.LinkedList<>(List.of("a", "b")).remove(9));
+        t("linked.add(2,\"z\") ok", () -> {
+            java.util.LinkedList<String> l = new java.util.LinkedList<>(List.of("a", "b"));
+            l.add(2, "z");
+            return l.toString();
+        });
+
+        System.out.println("singleton / empty wrappers");
+        List<String> single = java.util.Collections.singletonList("a");
+        t("singletonList.get(1) ", () -> single.get(1));
+        t("singletonList.get(-1)", () -> single.get(-1));
+        t("singletonList.get(0) ", () -> single.get(0));
+        List<String> emptyL = java.util.Collections.emptyList();
+        t("emptyList.get(0)     ", () -> emptyL.get(0));
+
+        System.out.println("listIterator(int)");
+        t("List.of(a,b).listIterator(5)", () -> two.listIterator(5));
+        t("List.of(a,b).listIterator(-1)", () -> two.listIterator(-1));
+        t("ArrayList.listIterator(5)", () -> arr.listIterator(5));
+        t("Arrays.asList.subList(0,5)", () -> al.subList(0, 5));
+        t("ArrayList.subList(0,5)", () -> arr.subList(0, 5));
+        t("ArrayList.subList(-1,1)", () -> arr.subList(-1, 1));
+        t("ArrayList.subList(2,1)", () -> arr.subList(2, 1));
+
+        System.out.println("concrete classes");
+        System.out.println("  List.of(a).getClass       = " + one.getClass().getName());
+        System.out.println("  List.of(a,b,c,d).getClass = " + n.getClass().getName());
+        System.out.println("  List.of().getClass        = " + List.of().getClass().getName());
+        System.out.println("  Arrays.asList.getClass    = " + al.getClass().getName());
+        System.out.println("  unmod(ArrayList).getClass = " + uOne.getClass().getName());
+        System.out.println("  unmod(LinkedList).getClass= " + uLinked.getClass().getName());
+        System.out.println("  ArrayList.getClass        = " + arr.getClass().getName());
+        System.out.println("  subList.getClass          = " + sub.getClass().getName());
+
         System.out.println("LIST-OOB-PROBE-DONE");
     }
 }

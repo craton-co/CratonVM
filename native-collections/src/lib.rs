@@ -1192,10 +1192,7 @@ impl DenseIntEntries {
             // `resize`, an occupied-slot probe, and sparse lookup are all
             // redundant when this is exactly the next dense slot and no
             // sparse entry can already own it.
-            if index <= Self::MAX_DENSE_KEY
-                && index == self.dense.len()
-                && self.sparse.is_empty()
-            {
+            if index <= Self::MAX_DENSE_KEY && index == self.dense.len() && self.sparse.is_empty() {
                 let seq = self.note_fresh_insert();
                 self.dense.push(Some(value));
                 if seq != key as u64 {
@@ -1851,8 +1848,29 @@ fn dbg_kcbool_report_miss(
     }
 }
 
-/// Create an iterator backed by a snapshot array of the given size.
-/// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
+/// Create an iterator over a snapshot array of the given size.
+///
+/// Returns a real `java.util.Arrays$ArrayItr` — the JDK's own `Object[]`
+/// iterator — so `getClass()`, `hasNext()`, `next()` and the `remove()` that
+/// throws are all the real thing. It falls back to the historical
+/// `HashMap$KeyItr` shape (field 0 = array, 1 = cursor, 2 = total) only when
+/// the image has no `Arrays$ArrayItr` to build, i.e. a `synthetic-jdk` build.
+///
+/// This used to mint `HashMap$KeyItr` unconditionally, and two things were
+/// wrong with that. The visible one: no JDK declares that class, so
+/// `Arrays.asList(a).iterator().getClass()` reported `java.util.HashMap$KeyItr`
+/// where HotSpot says `java.util.Arrays$ArrayItr` — measured by
+/// `probes/StrictIterPrimitivesProbe`. The structural one: it minted through
+/// the INFALLIBLE `alloc_synthetic` while three sibling sites used the fallible
+/// spelling, so under `--jdk-only` the refusal was order-dependent rather than
+/// a policy — `Arrays.asList(a).iterator()` created the class and every LATER
+/// `try_alloc_synthetic` for that name then found it and succeeded, which is
+/// why `linkedhashset.iterator()` passed in a probe that had called
+/// `Arrays.asList` first and threw `NoClassDefFoundError` in one that had not.
+///
+/// Building the real class costs one allocation and two field writes, against
+/// one allocation and three writes for the fabricated shape, so the honest
+/// version is not the expensive one — see `probes/SnapshotIteratorCostProbe`.
 pub fn make_iterator_from_array(
     ctx: &mut dyn NativeContext,
     snapshot_array: ObjectRef,
@@ -1864,23 +1882,53 @@ pub fn make_iterator_from_array(
     // through their pins. Covered by
     // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
     let array_pin = ctx.pin_native_root(snapshot_array);
-    // Fallible since 2026-08-05: this was the LAST infallible `HashMap$KeyItr`
-    // fabrication, and while it stood the refusal at the other three sites was
-    // order-dependent rather than a policy. `probes/StrictIterPrimitivesProbe`
-    // caught it under `--jdk-only`: `Arrays.asList(a).iterator()` reaches this
-    // helper, fabricates the class, and every LATER `try_alloc_synthetic` for
-    // the same name then finds it and succeeds — so
-    // `linkedhashset.iterator()` passed in a probe that had called
-    // `Arrays.asList` first and threw `NoClassDefFoundError` in one that had
-    // not. Route the refusal here too, so no snapshot iterator anywhere wears
-    // a fabricated class name in strict mode.
+    // The real iterator reads `a.length`, so a caller that over-allocated its
+    // snapshot has to be trimmed first — `real_snapshot_iterator` does that and
+    // then builds the same shape.
+    if ctx.array_length(snapshot_array) != size {
+        let cur = ctx.read_native_pin(array_pin, snapshot_array);
+        match real_snapshot_iterator(ctx, cur, size) {
+            Ok(v) => {
+                ctx.unpin_native_roots(array_pin);
+                return Ok(v);
+            }
+            // Only reachable in an image with no `Arrays$ArrayItr`. Re-read the
+            // array through its pin BEFORE dropping it: `real_snapshot_iterator`
+            // allocated, so the bare local above is stale by now, and handing a
+            // from-space reference to the fallback would store a dead array in
+            // the iterator. Nothing allocates between this unpin and the re-pin
+            // the callee takes as its first action.
+            Err(_) => {
+                let cur = ctx.read_native_pin(array_pin, snapshot_array);
+                ctx.unpin_native_roots(array_pin);
+                return make_fabricated_iterator_from_array(ctx, cur, size);
+            }
+        }
+    }
+    let snapshot_array_cur = ctx.read_native_pin(array_pin, snapshot_array);
+    if let Some(itr) = alloc_real_array_iterator(ctx, snapshot_array_cur) {
+        ctx.unpin_native_roots(array_pin);
+        return Ok(Some(Value::Object(Some(itr))));
+    }
+    let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
+    ctx.unpin_native_roots(array_pin);
+    make_fabricated_iterator_from_array(ctx, snapshot_array, size)
+}
+
+/// The pre-2026-08-06 snapshot-iterator shape, kept for images with no real
+/// `java.util.Arrays$ArrayItr` to build (`synthetic-jdk`). Under `--jdk-only`
+/// the fabrication is refused, and correctly: no JDK declares this class.
+fn make_fabricated_iterator_from_array(
+    ctx: &mut dyn NativeContext,
+    snapshot_array: ObjectRef,
+    size: usize,
+) -> MethodCallResult {
+    let array_pin = ctx.pin_native_root(snapshot_array);
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3) {
         Ok(itr) => itr,
-        Err(_refused) => {
-            let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
-            let real = real_snapshot_iterator(ctx, snapshot_array, size);
+        Err(refused) => {
             ctx.unpin_native_roots(array_pin);
-            return real;
+            return Err(refused);
         }
     };
     let itr_pin = ctx.pin_native_root(itr);
@@ -1946,32 +1994,102 @@ fn real_snapshot_iterator(
         }
         exact
     };
-    let arr_pin = ctx.pin_native_root(arr);
-    let list = ctx.new_object_initialized(
-        "java/util/Arrays$ArrayList",
-        "([Ljava/lang/Object;)V",
-        &[Value::Object(Some(arr))],
-    );
-    ctx.unpin_native_roots(arr_pin);
-    match list? {
-        Some(Value::Object(Some(list))) => {
-            ctx.invoke_virtual_bytecode_only(list, "iterator", "()Ljava/util/Iterator;", &[])
-        }
-        // No real `Arrays$ArrayList` to wrap it in. Nothing is left to fall
-        // back TO — returning the fabricated shape here would defeat the whole
-        // point — so surface a refusal naming the class that is actually
-        // missing, rather than the synthetic one the caller asked for.
-        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+    match alloc_real_array_iterator(ctx, arr) {
+        Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+        // Nothing is left to fall back TO — returning the fabricated shape
+        // here would defeat the whole point — so surface a refusal naming the
+        // class that is actually missing, not the synthetic one the caller
+        // asked for.
+        None => Err(cratonvm_native_api::refusal_to_java_failure(
             ctx,
             cratonvm_native_api::ClassIdentityError::Refused {
-                name: "java/util/Arrays$ArrayList".to_string(),
-                reason: "--jdk-only: a snapshot iterator needs the real \
-                         fixed-size list to stand in for the refused \
+                name: "java/util/Arrays$ArrayItr".to_string(),
+                reason: "--jdk-only: a snapshot iterator needs the real array \
+                         iterator to stand in for the refused \
                          `java.util.HashMap$KeyItr`, and this image has none"
                     .to_string(),
             },
         )),
     }
+}
+
+/// Allocate a real `java.util.Arrays$ArrayItr` over `arr`, or `None` when this
+/// image has no such class.
+///
+/// `Arrays$ArrayItr` is the JDK's own iterator over a bare `Object[]`, and it
+/// declares exactly the two fields a snapshot iterator needs:
+///
+/// ```text
+///   cursor : int
+///   a      : Object[]   (final)
+/// ```
+///
+/// So this is construction, not a fabricated layout: both fields are declared
+/// by the real class, both are written by NAME, and both receive a value of the
+/// declared type — the same thing `ArrayItr(E[] a)` does, minus running a
+/// constructor whose entire body is `this.a = a`. Everything the iterator then
+/// does — `hasNext`, `next`, and the inherited `remove` that throws — is real
+/// JDK bytecode reading real fields.
+///
+/// `arr` must ALREADY be exactly the logical length: `hasNext()` is
+/// `cursor < a.length`, so an over-allocated snapshot would iterate trailing
+/// nulls. Both callers trim first.
+///
+/// Returns `None` rather than fabricating anything, so a build without the real
+/// `java.util` (the `synthetic-jdk` feature) keeps its old shape instead of
+/// losing the ability to make an iterator at all.
+fn alloc_real_array_iterator(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Option<ObjectRef> {
+    alloc_real_snapshot_iterator_of(ctx, "java/util/Arrays$ArrayItr", "a", arr)
+}
+
+/// Build a real snapshot iterator of `class_name`, whose backing array lives in
+/// the field `array_field` and whose position lives in `cursor`.
+///
+/// The JDK has more than one iterator of exactly this shape, and which one is
+/// correct depends on the collection that produced it:
+///
+/// ```text
+///   java.util.Arrays$ArrayItr                            a         cursor
+///   java.util.concurrent.CopyOnWriteArrayList$COWIterator snapshot cursor
+/// ```
+///
+/// Both are array-plus-position, both snapshot at creation, and both inherit or
+/// declare a `remove()` that throws — which is why one helper serves both and
+/// why the choice is the CALLER's: returning an `Arrays$ArrayItr` from
+/// `CopyOnWriteArrayList.iterator()` iterates correctly but reports the wrong
+/// `getClass()`, and `probes/SnapshotIteratorShapeProbe` measures exactly that.
+pub fn alloc_real_snapshot_iterator_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    array_field: &str,
+    arr: ObjectRef,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    // `ensure_class_initialized` reports success with another class's id for
+    // some loader fallbacks. The real class or nothing.
+    if ctx.class_name_of_id(cid).unwrap_or_default() != class_name {
+        return None;
+    }
+    let a_slot = ctx.resolve_field_index(class_name, array_field)?;
+    let cursor_slot = ctx.resolve_field_index(class_name, "cursor")?;
+    let n_fields = ctx
+        .class_num_total_fields(cid)
+        .max(a_slot.max(cursor_slot) + 1);
+    // GC-SAFETY: `alloc_object` collects, and `arr` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins — the contract `make_iterator_from_array`
+    // documents, and what `gc_native_pins` covers.
+    let arr_pin = ctx.pin_native_root(arr);
+    let itr = ctx.alloc_object(cid, n_fields);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(itr, a_slot, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(arr_pin);
+    Some(itr)
 }
 
 fn native_unsorted_set_comparator(
@@ -2558,15 +2676,13 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
     &seg_locks()[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
-static SEG_RESIZE_EPOCHS: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
+static SEG_RESIZE_EPOCHS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
 
 fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_RESIZE_EPOCHS.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_RESIZE_EPOCHS.get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 // Validity generation for the per-thread CHM String-node memo. Every CHM
@@ -2588,25 +2704,23 @@ fn chm_seg_resize_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
 // is around `monitor_enter` — i.e. a host mutex held across a GC-safepoint
 // park. A thread blocked on such a mutex is not at a safepoint, so it would
 // stall every collection queued behind it.
-static SEG_MUTATION_EPOCHS: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
-static SEG_MUTATION_ACTIVE: std::sync::OnceLock<
-    [std::sync::atomic::AtomicU64; NUM_SEG_LOCKS],
-> = std::sync::OnceLock::new();
+static SEG_MUTATION_EPOCHS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
+static SEG_MUTATION_ACTIVE: std::sync::OnceLock<[std::sync::atomic::AtomicU64; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
 
 fn chm_seg_mutation_epoch(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_MUTATION_EPOCHS.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_MUTATION_EPOCHS
+        .get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 fn chm_seg_mutation_active(seg_id: i32) -> &'static std::sync::atomic::AtomicU64 {
     let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    &SEG_MUTATION_ACTIVE.get_or_init(|| {
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
-    })[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
+    &SEG_MUTATION_ACTIVE
+        .get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+        [((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 /// `(epoch, in-flight mutators)` for the stripe owning `seg_id`. The in-flight
@@ -2633,13 +2747,17 @@ impl ChmSegmentResizeGuard {
         let lock = chm_seg_lock_for(seg_id).write();
         let epoch = chm_seg_resize_epoch(seg_id);
         epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self { epoch, lock: Some(lock) }
+        Self {
+            epoch,
+            lock: Some(lock),
+        }
     }
 }
 
 impl Drop for ChmSegmentResizeGuard {
     fn drop(&mut self) {
-        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.lock.take();
     }
 }
@@ -3897,6 +4015,74 @@ fn unmod_view_size(al_state_data: Option<ObjectRef>, al_state_size: i32) -> Opti
     al_state_data.map(|_| al_state_size.max(0))
 }
 
+/// Whether a `cratonvm/internal/Unmodifiable*` receiver came from an
+/// *immutable* factory (`List.of` / `copyOf`) rather than from
+/// `Collections.unmodifiable*`.
+///
+/// Slot 1 is [`UNMOD_FIELD_IMMUTABLE`], stamped by `freeze_result`. CONTRACT:
+/// mirrors `getclass_immutable_marker` in native-builtins, which reads the same
+/// slot to decide whether `getClass()` reports `ImmutableCollections$*` or
+/// `Collections$Unmodifiable*`.
+fn unmod_is_immutable(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field(this, UNMOD_FIELD_IMMUTABLE), Value::Int(1))
+}
+
+/// The out-of-range error for an unmodifiable/immutable list wrapper, or `None`
+/// to stand aside and let the backing's own `get` throw.
+///
+/// HotSpot has three answers here and this VM funnels all three through one
+/// synthetic class — but not through one *object shape*. Measured on Temurin 25
+/// with `probes/ListOutOfBoundsProbe`:
+///
+/// ```text
+/// List.of("a").get(3)                       IndexOutOfBoundsException  "Index: 3 Size: 1"
+/// List.of("a","b").get(2)                   IndexOutOfBoundsException  "Index: 2 Size: 2"
+/// List.of().get(0)                          ArrayIndexOutOfBounds...   "Index 0 out of bounds for length 0"
+/// List.of("a","b","c").get(3)               ArrayIndexOutOfBounds...   "Index 3 out of bounds for length 3"
+/// unmodifiableList(new ArrayList(1)).get(3) IndexOutOfBoundsException  "Index 3 out of bounds for length 1"
+/// unmodifiableList(Arrays.asList(2)).get(5) ArrayIndexOutOfBounds...   "Index 5 out of bounds for length 2"
+/// unmodifiableList(new LinkedList(2)).get(5) IndexOutOfBoundsException "Index: 5, Size: 2"
+/// ```
+///
+/// The JDK's split is `ImmutableCollections.List12` (1-2 elements, bounds-checks
+/// first, plain class) versus `ListN` (0 or 3+, indexes its array directly, so
+/// the array access throws the subclass); and `Collections.unmodifiable*` is a
+/// *view* that simply delegates, so its answer is whatever its backing throws —
+/// which is why the last three rows differ from each other despite the same
+/// wrapper.
+///
+/// The doc for this bug recorded that the `List12` case could not be told from
+/// `Collections.unmodifiableList` here. It can: [`unmod_is_immutable`] reads the
+/// marker slot, which is the same bit `getClass()` already splits on. Reproducing
+/// the JDK's shape is therefore not a guess.
+fn unmod_list_oob_error(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    index: i32,
+    size: i32,
+) -> Option<MethodCallFailed> {
+    if !unmod_is_immutable(ctx, this) {
+        // `Collections.unmodifiableList` is a view. HotSpot delegates, so the
+        // backing decides both class and wording — an ArrayList backing answers
+        // with the plain class, an `Arrays$ArrayList` with the subclass, a
+        // LinkedList with a third wording again. Pre-empting it here is what
+        // made all three look alike.
+        return None;
+    }
+    if (1..=2).contains(&size) {
+        // `ImmutableCollections.List12` — bounds-checks before indexing, so the
+        // plain class, and its own wording: a SPACE, not the comma that
+        // `ArrayList.add`'s `rangeCheckForAdd` uses.
+        return Some(
+            cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index} Size: {size}"))
+                .into(),
+        );
+    }
+    // `ImmutableCollections.ListN` (0 or 3+ elements) indexes its array
+    // directly, so the array access itself throws the subclass.
+    Some(cratonvm_types::error::RuntimeError::aioobe(index, size).into())
+}
+
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
@@ -4031,13 +4217,12 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         //   List.of(a,b,c,d)     -> ArrayIndexOutOfBoundsException
         //
         // i.e. the JDK splits on `ImmutableCollections.List12` vs `ListN`, which
-        // index their storage differently. Two of those three want the subclass,
-        // and this VM funnels every unmodifiable/immutable list through ONE
-        // synthetic class, so there is no discriminator here that would let the
-        // 1-2 element case be told from `Collections.unmodifiableList` over a
-        // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
-        // split would mean guessing; keeping the status quo for this path is the
-        // honest option, and it is right for 0 and 3+ elements.
+        // index their storage differently. This VM funnels every
+        // unmodifiable/immutable list through ONE synthetic class -- but not
+        // through one object shape: slot 1 carries `UNMOD_FIELD_IMMUTABLE`, and
+        // `unmod_list_oob_error` makes the split from it. See that function for
+        // the measured table and for why the `Collections.unmodifiable*` case
+        // must delegate rather than answer here.
         //
         // The SIZE, though, must not come from `al_state`. That reads an
         // `elementData`-shaped backing and reports 0 for anything else, so an
@@ -4065,7 +4250,11 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let (data, al_size) = al_state(ctx, b);
         if let Some(n) = unmod_view_size(data, al_size) {
             if index < 0 || index >= n {
-                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+                if let Some(err) = unmod_list_oob_error(&*ctx, this, index, n) {
+                    return Err(err);
+                }
+                // `None` = a `Collections.unmodifiable*` view. Fall through to
+                // the delegation below and let the backing throw its own.
             }
         }
         // Unreadable backing: stand aside, exactly as `native_unmod_get` does.
@@ -4074,14 +4263,26 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `Collections$SingletonList` keeps its one element in a field, not in an
     // `elementData` array, so `al_state` reports size 0 and every index looked
     // out of range. Same reason `size()` needed `singleton_wrapper_size`.
-    if singleton_wrapper_size(ctx, this) == Some(1) {
-        if index != 0 {
+    match singleton_wrapper_size(ctx, this) {
+        Some(1) => {
+            if index != 0 {
+                // `Collections$SingletonList.get` -> `IndexOutOfBoundsException
+                // ("Index: "+index+", Size: 1")`. Plain class, comma form.
+                return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index: {index}, Size: 1"
+                ))
+                .into());
+            }
+            return Ok(Some(ctx.get_field_by_name(this, "element")));
+        }
+        Some(0) => {
+            // `Collections$EmptyList.get` names no size at all — its message is
+            // "Index: 0", full stop. Measured; not an omission here.
             return Err(
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }
-                    .into(),
+                cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}")).into(),
             );
         }
-        return Ok(Some(ctx.get_field_by_name(this, "element")));
+        _ => {}
     }
     let this = resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
@@ -4192,7 +4393,10 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // "Size" rather than "length"). Measured, not assumed:
         // probes/ListOutOfBoundsProbe against a HotSpot 25 control shows four
         // different OOB wordings across the List API.
-        return Err(cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into());
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index: {index}, Size: {size}"
+        ))
+        .into());
     }
     let index = index as usize;
     // GC-SAFETY: same hazard as `native_al_add` -- `al_ensure_capacity` can
@@ -5075,17 +5279,25 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     let (_, size) = al_state(ctx, this);
-    if from_i32 < 0 || from_i32 > size {
+    // `AbstractList.subListRangeCheck`: the plain class, and a wording that
+    // names WHICH endpoint failed rather than printing an index. The
+    // `fromIndex > toIndex` case below is an IllegalArgumentException, not a
+    // bounds exception at all, and already was.
+    if from_i32 < 0 {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: from_i32 }
-                .into(),
+            cratonvm_types::error::RuntimeError::ioobe(format!("fromIndex = {from_i32}")).into(),
         );
     }
-    if to_i32 < 0 || to_i32 > size {
+    if to_i32 > size {
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: to_i32 }
-                .into(),
+            cratonvm_types::error::RuntimeError::ioobe(format!("toIndex = {to_i32}")).into(),
         );
+    }
+    if from_i32 > size || to_i32 < 0 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "fromIndex = {from_i32}, toIndex = {to_i32}"
+        ))
+        .into());
     }
     if from_i32 > to_i32 {
         return Err(
@@ -6746,11 +6958,7 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     map_resize_inner(ctx, this, is_concurrent);
 }
 
-fn map_resize_inner(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    is_concurrent: bool,
-) {
+fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent: bool) {
     // Bug 1+2+5 (CRIT/HIGH) round-10 fix: only take the resize lock when
     // resizing a CHM segment. Plain `java/util/HashMap.put` is single-
     // threaded; serializing its resize through the striped lock array
@@ -9179,8 +9387,16 @@ fn native_map_remove_pinned(
         // address (fixed-suite-bugs/tomcat/
         // dohead-post-fix-sporadic-residuals-FIXED.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
-        let head_matches =
-            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
+        let head_matches = node_matches_inner(
+            ctx,
+            head_pin,
+            head,
+            is_null_key,
+            hash,
+            key_pin,
+            key_val,
+            identity_mode,
+        )?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -9236,8 +9452,16 @@ fn native_map_remove_pinned(
             // dereferencing either again.
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
-            let curr_matches =
-                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val, identity_mode)?;
+            let curr_matches = node_matches_inner(
+                ctx,
+                curr_pin,
+                curr,
+                is_null_key,
+                hash,
+                key_pin,
+                key_val,
+                identity_mode,
+            )?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
@@ -10765,7 +10989,10 @@ fn make_view_set_of(
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, present_marker(elem)]) {
+        if let Err(e) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing)), elem, present_marker(elem)],
+        ) {
             ctx.unpin_native_roots(first_pin);
             return Err(e);
         }
@@ -11483,7 +11710,10 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]);
+        let _ = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
+        );
     }
     let set = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(set_pin);
@@ -11746,7 +11976,8 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             for i in 0..keys.len() {
                 let other = ctx.read_native_pin(other_pin, other);
                 let key = read_pinned_elem(ctx, handles[i], keys[i]);
-                let contains = ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[key])?;
+                let contains =
+                    ctx.invoke_virtual(other, "contains", "(Ljava/lang/Object;)Z", &[key])?;
                 if !matches!(contains, Some(Value::Int(1))) {
                     return Ok(false);
                 }
@@ -13086,7 +13317,11 @@ fn native_arrays_array_list_get(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return Ok(Some(Value::Object(None)));
     };
     if index < 0 || index as usize >= ctx.array_length(arr) {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        // `Arrays$ArrayList` has no bounds check of its own: it indexes `a[i]`
+        // directly, so what a caller sees is the ARRAY access failing. Hence
+        // the subclass, and hence the array-access wording rather than the
+        // index-only one.
+        return Err(RuntimeError::aioobe(index, ctx.array_length(arr) as i32).into());
     }
     Ok(Some(ctx.get_array_element(arr, index as usize)))
 }
@@ -15988,7 +16223,10 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]) {
+        if let Err(err) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
+        ) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -16165,7 +16403,6 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let r = make_map_of(ctx, &[(k1, v1), (k2, v2)]);
     freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
-
 
 // ===========================================================================
 // Stream API — Eager evaluation on Vec<Value>
@@ -26729,7 +26966,10 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     for (i, val) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, present_marker(val)]) {
+        if let Err(e) = native_map_put(
+            ctx,
+            &[Value::Object(Some(backing)), val, present_marker(val)],
+        ) {
             ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
@@ -27071,10 +27311,7 @@ const CMP_TAG_COMPARING_INT: i32 = 6;
 const CMP_TAG_COMPARING_LONG: i32 = 7;
 const CMP_TAG_COMPARING_DOUBLE: i32 = 8;
 
-fn make_comparator(
-    ctx: &mut dyn NativeContext,
-    tag: i32,
-) -> Result<ObjectRef, MethodCallFailed> {
+fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> Result<ObjectRef, MethodCallFailed> {
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.Comparator$Native`; it stands in for the comparator objects
     // the real `Comparator` factory methods return.
@@ -29865,9 +30102,7 @@ fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let element = args.get(2).copied().unwrap_or(Value::Object(None));
     let size = ll_size(ctx, this);
     if index < 0 || index > size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(ll_out_of_bounds(index, size));
     }
     if index == size {
         ll_link_last(ctx, this, element);
@@ -29892,9 +30127,7 @@ fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this);
     if index < 0 || index >= size {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(ll_out_of_bounds(index, size));
     }
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ll_unlink_node(ctx, this, node))),
@@ -29937,6 +30170,18 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
 }
 
+/// `LinkedList`'s private `outOfBoundsMsg`, shared by every positional
+/// operation: `"Index: " + index + ", Size: " + size`.
+///
+/// The plain `IndexOutOfBoundsException`, not the array subclass — measured on
+/// Temurin 25, and the subclass is the direction that breaks a `catch`. Note
+/// the COMMA: `ArrayList.add(int, E)` uses this same wording, but
+/// `ImmutableCollections.List12` uses a SPACE ("Index: 3 Size: 1"). Three
+/// receivers, three shapes; `probes/ListOutOfBoundsProbe` holds all three.
+fn ll_out_of_bounds(index: i32, size: i32) -> MethodCallFailed {
+    cratonvm_types::error::RuntimeError::ioobe(format!("Index: {index}, Size: {size}")).into()
+}
+
 fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -29948,9 +30193,10 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
-        None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        ),
+        None => {
+            let size = ll_size(ctx, this);
+            Err(ll_out_of_bounds(index, size))
+        }
     }
 }
 
@@ -29977,9 +30223,10 @@ fn native_ll_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             ctx.set_field(node, LL_NODE_ELEM, new_val);
             Ok(Some(old))
         }
-        None => Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
-        ),
+        None => {
+            let size = ll_size(ctx, this);
+            Err(ll_out_of_bounds(index, size))
+        }
     }
 }
 
@@ -30622,9 +30869,7 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
 /// [`for_each_overlay_ref`]. Cached, because the root scan runs on every GC.
 fn lhm_root_all() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some())
 }
 
 fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
@@ -33560,12 +33805,7 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let (data, size) = al_state(ctx, this);
     if idx >= size as usize {
-        return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: idx as i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
     }
     if let Some(buf) = data {
         ctx.set_array_element(buf, idx, elem);
@@ -42194,7 +42434,14 @@ fn native_chm_get_string_fast(
         let after_mutation = chm_seg_mutation_snapshot(seg_id);
         if before_mutation == after_mutation && before_mutation.1 == 0 {
             if let Some(key_text) = ctx.read_string(key) {
-                ctx.chm_string_node_cache_put(this, seg_id, key, &key_text, node, before_mutation.0);
+                ctx.chm_string_node_cache_put(
+                    this,
+                    seg_id,
+                    key,
+                    &key_text,
+                    node,
+                    before_mutation.0,
+                );
             }
         }
     }
@@ -45733,13 +45980,10 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // indexes its array directly), while the 1-2 element `List12` throws the
     // plain class with a different wording again ("Index: 3 Size: 1").
     //
-    // Two of the three want the subclass, and this VM funnels every
-    // unmodifiable/immutable list through ONE synthetic class -- there is no
-    // discriminator here that separates a 1-2 element `List.of` from
-    // `Collections.unmodifiableList` over a 1-2 element `ArrayList`, which
-    // wants the plain class. Reproducing the JDK's split would be guessing;
-    // holding this path where it was is right for 0 and 3+ elements and is the
-    // status quo for the rest.
+    // The discriminator is slot 1 (`UNMOD_FIELD_IMMUTABLE`), not the class:
+    // `unmod_list_oob_error` separates a 1-2 element `List.of` from
+    // `Collections.unmodifiableList` over a 1-2 element `ArrayList` with the
+    // same bit `getClass()` already splits on. See that function.
     if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
     {
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
@@ -45761,7 +46005,12 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let (data, al_size) = al_state(ctx, backing);
             if let Some(n) = unmod_view_size(data, al_size) {
                 if *index < 0 || *index >= n {
-                    return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+                    if let Some(err) = unmod_list_oob_error(&*ctx, *this, *index, n) {
+                        return Err(err);
+                    }
+                    // `None` = a `Collections.unmodifiable*` view; `unmod_delegate`
+                    // below lets the backing throw its own, which is what HotSpot
+                    // does for that receiver.
                 }
             }
             // `None` = `al_state` could not read this backing. STAND ASIDE and
@@ -46067,9 +46316,23 @@ fn native_unmod_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if index < 0 || index > len {
-        // JDK throws IndexOutOfBoundsException; ArrayIndexOutOfBoundsException
-        // is a subclass, so `catch (IndexOutOfBoundsException)` still catches.
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        // The JDK throws the PLAIN `IndexOutOfBoundsException`. Throwing the
+        // subclass because "a `catch (IndexOutOfBoundsException)` still catches
+        // it" was the old rationale here, and it is the wrong way round: the
+        // subclass passes every catch the superclass would, and fails every
+        // test of the class itself.
+        //
+        // The wording follows the same split as `unmod_list_oob_error` — a
+        // SPACE for the immutable factories ("Index: 5 Size: 2"),
+        // `ArrayList`/`LinkedList`'s comma for an unmodifiable view.
+        let immutable = matches!(args.first(), Some(Value::Object(Some(this)))
+            if unmod_is_immutable(&*ctx, *this));
+        let message = if immutable {
+            format!("Index: {index} Size: {len}")
+        } else {
+            format!("Index: {index}, Size: {len}")
+        };
+        return Err(RuntimeError::ioobe(message).into());
     }
     Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
         ctx, snapshot, index,
@@ -49144,9 +49407,8 @@ fn cslm_arrays(
     let mut keys = match keys_opt {
         Some(k) => k,
         None => {
-            let (moved, k) = rooted_across1(ctx, this, |ctx| {
-                alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY)
-            });
+            let (moved, k) =
+                rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, CSLM_DEFAULT_CAPACITY));
             this = moved;
             ctx.set_field(this, CSLM_FIELD_KEYS, Value::Object(Some(k)));
             k
@@ -52761,9 +53023,7 @@ mod tests {
     /// already-marked owner.
     #[test]
     fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
-        use super::{
-            obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry,
-        };
+        use super::{obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry};
         // Tests the PREDICATE directly, not `gc_overlay_roots_for_collection`,
         // so it documents the defect regardless of whether enforcement is
         // enabled — which it is NOT by default; see
@@ -54457,7 +54717,11 @@ mod tests {
             }
 
             /// Allocate an object of `class_id` with `num_fields` slots.
-            pub(super) fn alloc_object_of(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+            pub(super) fn alloc_object_of(
+                &self,
+                class_id: ClassId,
+                num_fields: usize,
+            ) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
                 let obj = s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); num_fields],
