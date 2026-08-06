@@ -4310,17 +4310,28 @@ fn s2_typed_view_byte_start(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 /// `None` in synthetic-JDK mode (where the class does not exist, or exists only
 /// as a fabricated stub with no method bodies), which is what keeps the copying
 /// fallback below reachable.
-fn s2_bbacb_view_class(ctx: &dyn NativeContext, order: i32) -> Option<&'static str> {
+fn s2_bbacb_view_class(ctx: &mut dyn NativeContext, order: i32) -> Option<&'static str> {
     let cls = if order == 1 {
         "java/nio/ByteBufferAsCharBufferL"
     } else {
         "java/nio/ByteBufferAsCharBufferB"
     };
-    if ctx.class_id_by_name(cls).is_some() && !ctx.is_class_synthetic_stub(cls) {
-        Some(cls)
-    } else {
-        None
+    // `class_id_by_name` alone answers "already loaded", and nothing loads this
+    // class before the first `asCharBuffer` — so asking that way said "absent"
+    // on a real JDK and silently kept the copying fallback. Drive the load.
+    //
+    // The return value of `ensure_class_initialized` is not the test:
+    // `--jdk-only` aside, it fabricates a bare stub rather than failing. Ask
+    // the property instead — a stub has no method bodies, so handing one back
+    // would trade `AbstractMethodError` for a buffer whose every method is a
+    // no-op.
+    if ctx.ensure_class_initialized(cls).is_err() {
+        return None;
     }
+    if ctx.is_class_synthetic_stub(cls) {
+        return None;
+    }
+    Some(cls)
 }
 
 fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
