@@ -15854,6 +15854,21 @@ mod jit_native_dispatch_profile {
                 note_site_identity(key, &GET_INFO);
             }
         });
+        // What the gate BUYS, on the one call site that used to lack it
+        // (`jit_invoke_virtual_mic`, fixed by `5d299ca6f`). This is the
+        // steady state, and the CHEAPEST case: the key is already in the map
+        // and still names the same site, so it is one thread-local access,
+        // one `FxHashMap` lookup and three `String` comparisons, with no
+        // insert and no `eprintln!`. The very first call for a key is dearer
+        // — it allocates and stores three `String`s in a map that is never
+        // bounded and never cleared — and a key that HAS been recycled costs
+        // that again plus the event line. Seed the entry first, or this
+        // measures the insert on pass 1 and the hit on passes 2..N and goes
+        // flat at neither.
+        note_site_identity(key, &GET_INFO);
+        rung("note_site_identity() UNGUARDED [warm hit]", || {
+            note_site_identity(black_box(key), &GET_INFO);
+        });
         rung("OBJECT_NATIVE_DISPATCH_CACHE probe (miss)", || {
             black_box(OBJECT_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().get(&key).copied()));
         });

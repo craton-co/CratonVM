@@ -3816,6 +3816,39 @@ impl ClassManager {
             // Same reasoning as SSLSocketOutputStream above, InputStream side.
             self.get_loaded_class_id("java/io/InputStream")
                 .or_else(|| self.get_loaded_class_id("java/lang/Object"))
+        } else if name == "cratonvm/synthetic/Process" {
+            // Same reasoning again, for the object `ProcessBuilder.start()`
+            // hands back (`native-io`'s `spawn_and_wrap`).
+            //
+            // With the blanket `java/lang/Object` superclass below, the VM
+            // contradicted itself about this class: `Process.class
+            // .isAssignableFrom(p.getClass())` answered `true` — the subtype
+            // machinery knows the relation — while walking
+            // `p.getClass().getSuperclass()` never reached `java.lang.Process`.
+            // Measured against HotSpot 25:
+            //
+            //   HotSpot   ProcessImpl -> Process -> Object    consistent
+            //   CratonVM  synthetic/Process -> Object         NOT consistent
+            //
+            // `instanceof`, casts, `isInstance`, `isAssignableFrom`, `List.of`
+            // and array stores all agreed with HotSpot; only the hand-walked
+            // hierarchy disagreed, which is precisely the shape serialization
+            // frameworks, DI containers, matchers and mock frameworks use to
+            // decide assignability. Naming the real ancestor makes the two
+            // answers agree.
+            //
+            // `java.lang.Process` is abstract, which costs nothing here: this
+            // class is concrete and is allocated directly by a native, never
+            // through `new`, so no instantiability check consults the super.
+            //
+            // The natives keep winning for this receiver — dispatch probes the
+            // registry from the receiver's OWN class name first, and both
+            // `cratonvm/synthetic/Process` and `java/lang/Process` are
+            // registered — so inheriting `Process`'s concrete bytecode does not
+            // change which body runs. See `process.rs::is_vm_process`, which
+            // keys on this exact name.
+            self.get_loaded_class_id("java/lang/Process")
+                .or_else(|| self.get_loaded_class_id("java/lang/Object"))
         } else {
             self.get_loaded_class_id("java/lang/Object")
         };
