@@ -77,7 +77,15 @@ pub const JNI_OK: JInt = 0;
 pub const JNI_ERR: JInt = -1;
 pub const JNI_FALSE: JBoolean = 0;
 pub const JNI_TRUE: JBoolean = 1;
-pub const JNI_FUNCTION_COUNT: usize = 234;
+/// Number of slots in the `JNIEnv` function table.
+///
+/// This is a property of the JNI HEADER a native was compiled against, not a
+/// choice: `(*env)->IsVirtualThread(env, o)` compiles to a load from slot 234,
+/// and a table with 234 entries makes that load read one word PAST the
+/// allocation. JDK 25's `jni.h` ends at slot 235
+/// (`GetStringUTFLengthAsLong`), so the table is sized to 236 and every slot
+/// through the end of the header is wired or holds `jni_stub`.
+pub const JNI_FUNCTION_COUNT: usize = 236;
 pub const JNI_INVOKE_FUNCTION_COUNT: usize = 8;
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1426,29 @@ fn jni_surface_jdk_only(
             raise_jdk_only_violation(shared, thread, &violation);
             None
         }
+        // An ordinary Java exception thrown by the method the native called.
+        //
+        // JNI's contract is that it is PENDING when the up-call returns, so
+        // the native's `ExceptionCheck` sees it and can decide what to do;
+        // discarding it — which this arm used to do, along with every other
+        // failure — meant a native saw a `0` return from a method that had in
+        // fact thrown, with nothing pending to say so. That was unobservable
+        // for as long as the bare-varargs `Call<T>Method(...)` slots raised
+        // UnsatisfiedLinkError instead of dispatching; it is reachable now
+        // that they work.
+        //
+        // Published in place rather than through
+        // `set_jni_pending_exception_object`, which would re-enter
+        // `with_jni_context` for the `&mut JvmThread` this scope already
+        // holds. Same two writes: the raw handle for `ExceptionOccurred`, and
+        // the GC-remapped `native_pending_return` that is authoritative at the
+        // native's own return.
+        Err(crate::error::MethodCallFailed::ExceptionThrown(exc)) => {
+            let handle = obj_to_jobject(exc);
+            JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+            thread.native_pending_return = Some(exc);
+            None
+        }
         Err(_) => None,
     }
 }
@@ -2243,7 +2274,50 @@ extern "C" fn jni_exception_occurred(_env: JNIEnv) -> JThrowable {
 }
 
 // ---- Index 16: ExceptionDescribe ----
-extern "C" fn jni_exception_describe(_env: JNIEnv) {}
+///
+/// Prints the pending exception and **clears it** — the clear is the part that
+/// matters for control flow, and the empty no-op this used to be did neither.
+/// `if (ExceptionCheck(env)) { ExceptionDescribe(env); return -1; }` is the
+/// canonical JNI error path, and it is written on the understanding that
+/// nothing is pending afterwards; leaving the exception in place means it is
+/// delivered at the native's return to a caller that believes it was handled.
+extern "C" fn jni_exception_describe(_env: JNIEnv) {
+    let handle = JNI_PENDING_EXCEPTION.with(|cell| cell.get());
+    if handle == 0 {
+        return;
+    }
+    // Prefer the GC-remapped root over the raw handle, as `ExceptionOccurred`
+    // does — a collection may have moved the throwable since it was recorded.
+    let exc = with_jni_context(|_shared, thread| thread.native_pending_return)
+        .flatten()
+        .or_else(|| jobject_to_obj(handle));
+    // Clear FIRST: the print below is a Java up-call, and it must not run with
+    // this exception still pending.
+    JNI_PENDING_EXCEPTION.with(|cell| cell.set(0));
+    let _ = with_jni_context(|_shared, thread| {
+        thread.native_pending_return = None;
+    });
+    let Some(exc) = exc else {
+        return;
+    };
+    let _ = with_jni_context(|shared, thread| {
+        let class_id = shared.mem.heap.class_id_of(exc);
+        let printed = invoke_on_class_shared(
+            shared,
+            thread,
+            class_id,
+            "printStackTrace",
+            "()V",
+            &[Value::Object(Some(exc))],
+        );
+        // A failure while REPORTING must not become a second pending
+        // exception the caller never asked about.
+        if printed.is_err() {
+            JNI_PENDING_EXCEPTION.with(|cell| cell.set(0));
+            thread.native_pending_return = None;
+        }
+    });
+}
 
 // ---- Index 17: ExceptionClear ----
 extern "C" fn jni_exception_clear(_env: JNIEnv) {
@@ -4028,7 +4102,23 @@ extern "C" fn jni_get_java_vm(_env: JNIEnv, vm: *mut JavaVM) -> JInt {
 
 // ---- Index 228: ExceptionCheck ----
 extern "C" fn jni_exception_check(_env: JNIEnv) -> JBoolean {
-    JNI_FALSE
+    // This returned `JNI_FALSE` unconditionally — a constant, not a check.
+    //
+    // `if ((*env)->ExceptionCheck(env)) { … }` is how essentially every JNI
+    // library asks "did that up-call throw?", so a hard `false` did not fail
+    // loudly: it made every error-handling branch in every native library
+    // unreachable, and each caller went on to use a return value the JNI
+    // spec leaves undefined once an exception is pending.
+    //
+    // The pending slot is the authority here rather than
+    // `native_pending_return`, because the slot is what `ExceptionClear`
+    // resets — a check that consulted the root instead would keep answering
+    // `true` after the native had cleared.
+    if JNI_PENDING_EXCEPTION.with(|cell| cell.get()) != 0 {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 // ---- Index 5: DefineClass ----
@@ -4682,6 +4772,248 @@ extern "C" fn jni_varargs_unsupported() -> usize {
     0
 }
 
+
+// ---------------------------------------------------------------------------
+// Bare-varargs Call<Type>Method(...) trampolines
+// ---------------------------------------------------------------------------
+//
+// The `...` forms are a third of the JNI call surface and cannot be WRITTEN in
+// stable Rust — defining a C-variadic function is still unstable (rust-lang
+// #44930). They can, however, be ENTERED in assembly: a variadic callee's only
+// extra obligation over an ordinary one is to materialise the `va_list` its ABI
+// describes, and once it has, the `...MethodV` implementation already in this
+// file does the rest. So every `...` slot gets a small trampoline that builds
+// the platform `va_list` and hands off to its `V` sibling.
+//
+// `call` then `leave`/`ret`, not a tail `jmp`: the `va_list` and its register
+// save area live in THIS frame and must outlive the callee. The return value
+// needs no handling — RAX and XMM0 pass straight through — which is also why
+// one trampoline shape serves `jint`, `jlong`, `jobject`, `jdouble` and `void`
+// alike.
+//
+// Two named-argument counts cover every slot:
+//   3 named — `(env, obj|clazz, methodID, ...)`: NewObject, Call<T>Method,
+//             CallStatic<T>Method
+//   4 named — `(env, obj, clazz, methodID, ...)`: CallNonvirtual<T>Method
+//
+// Anything that is not x86-64 keeps `jni_varargs_unsupported`, which raises
+// UnsatisfiedLinkError rather than fabricating a 0/null.
+
+/// System V x86-64: spill the six GP and eight SSE argument registers into a
+/// 176-byte register-save area, then hand the callee a `__va_list_tag` whose
+/// `gp_offset` already skips the named arguments.
+///
+/// Frame after `push rbp; sub rsp,224` — RSP stays 16-aligned, which `movaps`
+/// requires:
+///   `[rsp    .. rsp+23 ]` the `__va_list_tag`
+///   `[rsp+32 .. rsp+207]` the register-save area (6x8 GP, then 8x16 SSE)
+///
+/// `AL` carries the caller's count of SSE argument registers used, so the
+/// `movaps` block is skipped entirely for the common all-integer call.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+macro_rules! jni_varargs_trampoline {
+    (@n 3, $sym:ident, $target:path) => {
+        jni_varargs_trampoline!(@emit $sym, $target, "24", "lea rcx, [rsp]", "");
+    };
+    (@n 4, $sym:ident, $target:path) => {
+        jni_varargs_trampoline!(@emit $sym, $target, "32", "mov rcx, [rsp+56]", "lea r8, [rsp]");
+    };
+    (@emit $sym:ident, $target:path, $gp_off:literal, $tail1:literal, $tail2:literal) => {
+        core::arch::global_asm!(
+            ".p2align 4",
+            concat!(".globl ", stringify!($sym)),
+            concat!(stringify!($sym), ":"),
+            "push rbp",
+            "mov rbp, rsp",
+            "sub rsp, 224",
+            "mov [rsp+32], rdi",
+            "mov [rsp+40], rsi",
+            "mov [rsp+48], rdx",
+            "mov [rsp+56], rcx",
+            "mov [rsp+64], r8",
+            "mov [rsp+72], r9",
+            "test al, al",
+            "je 1f",
+            "movaps [rsp+80], xmm0",
+            "movaps [rsp+96], xmm1",
+            "movaps [rsp+112], xmm2",
+            "movaps [rsp+128], xmm3",
+            "movaps [rsp+144], xmm4",
+            "movaps [rsp+160], xmm5",
+            "movaps [rsp+176], xmm6",
+            "movaps [rsp+192], xmm7",
+            "1:",
+            concat!("mov dword ptr [rsp], ", $gp_off), // gp_offset skips the named args
+            "mov dword ptr [rsp+4], 48",               // fp_offset: start of the SSE area
+            "lea rax, [rbp+16]",                       // overflow_arg_area = 1st stack arg
+            "mov [rsp+8], rax",
+            "lea rax, [rsp+32]",                       // reg_save_area
+            "mov [rsp+16], rax",
+            "mov rdi, [rsp+32]",                       // re-load the named args
+            "mov rsi, [rsp+40]",
+            "mov rdx, [rsp+48]",
+            $tail1,
+            $tail2,
+            "call {target}",
+            "leave",
+            "ret",
+            target = sym $target,
+        );
+    };
+}
+
+/// Windows x64: every argument, named or variadic, arrives in RCX/RDX/R8/R9
+/// then on the stack, and the caller always reserved the 32-byte home area at
+/// `[rsp+8]`. Spilling the four register arguments into their home slots makes
+/// the whole argument list one contiguous run of 8-byte slots — which IS the
+/// Windows `va_list`. A `double` vararg is passed in both its GP register and
+/// its XMM register, so the GP spill carries the bits.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+macro_rules! jni_varargs_trampoline {
+    (@n 3, $sym:ident, $target:path) => {
+        // 3 named: RCX/RDX/R8 already hold them; the va_list is the 4th arg.
+        jni_varargs_trampoline!(@emit $sym, $target, "lea rax, [rsp+32]",
+                                "sub rsp, 32", "mov r9, rax");
+    };
+    (@n 4, $sym:ident, $target:path) => {
+        // 4 named: all four registers are named, so the va_list is the 5th arg
+        // and goes on the stack just above the 32-byte shadow space.
+        jni_varargs_trampoline!(@emit $sym, $target, "lea rax, [rsp+40]",
+                                "sub rsp, 48", "mov [rsp+32], rax");
+    };
+    (@emit $sym:ident, $target:path, $lea:literal, $tail1:literal, $tail2:literal) => {
+        core::arch::global_asm!(
+            ".p2align 4",
+            concat!(".globl ", stringify!($sym)),
+            concat!(stringify!($sym), ":"),
+            "mov [rsp+8], rcx",  // home slots, in the caller's shadow space
+            "mov [rsp+16], rdx",
+            "mov [rsp+24], r8",
+            "mov [rsp+32], r9",
+            $lea,                // rax = &first variadic argument
+            "push rbp",
+            "mov rbp, rsp",
+            $tail1,              // shadow space (+ the 5th arg slot when needed)
+            $tail2,
+            "call {target}",
+            "mov rsp, rbp",
+            "pop rbp",
+            "ret",
+            target = sym $target,
+        );
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! jni_varargs_trampolines {
+    ($( $sym:ident => ($target:path, $named:tt) ),* $(,)?) => {
+        $( jni_varargs_trampoline!(@n $named, $sym, $target); )*
+        extern "C" {
+            $(
+                /// Assembly trampoline; only ever used for its ADDRESS.
+                fn $sym();
+            )*
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+jni_varargs_trampolines! {
+    jni_va_new_object => (jni_new_object_v, 3),
+
+    jni_va_call_object_method  => (jni_call_object_method_v, 3),
+    jni_va_call_boolean_method => (jni_call_boolean_method_v, 3),
+    jni_va_call_byte_method    => (jni_call_byte_method_v, 3),
+    jni_va_call_char_method    => (jni_call_char_method_v, 3),
+    jni_va_call_short_method   => (jni_call_short_method_v, 3),
+    jni_va_call_int_method     => (jni_call_int_method_v, 3),
+    jni_va_call_long_method    => (jni_call_long_method_v, 3),
+    jni_va_call_float_method   => (jni_call_float_method_v, 3),
+    jni_va_call_double_method  => (jni_call_double_method_v, 3),
+    jni_va_call_void_method    => (jni_call_void_method_v, 3),
+
+    jni_va_call_nonvirtual_object_method  => (jni_call_nonvirtual_object_method_v, 4),
+    jni_va_call_nonvirtual_boolean_method => (jni_call_nonvirtual_boolean_method_v, 4),
+    jni_va_call_nonvirtual_byte_method    => (jni_call_nonvirtual_byte_method_v, 4),
+    jni_va_call_nonvirtual_char_method    => (jni_call_nonvirtual_char_method_v, 4),
+    jni_va_call_nonvirtual_short_method   => (jni_call_nonvirtual_short_method_v, 4),
+    jni_va_call_nonvirtual_int_method     => (jni_call_nonvirtual_int_method_v, 4),
+    jni_va_call_nonvirtual_long_method    => (jni_call_nonvirtual_long_method_v, 4),
+    jni_va_call_nonvirtual_float_method   => (jni_call_nonvirtual_float_method_v, 4),
+    jni_va_call_nonvirtual_double_method  => (jni_call_nonvirtual_double_method_v, 4),
+    jni_va_call_nonvirtual_void_method    => (jni_call_nonvirtual_void_method_v, 4),
+
+    jni_va_call_static_object_method  => (jni_call_static_object_method_v, 3),
+    jni_va_call_static_boolean_method => (jni_call_static_boolean_method_v, 3),
+    jni_va_call_static_byte_method    => (jni_call_static_byte_method_v, 3),
+    jni_va_call_static_char_method    => (jni_call_static_char_method_v, 3),
+    jni_va_call_static_short_method   => (jni_call_static_short_method_v, 3),
+    jni_va_call_static_int_method     => (jni_call_static_int_method_v, 3),
+    jni_va_call_static_long_method    => (jni_call_static_long_method_v, 3),
+    jni_va_call_static_float_method   => (jni_call_static_float_method_v, 3),
+    jni_va_call_static_double_method  => (jni_call_static_double_method_v, 3),
+    jni_va_call_static_void_method    => (jni_call_static_void_method_v, 3),
+}
+
+/// The 31 bare-varargs slots, paired with what serves each: the trampoline on
+/// x86-64, `jni_varargs_unsupported` everywhere else.
+#[cfg(target_arch = "x86_64")]
+fn jni_varargs_slots() -> [(usize, usize); 31] {
+    macro_rules! slot {
+        ($idx:expr, $sym:ident) => {
+            ($idx, $sym as *const () as usize)
+        };
+    }
+    [
+        slot!(28, jni_va_new_object),
+        slot!(34, jni_va_call_object_method),
+        slot!(37, jni_va_call_boolean_method),
+        slot!(40, jni_va_call_byte_method),
+        slot!(43, jni_va_call_char_method),
+        slot!(46, jni_va_call_short_method),
+        slot!(49, jni_va_call_int_method),
+        slot!(52, jni_va_call_long_method),
+        slot!(55, jni_va_call_float_method),
+        slot!(58, jni_va_call_double_method),
+        slot!(61, jni_va_call_void_method),
+        slot!(64, jni_va_call_nonvirtual_object_method),
+        slot!(67, jni_va_call_nonvirtual_boolean_method),
+        slot!(70, jni_va_call_nonvirtual_byte_method),
+        slot!(73, jni_va_call_nonvirtual_char_method),
+        slot!(76, jni_va_call_nonvirtual_short_method),
+        slot!(79, jni_va_call_nonvirtual_int_method),
+        slot!(82, jni_va_call_nonvirtual_long_method),
+        slot!(85, jni_va_call_nonvirtual_float_method),
+        slot!(88, jni_va_call_nonvirtual_double_method),
+        slot!(91, jni_va_call_nonvirtual_void_method),
+        slot!(114, jni_va_call_static_object_method),
+        slot!(117, jni_va_call_static_boolean_method),
+        slot!(120, jni_va_call_static_byte_method),
+        slot!(123, jni_va_call_static_char_method),
+        slot!(126, jni_va_call_static_short_method),
+        slot!(129, jni_va_call_static_int_method),
+        slot!(132, jni_va_call_static_long_method),
+        slot!(135, jni_va_call_static_float_method),
+        slot!(138, jni_va_call_static_double_method),
+        slot!(141, jni_va_call_static_void_method),
+    ]
+}
+
+/// See the x86-64 arm: same slot indices, all refusing loudly.
+#[cfg(not(target_arch = "x86_64"))]
+fn jni_varargs_slots() -> [(usize, usize); 31] {
+    let refuse = jni_varargs_unsupported as *const () as usize;
+    let mut out = [(0usize, refuse); 31];
+    let idx = [
+        28, 34, 37, 40, 43, 46, 49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 79, 82, 85, 88, 91, 114,
+        117, 120, 123, 126, 129, 132, 135, 138, 141,
+    ];
+    for (o, i) in out.iter_mut().zip(idx) {
+        o.0 = i;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers for field access
 // ---------------------------------------------------------------------------
@@ -5022,7 +5354,13 @@ pub unsafe fn dispatch_jni_native(
     // `ret_char` was already computed above to decide `fp_return`.
     match ret_char {
         b'V' => Value::Object(None),
-        b'Z' => Value::Int((raw_result & 1) as i32),
+        // `jboolean` is a byte, and Java's `boolean` is 0 or 1, so the return
+        // has to be normalised — but by VALUE, the way HotSpot's native
+        // wrapper does it (`movzbl` then `setne`), not by the low BIT. A
+        // native that returns a flag word rather than a literal `JNI_TRUE`
+        // — `return flags & MASK;` is ordinary C — hands back something like
+        // `0x80`, which `& 1` reads as FALSE and HotSpot reads as true.
+        b'Z' => Value::Int((raw_result as u8 != 0) as i32),
         b'B' => Value::Int(raw_result as i8 as i32),
         b'C' => Value::Int(raw_result as u16 as i32),
         b'S' => Value::Int(raw_result as i16 as i32),
@@ -5084,25 +5422,31 @@ impl JniArg {
 }
 
 /// Validate a JNI native function pointer before calling through it.
-/// Returns `false` (and logs) for null / misaligned pointers.
+/// Returns `false` (and logs) for a null pointer, and for an entry address the
+/// TARGET ISA cannot execute.
+///
+/// "Cannot execute" is an architecture fact, not a style preference, and the
+/// two are not interchangeable. x86-64 instructions have NO alignment
+/// requirement at all: a function may legally start on an odd byte, and gcc
+/// does exactly that for small leaf functions — `cc -shared -fPIC -O1` on the
+/// strict corpus’s own JNI fixture put `add` at `0x11f7`, `mulLong` at
+/// `0x11ff` and `scale` at `0x120b`. The `fn_ptr % 2 != 0` check this function
+/// used to apply therefore REFUSED seven of the twelve natives in that library
+/// and returned 0 for each, which the Java side read as `add(40,2) == 0` —
+/// silent data corruption produced by a guard, from a correctly resolved
+/// pointer into correctly compiled code. Measured 2026-08-06 against the
+/// HotSpot 25 arm binding the same `.so`.
+///
+/// aarch64 is different and keeps its check: A64 instructions are fixed-width
+/// and must be 4-byte aligned, so an unaligned entry there really would fault.
 #[inline]
 fn jni_fn_ptr_ok(fn_ptr: usize) -> bool {
     if fn_ptr == 0 {
         tracing::error!("JNI call with null function pointer — returning 0");
         return false;
     }
-    // Alignment check: function pointers must be at least 2-byte aligned
-    // on all modern architectures (4-byte on ARM).
     #[cfg(target_arch = "aarch64")]
     if fn_ptr % 4 != 0 {
-        tracing::error!(
-            "JNI call with misaligned function pointer {:#x} — returning 0",
-            fn_ptr
-        );
-        return false;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    if fn_ptr % 2 != 0 {
         tracing::error!(
             "JNI call with misaligned function pointer {:#x} — returning 0",
             fn_ptr
@@ -5861,13 +6205,109 @@ extern "C" fn jni_release_string_chars(_env: JNIEnv, _str: JString, chars: *cons
 /// Opaque C va_list pointer.
 pub type VaList = *mut u8;
 
+/// A walk over a C `va_list`, in whichever shape the target ABI gives it.
+///
+/// This is not a detail that can be papered over with "8-byte slots". On
+/// **System V x86-64** a `va_list` is a four-field struct — two offsets, an
+/// overflow pointer and a register-save area — because the first six integer
+/// and first eight FP arguments were never on the stack: they live in a save
+/// area the variadic callee spilled them into, and the two classes advance
+/// through it INDEPENDENTLY. Reading that struct as an array of arguments
+/// decodes its own `gp_offset`/`fp_offset` header as argument one.
+///
+/// On **Windows x64** (and Apple's arm64) a `va_list` really is a bare pointer
+/// into a contiguous run of 8-byte slots, which is the shape this code
+/// previously assumed on every platform.
+enum VaCursor {
+    /// Contiguous 8-byte slots: Windows x64, Apple arm64.
+    Flat { p: *const u8 },
+    /// System V x86-64: a pointer to one `__va_list_tag`.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    SysV { tag: *mut SysVVaListTag },
+}
+
+/// The System V x86-64 `__va_list_tag`. `va_list` is a one-element array of
+/// it, so a `va_list` argument decays to a pointer to this.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+#[repr(C)]
+struct SysVVaListTag {
+    /// Byte offset of the next unconsumed INTEGER register slot, 0..48.
+    gp_offset: u32,
+    /// Byte offset of the next unconsumed SSE register slot, 48..176.
+    fp_offset: u32,
+    /// Next stack-passed argument.
+    overflow_arg_area: *mut u8,
+    /// 6 GP slots of 8 bytes, then 8 SSE slots of 16 bytes = 176 bytes.
+    reg_save_area: *mut u8,
+}
+
+/// End of the six integer register slots in a System V register-save area.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+const SYSV_GP_LIMIT: u32 = 6 * 8;
+/// End of the eight SSE register slots in a System V register-save area.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+const SYSV_FP_LIMIT: u32 = 6 * 8 + 8 * 16;
+
+impl VaCursor {
+    fn new(va: VaList) -> Self {
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+        {
+            VaCursor::SysV {
+                tag: va as *mut SysVVaListTag,
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(target_os = "windows"))))]
+        {
+            VaCursor::Flat { p: va as *const u8 }
+        }
+    }
+
+    /// Consume one argument and return its raw 8 bytes. `is_fp` selects the
+    /// SSE class (`float`/`double`); every other JNI argument type, references
+    /// included, is INTEGER class.
+    ///
+    /// # Safety
+    /// The cursor must be positioned on an argument the caller actually
+    /// pushed, in the class the caller pushed it as.
+    unsafe fn next(&mut self, is_fp: bool) -> u64 {
+        match self {
+            VaCursor::Flat { p } => {
+                let v = *(*p as *const u64);
+                *p = p.add(8);
+                v
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+            VaCursor::SysV { tag } => {
+                let t = &mut **tag;
+                if is_fp {
+                    if t.fp_offset < SYSV_FP_LIMIT {
+                        let p = t.reg_save_area.add(t.fp_offset as usize);
+                        t.fp_offset += 16;
+                        return *(p as *const u64);
+                    }
+                } else if t.gp_offset < SYSV_GP_LIMIT {
+                    let p = t.reg_save_area.add(t.gp_offset as usize);
+                    t.gp_offset += 8;
+                    return *(p as *const u64);
+                }
+                // Spilled. Every overflow argument occupies exactly 8 bytes —
+                // a `double` included; only 16-byte-aligned types differ, and
+                // no JNI argument type is one.
+                let p = t.overflow_arg_area;
+                t.overflow_arg_area = t.overflow_arg_area.add(8);
+                *(p as *const u64)
+            }
+        }
+    }
+}
+
 /// Read a JNI method's arguments from a va_list and pack them into a JValue
 /// array.  The caller is responsible for passing the correct `mid` so that we
 /// can look up the method descriptor and determine argument types.
 ///
 /// Returns `std::ptr::null()` on failure; otherwise returns a heap-allocated
 /// JValue slice that the caller must free with `Box::from_raw`.
-fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) {
+fn va_list_to_jvalues(mid: JMethodID, va: VaList) -> (*const JValue, usize) {
     if mid == 0 || va.is_null() {
         return (std::ptr::null(), 0);
     }
@@ -5889,13 +6329,17 @@ fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) 
         return (std::ptr::null(), 0);
     }
     let mut jvalues: Vec<JValue> = Vec::with_capacity(param_types.len());
+    let mut cursor = VaCursor::new(va);
     for &tag in &param_types {
-        // On all supported platforms, va_list args are 8-byte slots.
-        let raw: u64 = unsafe {
-            let val = *(va as *const u64);
-            va = va.add(8);
-            val
-        };
+        // C's default argument promotions apply to everything that reaches a
+        // `...`, and therefore to everything that reaches the `va_list` form:
+        // a `jfloat` argument arrives as a DOUBLE. Reading 'F' as raw 32 bits
+        // — which this loop used to do — decoded half of a double's mantissa.
+        let is_fp = tag == b'F' || tag == b'D';
+        // SAFETY: `cursor` walks a live `va_list` the caller vouched for, and
+        // `param_types` comes from the method's own descriptor, so it consumes
+        // exactly the arguments the caller pushed, in their register classes.
+        let raw: u64 = unsafe { cursor.next(is_fp) };
         let jv = match tag {
             b'Z' => JValue { z: raw as JBoolean },
             b'B' => JValue { b: raw as JByte },
@@ -5903,7 +6347,7 @@ fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) 
             b'S' => JValue { s: raw as JShort },
             b'I' => JValue { i: raw as JInt },
             b'J' => JValue { j: raw as JLong },
-            b'F' => JValue { f: f32::from_bits(raw as u32) },
+            b'F' => JValue { f: f64::from_bits(raw) as f32 },
             b'D' => JValue { d: f64::from_bits(raw) },
             _ /* L, [ */ => JValue { l: raw },
         };
@@ -6584,6 +7028,52 @@ extern "C" fn jni_get_module(_env: JNIEnv, _clazz: JClass) -> JObject {
     0
 }
 
+// ---- Index 234: IsVirtualThread (JNI 21) ----
+extern "C" fn jni_is_virtual_thread(env: JNIEnv, obj: JObject) -> JBoolean {
+    if obj == 0 {
+        return JNI_FALSE;
+    }
+    let clazz = jni_get_object_class(env, obj);
+    if clazz == 0 {
+        return JNI_FALSE;
+    }
+    // Same predicate `vm_exec` uses to decide a thread is virtual: every
+    // virtual thread implementation (`VirtualThread`, `ThreadBuilders$
+    // BoundVirtualThread`) extends `java.lang.BaseVirtualThread`. If that
+    // class was never loaded, no virtual thread exists yet and the answer is
+    // `false` for every receiver.
+    let base = with_shared_vm(|shared| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/BaseVirtualThread")
+    })
+    .flatten();
+    match base {
+        Some(b) => jni_is_assignable_from(env, clazz, b.as_u32() as JClass),
+        None => JNI_FALSE,
+    }
+}
+
+// ---- Index 235: GetStringUTFLengthAsLong (JNI 24) ----
+extern "C" fn jni_get_string_utf_length_as_long(env: JNIEnv, str_obj: JString) -> JLong {
+    // Identical measurement to GetStringUTFLength, in the wider return type
+    // that exists so a string longer than `jsize` can report its real modified
+    // UTF-8 length instead of overflowing.
+    if str_obj == 0 {
+        return 0;
+    }
+    let _ = env;
+    with_shared_vm(|shared| {
+        let oref = jobject_to_obj(str_obj)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
+        Some(modified_utf8_len(&s) as JLong)
+    })
+    .flatten()
+    .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // JNI Function Table (flat array)
 // ---------------------------------------------------------------------------
@@ -6614,22 +7104,30 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[17] = jni_exception_clear as *const () as usize;
     t[18] = jni_fatal_error as *const () as usize;
 
-    // GetObjectRefType
-    t[19] = jni_get_object_ref_type as *const () as usize;
-
-    // Local/global frame management
-    t[20] = jni_push_local_frame as *const () as usize;
-    t[21] = jni_pop_local_frame as *const () as usize;
+    // Local frame management.
+    //
+    // Slots 19..=27 used to sit one HIGHER than `jni.h` puts them, because a
+    // second `GetObjectRefType` had been wired at 19 (its real slot is 232,
+    // still wired below) and pushed everything after it along. A native does
+    // not name these functions — it loads slot N and calls it — so the shift
+    // was silent and total: `DeleteLocalRef` ran `DeleteGlobalRef`,
+    // `NewGlobalRef` ran `PopLocalFrame` (popping a frame the VM still
+    // believed was live), `DeleteGlobalRef` ran `NewGlobalRef` (so every
+    // release leaked a fresh global root), and `IsSameObject` — the idiom
+    // every library uses for `o == null` and for reference identity — ran the
+    // `void` `DeleteLocalRef` and returned whatever was left in RAX.
+    t[19] = jni_push_local_frame as *const () as usize;
+    t[20] = jni_pop_local_frame as *const () as usize;
 
     // References
-    t[22] = jni_new_global_ref as *const () as usize;
-    t[23] = jni_delete_global_ref as *const () as usize;
-    t[24] = jni_delete_local_ref as *const () as usize;
-    t[25] = jni_is_same_object as *const () as usize;
-    t[26] = jni_new_local_ref as *const () as usize;
-    t[27] = jni_ensure_local_capacity as *const () as usize;
-    t[28] = jni_alloc_object as *const () as usize;
-    // t[28] = NewObject (varargs) — not implementable in stable Rust extern "C"
+    t[21] = jni_new_global_ref as *const () as usize;
+    t[22] = jni_delete_global_ref as *const () as usize;
+    t[23] = jni_delete_local_ref as *const () as usize;
+    t[24] = jni_is_same_object as *const () as usize;
+    t[25] = jni_new_local_ref as *const () as usize;
+    t[26] = jni_ensure_local_capacity as *const () as usize;
+    t[27] = jni_alloc_object as *const () as usize;
+    // t[28] = NewObject (bare varargs) — wired with the other `...` slots below.
     t[29] = jni_new_object_v as *const () as usize;
     t[30] = jni_new_object_a as *const () as usize;
 
@@ -6640,14 +7138,17 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     // Method IDs
     t[33] = jni_get_method_id as *const () as usize;
 
-    // Call<Type>Method/V/A — virtual instance (groups of 3: varargs, va_list, array)
-    // Bare-varargs `...` slots (34,37,40,...) can't be dispatched in stable
-    // Rust; wire them to a stub that raises UnsatisfiedLinkError so a native
-    // calling them fails loudly instead of getting a fabricated 0/null. The
-    // V (va_list) and A (jvalue[]) forms below are fully implemented.
-    for slot in [34, 37, 40, 43, 46, 49, 52, 55, 58, 61] {
-        t[slot] = jni_varargs_unsupported as *const () as usize;
+    // The bare-varargs `...` slots — NewObject (28), Call<T>Method (34,37,…),
+    // CallNonvirtual<T>Method (64,67,…) and CallStatic<T>Method (114,117,…) —
+    // go to the assembly trampolines above, which build the platform `va_list`
+    // and hand off to the `V` sibling. On an architecture with no trampoline
+    // they keep `jni_varargs_unsupported`, which raises UnsatisfiedLinkError
+    // rather than fabricating a 0/null return.
+    for (slot, fn_addr) in jni_varargs_slots() {
+        t[slot] = fn_addr;
     }
+
+    // Call<Type>Method/V/A — virtual instance (groups of 3: varargs, va_list, array)
     t[35] = jni_call_object_method_v as *const () as usize;
     t[36] = jni_call_object_method_a as *const () as usize;
     t[38] = jni_call_boolean_method_v as *const () as usize;
@@ -6669,11 +7170,7 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[62] = jni_call_void_method_v as *const () as usize;
     t[63] = jni_call_void_method_a as *const () as usize;
 
-    // CallNonvirtual<Type>Method/V/A (groups of 3)
-    // Bare-varargs `...` slots (64,67,70,...) raise UnsatisfiedLinkError; V/A wired below.
-    for slot in [64, 67, 70, 73, 76, 79, 82, 85, 88, 91] {
-        t[slot] = jni_varargs_unsupported as *const () as usize;
-    }
+    // CallNonvirtual<Type>Method/V/A (groups of 3); the `...` slots are wired above.
     t[65] = jni_call_nonvirtual_object_method_v as *const () as usize;
     t[66] = jni_call_nonvirtual_object_method_a as *const () as usize;
     t[68] = jni_call_nonvirtual_boolean_method_v as *const () as usize;
@@ -6695,11 +7192,7 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[92] = jni_call_nonvirtual_void_method_v as *const () as usize;
     t[93] = jni_call_nonvirtual_void_method_a as *const () as usize;
 
-    // CallStatic<Type>Method/V/A (groups of 3)
-    // Bare-varargs `...` slots (114,117,120,...) raise UnsatisfiedLinkError; V/A wired below.
-    for slot in [114, 117, 120, 123, 126, 129, 132, 135, 138, 141] {
-        t[slot] = jni_varargs_unsupported as *const () as usize;
-    }
+    // CallStatic<Type>Method/V/A (groups of 3); the `...` slots are wired above.
     t[115] = jni_call_static_object_method_v as *const () as usize;
     t[116] = jni_call_static_object_method_a as *const () as usize;
     t[118] = jni_call_static_boolean_method_v as *const () as usize;
@@ -6855,11 +7348,18 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[230] = jni_get_direct_buffer_address as *const () as usize;
     t[231] = jni_get_direct_buffer_capacity as *const () as usize;
 
-    // GetObjectRefType (JNI 1.6) — also at slot 19 for compatibility
+    // GetObjectRefType (JNI 1.6)
     t[232] = jni_get_object_ref_type as *const () as usize;
 
     // GetModule (JNI 9+)
     t[233] = jni_get_module as *const () as usize;
+
+    // IsVirtualThread (JNI 21+) and GetStringUTFLengthAsLong (JNI 24+). Both
+    // are declared by JDK 25's `jni.h`, so a native compiled against it can
+    // load either slot; before the table was widened those two loads read off
+    // the end of the array.
+    t[234] = jni_is_virtual_thread as *const () as usize;
+    t[235] = jni_get_string_utf_length_as_long as *const () as usize;
 
     Box::new(t)
 }
@@ -7765,13 +8265,57 @@ mod tests {
         let local2 = obj_to_jobject(obj2);
         set_jni_context_arc(shared.clone());
         let env = get_jni_env();
-        let func_ptr = unsafe { *(*env).add(25) };
+        // Slot 24 per `jni.h`, not 25: this test read the slot the table
+        // happened to use rather than the slot a compiled native loads, so it
+        // stayed green through the whole 19..27 shift it was best placed to
+        // catch. `jni_function_table_matches_the_header` now pins the layout.
+        let func_ptr = unsafe { *(*env).add(24) };
         let is_same: extern "C" fn(JNIEnv, JObject, JObject) -> JBoolean =
             unsafe { std::mem::transmute(func_ptr) };
         assert_eq!(is_same(env, local1, local1), JNI_TRUE);
         assert_eq!(is_same(env, local1, local2), JNI_FALSE);
         assert_eq!(is_same(env, 0, 0), JNI_TRUE); // null == null
         clear_jni_context();
+    }
+
+    #[test]
+    fn jni_exception_check_reports_the_pending_slot() {
+        // It used to be a constant `JNI_FALSE`, which made every
+        // `if (ExceptionCheck(env))` branch in every native library dead code.
+        let env = get_jni_env();
+        let _ = take_jni_pending_exception();
+        assert_eq!(
+            jni_exception_check(env),
+            JNI_FALSE,
+            "nothing pending, nothing to report"
+        );
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(0x1234));
+        assert_eq!(
+            jni_exception_check(env),
+            JNI_TRUE,
+            "a pending exception must be visible to the native that caused it"
+        );
+        // And `ExceptionClear` is what turns it off again.
+        jni_exception_clear(env);
+        assert_eq!(jni_exception_check(env), JNI_FALSE);
+        let _ = take_jni_pending_exception();
+    }
+
+    #[test]
+    fn jni_exception_describe_clears_the_pending_slot() {
+        // Without a VM context there is no throwable to print, but the clear
+        // — the half that decides whether the exception reaches the caller —
+        // must still happen.
+        let env = get_jni_env();
+        let _ = take_jni_pending_exception();
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(0x1234));
+        jni_exception_describe(env);
+        assert_eq!(
+            jni_exception_check(env),
+            JNI_FALSE,
+            "ExceptionDescribe leaves nothing pending"
+        );
+        let _ = take_jni_pending_exception();
     }
 
     #[test]
@@ -8070,6 +8614,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_jni_native_boolean_return_is_normalised_by_value() {
+        // `0x80` has no bit 0 set, so the old `& 1` reduction called it false.
+        // HotSpot's native wrapper tests the whole byte and calls it true.
+        extern "C" fn flag_word(_env: JNIEnv, _this: JObject) -> u64 {
+            0x80
+        }
+        extern "C" fn high_bits_only(_env: JNIEnv, _this: JObject) -> u64 {
+            // Bits above the byte must NOT make it true: `jboolean` is a byte.
+            0xff00
+        }
+        let env = get_jni_env();
+        let r = unsafe { dispatch_jni_native(flag_word as *const () as usize, env, 0, &[], "()Z") };
+        assert_eq!(r, crate::types::Value::Int(1), "0x80 is a true jboolean");
+        let r = unsafe {
+            dispatch_jni_native(high_bits_only as *const () as usize, env, 0, &[], "()Z")
+        };
+        assert_eq!(r, crate::types::Value::Int(0), "only the low byte counts");
+    }
+
+    #[test]
     fn dispatch_jni_native_void_return() {
         extern "C" fn do_nothing(_env: JNIEnv, _this: JObject) {}
         let fn_ptr = do_nothing as *const () as usize;
@@ -8102,31 +8666,43 @@ mod tests {
     }
 
     #[test]
-    fn jni_bare_varargs_slots_raise_unsatisfied_link() {
-        // The bare C-varargs `...` call slots cannot be dispatched in stable
-        // Rust. They must be wired to `jni_varargs_unsupported` (which raises
-        // UnsatisfiedLinkError), NOT to the silent `jni_stub` (which would
-        // fabricate a 0/null return that a native would mistake for a result).
+    fn jni_bare_varargs_slots_are_dispatched_or_refused_loudly() {
+        // The bare C-varargs `...` call slots cannot be WRITTEN in stable Rust
+        // (defining a C-variadic function is still unstable), which is why
+        // they used to be wired to `jni_varargs_unsupported`. They can be
+        // ENTERED in assembly, though, and on x86-64 they now are: each slot
+        // gets a trampoline that builds the platform `va_list` and hands off
+        // to the `V` sibling. `jni_varargs_slots` is the single list of which
+        // slot gets which, so asserting against it is asserting against the
+        // wiring the table actually performs.
+        //
+        // What must hold on EVERY architecture is that none of these slots is
+        // the silent `jni_stub`: a 0/null return is indistinguishable from a
+        // real result to the native that receives it.
         let env = get_jni_env();
         let stub_ptr = jni_stub as *const () as usize;
-        let varargs_ptr = jni_varargs_unsupported as *const () as usize;
-        // Instance, nonvirtual, and static bare-varargs slot bases.
-        let bare_varargs_slots = [
-            34, 37, 40, 43, 46, 49, 52, 55, 58, 61, // CallXxxMethod(...)
-            64, 67, 70, 73, 76, 79, 82, 85, 88, 91, // CallNonvirtualXxxMethod(...)
-            114, 117, 120, 123, 126, 129, 132, 135, 138, 141, // CallStaticXxxMethod(...)
-        ];
-        for slot in bare_varargs_slots {
+        let refuse_ptr = jni_varargs_unsupported as *const () as usize;
+        let expected = jni_varargs_slots();
+        assert_eq!(expected.len(), 31, "NewObject plus three groups of ten");
+        for (slot, want) in expected {
             let func_ptr = unsafe { *(*env).add(slot) };
             assert_ne!(
                 func_ptr, stub_ptr,
-                "bare-varargs slot {slot} must not be the silent stub"
+                "bare-varargs slot {slot} must never be the silent stub"
             );
+            assert_eq!(func_ptr, want, "bare-varargs slot {slot}");
+            #[cfg(target_arch = "x86_64")]
+            assert_ne!(
+                func_ptr, refuse_ptr,
+                "bare-varargs slot {slot} has a trampoline on x86-64"
+            );
+            #[cfg(not(target_arch = "x86_64"))]
             assert_eq!(
-                func_ptr, varargs_ptr,
-                "bare-varargs slot {slot} must raise UnsatisfiedLinkError"
+                func_ptr, refuse_ptr,
+                "without a trampoline, slot {slot} must refuse loudly"
             );
         }
+        let _ = refuse_ptr;
     }
 
     #[test]
@@ -8821,11 +9397,13 @@ mod tests {
     #[test]
     fn jni_function_table_extended_to_234() {
         let env = get_jni_env();
-        // The table is `[usize; JNI_FUNCTION_COUNT]`, so reading slot 233 at
-        // all requires the table to be at least 234 entries long.
+        // The table is `[usize; JNI_FUNCTION_COUNT]`, so reading slot 235 at
+        // all requires the table to be at least 236 entries long — 235 is the
+        // last slot JDK 25's `jni.h` declares, and a native compiled against
+        // that header will load it.
         assert_eq!(
-            JNI_FUNCTION_COUNT, 234,
-            "the table must still have a slot 233 to wire"
+            JNI_FUNCTION_COUNT, 236,
+            "the table must cover every slot JDK 25's jni.h declares"
         );
         let func_ptr = unsafe { *(*env).add(233) };
         assert_eq!(
@@ -9317,4 +9895,439 @@ mod tests {
         let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(JJJJJJJJJJ)J") };
         assert_eq!(result, crate::types::Value::Long(55));
     }
+
+    // -----------------------------------------------------------------------
+    // The JNI function table's LAYOUT
+    // -----------------------------------------------------------------------
+
+    /// Normalise a name to letters and digits, lower-cased, so
+    /// `GetStringUTFChars` and `get_string_utf_chars` compare equal.
+    #[cfg(target_arch = "x86_64")]
+    fn squash(name: &str) -> String {
+        name.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Every slot of `JNINativeInterface_`, in `jni.h` order, starting at the
+    /// first non-reserved slot (4, `GetVersion`) and ending at the last slot
+    /// JDK 25 declares (235, `GetStringUTFLengthAsLong`).
+    ///
+    /// A native never NAMES a JNI function: it loads slot N from the table and
+    /// calls it. So the only thing that makes `(*env)->DeleteLocalRef(...)`
+    /// mean "delete a local ref" is that slot 23 holds this VM's
+    /// `jni_delete_local_ref` — and until 2026-08-06 it did not. A second
+    /// `GetObjectRefType` had been wired at 19, which pushed `PushLocalFrame`
+    /// through `AllocObject` one slot along: `DeleteLocalRef` ran
+    /// `DeleteGlobalRef`, `NewGlobalRef` ran `PopLocalFrame`,
+    /// `DeleteGlobalRef` ran `NewGlobalRef` (so every release leaked a global
+    /// root), and `IsSameObject` — the idiom every library uses for a null
+    /// check — ran the `void` `DeleteLocalRef` and returned stack residue.
+    ///
+    /// Every test that existed then was written against the slot the table
+    /// HAPPENED to use rather than the slot the header specifies, so all of
+    /// them stayed green through it. This one is written the other way round:
+    /// the left column is the header, verbatim, and position IS the index.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn jni_function_table_matches_the_jni_h_layout() {
+        // Each row: the name jni.h gives the slot, the function this VM
+        // wires there. Position IS the index — the first row is slot 4.
+        macro_rules! slots {
+            ($($name:literal => $f:path),* $(,)?) => {
+                &[$( ($name, $f as *const () as usize, stringify!($f)) ),*]
+            };
+        }
+        let header: &[(&str, usize, &str)] = slots![
+            "GetVersion" => jni_get_version,
+            "DefineClass" => jni_define_class,
+            "FindClass" => jni_find_class,
+            "FromReflectedMethod" => jni_from_reflected_method,
+            "FromReflectedField" => jni_from_reflected_field,
+            "ToReflectedMethod" => jni_to_reflected_method,
+            "GetSuperclass" => jni_get_superclass,
+            "IsAssignableFrom" => jni_is_assignable_from,
+            "ToReflectedField" => jni_to_reflected_field,
+            "Throw" => jni_throw,
+            "ThrowNew" => jni_throw_new,
+            "ExceptionOccurred" => jni_exception_occurred,
+            "ExceptionDescribe" => jni_exception_describe,
+            "ExceptionClear" => jni_exception_clear,
+            "FatalError" => jni_fatal_error,
+            "PushLocalFrame" => jni_push_local_frame,
+            "PopLocalFrame" => jni_pop_local_frame,
+            "NewGlobalRef" => jni_new_global_ref,
+            "DeleteGlobalRef" => jni_delete_global_ref,
+            "DeleteLocalRef" => jni_delete_local_ref,
+            "IsSameObject" => jni_is_same_object,
+            "NewLocalRef" => jni_new_local_ref,
+            "EnsureLocalCapacity" => jni_ensure_local_capacity,
+            "AllocObject" => jni_alloc_object,
+            "NewObject" => jni_va_new_object,
+            "NewObjectV" => jni_new_object_v,
+            "NewObjectA" => jni_new_object_a,
+            "GetObjectClass" => jni_get_object_class,
+            "IsInstanceOf" => jni_is_instance_of,
+            "GetMethodID" => jni_get_method_id,
+            "CallObjectMethod" => jni_va_call_object_method,
+            "CallObjectMethodV" => jni_call_object_method_v,
+            "CallObjectMethodA" => jni_call_object_method_a,
+            "CallBooleanMethod" => jni_va_call_boolean_method,
+            "CallBooleanMethodV" => jni_call_boolean_method_v,
+            "CallBooleanMethodA" => jni_call_boolean_method_a,
+            "CallByteMethod" => jni_va_call_byte_method,
+            "CallByteMethodV" => jni_call_byte_method_v,
+            "CallByteMethodA" => jni_call_byte_method_a,
+            "CallCharMethod" => jni_va_call_char_method,
+            "CallCharMethodV" => jni_call_char_method_v,
+            "CallCharMethodA" => jni_call_char_method_a,
+            "CallShortMethod" => jni_va_call_short_method,
+            "CallShortMethodV" => jni_call_short_method_v,
+            "CallShortMethodA" => jni_call_short_method_a,
+            "CallIntMethod" => jni_va_call_int_method,
+            "CallIntMethodV" => jni_call_int_method_v,
+            "CallIntMethodA" => jni_call_int_method_a,
+            "CallLongMethod" => jni_va_call_long_method,
+            "CallLongMethodV" => jni_call_long_method_v,
+            "CallLongMethodA" => jni_call_long_method_a,
+            "CallFloatMethod" => jni_va_call_float_method,
+            "CallFloatMethodV" => jni_call_float_method_v,
+            "CallFloatMethodA" => jni_call_float_method_a,
+            "CallDoubleMethod" => jni_va_call_double_method,
+            "CallDoubleMethodV" => jni_call_double_method_v,
+            "CallDoubleMethodA" => jni_call_double_method_a,
+            "CallVoidMethod" => jni_va_call_void_method,
+            "CallVoidMethodV" => jni_call_void_method_v,
+            "CallVoidMethodA" => jni_call_void_method_a,
+            "CallNonvirtualObjectMethod" => jni_va_call_nonvirtual_object_method,
+            "CallNonvirtualObjectMethodV" => jni_call_nonvirtual_object_method_v,
+            "CallNonvirtualObjectMethodA" => jni_call_nonvirtual_object_method_a,
+            "CallNonvirtualBooleanMethod" => jni_va_call_nonvirtual_boolean_method,
+            "CallNonvirtualBooleanMethodV" => jni_call_nonvirtual_boolean_method_v,
+            "CallNonvirtualBooleanMethodA" => jni_call_nonvirtual_boolean_method_a,
+            "CallNonvirtualByteMethod" => jni_va_call_nonvirtual_byte_method,
+            "CallNonvirtualByteMethodV" => jni_call_nonvirtual_byte_method_v,
+            "CallNonvirtualByteMethodA" => jni_call_nonvirtual_byte_method_a,
+            "CallNonvirtualCharMethod" => jni_va_call_nonvirtual_char_method,
+            "CallNonvirtualCharMethodV" => jni_call_nonvirtual_char_method_v,
+            "CallNonvirtualCharMethodA" => jni_call_nonvirtual_char_method_a,
+            "CallNonvirtualShortMethod" => jni_va_call_nonvirtual_short_method,
+            "CallNonvirtualShortMethodV" => jni_call_nonvirtual_short_method_v,
+            "CallNonvirtualShortMethodA" => jni_call_nonvirtual_short_method_a,
+            "CallNonvirtualIntMethod" => jni_va_call_nonvirtual_int_method,
+            "CallNonvirtualIntMethodV" => jni_call_nonvirtual_int_method_v,
+            "CallNonvirtualIntMethodA" => jni_call_nonvirtual_int_method_a,
+            "CallNonvirtualLongMethod" => jni_va_call_nonvirtual_long_method,
+            "CallNonvirtualLongMethodV" => jni_call_nonvirtual_long_method_v,
+            "CallNonvirtualLongMethodA" => jni_call_nonvirtual_long_method_a,
+            "CallNonvirtualFloatMethod" => jni_va_call_nonvirtual_float_method,
+            "CallNonvirtualFloatMethodV" => jni_call_nonvirtual_float_method_v,
+            "CallNonvirtualFloatMethodA" => jni_call_nonvirtual_float_method_a,
+            "CallNonvirtualDoubleMethod" => jni_va_call_nonvirtual_double_method,
+            "CallNonvirtualDoubleMethodV" => jni_call_nonvirtual_double_method_v,
+            "CallNonvirtualDoubleMethodA" => jni_call_nonvirtual_double_method_a,
+            "CallNonvirtualVoidMethod" => jni_va_call_nonvirtual_void_method,
+            "CallNonvirtualVoidMethodV" => jni_call_nonvirtual_void_method_v,
+            "CallNonvirtualVoidMethodA" => jni_call_nonvirtual_void_method_a,
+            "GetFieldID" => jni_get_field_id,
+            "GetObjectField" => jni_get_object_field,
+            "GetBooleanField" => jni_get_boolean_field,
+            "GetByteField" => jni_get_byte_field,
+            "GetCharField" => jni_get_char_field,
+            "GetShortField" => jni_get_short_field,
+            "GetIntField" => jni_get_int_field,
+            "GetLongField" => jni_get_long_field,
+            "GetFloatField" => jni_get_float_field,
+            "GetDoubleField" => jni_get_double_field,
+            "SetObjectField" => jni_set_object_field,
+            "SetBooleanField" => jni_set_boolean_field,
+            "SetByteField" => jni_set_byte_field,
+            "SetCharField" => jni_set_char_field,
+            "SetShortField" => jni_set_short_field,
+            "SetIntField" => jni_set_int_field,
+            "SetLongField" => jni_set_long_field,
+            "SetFloatField" => jni_set_float_field,
+            "SetDoubleField" => jni_set_double_field,
+            "GetStaticMethodID" => jni_get_static_method_id,
+            "CallStaticObjectMethod" => jni_va_call_static_object_method,
+            "CallStaticObjectMethodV" => jni_call_static_object_method_v,
+            "CallStaticObjectMethodA" => jni_call_static_object_method_a,
+            "CallStaticBooleanMethod" => jni_va_call_static_boolean_method,
+            "CallStaticBooleanMethodV" => jni_call_static_boolean_method_v,
+            "CallStaticBooleanMethodA" => jni_call_static_boolean_method_a,
+            "CallStaticByteMethod" => jni_va_call_static_byte_method,
+            "CallStaticByteMethodV" => jni_call_static_byte_method_v,
+            "CallStaticByteMethodA" => jni_call_static_byte_method_a,
+            "CallStaticCharMethod" => jni_va_call_static_char_method,
+            "CallStaticCharMethodV" => jni_call_static_char_method_v,
+            "CallStaticCharMethodA" => jni_call_static_char_method_a,
+            "CallStaticShortMethod" => jni_va_call_static_short_method,
+            "CallStaticShortMethodV" => jni_call_static_short_method_v,
+            "CallStaticShortMethodA" => jni_call_static_short_method_a,
+            "CallStaticIntMethod" => jni_va_call_static_int_method,
+            "CallStaticIntMethodV" => jni_call_static_int_method_v,
+            "CallStaticIntMethodA" => jni_call_static_int_method_a,
+            "CallStaticLongMethod" => jni_va_call_static_long_method,
+            "CallStaticLongMethodV" => jni_call_static_long_method_v,
+            "CallStaticLongMethodA" => jni_call_static_long_method_a,
+            "CallStaticFloatMethod" => jni_va_call_static_float_method,
+            "CallStaticFloatMethodV" => jni_call_static_float_method_v,
+            "CallStaticFloatMethodA" => jni_call_static_float_method_a,
+            "CallStaticDoubleMethod" => jni_va_call_static_double_method,
+            "CallStaticDoubleMethodV" => jni_call_static_double_method_v,
+            "CallStaticDoubleMethodA" => jni_call_static_double_method_a,
+            "CallStaticVoidMethod" => jni_va_call_static_void_method,
+            "CallStaticVoidMethodV" => jni_call_static_void_method_v,
+            "CallStaticVoidMethodA" => jni_call_static_void_method_a,
+            "GetStaticFieldID" => jni_get_static_field_id,
+            "GetStaticObjectField" => jni_get_static_object_field,
+            "GetStaticBooleanField" => jni_get_static_boolean_field,
+            "GetStaticByteField" => jni_get_static_byte_field,
+            "GetStaticCharField" => jni_get_static_char_field,
+            "GetStaticShortField" => jni_get_static_short_field,
+            "GetStaticIntField" => jni_get_static_int_field,
+            "GetStaticLongField" => jni_get_static_long_field,
+            "GetStaticFloatField" => jni_get_static_float_field,
+            "GetStaticDoubleField" => jni_get_static_double_field,
+            "SetStaticObjectField" => jni_set_static_object_field,
+            "SetStaticBooleanField" => jni_set_static_boolean_field,
+            "SetStaticByteField" => jni_set_static_byte_field,
+            "SetStaticCharField" => jni_set_static_char_field,
+            "SetStaticShortField" => jni_set_static_short_field,
+            "SetStaticIntField" => jni_set_static_int_field,
+            "SetStaticLongField" => jni_set_static_long_field,
+            "SetStaticFloatField" => jni_set_static_float_field,
+            "SetStaticDoubleField" => jni_set_static_double_field,
+            "NewString" => jni_new_string,
+            "GetStringLength" => jni_get_string_length,
+            "GetStringChars" => jni_get_string_chars,
+            "ReleaseStringChars" => jni_release_string_chars,
+            "NewStringUTF" => jni_new_string_utf,
+            "GetStringUTFLength" => jni_get_string_utf_length,
+            "GetStringUTFChars" => jni_get_string_utf_chars,
+            "ReleaseStringUTFChars" => jni_release_string_utf_chars,
+            "GetArrayLength" => jni_get_array_length,
+            "NewObjectArray" => jni_new_object_array,
+            "GetObjectArrayElement" => jni_get_object_array_element,
+            "SetObjectArrayElement" => jni_set_object_array_element,
+            "NewBooleanArray" => jni_new_boolean_array,
+            "NewByteArray" => jni_new_byte_array,
+            "NewCharArray" => jni_new_char_array,
+            "NewShortArray" => jni_new_short_array,
+            "NewIntArray" => jni_new_int_array,
+            "NewLongArray" => jni_new_long_array,
+            "NewFloatArray" => jni_new_float_array,
+            "NewDoubleArray" => jni_new_double_array,
+            "GetBooleanArrayElements" => jni_get_boolean_array_elements,
+            "GetByteArrayElements" => jni_get_byte_array_elements,
+            "GetCharArrayElements" => jni_get_char_array_elements,
+            "GetShortArrayElements" => jni_get_short_array_elements,
+            "GetIntArrayElements" => jni_get_int_array_elements,
+            "GetLongArrayElements" => jni_get_long_array_elements,
+            "GetFloatArrayElements" => jni_get_float_array_elements,
+            "GetDoubleArrayElements" => jni_get_double_array_elements,
+            "ReleaseBooleanArrayElements" => jni_release_boolean_array_elements,
+            "ReleaseByteArrayElements" => jni_release_byte_array_elements,
+            "ReleaseCharArrayElements" => jni_release_char_array_elements,
+            "ReleaseShortArrayElements" => jni_release_short_array_elements,
+            "ReleaseIntArrayElements" => jni_release_int_array_elements,
+            "ReleaseLongArrayElements" => jni_release_long_array_elements,
+            "ReleaseFloatArrayElements" => jni_release_float_array_elements,
+            "ReleaseDoubleArrayElements" => jni_release_double_array_elements,
+            "GetBooleanArrayRegion" => jni_get_boolean_array_region,
+            "GetByteArrayRegion" => jni_get_byte_array_region,
+            "GetCharArrayRegion" => jni_get_char_array_region,
+            "GetShortArrayRegion" => jni_get_short_array_region,
+            "GetIntArrayRegion" => jni_get_int_array_region,
+            "GetLongArrayRegion" => jni_get_long_array_region,
+            "GetFloatArrayRegion" => jni_get_float_array_region,
+            "GetDoubleArrayRegion" => jni_get_double_array_region,
+            "SetBooleanArrayRegion" => jni_set_boolean_array_region,
+            "SetByteArrayRegion" => jni_set_byte_array_region,
+            "SetCharArrayRegion" => jni_set_char_array_region,
+            "SetShortArrayRegion" => jni_set_short_array_region,
+            "SetIntArrayRegion" => jni_set_int_array_region,
+            "SetLongArrayRegion" => jni_set_long_array_region,
+            "SetFloatArrayRegion" => jni_set_float_array_region,
+            "SetDoubleArrayRegion" => jni_set_double_array_region,
+            "RegisterNatives" => jni_register_natives,
+            "UnregisterNatives" => jni_unregister_natives,
+            "MonitorEnter" => jni_monitor_enter,
+            "MonitorExit" => jni_monitor_exit,
+            "GetJavaVM" => jni_get_java_vm,
+            "GetStringRegion" => jni_get_string_region,
+            "GetStringUTFRegion" => jni_get_string_utf_region,
+            "GetPrimitiveArrayCritical" => jni_get_primitive_array_critical,
+            "ReleasePrimitiveArrayCritical" => jni_release_primitive_array_critical,
+            "GetStringCritical" => jni_get_string_critical,
+            "ReleaseStringCritical" => jni_release_string_critical,
+            "NewWeakGlobalRef" => jni_new_weak_global_ref,
+            "DeleteWeakGlobalRef" => jni_delete_weak_global_ref,
+            "ExceptionCheck" => jni_exception_check,
+            "NewDirectByteBuffer" => jni_new_direct_byte_buffer,
+            "GetDirectBufferAddress" => jni_get_direct_buffer_address,
+            "GetDirectBufferCapacity" => jni_get_direct_buffer_capacity,
+            "GetObjectRefType" => jni_get_object_ref_type,
+            "GetModule" => jni_get_module,
+            "IsVirtualThread" => jni_is_virtual_thread,
+            "GetStringUTFLengthAsLong" => jni_get_string_utf_length_as_long,
+        ];
+        assert_eq!(
+            header.len(),
+            JNI_FUNCTION_COUNT - 4,
+            "the table must have exactly one slot per jni.h entry after the \
+             four reserved ones"
+        );
+        let env = get_jni_env();
+        for (i, (header_name, wired, rust_name)) in header.iter().enumerate() {
+            let slot = i + 4;
+            let actual = unsafe { *(*env).add(slot) };
+            assert_eq!(
+                actual, *wired,
+                "slot {slot} must dispatch to `{rust_name}`, which is this \
+                 VM's {header_name}"
+            );
+            // And the wired function's own name must BE the header's name.
+            // That is what makes the table a check rather than a copy of the
+            // wiring: a row can only satisfy both columns if the slot is right.
+            let rust = rust_name
+                .strip_prefix("jni_va_")
+                .or_else(|| rust_name.strip_prefix("jni_"))
+                .unwrap_or(rust_name);
+            assert_eq!(
+                squash(rust),
+                squash(header_name),
+                "slot {slot} is wired to `{rust_name}` but jni.h calls it \
+                 `{header_name}`"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The function-pointer guard
+    // -----------------------------------------------------------------------
+
+    /// An odd entry address is legal x86-64 and must be CALLED, not refused.
+    ///
+    /// `cc -shared -fPIC -O1` on the strict corpus's own JNI fixture put
+    /// `add` at `0x11f7`, `mulLong` at `0x11ff` and `scale` at `0x120b`. The
+    /// old `fn_ptr % 2 != 0` guard refused all three and returned 0, so
+    /// `add(40, 2)` read as `0` in Java — a wrong VALUE manufactured by a
+    /// safety check, from a correctly resolved pointer into correctly
+    /// compiled code.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn jni_fn_ptr_odd_address_is_callable() {
+        assert!(!jni_fn_ptr_ok(0), "a null pointer is still refused");
+        assert!(jni_fn_ptr_ok(0x11f7), "x86-64 has no entry-alignment rule");
+        assert!(jni_fn_ptr_ok(0x120b));
+    }
+
+    // -----------------------------------------------------------------------
+    // The bare-varargs trampolines
+    // -----------------------------------------------------------------------
+
+    // Two trampolines built by the SAME macro the 31 real ones use, pointed at
+    // sinks that report what arrived. Calling them through a genuine variadic
+    // function-pointer type makes the compiler emit a real C varargs call
+    // sequence for the active ABI — including System V's `AL` = SSE-register
+    // count — so this exercises the trampoline, not a hand-rolled imitation.
+    #[cfg(target_arch = "x86_64")]
+    jni_varargs_trampoline!(@n 3, jni_va_test_three_named, jni_va_test_sink3);
+    #[cfg(target_arch = "x86_64")]
+    jni_varargs_trampoline!(@n 4, jni_va_test_four_named, jni_va_test_sink4);
+    #[cfg(target_arch = "x86_64")]
+    extern "C" {
+        fn jni_va_test_three_named();
+        fn jni_va_test_four_named();
+    }
+
+    /// Reads back: two integers, a double, and eight more integers — enough to
+    /// run past System V's six-GP register budget into the overflow area.
+    #[cfg(target_arch = "x86_64")]
+    extern "C" fn jni_va_test_sink3(a: u64, b: u64, c: u64, va: VaList) -> u64 {
+        let mut cur = VaCursor::new(va);
+        unsafe {
+            let i1 = cur.next(false);
+            let d = f64::from_bits(cur.next(true));
+            let mut tail = 0u64;
+            for _ in 0..8 {
+                tail = tail.wrapping_add(cur.next(false));
+            }
+            assert_eq!((a, b, c), (11, 22, 33), "named args");
+            assert_eq!(i1, 40, "first variadic integer");
+            assert!((d - 1.5).abs() < f64::EPSILON, "variadic double: {d}");
+            assert_eq!(tail, 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8, "spilled integers");
+        }
+        42
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    extern "C" fn jni_va_test_sink4(a: u64, b: u64, c: u64, d: u64, va: VaList) -> u64 {
+        let mut cur = VaCursor::new(va);
+        unsafe {
+            let i1 = cur.next(false);
+            let f = f64::from_bits(cur.next(true));
+            let i2 = cur.next(false);
+            assert_eq!((a, b, c, d), (11, 22, 33, 44), "named args");
+            assert_eq!((i1, i2), (40, 2), "variadic integers");
+            assert!((f - 2.5).abs() < f64::EPSILON, "variadic double: {f}");
+        }
+        43
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn jni_varargs_trampoline_delivers_the_c_argument_list() {
+        let three: unsafe extern "C" fn(u64, u64, u64, ...) -> u64 =
+            unsafe { std::mem::transmute(jni_va_test_three_named as *const ()) };
+        let r3 = unsafe {
+            three(
+                11, 22, 33, 40u64, 1.5f64, 1u64, 2u64, 3u64, 4u64, 5u64, 6u64, 7u64, 8u64,
+            )
+        };
+        assert_eq!(r3, 42, "the sink's return must pass back through RAX");
+
+        let four: unsafe extern "C" fn(u64, u64, u64, u64, ...) -> u64 =
+            unsafe { std::mem::transmute(jni_va_test_four_named as *const ()) };
+        let r4 = unsafe { four(11, 22, 33, 44, 40u64, 2.5f64, 2u64) };
+        assert_eq!(r4, 43);
+    }
+
+    /// The System V `va_list` is a register-save-area walk with two
+    /// INDEPENDENT cursors, not an array of arguments. Reading it as an array
+    /// returns its own `gp_offset`/`fp_offset` header as argument one.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    #[test]
+    fn sysv_va_cursor_walks_both_register_classes_then_the_overflow_area() {
+        // 6 GP slots of 8 bytes, then 8 SSE slots of 16.
+        let mut save = [0u64; 6 + 16];
+        for (i, w) in save.iter_mut().take(6).enumerate() {
+            *w = 100 + i as u64;
+        }
+        save[6] = 1.5f64.to_bits(); // xmm0
+        save[8] = 2.5f64.to_bits(); // xmm1
+        let mut overflow = [900u64, 901];
+        let mut tag = SysVVaListTag {
+            gp_offset: 8, // one named integer argument already consumed
+            fp_offset: 48,
+            overflow_arg_area: overflow.as_mut_ptr() as *mut u8,
+            reg_save_area: save.as_mut_ptr() as *mut u8,
+        };
+        let mut cur = VaCursor::new(&mut tag as *mut SysVVaListTag as VaList);
+        unsafe {
+            assert_eq!(cur.next(false), 101, "second GP register, not the first");
+            assert_eq!(f64::from_bits(cur.next(true)), 1.5, "xmm0");
+            assert_eq!(cur.next(false), 102, "GP advances independently of SSE");
+            assert_eq!(f64::from_bits(cur.next(true)), 2.5, "xmm1");
+            for want in [103, 104, 105] {
+                assert_eq!(cur.next(false), want);
+            }
+            // GP register budget exhausted: the rest come off the stack.
+            assert_eq!(cur.next(false), 900);
+            assert_eq!(cur.next(false), 901);
+        }
+    }
+
 }
