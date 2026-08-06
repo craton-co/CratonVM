@@ -3557,6 +3557,19 @@ pub(super) fn try_jit_upgrade_with_gate(
                 shared,
                 callee_cached.declaring_class_id,
             ));
+            // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+            // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+            // and for anything unregistered, which is the fail-closed direction.
+            // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+            // for a triple whose helper cell is already non-zero.
+            let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+                let registry = &shared.natives.native_methods;
+                registry
+                    .resolve_id(class, method, descriptor)
+                    .and_then(|id| registry.kind_of_id(id))
+                    .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+            };
+            
             let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
                 &callee_cached,
                 Some(&c_resolver),
@@ -3625,6 +3638,14 @@ pub(super) fn try_jit_upgrade_with_gate(
                     // latch the JIT read for itself, so a `Compatible` VM sharing a
                     // process with a `JdkOnly` one lost the thin direct-call helpers.
                     crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+                    // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+                    // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+                    // whether a thin direct-call helper may shadow real bytecode.
+
+                    Some(&intrinsic_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -3724,6 +3745,19 @@ pub(super) fn try_jit_upgrade_with_gate(
         shared,
         cached.declaring_class_id,
     ));
+    // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+    // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+    // and for anything unregistered, which is the fail-closed direction.
+    // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+    // for a triple whose helper cell is already non-zero.
+    let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+        let registry = &shared.natives.native_methods;
+        registry
+            .resolve_id(class, method, descriptor)
+            .and_then(|id| registry.kind_of_id(id))
+            .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+    };
+    
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
@@ -3787,6 +3821,14 @@ pub(super) fn try_jit_upgrade_with_gate(
             // latch the JIT read for itself, so a `Compatible` VM sharing a
             // process with a `JdkOnly` one lost the thin direct-call helpers.
             crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+            // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+            // whether a thin direct-call helper may shadow real bytecode.
+
+            Some(&intrinsic_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -4908,6 +4950,19 @@ pub(super) fn try_jit_compile_callee_slow(
         shared,
         cached.declaring_class_id,
     ));
+    // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+    // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+    // and for anything unregistered, which is the fail-closed direction.
+    // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+    // for a triple whose helper cell is already non-zero.
+    let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+        let registry = &shared.natives.native_methods;
+        registry
+            .resolve_id(class, method, descriptor)
+            .and_then(|id| registry.kind_of_id(id))
+            .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+    };
+    
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -4967,6 +5022,14 @@ pub(super) fn try_jit_compile_callee_slow(
             // latch the JIT read for itself, so a `Compatible` VM sharing a
             // process with a `JdkOnly` one lost the thin direct-call helpers.
             crate::vm::dispatch_policy(shared).is_jdk_only(),
+
+            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+            // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+            // whether a thin direct-call helper may shadow real bytecode.
+
+            Some(&intrinsic_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
