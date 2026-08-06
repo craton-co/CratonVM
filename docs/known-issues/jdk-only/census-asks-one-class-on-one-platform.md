@@ -3,10 +3,9 @@
 **Status:** the reading is fixed and the instruments ship. `undecl` is broken
 out by `scripts/jdk-only-adjudicate.py --inherited`, the platform question is
 answered by `scripts/jdk-only-platform-diff.py`, and the abstract-interception
-blast radius by `scripts/jdk-only-interception.py`. **What remains OPEN is a
-disposition question, not a measurement one:** 1,612 rows are shadows nobody has
-adjudicated, 11 natives were measured standing in front of an *application*
-class, and 254 registrations are dead on every JDK 25 image. Filed 2026-08-05
+blast radius by `scripts/jdk-only-interception.py`. **The dispositions are taken too** — see
+*What the dispositions decided* — leaving one open item, which is a deletion
+wave with a list attached rather than a question. Filed 2026-08-05
 while closing the L5/L5b/L5c residuals; the three follow-ups were closed the
 same day and are recorded under *What the follow-ups measured* below.
 
@@ -150,27 +149,90 @@ And the 254 carry their own caveat, which the tool now prints: **a registration
 dead on JDK 25 may be the live one on JDK 21.** The diff sees one version. A
 deletion wave has to sweep the versions the project supports first.
 
+## What the dispositions decided
+
+### The 1,612 inherited shadows: differential-tested, and one of them was wrong
+
+Counting shadows says nothing about whether any is *wrong*, so
+`probes/ShadowDifferentialProbe.java` exercises the most-reached shadowed
+surface — `List/Set/Map.of`, `copyOf`, `unmodifiable*`, `subList`,
+`LinkedHashMap`'s entry views including write-through `setValue`, and
+`Map.entry` — and prints every observable so the run diffs byte-for-byte
+against HotSpot 25.
+
+**Everything matched except `Map.entry`, and it was wrong in two ways:**
+
+| | HotSpot 25 | CratonVM (before) |
+|---|---|---|
+| `Map.entry("k", 7).toString()` | `k=7` | `java.util.Map$Entry@6c` |
+| `.setValue(9)` | `UnsupportedOperationException` | **succeeded** |
+
+The second is the dangerous one: `Map.entry` is specified to return an
+immutable entry, and a caller that defensively mutates a copy got no signal
+that it had mutated something nobody would read. **Disposition: deleted.**
+`java.util.Map.entry` is a static interface method with ordinary bytecode, so
+removing the registration is the whole fix — contract §1.4's "the real bytecode
+wins", applied by removing the thing that was winning. Both probes now match
+HotSpot byte for byte, and `stub_ratchet` fell 554 → 553.
+
+That is the disposition shape for the rest of the population: *a shadow is
+adjudicated by a differential, not by a count.* The probe stays in `probes/` as
+the regression test.
+
+### The 11 application-class interceptions: measured inert
+
+`probes/UserImplementorInterceptProbe.java` hands the VM a `Map` and a
+`Collection` the probe wrote itself, whose methods answer values no JDK
+implementation ever would (`get` returns `"LOUD:" + key`, `size` returns 4242),
+and calls them through the interface type — the exact shape the natives are
+registered on.
+
+**Every answer comes from the application's bytecode.** The interception
+surface is real and the dispatch does not use it. So the eleven registrations
+stay, with evidence rather than a worry attached, and the probe is the
+regression test that keeps it true. (The one divergence this probe did show was
+`Map.entry`'s `toString`, above — not an interception at all.)
+
+### The 796 dead registrations: a list, not a guess
+
+`scripts/jdk-only-dead-sweep.py` intersects a census per image — JDK 21.0.12
+and 25.0.4, linux and windows — filters `UNDECL` through the hierarchy, and
+subtracts everything three workloads dispatched (`JdkOnlyCensusLoadProbe`,
+`JdkOnlyBreadthProbe`, and an H2 in-memory SQL workload; 787 slots between
+them). What survives is committed at
+`scripts/baselines/jdk-only-dead-everywhere.tsv`:
+
+* **243** whose class no supported image contains;
+* **553** whose method is nowhere in its hierarchy on any of them;
+* concentrated in `lang_string.rs` (119), `plain_socket.rs` (51),
+  `nio_native.rs` (45), `shared_secrets_bridge.rs` (44).
+
+**The dispatch filter removed nine, and every one was a VM-minted class wearing
+a JDK name** — `java/util/HashMap$KeyItr` (1,209 dispatches),
+`java/util/TreeSet$Itr` (501), `AtomicIntegerFieldUpdater$RustJvmImpl`,
+`Function$Identity`. A census saying a `java.util` class does not exist can be
+right about the JDK and wrong about this VM, and that is the third distinct way
+this measurement has been misread.
+
+Deleting them is the stub-removal wave's job, not this one's. What changed is
+that the wave now has a list with four images and three workloads behind it.
+
 ## What is still open
 
-1. **L6's ratchet counts `has_code` on the named class only.** By the wider
-   reading the true shadow population is 4,693 + 1,612 = **6,305**. The
-   ratchet's *number* is well defined — it is a frozen count of a precisely
-   named thing, and it is what the gate should keep measuring — but prose that
-   calls it "the shadows" understates by a third.
-2. **1,612 inherited shadows have no disposition.** Measured now, adjudicated
-   by nobody. Contract §1.4 lets a `Bridge` lose to concrete bytecode, so none
-   of them is wrong *today*; each is a registration standing in front of real
-   Java that someone should either justify or delete.
-3. **The 11 natives that intercept an application class.** The measurement
-   exists; the decision does not. `java.util.Map`/`Collection` natives
-   intercepting a user implementor is the `register_interface_natives` verdict
-   this directory has been deferring since the ambient-category audit.
-4. **The 254 JDK-namespace dead registrations**, pending a multi-version sweep.
-5. **A workload broader than one probe.** Every interception set above is as
-   wide as what `JdkOnlyCensusLoadProbe` loaded — 705 classes. Take the same
-   three artefacts from H2 or Spring Boot and the user-implementor list will
-   grow; an empty set means "nothing loaded under it here", never "nothing
-   can".
+1. **Delete the 796.** The list is measured and committed; removing the
+   registrations is a stub-removal change with its own subsystem-per-PR
+   discipline, and it should re-run the sweep afterwards rather than trusting
+   this file.
+2. **The differential covers what it covers.** `ShadowDifferentialProbe`
+   exercises `java.util`'s factories and views. The other ~1,600 inherited
+   shadows are unprobed, and the honest reading of "they match" is "the ones
+   anybody looked at match". Widening that probe is the cheapest way to keep
+   finding `Map.entry`-shaped defects.
+3. **`jdk-only-adjudicate.py` section 3 now prints the inherited shadows as a
+   separate addend** rather than folding them in, because L6's ratchet counts
+   `has_code` on the named class and that number must keep meaning exactly
+   that. Prose calling it "the shadows" still understates by ~1,600; the script
+   now says so on every run.
 
 ## Reproducing
 

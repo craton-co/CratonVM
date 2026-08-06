@@ -25716,7 +25716,6 @@ mod tests {
     /// `docs/known-issues/vm/compact-layout-registry-is-process-global-20260805.md`
     /// — including two fixes that were tried and are NOT sufficient.
     #[test]
-    #[ignore = "documents an OPEN defect: the compact-layout registry is process-global but ClassIds are per-VM"]
     fn two_vms_must_not_share_a_compact_layout_for_the_same_class_id() {
         let vm_a = test_shared();
         let vm_b = test_shared();

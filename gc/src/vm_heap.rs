@@ -283,6 +283,17 @@ impl VmHeap {
     // Core allocation (both backends implement GarbageCollector trait)
     // =====================================================================
 
+    /// Bind every backend to this VM's compact-layout domain.
+    ///
+    /// Must be called before the VM defines its first class, because
+    /// `class_id` is a per-`ClassStore` index and the layout registry is
+    /// process-global: an untold heap defaults to the FIRST domain, which is
+    /// correct for a single-VM process and merely costs later VMs their compact
+    /// layouts (tagged slots are always correct, just larger).
+    pub fn set_layout_domain(&self, domain: u32) {
+        dispatch!(self, set_layout_domain(domain))
+    }
+
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         dispatch!(self, alloc_object(class_id, num_fields))
     }
