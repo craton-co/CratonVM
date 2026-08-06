@@ -3781,6 +3781,25 @@ fn try_delegate_real_collection(
 /// after `Set.of` is assigned to a `HashSet`-typed local, and what these tests
 /// do — found no backing map and answered 0. Unwrapping first makes the
 /// concrete-class entry points agree with the wrapper's.
+/// The size to bounds-check an unmodifiable view's `get(index)` against.
+///
+/// `al_state` reads an `elementData`-shaped backing and reports **0** for every
+/// other List shape. Taking that at face value made
+/// `Collections.unmodifiableList(x).get(i)` throw on a perfectly valid index
+/// whenever `x` was a `LinkedList`, an `Arrays$ArrayList`, or anything else —
+/// on a list that iterates fine, because iteration does not come through here.
+///
+/// So a reported 0 means "could not read it", not "empty", and the caller has
+/// to ask the backing itself. A genuinely empty backing answers 0 either way,
+/// which is why the fallback is safe to take on 0 rather than needing a
+/// separate "unreadable" signal.
+fn unmod_view_size(al_state_size: i32, backing_size: impl FnOnce() -> Option<i32>) -> i32 {
+    if al_state_size > 0 {
+        return al_state_size;
+    }
+    backing_size().unwrap_or(al_state_size).max(0)
+}
+
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
@@ -3922,11 +3941,39 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
         // split would mean guessing; keeping the status quo for this path is the
         // honest option, and it is right for 0 and 3+ elements.
-        let (_, n) = al_state(ctx, b);
+        //
+        // The SIZE, though, must not come from `al_state`. That reads an
+        // `elementData`-shaped backing and reports 0 for anything else, so an
+        // unmodifiable view over a `LinkedList`, an `Arrays$ArrayList`, or any
+        // other List threw on a PERFECTLY VALID index -- on a list that
+        // iterates fine, because iteration takes a different path:
+        //
+        //   Collections.unmodifiableList(new LinkedList<>(List.of("x","y")))
+        //       .get(0)   -> AIOOBE       (HotSpot: "x")
+        //   Collections.unmodifiableList(Arrays.asList("p","q"))
+        //       .get(0)   -> AIOOBE       (HotSpot: "p")
+        //
+        // That is what fails Spring's `CompileWithForkedClassLoaderExtension
+        // .runTest:140` -- `summary.getFailures().get(0)`, where
+        // `SummaryGeneratingListener.getFailures()` hands back exactly such a
+        // view -- and with it both `AotIntegrationTests` end-to-end tests. The
+        // nested run's REAL failure is destroyed on the way out and replaced by
+        // this AIOOBE. Repro: docs/known-issues/repros/junit-summary-failures/
+        // (SUM.java, 3 seconds) and .../list-get-oob/UM.java.
+        //
+        // Ask the backing for its own size, and read through its own `get`, so
+        // any List shape works. `unmod_receiver_backing` is `None` for a plain
+        // ArrayList, so the virtual call cannot come back here forever: the
+        // innermost backing takes the normal path below.
+        let al_size = al_state(ctx, b).1;
+        let n = unmod_view_size(al_size, || match ctx.invoke_virtual(b, "size", "()I", &[]) {
+            Ok(Some(Value::Int(v))) => Some(v),
+            _ => None,
+        });
         if index < 0 || index >= n {
             return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
         }
-        return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
+        return ctx.invoke_virtual(b, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)]);
     }
     // `Collections$SingletonList` keeps its one element in a field, not in an
     // `elementData` array, so `al_state` reports size 0 and every index looked
@@ -52262,6 +52309,33 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Collections.unmodifiableList(x).get(i)` bounds-checked against
+    /// `al_state`, which reports 0 for any backing that is not
+    /// `elementData`-shaped -- so a view over a LinkedList or an
+    /// `Arrays$ArrayList` threw AIOOBE on a VALID index while iterating fine.
+    /// That destroyed the real failure inside Spring's
+    /// `SummaryGeneratingListener.getFailures().get(0)` and failed both
+    /// `AotIntegrationTests` end-to-end tests.
+    #[test]
+    fn unmod_view_size_falls_back_when_al_state_cannot_read_the_backing() {
+        // The bug: al_state says 0, the backing really has 2.
+        assert_eq!(unmod_view_size(0, || Some(2)), 2);
+        // A readable ArrayList-shaped backing is trusted directly, no call.
+        assert_eq!(
+            unmod_view_size(3, || panic!("must not ask the backing when al_state read it")),
+            3
+        );
+        // Genuinely empty: both agree, and the fallback is harmless.
+        assert_eq!(unmod_view_size(0, || Some(0)), 0);
+        // Backing cannot answer either -- stay at 0 rather than inventing a
+        // size, so `get` still refuses rather than reading out of bounds.
+        assert_eq!(unmod_view_size(0, || None), 0);
+        // A negative answer from either source can never widen the bounds.
+        assert_eq!(unmod_view_size(0, || Some(-1)), 0);
+        assert_eq!(unmod_view_size(-5, || Some(4)), 4);
+    }
+
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
