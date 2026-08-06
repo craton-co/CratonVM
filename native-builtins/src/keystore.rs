@@ -99,8 +99,20 @@ pub enum EntryKind {
         /// X.509 cert DER.
         cert_der: Vec<u8>,
     },
-    /// Symmetric key material from a PKCS#12 SecretBag.
-    SecretKey { key_bytes: Vec<u8> },
+    /// Symmetric key material from a PKCS#12 SecretBag, carried together with
+    /// the JCA algorithm name it was stored under.
+    ///
+    /// The name is not decoration. `SunPKCS12` encodes a `SecretKeyEntry` as
+    /// `SEQUENCE { INTEGER 0, AlgorithmId.get(key.getAlgorithm()), OCTET
+    /// STRING key.getEncoded() }`, so the algorithm survives a round trip only
+    /// as that OID. This module used to discard it and hand every recovered
+    /// secret key back as algorithm `"RAW"` -- which is the key's FORMAT, not
+    /// its algorithm -- so `Cipher.getInstance(key.getAlgorithm())` on a key
+    /// read out of a keystore failed where HotSpot succeeded.
+    SecretKey {
+        key_bytes: Vec<u8>,
+        algorithm: String,
+    },
 }
 
 /// One loaded keystore. The map keys are case-preserved aliases.
@@ -227,6 +239,40 @@ pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec
     }
 }
 
+/// Insert/replace a secret-key entry in an already-registered store
+/// (`KeyStore.setEntry` with a `SecretKeyEntry`, or the pre-1.5
+/// `setKeyEntry(alias, SecretKey, password, null)`).
+///
+/// Companion to `keystore_set_key_entry` for the symmetric case. Before it
+/// existed, both routes either did nothing at all (`setEntry` -- see
+/// `engine_set_entry`) or stored the raw bytes as a `PrivateKey` entry, so
+/// `getKey` handed back a `PrivateKey` proxy claiming algorithm RSA for what
+/// the caller had put in as an AES `SecretKeySpec`.
+pub fn keystore_set_secret_key_entry(
+    id: i32,
+    alias: &str,
+    key_bytes: Vec<u8>,
+    algorithm: &str,
+) -> bool {
+    let mut g = registry().write();
+    if let Some(store) = g.stores.get_mut(&id) {
+        store.entries.insert(
+            alias.to_string(),
+            KeyStoreEntry {
+                alias: alias.to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::SecretKey {
+                    key_bytes,
+                    algorithm: algorithm.to_string(),
+                },
+            },
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Remove an entry from a registered store (`KeyStore.deleteEntry`).
 pub fn keystore_delete_entry(id: i32, alias: &str) {
     let mut g = registry().write();
@@ -305,6 +351,130 @@ pub(crate) fn load_keystore_ex(
 // ---------------------------------------------------------------------------
 // PKCS#12 — backed by the `p12` crate
 // ---------------------------------------------------------------------------
+
+/// JCA secret-key algorithm name -> the OID `SunPKCS12` writes into a
+/// SecretBag's inner `AlgorithmIdentifier`.
+///
+/// MEASURED on JDK 25, not guessed: this is exactly what
+/// `AlgorithmId.get(name).getOID()` answers, and two of the rows are not the
+/// OID an educated guess produces (`DESede` is the OIW `1.3.14.3.2.17`, not
+/// PKCS#3's `des-EDE3-CBC`; `Blowfish` is `…3029.1.1.2`, not `…3029.1.2`).
+/// Getting one wrong is not a parse error on either side — the key material
+/// still round-trips — it just comes back out under a DIFFERENT algorithm
+/// name, which is the quiet kind of wrong this whole record is about.
+const SECRET_KEY_ALG_OIDS: &[(&str, &[u64])] = &[
+    ("AES", &[2, 16, 840, 1, 101, 3, 4, 1]),
+    ("DESede", &[1, 3, 14, 3, 2, 17]),
+    ("DES", &[1, 3, 14, 3, 2, 7]),
+    ("RC2", &[1, 2, 840, 113549, 3, 2]),
+    ("ARCFOUR", &[1, 2, 840, 113549, 3, 4]),
+    ("Blowfish", &[1, 3, 6, 1, 4, 1, 3029, 1, 1, 2]),
+    ("HmacSHA1", &[1, 2, 840, 113549, 2, 7]),
+    ("HmacSHA224", &[1, 2, 840, 113549, 2, 8]),
+    ("HmacSHA256", &[1, 2, 840, 113549, 2, 9]),
+    ("HmacSHA384", &[1, 2, 840, 113549, 2, 10]),
+    ("HmacSHA512", &[1, 2, 840, 113549, 2, 11]),
+];
+
+/// OID -> the name to report on the way back OUT, which is what
+/// `AlgorithmId.getName()` answers on JDK 25 — also measured.
+///
+/// This is deliberately NOT the inverse of [`SECRET_KEY_ALG_OIDS`]: the JDK is
+/// itself asymmetric for three algorithms (`AlgorithmId.get("DES")` encodes
+/// `1.3.14.3.2.7`, but reading that OID back names it `"DES/CBC"`). Matching
+/// the JDK's answer beats internal tidiness here, because the thing that
+/// compares the two is a differential against HotSpot. The `des-EDE3-CBC` row
+/// has no write counterpart at all; it exists because OpenSSL-produced files
+/// use it.
+const SECRET_KEY_ALG_NAMES: &[(&[u64], &str)] = &[
+    (&[2, 16, 840, 1, 101, 3, 4, 1], "AES"),
+    (&[1, 3, 14, 3, 2, 17], "DESede"),
+    (&[1, 2, 840, 113549, 3, 7], "DESede/CBC/NoPadding"),
+    (&[1, 3, 14, 3, 2, 7], "DES/CBC"),
+    (&[1, 2, 840, 113549, 3, 2], "RC2/CBC/PKCS5Padding"),
+    (&[1, 2, 840, 113549, 3, 4], "ARCFOUR"),
+    (&[1, 3, 6, 1, 4, 1, 3029, 1, 1, 2], "Blowfish"),
+    (&[1, 2, 840, 113549, 2, 7], "HmacSHA1"),
+    (&[1, 2, 840, 113549, 2, 8], "HmacSHA224"),
+    (&[1, 2, 840, 113549, 2, 9], "HmacSHA256"),
+    (&[1, 2, 840, 113549, 2, 10], "HmacSHA384"),
+    (&[1, 2, 840, 113549, 2, 11], "HmacSHA512"),
+];
+
+/// Parse a dotted OID string (`"1.2.840.113549.3.7"`) into components.
+///
+/// Rejects anything that is not a well-formed OID, including the arc-0/1
+/// constraint the DER encoder relies on — a bad first arc would panic the
+/// writer rather than produce a wrong file, which is worse.
+fn parse_dotted_oid(text: &str) -> Option<Vec<u64>> {
+    let parts: Option<Vec<u64>> = text.split('.').map(|c| c.parse::<u64>().ok()).collect();
+    let parts = parts?;
+    if parts.len() < 2 || parts[0] > 2 || (parts[0] < 2 && parts[1] >= 40) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// The OID to encode a JCA secret-key algorithm name under, or `None` when this
+/// VM cannot encode it at all (which is also true of a real JDK — see
+/// `AlgorithmId.get("ChaCha20")`, a `NoSuchAlgorithmException`).
+///
+/// Three name shapes resolve, in order: a name this VM writes
+/// ([`SECRET_KEY_ALG_OIDS`]); a name this VM *reads* ([`SECRET_KEY_ALG_NAMES`]),
+/// so `load` → `store` of a `"DES/CBC"` entry is lossless rather than fatal;
+/// and a bare dotted OID, which is what [`secret_key_alg_name`] answers for an
+/// OID neither table names — same reason.
+fn secret_key_alg_oid(name: &str) -> Option<yasna::models::ObjectIdentifier> {
+    if let Some((_, oid)) = SECRET_KEY_ALG_OIDS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
+        return Some(yasna::models::ObjectIdentifier::from_slice(oid));
+    }
+    if let Some((oid, _)) = SECRET_KEY_ALG_NAMES
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(name))
+    {
+        return Some(yasna::models::ObjectIdentifier::from_slice(oid));
+    }
+    parse_dotted_oid(name).map(|parts| yasna::models::ObjectIdentifier::from_slice(&parts))
+}
+
+/// The JCA algorithm name for an OID read out of a SecretBag, falling back to
+/// the dotted OID text (what `AlgorithmId.getName()` answers for an OID it has
+/// no name for).
+fn secret_key_alg_name(oid: &yasna::models::ObjectIdentifier) -> String {
+    let components = oid.components().as_slice();
+    for (known, name) in SECRET_KEY_ALG_NAMES {
+        if components == *known {
+            return (*name).to_string();
+        }
+    }
+    components
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// [`secret_key_alg_name`] over a parsed `p12::AlgorithmIdentifier`.
+///
+/// `AlgorithmIdentifier::parse` folds three legacy PKCS#12 OIDs into named
+/// variants before anything reaches `OtherAlg`. None of them is a secret-key
+/// algorithm, but a malformed/hostile file could still put one there, so name
+/// them explicitly instead of falling through to a wrong default.
+fn secret_alg_name(alg: &p12::AlgorithmIdentifier) -> String {
+    match alg {
+        p12::AlgorithmIdentifier::OtherAlg(other) => secret_key_alg_name(&other.algorithm_type),
+        p12::AlgorithmIdentifier::Sha1 => "SHA1".to_string(),
+        p12::AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => {
+            "PBEWithSHA1AndRC2_40".to_string()
+        }
+        p12::AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(_) => {
+            "PBEWithSHA1AndDESede".to_string()
+        }
+    }
+}
 
 /// Crate-private `p12::bmp_string`, re-implemented: UTF-16BE + trailing 0x0000.
 /// The PKCS#12 PBE/MAC password mixing operates on this BMPString form.
@@ -734,7 +904,7 @@ pub(crate) fn load_pkcs12_ex(
     let mut keys_by_local_id: IndexMap<Vec<u8>, (Option<String>, Vec<u8>)> = IndexMap::new();
     let mut certs_by_local_id: IndexMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = IndexMap::new();
     let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
-    let mut secret_keys: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut secret_keys: Vec<(String, Vec<u8>, String)> = Vec::new();
 
     for bag in &bags {
         let friendly = bag.friendly_name();
@@ -828,15 +998,20 @@ pub(crate) fn load_pkcs12_ex(
                         yasna::parse_ber(&secret_info, |r| {
                             r.read_sequence(|r| {
                                 let _version = r.next().read_u8()?;
-                                let _algorithm = p12::AlgorithmIdentifier::parse(r.next())?;
-                                r.next().read_bytes()
+                                // NOT discarded (it used to be): this
+                                // identifier is the only record of the key's
+                                // JCA algorithm name -- see
+                                // `EntryKind::SecretKey`.
+                                let algorithm = p12::AlgorithmIdentifier::parse(r.next())?;
+                                let key_bytes = r.next().read_bytes()?;
+                                Ok((algorithm, key_bytes))
                             })
                         })
                         .ok()
                     });
-                if let Some(key_bytes) = secret {
+                if let Some((algorithm, key_bytes)) = secret {
                     let alias = friendly.unwrap_or_else(|| hex_lower(&local_id));
-                    secret_keys.push((alias, key_bytes));
+                    secret_keys.push((alias, key_bytes, secret_alg_name(&algorithm)));
                 }
             }
             _ => {}
@@ -845,13 +1020,16 @@ pub(crate) fn load_pkcs12_ex(
 
     let mut entries: IndexMap<String, KeyStoreEntry> = IndexMap::new();
 
-    for (alias, key_bytes) in secret_keys {
+    for (alias, key_bytes, algorithm) in secret_keys {
         entries.insert(
             alias.clone(),
             KeyStoreEntry {
                 alias,
                 creation_time_ms: 0,
-                kind: EntryKind::SecretKey { key_bytes },
+                kind: EntryKind::SecretKey {
+                    key_bytes,
+                    algorithm,
+                },
             },
         );
     }
@@ -1077,6 +1255,302 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
     Ok(LoadedKeyStore { entries })
 }
 
+/// PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC encryption of one PKCS#8-shaped
+/// blob, producing the `EncryptedPrivateKeyInfo` a PKCS#12 shrouded key bag
+/// or secret bag carries.
+///
+/// This is the exact inverse of [`decrypt_pbes2_params`] above, and the same
+/// envelope current `SunPKCS12` writes by default
+/// (`keystore.pkcs12.keyProtectionAlgorithm` = `PBEWithHMACSHA256AndAES_256`),
+/// so the output is readable by both this module's loader and a real JDK.
+///
+/// Returns `None` when OS entropy is unavailable -- a predictable salt/IV here
+/// would be worse than refusing, and [`write_pkcs12`] turns the `None` into a
+/// visible error rather than an unprotected or silently-dropped key.
+fn pbes2_encrypt(plain: &[u8], password: &[u8]) -> Option<p12::EncryptedPrivateKeyInfo> {
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncryptMut, KeyIvInit};
+
+    // 10_000 rounds is SunPKCS12's own default for this algorithm; matching it
+    // keeps a CV-written keystore indistinguishable from a keytool-written one
+    // in the one parameter a reader is entitled to sanity-check.
+    const ITERATIONS: u32 = 10_000;
+    const KEY_LEN: usize = 32;
+
+    let mut salt = [0u8; 20];
+    let mut iv = [0u8; 16];
+    if !crate::securerandom::os_random_bytes(&mut salt) {
+        return None;
+    }
+    if !crate::securerandom::os_random_bytes(&mut iv) {
+        return None;
+    }
+
+    // prf 256 == HMAC-SHA256, the encoding `decrypt_pbes2_params` uses.
+    let key = crate::phases_early::pbkdf2_derive_for(256, password, &salt, ITERATIONS, KEY_LEN);
+    let mut out = vec![0u8; plain.len() + 16];
+    let written = cbc::Encryptor::<aes::Aes256>::new(
+        GenericArray::from_slice(&key),
+        GenericArray::from_slice(&iv),
+    )
+    .encrypt_padded_b2b_mut::<Pkcs7>(plain, &mut out)
+    .ok()?
+    .len();
+    out.truncate(written);
+
+    let params = yasna::construct_der(|w| {
+        w.write_sequence(|w| {
+            // keyDerivationFunc: PBKDF2 { salt, iterationCount, keyLength, prf }
+            w.next().write_sequence(|w| {
+                w.next()
+                    .write_oid(&yasna::models::ObjectIdentifier::from_slice(&[
+                        1, 2, 840, 113549, 1, 5, 12,
+                    ]));
+                w.next().write_sequence(|w| {
+                    w.next().write_bytes(&salt);
+                    w.next().write_u32(ITERATIONS);
+                    w.next().write_u32(KEY_LEN as u32);
+                    w.next().write_sequence(|w| {
+                        w.next()
+                            .write_oid(&yasna::models::ObjectIdentifier::from_slice(&[
+                                1, 2, 840, 113549, 2, 9,
+                            ]));
+                        w.next().write_null();
+                    });
+                });
+            });
+            // encryptionScheme: aes256-CBC { iv }
+            w.next().write_sequence(|w| {
+                w.next()
+                    .write_oid(&yasna::models::ObjectIdentifier::from_slice(&[
+                        2, 16, 840, 1, 101, 3, 4, 1, 42,
+                    ]));
+                w.next().write_bytes(&iv);
+            });
+        })
+    });
+
+    Some(p12::EncryptedPrivateKeyInfo {
+        encryption_algorithm: p12::AlgorithmIdentifier::OtherAlg(p12::OtherAlgorithmIdentifier {
+            // PBES2
+            algorithm_type: yasna::models::ObjectIdentifier::from_slice(&[
+                1, 2, 840, 113549, 1, 5, 13,
+            ]),
+            params: Some(params),
+        }),
+        encrypted_data: out,
+    })
+}
+
+/// Serialise a keystore to PKCS#12 (RFC 7292).
+///
+/// WHY THIS EXISTS AT ALL: JKS -- what [`write_jks`] emits, and what
+/// `engineStore` wrote for every store regardless of declared type -- has no
+/// representation for a `SecretKeyEntry`. A keystore holding one therefore had
+/// to either change format or lose the entry, and it silently lost it: the
+/// alias was filtered out of the JKS body and the caller got a structurally
+/// valid, entry-less file plus no exception
+/// (`docs/known-issues/vm/pkcs12-setentry-secretkeyentry-is-a-silent-noop-20260805.md`).
+///
+/// Shape, and why each choice: one unencrypted `SafeContents`
+/// (`ContentInfo::Data`) carrying every bag; private keys in a
+/// `pkcs8ShroudedKeyBag` and secret keys in a `secretBag`, both wrapped in the
+/// PBES2 envelope [`pbes2_encrypt`] builds; certificates in the clear inside
+/// that same SafeContents. `SunPKCS12` additionally encrypts the certificate
+/// SafeContents -- nothing requires it, certificates are public, and leaving
+/// them readable is what keeps a CV-written store listable by a plain
+/// `keytool -list` with no password. Integrity is a SHA-256 `MacData` over the
+/// AuthenticatedSafe, which is what [`verify_pkcs12_mac`] checks on the way
+/// back in.
+///
+/// Cert-bag attributes mirror `SunPKCS12` exactly: the LEAF of a key entry's
+/// chain carries `localKeyId` + `friendlyName`, the rest of the chain carries
+/// nothing and is re-attached on load by issuer/subject matching
+/// ([`extend_chain_by_issuer`]). Giving every chain cert the same `localKeyId`
+/// would read back correctly here but is not what a real JDK expects to find.
+///
+/// KNOWN LIMITATION, stated rather than hidden: PKCS#12 permits a per-entry
+/// key password distinct from the store password, and a `LoadedKeyStore` does
+/// not carry one -- every key is protected with the STORE password, exactly
+/// like [`jks_protect_key`] does for JKS.
+pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Vec<u8>, String> {
+    use yasna::models::ObjectIdentifier;
+
+    let oid_pkcs8_shrouded = ObjectIdentifier::from_slice(&[1, 2, 840, 113549, 1, 12, 10, 1, 2]);
+    let oid_secret_bag = ObjectIdentifier::from_slice(&[1, 2, 840, 113549, 1, 12, 10, 1, 5]);
+
+    let mut bags: Vec<p12::SafeBag> = Vec::new();
+    let mut next_key_id: u32 = 0;
+
+    for (alias, entry) in store.entries.iter() {
+        match &entry.kind {
+            EntryKind::TrustedCert { cert_der } => {
+                // The `trustedKeyUsage` attribute is what makes this a TRUSTED
+                // certificate entry rather than a stray certificate. Without
+                // it, a real JDK reading the file drops the bag entirely (it
+                // keeps only certs that pair with a key), which is how the
+                // first cut of this writer produced a 4-entry keystore that
+                // HotSpot listed as 3 — silent loss of exactly the kind this
+                // record is about. `AnyUsage` (2.5.29.37.0) is the value
+                // `PKCS12KeyStore.setCertEntry` writes.
+                bags.push(p12::SafeBag {
+                    bag: p12::SafeBagKind::CertBag(p12::CertBag::X509(cert_der.clone())),
+                    attributes: vec![
+                        p12::PKCS12Attribute::FriendlyName(alias.clone()),
+                        p12::PKCS12Attribute::Other(p12::OtherAttribute {
+                            oid: ObjectIdentifier::from_slice(&[
+                                2, 16, 840, 1, 113894, 746875, 1, 1,
+                            ]),
+                            data: vec![yasna::construct_der(|w| {
+                                w.write_oid(&ObjectIdentifier::from_slice(&[2, 5, 29, 37, 0]))
+                            })],
+                        }),
+                    ],
+                });
+            }
+            EntryKind::PrivateKey { key_der, chain } => {
+                next_key_id += 1;
+                let key_id = next_key_id.to_be_bytes().to_vec();
+                // A key that never decrypted is still inside its ORIGINAL
+                // envelope (see `load_jks`/`load_pkcs12`'s
+                // `unwrap_or(encrypted)` arms). Re-wrapping it would
+                // double-encrypt; pass it straight through when it already
+                // parses as an EncryptedPrivateKeyInfo.
+                let epki = if let Ok(existing) =
+                    yasna::parse_ber(key_der, p12::EncryptedPrivateKeyInfo::parse)
+                {
+                    existing
+                } else {
+                    pbes2_encrypt(key_der, password).ok_or_else(|| {
+                        format!(
+                            "write_pkcs12({alias:?}): OS entropy unavailable, refusing to \\n                             protect a private key with a predictable salt"
+                        )
+                    })?
+                };
+                bags.push(p12::SafeBag {
+                    bag: p12::SafeBagKind::Pkcs8ShroudedKeyBag(epki),
+                    attributes: vec![
+                        p12::PKCS12Attribute::FriendlyName(alias.clone()),
+                        p12::PKCS12Attribute::LocalKeyId(key_id.clone()),
+                    ],
+                });
+                for (idx, cert_der) in chain.iter().enumerate() {
+                    bags.push(p12::SafeBag {
+                        bag: p12::SafeBagKind::CertBag(p12::CertBag::X509(cert_der.clone())),
+                        attributes: if idx == 0 {
+                            vec![
+                                p12::PKCS12Attribute::FriendlyName(alias.clone()),
+                                p12::PKCS12Attribute::LocalKeyId(key_id.clone()),
+                            ]
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
+            }
+            EntryKind::SecretKey {
+                key_bytes,
+                algorithm,
+            } => {
+                let Some(alg_oid) = secret_key_alg_oid(algorithm) else {
+                    return Err(format!(
+                        "write_pkcs12({alias:?}): no PKCS#12 OID is known for secret-key \\n                         algorithm {algorithm:?}, and writing it under a wrong OID would \\n                         read back as a different algorithm"
+                    ));
+                };
+                // The PKCS#8-shaped plaintext SunPKCS12 encrypts:
+                //   SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING key }
+                let plain = yasna::construct_der(|w| {
+                    w.write_sequence(|w| {
+                        w.next().write_u8(0);
+                        w.next().write_sequence(|w| {
+                            w.next().write_oid(&alg_oid);
+                        });
+                        w.next().write_bytes(key_bytes);
+                    })
+                });
+                let epki = pbes2_encrypt(&plain, password).ok_or_else(|| {
+                    format!(
+                        "write_pkcs12({alias:?}): OS entropy unavailable, refusing to protect \\n                         a secret key with a predictable salt"
+                    )
+                })?;
+                let epki_der = yasna::construct_der(|w| epki.write(w));
+                // SecretBag ::= SEQUENCE { secretTypeId, [0] EXPLICIT ANY }.
+                // SunPKCS12 writes pkcs8ShroudedKeyBag as the type id and the
+                // EncryptedPrivateKeyInfo as an OCTET STRING inside the tag.
+                let secret_bag = yasna::construct_der(|w| {
+                    w.write_sequence(|w| {
+                        w.next().write_oid(&oid_pkcs8_shrouded);
+                        w.next()
+                            .write_tagged(yasna::Tag::context(0), |w| w.write_bytes(&epki_der));
+                    })
+                });
+                bags.push(p12::SafeBag {
+                    bag: p12::SafeBagKind::OtherBagKind(p12::OtherBag {
+                        bag_id: oid_secret_bag.clone(),
+                        bag_value: secret_bag,
+                    }),
+                    attributes: vec![p12::PKCS12Attribute::FriendlyName(alias.clone())],
+                });
+            }
+        }
+    }
+
+    let safe_contents = yasna::construct_der(|w| {
+        w.write_sequence_of(|w| {
+            for bag in &bags {
+                bag.write(w.next());
+            }
+        })
+    });
+    let auth_safe = yasna::construct_der(|w| {
+        w.write_sequence_of(|w| {
+            p12::ContentInfo::Data(safe_contents.clone()).write(w.next());
+        })
+    });
+
+    // MacData over the AuthenticatedSafe. SHA-256, because that is what
+    // `pkcs12_mac_digest` names as the default current SunPKCS12 emits and
+    // what `verify_pkcs12_mac` will re-derive on the way back in.
+    const MAC_ITERATIONS: u32 = 10_000;
+    let mut mac_salt = [0u8; 20];
+    if !crate::securerandom::os_random_bytes(&mut mac_salt) {
+        return Err(
+            "write_pkcs12: OS entropy unavailable, refusing to emit a PKCS#12 MAC with a \\n             predictable salt"
+                .to_string(),
+        );
+    }
+    let password_str = String::from_utf8_lossy(password).to_string();
+    let password_bmp = pkcs12_bmp_string(&password_str);
+    let digest = Pkcs12MacDigest::Sha256;
+    let mac_key = pkcs12_mac_kdf(
+        digest,
+        &password_bmp,
+        &mac_salt,
+        MAC_ITERATIONS,
+        3,
+        digest.output_len(),
+    );
+    let mac_data = p12::MacData {
+        mac: p12::DigestInfo {
+            digest_algorithm: p12::AlgorithmIdentifier::OtherAlg(p12::OtherAlgorithmIdentifier {
+                algorithm_type: ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 2, 1]),
+                params: Some(yasna::construct_der(|w| w.write_null())),
+            }),
+            digest: pkcs12_hmac(digest, &mac_key, &auth_safe),
+        },
+        salt: mac_salt.to_vec(),
+        iterations: MAC_ITERATIONS,
+    };
+
+    let pfx = p12::PFX {
+        version: 3,
+        auth_safe: p12::ContentInfo::Data(auth_safe),
+        mac_data: Some(mac_data),
+    };
+    Ok(pfx.to_der())
+}
+
 /// Serialise a keystore to the JKS v2 wire format (magic, version, entry
 /// count, per-entry records, trailing `SHA1(pw||salt||body)` tag). Used by
 /// `engineStore`: CV's read path (`load_keystore`) detects the format by magic,
@@ -1095,7 +1569,7 @@ pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
                                                  // JKS has no compatible representation for SecretKeyEntry.  Keep the
                                                  // entry available in memory, but omit it from this legacy wire format.
                                                  // (PKCS#12 callers are still loaded from their original SecretBag.)
-    let mut aliases: Vec<&String> = store
+    let aliases: Vec<&String> = store
         .entries
         .iter()
         .filter_map(|(alias, entry)| match &entry.kind {
@@ -1103,10 +1577,15 @@ pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
             _ => Some(alias),
         })
         .collect();
-    aliases.sort_unstable();
     body.extend_from_slice(&(aliases.len() as u32).to_be_bytes());
 
-    // Deterministic alias order for stable, reproducible output.
+    // INSERTION order, not alphabetical. `LoadedKeyStore::entries` is an
+    // `IndexMap` precisely because real JDK enumerates a keystore in the order
+    // its entries were read/inserted, and the `sort_unstable()` that used to
+    // stand here made a store -> load round trip silently re-alphabetise them:
+    // `setKeyEntry("pk", ..); setCertificateEntry("ca", ..)` came back as
+    // `[ca, pk]` where HotSpot answers `[pk, ca]`. `IndexMap` iteration is
+    // itself deterministic, which is all that sort was reaching for.
     for alias in aliases {
         let entry = &store.entries[alias];
         let ab = alias.as_bytes();
@@ -1693,6 +2172,22 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "(Ljava/io/OutputStream;[C)V",
         engine_store,
     );
+
+    // engineSetEntry / engineGetEntry — the `KeyStore.Entry`-shaped half of the
+    // API. See `engine_set_entry`'s doc comment for why leaving these to real
+    // bytecode was a silent data loss rather than merely a gap.
+    r.register(
+        fqn,
+        "engineSetEntry",
+        "(Ljava/lang/String;Ljava/security/KeyStore$Entry;Ljava/security/KeyStore$ProtectionParameter;)V",
+        engine_set_entry,
+    );
+    r.register(
+        fqn,
+        "engineGetEntry",
+        "(Ljava/lang/String;Ljava/security/KeyStore$ProtectionParameter;)Ljava/security/KeyStore$Entry;",
+        engine_get_entry,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -1997,7 +2492,11 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             }
         }
         Ok(Some(Value::Object(Some(pk))))
-    } else if let EntryKind::SecretKey { key_bytes } = &entry.kind {
+    } else if let EntryKind::SecretKey {
+        key_bytes,
+        algorithm,
+    } = &entry.kind
+    {
         // Return the concrete mirror rather than the `SecretKey` interface:
         // SmallRye asks `Key.getEncoded()`, whose real interface method has no
         // code body. `SecretKeySpec` has registered accessors and preserves
@@ -2008,8 +2507,13 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             ctx.set_array_element(bytes, i, Value::Int(*byte as i8 as i32));
         }
         ctx.set_field(key, 0, Value::Object(Some(bytes)));
-        let algorithm = ctx.create_string("RAW");
-        ctx.set_field(key, 1, Value::Object(Some(algorithm)));
+        // The entry's OWN algorithm, not the constant "RAW" that used to be
+        // written here: "RAW" is `SecretKeySpec.getFormat()`, and reporting the
+        // format as the ALGORITHM broke every
+        // `Cipher.getInstance(key.getAlgorithm())` on a key recovered from a
+        // keystore.
+        let alg_name = ctx.create_string(algorithm);
+        ctx.set_field(key, 1, Value::Object(Some(alg_name)));
         Ok(Some(Value::Object(Some(key))))
     } else {
         Ok(Some(Value::Object(None)))
@@ -2302,6 +2806,40 @@ pub(crate) fn engine_set_key_entry(
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(None),
     };
+
+    // `engineSetKeyEntry(String, Key, char[], Certificate[])` accepts ANY
+    // `Key`. Real `PKCS12KeyStore` branches on `instanceof PrivateKey` vs
+    // `instanceof SecretKey` and writes a SecretBag for the latter; this native
+    // used to store every key as a `PrivateKey` entry, so
+    // `setKeyEntry(a, new SecretKeySpec(raw, "DESede"), pw, null)` came back
+    // out of `getKey` as a `PrivateKey` claiming algorithm RSA -- the raw bytes
+    // survived, their type and algorithm did not.
+    //
+    // `Key.getFormat()` is the spec-defined discriminator ("RAW" for a secret
+    // key, "PKCS#8" for a private key) and costs one virtual call, so ask it
+    // rather than plumbing interface-identity checks through the native API.
+    if string_from_virtual(ctx, key, "getFormat", "()Ljava/lang/String;").as_deref() == Some("RAW") {
+        if !spi_supports_secret_keys(ctx, this) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/KeyStoreException",
+                "Cannot store non-PrivateKeys",
+            ));
+        }
+        let raw = read_encoded_byte_array(ctx, key);
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let key_algorithm =
+            string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;")
+                .unwrap_or_else(|| "AES".to_string());
+        if let Err(failure) = require_encodable_secret_alg(ctx, &key_algorithm) {
+            return Err(failure);
+        }
+        keystore_set_secret_key_entry(id, &alias, raw, &key_algorithm);
+        return Ok(None);
+    }
+
     let mut key_der = read_encoded_byte_array(ctx, key);
     if key_der.is_empty() {
         // `engine_get_key`'s compact four-slot `PrivateKey` proxy carries a
@@ -2363,6 +2901,416 @@ pub(crate) fn engine_set_key_entry(
     Ok(None)
 }
 
+/// Refuse a secret-key algorithm this VM cannot encode into a SecretBag,
+/// AT THE POINT THE ENTRY IS SET.
+///
+/// Real `PKCS12KeyStore.setKeyEntry` calls `AlgorithmId.get(algorithm)` while
+/// storing and wraps its `NoSuchAlgorithmException` in a `KeyStoreException`,
+/// so `setEntry` with e.g. a `"ChaCha20"` `SecretKeySpec` fails immediately on
+/// HotSpot too. Deferring the complaint to `store()` would leave a caller
+/// holding a keystore that looks fine and cannot be written — a second silent
+/// no-op in place of the one this record is about.
+fn require_encodable_secret_alg(
+    ctx: &mut dyn NativeContext,
+    algorithm: &str,
+) -> Result<(), MethodCallFailed> {
+    if secret_key_alg_oid(algorithm).is_some() {
+        return Ok(());
+    }
+    Err(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/security/KeyStoreException",
+        &format!(
+            "Key protection algorithm not found: no PKCS#12 object identifier is known for              secret-key algorithm {algorithm:?}"
+        ),
+    ))
+}
+
+/// Invoke a no-argument virtual method returning a `String` and decode it.
+fn string_from_virtual(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    name: &str,
+    descriptor: &str,
+) -> Option<String> {
+    match ctx.invoke_virtual(obj, name, descriptor, &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// The exact class name of an object, or the empty string when it cannot be
+/// resolved.
+fn class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    let class_id = ctx.class_id_of_object(obj);
+    ctx.class_name_of_id(class_id).unwrap_or_default()
+}
+
+/// Whether the SPI this call landed on can hold a `SecretKeyEntry` at all.
+///
+/// PKCS#12 has a SecretBag; JKS has no representation for one, and real
+/// `JavaKeyStore.engineSetKeyEntry` answers exactly
+/// `KeyStoreException("Cannot store non-PrivateKeys")`. The check is by
+/// receiver class rather than a flag threaded through `register_engine_surface`
+/// because `NativeCallback` is a bare `fn` pointer and cannot capture the FQN
+/// it was registered under.
+fn spi_supports_secret_keys(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    !class_name_of(ctx, this).starts_with("sun/security/provider/JavaKeyStore")
+}
+
+/// Read `KeyStore.PasswordProtection.getPassword()` off a protection parameter.
+/// `Ok(None)` means "not a `PasswordProtection`", which every caller has to
+/// answer differently from "a `PasswordProtection` carrying a null password".
+fn protection_password(
+    ctx: &mut dyn NativeContext,
+    prot: ObjectRef,
+) -> Result<Option<Value>, MethodCallFailed> {
+    if class_name_of(ctx, prot) != "java/security/KeyStore$PasswordProtection" {
+        return Ok(None);
+    }
+    match ctx.invoke_virtual(prot, "getPassword", "()[C", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// engineSetEntry(String, KeyStore.Entry, KeyStore.ProtectionParameter).
+///
+/// WHY THIS HAS TO BE A NATIVE — this is the whole
+/// `pkcs12-setentry-secretkeyentry-is-a-silent-noop-20260805` defect:
+/// `KeyStore.setEntry` is real bytecode and delegates straight here, but real
+/// `PKCS12KeyStore.engineSetEntry` does NOT route through the public
+/// `engineSetKeyEntry`/`engineSetCertificateEntry` this module already
+/// intercepts. It calls its own PRIVATE `setKeyEntry`/`setCertEntry`, which
+/// mutate the SPI object's own `entries` map. Every read on this VM
+/// (`engineAliases`, `engineSize`, `engineContainsAlias`, `engineGetKey`,
+/// `engineStore`) is served from this file's side table instead, so the real
+/// mutation landed somewhere nothing ever looks: `setEntry` returned normally,
+/// threw nothing, and the entry was already gone before anything was
+/// serialised. All three entry kinds were affected, not only `SecretKeyEntry`.
+///
+/// The decision tree below is `PKCS12KeyStore.engineSetEntry`'s, message for
+/// message, including the two `KeyStoreException`s that are the only correct
+/// answer for a missing password — a caller that checks for an exception has
+/// to be told, and telling it is the entire point.
+///
+/// KNOWN LIMITATION, stated rather than hidden: the per-entry password is
+/// accepted and validated but not retained; entries are held in the clear in
+/// the side table and re-protected with the STORE password by `engineStore`.
+/// That is the same limitation `jks_protect_key` documents for JKS, and it is
+/// invisible to any caller that uses one password for both (every fixture, and
+/// the overwhelmingly common case).
+fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
+    let entry = match args.get(2) {
+        Some(Value::Object(Some(e))) => *e,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("KeyStore.setEntry: entry is null".into()),
+            }
+            .into())
+        }
+    };
+
+    // A protection parameter that is present but not a `PasswordProtection` is
+    // rejected before anything is stored, exactly like the real SPI.
+    let mut password: Option<Value> = None;
+    if let Some(Value::Object(Some(prot))) = args.get(3) {
+        match protection_password(ctx, *prot)? {
+            None => {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    "unsupported protection parameter",
+                ))
+            }
+            Some(Value::Object(None)) => {}
+            Some(v) => password = Some(v),
+        }
+    }
+
+    let id = keystore_ensure_store_id(ctx, this);
+    let entry_class = class_name_of(ctx, entry);
+    match entry_class.as_str() {
+        "java/security/KeyStore$TrustedCertificateEntry" => {
+            if password.is_some() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    "trusted certificate entries are not password-protected",
+                ));
+            }
+            let cert = match ctx.invoke_virtual(
+                entry,
+                "getTrustedCertificate",
+                "()Ljava/security/cert/Certificate;",
+                &[],
+            )? {
+                Some(Value::Object(Some(c))) => c,
+                _ => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/security/KeyStoreException",
+                        &format!("setEntry({alias:?}): entry carries no trusted certificate"),
+                    ))
+                }
+            };
+            let der = certificate_der(ctx, cert);
+            if der.is_empty() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    &format!(
+                        "setEntry({alias:?}): no DER encoding available for this certificate \n                         — nothing was stored"
+                    ),
+                ));
+            }
+            keystore_set_cert_entry(id, &alias, der);
+            Ok(None)
+        }
+        "java/security/KeyStore$PrivateKeyEntry" => {
+            if password.is_none() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    "non-null password required to create PrivateKeyEntry",
+                ));
+            }
+            let key = match ctx.invoke_virtual(
+                entry,
+                "getPrivateKey",
+                "()Ljava/security/PrivateKey;",
+                &[],
+            )? {
+                Some(Value::Object(Some(k))) => k,
+                _ => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/security/KeyStoreException",
+                        &format!("setEntry({alias:?}): entry carries no private key"),
+                    ))
+                }
+            };
+            let mut key_der = read_encoded_byte_array(ctx, key);
+            if key_der.is_empty() {
+                // Same handle-resolution fallback `engine_set_key_entry` needs:
+                // this module's own compact `PrivateKey` proxy carries a
+                // `(store_id, alias_hash)` pair instead of an in-object DER.
+                key_der = private_key_der_from_proxy(ctx, key).unwrap_or_default();
+            }
+            if key_der.is_empty() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    &format!(
+                        "setEntry({alias:?}): the private key has no PKCS#8 encoding this VM \n                         can store (getEncoded() returned nothing) — nothing was stored"
+                    ),
+                ));
+            }
+            let mut chain: Vec<Vec<u8>> = Vec::new();
+            if let Some(Value::Object(Some(arr))) = ctx.invoke_virtual(
+                entry,
+                "getCertificateChain",
+                "()[Ljava/security/cert/Certificate;",
+                &[],
+            )? {
+                let len = ctx.array_length(arr);
+                for i in 0..len {
+                    if let Value::Object(Some(cert)) = ctx.get_array_element(arr, i) {
+                        let der = certificate_der(ctx, cert);
+                        if !der.is_empty() {
+                            chain.push(der);
+                        }
+                    }
+                }
+            }
+            // Same TLS staging `engine_set_key_entry` performs: an in-memory
+            // keystore built through setEntry is just as much a server identity
+            // as one built through setKeyEntry.
+            if !chain.is_empty() {
+                crate::t27_tls::install_identity_from_der(&key_der, &chain);
+            }
+            keystore_set_key_entry(id, &alias, key_der, chain);
+            Ok(None)
+        }
+        "java/security/KeyStore$SecretKeyEntry" => {
+            if password.is_none() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    "non-null password required to create SecretKeyEntry",
+                ));
+            }
+            if !spi_supports_secret_keys(ctx, this) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    "Cannot store non-PrivateKeys",
+                ));
+            }
+            let key = match ctx.invoke_virtual(
+                entry,
+                "getSecretKey",
+                "()Ljavax/crypto/SecretKey;",
+                &[],
+            )? {
+                Some(Value::Object(Some(k))) => k,
+                _ => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/security/KeyStoreException",
+                        &format!("setEntry({alias:?}): entry carries no secret key"),
+                    ))
+                }
+            };
+            let raw = read_encoded_byte_array(ctx, key);
+            if raw.is_empty() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/KeyStoreException",
+                    &format!(
+                        "setEntry({alias:?}): the secret key has no RAW encoding this VM can \n                         store (getEncoded() returned nothing) — nothing was stored"
+                    ),
+                ));
+            }
+            let algorithm = string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;")
+                .unwrap_or_else(|| "AES".to_string());
+            require_encodable_secret_alg(ctx, &algorithm)?;
+            keystore_set_secret_key_entry(id, &alias, raw, &algorithm);
+            Ok(None)
+        }
+        other => {
+            let dotted = other.replace('/', ".");
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/KeyStoreException",
+                &format!("unsupported entry type: {dotted}"),
+            ))
+        }
+    }
+}
+
+/// engineGetEntry(String, KeyStore.ProtectionParameter).
+///
+/// The companion to [`engine_set_entry`], and needed for the same reason: real
+/// `PKCS12KeyStore.engineGetEntry` reads the SPI object's own `entries` map,
+/// which on this VM is empty because every mutation lands in this file's side
+/// table. Leaving it to real bytecode meant `getEntry` answered `null` for an
+/// alias that `containsAlias`/`aliases()`/`getKey` all reported as present, and
+/// `UnrecoverableKeyException` for a trusted-cert entry that
+/// `setCertificateEntry` had just stored successfully.
+///
+/// The algorithm is `KeyStoreSpi.engineGetEntry`'s, which is defined purely in
+/// terms of the `engine*` accessors this module already owns.
+fn engine_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
+
+    let Some(store) = keystore_lookup(id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(entry) = store.entries.get(&alias) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let is_cert_entry = matches!(entry.kind, EntryKind::TrustedCert { .. });
+    let chain_len = match &entry.kind {
+        EntryKind::PrivateKey { chain, .. } => chain.len(),
+        _ => 0,
+    };
+    let is_secret = matches!(entry.kind, EntryKind::SecretKey { .. });
+
+    let prot = match args.get(2) {
+        Some(Value::Object(Some(p))) => Some(*p),
+        _ => None,
+    };
+
+    let Some(prot) = prot else {
+        if !is_cert_entry {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/UnrecoverableKeyException",
+                "requested entry requires a password",
+            ));
+        }
+        let cert = engine_get_certificate(ctx, args)?;
+        let cert = match cert {
+            Some(v @ Value::Object(Some(_))) => v,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        return ctx.new_object_initialized(
+            "java/security/KeyStore$TrustedCertificateEntry",
+            "(Ljava/security/cert/Certificate;)V",
+            &[cert],
+        );
+    };
+
+    let Some(password) = protection_password(ctx, prot)? else {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/UnsupportedOperationException",
+            "unsupported protection parameter",
+        ));
+    };
+    if is_cert_entry {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/UnsupportedOperationException",
+            "trusted certificate entries are not password-protected",
+        ));
+    }
+
+    let key_args = [
+        Value::Object(Some(this)),
+        args.get(1).copied().unwrap_or(Value::Object(None)),
+        password,
+    ];
+    let key = match engine_get_key(ctx, &key_args)? {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    if is_secret {
+        return ctx.new_object_initialized(
+            "java/security/KeyStore$SecretKeyEntry",
+            "(Ljavax/crypto/SecretKey;)V",
+            &[key],
+        );
+    }
+
+    if chain_len == 0 {
+        // Unreachable through any API real JDK permits — `PKCS12KeyStore`
+        // refuses to store a private key without a chain, and
+        // `PrivateKeyEntry`'s constructor rejects a zero-length one. Say so
+        // instead of letting the constructor throw an
+        // `IllegalArgumentException` that names neither the alias nor the
+        // keystore.
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/KeyStoreException",
+            &format!(
+                "getEntry({alias:?}): this private-key entry has no certificate chain, so no \n                 PrivateKeyEntry can be built for it"
+            ),
+        ));
+    }
+    let chain = match engine_get_certificate_chain(ctx, args)? {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => Value::Object(None),
+    };
+    ctx.new_object_initialized(
+        "java/security/KeyStore$PrivateKeyEntry",
+        "(Ljava/security/PrivateKey;[Ljava/security/cert/Certificate;)V",
+        &[key, chain],
+    )
+}
+
 /// engineDeleteEntry(String alias) -- in-memory removal (companion to
 /// engine_set_certificate_entry; same side-table consistency rationale).
 pub(crate) fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2395,7 +3343,32 @@ pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => Vec::new(),
     };
     let store = keystore_lookup(id).unwrap_or_default();
-    let bytes = write_jks(&store, &password);
+    // Format choice, stated plainly: JKS cannot represent a `SecretKeyEntry`
+    // at all, so a store holding one has to go out as PKCS#12 or lose the
+    // entry -- which is exactly what this did, silently, until now. Stores
+    // WITHOUT a secret key keep the byte-for-byte JKS body, because that is
+    // the shape every already-validated round trip in this VM (the keycloak
+    // truststore merge, the TLS identity paths) is measured against, and CV's
+    // loader detects either format by magic on the way back in.
+    let bytes = if store
+        .entries
+        .values()
+        .any(|e| matches!(e.kind, EntryKind::SecretKey { .. }))
+    {
+        match write_pkcs12(&store, &password) {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                // Never fall back to JKS here: that would drop the secret key
+                // and hand the caller a valid-looking file, which is the
+                // original defect.
+                return Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::IOException { message }),
+                ));
+            }
+        }
+    } else {
+        write_jks(&store, &password)
+    };
     // Build a Java byte[] and call OutputStream.write(byte[]).
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
     for (i, b) in bytes.iter().enumerate() {
@@ -3320,5 +4293,212 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = fnv1a_32(b"world");
         assert_ne!(h1, h3);
+    }
+
+    // -----------------------------------------------------------------
+    // PKCS#12 writer (`pkcs12-setentry-secretkeyentry-…-20260805`)
+    // -----------------------------------------------------------------
+
+    fn secret_entry(alias: &str, bytes: &[u8], algorithm: &str) -> (String, KeyStoreEntry) {
+        (
+            alias.to_string(),
+            KeyStoreEntry {
+                alias: alias.to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::SecretKey {
+                    key_bytes: bytes.to_vec(),
+                    algorithm: algorithm.to_string(),
+                },
+            },
+        )
+    }
+
+    fn cert_entry(alias: &str, der: &[u8]) -> (String, KeyStoreEntry) {
+        (
+            alias.to_string(),
+            KeyStoreEntry {
+                alias: alias.to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::TrustedCert {
+                    cert_der: der.to_vec(),
+                },
+            },
+        )
+    }
+
+    fn store_of(entries: Vec<(String, KeyStoreEntry)>) -> LoadedKeyStore {
+        let mut map: IndexMap<String, KeyStoreEntry> = IndexMap::new();
+        for (alias, entry) in entries {
+            map.insert(alias, entry);
+        }
+        LoadedKeyStore { entries: map }
+    }
+
+    /// The defect this file records, reduced to the storage layer: a keystore
+    /// holding a secret key had to survive `store` -> `load` with its BYTES,
+    /// its ALGORITHM and its ALIAS intact. Asserting only "an entry came back"
+    /// would have passed against the "RAW" bug.
+    #[test]
+    fn pkcs12_round_trips_a_secret_key_with_its_algorithm() {
+        let key = [0u8, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105];
+        let store = store_of(vec![secret_entry("ske", &key, "AES")]);
+        let der = write_pkcs12(&store, b"changeit").expect("write");
+        let back = load_pkcs12(&der, b"changeit").expect("load");
+
+        assert_eq!(back.entries.len(), 1, "entry count after round trip");
+        let entry = back.entries.get("ske").expect("alias preserved");
+        match &entry.kind {
+            EntryKind::SecretKey {
+                key_bytes,
+                algorithm,
+            } => {
+                assert_eq!(key_bytes.as_slice(), &key, "key material");
+                assert_eq!(algorithm, "AES", "algorithm name, not the format");
+            }
+            other => panic!("secret key came back as {other:?}"),
+        }
+    }
+
+    /// DESede is the row a guess gets wrong (`1.3.14.3.2.17`, not PKCS#3's
+    /// `des-EDE3-CBC`), so it is worth its own assertion rather than trusting
+    /// the AES case to cover the table.
+    #[test]
+    fn pkcs12_round_trips_desede_under_the_oid_the_jdk_uses() {
+        let store = store_of(vec![secret_entry("des", &[0x5au8; 24], "DESede")]);
+        // The identifier itself sits INSIDE the encrypted SecretBag, so assert
+        // it at the table rather than by scanning the ciphertext.
+        assert_eq!(
+            secret_key_alg_oid("DESede").unwrap().components().as_slice(),
+            &[1u64, 3, 14, 3, 2, 17]
+        );
+        let der = write_pkcs12(&store, b"changeit").expect("write");
+        let back = load_pkcs12(&der, b"changeit").expect("load");
+        match &back.entries.get("des").expect("alias").kind {
+            EntryKind::SecretKey { algorithm, .. } => assert_eq!(algorithm, "DESede"),
+            other => panic!("came back as {other:?}"),
+        }
+    }
+
+    /// A store with all three entry kinds. The private key exercises the
+    /// shrouded-key-bag + localKeyId pairing, the trusted cert exercises the
+    /// `trustedKeyUsage` attribute, and the secret key is the reason the whole
+    /// writer exists.
+    #[test]
+    fn pkcs12_round_trips_a_mixed_store() {
+        let leaf = b"\x30\x0aLEAFCERT01".to_vec();
+        let mut entries = IndexMap::new();
+        entries.insert(
+            "pk".to_string(),
+            KeyStoreEntry {
+                alias: "pk".to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::PrivateKey {
+                    key_der: b"\x30\x08PRIVKEY1".to_vec(),
+                    chain: vec![leaf.clone()],
+                },
+            },
+        );
+        let (a, e) = cert_entry("ca", b"\x30\x08CACERT01");
+        entries.insert(a, e);
+        let (a, e) = secret_entry("sk", &[1u8, 2, 3, 4], "HmacSHA256");
+        entries.insert(a, e);
+        let store = LoadedKeyStore { entries };
+
+        let der = write_pkcs12(&store, b"pw").expect("write");
+        let back = load_pkcs12(&der, b"pw").expect("load");
+        assert_eq!(back.entries.len(), 3, "aliases: {:?}", back.entries.keys());
+
+        match &back.entries.get("pk").expect("pk").kind {
+            EntryKind::PrivateKey { key_der, chain } => {
+                assert_eq!(key_der.as_slice(), b"\x30\x08PRIVKEY1");
+                assert_eq!(chain, &vec![leaf]);
+            }
+            other => panic!("pk came back as {other:?}"),
+        }
+        match &back.entries.get("ca").expect("ca").kind {
+            EntryKind::TrustedCert { cert_der } => {
+                assert_eq!(cert_der.as_slice(), b"\x30\x08CACERT01")
+            }
+            other => panic!("ca came back as {other:?}"),
+        }
+        match &back.entries.get("sk").expect("sk").kind {
+            EntryKind::SecretKey {
+                key_bytes,
+                algorithm,
+            } => {
+                assert_eq!(key_bytes.as_slice(), &[1u8, 2, 3, 4]);
+                assert_eq!(algorithm, "HmacSHA256");
+            }
+            other => panic!("sk came back as {other:?}"),
+        }
+    }
+
+    /// The MAC is not decoration: a wrong password must be rejected rather
+    /// than yielding an empty-looking keystore.
+    #[test]
+    fn pkcs12_write_produces_a_mac_that_rejects_the_wrong_password() {
+        let store = store_of(vec![secret_entry("ske", &[9u8; 16], "AES")]);
+        let der = write_pkcs12(&store, b"right").expect("write");
+        assert!(load_pkcs12(&der, b"right").is_ok());
+        assert!(matches!(
+            load_pkcs12(&der, b"wrong"),
+            Err(KeyStoreError::Pkcs12MacFailed)
+        ));
+    }
+
+    /// `write_pkcs12` must not emit a file whose secret key would read back as
+    /// a DIFFERENT algorithm, so an unencodable name is an error, not a guess.
+    /// The same names a real JDK's `AlgorithmId.get` refuses are refused here.
+    #[test]
+    fn pkcs12_refuses_a_secret_key_algorithm_it_cannot_encode() {
+        let store = store_of(vec![secret_entry("x", &[0u8; 16], "ChaCha20")]);
+        let err = write_pkcs12(&store, b"pw").expect_err("must not invent an OID");
+        assert!(err.contains("ChaCha20"), "message names the algorithm: {err}");
+    }
+
+    /// A name this VM only READS (`AlgorithmId.getName()` is asymmetric for
+    /// three OIDs) and a bare dotted OID both have to encode, or `load` ->
+    /// `store` of somebody else's keystore would fail where it used to work.
+    #[test]
+    fn secret_key_alg_oid_accepts_read_side_names_and_bare_oids() {
+        assert!(secret_key_alg_oid("DES/CBC").is_some());
+        assert!(secret_key_alg_oid("RC2/CBC/PKCS5Padding").is_some());
+        assert!(secret_key_alg_oid("1.2.840.113549.3.7").is_some());
+        assert!(secret_key_alg_oid("aes").is_some(), "names are case-insensitive");
+        assert!(secret_key_alg_oid("not an algorithm").is_none());
+        assert!(
+            secret_key_alg_oid("9.99.1").is_none(),
+            "an OID whose first arc is out of range must not reach the DER writer"
+        );
+    }
+
+    #[test]
+    fn secret_key_alg_name_falls_back_to_the_dotted_oid() {
+        let unknown = yasna::models::ObjectIdentifier::from_slice(&[1, 2, 3, 4, 5]);
+        assert_eq!(secret_key_alg_name(&unknown), "1.2.3.4.5");
+        let aes = yasna::models::ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 1]);
+        assert_eq!(secret_key_alg_name(&aes), "AES");
+    }
+
+    /// A secret key cannot go into a JKS body at all; it must be the store's
+    /// format choice that changes, never the entry that disappears.
+    #[test]
+    fn jks_still_omits_secret_keys_and_keeps_insertion_order() {
+        let mut entries = IndexMap::new();
+        let (a, e) = cert_entry("zzz-first", b"\x30\x06DUMMY1");
+        entries.insert(a, e);
+        let (a, e) = secret_entry("secret", &[1u8; 16], "AES");
+        entries.insert(a, e);
+        let (a, e) = cert_entry("aaa-second", b"\x30\x06DUMMY2");
+        entries.insert(a, e);
+        let store = LoadedKeyStore { entries };
+
+        let jks = write_jks(&store, b"pw");
+        let back = load_jks(&jks, b"pw").expect("load");
+        assert_eq!(
+            back.entries.keys().collect::<Vec<_>>(),
+            vec!["zzz-first", "aaa-second"],
+            "insertion order, not alphabetical, and no secret key"
+        );
     }
 }
