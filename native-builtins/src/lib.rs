@@ -14016,6 +14016,12 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/util/Optional;",
         crate::lang_system::native_runtime_version_build,
     );
+    // Every spawn route funnels into `native-io`'s `spawn_and_wrap`, including
+    // the `ProcessBuilder.start` that this crate does NOT own. Hand it the
+    // SecurityManager gate here, alongside the exec registrations, so the two
+    // cannot drift apart. Idempotent.
+    crate::lang_system::install_spawn_policy_hook();
+
     // Runtime.exec overloads — spawn subprocesses via std::process::Command
     registry.register(
         "java/lang/Runtime",
@@ -37796,7 +37802,20 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Object(None))),
     };
     if cursor >= native_arraylist_size(ctx, list) {
-        return Ok(Some(Value::Object(None)));
+        // The JDK contract, and what the sibling `ArrayList$Itr.next()` native
+        // in native-collections already does. A `null` here is not a harmless
+        // "nothing left": `AbstractSequentialList.get(index)` is
+        // `listIterator(index).next()` wrapped in
+        // `catch (NoSuchElementException) -> IndexOutOfBoundsException`, so
+        // swallowing it made `get(size())` answer `null` on EVERY list that
+        // inherits `get` -- directly and through a
+        // `Collections.unmodifiableList` view. See the identical reasoning on
+        // the `Collections$EmptyIterator` natives in this file.
+        return Err(MethodCallFailed::from(
+            RuntimeError::NoSuchElementException {
+                message: "ArrayList$ListItr.next".to_string(),
+            },
+        ));
     }
     let value = cratonvm_native_collections::native_al_get(
         ctx,
@@ -37826,7 +37845,12 @@ fn native_snapshot_list_itr_previous(
     let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
     let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
     if cursor <= 0 {
-        return Ok(Some(Value::Object(None)));
+        // Same contract as `next()` above, at the other end.
+        return Err(MethodCallFailed::from(
+            RuntimeError::NoSuchElementException {
+                message: "ArrayList$ListItr.previous".to_string(),
+            },
+        ));
     }
     let list = match native_arraylist_list_itr_list(ctx, this) {
         Some(list) => list,
@@ -38726,7 +38750,32 @@ fn reflect_array_element_assignable(
         }
     }
     let value_class = ctx.class_id_of_object(value);
-    value_class == component || ctx.is_subclass(value_class, component)
+    if value_class == component || ctx.is_subclass(value_class, component) {
+        return true;
+    }
+    // DIAG (`CRATONVM_DBG=coerce`): the refusal carries no detail of its own --
+    // HotSpot's wording is the bare "array element type mismatch" and source
+    // witnesses pin it -- so name both sides here instead. The recurring cause
+    // is NOT a real type error but one class NAME resolved to two `ClassId`s
+    // under two loaders; the same lever already exists for the sibling
+    // "argument type mismatch" in `lang_class.rs`. See
+    // `field-set-argument-type-mismatch-is-a-loader-split-use-dbg-coerce`.
+    if crate::nbflags().dbg_coerce {
+        let comp_name = ctx
+            .class_name_of_id(component)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let value_name = ctx
+            .class_name_of_id(value_class)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let arr_name = ctx
+            .class_name_of_id(arr_class)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        eprintln!(
+            "[DBG_COERCE] Array.set: rejecting -- array={arr_name} component={comp_name} \
+(cid={component:?}) value_class={value_name} (cid={value_class:?})"
+        );
+    }
+    false
 }
 
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -41922,6 +41971,30 @@ mod t2_6_crypto_acceptance_tests {
 // MemorySegment) initializes inherited private fields. Field-index writes are
 // unsafe here because CharBuffer subclasses add their own layout; use the
 // resolved names so duplicate()/asReadOnlyBuffer() preserve mark semantics.
+//
+// The constructor is not just four field writes: it VALIDATES, and several
+// callers depend on that rather than checking themselves. The JDK body is
+//
+//     if (cap < 0) throw createCapacityException(cap);
+//     this.capacity = cap; this.segment = segment;
+//     limit(lim);       // IllegalArgumentException if lim > cap or lim < 0
+//     position(pos);    // IllegalArgumentException if pos > limit or pos < 0
+//     if (mark >= 0) { if (mark > pos) throw ...; this.mark = mark; }
+//
+// and `CharBuffer.wrap(csq, start, end)`, `CharBuffer.wrap(char[], off, len)`
+// and `StringCharBuffer.subSequence` are all written as
+// `try { new ...(...) } catch (IllegalArgumentException x) { throw new
+// IndexOutOfBoundsException(); }` — the range check IS the constructor's.
+// Writing the fields without checking them made
+// `CharBuffer.wrap("Hello, World").subSequence(3, 2)` return a buffer with
+// position 3 and limit 2, and `CharBuffer.wrap(new char[4], 3, 2)` a buffer
+// running two limbs past its own array, where HotSpot throws.
+//
+// See `docs/known-issues/buffer-constructor-does-not-validate-position-and-limit.md`
+// (retired) — and note that the validation is NOT missing from
+// `Buffer.limit(int)`/`position(int)` themselves, which are correct and do
+// fire for every direct caller. It was missing only here, because this native
+// stands in front of the constructor that would have called them.
 fn register_real_buffer_constructor_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "java/nio/Buffer",
@@ -41934,6 +42007,33 @@ fn register_real_buffer_constructor_natives(registry: &mut NativeMethodRegistry)
             let limit = args.get(3).and_then(Value::as_int).unwrap_or(0);
             let capacity = args.get(4).and_then(Value::as_int).unwrap_or(0);
             let segment = args.get(5).copied().unwrap_or(Value::Object(None));
+            // Messages are `createCapacityException` / `createLimitException` /
+            // `createPositionException` verbatim: callers that convert this to
+            // an `IndexOutOfBoundsException` discard them, but anything that
+            // lets the `IllegalArgumentException` out shows them to the user.
+            let bad = |message: String| -> cratonvm_types::error::MethodCallFailed {
+                cratonvm_types::error::RuntimeError::IllegalArgumentException { message }.into()
+            };
+            if capacity < 0 {
+                return Err(bad(format!("capacity < 0: ({capacity} < 0)")));
+            }
+            if limit > capacity {
+                return Err(bad(format!(
+                    "newLimit > capacity: ({limit} > {capacity})"
+                )));
+            }
+            if limit < 0 {
+                return Err(bad(format!("newLimit < 0: ({limit} < 0)")));
+            }
+            if position > limit {
+                return Err(bad(format!("newPosition > limit: ({position} > {limit})")));
+            }
+            if position < 0 {
+                return Err(bad(format!("newPosition < 0: ({position} < 0)")));
+            }
+            if mark >= 0 && mark > position {
+                return Err(bad(format!("mark > position: ({mark} > {position})")));
+            }
             ctx.set_field_by_name(this, "mark", Value::Int(mark));
             ctx.set_field_by_name(this, "position", Value::Int(position));
             ctx.set_field_by_name(this, "limit", Value::Int(limit));

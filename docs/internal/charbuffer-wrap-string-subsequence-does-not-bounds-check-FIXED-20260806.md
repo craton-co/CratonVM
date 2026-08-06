@@ -152,9 +152,9 @@ Suites on the merged state, 0 failures: `native-builtins --lib` 3287,
 `vm --test wp8_10_9_string_contains_native` 6, and the blocking synthetic-JDK
 VM gate.
 
-## What is deliberately NOT fixed here
+## What was deliberately NOT fixed here — and was fixed the next day
 
-One row: `CharBuffer.wrap(str).subSequence(3, 2)` returns an empty buffer
+One row: `CharBuffer.wrap(str).subSequence(3, 2)` returned an empty buffer
 (`pos=3 lim=2 rem=0`) where HotSpot throws `IndexOutOfBoundsException`.
 
 `StringCharBuffer.subSequence` does not range-check that pair itself — it lets
@@ -162,17 +162,18 @@ the `Buffer` constructor's `position(pos)` raise `IllegalArgumentException` and
 catches it. **CratonVM's `Buffer.position(int)` validation is correct and does
 fire** — `IntBuffer.allocate(5).position(9)`, `LongBuffer`, `DoubleBuffer`,
 `ShortBuffer.limit(9)` and `CharBuffer.allocate(5).limit(3).position(4)` all
-throw the right exception with HotSpot's exact message — but it does not fire
-when called from inside `Buffer.<init>`. That is a constructor-dispatch defect,
-not a `CharBuffer` one, and it is **pre-existing**: the never-intercepted
-three-argument `wrap(str, 0, 5).subSequence(3, 2)` did not throw on the
-pre-change binary either. Filed as
-[`buffer-constructor-does-not-validate-position-and-limit.md`](../known-issues/buffer-constructor-does-not-validate-position-and-limit.md).
+throw the right exception with HotSpot's exact message — but it did not fire
+when called from inside `Buffer.<init>`. That was pre-existing: the
+never-intercepted three-argument `wrap(str, 0, 5).subSequence(3, 2)` did not
+throw on the pre-change binary either.
 
-No data is fabricated in that case — the buffer is empty — so it is a
-wrong-answer-instead-of-exception divergence on an argument order that is
-already a programming error, not the out-of-range read this record was filed
-about.
+**FIXED 2026-08-06** →
+[`buffer-constructor-does-not-validate-position-and-limit-FIXED-20260806.md`](buffer-constructor-does-not-validate-position-and-limit-FIXED-20260806.md),
+which takes `probes/CharBufferWrapProbe` from this record's 1 divergence to
+**0 of 61**. The mechanism this record guessed at — covariant-bridge dispatch
+inside a constructor — was wrong again: `java/nio/Buffer.<init>` is itself a
+registered native, and it wrote the fields without performing any of the
+constructor's checks. Nothing was dispatched anywhere surprising.
 
 ## What this one is worth keeping
 

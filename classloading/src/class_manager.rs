@@ -16586,14 +16586,39 @@ mod tests {
     /// whose layout actually shifted.
     #[test]
     fn recompute_subclass_layouts_fires_jit_invalidate_hook_for_changed_descendants() {
-        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
-        static FIRED_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static LAST_CLASS_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+        // Record per THREAD, not process-wide.
+        //
+        // The hook is one process-global `fn(u32)` and `upgrade_synthetic_class`
+        // fires it too, so every other test in this binary that upgrades a stub
+        // — or that calls `recompute_subclass_layouts` on its own manager, as
+        // the two sibling tests below do — also runs this hook, concurrently,
+        // on its own thread. A global counter read before and after the call
+        // therefore counted their firings as well as this test's, and the
+        // `assert_eq!(fired, 1)` below failed about once in twenty runs of
+        // `cargo test -p cratonvm-classloading` (measured 2026-08-06). The
+        // `LAST_CLASS_ID` assertion had the same hazard and was worse: a
+        // foreign firing between the two loads overwrote the id outright.
+        //
+        // `recompute_subclass_layouts` fires synchronously on the calling
+        // thread, so a thread-local makes the observation exactly as wide as
+        // the call under test — this test's firings and nobody else's. That
+        // keeps the assertion an EQUALITY. Relaxing it to `>= 1` would also
+        // have stopped the flake, and would have stopped it detecting a
+        // missing invalidation, which is the only thing it is for.
+        thread_local! {
+            static FIRINGS: std::cell::RefCell<Vec<u32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
         fn hook(class_id: u32) {
-            FIRED_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
-            LAST_CLASS_ID.store(class_id, AtomicOrdering::SeqCst);
+            FIRINGS.with(|fired| fired.borrow_mut().push(class_id));
         }
         install_jit_invalidate_hook(hook);
+        // `install_jit_invalidate_hook` is a `OnceLock::set`: the first
+        // installer in the process wins and later ones are dropped in silence.
+        // This is the crate's only installer, so ours is the one that runs. If
+        // a second is ever added, the two have to share one recording hook —
+        // otherwise nothing is recorded here and the assertion below fails
+        // with an empty vector, which is what its message names.
 
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
@@ -16683,27 +16708,19 @@ mod tests {
             parent.num_total_fields = 2;
         }
 
-        let before = FIRED_COUNT.load(AtomicOrdering::SeqCst);
+        FIRINGS.with(|fired| fired.borrow_mut().clear());
         mgr.recompute_subclass_layouts(parent_id);
-        let fired = FIRED_COUNT.load(AtomicOrdering::SeqCst) - before;
+        let fired = FIRINGS.with(|fired| fired.borrow().clone());
 
-        // Only meaningful if this test won the process-wide OnceLock install
-        // race (it's the only classloading-crate test that installs this
-        // hook, so it always should — but stay defensive, matching
-        // `jit_invalidate_hook_inactive_returns_quietly`'s own guard style).
-        if JIT_INVALIDATE_HOOK_ACTIVE.load(AtomicOrdering::Acquire) {
-            assert_eq!(
-                fired, 1,
-                "Child's first_field_index/num_total_fields shifted with \
-                 Parent's growth (1 -> 2 fields), so the JIT cache must be \
-                 told to evict any code compiled against Child's stale \
-                 field offsets"
-            );
-            assert_eq!(
-                LAST_CLASS_ID.load(AtomicOrdering::SeqCst),
-                child_id.as_u32()
-            );
-        }
+        assert_eq!(
+            fired,
+            vec![child_id.as_u32()],
+            "Child's first_field_index/num_total_fields shifted with Parent's \
+             growth (1 -> 2 fields), so the JIT cache must be told to evict any \
+             code compiled against Child's stale field offsets, once, and for \
+             Child. An EMPTY vector means another test installed the \
+             process-wide hook first, so this one recorded nothing"
+        );
 
         // Sanity check this scenario really is the "layout changed" case
         // (not a no-op): Child's own layout must reflect Parent's growth.

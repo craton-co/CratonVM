@@ -1075,7 +1075,7 @@ mod tests {
         register_submission(sub.clone());
 
         ensure_completion_reaper_started();
-        enqueue_completion(handle, weak_vm);
+        enqueue_completion(handle, weak_vm, sub.clone());
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1878,6 +1878,30 @@ impl OffloadCache {
         //    be freed out from under a kernel that's still in-flight
         //    on the device, even if every other reference (registry +
         //    caller) is dropped first.
+        //
+        //    AUDIT 2026-08-03: that "benign" reasoning above missed a
+        //    real consequence — being the *last* strong reference means
+        //    THIS closure is the one whose drop runs `StreamSubmission`'s
+        //    (and transitively `cuda_bridge::Stream`'s / cudarc's
+        //    `CudaStream`'s) destructor, and `CudaStream::drop` issues a
+        //    real CUDA driver call (stream teardown/sync against the
+        //    default stream). Doing that from inside a `cuLaunchHostFunc`
+        //    callback is exactly the "must never re-enter the CUDA
+        //    driver" rule stated two paragraphs up — verified on
+        //    hardware (RTX 2060) via a reproducible `cudarc` panic,
+        //    `DriverError(CUDA_ERROR_NOT_PERMITTED, "operation not
+        //    permitted")`, out of `CudaStream`'s `Drop` impl, on every
+        //    dispatch of a synchronous (non-Future-API) kernel like
+        //    `GpuDotBench.dotReduce` — that path never calls
+        //    `register_submission`, so by the time the driver actually
+        //    invokes this callback the synchronous caller has already
+        //    finished and dropped its own reference, leaving this
+        //    closure's clone as the last one, 100% of the time.
+        //    Fix: move `cb_submission` INTO `enqueue_completion` instead
+        //    of letting it drop locally here. The reaper thread — an
+        //    ordinary thread, not a CUDA callback — becomes the one that
+        //    (maybe) runs the final drop, which is exactly where CUDA
+        //    driver calls are allowed.
         ensure_completion_reaper_started();
         let cb_submission = submission.clone();
         let cb_weak_vm = weak_vm;
@@ -1885,7 +1909,13 @@ impl OffloadCache {
             cb_submission
                 .device_done
                 .store(true, std::sync::atomic::Ordering::Release);
-            enqueue_completion(cb_submission.handle, cb_weak_vm);
+            let cb_handle = cb_submission.handle;
+            // Transfers ownership of `cb_submission` into the reaper
+            // queue — see the AUDIT note above. Do not reintroduce a
+            // local `Arc<StreamSubmission>`/`Arc<Stream>` drop in this
+            // closure; that is precisely what re-enters the CUDA driver
+            // from a host callback.
+            enqueue_completion(cb_handle, cb_weak_vm, cb_submission);
         })) {
             tracing::debug!(
                 "gpu offload: add_host_callback registration failed ({e}); \
@@ -1990,11 +2020,11 @@ pub fn release_submission(handle: u64) {
 // statics sidestep the issue entirely — `REAPER_QUEUE`'s mutex is the
 // only lock the condvar wait ever touches.
 //
-// The queue holds a `(handle, weak_vm)` pair per entry, NOT a bare
-// handle — an earlier version captured a single `Weak<SharedVm>` once,
-// at thread-spawn time, and reused it for every drained handle for the
-// rest of the process's life. That is correct for a single
-// long-lived production VM (matching `SUBMISSIONS`/
+// The queue holds a `(handle, weak_vm, submission)` triple per entry,
+// NOT a bare handle — an earlier version captured a single
+// `Weak<SharedVm>` once, at thread-spawn time, and reused it for every
+// drained handle for the rest of the process's life. That is correct
+// for a single long-lived production VM (matching `SUBMISSIONS`/
 // `NEXT_SUBMISSION_HANDLE`, which really are process-global-for-life
 // data), but it is WRONG the moment more than one `SharedVm` exists
 // over the process's lifetime — e.g. an integration-test binary that
@@ -2008,9 +2038,34 @@ pub fn release_submission(handle: u64) {
 // alongside each queued handle instead of pinning one to the thread's
 // whole lifetime fixes this for any number of concurrent or
 // sequential `SharedVm` instances.
+//
+// AUDIT 2026-08-03: the third element, `Arc<StreamSubmission>`, is the
+// fix for a real hardware bug, not an optimization. The host callback
+// in `dispatch_async` used to clone `submission` for its own use and
+// let that clone drop locally at the end of the closure. For a
+// synchronous (non-Future-API) dispatch — e.g. the transparent `--gpu`
+// path for a reduction kernel like `GpuDotBench.dotReduce`, which never
+// calls `register_submission` — that clone reliably ends up being the
+// *last* strong reference by the time the driver fires the callback
+// (the synchronous caller has already read its result and moved on).
+// Dropping the last `Arc<StreamSubmission>` drops the `cuda_bridge`
+// `Stream` inside it, whose `Drop` (via cudarc's `CudaStream::drop`)
+// issues a real CUDA driver call — forbidden from inside a
+// `cuLaunchHostFunc` callback, and confirmed on hardware (RTX 2060) to
+// panic with `DriverError(CUDA_ERROR_NOT_PERMITTED, "operation not
+// permitted")` on literally every such dispatch. Carrying the `Arc`
+// through this queue instead moves that potential final drop onto the
+// reaper thread — an ordinary thread, where CUDA driver calls are
+// allowed — while still preserving the original "keep the submission
+// (and any device buffers referenced by its pending `FinalizeState`)
+// alive until finalization" intent.
 #[cfg(feature = "gpu-offload")]
 static REAPER_QUEUE: parking_lot::Mutex<
-    std::collections::VecDeque<(u64, std::sync::Weak<crate::vm::SharedVm>)>,
+    std::collections::VecDeque<(
+        u64,
+        std::sync::Weak<crate::vm::SharedVm>,
+        std::sync::Arc<StreamSubmission>,
+    )>,
 > = parking_lot::Mutex::new(std::collections::VecDeque::new());
 #[cfg(feature = "gpu-offload")]
 static REAPER_WAKE: parking_lot::Condvar = parking_lot::Condvar::new();
@@ -2047,12 +2102,22 @@ fn ensure_completion_reaper_started() {
 }
 
 /// Body of the completion reaper thread. Blocks on `REAPER_WAKE` (no
-/// busy-polling); for each drained `(handle, weak_vm)` pair, upgrades
-/// that entry's own `weak_vm` and runs the same [`finalize_submission`]
-/// work `get()` would have — off the mutator, with no Java thread
-/// involved. `finalize_submission`'s own errors are already recorded
-/// on `StreamSubmission::status`; there is nothing further to do with
-/// its `Result` here.
+/// busy-polling); for each drained `(handle, weak_vm, submission)`
+/// triple, upgrades that entry's own `weak_vm` and runs the same
+/// [`finalize_submission`] work `get()` would have — off the mutator,
+/// with no Java thread involved. `finalize_submission`'s own errors are
+/// already recorded on `StreamSubmission::status`; there is nothing
+/// further to do with its `Result` here.
+///
+/// `submission` is kept bound (not `let _ = ...`'d away) for the
+/// duration of `finalize_enqueued_handle` and only drops when the loop
+/// moves on to the next iteration. If this is the last strong
+/// `Arc<StreamSubmission>` in the process, that drop — and the
+/// `cuda_bridge::Stream` / cudarc `CudaStream` teardown it can
+/// transitively trigger — happens right here, on this ordinary thread.
+/// That is the point: see `REAPER_QUEUE`'s doc comment for why it must
+/// NOT happen back in the `cuLaunchHostFunc` callback that produced
+/// this entry.
 #[cfg(feature = "gpu-offload")]
 fn completion_reaper_loop() {
     loop {
@@ -2073,11 +2138,13 @@ fn completion_reaper_loop() {
                 REAPER_WAKE.wait(&mut queue);
             }
         };
-        let (handle, weak_vm) = match item {
+        let (handle, weak_vm, _submission_keepalive) = match item {
             Some(item) => item,
             None => return,
         };
         finalize_enqueued_handle(&weak_vm, handle);
+        // `_submission_keepalive` drops here — safe on this thread even
+        // if it is the last `Arc<StreamSubmission>`.
     }
 }
 
@@ -2108,10 +2175,10 @@ fn finalize_enqueued_handle(weak_vm: &std::sync::Weak<crate::vm::SharedVm>, hand
     }
 }
 
-/// Push `(handle, weak_vm)` onto the reaper's work queue and wake it.
-/// `weak_vm` travels with the handle rather than being fixed once for
-/// the reaper thread's whole life — see the doc comment on
-/// `REAPER_QUEUE` for why that distinction matters. Called from the
+/// Push `(handle, weak_vm, submission)` onto the reaper's work queue
+/// and wake it. `weak_vm` travels with the handle rather than being
+/// fixed once for the reaper thread's whole life — see the doc comment
+/// on `REAPER_QUEUE` for why that distinction matters. Called from the
 /// `cuLaunchHostFunc` callback registered in `dispatch_async`, so this
 /// must stay cheap and must never call back into the CUDA driver: a
 /// `parking_lot::Mutex` lock + `VecDeque` push + `Condvar::notify_one`
@@ -2120,9 +2187,21 @@ fn finalize_enqueued_handle(weak_vm: &std::sync::Weak<crate::vm::SharedVm>, hand
 /// exists yet (a caller that races `ensure_completion_reaper_started`'s
 /// spawn) is harmless — the entry just sits in the queue until the
 /// worker starts draining it.
+///
+/// `submission` is *moved* in, not cloned — the caller (the host
+/// callback) must give up its own `Arc<StreamSubmission>` here rather
+/// than holding onto it and letting it drop locally. `VecDeque::push_back`
+/// only moves bytes around; it never drops the value being inserted, so
+/// transferring ownership this way adds no CUDA-driver-call risk to
+/// this function itself. See `REAPER_QUEUE`'s doc comment for why the
+/// eventual drop needs to happen on the reaper thread instead of here.
 #[cfg(feature = "gpu-offload")]
-fn enqueue_completion(handle: u64, weak_vm: std::sync::Weak<crate::vm::SharedVm>) {
-    REAPER_QUEUE.lock().push_back((handle, weak_vm));
+fn enqueue_completion(
+    handle: u64,
+    weak_vm: std::sync::Weak<crate::vm::SharedVm>,
+    submission: std::sync::Arc<StreamSubmission>,
+) {
+    REAPER_QUEUE.lock().push_back((handle, weak_vm, submission));
     REAPER_WAKE.notify_one();
 }
 
