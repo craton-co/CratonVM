@@ -1119,7 +1119,10 @@ impl G1Region {
 
         self.cursor = end;
         let ptr = aligned as *mut u8;
-        // Zero-init the allocated area
+        // Zero-init the allocated area. This is the SINGLE establishment of
+        // the TLAB zeroing contract — `refill_tlab`'s carves used to repeat it
+        // over the identical range. `refill_tlab_zeroes_dirty_eden_bytes` is
+        // the oracle: it dirties Eden above the cursor and fails if this goes.
         unsafe {
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -6929,8 +6932,11 @@ impl G1Collector {
                     // chunk. Inline compiled allocation relies on this for
                     // JVM default field values and zero-valued header words.
                     // Eden regions are recycled without clearing their bytes,
-                    // so G1 must establish the contract here.
-                    unsafe { std::ptr::write_bytes(ptr, 0, actual) };
+                    // so the contract has to be established somewhere — and
+                    // `bump_alloc` already establishes it, zeroing exactly
+                    // `actual` bytes at exactly this pointer before returning
+                    // it. A second `write_bytes` over the identical range was
+                    // memsetting the whole TLAB twice.
                     return Some((ptr, actual));
                 }
             }
@@ -6962,9 +6968,9 @@ impl G1Collector {
             if remaining >= 256 {
                 let actual = requested_size.min(remaining);
                 if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8) {
-                    // SAFETY: bump_alloc reserved `actual` writable bytes
-                    // exclusively from this Eden region.
-                    unsafe { std::ptr::write_bytes(ptr, 0, actual) };
+                    // `bump_alloc` has already zeroed exactly these `actual`
+                    // bytes; re-zeroing them here was a second full pass over
+                    // the TLAB. See the sibling carve above.
                     self.note_region_consumed_locked(&regions);
                     return Some((ptr, actual));
                 }

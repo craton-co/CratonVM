@@ -1,16 +1,33 @@
 # `ArrayIndexOutOfBoundsException` from an array access carries no detail message
 
-**Status:** OPEN. Low severity — the **class** is right everywhere, so nothing
-catches differently. This is a diagnosability gap, not a control-flow one.
+**Status:** PARTIALLY FIXED 2026-08-06 (`510f12fc6`). There is now a message
+where there was `null`; it is not yet HotSpot's *wording*, because that needs
+the array length and the variant still does not carry one. The remaining work is
+exactly the widening described under "What must change" below.
+
+Low severity throughout — the **class** is right everywhere, so nothing catches
+differently. This is a diagnosability gap, not a control-flow one.
 
 **Reproducer:** `probes/PreconditionsFormatterProbe`, the two `Array domain`
-rows.
+rows, and `docs/known-issues/repros/list-get-oob/LG2.java`.
 
 ```
-                       HotSpot 25                                                    CratonVM
-int[] load oob         Index 9 out of bounds for length 4                            null
-System.arraycopy oob   arraycopy: last source index 9 out of bounds for int[4]       null
+                       HotSpot 25                                                CratonVM before   CratonVM now
+int[] load oob         Index 9 out of bounds for length 4                        null              Array index out of range: 9
+System.arraycopy oob   arraycopy: last source index 9 out of bounds for int[4]   null              (unchanged — different throw path)
 ```
+
+`as_java_throwable` no longer discards the payload: it returns
+`Option<Cow<'_, str>>` and a `synthesised_detail_message` builder supplies the
+JDK's own `int`-constructor wording, `"Array index out of range: {index}"`, for
+the two variants that carry an operand but have no `String` to borrow
+(`ArrayIndexOutOfBoundsException`, `NegativeArraySizeException` — the latter now
+matching HotSpot exactly, since HotSpot's message there *is* just the size).
+
+That deliberately stops short of HotSpot's array-access wording, which needs the
+length. Using the `int`-constructor text is exact for what the variant knows
+rather than a guess at what it does not — and it is what the JDK itself prints
+when only an index is available.
 
 ## Why it happens
 
@@ -37,7 +54,7 @@ sites across `native-awt`, `native-builtins`, `native-builtins-crypto`,
 previously need — several of them do not have it in scope. That is its own
 change with its own review, not a rider on an exception-class fix.
 
-## What must change
+## What must change (still open)
 
 Give the variant the operands HotSpot's message needs, and fill them at the
 throw sites that have them:

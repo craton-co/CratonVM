@@ -103,7 +103,7 @@
 > `managerwebapp-deploy-bare-assertion-FIXED.md` retired against in July naming
 > these same two methods. Re-measured from scratch today and written up with
 > fresh numbers and standalone probes in
-> `docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md`.
+> `../../../known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`.
 > Per the known-issues triage rule this doc retires, since its own defect is
 > fixed and the residual has a separate open owner.
 
