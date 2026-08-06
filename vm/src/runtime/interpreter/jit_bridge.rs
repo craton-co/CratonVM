@@ -5471,7 +5471,7 @@ pub fn jit_panic_to_exception(
 
     // Parse ArrayIndexOutOfBoundsException
     if msg.starts_with("ArrayIndexOutOfBoundsException") {
-        let error = RuntimeError::aioobe_no_length(parse_aioobe_index(msg));
+        let error = RuntimeError::aioobe_index_only(parse_aioobe_index(msg));
         return crate::runtime::exceptions::throw_runtime_error(shared, thread, error);
     }
 

@@ -3508,7 +3508,7 @@ fn read_define_class_nonnegative_int(
     match args.get(idx) {
         Some(Value::Int(v)) if *v >= 0 => Ok(*v as usize),
         Some(Value::Int(v)) => {
-            Err(RuntimeError::aioobe_no_length(*v).into())
+            Err(RuntimeError::aioobe_index_only(*v).into())
         }
         _ => Ok(0),
     }
@@ -3523,9 +3523,9 @@ fn read_byte_array_define_class_slice(
     let arr_len = ctx.array_length(array);
     let end = offset
         .checked_add(length)
-        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
+        .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
     if end > arr_len {
-        return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32)
         .into());
     }
 
@@ -3560,13 +3560,13 @@ fn read_byte_buffer_define_class_slice(
         let cap = ctx.array_length(array);
         let absolute_off = pos
             .checked_add(offset)
-            .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
+            .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         let upper = limit.min(cap);
         let end = absolute_off
             .checked_add(length)
-            .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
+            .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         if end > upper {
-            return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
+            return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32)
             .into());
         }
         return read_byte_array_define_class_slice(ctx, array, absolute_off, length);
@@ -3596,13 +3596,13 @@ fn read_byte_buffer_define_class_slice(
     }
     let absolute_off = pos
         .checked_add(offset)
-        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
+        .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
     let upper = limit.min(cap);
     let end = absolute_off
         .checked_add(length)
-        .ok_or_else(|| RuntimeError::aioobe_no_length(i32::MAX))?;
+        .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
     if end > upper {
-        return Err(RuntimeError::aioobe_no_length(end.min(i32::MAX as usize) as i32)
+        return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32)
         .into());
     }
     let mut out = vec![0u8; length];

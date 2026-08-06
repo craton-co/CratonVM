@@ -282,7 +282,7 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let total = ctx.array_length(arr);
     if off.saturating_add(len) > total {
-        return Err(RuntimeError::aioobe_no_length((off + len) as i32)
+        return Err(RuntimeError::aioobe_index_only((off + len) as i32)
         .into());
     }
     let mut bytes = Vec::with_capacity(len);

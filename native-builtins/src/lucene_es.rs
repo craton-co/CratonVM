@@ -1887,7 +1887,7 @@ fn lucene_eof() -> MethodCallFailed {
 
 pub(crate) fn lucene_aioobe(index: i32) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(
-        RuntimeError::aioobe_no_length(index),
+        RuntimeError::aioobe_index_only(index),
     ))
 }
 

@@ -5982,7 +5982,7 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if index < 0 || index >= length {
-            return Err(RuntimeError::aioobe_no_length(index).into());
+            return Err(RuntimeError::aioobe_index_only(index).into());
         }
         Ok(Some(Value::Int(index)))
     });
@@ -6000,7 +6000,7 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if from < 0 || from > to || to > length {
-            return Err(RuntimeError::aioobe_no_length(from).into());
+            return Err(RuntimeError::aioobe_index_only(from).into());
         }
         Ok(Some(Value::Int(from)))
     });
@@ -6018,7 +6018,7 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if from < 0 || size < 0 || from + size > length {
-            return Err(RuntimeError::aioobe_no_length(from).into());
+            return Err(RuntimeError::aioobe_index_only(from).into());
         }
         Ok(Some(Value::Int(from)))
     });

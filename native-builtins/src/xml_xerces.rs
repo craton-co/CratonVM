@@ -272,11 +272,11 @@ fn xml_limit_slot(
     index: i32,
 ) -> Result<usize, MethodCallFailed> {
     if index < 0 {
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     let slot = index as usize;
     if slot >= ctx.array_length(array) {
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     Ok(slot)
 }
@@ -946,14 +946,14 @@ fn xml_entity_scanner_units(
     length: i32,
 ) -> Result<Vec<u16>, MethodCallFailed> {
     if offset < 0 || length < 0 {
-        return Err(RuntimeError::aioobe_no_length(offset).into());
+        return Err(RuntimeError::aioobe_index_only(offset).into());
     }
     let end =
         offset
             .checked_add(length)
-            .ok_or_else(|| RuntimeError::aioobe_no_length(offset.wrapping_add(length)))?;
+            .ok_or_else(|| RuntimeError::aioobe_index_only(offset.wrapping_add(length)))?;
     if end as usize > ctx.array_length(chars) {
-        return Err(RuntimeError::aioobe_no_length(end).into());
+        return Err(RuntimeError::aioobe_index_only(end).into());
     }
     let mut units = Vec::with_capacity(length as usize);
     for slot in offset..end {
@@ -1411,7 +1411,7 @@ fn xml_entity_scanner_char_at(
     index: i32,
 ) -> Result<i32, MethodCallFailed> {
     if index < 0 || index as usize >= ctx.array_length(array) {
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     Ok(ctx
         .get_array_element(array, index as usize)
@@ -1426,7 +1426,7 @@ fn xml_entity_scanner_set_char(
     value: i32,
 ) -> Result<(), MethodCallFailed> {
     if index < 0 || index as usize >= ctx.array_length(array) {
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     ctx.set_array_element(array, index as usize, Value::Int(value));
     Ok(())

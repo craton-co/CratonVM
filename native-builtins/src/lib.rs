@@ -242,7 +242,7 @@ fn native_output_stream_writer_write_chars(
     let arr_len = ctx.array_length(chars) as i32;
     let end = off.checked_add(len).unwrap_or(i32::MAX);
     if off < 0 || len < 0 || end > arr_len {
-        return Err(RuntimeError::aioobe_no_length(end).into());
+        return Err(RuntimeError::aioobe_index_only(end).into());
     }
     if len == 0 {
         return Ok(None);
@@ -5597,7 +5597,7 @@ fn native_heap_byte_buffer_init_array_offset_len(
         } else {
             limit64.min(i32::MAX as i64) as i32
         };
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     let limit = limit64 as i32;
     let segment = args.get(4).copied().unwrap_or(Value::Object(None));
@@ -17731,7 +17731,7 @@ pub fn register_essential_natives_with_shims(
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let dest_len = ctx.array_length(dest) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
-                return Err(RuntimeError::aioobe_no_length(if off < 0 { off } else { off.wrapping_add(len) })
+                return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
                 .into());
             }
             let pos_idx = ctx
@@ -20630,7 +20630,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         let total = ctx.array_length(arr);
         if from > to || to > total {
             return Err(
-                cratonvm_types::error::RuntimeError::aioobe_no_length(to as i32)
+                cratonvm_types::error::RuntimeError::aioobe_index_only(to as i32)
                 .into(),
             );
         }
@@ -38411,7 +38411,7 @@ fn reflect_array_index(
         _ => 0,
     };
     if idx < 0 || i64::from(idx) >= ctx.array_length(arr) as i64 {
-        return Err(RuntimeError::aioobe_no_length(idx).into());
+        return Err(RuntimeError::aioobe_no_message(idx).into());
     }
     Ok(idx as usize)
 }

@@ -865,7 +865,7 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
 
         let arr_len = ctx.array_length(byte_arr);
         if offset + count > arr_len {
-            return Err(RuntimeError::aioobe_no_length((offset + count) as i32)
+            return Err(RuntimeError::aioobe_index_only((offset + count) as i32)
             .into());
         }
 

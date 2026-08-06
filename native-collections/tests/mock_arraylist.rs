@@ -499,5 +499,5 @@ fn iterator_remove_drops_element() {
 fn is_aioobe(err: &MethodCallFailed, expected: i32) -> bool {
     matches!(err,
         MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_no_length(index))) if *index == expected)
+            RuntimeError::aioobe_index_only(index))) if *index == expected)
 }

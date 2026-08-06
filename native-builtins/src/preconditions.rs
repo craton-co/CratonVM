@@ -232,7 +232,7 @@ fn throw_constructed(
             .into()
         }
         "java/lang/ArrayIndexOutOfBoundsException" => {
-            RuntimeError::aioobe_no_length(index).into()
+            RuntimeError::aioobe_index_only(index).into()
         }
         _ => RuntimeError::ioobe(message).into(),
     }

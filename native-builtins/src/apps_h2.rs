@@ -1941,7 +1941,7 @@ fn h2_long_data_type_binary_search(
 
     while low <= high {
         if x < 0 || x as usize >= ctx.array_length(storage) {
-            return Err(RuntimeError::aioobe_no_length(x).into());
+            return Err(RuntimeError::aioobe_index_only(x).into());
         }
         let element = match ctx.get_array_element(storage, x as usize) {
             Value::Object(Some(obj)) => obj,
@@ -2761,7 +2761,7 @@ fn h2_parser_advance_to(
         }
     };
     if index < 0 || index as usize >= h2_arraylist_size(ctx, tokens) {
-        return Err(RuntimeError::aioobe_no_length(index).into());
+        return Err(RuntimeError::aioobe_index_only(index).into());
     }
     let token = match h2_arraylist_get(ctx, tokens, index as usize) {
         Some(Value::Object(Some(o))) => o,

@@ -262,7 +262,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let arr_len = ctx.array_length(*arr) as i64;
             if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-                return Err(RuntimeError::aioobe_no_length(if off < 0 { off } else { off.wrapping_add(len) })
+                return Err(RuntimeError::aioobe_index_only(if off < 0 { off } else { off.wrapping_add(len) })
                 .into());
             }
             let off = off as usize;
@@ -3046,7 +3046,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // poison indices in `set_array_element`.
         let arr_len = ctx.array_length(arr);
         if off.saturating_add(len) > arr_len {
-            return Err(RuntimeError::aioobe_no_length(off.saturating_add(len) as i32)
+            return Err(RuntimeError::aioobe_index_only(off.saturating_add(len) as i32)
             .into());
         }
         if len == 0 {
@@ -3201,7 +3201,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
         let arr_len = ctx.array_length(arr);
         if off.saturating_add(len) > arr_len {
-            return Err(RuntimeError::aioobe_no_length(off.saturating_add(len) as i32)
+            return Err(RuntimeError::aioobe_index_only(off.saturating_add(len) as i32)
             .into());
         }
         if len == 0 {

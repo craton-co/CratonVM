@@ -532,14 +532,14 @@ fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let offset = match args.get(3) {
         Some(Value::Int(o)) if *o >= 0 => *o as usize,
         Some(Value::Int(_)) => {
-            return Err(RuntimeError::aioobe_no_length(-1).into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
         _ => 0,
     };
     let length = match args.get(4) {
         Some(Value::Int(l)) if *l >= 0 => *l as usize,
         Some(Value::Int(_)) => {
-            return Err(RuntimeError::aioobe_no_length(-1).into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
         _ => 0,
     };
@@ -548,7 +548,7 @@ fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     // Validate bounds
     if offset.saturating_add(length) > arr_len {
-        return Err(RuntimeError::aioobe_no_length((offset + length) as i32)
+        return Err(RuntimeError::aioobe_index_only((offset + length) as i32)
         .into());
     }
 

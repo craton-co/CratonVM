@@ -14,6 +14,7 @@
 //! that `VmError` carries, and because every crate that can raise one already
 //! depends on this module.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use thiserror::Error;
@@ -1316,13 +1317,34 @@ impl RuntimeError {
         }
     }
 
-    /// An AIOOBE whose call site does not know the array's length, so it
-    /// cannot build HotSpot's text — a `getMessage()` of null, which is also
-    /// what HotSpot's own `java.lang.reflect.Array` accessors return.
+    /// An AIOOBE whose call site knows the index but not the array's length,
+    /// so it cannot build HotSpot's array-access text.
     ///
-    /// Prefer [`RuntimeError::aioobe`]; this exists so the remaining sites say
-    /// so explicitly rather than silently passing `None`.
-    pub fn aioobe_no_length(index: i32) -> Self {
+    /// It gets the JDK's own `ArrayIndexOutOfBoundsException(int)` wording,
+    /// `"Array index out of range: N"` — which is what a `java.util.Arrays`
+    /// range check produces on HotSpot, and what the great majority of the
+    /// natives migrated in 2026-08-06 are standing in for. It is exact for
+    /// what is known rather than a guess at what is not.
+    ///
+    /// Prefer [`RuntimeError::aioobe`] wherever the length is reachable; an
+    /// array access must never come through here, because HotSpot's wording
+    /// for one names the length.
+    pub fn aioobe_index_only(index: i32) -> Self {
+        RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+            message: Some(format!("Array index out of range: {index}")),
+        }
+    }
+
+    /// An AIOOBE with a deliberately **null** `getMessage()`.
+    ///
+    /// Not an unfinished migration: HotSpot's `java.lang.reflect.Array`
+    /// accessors raise the exception with no text at all, so
+    /// `Array.get(new int[4], 9).getMessage()` is null there while a plain
+    /// `a[9]` in bytecode says "Index 9 out of bounds for length 4". Use this
+    /// only where a HotSpot control shows a null message; use
+    /// [`RuntimeError::aioobe_index_only`] otherwise.
+    pub fn aioobe_no_message(index: i32) -> Self {
         RuntimeError::ArrayIndexOutOfBoundsException {
             index,
             message: None,
@@ -1348,7 +1370,35 @@ impl RuntimeError {
     /// needed — which is how `Method.invoke` came to propagate a native
     /// `UnsupportedOperationException` raw instead of wrapping it (H2
     /// `TestMVStore.testIterate`).
-    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<&str>)> {
+    /// The detail message for a variant that carries a payload but no `String`
+    /// to borrow, so it has to be built.
+    ///
+    /// Every other variant either owns a message the table below borrows, or
+    /// genuinely has none. `NegativeArraySizeException` owns its payload as an
+    /// `i32` and the table dropped it, so `getMessage()` came back **null**
+    /// where HotSpot has text.
+    ///
+    /// `ArrayIndexOutOfBoundsException` was in the same position until
+    /// 2026-08-06, and was answered here with the JDK's
+    /// `ArrayIndexOutOfBoundsException(int)` wording, `"Array index out of
+    /// range: N"`. That is right for a site that knows only an index, and
+    /// wrong for the two that matter most: an array access says "Index 9 out
+    /// of bounds for length 4", and `java.lang.reflect.Array` says nothing at
+    /// all. Answering here made the choice unavailable to the call site, so
+    /// the variant carries its own `message` now and the three
+    /// `RuntimeError::aioobe*` constructors pick the wording — including
+    /// [`RuntimeError::aioobe_index_only`], which is this text, still the
+    /// right default for a native that holds an index and nothing else.
+    fn synthesised_detail_message(&self) -> Option<String> {
+        match self {
+            // HotSpot's message is the size alone, with no prose (`new int[-1]`
+            // reports `-1`).
+            RuntimeError::NegativeArraySizeException { size } => Some(size.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<Cow<'_, str>>)> {
         let pair = match self {
             RuntimeError::NullPointerException { message } => (
                 "java/lang/NullPointerException",
@@ -1368,6 +1418,11 @@ impl RuntimeError {
             RuntimeError::ArithmeticException { message } => {
                 ("java/lang/ArithmeticException", Some(message.as_str()))
             }
+            // The variant now carries its own message, so this arm borrows
+            // like every other one and `synthesised_detail_message` no longer
+            // answers for it. `None` here means the no-arg constructor and a
+            // null `getMessage()` — which is what HotSpot's
+            // `java.lang.reflect.Array` accessors produce.
             RuntimeError::ArrayIndexOutOfBoundsException { message, .. } => (
                 "java/lang/ArrayIndexOutOfBoundsException",
                 message.as_deref(),
@@ -1378,6 +1433,7 @@ impl RuntimeError {
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))
             }
+            // As above: the message is synthesised from `size`, not absent.
             RuntimeError::NegativeArraySizeException { size: _ } => {
                 ("java/lang/NegativeArraySizeException", None)
             }
@@ -1508,13 +1564,141 @@ impl RuntimeError {
             }
             RuntimeError::NotImplemented { feature: _ } => return None,
         };
-        Some(pair)
+        let (class_name, borrowed) = pair;
+        // A synthesised message wins over the table's `None`. The two are
+        // mutually exclusive by construction — `synthesised_detail_message`
+        // answers only for variants whose arm above has nothing to borrow — and
+        // `or_else` keeps it that way if a third such variant is ever added:
+        // the borrowed message stays authoritative wherever one exists.
+        let message = self
+            .synthesised_detail_message()
+            .map(Cow::Owned)
+            .or_else(|| borrowed.map(Cow::Borrowed));
+        Some((class_name, message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- as_java_throwable detail messages --
+
+    /// The two variants that carry an `i32` payload used to convert with a
+    /// `None` message, so every VM-thrown AIOOBE reached Java as
+    /// `java.lang.ArrayIndexOutOfBoundsException: null`. That is a behavioural
+    /// divergence for anything reading `getMessage()`, and it is what made a
+    /// Spring AOT failure undiagnosable.
+    ///
+    /// Expected text measured on HotSpot (Temurin jdk-25.0.3+9).
+    #[test]
+    fn payload_carrying_variants_synthesise_hotspots_message() {
+        let (cls, msg) = RuntimeError::aioobe_index_only(7)
+            .as_java_throwable()
+            .expect("AIOOBE is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        // `new ArrayIndexOutOfBoundsException(7)` on HotSpot — the wording for
+        // a site that knows the index and not the length. An array access
+        // takes `aioobe` and says something else; see the test below.
+        assert_eq!(msg.as_deref(), Some("Array index out of range: 7"));
+
+        let (cls, msg) = RuntimeError::NegativeArraySizeException { size: -1 }
+            .as_java_throwable()
+            .expect("NegativeArraySizeException is a Java throwable");
+        assert_eq!(cls, "java/lang/NegativeArraySizeException");
+        // `new int[-1]` on HotSpot: the size alone, no prose.
+        assert_eq!(msg.as_deref(), Some("-1"));
+    }
+
+    /// `None` must keep meaning "construct with the no-arg constructor, so
+    /// `getMessage()` is null". Several variants depend on that distinction and
+    /// the synthesising path must not have blurred it.
+    #[test]
+    fn variants_with_no_message_still_convert_to_none() {
+        for err in [
+            RuntimeError::StackOverflowError,
+            RuntimeError::InterruptedException,
+            RuntimeError::BufferUnderflowException,
+            RuntimeError::BufferOverflowException,
+            RuntimeError::ReadOnlyBufferException,
+            RuntimeError::ConcurrentModificationException,
+        ] {
+            let (_, msg) = err.as_java_throwable().expect("is a Java throwable");
+            assert!(msg.is_none(), "{err:?} must have a null detail message");
+        }
+
+        // The empty-string markers are "no message" too, not an empty one.
+        // Bound to a `let` because the returned `Cow` borrows from the error.
+        let npe = RuntimeError::NullPointerException {
+            message: Some(String::new()),
+        };
+        let (_, msg) = npe.as_java_throwable().unwrap();
+        assert!(msg.is_none(), "an empty NPE marker means getMessage() == null");
+
+        let uoe = RuntimeError::UnsupportedOperationException {
+            message: String::new(),
+        };
+        let (_, msg) = uoe.as_java_throwable().unwrap();
+        assert!(msg.is_none(), "an empty UOE message means getMessage() == null");
+    }
+
+    /// A variant that owns a message is still BORROWED, not copied — the `Cow`
+    /// exists so only the two synthesising variants pay for an allocation.
+    #[test]
+    fn owned_messages_are_borrowed_not_copied() {
+        let err = RuntimeError::IllegalStateException {
+            message: "boom".to_string(),
+        };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Borrowed("boom"))));
+
+        // The AIOOBE variant owns its message since 2026-08-06, so it
+        // borrows like the rest. `NegativeArraySizeException` is now the only
+        // variant that still has to build one.
+        let err = RuntimeError::aioobe(9, 4);
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(
+            msg,
+            Some(Cow::Borrowed("Index 9 out of bounds for length 4"))
+        ));
+
+        let err = RuntimeError::NegativeArraySizeException { size: -1 };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Owned(_))));
+    }
+
+    /// The three wordings are three different HotSpot behaviours, not three
+    /// spellings of one. A single blanket message for the variant — which is
+    /// what `synthesised_detail_message` used to do — cannot be right for all
+    /// three at once, and that is why the call site chooses.
+    #[test]
+    fn the_three_aioobe_constructors_do_not_agree() {
+        let access = RuntimeError::aioobe(9, 4);
+        let index_only = RuntimeError::aioobe_index_only(9);
+        let reflective = RuntimeError::aioobe_no_message(9);
+        assert_eq!(
+            access.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            Some("Index 9 out of bounds for length 4")
+        );
+        assert_eq!(
+            index_only.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            Some("Array index out of range: 9")
+        );
+        assert_eq!(
+            reflective.as_java_throwable().and_then(|(_, m)| m).as_deref(),
+            None
+        );
+    }
+
+    /// `NotImplemented` is a VM gap, not something Java can catch.
+    #[test]
+    fn not_implemented_is_not_a_java_throwable() {
+        let err = RuntimeError::NotImplemented {
+            feature: "whatever".to_string(),
+        };
+        assert!(err.as_java_throwable().is_none());
+    }
+
 
     // -- VmError Display tests --
 
@@ -1708,13 +1892,13 @@ mod tests {
 
     #[test]
     fn runtime_error_array_index_out_of_bounds() {
-        let err = RuntimeError::aioobe_no_length(-1);
+        let err = RuntimeError::aioobe_no_message(-1);
         assert_eq!(format!("{err}"), "ArrayIndexOutOfBoundsException: index -1");
         assert_eq!(
-            err.as_java_throwable(),
-            Some(("java/lang/ArrayIndexOutOfBoundsException", None)),
-            "a site that cannot name the length must still produce a \
-             message-less throwable, i.e. the no-arg constructor"
+            err.as_java_throwable().and_then(|(_, m)| m),
+            None,
+            "aioobe_no_message must produce a message-less throwable, i.e. the \
+             no-arg constructor — HotSpot's reflect.Array behaviour"
         );
     }
 
