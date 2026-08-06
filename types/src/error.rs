@@ -14,6 +14,7 @@
 //! that `VmError` carries, and because every crate that can raise one already
 //! depends on this module.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use thiserror::Error;
@@ -1143,7 +1144,42 @@ impl RuntimeError {
     /// needed — which is how `Method.invoke` came to propagate a native
     /// `UnsupportedOperationException` raw instead of wrapping it (H2
     /// `TestMVStore.testIterate`).
-    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<&str>)> {
+    /// The detail message for variants that carry a payload but no `String` to
+    /// borrow, so it has to be built.
+    ///
+    /// Every other variant either owns a message the table below borrows, or
+    /// genuinely has none. These two owned their payload as an `i32` and the
+    /// table dropped it, so `getMessage()` came back **null** where HotSpot has
+    /// text — a real behavioural divergence for anything that reads the message,
+    /// and the reason a VM-thrown AIOOBE was undiagnosable: it reached Java as
+    /// `java.lang.ArrayIndexOutOfBoundsException: null` with nothing to say
+    /// which index or which array.
+    ///
+    /// Measured on HotSpot (Temurin jdk-25.0.3+9):
+    ///
+    /// ```text
+    /// int[] x = new int[3]; x[5]      Index 5 out of bounds for length 3
+    /// new ArrayIndexOutOfBoundsException(7)  Array index out of range: 7
+    /// new int[-1]                     -1
+    /// ```
+    ///
+    /// The first of those needs the array LENGTH, which this variant does not
+    /// carry (adding it would touch ~196 construction sites). So the honest
+    /// message is the JDK's own `int`-constructor wording, which is exact for
+    /// what is known rather than a guess at what is not. A caller that wants
+    /// HotSpot's array-access wording has to supply the length.
+    fn synthesised_detail_message(&self) -> Option<String> {
+        match self {
+            RuntimeError::ArrayIndexOutOfBoundsException { index } => {
+                Some(format!("Array index out of range: {index}"))
+            }
+            // HotSpot's message is the size alone, with no prose.
+            RuntimeError::NegativeArraySizeException { size } => Some(size.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn as_java_throwable(&self) -> Option<(&'static str, Option<Cow<'_, str>>)> {
         let pair = match self {
             RuntimeError::NullPointerException { message } => (
                 "java/lang/NullPointerException",
@@ -1163,6 +1199,9 @@ impl RuntimeError {
             RuntimeError::ArithmeticException { message } => {
                 ("java/lang/ArithmeticException", Some(message.as_str()))
             }
+            // `None` here means "nothing to BORROW", not "no message":
+            // `synthesised_detail_message` builds one from `index` and it wins
+            // below. Do not read this arm as the no-arg-constructor case.
             RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
                 ("java/lang/ArrayIndexOutOfBoundsException", None)
             }
@@ -1172,6 +1211,7 @@ impl RuntimeError {
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))
             }
+            // As above: the message is synthesised from `size`, not absent.
             RuntimeError::NegativeArraySizeException { size: _ } => {
                 ("java/lang/NegativeArraySizeException", None)
             }
@@ -1302,13 +1342,107 @@ impl RuntimeError {
             }
             RuntimeError::NotImplemented { feature: _ } => return None,
         };
-        Some(pair)
+        let (class_name, borrowed) = pair;
+        // A synthesised message wins over the table's `None`. The two are
+        // mutually exclusive by construction — `synthesised_detail_message`
+        // answers only for variants whose arm above has nothing to borrow — and
+        // `or_else` keeps it that way if a third such variant is ever added:
+        // the borrowed message stays authoritative wherever one exists.
+        let message = self
+            .synthesised_detail_message()
+            .map(Cow::Owned)
+            .or_else(|| borrowed.map(Cow::Borrowed));
+        Some((class_name, message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- as_java_throwable detail messages --
+
+    /// The two variants that carry an `i32` payload used to convert with a
+    /// `None` message, so every VM-thrown AIOOBE reached Java as
+    /// `java.lang.ArrayIndexOutOfBoundsException: null`. That is a behavioural
+    /// divergence for anything reading `getMessage()`, and it is what made a
+    /// Spring AOT failure undiagnosable.
+    ///
+    /// Expected text measured on HotSpot (Temurin jdk-25.0.3+9).
+    #[test]
+    fn payload_carrying_variants_synthesise_hotspots_message() {
+        let (cls, msg) = RuntimeError::ArrayIndexOutOfBoundsException { index: 7 }
+            .as_java_throwable()
+            .expect("AIOOBE is a Java throwable");
+        assert_eq!(cls, "java/lang/ArrayIndexOutOfBoundsException");
+        // `new ArrayIndexOutOfBoundsException(7)` on HotSpot. NOT the
+        // array-access wording, which needs a length this variant lacks.
+        assert_eq!(msg.as_deref(), Some("Array index out of range: 7"));
+
+        let (cls, msg) = RuntimeError::NegativeArraySizeException { size: -1 }
+            .as_java_throwable()
+            .expect("NegativeArraySizeException is a Java throwable");
+        assert_eq!(cls, "java/lang/NegativeArraySizeException");
+        // `new int[-1]` on HotSpot: the size alone, no prose.
+        assert_eq!(msg.as_deref(), Some("-1"));
+    }
+
+    /// `None` must keep meaning "construct with the no-arg constructor, so
+    /// `getMessage()` is null". Several variants depend on that distinction and
+    /// the synthesising path must not have blurred it.
+    #[test]
+    fn variants_with_no_message_still_convert_to_none() {
+        for err in [
+            RuntimeError::StackOverflowError,
+            RuntimeError::InterruptedException,
+            RuntimeError::BufferUnderflowException,
+            RuntimeError::BufferOverflowException,
+            RuntimeError::ReadOnlyBufferException,
+            RuntimeError::ConcurrentModificationException,
+        ] {
+            let (_, msg) = err.as_java_throwable().expect("is a Java throwable");
+            assert!(msg.is_none(), "{err:?} must have a null detail message");
+        }
+
+        // The empty-string markers are "no message" too, not an empty one.
+        // Bound to a `let` because the returned `Cow` borrows from the error.
+        let npe = RuntimeError::NullPointerException {
+            message: Some(String::new()),
+        };
+        let (_, msg) = npe.as_java_throwable().unwrap();
+        assert!(msg.is_none(), "an empty NPE marker means getMessage() == null");
+
+        let uoe = RuntimeError::UnsupportedOperationException {
+            message: String::new(),
+        };
+        let (_, msg) = uoe.as_java_throwable().unwrap();
+        assert!(msg.is_none(), "an empty UOE message means getMessage() == null");
+    }
+
+    /// A variant that owns a message is still BORROWED, not copied — the `Cow`
+    /// exists so only the two synthesising variants pay for an allocation.
+    #[test]
+    fn owned_messages_are_borrowed_not_copied() {
+        let err = RuntimeError::IllegalStateException {
+            message: "boom".to_string(),
+        };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Borrowed("boom"))));
+
+        let err = RuntimeError::ArrayIndexOutOfBoundsException { index: 3 };
+        let (_, msg) = err.as_java_throwable().unwrap();
+        assert!(matches!(msg, Some(Cow::Owned(_))));
+    }
+
+    /// `NotImplemented` is a VM gap, not something Java can catch.
+    #[test]
+    fn not_implemented_is_not_a_java_throwable() {
+        let err = RuntimeError::NotImplemented {
+            feature: "whatever".to_string(),
+        };
+        assert!(err.as_java_throwable().is_none());
+    }
+
 
     // -- VmError Display tests --
 
