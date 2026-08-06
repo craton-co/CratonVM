@@ -50,7 +50,10 @@ use crate::old_gen::OldGen;
 use crate::gc_flags;
 use crate::satb::SatbQueue;
 use crate::{compact_ref_fields_enabled, is_compact_object, object_body_size};
-use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
+use cratonvm_types::narrow_oop::{
+    decode as narrow_decode, encode as narrow_encode, narrow_oops_enabled, read_ref_slot,
+    ref_element_size, ref_field_size, write_ref_slot,
+};
 use cratonvm_types::GC_FLAG_COMPACT;
 use cratonvm_types::{ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value};
 
@@ -11670,20 +11673,43 @@ impl GenerationalHeap {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                 let stretch_hi = if resynced { cursor } else { used };
+                let mut mark_if_old_base = |candidate: usize| {
+                    if walked_bases.binary_search(&candidate).is_ok() {
+                        // SAFETY: `candidate` is a verified old-gen object BASE;
+                        // its header is valid and mutable for marking.
+                        let ref_header = unsafe { &mut *(candidate as *mut ObjectHeader) };
+                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
+                            ref_header.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(candidate as *mut u8);
+                        }
+                    }
+                };
                 let mut w = stretch_lo & !7;
                 while w + 8 <= stretch_hi {
                     // SAFETY: `[base+w, base+w+8)` is mapped from-space memory.
                     let word = unsafe { *((base + w) as *const u64) } as usize;
-                    if walked_bases.binary_search(&word).is_ok() {
-                        // SAFETY: `word` is a verified old-gen object BASE;
-                        // its header is valid and mutable for marking.
-                        let ref_header = unsafe { &mut *(word as *mut ObjectHeader) };
-                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                            ref_header.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(word as *mut u8);
-                        }
-                    }
+                    mark_if_old_base(word);
                     w += 8;
+                }
+                // Hole 2 of `crate::compressed_oops`'s "two correctness holes":
+                // under narrow oops a reference slot is 4 bytes, so a PAIR of
+                // adjacent narrow oops occupies one aligned 8-byte word and can
+                // never equal an old-gen base — every mark in this stretch was
+                // missed, and a missed mark here is premature reclamation. Take
+                // a second pass at 4-byte granularity, decoding each half.
+                // Over-marking is safe (the wide pass above relies on the same
+                // property), and the base validation is what keeps a coincidence
+                // from writing a mark bit into a live object's payload.
+                if narrow_oops_enabled() {
+                    let mut w = stretch_lo & !3;
+                    while w + 4 <= stretch_hi {
+                        // SAFETY: `[base+w, base+w+4)` is mapped from-space memory.
+                        let n = unsafe { *((base + w) as *const u32) };
+                        if n != 0 {
+                            mark_if_old_base(narrow_decode(n) as usize);
+                        }
+                        w += 4;
+                    }
                 }
                 if resynced {
                     continue;
@@ -11859,6 +11885,24 @@ impl GenerationalHeap {
         // address. (A primitive that happens to equal a moved object's old
         // address would be corrupted — vanishingly unlikely — whereas an
         // unrewritten real reference is a certain use-after-free.)
+        //
+        // Hole 2 of `crate::compressed_oops`, rewrite half: under narrow oops a
+        // reference slot is 4 bytes, so the wide pass alone leaves every
+        // narrowed reference in an unparseable stretch pointing at the object's
+        // pre-compaction address — a certain use-after-free. The second pass
+        // below decodes each aligned 4-byte half and re-encodes the relocated
+        // address in place.
+        //
+        // It carries the same false-positive trade the wide pass already
+        // documents, and carries MORE of it: a narrow candidate has only 32 bits
+        // of entropy, so a primitive half that happens to decode to a moved
+        // object's old base is far likelier than a 64-bit word that happens to
+        // equal one. That is accepted here for the same reason the wide pass
+        // accepts its own — an unrewritten reference is a *certain* dangling
+        // pointer — and it is bounded in practice: `oldgen_compact_enabled` is
+        // off by default, so `compact_map` is empty and neither pass runs at
+        // all unless `CRATONVM_OLDGEN_COMPACT=1` is set.
+        let narrow = narrow_oops_enabled();
         let rewrite_stretch_conservatively = |lo: usize, hi: usize| {
             let mut w = lo & !7;
             while w + 8 <= hi {
@@ -11869,6 +11913,25 @@ impl GenerationalHeap {
                     unsafe { *cell = new_addr as u64 };
                 }
                 w += 8;
+            }
+            if !narrow {
+                return;
+            }
+            // The wide pass runs first so that a genuine 8-byte pointer (a
+            // LEGACY `Value` cell payload, which is never narrowed) takes
+            // precedence over the two halves it decomposes into.
+            let mut w = lo & !3;
+            while w + 4 <= hi {
+                // SAFETY: `[base+lo, base+hi)` is mapped from-space memory.
+                let cell = (base + w) as *mut u32;
+                let n = unsafe { *cell };
+                if n != 0 {
+                    let addr = narrow_decode(n) as usize;
+                    if let Some(&new_addr) = compact_map.get(&addr) {
+                        unsafe { *cell = narrow_encode(new_addr as u64) };
+                    }
+                }
+                w += 4;
             }
         };
         while cursor < used {

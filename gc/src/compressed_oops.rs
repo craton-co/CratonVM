@@ -4,9 +4,17 @@
 //! Compressed object pointers (CompressedOops) for heaps under 32 GB.
 //!
 //! When the Java heap fits in 32 GB, every object reference can be stored as a
-//! 32-bit value instead of a full 64-bit pointer. This cuts reference footprint
-//! in half and typically saves 20-30 % of total heap for reference-heavy
-//! workloads.
+//! 32-bit value instead of a full 64-bit pointer. In HotSpot this typically
+//! saves 20-30 % of total heap for reference-heavy workloads.
+//!
+//! **In CratonVM it saves 4.7 %.** Measured 2026-08-06, interleaved A-B-B-A on
+//! spring-beans `BeanRegistrationsAotContributionTests`: peak RSS 1850 MB wide
+//! vs 1763 MB narrow, wall time indistinguishable. The reason is the 32-byte
+//! `ObjectHeader` (HotSpot's is 12): halving the reference *fields* of objects
+//! whose header already costs 32 bytes moves a minority of the bytes, so the
+//! header shrink is the item with the leverage here, not this one. Full
+//! derivation in
+//! `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 //!
 //! Three modes are supported:
 //!
@@ -28,38 +36,56 @@
 //! What is narrowed when the gate is on: **reference instance fields** and
 //! **reference array elements**, from 8 bytes to 4. Nothing else.
 //!
-//! ## The gate is NOT off for throughput reasons. Two correctness holes remain.
+//! ## The gate is NOT off for throughput reasons. Two correctness holes — both
+//! ## now CLOSED (2026-08-06); the gate stays off for the reasons below them.
 //!
 //! This header previously claimed the only reason the gate stays off is that
 //! the JIT's inline compact-field fast paths are disabled, i.e. "a throughput
 //! regression, not incompleteness". A full sweep of every reference-slot access
 //! in the workspace found that to be false. Under the *generational* backend
-//! (the only one the gate permits — `vm/src/vm/vm_init.rs:862`) two paths still
-//! read or write a reference slot at the wrong width:
+//! (the only one the gate permits — `vm/src/vm/vm_init.rs:862`) two paths read
+//! or wrote a reference slot at the wrong width:
 //!
-//! 1. **`jit/src/x64.rs:14639` `emit_load_string_value_ptr`.** Emits an
+//! 1. **`jit/src/x64/objects.rs` `emit_load_string_value_ptr`.** It emitted an
 //!    unconditional 64-bit `MOV dst, [base + compact_offset]` for the
-//!    `String.value` `byte[]` field. Unlike the `getfield`/`putfield` arms
-//!    (`x64.rs:16495`, `:22032`, `:22497`) it is **not** gated on
-//!    `jit::x64::narrow_oops_block_inline_fields` (`x64.rs:2119`). Under narrow
-//!    oops it loads 4 bytes of
-//!    narrow oop plus 4 bytes of the adjacent `coder`/`hash` field and
-//!    dereferences the result: a deterministic wild-pointer SIGSEGV on every
-//!    inlined `charAt`/`length`/`indexOf`/`hashCode`/`equals`/`compareTo`
-//!    (10 call sites, `x64.rs:25018`-`:25654`). The one-line unblock is to
-//!    short-circuit `try_resolve_string_intrinsic` (`jit/src/lib.rs:3931`) on
-//!    `narrow_oops_enabled()`; the real fix is a narrow arm in that emitter,
-//!    mirroring `emit_narrow_ref_aload_regs` (`x64.rs:17132`).
-//! 2. **`gc/src/gen_heap.rs:8261` `mark_young_to_old_refs` and `:8369`
-//!    `rewrite_stretch_conservatively`.** Both scan an unparseable heap stretch
-//!    in aligned 8-byte words looking for old-gen object bases. A pair of
-//!    adjacent narrow oops never matches, so marks are missed (premature
-//!    reclamation) and refs to moved objects are left unrewritten (dangling).
+//!    `String.value` `byte[]` field. Unlike the `getfield`/`putfield` arms it
+//!    was **not** gated on `jit::x64::narrow_oops_block_inline_fields`, so under
+//!    narrow oops it loaded 4 bytes of narrow oop plus 4 bytes of the adjacent
+//!    `coder`/`hash` field and dereferenced the result: a deterministic
+//!    wild-pointer SIGSEGV on every inlined
+//!    `charAt`/`length`/`indexOf`/`hashCode`/`equals`/`compareTo`.
+//!
+//!    **CLOSED 2026-08-06.** The emitter has a narrow arm
+//!    (`emit_load_narrow_ref_field`) mirroring `emit_narrow_ref_aload_regs`,
+//!    selected per call site by `StringFieldLayout::value_compact_is_narrow` so
+//!    the no-registered-layout fallback (which points the compact offset at the
+//!    LEGACY 8-byte cell payload) keeps its wide load. The stopgap that refused
+//!    `try_resolve_string_intrinsic` outright under narrow oops — and the
+//!    throughput it cost — is gone.
+//! 2. **`gc/src/gen_heap.rs` `mark_young_to_old_refs` and
+//!    `rewrite_stretch_conservatively`.** Both scanned an unparseable heap
+//!    stretch in aligned 8-byte words looking for old-gen object bases. A pair
+//!    of adjacent narrow oops never matches, so marks were missed (premature
+//!    reclamation) and refs to moved objects were left unrewritten (dangling).
 //!    Fallback paths — but they are the paths that run when the parseable walk
 //!    has already failed, which is exactly when correctness matters most.
 //!
-//! Because of these, `enable_for_live_heap` prints an explicit unsoundness
-//! warning on success. **Do not flip the default until both are closed.**
+//!    **CLOSED 2026-08-06.** Each now takes a second pass over the stretch at
+//!    4-byte granularity under `narrow_oops_enabled()`, decoding each half as a
+//!    narrow oop. The mark pass is unconditionally safe (over-marking always
+//!    was). The rewrite pass inherits the wide pass's false-positive trade and
+//!    more of it — 32 bits of entropy instead of 64 — which is accepted for the
+//!    same reason and is bounded by `oldgen_compact_enabled` being off by
+//!    default, so `compact_map` is empty and neither pass runs.
+//!
+//! `enable_for_live_heap` still prints an unsoundness warning, and the default
+//! must stay off: items 4 and 6 below are unmigrated, and item 6 in particular
+//! means the G1/ZGC backends would corrupt the heap outright. What is gone is
+//! the claim that the *generational* backend has a known wrong-width slot
+//! access.
+//!
+//! For what closing hole 1 did and did not buy on the workload that prompted
+//! it, see `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 //!
 //! ## Verified NOT needed (contrary to the older remaining-work list)
 //!
@@ -991,26 +1017,33 @@ pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
 /// Announce, once, that this run has two known correctness holes.
 ///
 /// The caller (`vm/src/vm/vm_init.rs:884`) already prints a success line saying
-/// narrow oops are on. That line reads like an endorsement. Until the two
-/// blockers in the module header are closed, anyone who flips
-/// `-XX:+UseCompressedOops` is running a VM that will SIGSEGV in the String
-/// intrinsics and can miss GC marks, and they must be told so at the moment
-/// they opt in — not discover it from a crash dump.
+/// narrow oops are on. That line reads like an endorsement, and it is not one:
+/// anyone who flips `-XX:+UseCompressedOops` must be told what is still
+/// unmigrated at the moment they opt in, not discover it from a crash dump.
+///
+/// The two blockers this warning was written for — the ungated 64-bit
+/// `String.value` load and the 8-byte-word conservative heap rescans — were
+/// **closed on 2026-08-06** (see the module header). What is left is narrower
+/// and is what this now says.
 ///
 /// This is **not** a new gate. The gate already exists and is already off by
 /// default; this only makes the existing opt-in honest about what it buys.
 fn warn_known_unsound() {
     eprintln!(
-        "[cratonvm] WARNING: compressed oops have two KNOWN correctness holes and \
-         are not production-ready:\n\
-         [cratonvm]   1. jit/src/x64.rs emit_load_string_value_ptr loads String.value \
-         at 8 bytes with no narrow-oop gate -> wild-pointer SIGSEGV in every inlined \
-         charAt/length/indexOf/hashCode/equals/compareTo.\n\
-         [cratonvm]   2. gc/src/gen_heap.rs mark_young_to_old_refs / \
-         rewrite_stretch_conservatively scan unparseable heap stretches in 8-byte \
-         words -> missed marks and unrewritten references.\n\
-         [cratonvm] Disabling the JIT avoids (1) but not (2). See \
-         gc/src/compressed_oops.rs for the full list."
+        "[cratonvm] WARNING: compressed oops are opt-in and not production-ready. \
+         The two correctness holes this warning used to name (the ungated 64-bit \
+         String.value load, and the 8-byte-word conservative heap rescans) were \
+         closed 2026-08-06. What remains:\n\
+         [cratonvm]   1. Only the GENERATIONAL backend is migrated. gc/src/g1.rs, \
+         gc/src/zgc.rs and gc/src/region.rs still read reference slots at 8 bytes; \
+         vm/src/vm/vm_init.rs refuses the combination, and that check is \
+         load-bearing.\n\
+         [cratonvm]   2. The narrow aaload/aastore emitters hardcode shift 3, which \
+         is correct only because enable_for_live_heap pins it.\n\
+         [cratonvm]   3. It is worth 4.7% of peak RSS on this VM, not the 20-30% \
+         narrow oops buy on HotSpot -- the 32-byte ObjectHeader is the dominant \
+         term and compression does not touch it.\n\
+         [cratonvm] See gc/src/compressed_oops.rs for the full list."
     );
 }
 
