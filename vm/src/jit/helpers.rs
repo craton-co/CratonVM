@@ -1756,19 +1756,58 @@ pub(crate) fn jit_site_key(vm_identity: usize, info_ptr: usize) -> JitSiteKey {
 }
 
 thread_local! {
-    /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
-    ///
-    /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
-    /// `ClassId(0)` never reach it — an array header carries its COMPONENT
-    /// class id, so `(site, class id)` does not identify one.
-    static VIRTUAL_TARGET_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), CachedDispatchTarget>> =
-        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-
     /// `(class_definition_epoch, any_class_redefined)` this thread last
     /// flushed its class-identity dispatch memos at. See
     /// [`flush_class_identity_dispatch_memos`].
     static DISPATCH_MEMO_CLASS_IDENTITY: Cell<(u64, bool)> = const { Cell::new((0, false)) };
+}
+
+/// Declare a per-thread dispatch memo keyed on a [`JitSiteKey`] — i.e. on a
+/// `JitInvokeInfo` **address** — and generate the single flush that empties
+/// every such memo.
+///
+/// **Declaration and flush come from one list on purpose.** The defect
+/// `383e7f5cf` fixed was precisely those two drifting apart: four of the eight
+/// memos below sat on neither flush trigger's hand-maintained list, so a
+/// recycled `JitInvokeInfo` address let one call site serve another's
+/// dispatch. Writing the list twice is what made that possible. A memo
+/// declared here cannot repeat it — it does not exist unless it is also
+/// flushed, and the compiler, not a reviewer, is what enforces that.
+///
+/// A memo whose key does NOT contain an info address (`INTEGER_WRAPPER_CLASS_CACHE`,
+/// `MATCHER_CLASS_CACHE`, the `JIT_TYPECHECK_*` family) does not belong here:
+/// those key on `(vm_identity, ClassId)` or on process-interned name pointers
+/// that are never freed, so address reuse cannot rename them.
+macro_rules! site_keyed_memos {
+    ($(
+        $(#[$attr:meta])*
+        $name:ident : $key:ty => $val:ty ;
+    )+) => {
+        thread_local! {
+            $(
+                $(#[$attr])*
+                static $name: std::cell::RefCell<rustc_hash::FxHashMap<$key, $val>> =
+                    std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+            )+
+        }
+
+        /// Drop every thread-local memo whose key contains a `JitInvokeInfo`
+        /// address. Generated from [`site_keyed_memos!`]'s own declaration
+        /// list, so it cannot fall behind it.
+        #[cold]
+        fn clear_site_keyed_dispatch_memos() {
+            $( $name.with(|c| c.borrow_mut().clear()); )+
+        }
+
+        /// `(memo name, live entry count)` for every site-keyed memo on this
+        /// thread, in declaration order. Test-only: it is what lets
+        /// `a_jit_generation_change_clears_every_site_keyed_memo` assert
+        /// against the real list rather than a copy of it.
+        #[cfg(test)]
+        fn site_keyed_memo_census() -> Vec<(&'static str, usize)> {
+            vec![ $( (stringify!($name), $name.with(|c| c.borrow().len())) ),+ ]
+        }
+    };
 }
 
 /// Flush this thread's dispatch memos whose validity depends on class
@@ -1871,11 +1910,6 @@ fn flush_raw_entry_dispatch_caches() {
     });
 }
 
-/// Drop every thread-local memo whose key contains a `JitInvokeInfo` address.
-///
-/// Kept as one function so a memo added later cannot be flushed by one of the
-/// two triggers above and missed by the other — the split that left
-/// `NATIVE_SITE_CACHE` and `VIRTUAL_TARGET_CACHE` unflushed by either.
 /// `CRATONVM_DBG_SITE_ALIAS=1` — count of dispatch-helper entries whose `JitSiteKey` named a
 /// DIFFERENT call site than the one that first used it — i.e. a `JitInvokeInfo`
 /// address that was freed with its `CompiledMethod` and re-issued.
@@ -1968,18 +2002,6 @@ fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
 fn site_alias_detect_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
-}
-
-#[cold]
-fn clear_site_keyed_dispatch_memos() {
-    DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-    VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-    DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
-    VIRTUAL_DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
-    OBJECT_NATIVE_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-    INTEGER_NATIVE_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
-    NATIVE_SITE_CACHE.with(|dc| dc.borrow_mut().clear());
-    VIRTUAL_TARGET_CACHE.with(|dc| dc.borrow_mut().clear());
 }
 
 /// May a callee that declares an exception table be published into the
@@ -8367,26 +8389,32 @@ struct NativeSiteCache {
 // cross-VM hit would execute. A thread reaches two VMs via JNI
 // `AttachCurrentThread`, or by being reused across `SharedVm`s in one test
 // process; thread-local is not per-VM.
-thread_local! {
-    static DISPATCH_CACHE: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, DispatchCache>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static DISPATCH_COUNTER: std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, u32>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static OBJECT_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, NativeDispatchCache>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static INTEGER_NATIVE_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, Option<IntegerNativeDispatchCache>>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+site_keyed_memos! {
+    DISPATCH_CACHE: JitSiteKey => DispatchCache;
+    DISPATCH_COUNTER: JitSiteKey => u32;
+    OBJECT_NATIVE_DISPATCH_CACHE: JitSiteKey => NativeDispatchCache;
+    INTEGER_NATIVE_DISPATCH_CACHE: JitSiteKey => Option<IntegerNativeDispatchCache>;
     /// Leaf-native resolution per JIT call site — see
     /// [`NativeSiteCache`]. `None` is a cached refusal ("this site is
     /// not a leaf native"), which is what keeps the ~27-gate `invoke_or_native`
     /// probe off every OTHER site's steady state; it is keyed on the registry
     /// generation stored beside it so a lazy `register_*` pass that appears
     /// later is still seen.
-    static NATIVE_SITE_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<JitSiteKey, (u32, Option<NativeSiteCache>)>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    NATIVE_SITE_CACHE: JitSiteKey => (u32, Option<NativeSiteCache>);
+    /// Virtual/interface call sites are keyed by their JIT site key AND the
+    /// receiver's actual class id. A static CP owner is not sound here:
+    /// an interface method may resolve to a receiver override.
+    VIRTUAL_DISPATCH_CACHE: (JitSiteKey, u32) => DispatchCache;
+    VIRTUAL_DISPATCH_COUNTER: (JitSiteKey, u32) => u32;
+    /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
+    ///
+    /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
+    /// `ClassId(0)` never reach it — an array header carries its COMPONENT
+    /// class id, so `(site, class id)` does not identify one.
+    VIRTUAL_TARGET_CACHE: (JitSiteKey, u32) => CachedDispatchTarget;
+}
+
+thread_local! {
     /// Real `java/lang/Integer` class discovered from the first ordinary
     /// `valueOf` result in each VM, as `(vm_identity, class id)`. A different
     /// VM identity invalidates the entry.
@@ -8396,15 +8424,6 @@ thread_local! {
     /// VM for the virtual-MIC native fast path. `(vm_identity, class id)`.
     static MATCHER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
-    // Virtual/interface call sites are keyed by their JIT site key AND the
-    // receiver's actual class id. A static CP owner is not sound here:
-    // an interface method may resolve to a receiver override.
-    static VIRTUAL_DISPATCH_CACHE:
-        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), DispatchCache>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    static VIRTUAL_DISPATCH_COUNTER:
-        std::cell::RefCell<rustc_hash::FxHashMap<(JitSiteKey, u32), u32>>
-        = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 // ===========================================================================
@@ -13232,10 +13251,17 @@ mod tests {
     /// only if EVERY site-keyed memo is on the flush list. Before this fix four
     /// of the eight were on neither trigger's list.
     ///
-    /// Non-vacuous by construction: each memo is populated first and the
-    /// assertion is that the flush emptied it, so a memo dropped from
-    /// `clear_site_keyed_dispatch_memos` fails here rather than passing on an
-    /// already-empty map.
+    /// The flush list is no longer hand-maintained: `site_keyed_memos!`
+    /// generates `clear_site_keyed_dispatch_memos` from the same declaration
+    /// list, so a memo cannot be declared and left unflushed. What is still
+    /// worth testing is that the TRIGGER fires — that a generation change
+    /// actually reaches the flush — and that is what this asserts.
+    ///
+    /// Non-vacuous two ways. Each populated memo is checked non-empty before
+    /// the flush, so an assertion cannot pass on a map that was already clear.
+    /// And the post-flush sweep runs over `site_keyed_memo_census()` — the real
+    /// list — rather than a copy of it, so a memo added later is covered here
+    /// the moment it is declared.
     #[test]
     fn a_jit_generation_change_clears_every_site_keyed_memo() {
         let _g = memo_test_guard();
@@ -13243,17 +13269,29 @@ mod tests {
         let key = jit_site_key(9001, info_ptr);
         let vkey = (key, 77u32);
 
+        DISPATCH_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                key,
+                DispatchCache { entry: 0xdead_beef, needs_context: false, _owner: None },
+            );
+        });
         DISPATCH_COUNTER.with(|c| {
             c.borrow_mut().insert(key, 3);
-        });
-        VIRTUAL_DISPATCH_COUNTER.with(|c| {
-            c.borrow_mut().insert(vkey, 3);
         });
         INTEGER_NATIVE_DISPATCH_CACHE.with(|c| {
             c.borrow_mut().insert(key, None);
         });
         NATIVE_SITE_CACHE.with(|c| {
             c.borrow_mut().insert(key, (0, None));
+        });
+        VIRTUAL_DISPATCH_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                vkey,
+                DispatchCache { entry: 0xfeed_face, needs_context: true, _owner: None },
+            );
+        });
+        VIRTUAL_DISPATCH_COUNTER.with(|c| {
+            c.borrow_mut().insert(vkey, 3);
         });
         VIRTUAL_TARGET_CACHE.with(|c| {
             c.borrow_mut().insert(
@@ -13265,14 +13303,23 @@ mod tests {
                 },
             );
         });
+        // OBJECT_NATIVE_DISPATCH_CACHE holds a resolved `NativeCallback`, which
+        // cannot be conjured without a registry. It is covered by the sweep
+        // below rather than by a population line; the seven above are what make
+        // that sweep non-vacuous.
 
-        // Every memo populated — otherwise the assertions below would pass on
-        // maps that were empty to begin with.
-        assert!(DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&key)));
-        assert!(VIRTUAL_DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&vkey)));
-        assert!(INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key)));
-        assert!(NATIVE_SITE_CACHE.with(|c| c.borrow().contains_key(&key)));
-        assert!(VIRTUAL_TARGET_CACHE.with(|c| c.borrow().contains_key(&vkey)));
+        // Non-empty first, or the post-flush assertions prove nothing.
+        for (name, len) in site_keyed_memo_census() {
+            if name == "OBJECT_NATIVE_DISPATCH_CACHE" {
+                continue;
+            }
+            assert!(
+                len > 0,
+                "{name} was not populated by this test. A site-keyed memo added to \
+                 `site_keyed_memos!` needs a population line here too, otherwise the \
+                 sweep below passes on a map that was empty to begin with."
+            );
+        }
 
         // Make this thread's remembered generation differ from the live one,
         // which is exactly the state a publication elsewhere leaves it in.
@@ -13280,28 +13327,13 @@ mod tests {
             .with(|seen| seen.set(cratonvm_jit::jit_cache_generation().wrapping_sub(1)));
         flush_raw_entry_dispatch_caches();
 
-        assert!(
-            !DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&key)),
-            "DISPATCH_COUNTER survived a JIT generation change"
-        );
-        assert!(
-            !VIRTUAL_DISPATCH_COUNTER.with(|c| c.borrow().contains_key(&vkey)),
-            "VIRTUAL_DISPATCH_COUNTER survived a JIT generation change"
-        );
-        assert!(
-            !INTEGER_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().contains_key(&key)),
-            "INTEGER_NATIVE_DISPATCH_CACHE survived a JIT generation change"
-        );
-        assert!(
-            !NATIVE_SITE_CACHE.with(|c| c.borrow().contains_key(&key)),
-            "NATIVE_SITE_CACHE survived a JIT generation change — a recycled \
-             JitInvokeInfo address would call the previous site's native"
-        );
-        assert!(
-            !VIRTUAL_TARGET_CACHE.with(|c| c.borrow().contains_key(&vkey)),
-            "VIRTUAL_TARGET_CACHE survived a JIT generation change — a recycled \
-             JitInvokeInfo address would resolve against the previous site's class"
-        );
+        for (name, len) in site_keyed_memo_census() {
+            assert_eq!(
+                len, 0,
+                "{name} survived a JIT generation change — a recycled JitInvokeInfo \
+                 address would inherit the previous call site's answer out of it"
+            );
+        }
     }
 
     #[test]
