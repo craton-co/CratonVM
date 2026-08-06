@@ -66,7 +66,7 @@ inherited-concrete surface, in real-JDK mode. The probe is the regression test.
 
 **Not closed, and the contrast is the useful part:** the identical shape one
 package over *is* broken.
-[`process-natives-answer-for-user-subclasses.md`](process-natives-answer-for-user-subclasses.md)
+[`process-natives-answer-for-user-subclasses-FIXED-20260806.md`](../../internal/process-natives-answer-for-user-subclasses-FIXED-20260806.md)
 has `java.lang.Process`'s concrete natives answering for a user subclass out of
 the VM's fixed field layout — `isAlive()` false for a live process, `pid()` 0
 where the spec requires `UnsupportedOperationException`.
