@@ -37048,7 +37048,7 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         // getMessage/getLocalizedMessage/toString across every class in these
         // two lists; it and `NullPointerException` were the only two left after
         // PatternSyntaxException. See
-        // `docs/internal/a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
+        // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",
