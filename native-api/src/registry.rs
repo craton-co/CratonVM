@@ -4447,6 +4447,33 @@ pub struct NativeCensusEntry {
     /// Times this slot was dispatched through any path this run. `0` on a
     /// superseded row: the count belongs to whoever currently owns the slot.
     pub invocations: u64,
+    /// Whether this registration still **owns its slot**, i.e. whether a
+    /// dispatch of this triple would reach *this* row's callback.
+    ///
+    /// `false` means a later `register*` of the identical triple replaced it
+    /// (last-write-wins into the slot), so the row records that a registration
+    /// happened and nothing more: it can never be dispatched, and adjudicating
+    /// its kind decides nothing.
+    ///
+    /// # Why this is a column and not left to the reader
+    ///
+    /// Every consumer of this census was inferring it — or not inferring it.
+    /// Measured on `JdkOnlyCensusLoadProbe` (JDK 25, 2026-08-06): of 11,876
+    /// rows, **1,237 own no slot**, and **1,092 of the 9,660 rows the
+    /// adjudication reports as unadjudicated `Bridge` are among them**. So the
+    /// live unadjudicated surface is 8,568, and a reclassification wave sized
+    /// off the larger number would go looking for ~1,100 registrations that
+    /// cannot affect anything.
+    ///
+    /// It is derivable from census order (within a triple, the last row owns the
+    /// slot) — which is exactly why it belongs here instead: that is an
+    /// undocumented ordering guarantee for external scripts to depend on, and
+    /// [`NativeMethodRegistry::census`] already has the answer in hand.
+    ///
+    /// This is the fourth distinct way this census has been misread; the other
+    /// three are in
+    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
     /// some enclosing registrar (`register`).
@@ -5173,10 +5200,8 @@ impl NativeMethodRegistry {
             .enumerate()
             .map(|(reg_index, (class, name, descriptor))| {
                 let prov = self.provenance.get(reg_index);
-                let invocations = owner_slot
-                    .get(reg_index)
-                    .copied()
-                    .flatten()
+                let owning_slot = owner_slot.get(reg_index).copied().flatten();
+                let invocations = owning_slot
                     .and_then(|slot_idx| self.slot_invocations.get(slot_idx as usize))
                     .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(0);
@@ -5201,6 +5226,10 @@ impl NativeMethodRegistry {
                     // fallback direction) as `kind` above: a hypothetical
                     // desync reports "inherited", never a false "adjudicated".
                     kind_stated: self.kind_stated.get(reg_index).copied().unwrap_or(false),
+                    // The same `owner_slot` reverse index the invocation count
+                    // above is read through — a superseded registration has no
+                    // entry in it, which is precisely what "owns no slot" means.
+                    owns_slot: owning_slot.is_some(),
                 }
             })
             .collect()
@@ -8207,12 +8236,23 @@ mod tests {
         assert_eq!(census[0].kind, NativeKind::SyntheticStub);
         assert_eq!(census[0].overwrote, None);
         assert_eq!(census[0].invocations, 0);
+        // ... and it owns no slot, which is the fact that makes the zero above
+        // mean "cannot be dispatched" rather than "was not dispatched yet".
+        // Adjudicating this row's kind decides nothing.
+        assert!(
+            !census[0].owns_slot,
+            "a superseded registration must not claim to own its slot"
+        );
 
         // Row 1: the current owner. `overwrote` is the history that was
         // previously unrecoverable — it is read before the in-place slot update.
         assert_eq!(census[1].kind, NativeKind::Bridge);
         assert_eq!(census[1].overwrote, Some(NativeKind::SyntheticStub));
         assert_eq!(census[1].invocations, 3);
+        assert!(
+            census[1].owns_slot,
+            "the surviving registration must own its slot"
+        );
 
         for row in &census {
             let site = row.registered_by.as_deref().expect("provenance recorded");
