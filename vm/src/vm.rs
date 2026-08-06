@@ -76093,9 +76093,10 @@ public class SkippedTest {
         use cratonvm_gc::compact_header::CompactHeader;
         use cratonvm_gc::heap::HEADER_SIZE;
         assert_eq!(std::mem::size_of::<CompactHeader>(), 8);
-        assert_eq!(HEADER_SIZE, 32);
-        // 24 bytes saved per object
-        assert_eq!(HEADER_SIZE - CompactHeader::SIZE, 24);
+        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
+        // word; the gap this type would still close is 16, not 24.
+        assert_eq!(HEADER_SIZE, 24);
+        assert_eq!(HEADER_SIZE - CompactHeader::SIZE, 16);
     }
 
     #[test]

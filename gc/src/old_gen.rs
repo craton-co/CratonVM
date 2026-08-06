@@ -1183,8 +1183,20 @@ impl OldGen {
         // `write_cursor` tracks the next available byte offset (8-byte aligned).
         let mut write_cursor: usize = 0;
         let mut pointer_map: HashMap<usize, usize> = HashMap::new();
-        // (src_ptr, total_size, dest_ptr) for each live object
-        let mut live_objects: Vec<(*mut u8, usize, *mut u8)> = Vec::new();
+        // (src_ptr, total_size, dest_ptr, saved_mark) for each live object.
+        //
+        // `saved_mark` exists because of the 32 -> 24 header shrink. Forwarding
+        // now lives in the mark word, and this is a SLIDING compactor: it
+        // installs the forward in Phase 1 and copies in Phase 3, so the write
+        // that says "forwarded" destroys the object's lock state BEFORE the copy
+        // that would have carried it to the destination. A copying collector
+        // does not have this problem (it copies first, then clobbers the
+        // source); this one does, and the failure would be silent — every thin
+        // lock in the old generation reset, and every INFLATED word's single
+        // strong `Arc<Monitor>` reference dropped on the floor, leaving the slid
+        // survivor with no monitor. Snapshot before clobbering, restore after
+        // the copy. See `docs/internal/arch-2026-07-26/header-shrink.md` §4.3.
+        let mut live_objects: Vec<(*mut u8, usize, *mut u8, u64)> = Vec::new();
 
         for &(obj_ptr, total_size) in &objects {
             let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
@@ -1209,8 +1221,11 @@ impl OldGen {
             let aligned = (write_cursor + 7) & !7;
             let dest = unsafe { base.add(aligned) };
 
-            // Store forwarding address in header for Phase 2 reference updates
-            header.forwarding_ptr = dest;
+            // Store forwarding address in header for Phase 2 reference updates.
+            // Snapshot the mark word first — installing the forward overwrites
+            // it (see the `live_objects` note above).
+            let saved_mark = header.mark_word.load(std::sync::atomic::Ordering::Relaxed);
+            header.set_forwarding_address(dest);
 
             if obj_ptr != dest {
                 pointer_map.insert(obj_ptr as usize, dest as usize);
@@ -1232,14 +1247,14 @@ impl OldGen {
                 // address is not wrongly cleared.
                 pointer_map.insert(obj_ptr as usize, dest as usize);
             }
-            live_objects.push((obj_ptr, total_size, dest));
+            live_objects.push((obj_ptr, total_size, dest, saved_mark));
             write_cursor = aligned + total_size;
         }
 
         // Phase 2: Update references within live old-gen objects.
         // Each reference slot that points to a moved old-gen object is rewritten
         // to the object's forwarding address.
-        for &(obj_ptr, _, _) in &live_objects {
+        for &(obj_ptr, _, _, _) in &live_objects {
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
             Self::update_refs_in_object(obj_ptr, header, &self.data);
         }
@@ -1248,13 +1263,19 @@ impl OldGen {
         // Processing order is low-to-high by source address, and dest ≤ src
         // for sliding compaction, so `std::ptr::copy` (memmove) is safe even
         // for overlapping regions.
-        for &(src, size, dest) in &live_objects {
+        for &(src, size, dest, saved_mark) in &live_objects {
             if src != dest {
                 unsafe { std::ptr::copy(src, dest, size) };
             }
-            // Clear GC metadata on the (possibly moved) object
+            // Clear GC metadata on the (possibly moved) object. Restoring the
+            // snapshot both retires the forward (the mark word IS the forwarding
+            // slot now) and gives the survivor back the lock state Phase 1
+            // overwrote — NEUTRAL, a thin lock's owner/recursion, or an INFLATED
+            // word and the one strong `Arc<Monitor>` reference it owns.
             let final_header = unsafe { &mut *(dest as *mut ObjectHeader) };
-            final_header.forwarding_ptr = std::ptr::null_mut();
+            final_header
+                .mark_word
+                .store(saved_mark, std::sync::atomic::Ordering::Relaxed);
             final_header.gc_flags &= !GC_FLAG_MARKED;
         }
 
@@ -1602,8 +1623,8 @@ impl OldGen {
                     return None; // reference outside the compacted old-gen region
                 }
                 let ref_header = &*(ref_ptr as *const ObjectHeader);
-                if !ref_header.forwarding_ptr.is_null() {
-                    if seedhunt_enabled() && (ref_header.forwarding_ptr as usize) < 0x1000 {
+                if ref_header.is_forwarded() {
+                    if seedhunt_enabled() && (ref_header.forwarding_address() as usize) < 0x1000 {
                         eprintln!(
                             "[gcfwd] write small fwd: holder@0x{:x} cid={} \
                              referent@0x{:x} cid={} marked={} fwd=0x{:x}",
@@ -1612,10 +1633,10 @@ impl OldGen {
                             r,
                             ref_header.class_id.as_u32(),
                             ref_header.gc_flags & GC_FLAG_MARKED != 0,
-                            ref_header.forwarding_ptr as usize,
+                            ref_header.forwarding_address() as usize,
                         );
                     }
-                    Some(ref_header.forwarding_ptr)
+                    Some(ref_header.forwarding_address())
                 } else {
                     // Dangling-ref guard: an in-old-gen target with a null
                     // forwarding pointer is an UNMARKED object that Phase 0
@@ -1848,9 +1869,11 @@ mod tests {
 
         assert_eq!(second as usize - first as usize, 48);
         // OldGen reserves at least one header for any request, so the second
-        // 8-byte request occupies one 32-byte production header after the
-        // 48-byte aligned extent.
-        assert_eq!(og.used(), 80);
+        // 8-byte request occupies one production header after the 48-byte
+        // aligned extent. Derived rather than restated: this number moved 80 ->
+        // 72 with the 2026-08-06 header shrink, and a literal here would have
+        // to be re-derived by hand every time the layout moves.
+        assert_eq!(og.used(), 48 + cratonvm_types::HEADER_SIZE);
     }
 
     #[test]
@@ -2183,7 +2206,7 @@ mod tests {
                 "B data lost across compaction"
             );
             // GC metadata cleared on the survivor.
-            assert!(b_hdr.forwarding_ptr.is_null());
+            assert!(!b_hdr.is_forwarded());
             assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);
         }
     }
@@ -2329,7 +2352,7 @@ mod tests {
             let c_hdr = &*(c as *const ObjectHeader);
             assert_eq!(c_hdr.identity_hash_code, C_TAG, "C must not have moved");
             assert_eq!(c_hdr.gc_flags & GC_FLAG_MARKED, 0, "marks must be cleared");
-            assert!(c_hdr.forwarding_ptr.is_null());
+            assert!(!c_hdr.is_forwarded());
         }
     }
 

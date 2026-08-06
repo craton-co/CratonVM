@@ -14016,6 +14016,12 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/util/Optional;",
         crate::lang_system::native_runtime_version_build,
     );
+    // Every spawn route funnels into `native-io`'s `spawn_and_wrap`, including
+    // the `ProcessBuilder.start` that this crate does NOT own. Hand it the
+    // SecurityManager gate here, alongside the exec registrations, so the two
+    // cannot drift apart. Idempotent.
+    crate::lang_system::install_spawn_policy_hook();
+
     // Runtime.exec overloads — spawn subprocesses via std::process::Command
     registry.register(
         "java/lang/Runtime",

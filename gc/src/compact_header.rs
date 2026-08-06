@@ -638,8 +638,8 @@ pub fn migrate_to_compact(
     }
 
     // Migrate forwarding pointer.
-    if !old.forwarding_ptr.is_null() {
-        header.set_forwarding_ptr(old.forwarding_ptr as usize);
+    if old.is_forwarded() {
+        header.set_forwarding_ptr(old.forwarding_address() as usize);
     }
 
     header
@@ -851,7 +851,7 @@ impl HeaderView {
             identity_hash_code: h.identity_hash_code,
             gc_age: h.gc_age,
             gc_flags: h.gc_flags,
-            is_forwarded: !h.forwarding_ptr.is_null(),
+            is_forwarded: h.is_forwarded(),
         }
     }
 
@@ -937,6 +937,13 @@ pub struct CompactAllocator {
 /// Size of each value slot (matches the legacy slot size for compatibility).
 const COMPACT_SLOT_SIZE: usize = 16;
 
+/// Header bytes a compact object saves over a legacy one. Was a bare `24`
+/// twice below until the 2026-08-06 header shrink took the legacy header from
+/// 32 to 24 and made it 16 — a literal that feeds `savings_report()` and four
+/// assertions, so it drifts silently. Derived now.
+const LEGACY_MINUS_COMPACT_HEADER: usize =
+    cratonvm_types::HEADER_SIZE - CompactHeader::SIZE;
+
 impl CompactAllocator {
     /// Create a new compact allocator with the given capacity in bytes.
     pub fn new(capacity: usize) -> Self {
@@ -987,7 +994,8 @@ impl CompactAllocator {
 
         self.object_count.fetch_add(1, Ordering::Relaxed);
         // Savings: 32 - 8 = 24 bytes per object
-        self.bytes_saved.fetch_add(24, Ordering::Relaxed);
+        self.bytes_saved
+            .fetch_add(LEGACY_MINUS_COMPACT_HEADER, Ordering::Relaxed);
 
         Some(ptr)
     }
@@ -1026,7 +1034,8 @@ impl CompactAllocator {
         }
 
         self.object_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_saved.fetch_add(24, Ordering::Relaxed);
+        self.bytes_saved
+            .fetch_add(LEGACY_MINUS_COMPACT_HEADER, Ordering::Relaxed);
 
         Some(ptr)
     }
@@ -1990,7 +1999,15 @@ mod tests {
             0,
             0,
         );
-        old.forwarding_ptr = 0x1234 as *mut u8;
+        // Raw bits, not `set_forwarding_address`: the constructor asserts the
+        // target is a plausible, 8-byte-aligned heap pointer, and 0x1234 is
+        // deliberately neither. Writing the word directly is how a test says
+        // "pretend the collector already forwarded this" without pretending the
+        // address is real.
+        old.mark_word.store(
+            0x1234u64 | cratonvm_types::MARK_FORWARDED,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let view = HeaderView::from_legacy(&old);
         assert!(view.is_forwarded());
     }
@@ -2031,7 +2048,11 @@ mod tests {
         assert_eq!(resolved, Some(cid));
 
         assert_eq!(alloc.object_count(), 1);
-        assert_eq!(alloc.bytes_saved(), 24); // 32 - 8
+        // Derived, not restated: this delta moved 24 -> 16 when the legacy
+        // header shrank 32 -> 24 on 2026-08-06, and it is the number the
+        // savings report is FOR — a literal here reports the wrong saving
+        // as confidently as the right one.
+        assert_eq!(alloc.bytes_saved(), LEGACY_MINUS_COMPACT_HEADER);
     }
 
     #[test]
@@ -2073,7 +2094,7 @@ mod tests {
             assert!(ptr.is_some(), "Failed to alloc object {}", i);
         }
         assert_eq!(alloc.object_count(), 100);
-        assert_eq!(alloc.bytes_saved(), 100 * 24);
+        assert_eq!(alloc.bytes_saved(), 100 * LEGACY_MINUS_COMPACT_HEADER);
     }
 
     #[test]
@@ -2124,7 +2145,7 @@ mod tests {
         }
         let report = alloc.savings_report();
         assert_eq!(report.object_count, 50);
-        assert_eq!(report.header_bytes_saved, 50 * 24);
+        assert_eq!(report.header_bytes_saved, 50 * LEGACY_MINUS_COMPACT_HEADER);
         assert_eq!(report.klass_table_entries, 50);
         assert_eq!(report.hash_table_entries, 0); // no hash codes requested
     }
@@ -2175,10 +2196,12 @@ mod tests {
     // -- 54.6: Integration with CompactHeader --
 
     #[test]
-    fn s54_compact_header_8_vs_legacy_32() {
+    fn s54_compact_header_8_vs_legacy_24() {
         assert_eq!(CompactHeader::SIZE, 8);
-        assert_eq!(crate::heap::HEADER_SIZE, 32);
-        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 24);
+        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
+        // word. The gap this type would still close is now 16, not 24.
+        assert_eq!(crate::heap::HEADER_SIZE, 24);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 16);
     }
 
     #[test]
@@ -2256,7 +2279,7 @@ mod tests {
         }
         assert_eq!(ptrs.len(), 10_000);
         assert_eq!(alloc.object_count(), 10_000);
-        assert_eq!(alloc.bytes_saved(), 10_000 * 24);
+        assert_eq!(alloc.bytes_saved(), 10_000 * LEGACY_MINUS_COMPACT_HEADER);
 
         // Verify all objects have correct class IDs
         for (i, ptr) in ptrs.iter().enumerate() {

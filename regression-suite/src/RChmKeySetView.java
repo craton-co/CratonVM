@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -221,10 +222,117 @@ public class RChmKeySetView {
                 "newThreadPerTaskExecutor did not reach TERMINATED");
     }
 
+    /**
+     * `keySet()` with no argument: a live, READ-ONLY view of the same map.
+     *
+     * It used to be a `java.util.HashSet` carrying a resync-on-read backing.
+     * That got reads and `remove` right, and three things wrong: the cast
+     * threw, `add` silently mutated a private snapshot instead of throwing,
+     * and `retainAll` did not write through at all while `removeAll` returned
+     * `false` after removing.
+     */
+    static void plainKeySetView() {
+        ConcurrentHashMap<String, Integer> m = new ConcurrentHashMap<>();
+        m.put("a", 1);
+        m.put("b", 2);
+        m.put("c", 3);
+        Set<String> ks = m.keySet();
+
+        ConcurrentHashMap.KeySetView<String, Integer> view =
+                (ConcurrentHashMap.KeySetView<String, Integer>) ks;
+        check(view.getMappedValue() == null,
+                "keySet() has a mapped value: " + view.getMappedValue());
+        check(view.getMap() == m, "keySet().getMap() is not the source map");
+
+        // Live, not a snapshot.
+        m.put("d", 4);
+        check(ks.size() == 4 && ks.contains("d"), "keySet() did not see a later put");
+        m.remove("d");
+        check(ks.size() == 3 && !ks.contains("d"), "keySet() did not see a later remove");
+
+        // Read-only: no mapped value means `add` cannot work.
+        boolean threw = false;
+        try {
+            ks.add("nope");
+        } catch (UnsupportedOperationException e) {
+            threw = true;
+        }
+        check(threw, "keySet().add did not throw UnsupportedOperationException");
+        check(!m.containsKey("nope"), "keySet().add mutated the map");
+        threw = false;
+        try {
+            ks.addAll(Arrays.asList("p", "q"));
+        } catch (UnsupportedOperationException e) {
+            threw = true;
+        }
+        check(threw, "keySet().addAll did not throw UnsupportedOperationException");
+
+        // Every removal path writes through to the map.
+        check(ks.remove("c") && !m.containsKey("c"), "keySet().remove did not write through");
+        m.put("c", 3);
+        for (Iterator<String> it = ks.iterator(); it.hasNext(); ) {
+            if (it.next().equals("c")) {
+                it.remove();
+            }
+        }
+        check(!m.containsKey("c"), "keySet().iterator().remove did not write through");
+        m.put("e", 5);
+        check(ks.removeIf(x -> x.equals("e")) && !m.containsKey("e"),
+                "keySet().removeIf did not write through");
+        m.put("f", 6);
+        m.put("g", 7);
+        List<String> drop = new ArrayList<>();
+        drop.add("f");
+        drop.add("g");
+        check(ks.removeAll(drop) && !m.containsKey("f") && !m.containsKey("g"),
+                "keySet().removeAll did not write through (or reported false having removed)");
+        m.put("h", 8);
+        List<String> keep = new ArrayList<>();
+        keep.add("a");
+        keep.add("b");
+        check(ks.retainAll(keep) && !m.containsKey("h") && m.containsKey("a"),
+                "keySet().retainAll did not write through");
+        ks.clear();
+        check(m.isEmpty() && ks.isEmpty(), "keySet().clear did not write through");
+
+        // The Spring `SimpleAliasRegistry.getAliases` shape: iteration order is
+        // HotSpot's flat-table bucket order, and all four readers agree on it.
+        ConcurrentHashMap<String, String> am = new ConcurrentHashMap<>(16);
+        am.put("myalias", "x");
+        am.put("youralias", "y");
+        am.put("thirdalias", "z");
+        List<String> viaKeySet = new ArrayList<>(am.keySet());
+        List<String> viaForEach = new ArrayList<>();
+        am.forEach((k, v) -> viaForEach.add(k));
+        List<String> viaIterator = new ArrayList<>();
+        for (String k : am.keySet()) {
+            viaIterator.add(k);
+        }
+        check(viaKeySet.equals(viaForEach) && viaKeySet.equals(viaIterator),
+                "keySet()/forEach/iterator disagree on order: " + viaKeySet + " " + viaForEach
+                        + " " + viaIterator);
+        System.out.println("CK keySet order=" + viaKeySet);
+
+        // The `CachedIntrospectionResults.clearClassLoader` shape.
+        ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
+        for (int i = 0; i < 10; i++) {
+            cache.put("k" + i, i % 2 == 0 ? "keep" : "drop");
+        }
+        cache.keySet().removeIf(k -> "drop".equals(cache.get(k)));
+        check(cache.size() == 5, "keySet().removeIf evicted " + (10 - cache.size()) + " of 5");
+
+        // Reached polymorphically, the static receiver type must not decide the class.
+        Map<String, Integer> asMap = m;
+        m.put("z", 1);
+        check(asMap.keySet().contains("z") && asMap.keySet().size() == 1,
+                "((Map) chm).keySet() disagrees with chm.keySet()");
+    }
+
     public static void main(String[] args) throws Exception {
         identity();
         surface();
         mappedKeySetView();
+        plainKeySetView();
         churn();
         concurrentAdds();
         executorClose();

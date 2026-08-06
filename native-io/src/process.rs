@@ -74,6 +74,41 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
+// Java-visible spawn policy gate
+// ---------------------------------------------------------------------------
+
+/// A pre-spawn policy check, called with `command[0]` before any fork/exec.
+///
+/// Returning `Err` cancels the spawn and propagates the error verbatim to the
+/// Java caller, so a `SecurityException` stays a `SecurityException`.
+pub type SpawnPolicyHook = fn(&mut dyn NativeContext, &str) -> Result<(), MethodCallFailed>;
+
+/// Installed once at native-registration time by `native-builtins`, which owns
+/// `SecurityManager` and therefore cannot be called from here directly (it
+/// depends on this crate, not the reverse).
+///
+/// A `fn` pointer, not per-VM state: the hook is the same code in every VM in
+/// the process, and it resolves the *calling* VM's SecurityManager through the
+/// `NativeContext` it is handed. Nothing about a particular VM is latched.
+static SPAWN_POLICY_HOOK: OnceLock<SpawnPolicyHook> = OnceLock::new();
+
+/// Install the pre-spawn policy gate. Idempotent: the first hook wins, so
+/// calling this from more than one registration path is safe.
+pub fn set_spawn_policy_hook(hook: SpawnPolicyHook) {
+    let _ = SPAWN_POLICY_HOOK.set(hook);
+}
+
+/// Run the installed policy gate, if any. With no hook installed (a
+/// native-io-only build, or a unit test) this is a no-op, which matches the
+/// JDK: spawning is unrestricted until a SecurityManager is installed.
+fn run_spawn_policy(ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+    match SPAWN_POLICY_HOOK.get() {
+        Some(hook) => hook(ctx, program),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process-table (holds live std::process::Child handles)
 // ---------------------------------------------------------------------------
 
@@ -474,6 +509,25 @@ fn spawn_and_wrap_with_redirects(
         .into());
     }
 
+    // SECURITY: the Java-visible spawn gate (`SecurityManager.checkExec`),
+    // ahead of everything else so a denial cannot be observed as an
+    // `IOException` and so no fork/exec syscall is issued.
+    //
+    // It lives HERE, in the one function every spawn route funnels through
+    // (`ProcessBuilder.start`, `Runtime.exec`, `ProcessImpl.create`,
+    // `forkAndExec`), because it previously lived in only some of them:
+    // `native-builtins` gated `Runtime.exec` and its own now-shadowed
+    // `ProcessBuilder.start`, while THIS crate's `ProcessBuilder.start` -- the
+    // registration that actually wins at runtime -- had no gate at all. A
+    // deny-all `checkExec` policy therefore refused `Runtime.exec` and let
+    // `new ProcessBuilder(...).start()` fork the same child unchallenged
+    // (probes/ExecPolicyProbe.java, PB_CHILD_RAN=true).
+    //
+    // Called with `program` verbatim, before the Windows quote-strip below, so
+    // the SecurityManager sees exactly the `command[0]` the caller wrote --
+    // which is what HotSpot's `ProcessBuilder.start` passes to `checkExec`.
+    run_spawn_policy(ctx, program)?;
+
     // Windows launchers wrap a space-containing program path in double quotes
     // (e.g. WildFly's `StandaloneCommandBuilder` →
     // `"C:\Program Files\…\bin\java"`). The OS `CreateProcess` takes the program
@@ -650,6 +704,20 @@ fn spawn_and_wrap_with_redirects(
         },
     );
 
+    // `ensure_synthetic_class` gives `cratonvm/synthetic/Process` a real
+    // `java.lang.Process` superclass, but it resolves it with
+    // `get_loaded_class_id` — which answers only for a class that is ALREADY
+    // loaded. Load it here so the fabrication cannot silently fall back to
+    // `java/lang/Object` and reintroduce the supertype inconsistency
+    // (`isAssignableFrom` true while the `getSuperclass()` chain omits it).
+    //
+    // In practice the caller's own bytecode has already resolved
+    // `java.lang.Process` — it is `start()`'s return type — so this is
+    // ordinarily a no-op lookup. It is not free to rely on that: this native is
+    // also reached from paths that never named the type, and a mode without a
+    // real `java.lang.Process` at all must still get the old behaviour rather
+    // than an error, which is why the result is deliberately discarded.
+    let _ = ctx.load_class("java/lang/Process");
     // Allocate the synthetic Process under its own named class (see
     // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
     // ahead of them belong to java.lang.Process's own reader/writer caches and
@@ -3108,6 +3176,156 @@ mod tests {
         ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
         ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
         proc_ref
+    }
+
+    /// A spawn must hand back a LIVE, READABLE stdout pipe.
+    ///
+    /// This is the property `Runtime.exec` did not have: it ran the child to
+    /// completion with `Command::output()` and stored the bytes as a Java
+    /// String on an object nothing downstream could read, so
+    /// `Process.getInputStream()` fell through to fd -1 and every read
+    /// returned EOF. Tomcat's `CGIServlet` copies exactly that stream into
+    /// the HTTP response, which is why `TestSecurity2019.testCVE_2019_0232`
+    /// saw `200 OK` with an empty body.
+    ///
+    /// Asserted through the `FdTable`, the same route the pipe-stream natives
+    /// take, rather than through the Java stream objects: the point is that
+    /// the fd recorded on the Process is the child's real stdout.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_and_wrap_exposes_a_live_stdout_pipe() {
+        let mut ctx = MockNativeContext::new();
+        let result = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["hello-from-the-child".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("spawn /bin/echo")
+        .expect("spawn returns a Process");
+        let proc_ref = match result {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected a Process object, got {other:?}"),
+        };
+
+        let handle = match ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+            Value::Long(h) => h,
+            other => panic!("PROC_FIELD_HANDLE must be a Long, got {other:?}"),
+        };
+        assert_ne!(handle, 0, "a spawned Process must carry a live handle");
+
+        let stdout_fd = match ctx.get_field(proc_ref, PROC_FIELD_STDOUT_FD) {
+            Value::Int(fd) => fd,
+            other => panic!("PROC_FIELD_STDOUT_FD must be an Int, got {other:?}"),
+        };
+        assert!(
+            stdout_fd >= 0,
+            "a piped stdout must have a real fd-table id, got {stdout_fd}"
+        );
+
+        let mut buf = [0u8; 64];
+        let n = ctx
+            .fd_table()
+            .read_bytes(stdout_fd as FdId, &mut buf)
+            .expect("read the child's stdout");
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            text.contains("hello-from-the-child"),
+            "the child's stdout must be readable through the recorded fd, got {text:?}"
+        );
+
+        assert_eq!(wait_for_handle(handle), 0);
+    }
+
+    /// The spawn policy gate runs BEFORE the fork, on every spawn route.
+    ///
+    /// `SecurityManager.checkExec` used to be applied by `Runtime.exec` and by
+    /// `native-builtins`' own (shadowed) `ProcessBuilder.start`, but NOT by the
+    /// `ProcessBuilder.start` that actually wins at runtime, so a deny-all
+    /// policy refused one entry point and let the other fork the same child.
+    /// The gate now lives in `spawn_and_wrap`, which all of them funnel
+    /// through.
+    ///
+    /// Both arms are in one test on purpose: the hook is a process-global
+    /// `OnceLock`, so a second test installing a different one would silently
+    /// keep the first.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_policy_hook_is_consulted_and_can_refuse_the_fork() {
+        use std::sync::atomic::AtomicBool;
+
+        static DENY: AtomicBool = AtomicBool::new(true);
+        static SAW: Mutex<Option<String>> = Mutex::new(None);
+
+        fn hook(_ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+            *SAW.lock() = Some(program.to_string());
+            if DENY.load(Ordering::Relaxed) {
+                Err(RuntimeError::SecurityException {
+                    message: format!("test policy denies {program}"),
+                }
+                .into())
+            } else {
+                Ok(())
+            }
+        }
+        set_spawn_policy_hook(hook);
+
+        // --- deny arm: the error propagates verbatim and nothing is spawned.
+        let mut ctx = MockNativeContext::new();
+        let marker = std::env::temp_dir().join(format!(
+            "cratonvm-spawn-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let denied = spawn_and_wrap(
+            &mut ctx,
+            "/usr/bin/touch",
+            &[marker.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
+            false,
+        );
+        match denied {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::SecurityException { .. },
+            ))) => {}
+            other => panic!("a refused spawn must surface the SecurityException, got {other:?}"),
+        }
+        assert_eq!(
+            SAW.lock().as_deref(),
+            Some("/usr/bin/touch"),
+            "the gate must see command[0]"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a refused spawn must not fork: {} exists",
+            marker.display()
+        );
+
+        // --- allow arm: the same call goes through once the gate says yes.
+        DENY.store(false, Ordering::Relaxed);
+        let allowed = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["ok".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("an allowed spawn must proceed")
+        .expect("spawn returns a Process");
+        if let Value::Object(Some(proc_ref)) = allowed {
+            if let Value::Long(handle) = ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+                assert_eq!(wait_for_handle(handle), 0);
+            }
+        }
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// End-to-end spawn + waitFor round-trip — no NativeContext needed.

@@ -1108,23 +1108,20 @@ fn t1_brooks_barrier_follows_forwarding_pointer() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let old = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     let new_obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
-    // Directly install a forwarding pointer on `old`'s header exactly the
-    // way the live stop-the-world collector does. Every `VmHeap` backend
-    // lays objects out with the full 32-byte `ObjectHeader`, and
-    // `gen_heap::forward_object` records relocation by writing the legacy
-    // `ObjectHeader.forwarding_ptr` field (offset 24) — NOT the compact
-    // 64-bit header word at offset 0 (which, in a full header, is
-    // `class_id`/`identity_hash_code`, not the mark word). The read-barrier
-    // `load_and_forward` reads that same `forwarding_ptr` field via
-    // `is_forwarded()`/`forwarding_address()`, so the test must install
-    // forwarding through `ObjectHeader` to exercise the real path.
+    // Directly install a forwarding pointer on `old`'s header exactly the way
+    // the live stop-the-world collector does. Since the 2026-08-06 header
+    // shrink that means the MARK WORD's `MARK_FORWARDED` state — the dedicated
+    // `forwarding_ptr` field this used to write (at offset 24, in the then
+    // 32-byte header) is gone, and `set_forwarding_address` is the one
+    // installer. The read barrier `load_and_forward` decodes the same word via
+    // `is_forwarded()` / `forwarding_address()`, so this still exercises the
+    // real path rather than a parallel one.
     //
-    // SAFETY: `old` is a live object allocated above; its first
-    // `ObjectHeader` bytes are valid and mutable, and `forwarding_ptr`
-    // is null until we write it here.
+    // SAFETY: `old` is a live object allocated above; its `ObjectHeader` bytes
+    // are valid, and the mark word is NEUTRAL until we write it here.
     unsafe {
-        let hdr = old.as_ptr() as *mut cratonvm_gc::ObjectHeader;
-        std::ptr::addr_of_mut!((*hdr).forwarding_ptr).write(new_obj.as_ptr() as *mut u8);
+        let hdr = old.as_ptr() as *const cratonvm_gc::ObjectHeader;
+        (*hdr).set_forwarding_address(new_obj.as_ptr() as *mut u8);
     }
     // Now the barrier should follow the forwarding pointer.
     let forwarded = shared.mem.heap.load_and_forward(old);
