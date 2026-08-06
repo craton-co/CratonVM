@@ -631,7 +631,9 @@ mod tests {
         let mut store = ClassStore::new();
         let id = store.next_id();
         let mut class = make_class(id, "java/util/Fake", None, anon(2), 0, 2);
-        class.origin.is_compatibility_stub() = true;
+        class.set_origin(crate::class_origin::ClassOrigin::compatibility_stub(
+            "test fixture",
+        ));
         store.add(class);
         assert!(diff_against_model(&store, id, &anon(2)).is_none());
     }
