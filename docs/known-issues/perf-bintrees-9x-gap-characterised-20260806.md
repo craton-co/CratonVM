@@ -63,9 +63,57 @@ relocate. `chain_entry_rbp_is_foreign` already special-cases direct self-calls
 (`returned_from_direct_self_call` matches `E8 rel32` targeting the entry), so
 `bottomUpTree`→`bottomUpTree` is fine; what defeats it is `binaryTrees` calling
 **two different** JIT methods, leaving the chain entry's `compiled_method`
-unable to describe the innermost frame. The real fix is to walk the JIT frame
-chain and verify each frame against its own method — which is the most
-safety-critical code in the VM, and is why this page stops here.
+unable to describe the innermost frame.
+
+### FIXED 2026-08-06 — the frame says which method built it
+
+`innermost_frame_method` replaces the boolean. "The entry cannot describe this
+frame" is not "nothing can": the frame's own return address names the method,
+provided the call was the direct form.
+
+```text
+[exact_rbp + 8] = ret_addr
+[ret_addr - 5]  = E8 rel32
+ret_addr + rel32 == callee.entry_ptr()      <- must be the ENTRY, not just inside
+```
+
+That callee describes the frame exactly, because the frame was built by the
+prologue at `entry_ptr`. Indirect calls (the inline MIC/PIC cascade, the hashed
+megamorphic stub) encode no target and stay foreign, so the failure direction is
+still a non-moving sweep and never a frame walked with the wrong map. Measured
+on the same binary with `CRATONVM_GC_NO_CALLEE_RESOLVE=1` as the control:
+
+| `-Xmx` | collections | off | on |
+|---|---:|---|---|
+| 8g | 1 | `cycles=0 fallbacks=1` | **`cycles=1 fallbacks=0`** |
+| 2g | 6 | `cycles=0 fallbacks=6` | **`cycles=6 fallbacks=0`** |
+| 1g | 12 | `cycles=0 fallbacks=12` | **`cycles=12 fallbacks=0`** |
+| 700m | 18 | `cycles=0 fallbacks=18` | **`cycles=18 fallbacks=0`** |
+
+`young=MOVING reason=moving-jit-coverage-proven`. Every collection relocates;
+none fall back.
+
+**1.089x at 8g, 1.000x at 16g** — exactly as it should be, since 16g collects
+zero times and a change to what happens *at* a collection cannot help a run that
+never has one. Seven-phase checksums identical, and the bintrees checksum exact
+through all 18 relocating collections at 700m.
+
+That last point is worth stating precisely, because the sibling result on this
+page is the opposite. A green bintrees run cannot validate the **spill sink**
+(the positive control below stays green with the spill removed entirely). It
+*can* validate this one: under relocation the innermost frame's oop map is used
+to rewrite pointers, so a frame walked with the wrong method's map leaves real
+oops stale — and `itemCheck` dereferences every node immediately afterwards.
+18 relocating collections producing the exact checksum is evidence.
+
+**One correction to this section's own claim.** "Unlocks the 11% already being
+paid" is not what happened, and the 16g row shows it: the shadow push/reload is
+still emitted and still executed at every safepoint. The 11% was being paid and
+still is. What changed is that it now buys something — the collector uses the
+precise roots instead of declining them, so the *collection* gets cheaper (a
+Cheney copy of a nursery that is almost entirely garbage, in place of a
+~410 ms non-moving sweep). Removing the 11% itself would mean giving up precise
+roots, which is a different trade.
 
 ## The other structural half: objects are 2x
 
@@ -386,9 +434,9 @@ not a peephole.
 
 The two structural levers are large:
 
-1. **Make moving-young stop falling back** on multi-method JIT stacks. Unlocks
-   the 11% already being paid, and turns the 8g collection from a ~410 ms
-   non-moving sweep into a copy of a nursery that is almost entirely garbage.
+1. ~~**Make moving-young stop falling back** on multi-method JIT stacks.~~
+   **DONE 2026-08-06** — see the section above. 1.089x at 8g; every collection
+   now relocates. It does not remove the 11%, it makes the 11% buy something.
 2. **Shrink the header** (see the two corrections above). The end state is the
    8-byte `CompactHeader` on the path that already packs reference fields at 8
    bytes, which takes `Node` from 48 to 24 — level with HotSpot. That path is
