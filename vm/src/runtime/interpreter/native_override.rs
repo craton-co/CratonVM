@@ -7218,8 +7218,54 @@ mod redefine_immunity_tests {
         //
         // Same fix, same reason, as `jit::ir_lower`'s `declared_op_variants`
         // and `vm::runtime::env_cache`'s flags scan.
-        let src = include_str!("native_override.rs").replace("\r\n", "\n");
-        let src = src.as_str();
+        // A FIFTH staleness mode, found 2026-08-06: this gate policed exactly
+        // one file. The rule it states — "an arm may be named only inside the
+        // two aggregators" — is a rule about the override policy, not about a
+        // file, and the aggregators are `pub(super)`, so every sibling module
+        // can name an arm and none of them were being read.
+        //
+        // `vm/src/runtime/interpreter.rs` did: its no-`Code` dispatch arm
+        // hand-rolled `reflection && string_builder && path`, the aggregate
+        // minus five arms including `synthetic_collection`. That is the same
+        // open-coding whose 2026-07-31 instance took the collection probe to 18
+        // rather than 0 — the incident written up on
+        // `redefine_immune_forced_native` as the reason this gate exists. It
+        // sat in a sibling file for as long as the gate has been green.
+        //
+        // Scanning the whole `runtime` subtree is the fix. `include_str!` needs
+        // literal paths, so the sibling list is explicit; a new module that
+        // names an arm is not covered until it is added here, which is the
+        // remaining hole and is at least a hole in one obvious place.
+        let sources: [(&str, String); 6] = [
+            (
+                "native_override.rs",
+                include_str!("native_override.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../interpreter.rs",
+                include_str!("../interpreter.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "invoke.rs",
+                include_str!("invoke.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "dispatch_virtual.rs",
+                include_str!("dispatch_virtual.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../instrument.rs",
+                include_str!("../instrument.rs").replace("\r\n", "\n"),
+            ),
+            (
+                "../../vm/vm_exec.rs",
+                include_str!("../../vm/vm_exec.rs").replace("\r\n", "\n"),
+            ),
+        ];
+
+        // The aggregators live in THIS file, so the exemption range is computed
+        // from this file's text and applies only while scanning it.
+        let src = sources[0].1.as_str();
 
         // The exemption is the RULE, located in the source: an arm may be named
         // only inside the two aggregators, whose entire job is to compose them.
@@ -7267,30 +7313,40 @@ mod redefine_immunity_tests {
         );
 
         let mut offenders = Vec::new();
-        let mut offset = 0usize;
-        for (n, line) in src.lines().enumerate() {
-            let line_start = offset;
-            offset += line.len() + 1; // `lines()` strips a single `\n`
-            let code = line.trim_start();
-            // Comments, and this test's own list of names (string literals).
-            if code.starts_with("//") || code.starts_with('"') {
-                continue;
-            }
-            let inside_aggregator = aggregator_bodies
-                .iter()
-                .any(|&(start, end)| line_start >= start && line_start < end);
-            if inside_aggregator {
-                continue;
-            }
-            for part in [
-                "redefine_immune_string_builder_native(",
-                "redefine_immune_path_native(",
-                "redefine_immune_jfr_native(",
-                "redefine_immune_synthetic_collection_native(",
-            ] {
-                // An arm's own `fn` declaration is not a call site.
-                if code.contains(part) && !code.contains(&format!("fn {part}")) {
-                    offenders.push(format!("line {}: {}", n + 1, code));
+        for (file, text) in &sources {
+            // The aggregator exemption is a byte range in `native_override.rs`
+            // only. In any other file there is nothing to exempt — naming an
+            // arm there is the offence, wherever in the file it sits.
+            let exempt: &[(usize, usize)] = if *file == "native_override.rs" {
+                &aggregator_bodies
+            } else {
+                &[]
+            };
+            let mut offset = 0usize;
+            for (n, line) in text.lines().enumerate() {
+                let line_start = offset;
+                offset += line.len() + 1; // `lines()` strips a single `\n`
+                let code = line.trim_start();
+                // Comments, and this test's own list of names (string literals).
+                if code.starts_with("//") || code.starts_with('"') {
+                    continue;
+                }
+                if exempt
+                    .iter()
+                    .any(|&(start, end)| line_start >= start && line_start < end)
+                {
+                    continue;
+                }
+                for part in [
+                    "redefine_immune_string_builder_native(",
+                    "redefine_immune_path_native(",
+                    "redefine_immune_jfr_native(",
+                    "redefine_immune_synthetic_collection_native(",
+                ] {
+                    // An arm's own `fn` declaration is not a call site.
+                    if code.contains(part) && !code.contains(&format!("fn {part}")) {
+                        offenders.push(format!("{}:{}: {}", file, n + 1, code));
+                    }
                 }
             }
         }

@@ -1001,16 +1001,31 @@ pub fn execute(
             // per-class native shadow so the interpreter runs the (instrumented)
             // body and the advice fires. Fast-pathed on `any_class_redefined`.
             //
-            // JDK-ONLY-WAVE2: the three `redefine_immune_*` predicates are
+            // JDK-ONLY-WAVE2: the `redefine_immune_*` predicates are
             // hard-coded class/method-name exception lists (defined in
-            // `vm/src/runtime/interpreter/invoke.rs`, not owned here). They
-            // encode "this native keeps winning even over instrumented
-            // bytecode", which is a §1.4 shadow decision taken outside
-            // `resolve_dispatch`. What should replace them: `NativeKind` —
-            // exactly `Intrinsic` should be redefine-immune, and everything
-            // else should yield to redefined bytecode, with no name list at
-            // all. NOT deleted this wave; the lists gate real Mockito/ByteBuddy
-            // behaviour. Call site marked so wave 2 finds it mechanically.
+            // `native_override.rs`, not owned here). They encode "this native
+            // keeps winning even over instrumented bytecode", which is a §1.4
+            // shadow decision taken outside `resolve_dispatch`. What should
+            // replace them: `NativeKind` — exactly `Intrinsic` should be
+            // redefine-immune, and everything else should yield to redefined
+            // bytecode, with no name list at all. NOT deleted this wave; the
+            // lists gate real Mockito/ByteBuddy behaviour.
+            //
+            // This site used to open-code `reflection && string_builder &&
+            // path`, which is the aggregate MINUS five arms: `jfr`,
+            // `bc_crypto_math`, `stamped_lock`, the `FileHandler` ctor/publish
+            // group, and `synthetic_collection`. The last one is the one that
+            // bites: a redefined `java/util/HashMap` reaching here lost its
+            // registered native and ran real JDK bytecode against a CratonVM
+            // synthetic object, which `redefine_immune_synthetic_collection_native`
+            // says can never work.
+            //
+            // That is the SAME defect `layout_immunity_is_not_open_coded`
+            // exists to prevent, and it was invisible to it: that gate
+            // `include_str!`s `native_override.rs` and polices only its own
+            // file, while this hand-rolled chain lives here. The gate now scans
+            // its siblings too — a fifth staleness mode, after the three its
+            // own comment lists and the CRLF one below them.
             let class_redefined = crate::classloading::any_class_redefined()
                 && shared
                     .classes
@@ -1018,13 +1033,11 @@ pub fn execute(
                     .read()
                     .class_redefine_generation(class_id)
                     > 0
-                && !redefine_immune_reflection_native(&class_name_owned, method_name)
-                && !redefine_immune_string_builder_native(
+                && !redefine_immune_forced_native(
                     &class_name_owned,
                     method_name,
                     method_descriptor,
-                )
-                && !redefine_immune_path_native(&class_name_owned, method_name, method_descriptor);
+                );
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
                 // JDK-only §7, resolved-class native. `bytecode_available =
                 // false`: this whole arm only runs when the resolved method has
