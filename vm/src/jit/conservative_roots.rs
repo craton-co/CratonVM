@@ -1176,9 +1176,33 @@ pub fn note_jit_boundary() {
 /// native calls); we only need the *authoritative* GC root scans to be fresh.
 /// Bumping the generation here discards the stale snapshot so the immediately
 /// following `scan_active_jit_frames` performs a full, current scan.
+///
+/// ## H2-CID0 (2026-08-05) — there are TWO caches here, and this used to reset one
+///
+/// [`UNREG_JIT_MEMO`] memoizes the *other* per-native-call scan: the detection
+/// of a JIT frame that is live without having pushed an entry guard. It is not
+/// keyed on the boundary generation, so bumping the generation left it intact —
+/// and it is the cache that decides whether such a frame's oops are marked at
+/// all. Miss the frame and the young non-moving sweep frees objects it alone
+/// holds.
+///
+/// The argument above applies to it verbatim, and more sharply: a stale root
+/// snapshot drops references, while a stale unregistered-frame verdict drops
+/// an entire frame's worth of them AND leaves the collector believing it may
+/// relocate. Reset it here so the authoritative scan cannot inherit a verdict
+/// about a stack that has since been rewritten.
+///
+/// Cost is one full band rescan per GC-authoritative root collection, not per
+/// native call — which is exactly the trade this function already documents.
+/// The `UnregMemo::hiwater` rule still does the between-collections tightening;
+/// it cannot replace this, because it only reacts to stack-pointer rises it
+/// happens to OBSERVE, and a return-and-re-descend that falls entirely between
+/// two snapshots is invisible to it (measured: 972 suppressed detections in one
+/// run with hi-water enabled).
 #[inline]
 pub fn invalidate_scan_cache_for_gc() {
     note_jit_boundary();
+    UNREG_JIT_MEMO.with(|c| c.set(UnregMemo::new()));
 }
 
 fn jit_scan_cache_enabled() -> bool {
@@ -3817,6 +3841,30 @@ mod tests {
             UnregScan::AlreadyClean,
             "documents the defect the hi-water rule fixes",
         );
+    }
+
+    /// H2-CID0 (2026-08-05) — a reset memo vouches for nothing.
+    ///
+    /// `invalidate_scan_cache_for_gc` resets the memo so the GC-authoritative
+    /// scan cannot inherit a verdict about a stack that has since been
+    /// rewritten. The property that matters is that a freshly-reset memo
+    /// demands a FULL rescan (`hi: None`) at any depth, not an incremental
+    /// band — an incremental band would still trust the missing prefix.
+    #[test]
+    fn a_reset_memo_demands_a_full_rescan_at_any_depth() {
+        let mut m = UnregMemo::new();
+        m.mark_clean(1000, 5);
+        assert_eq!(m.observe(1200, 5, true), UnregScan::AlreadyClean);
+
+        m = UnregMemo::new();
+        for depth in [10usize, 1000, 100_000, usize::MAX - 1] {
+            assert_eq!(
+                m.observe(depth, 5, true),
+                UnregScan::Detect { hi: None },
+                "a reset memo must force a full rescan at depth {depth}, not an \
+                 incremental band over a prefix nothing has verified",
+            );
+        }
     }
 
     /// A new compilation invalidates the verdict regardless of depth — a slot
