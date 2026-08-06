@@ -419,7 +419,7 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
-/// `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` — arm §1.4 enforcement at
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` — arm §1.4 enforcement at
 /// `try_stackless_invoke` step 1 under `--jdk-only`.
 ///
 /// Step 1 always *observes* a `Bridge` standing in front of concrete bytecode
@@ -447,7 +447,7 @@ pub fn intrinsics_disabled() -> bool {
 pub fn jdk_only_enforce_shadow() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JDK_ONLY_ENFORCE_SHADOW") {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ENFORCE_NATIVE_SHADOW") {
             Ok(v) => !v.is_empty() && v != "0",
             Err(_) => false,
         }

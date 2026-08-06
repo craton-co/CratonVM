@@ -444,7 +444,7 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// and pays for it on the hottest path in strict mode. The identities are what
 /// the migration needs; the magnitude only has to be non-zero.
 ///
-/// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
+/// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement moves every
 /// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {

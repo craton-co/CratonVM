@@ -181,5 +181,5 @@ was always the real gate"), and it is wave-2 item 4. What landed instead:
   exact `refusals.interpreter_shadow_unenforced` counter. That is the inert-lists
   complaint above, closed: the census can now see the shadows that actually
   dispatch, not only the ones some other site catches.
-* the **enforcement** is `CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1`, off by default,
+* the **enforcement** is `CRATONVM_ENFORCE_NATIVE_SHADOW=1`, off by default,
   so item 4 can re-take that 32/17-vs-3/46 measurement one subsystem at a time.
