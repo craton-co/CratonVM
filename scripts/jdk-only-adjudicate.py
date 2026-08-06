@@ -168,6 +168,18 @@ else:
     print("  (from scripts/jdk-only-inherited-decl.sh) to break it out.")
 
 print("\n=== 3. natives shadowing concrete bytecode (image has_code) ===")
+if INHERITED_TSV:
+    # `has_code` is asked of the NAMED class. A native over a method the
+    # class inherits concretely is just as much a shadow, and this column
+    # cannot see one.
+    extra = sum(1 for r in rows
+                if resolved.get((r["class"], r["name"], r["descriptor"]),
+                                ("", "", ""))[0] == "INHERITED"
+                and "code" in resolved[(r["class"], r["name"],
+                                        r["descriptor"])][2])
+    print(f"  + {extra} more shadow bytecode they INHERIT, invisible to the"
+          f" has_code column below")
+    print(f"    (true shadow population = the total below + {extra})")
 shadow = [r for r in rows if img(r).get("has_code")]
 print(f"  total {len(shadow)}; dispatched this run {sum(1 for r in shadow if r['invocations'] > 0)}")
 by_kind = Counter(r["kind"] for r in shadow)
