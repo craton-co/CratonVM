@@ -26137,13 +26137,79 @@ fn system_logger_emit(
     );
 }
 
+/// The real `java.base` class the strict-mode fallback constructs instead of
+/// fabricating [`CRATON_SYSTEM_LOGGER_CLASS`].
+///
+/// Chosen by the rule the iterator/collector fallbacks established: a real
+/// class is only usable as a stand-in when **its fields are declared and
+/// writable, so filling it is construction rather than fabrication**.
+/// `SimpleConsoleLogger(String name, boolean usePlatformLevel)` is a public
+/// constructor's worth of state — `name`, `usePlatformLevel`, and a `level`
+/// that defaults to INFO — and it is the class `DefaultLoggerFinder` itself
+/// hands out when no `LoggerFinder` service and no `java.logging` module are
+/// available, which is exactly the situation a strict CratonVM boot is in.
+///
+/// Measured under `--jdk-only` before it was wired in (`probes/LoggerRoutes`,
+/// Azure Linux, JDK 25): constructing it reflectively already worked, and
+/// `getName()`, `isLoggable(INFO)=true` and `isLoggable(DEBUG)=false` matched
+/// both HotSpot and the shim this replaces. So the object runs its OWN
+/// bytecode for the whole `System.Logger` surface — the interface-name
+/// registrations cannot shadow a concrete implementation, which is the same
+/// property the block comment above `register_system_logger_methods` relies on.
+///
+/// It is NOT what HotSpot's `System.getLogger` returns when `java.logging` is
+/// resolved (that is `LoggingProviderImpl$JULWrapper`). Reaching THAT needs the
+/// `LoggerFinderLoader` → `ServiceLoader` chain, which
+/// `Reflection.getCallerClass()` returning null on CratonVM boot frames is
+/// still enough to break — see the block comment above.
+const REAL_SYSTEM_LOGGER_CLASS: &str = "jdk/internal/logger/SimpleConsoleLogger";
+
+/// Build a real `System.Logger` for `name`, or `None` if this image has no
+/// [`REAL_SYSTEM_LOGGER_CLASS`].
+///
+/// A construction that FAILS is propagated rather than folded into `None`: a
+/// half-run `<init>` can leave a pending Java exception, and replacing it with
+/// the original fabrication refusal would report the wrong cause.
+fn real_jdk_system_logger(
+    ctx: &mut dyn NativeContext,
+    name: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if ctx.class_id_by_name(REAL_SYSTEM_LOGGER_CLASS).is_none()
+        && ctx.ensure_class_initialized(REAL_SYSTEM_LOGGER_CLASS).is_err()
+    {
+        return Ok(None);
+    }
+    // `usePlatformLevel = false`: the CratonVM shim published at INFO with no
+    // logging configuration, `SimpleConsoleLogger`'s `System.Logger` default is
+    // INFO too, and `true` would instead read `sun.util.logging`'s platform
+    // level. Keeping INFO is what makes this a drop-in.
+    match ctx.new_object_initialized(
+        REAL_SYSTEM_LOGGER_CLASS,
+        "(Ljava/lang/String;Z)V",
+        &[name, Value::Int(0)],
+    )? {
+        Some(Value::Object(Some(logger))) => Ok(Some(logger)),
+        _ => Ok(None),
+    }
+}
+
 /// Allocate a `System.Logger` receiver named `name`.
 ///
-/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7). This stands in for
-/// whatever `System.LoggerFinder` would have produced from real bytecode, so
-/// under `--jdk-only` the fabrication is refused and the refusal propagates as
-/// a `ClassNotFoundException` naming `cratonvm/internal/SystemLogger` — rather
-/// than being recorded as a violation and then performed anyway.
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under `--jdk-only` the
+/// fabrication of [`CRATON_SYSTEM_LOGGER_CLASS`] is refused rather than being
+/// recorded as a violation and then performed anyway.
+///
+/// **The refusal now has somewhere to land (2026-08-06).** Refusing alone was
+/// measured, and it took out `java.io.ObjectInputFilter$Config.<clinit>` — which
+/// calls `System.getLogger("java.io.serialization")` unconditionally — and with
+/// it *every* `ObjectInputStream` construction, i.e. all of deserialization.
+/// That was the last of the five classes in
+/// `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`, the
+/// `serialization` row, and it is the reason `RSerial` and
+/// `JdkOnlyBreadthProbe/strict/serialization` stayed red after the other four
+/// were fixed. §1.1 forbids substituting a FAKE for the refused class; it does
+/// not forbid — it requires — handing back the real thing, so the fallback
+/// constructs [`REAL_SYSTEM_LOGGER_CLASS`].
 pub(crate) fn craton_alloc_system_logger(
     ctx: &mut dyn NativeContext,
     name: Value,
@@ -26160,14 +26226,28 @@ pub(crate) fn craton_alloc_system_logger(
         {
             Ok(id) => id,
             Err(err) => {
+                // Strict mode refused the fabrication. Build the real class
+                // instead — see this function's doc comment for what refusing
+                // alone cost. The pin is still held here on purpose: `name` is
+                // about to be handed to a real `<init>` that allocates, and the
+                // young generation can move underneath it.
+                let name_now = match name_pin {
+                    Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+                    None => Value::Object(None),
+                };
+                let real = real_jdk_system_logger(ctx, name_now);
                 // Release the pin taken above before unwinding: an early
                 // return past `unpin_native_roots` leaks the frame.
                 if let Some((handle, _)) = name_pin {
                     ctx.unpin_native_roots(handle);
                 }
-                // Catchable `NoClassDefFoundError`, not the uncatchable
-                // `InternalError` the `?` conversion would give.
-                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+                return match real? {
+                    Some(logger) => Ok(logger),
+                    // No real class to stand in, so the refusal stands. A
+                    // catchable `NoClassDefFoundError`, not the uncatchable
+                    // `InternalError` the `?` conversion would give.
+                    None => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+                };
             }
         },
     };
