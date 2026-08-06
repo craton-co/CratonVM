@@ -23370,6 +23370,124 @@ mod tests {
         assert!(result.is_some());
     }
 
+    /// **Every publication advances `jit_cache_generation()`** — first-time
+    /// insertion, replacement, and OSR body alike.
+    ///
+    /// This is the load-bearing step of the recycled-`JitSiteKey` argument, and
+    /// until now it rested on a comment plus four hand-written `fetch_add`
+    /// calls. See
+    /// `docs/internal/site-alias-diagnostic-and-the-recycled-jitsitekey-question-CLOSED-20260806.md`.
+    ///
+    /// The chain it closes: a `JitInvokeInfo` box is owned by its
+    /// `CompiledMethod` (`_jit_invoke_infos`), so its ADDRESS — which is what a
+    /// `JitSiteKey` is — is freed and re-issued. Every per-thread memo keyed on
+    /// one is cleared by `flush_raw_entry_dispatch_caches`, which fires on a
+    /// generation change and runs before any memo probe. That only closes the
+    /// hole because a recycled address cannot become *dispatchable* without a
+    /// publication: compiled code referencing the new `JitInvokeInfo` has to be
+    /// published before it can run. So if a publication could land without
+    /// advancing the generation, the flush would not fire and one call site
+    /// would serve another's dispatch — the defect `383e7f5cf` fixed, in a new
+    /// disguise.
+    ///
+    /// **Non-vacuous:** each step asserts the body is actually REACHABLE
+    /// afterwards, not just that a counter moved. A `put` that silently
+    /// declined (stale publication epoch, `prepare_for_publication` refusal)
+    /// publishes nothing and correctly does not bump — so a test that only
+    /// watched the counter could pass while proving nothing about publication.
+    ///
+    /// **Strictly greater, not `+ 1`:** `JIT_CACHE_GENERATION` is a process
+    /// global and the test binary runs tests in parallel, so a concurrent
+    /// publication in another test may also bump it. `>` is the assertion that
+    /// is both true and stable; `== before + 1` would be a flake.
+    ///
+    /// **Verified as a negative control.** Deleting the `fetch_add` at the
+    /// first-time publication site turns this red on the first arm, with the
+    /// message it was written to produce — so it is pinning the bump, not
+    /// riding on a counter something else moves.
+    #[test]
+    fn every_publication_advances_the_jit_cache_generation() {
+        fn ret_body(osr: bool) -> CompiledMethod {
+            let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+            buf.emit(&[0xC3]); // RET
+            let mut cm = CompiledMethod::new(buf);
+            cm.compiled_via_osr = osr;
+            cm
+        }
+
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("GenerationClass");
+        let method: Arc<str> = Arc::from("hot");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+
+        // 1. First-time insertion. The comment at the bump site calls this out
+        //    specifically ("bump on EVERY publication, not just replacements"),
+        //    because it is the one a replacement-only bump would miss.
+        let before = jit_cache_generation();
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(false),
+        );
+        let first = cache
+            .get(&class, &method, &desc, cid)
+            .expect("first publication must be reachable");
+        assert!(
+            jit_cache_generation() > before,
+            "a first-time publication did not advance the JIT cache generation; \
+             a recycled JitInvokeInfo address could then inherit the previous \
+             site's memoized dispatch"
+        );
+
+        // 2. Replacement. The superseded artifact's `JitInvokeInfo` boxes are
+        //    what get freed and re-issued, so this is the case the whole
+        //    argument is about.
+        let before = jit_cache_generation();
+        let first_entry = first.entry_ptr();
+        drop(first);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(false),
+        );
+        let replaced = cache
+            .get(&class, &method, &desc, cid)
+            .expect("replacement must be reachable");
+        assert_ne!(
+            replaced.entry_ptr(),
+            first_entry,
+            "the second put must have superseded the first, or this arm proves nothing"
+        );
+        assert!(
+            jit_cache_generation() > before,
+            "a replacement publication did not advance the JIT cache generation"
+        );
+
+        // 3. OSR body. A separate entry point with its own bump; it publishes
+        //    alongside the method-entry body rather than superseding it.
+        let before = jit_cache_generation();
+        cache.put_osr(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            ret_body(true),
+        );
+        assert!(
+            cache.get_osr(&class, &method, &desc, cid).is_some(),
+            "OSR publication must be reachable"
+        );
+        assert!(
+            jit_cache_generation() > before,
+            "an OSR publication did not advance the JIT cache generation"
+        );
+    }
+
     #[test]
     fn test_jit_cache_osr_and_method_entry_bodies_coexist() {
         let mut cache = JitCache::new();
