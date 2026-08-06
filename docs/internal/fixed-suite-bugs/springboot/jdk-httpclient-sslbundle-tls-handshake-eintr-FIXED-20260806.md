@@ -131,7 +131,15 @@ built in, and it produces the identical evidence on either host:
 | knob | effect |
 |---|---|
 | `CRATONVM_DBG_EINTR_INJECT=<n>` | synthesise an `EINTR` on every *n*-th operation through `eintr` (floor of 2) |
-| `CRATONVM_DBG_EINTR_NO_RETRY=1` | do not absorb it — i.e. behave exactly as the code did before this branch |
+| `CRATONVM_DBG_EINTR_NO_RETRY=1` | do not absorb it |
+
+`NO_RETRY` governs every retry *this branch* introduced — `retry_eintr`,
+`EintrIo`, `EintrStream`, which is the whole handshake family. It does not
+reach the hand-written arms that predate it (`net::read0`/`write0`/
+`net_poll_raw`, `socket_channel::try_read_nb`, `read_eof_tolerant`) or
+`socket_channel`'s new TCP accept arm, all of which retry unconditionally. So
+it is the pre-branch behaviour *of the handshake*, which is what this page is
+about, not of the whole crate.
 
 One binary, all arms, **positive control first**. Windows box,
 `cratonvm-tlseintr-20260806.exe` (release, `b7706a982`), `-jit`,

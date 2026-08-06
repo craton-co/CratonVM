@@ -55,11 +55,18 @@
 //!
 //! * `CRATONVM_DBG_EINTR_INJECT=<n>` — synthesise an `EINTR` on every *n*-th
 //!   operation that passes through this module.
-//! * `CRATONVM_DBG_EINTR_NO_RETRY=1` — do not retry, i.e. behave exactly as the
-//!   code did before this module existed.
+//! * `CRATONVM_DBG_EINTR_NO_RETRY=1` — do not retry.
 //!
 //! One binary, two arms: `INJECT` alone must stay green, `INJECT` plus
 //! `NO_RETRY` must reproduce the reported `IOException`.
+//!
+//! `NO_RETRY` governs [`retry_eintr`], [`EintrIo`] and [`EintrStream`] — i.e.
+//! every retry this module introduced, which is the whole TLS handshake family.
+//! It does **not** reach the hand-written EINTR arms that predate it
+//! (`net::read0`/`write0`/`net_poll_raw`, `socket_channel::try_read_nb`,
+//! `http_url_connection::read_eof_tolerant`) or `socket_channel`'s TCP accept
+//! arm, all of which retry unconditionally. So on Linux the `NO_RETRY` arm is
+//! the pre-branch behaviour *of the handshake*, not of the whole crate.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
