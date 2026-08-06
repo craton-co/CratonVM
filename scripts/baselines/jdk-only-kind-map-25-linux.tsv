@@ -7,9 +7,9 @@
 # jdk_version: 25.0.3
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11876
+# rows: 11897
 # unchosen: 0
-# note: The ten fakes --jdk-only kept because a second file registered the same triple under a Bridge scope: Function$Identity.apply and UnaryOperator.identity (the copies L7 item 4 did not reach), five CountDownLatch, two CyclicBarrier, InputStream.transferTo. Strict census A/B: 10 triples refused, 0 admitted, 0 effective-kind changes in --real-jdk.
+# note: Re-freeze on the dev merge (owns_slot column, L10, and the springboot/tls landings). Ambient-category work: current_category is an Option and scoped, nine unscoped registrars state SyntheticStub, and 58 triples --jdk-only was admitting by registration order are refused.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -1520,7 +1520,7 @@ java/io/UnixFileSystem	getSpace0	(Ljava/io/File;I)J	0	bridge	1	1
 java/io/UnixFileSystem	initIDs	()V	0	bridge	1	1
 java/io/UnixFileSystem	initIDs	()V	1	bridge	1	1
 java/io/UnixFileSystem	list	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	0	1
-java/io/UnixFileSystem	list0	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	0	1
+java/io/UnixFileSystem	list0	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	1	1
 java/io/UnixFileSystem	listRoots0	()I	0	bridge	0	1
 java/io/UnixFileSystem	rename0	(Ljava/io/File;Ljava/io/File;)Z	0	bridge	1	1
 java/io/UnixFileSystem	setLastModifiedTime	(Ljava/io/File;J)Z	0	bridge	0	1
@@ -1576,7 +1576,7 @@ java/io/WinNTFileSystem	getSpace0	(Ljava/io/File;I)J	0	bridge	1	1
 java/io/WinNTFileSystem	initIDs	()V	0	bridge	1	1
 java/io/WinNTFileSystem	initIDs	()V	1	bridge	1	1
 java/io/WinNTFileSystem	list	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	0	1
-java/io/WinNTFileSystem	list0	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	0	1
+java/io/WinNTFileSystem	list0	(Ljava/io/File;)[Ljava/lang/String;	0	bridge	1	1
 java/io/WinNTFileSystem	listRoots0	()I	0	bridge	1	1
 java/io/WinNTFileSystem	rename0	(Ljava/io/File;Ljava/io/File;)Z	0	bridge	1	1
 java/io/WinNTFileSystem	setLastModifiedTime	(Ljava/io/File;J)Z	0	bridge	0	1
@@ -5063,7 +5063,6 @@ java/nio/ByteBufferAsCharBufferB	get	()C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	get	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	hasArray	()Z	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-java/nio/ByteBufferAsCharBufferB	subSequence	(II)Ljava/nio/CharBuffer;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	toString	()Ljava/lang/String;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferB	toString	(II)Ljava/lang/String;	0	bridge	0	1
 java/nio/ByteBufferAsCharBufferL	charAt	(I)C	0	intrinsic	0	1
@@ -5071,7 +5070,6 @@ java/nio/ByteBufferAsCharBufferL	get	()C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	get	(I)C	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	hasArray	()Z	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
-java/nio/ByteBufferAsCharBufferL	subSequence	(II)Ljava/nio/CharBuffer;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	toString	()Ljava/lang/String;	0	intrinsic	0	1
 java/nio/ByteBufferAsCharBufferL	toString	(II)Ljava/lang/String;	0	bridge	0	1
 java/nio/ByteBufferAsCharBufferRB	order	()Ljava/nio/ByteOrder;	0	bridge	0	1
@@ -7691,6 +7689,29 @@ java/util/concurrent/ConcurrentHashMap	size	()I	0	bridge	0	1
 java/util/concurrent/ConcurrentHashMap	toString	()Ljava/lang/String;	0	bridge	0	1
 java/util/concurrent/ConcurrentHashMap	values	()Ljava/util/Collection;	0	bridge	0	1
 java/util/concurrent/ConcurrentHashMap	writeObject	(Ljava/io/ObjectOutputStream;)V	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	add	(Ljava/lang/Object;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	addAll	(Ljava/util/Collection;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	clear	()V	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	contains	(Ljava/lang/Object;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	containsAll	(Ljava/util/Collection;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	forEach	(Ljava/util/function/Consumer;)V	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	getMap	()Ljava/util/concurrent/ConcurrentHashMap;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	getMappedValue	()Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	hashCode	()I	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	isEmpty	()Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	iterator	()Ljava/util/Iterator;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	remove	(Ljava/lang/Object;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	removeAll	(Ljava/util/Collection;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	removeIf	(Ljava/util/function/Predicate;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	retainAll	(Ljava/util/Collection;)Z	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	size	()I	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	spliterator	()Ljava/util/Spliterator;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	stream	()Ljava/util/stream/Stream;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	toArray	()[Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	toArray	(Ljava/util/function/IntFunction;)[Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	toArray	([Ljava/lang/Object;)[Ljava/lang/Object;	0	bridge	0	1
+java/util/concurrent/ConcurrentHashMap$KeySetView	toString	()Ljava/lang/String;	0	bridge	0	1
 java/util/concurrent/ConcurrentMap	containsKey	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/util/concurrent/ConcurrentMap	get	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 java/util/concurrent/ConcurrentMap	put	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
@@ -7792,14 +7813,6 @@ java/util/concurrent/ExecutorService	shutdownNow	()Ljava/util/List;	0	bridge	0	1
 java/util/concurrent/ExecutorService	submit	(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;	0	bridge	0	1
 java/util/concurrent/ExecutorService	submit	(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;	0	bridge	0	1
 java/util/concurrent/ExecutorService	submit	(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;	0	bridge	0	1
-java/util/concurrent/Executors	newCachedThreadPool	()Ljava/util/concurrent/ExecutorService;	0	bridge	0	1
-java/util/concurrent/Executors	newCachedThreadPool	()Ljava/util/concurrent/ExecutorService;	1	intrinsic	0	1
-java/util/concurrent/Executors	newCachedThreadPool	(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;	0	bridge	0	1
-java/util/concurrent/Executors	newCachedThreadPool	(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;	1	intrinsic	0	1
-java/util/concurrent/Executors	newFixedThreadPool	(I)Ljava/util/concurrent/ExecutorService;	0	bridge	0	1
-java/util/concurrent/Executors	newFixedThreadPool	(I)Ljava/util/concurrent/ExecutorService;	1	intrinsic	0	1
-java/util/concurrent/Executors	newSingleThreadExecutor	()Ljava/util/concurrent/ExecutorService;	0	bridge	0	1
-java/util/concurrent/Executors	newSingleThreadExecutor	()Ljava/util/concurrent/ExecutorService;	1	intrinsic	0	1
 java/util/concurrent/Flow$Subscriber	onComplete	()V	0	bridge	0	1
 java/util/concurrent/Flow$Subscriber	onError	(Ljava/lang/Throwable;)V	0	bridge	0	1
 java/util/concurrent/Flow$Subscriber	onNext	(Ljava/lang/Object;)V	0	bridge	0	1
@@ -11308,6 +11321,8 @@ sun/nio/ch/FileChannelImpl	maxDirectTransferSize0	()I	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	open	(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	open	(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	position0	(Ljava/io/FileDescriptor;J)J	0	bridge	0	1
+sun/nio/ch/FileChannelImpl	transferFrom0	(IIJJ)J	0	bridge	0	1
+sun/nio/ch/FileChannelImpl	transferFrom0	(IIJJZ)J	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	transferTo0	(IJJI)J	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	transferTo0	(IJJIZ)J	0	bridge	0	1
 sun/nio/ch/FileChannelImpl	truncate	(J)Ljava/nio/channels/FileChannel;	0	bridge	0	1
@@ -11334,6 +11349,8 @@ sun/nio/ch/FileDispatcherImpl	release0	(Ljava/io/FileDescriptor;JJ)V	0	bridge	1	
 sun/nio/ch/FileDispatcherImpl	seek0	(Ljava/io/FileDescriptor;J)J	0	bridge	1	1
 sun/nio/ch/FileDispatcherImpl	setDirect0	(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I	0	bridge	1	1
 sun/nio/ch/FileDispatcherImpl	size0	(Ljava/io/FileDescriptor;)J	0	bridge	1	1
+sun/nio/ch/FileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJ)J	0	bridge	0	1
+sun/nio/ch/FileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJZ)J	0	bridge	1	1
 sun/nio/ch/FileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J	0	bridge	0	1
 sun/nio/ch/FileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J	0	bridge	1	1
 sun/nio/ch/FileDispatcherImpl	truncate0	(Ljava/io/FileDescriptor;J)I	0	bridge	1	1
@@ -11573,6 +11590,8 @@ sun/nio/ch/UnixFileDispatcherImpl	seek0	(Ljava/io/FileDescriptor;J)J	0	bridge	1	
 sun/nio/ch/UnixFileDispatcherImpl	setDirect0	(Ljava/io/FileDescriptor;)I	0	bridge	1	1
 sun/nio/ch/UnixFileDispatcherImpl	setDirect0	(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I	0	bridge	0	1
 sun/nio/ch/UnixFileDispatcherImpl	size0	(Ljava/io/FileDescriptor;)J	0	bridge	1	1
+sun/nio/ch/UnixFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJ)J	0	bridge	0	1
+sun/nio/ch/UnixFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJZ)J	0	bridge	0	1
 sun/nio/ch/UnixFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J	0	bridge	0	1
 sun/nio/ch/UnixFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J	0	bridge	0	1
 sun/nio/ch/UnixFileDispatcherImpl	truncate0	(Ljava/io/FileDescriptor;J)I	0	bridge	1	1
@@ -11610,6 +11629,8 @@ sun/nio/ch/WindowsFileDispatcherImpl	release0	(Ljava/io/FileDescriptor;JJ)V	0	br
 sun/nio/ch/WindowsFileDispatcherImpl	seek0	(Ljava/io/FileDescriptor;J)J	0	bridge	0	1
 sun/nio/ch/WindowsFileDispatcherImpl	setDirect0	(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I	0	bridge	0	1
 sun/nio/ch/WindowsFileDispatcherImpl	size0	(Ljava/io/FileDescriptor;)J	0	bridge	0	1
+sun/nio/ch/WindowsFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJ)J	0	bridge	0	1
+sun/nio/ch/WindowsFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJZ)J	0	bridge	0	1
 sun/nio/ch/WindowsFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J	0	bridge	0	1
 sun/nio/ch/WindowsFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J	0	bridge	0	1
 sun/nio/ch/WindowsFileDispatcherImpl	truncate0	(Ljava/io/FileDescriptor;J)I	0	bridge	0	1

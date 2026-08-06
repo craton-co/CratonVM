@@ -26174,13 +26174,79 @@ fn system_logger_emit(
     );
 }
 
+/// The real `java.base` class the strict-mode fallback constructs instead of
+/// fabricating [`CRATON_SYSTEM_LOGGER_CLASS`].
+///
+/// Chosen by the rule the iterator/collector fallbacks established: a real
+/// class is only usable as a stand-in when **its fields are declared and
+/// writable, so filling it is construction rather than fabrication**.
+/// `SimpleConsoleLogger(String name, boolean usePlatformLevel)` is a public
+/// constructor's worth of state — `name`, `usePlatformLevel`, and a `level`
+/// that defaults to INFO — and it is the class `DefaultLoggerFinder` itself
+/// hands out when no `LoggerFinder` service and no `java.logging` module are
+/// available, which is exactly the situation a strict CratonVM boot is in.
+///
+/// Measured under `--jdk-only` before it was wired in (`probes/LoggerRoutes`,
+/// Azure Linux, JDK 25): constructing it reflectively already worked, and
+/// `getName()`, `isLoggable(INFO)=true` and `isLoggable(DEBUG)=false` matched
+/// both HotSpot and the shim this replaces. So the object runs its OWN
+/// bytecode for the whole `System.Logger` surface — the interface-name
+/// registrations cannot shadow a concrete implementation, which is the same
+/// property the block comment above `register_system_logger_methods` relies on.
+///
+/// It is NOT what HotSpot's `System.getLogger` returns when `java.logging` is
+/// resolved (that is `LoggingProviderImpl$JULWrapper`). Reaching THAT needs the
+/// `LoggerFinderLoader` → `ServiceLoader` chain, which
+/// `Reflection.getCallerClass()` returning null on CratonVM boot frames is
+/// still enough to break — see the block comment above.
+const REAL_SYSTEM_LOGGER_CLASS: &str = "jdk/internal/logger/SimpleConsoleLogger";
+
+/// Build a real `System.Logger` for `name`, or `None` if this image has no
+/// [`REAL_SYSTEM_LOGGER_CLASS`].
+///
+/// A construction that FAILS is propagated rather than folded into `None`: a
+/// half-run `<init>` can leave a pending Java exception, and replacing it with
+/// the original fabrication refusal would report the wrong cause.
+fn real_jdk_system_logger(
+    ctx: &mut dyn NativeContext,
+    name: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if ctx.class_id_by_name(REAL_SYSTEM_LOGGER_CLASS).is_none()
+        && ctx.ensure_class_initialized(REAL_SYSTEM_LOGGER_CLASS).is_err()
+    {
+        return Ok(None);
+    }
+    // `usePlatformLevel = false`: the CratonVM shim published at INFO with no
+    // logging configuration, `SimpleConsoleLogger`'s `System.Logger` default is
+    // INFO too, and `true` would instead read `sun.util.logging`'s platform
+    // level. Keeping INFO is what makes this a drop-in.
+    match ctx.new_object_initialized(
+        REAL_SYSTEM_LOGGER_CLASS,
+        "(Ljava/lang/String;Z)V",
+        &[name, Value::Int(0)],
+    )? {
+        Some(Value::Object(Some(logger))) => Ok(Some(logger)),
+        _ => Ok(None),
+    }
+}
+
 /// Allocate a `System.Logger` receiver named `name`.
 ///
-/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7). This stands in for
-/// whatever `System.LoggerFinder` would have produced from real bytecode, so
-/// under `--jdk-only` the fabrication is refused and the refusal propagates as
-/// a `ClassNotFoundException` naming `cratonvm/internal/SystemLogger` — rather
-/// than being recorded as a violation and then performed anyway.
+/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under `--jdk-only` the
+/// fabrication of [`CRATON_SYSTEM_LOGGER_CLASS`] is refused rather than being
+/// recorded as a violation and then performed anyway.
+///
+/// **The refusal now has somewhere to land (2026-08-06).** Refusing alone was
+/// measured, and it took out `java.io.ObjectInputFilter$Config.<clinit>` — which
+/// calls `System.getLogger("java.io.serialization")` unconditionally — and with
+/// it *every* `ObjectInputStream` construction, i.e. all of deserialization.
+/// That was the last of the five classes in
+/// `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md`, the
+/// `serialization` row, and it is the reason `RSerial` and
+/// `JdkOnlyBreadthProbe/strict/serialization` stayed red after the other four
+/// were fixed. §1.1 forbids substituting a FAKE for the refused class; it does
+/// not forbid — it requires — handing back the real thing, so the fallback
+/// constructs [`REAL_SYSTEM_LOGGER_CLASS`].
 pub(crate) fn craton_alloc_system_logger(
     ctx: &mut dyn NativeContext,
     name: Value,
@@ -26197,14 +26263,28 @@ pub(crate) fn craton_alloc_system_logger(
         {
             Ok(id) => id,
             Err(err) => {
+                // Strict mode refused the fabrication. Build the real class
+                // instead — see this function's doc comment for what refusing
+                // alone cost. The pin is still held here on purpose: `name` is
+                // about to be handed to a real `<init>` that allocates, and the
+                // young generation can move underneath it.
+                let name_now = match name_pin {
+                    Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+                    None => Value::Object(None),
+                };
+                let real = real_jdk_system_logger(ctx, name_now);
                 // Release the pin taken above before unwinding: an early
                 // return past `unpin_native_roots` leaks the frame.
                 if let Some((handle, _)) = name_pin {
                     ctx.unpin_native_roots(handle);
                 }
-                // Catchable `NoClassDefFoundError`, not the uncatchable
-                // `InternalError` the `?` conversion would give.
-                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
+                return match real? {
+                    Some(logger) => Ok(logger),
+                    // No real class to stand in, so the refusal stands. A
+                    // catchable `NoClassDefFoundError`, not the uncatchable
+                    // `InternalError` the `?` conversion would give.
+                    None => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+                };
             }
         },
     };
@@ -32391,10 +32471,26 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     _ => 0,
                 },
             };
-            // address / byte_offset — the JDK uses `bb.offset()` + 2*index.
-            let bb_off = match ctx.get_field_by_name(bb_obj, "offset") {
-                Value::Int(v) => v,
-                _ => 0,
+            // Byte index of the view's element 0 inside `bb.hb`.
+            //
+            // The JDK's own answer is the view's `address`: every accessor on
+            // `ByteBufferAsCharBuffer*` computes `(i << 1) + address`, and the
+            // ctor seeds `address` to the SOURCE buffer's address plus its
+            // position at the moment the view was made. So the view's element 0
+            // is at `address - ARRAY_BYTE_BASE_OFFSET` bytes into `hb`, which
+            // folds in both the source's array-base `offset` AND its position.
+            //
+            // Reading `bb.offset` instead — what this did — drops the source's
+            // position: `bb.position(4).asCharBuffer().get(0)` decoded byte 0
+            // rather than byte 4. It also goes stale, because the source's
+            // position moves after the view is taken and the view must not
+            // follow it.
+            let bb_off = match ctx.get_field_by_name(this, "address") {
+                Value::Long(addr) if addr >= 16 => (addr - 16) as i32,
+                _ => match ctx.get_field_by_name(bb_obj, "offset") {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
             };
             // Class name suffix tells us endianness: `B` = big-endian,
             // `L` = little-endian.
@@ -32498,84 +32594,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             registry.register(bbacb, "hasArray", "()Z", |_ctx, _args| {
                 Ok(Some(Value::Int(0)))
             });
-            // subSequence(II) — return a fresh CharBuffer with copied chars.
-            // The JDK returns a slice of the same BBACB type, but copying
-            // into a flat char[] backed CharBuffer is sufficient for
-            // `subSequence(...).toString()` and `subSequence(...).charAt(i)`.
-            registry.register(
-                bbacb,
-                "subSequence",
-                "(II)Ljava/nio/CharBuffer;",
-                |ctx, args| {
-                    let this = match args.first() {
-                        Some(Value::Object(Some(o))) => *o,
-                        _ => {
-                            return Err(RuntimeError::NullPointerException {
-                                message: Some("ByteBufferAsCharBuffer.subSequence on null".into()),
-                            }
-                            .into())
-                        }
-                    };
-                    let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-                    let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-                    let (byte_arr, pos, lim, bb_off, big_endian) = bbacb_read_underlying_bytes(
-                        ctx, this,
-                    )
-                    .ok_or(RuntimeError::IllegalStateException {
-                        message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
-                    })?;
-                    // `ByteBufferAsCharBuffer.subSequence` opens with
-                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
-                    // `lim` was read and then explicitly discarded here, so the
-                    // range was never checked: `subSequence(0, 99)` on a
-                    // six-char view decoded 93 code units from past the end of
-                    // the underlying `byte[]` and handed them back as content.
-                    // Same defect, same day, as `CharBuffer.subSequence` —
-                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
-                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
-                        return Err(RuntimeError::ioobe(
-                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
-                                i64::from(start),
-                                i64::from(end),
-                                i64::from(lim.saturating_sub(pos)),
-                            ),
-                        )
-                        .into());
-                    }
-                    let n = (end - start).max(0) as usize;
-                    let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
-                    for i in 0..n {
-                        let real = pos + start + i as i32;
-                        let bi = (bb_off + 2 * real) as usize;
-                        let hi = ctx.get_array_element(byte_arr, bi).as_int().unwrap_or(0) & 0xFF;
-                        let lo = ctx
-                            .get_array_element(byte_arr, bi + 1)
-                            .as_int()
-                            .unwrap_or(0)
-                            & 0xFF;
-                        let ch = if big_endian {
-                            (hi << 8) | lo
-                        } else {
-                            (lo << 8) | hi
-                        };
-                        ctx.set_array_element(chars_arr, i, Value::Int(ch));
-                    }
-                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
-                    ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars_arr)));
-                    ctx.set_field_by_name(buf, "offset", Value::Int(0));
-                    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-                    ctx.set_field_by_name(buf, "position", Value::Int(0));
-                    ctx.set_field_by_name(buf, "limit", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "capacity", Value::Int(n as i32));
-                    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-                    ctx.set_field(buf, 0, Value::Object(Some(chars_arr)));
-                    ctx.set_field(buf, 1, Value::Int(0));
-                    ctx.set_field(buf, 2, Value::Int(n as i32));
-                    ctx.set_field(buf, 3, Value::Int(n as i32));
-                    ctx.set_field(buf, 4, Value::Int(-1));
-                    Ok(Some(Value::Object(Some(buf))))
-                },
-            );
+            // subSequence(II) -- DELETED, deliberately.
+            //
+            // This used to return a fresh char[]-backed buffer stamped with
+            // the ABSTRACT `java/nio/CharBuffer`, on the reasoning that a
+            // copy is "sufficient for `subSequence(...).toString()`". It is
+            // not: the JDK returns a slice of the same BBACB type over the
+            // same bytes, so a copy loses write-through, reports
+            // `hasArray() == true`, and -- the part that actually broke --
+            // leaves every method with no native on the abstract class
+            // throwing `AbstractMethodError`.
+            //
+            // Now that `asCharBuffer` hands back a real
+            // `ByteBufferAsCharBuffer{B,L}` (see `s2_bb_as_char_buffer`),
+            // the JDK's own `subSequence` body is present and correct,
+            // including the `Objects.checkFromToIndex` bounds check this
+            // override was originally written to add. Leaving the override
+            // in place would shadow it and re-introduce all three
+            // divergences.
             // toString() — read all chars between pos..lim.
             registry.register(bbacb, "toString", "()Ljava/lang/String;", |ctx, args| {
                 let this = match args.first() {
@@ -38500,6 +38536,199 @@ fn reflect_array_index(
     Ok(idx as usize)
 }
 
+/// JLS §5.1.2 widening primitive conversion, as `java.lang.reflect.Array`
+/// applies it: `true` when a value of `from` may be read as / stored as `to`.
+///
+/// Both directions of the API use this one table. `Array.getX(a, i)` asks
+/// `widens_to(element_type, X)` -- reading an `int[]` as a `long` is fine, the
+/// reverse is not -- and `Array.setX(a, i, v)` asks `widens_to(X, element_type)`,
+/// which is the same relation with the arguments swapped. Getting the direction
+/// wrong is invisible for the eight same-type cells and wrong for every other
+/// one, so the two call sites below name their direction explicitly.
+///
+/// `boolean` converts to nothing and from nothing, and `char` is the usual
+/// asymmetry: `char` widens to `int` but `short` does not widen to `char`,
+/// because neither of those two ranges contains the other. Measured cell by
+/// cell in `probes/ReflectArrayContractProbe`.
+fn widens_to(from: cratonvm_types::ArrayElementType, to: cratonvm_types::ArrayElementType) -> bool {
+    use cratonvm_types::ArrayElementType as T;
+    if from == to {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (T::Byte, T::Short | T::Int | T::Long | T::Float | T::Double)
+            | (T::Short, T::Int | T::Long | T::Float | T::Double)
+            | (T::Char, T::Int | T::Long | T::Float | T::Double)
+            | (T::Int, T::Long | T::Float | T::Double)
+            | (T::Long, T::Float | T::Double)
+            | (T::Float, T::Double)
+    )
+}
+
+/// The element type of an array a PRIMITIVE accessor was handed, or the
+/// `IllegalArgumentException` HotSpot throws when it is a reference array.
+///
+/// This check runs BEFORE the bounds check, which is observable:
+/// `Array.getInt(new Object[4], 9)` is an `IllegalArgumentException` on HotSpot
+/// while `Array.getInt(new long[4], 9)` is an `ArrayIndexOutOfBoundsException`.
+/// The widening check, in contrast, runs AFTER bounds. Three checks, three
+/// positions; `probes/ReflectArrayContractProbe`'s "bounds vs type" rows pin
+/// each one.
+fn reflect_array_primitive_elem(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+) -> Result<cratonvm_types::ArrayElementType, MethodCallFailed> {
+    let elem = ctx.heap_element_type_of(arr);
+    if elem == cratonvm_types::ArrayElementType::Reference {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Argument is not an array of primitive type".to_string(),
+        }
+        .into());
+    }
+    Ok(elem)
+}
+
+/// HotSpot's wording for a conversion the widening table refuses.
+fn reflect_array_type_mismatch() -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: "argument type mismatch".to_string(),
+    }
+    .into()
+}
+
+/// Reinterpret a primitive element as `want`, which `widens_to` has already
+/// allowed. The `Value` shape follows the Java RETURN type, not the array's:
+/// `getLong` on an `int[]` must hand back a `Value::Long`, or the caller reads
+/// half a slot.
+fn reflect_widen_value(
+    v: Value,
+    from: cratonvm_types::ArrayElementType,
+    want: cratonvm_types::ArrayElementType,
+) -> Value {
+    use cratonvm_types::ArrayElementType as T;
+    // Every source that can reach a wider type is integral except f32->f64.
+    let as_i64 = match v {
+        Value::Int(i) => i64::from(i),
+        Value::Long(l) => l,
+        Value::Float(f) => f as i64,
+        Value::Double(d) => d as i64,
+        _ => 0,
+    };
+    let as_f64 = match v {
+        Value::Int(i) => f64::from(i),
+        Value::Long(l) => l as f64,
+        Value::Float(f) => f64::from(f),
+        Value::Double(d) => d,
+        _ => 0.0,
+    };
+    match want {
+        // Same-width integral reads keep the stored bits; `from == want` here
+        // in every case the table allows.
+        T::Boolean | T::Byte | T::Char | T::Short | T::Int => Value::Int(as_i64 as i32),
+        T::Long => Value::Long(as_i64),
+        T::Float => Value::Float(if from == T::Float {
+            match v {
+                Value::Float(f) => f,
+                _ => as_f64 as f32,
+            }
+        } else {
+            as_f64 as f32
+        }),
+        T::Double => Value::Double(as_f64),
+        T::Reference => v,
+    }
+}
+
+/// `Array.getBoolean/getByte/getChar/getShort/getInt/getLong/getFloat/getDouble`.
+///
+/// One body per requested type, bound at registration, because the requested
+/// type IS the contract: five of these used to share `native_array_get_int`,
+/// which returned the raw element whatever the array held, so
+/// `Array.getInt(new long[4], 0)` answered `0` instead of throwing.
+fn reflect_array_get_primitive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want: cratonvm_types::ArrayElementType,
+) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
+    let elem = reflect_array_primitive_elem(&*ctx, arr)?;
+    let idx = reflect_array_index(&*ctx, arr, args)?;
+    if !widens_to(elem, want) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let raw = ctx.get_array_element(arr, idx);
+    Ok(Some(reflect_widen_value(raw, elem, want)))
+}
+
+/// `Array.setBoolean/setByte/setChar/setShort/setInt/setLong/setFloat/setDouble`.
+///
+/// The widening direction is the mirror of the getter's: a `setInt` may store
+/// into a `long[]` but not into a `short[]`.
+fn reflect_array_set_primitive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    have: cratonvm_types::ArrayElementType,
+) -> MethodCallResult {
+    let arr = reflect_array_arg(ctx, args)?;
+    let elem = reflect_array_primitive_elem(&*ctx, arr)?;
+    let idx = reflect_array_index(&*ctx, arr, args)?;
+    if !widens_to(have, elem) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let raw = args.get(2).copied().unwrap_or(Value::Int(0));
+    ctx.set_array_element(arr, idx, reflect_widen_value(raw, have, elem));
+    Ok(None)
+}
+
+/// The primitive a wrapper class boxes, or `None` for anything else.
+fn reflect_boxed_primitive(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+) -> Option<cratonvm_types::ArrayElementType> {
+    use cratonvm_types::ArrayElementType as T;
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
+    Some(match class_name.as_str() {
+        "java/lang/Boolean" => T::Boolean,
+        "java/lang/Byte" => T::Byte,
+        "java/lang/Character" => T::Char,
+        "java/lang/Short" => T::Short,
+        "java/lang/Integer" => T::Int,
+        "java/lang/Long" => T::Long,
+        "java/lang/Float" => T::Float,
+        "java/lang/Double" => T::Double,
+        _ => return None,
+    })
+}
+
+/// Whether `value` may be stored into a reference array whose component class
+/// is `component`.
+///
+/// `null` is always storable; `Object[]` takes everything. Anything this cannot
+/// prove assignable is refused with HotSpot's "array element type mismatch" --
+/// a FOURTH distinct `IllegalArgumentException` wording, separate from the
+/// "argument type mismatch" a primitive array uses.
+fn reflect_array_element_assignable(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    value: ObjectRef,
+) -> bool {
+    let arr_class = ctx.class_id_of_object(arr);
+    // `array_component_class_id` is the direct answer; some array objects carry
+    // the component class as their own class id instead (primitive arrays are
+    // allocated with a synthetic id), so fall back rather than refusing.
+    let component = ctx
+        .array_component_class_id(arr_class)
+        .unwrap_or(arr_class);
+    if let Some(object_class) = ctx.class_id_by_name("java/lang/Object") {
+        if component == object_class {
+            return true;
+        }
+    }
+    let value_class = ctx.class_id_of_object(value);
+    value_class == component || ctx.is_subclass(value_class, component)
+}
+
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = reflect_array_arg(ctx, args)?;
     Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
@@ -38672,15 +38901,68 @@ fn unbox_for_array_set(
 }
 
 fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType as T;
     let arr = reflect_array_arg(ctx, args)?;
+    // Bounds BEFORE the value check: `Array.set(new int[4], 9, "x")` is an
+    // `ArrayIndexOutOfBoundsException` on HotSpot even though the value is also
+    // wrong. (The primitive GETTERS order these the other way round; see
+    // `reflect_array_primitive_elem`.)
     let idx = reflect_array_index(&*ctx, arr, args)?;
     let raw = args.get(2).cloned().unwrap_or(Value::Object(None));
-    // If the target array is a primitive array, unbox the wrapper Object
-    // into the matching primitive Value before writing.  For reference
-    // arrays the value is passed through as-is.
     let elem = ctx.heap_element_type_of(arr);
-    let val = unbox_for_array_set(ctx, elem, raw)?;
-    ctx.set_array_element(arr, idx, val);
+    if elem == T::Reference {
+        // A reference array takes null unconditionally and otherwise wants an
+        // assignable element -- and says so with its own wording.
+        if let Value::Object(Some(value)) = raw {
+            if !reflect_array_element_assignable(ctx, arr, value) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "array element type mismatch".to_string(),
+                }
+                .into());
+            }
+        }
+        ctx.set_array_element(arr, idx, raw);
+        return Ok(None);
+    }
+    // A primitive array takes a BOX whose primitive widens to the element type.
+    // `Array.set(new int[4], 0, Long.valueOf(1))` is refused even though the
+    // reverse (`set(long[], Integer)`) is fine, because the direction is the
+    // same one `setLong`/`setInt` use.
+    let value = match raw {
+        Value::Object(Some(o)) => o,
+        Value::Object(None) => {
+            // HotSpot's message here is NULL, not text -- `Array.set` reaches
+            // `IllegalArgumentException()` with no argument for a null stored
+            // into a primitive array.
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+        // Already-unboxed primitives arrive from internal callers that never
+        // went through a wrapper; keep serving them, widening-checked.
+        other => {
+            let have = match other {
+                Value::Long(_) => T::Long,
+                Value::Float(_) => T::Float,
+                Value::Double(_) => T::Double,
+                _ => T::Int,
+            };
+            if !widens_to(have, elem) {
+                return Err(reflect_array_type_mismatch());
+            }
+            ctx.set_array_element(arr, idx, reflect_widen_value(other, have, elem));
+            return Ok(None);
+        }
+    };
+    let Some(have) = reflect_boxed_primitive(&*ctx, value) else {
+        return Err(reflect_array_type_mismatch());
+    };
+    if !widens_to(have, elem) {
+        return Err(reflect_array_type_mismatch());
+    }
+    let unboxed = ctx.get_field(value, 0);
+    ctx.set_array_element(arr, idx, reflect_widen_value(unboxed, have, elem));
     Ok(None)
 }
 
@@ -38795,7 +39077,39 @@ fn array_new_instance_for_component(
     }
 }
 
+/// The three `Array.newInstance(Class, ...)` argument checks HotSpot makes
+/// before it allocates anything, measured on Temurin 25:
+///
+/// ```text
+/// Array.newInstance(null, 1)            NullPointerException
+/// Array.newInstance(void.class, 1)      IllegalArgumentException (null message)
+/// Array.newInstance(int.class, new int[0])  IllegalArgumentException (null message)
+/// ```
+///
+/// All three used to allocate and return an array instead — a null component
+/// type quietly became `Object[]`, and `void.class` did too.
+fn reflect_array_component_ok(
+    ctx: &mut dyn NativeContext,
+    mirror_arg: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    let mirror = match mirror_arg {
+        Some(Value::Object(Some(m))) => *m,
+        // A null `Class` argument. HotSpot dereferences it, so: NPE, no message.
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+    };
+    let name = crate::lang_class::mirror_class_name(&*ctx, mirror).unwrap_or_default();
+    if name == "void" {
+        // There is no `void[]`. Empty message = null `getMessage()`.
+        return Err(RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    reflect_array_component_ok(ctx, args.first())?;
     // `.max(0)` CLAMPED a negative length and returned an empty array, so
     // `Array.newInstance(int.class, -1)` handed back an `int[0]` where HotSpot
     // throws. Measured on Temurin 25: `NegativeArraySizeException` whose detail
@@ -38819,6 +39133,16 @@ fn native_array_new_instance_multi(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    reflect_array_component_ok(ctx, args.first())?;
+    // Zero dimensions is not a zero-length array, it is a bad argument.
+    if let Some(Value::Object(Some(dims))) = args.get(1) {
+        if ctx.array_length(*dims) == 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: String::new(),
+            }
+            .into());
+        }
+    }
     // `Array.newInstance(Class, int[])` must fully materialize ALL dimensions
     // with the precise nested array type (`String[2][2]` → `[[Ljava/lang/String;`).
     // The previous body read only `dims[0]` and built a one-dimensional array,

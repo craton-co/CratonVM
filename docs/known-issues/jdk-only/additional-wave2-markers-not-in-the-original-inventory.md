@@ -16,6 +16,94 @@ now publishes the policy), §12 (all three documentation gaps are closed) and
 §13 (three of five stale doc paths remain, and the count is per-occurrence not
 per-path).
 
+## 2026-08-06 status
+
+Five sections touched. Two audits produced verdicts, one section produced a
+real defect, one had a stale prescription still live in the code, and one
+record's own count was 39% low.
+
+* **§9 — a DEFECT, fixed.** The record frames this as "replace the name lists
+  with `NativeKind`", a wave-2 refactor. Underneath it was a live bug: the call
+  site open-coded `reflection && string_builder && path`, which is
+  `redefine_immune_forced_native` **minus five arms** — `jfr`,
+  `bc_crypto_math`, `stamped_lock`, the `FileHandler` group and
+  `synthetic_collection`. A redefined `java/util/HashMap` reaching it ran real
+  JDK bytecode against a CratonVM synthetic object. Collapsed onto the
+  aggregate.
+  Also: the record says "the three `redefine_immune_*` predicates". There are
+  **seven**, and this site named three of them.
+  The gate that exists to catch exactly this (`layout_immunity_is_not_open_coded`)
+  could not see it: it `include_str!`s `native_override.rs` and polices one
+  file, while the aggregators are `pub(super)` and every sibling can name an
+  arm. It now scans the siblings. That is a **fifth** staleness mode for that
+  gate, after the four its own comment lists.
+* **§5 — the retraction never reached the code.** This page retracted the
+  policy-qualified-memo prescription on 2026-08-04, but the marker in
+  `jit-api/src/lib.rs` still carried it verbatim, so the next reader would have
+  implemented it. Marker rewritten. Re-verified: the function takes three
+  `&str`, and its body is **2,230 lines** (`native_override.rs` 2406–4636), not
+  the ~1,400 the marker claimed.
+* **§3 — the unaudited half is now a verdict, not an unknown.** Both functions
+  walked arm by arm. `jit_invoke_dispatch` (`helpers.rs` 8788–9696) and
+  `jit_invoke_virtual_mic` (11377–12383) route **every** native exit through
+  `admit_jit_fast_native{,_resolved}` and count it — except
+  `matcher_native_callback_uncached` (11729), the residual already named here.
+  No new gap. §3 item 1 can be read as closed apart from that one leaf.
+* **§10 — verified NOT a live defect.** Both hard-coded `compat_native_wins =
+  true` sites are faithful to the pre-§7 behaviour they replaced:
+  `resolve_native_dispatch_wave1` uses the flag only to choose between "site
+  preferred bytecode" and the kind-based ladder, and neither site ever
+  preferred bytecode. The `NativeShadowsBytecode` observation these sites need
+  is still recorded, by the `Bridge if bytecode_available` arm. Genuinely a
+  deferred cleanup contingent on unifying the two forced-native lists, as the
+  record says — not something running wrong today.
+* **§11 — the count is stale and low.** Filed as 217 disjuncts over ~2,650
+  lines (17595–20244). Measured 2026-08-06: **302** disjuncts, 19668–22292. The
+  item is unchanged in kind, but anyone scoping the deletion from this page
+  would plan against a number 39% too small.
+
+### Second pass, same day — §2, §6, §7
+
+* **§2 — FIXED, and the record named the wrong gate.** Two gates guard the thin
+  direct-call helpers: `build_helpers` skips REGISTERING the `*_DIRECT_FN`
+  addresses under `JdkOnly`, and `direct_native_helper` refuses to BIND once
+  the latch is strict. The registration skip is not the leak — it only fails to
+  set a cell, and a `Compatible` VM's own `build_helpers` sets it. **The latch
+  is the leak**: monotone toward strict and process-wide, so the first
+  `JdkOnly` VM makes every other VM's compilation get `0`.
+  So the fix inverts: the addresses are now registered **unconditionally**
+  (they are process-invariant Rust `fn` pointers — withholding them was never
+  per-VM protection), and the policy is threaded per compilation as an argument
+  on `try_compile_with_invokespecial_resolver` / `try_compile_inner`, with
+  three production callers in `jit_bridge.rs`.
+  The record asks for the policy to move into "a single per-VM struct that the
+  compile path already threads". It does thread one — `&JitRuntimeHelpers` —
+  but that is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, so a
+  policy bit does not belong in it; an argument is the right shape.
+  **Remaining half:** `jit_entry_publishable` still reads the latch. It has no
+  VM handle, and §1's own measurement says that refusal never fires, so
+  process-global there refuses nothing in either VM.
+* **§6 — FIXED.** `JNI_NATIVE_METHODS` now lives on
+  `SharedVm::natives::jni_native_methods`. The record says "NOT moved this wave
+  — it is touched by `vm_exec.rs`, owned by another agent"; measured, that is
+  three production call sites, all with `shared` already in scope. The record
+  also misses `UnregisterNatives`, which had the same defect in mirror image —
+  one VM's teardown removed another's bindings.
+  The census half is **not** closed and cannot honestly be: `record_invocation`
+  keys on a `NativeMethodId` and only `NativeMethodRegistry` issues one.
+* **§7 — the defect was already fixed; the note above it still denied it.** The
+  `JDK-ONLY-NOTE` said the `Call*Method` helpers swallow `ExceptionThrown`. The
+  arm thirty lines below has published the pending exception since the
+  bare-varargs slots started dispatching. Corrected. The honest residual is
+  every *other* `Err(_)`, which has no JNI representation.
+  The `ORCHESTRATOR:` loose end is now a decision: nothing else in the tree
+  materialises a violation as a throwable and `render` names no Java type, so
+  `InternalError` stands — and it already satisfies the constraint that
+  matters, which is that a refusal be catchable.
+
+**Still open:** §1, §4, §8, the bulk of §11, §3's Matcher-leaf residual, and
+the `jit_entry_publishable` half of §2.
+
 ## 2026-08-04 status
 
 * **§5 — RETRACTED.** Its premise does not hold: the memo is mode-independent.

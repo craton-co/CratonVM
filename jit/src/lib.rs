@@ -7088,8 +7088,15 @@ pub enum JitNewSite {
 pub struct StringFieldLayout {
     /// Abstract field slot index of `String.value` (the backing array ref).
     pub value_field_index: usize,
-    /// Byte offset of `value`'s bare 8-byte pointer in a COMPACT instance.
+    /// Byte offset of `value`'s bare pointer in a COMPACT instance.
     pub value_compact_offset: i32,
+    /// Whether `value`'s COMPACT slot is a 4-byte **narrow** oop rather than a
+    /// bare 8-byte pointer. True exactly when compressed oops are on *and* a
+    /// `CompactLayout` was actually registered for `string_class_id` — the
+    /// no-registered-layout fallback below points `value_compact_offset` at
+    /// the LEGACY 8-byte cell payload, which must keep the wide load even
+    /// under narrow oops.
+    pub value_compact_is_narrow: bool,
     /// Byte offset of `value`'s 8-byte pointer payload in a LEGACY instance
     /// (`HEADER_SIZE + value_field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD64_OFFSET`).
     pub value_legacy_offset: i32,
@@ -7209,27 +7216,33 @@ impl StringFieldLayout {
         // predicate every collector's allocation path uses), so the compact
         // arm is unreachable, and pointing it at the legacy address keeps it
         // harmless rather than wild if that invariant ever slips.
-        let compact = |idx: usize, is_ref: bool| -> (i32, bool) {
+        // Returns `(address, is_byte_wide, storage_width)`; `storage_width` is
+        // 8 for the fallback so a reference there keeps its wide load.
+        let compact = |idx: usize, is_ref: bool| -> (i32, bool, u32) {
             if cratonvm_types::compact_ref_fields_enabled() {
                 if let Some((body_off, storage)) =
                     cratonvm_types::compact_field_storage(string_class_id, idx)
                 {
+                    let width = storage.size_runtime();
                     return (
                         (cratonvm_types::HEADER_SIZE + body_off) as i32,
-                        storage.size_runtime() == 1,
+                        width == 1,
+                        width,
                     );
                 }
             }
-            (legacy(idx, is_ref), false)
+            (legacy(idx, is_ref), false, 8)
         };
 
-        let (value_compact_offset, _) = compact(value_field_index, true);
-        let (hash_compact_offset, _) = compact(hash_field_index, false);
-        let (coder_compact_offset, coder_compact_is_byte) =
-            coder_field_index.map_or((0, false), |idx| compact(idx, false));
+        let (value_compact_offset, _, value_compact_width) = compact(value_field_index, true);
+        let (hash_compact_offset, _, _) = compact(hash_field_index, false);
+        let (coder_compact_offset, coder_compact_is_byte, _) =
+            coder_field_index.map_or((0, false, 4), |idx| compact(idx, false));
         StringFieldLayout {
             value_field_index,
             value_compact_offset,
+            value_compact_is_narrow: value_compact_width
+                == cratonvm_types::narrow_oop::NARROW_REF_SIZE as u32,
             value_legacy_offset: legacy(value_field_index, true),
             hash_field_index,
             hash_compact_offset,
@@ -7786,12 +7799,13 @@ fn record_jdk_only_ic_native_refusal() {
 #[inline]
 fn direct_native_helper(
     cell: &std::sync::atomic::AtomicUsize,
+    jdk_only: bool,
     class: &str,
     method: &str,
     descriptor: &str,
 ) -> usize {
     let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
-    if entry != 0 && jit_is_jdk_only() {
+    if entry != 0 && jdk_only {
         record_jdk_only_direct_native_refusal(class, method, descriptor);
         return 0;
     }
@@ -8374,33 +8388,25 @@ pub fn try_resolve_string_intrinsic(
     //   * java/lang/CharSequence — the receiver may be any CharSequence, so
     //     the String-layout decode is only valid behind a runtime class-id
     //     guard against the real String class id.
-    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes": every
-    // one of these intrinsics reaches `emit_load_string_value_ptr`
-    // (`jit/src/x64.rs`), which emits an unconditional 64-bit load of the
-    // `String.value` reference field. That emitter is NOT gated on
-    // `narrow_oops_block_inline_fields` the way the getfield/putfield arms
-    // are, so under narrow oops it loads 4 bytes of narrow oop plus 4 bytes of
-    // the adjacent coder/hash field and dereferences the result - a
-    // deterministic wild-pointer SIGSEGV on every inlined charAt / length /
-    // indexOf / hashCode / equals / compareTo.
+    // Hole 1 of `gc/src/compressed_oops.rs`'s "two correctness holes" used to
+    // be closed here, by refusing every String intrinsic under narrow oops:
+    // all of them reach `emit_load_string_value_ptr` (`jit/src/x64/objects.rs`),
+    // which emitted an unconditional 64-bit load of the `String.value`
+    // reference field and so, under narrow oops, loaded 4 bytes of narrow oop
+    // plus 4 bytes of the adjacent coder/hash field and dereferenced the
+    // result.
     //
-    // Refusing the intrinsic here is the unblock that module's header
-    // prescribes: it costs throughput (the calls fall back to native
-    // dispatch) and costs nothing when the gate is off, which is the default.
-    // The real fix is a narrow arm in that emitter, mirroring
-    // `emit_narrow_ref_aload_regs`.
+    // That emitter now has a proper narrow arm (`emit_load_narrow_ref_field`),
+    // selected per call site by `StringFieldLayout::value_compact_is_narrow`,
+    // so the refusal that used to stand here — and the throughput it cost —
+    // is gone. The intrinsics are admitted under both widths.
     //
     // Hole 2 — the conservative 8-byte-word rescan in `gen_heap`'s
-    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is CLOSED
-    // (2026-08-06): both now go through `for_each_conservative_ref_slot`, which
-    // visits narrow slots at 4 bytes as well. So the two holes that made the
-    // gate unsound are covered: this one by refusal, that one by a fix.
-    // `enable_for_live_heap` still warns, and the default stays off, because
-    // "no known unsoundness" is not the same as "measured sound" — nothing has
-    // yet run a corpus with the gate ON. See gc/src/compressed_oops.rs.
-    if cratonvm_types::narrow_oop::narrow_oops_enabled() {
-        return None;
-    }
+    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is closed
+    // too (both go through `for_each_conservative_ref_slot`, which visits
+    // narrow slots at 4 bytes as well). The gate still defaults off; see
+    // `gc/src/compressed_oops.rs` for why, which is no longer "a known
+    // wrong-width slot access on this backend".
     let is_string = class == "java/lang/String";
     let is_charseq = class == "java/lang/CharSequence";
     if !is_string && !is_charseq {
@@ -13126,6 +13132,11 @@ pub fn try_compile(
         cp_invokedynamic_descriptor_resolver,
         None,
         None,
+        // No VM in scope here. The latch is what this wrapper's callers (this
+        // crate's tests, and any VM site not yet threading a policy) have
+        // always read, and no test latches it, so they keep reading
+        // `Compatible`.
+        jit_is_jdk_only(),
     )
 }
 
@@ -13273,6 +13284,18 @@ pub fn try_compile_with_invokespecial_resolver(
     // answer — refuses the speculation; it never falls back to the other
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
 ) -> Option<CompiledMethod> {
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
@@ -13380,6 +13403,7 @@ pub fn try_compile_with_invokespecial_resolver(
         &mut backend_attempted,
         self_call_identity_stable,
         &admission,
+        jdk_only,
     );
 
     // Take once and use for all three sinks: the bail-list decision below, the
@@ -14000,6 +14024,18 @@ fn try_compile_inner(
     // backend call at the end of this function can require it. See
     // `x64::compile_with_param_slots`'s first parameter.
     admission: &compile_gate::CompileAdmission,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -15278,6 +15314,7 @@ fn try_compile_inner(
                             {
                                 let entry = direct_native_helper(
                                     &THREAD_CURRENT_THREAD_DIRECT_FN,
+                                    jdk_only,
                                     direct_class,
                                     &mn,
                                     &desc,
@@ -16809,6 +16846,7 @@ fn try_compile_inner(
                         // frames can observe.
                         let entry = direct_native_helper(
                             &STRING_LATIN1_LOWER_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16846,6 +16884,7 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &THREAD_CURRENT_THREAD_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -16880,6 +16919,7 @@ fn try_compile_inner(
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
                             &INTEGER_VALUE_OF_DIRECT_FN,
+                            jdk_only,
                             &class_name,
                             &method_name,
                             &descriptor,
@@ -17136,6 +17176,7 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &INTEGER_INT_VALUE_DIRECT_FN,
+                        jdk_only,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17165,6 +17206,7 @@ fn try_compile_inner(
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
+                        jdk_only,
                         &class_name,
                         &method_name,
                         &descriptor,
@@ -17221,6 +17263,7 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_PUT_DIRECT_FN,
+                                jdk_only,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -17235,6 +17278,7 @@ fn try_compile_inner(
                         Some((
                             direct_native_helper(
                                 &HASHMAP_GET_DIRECT_FN,
+                                jdk_only,
                                 &class_name,
                                 &method_name,
                                 &descriptor,
@@ -18590,6 +18634,58 @@ mod code_buffer_retry_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Two VMs, two answers — the property JDK-ONLY-WAVE2 §2 was filed about.
+    ///
+    /// `direct_native_helper`'s policy input used to be the process-global
+    /// `JIT_COMPATIBILITY_MODE` latch, which only ever moved toward strict. A
+    /// `Compatible` VM sharing a process with a `JdkOnly` one therefore lost
+    /// the thin direct-call helpers: the strict VM latched, and every later
+    /// compilation in the process — whosever it was — got `0` back.
+    ///
+    /// This test could not have been written against that design. There was no
+    /// per-call policy to vary, and the module comment on
+    /// `set_jit_execution_policy` explicitly forbids latching from a unit test
+    /// in this crate precisely because it is irreversible and `mod tests`
+    /// shares one binary. Now the policy is an argument, so the two cases are
+    /// independent by construction and a test can simply ask for both.
+    #[test]
+    fn direct_native_helper_answers_per_vm_not_per_process() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // A registered helper address. `build_helpers` now publishes these
+        // unconditionally; whether they may be BOUND is the policy question
+        // below, and it is asked per compilation.
+        CELL.store(0xdead_beef, std::sync::atomic::Ordering::Relaxed);
+
+        // Strict refuses and records.
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper(&CELL, true, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0,
+            "a JdkOnly compilation must not bind a thin direct-call helper"
+        );
+        assert!(
+            jdk_only_direct_native_refusals() > before,
+            "the refusal must be counted, not silent"
+        );
+
+        // Compatible still binds — and critically, does so AFTER the strict
+        // call above. Under the latch this is exactly the assertion that
+        // failed, because the strict answer poisoned the process.
+        assert_eq!(
+            direct_native_helper(&CELL, false, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            0xdead_beef,
+            "a Compatible compilation lost its helper because another VM was strict"
+        );
+
+        // And the unset sentinel is still the unset sentinel in both modes.
+        CELL.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            direct_native_helper(&CELL, false, "c", "m", "()V"),
+            0
+        );
+        assert_eq!(direct_native_helper(&CELL, true, "c", "m", "()V"), 0);
+    }
     /// Poll `cond` until it holds, for up to ~1s.
     ///
     /// Several globals these tests observe are *eventually* consistent, not

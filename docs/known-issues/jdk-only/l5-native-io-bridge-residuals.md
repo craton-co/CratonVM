@@ -6,6 +6,50 @@ behaves today exactly as it did before L5. What is open is that each one is
 tagged `Bridge` while the JDK 25 image says its target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits it on a claim nobody has checked.
 
+> **MOSTLY CLOSED 2026-08-06 — re-measured, and the last statement row landed.**
+> Read this banner before the body: three of the five items under *What would
+> close this* are done, and one of the remaining two was filed in the wrong
+> column.
+>
+> * **The statement pass is finished.** L5's own criterion — a row may state
+>   `Bridge` exactly when the image declares that triple `ACC_NATIVE` — now
+>   selects **zero** rows tree-wide. It was down to one:
+>   `java/io/UnixFileSystem.list0`, whose `for name in ["list", "list0"]` loop
+>   called `r.register` while fourteen sibling loops in the same function body
+>   went through the `fs_reg` helper that states the kind. Routed through the
+>   helper: `ACC_NATIVE`-backed-and-stated 773 → 774, total `bridge` stated
+>   835 → 837 (the extra one is `WinNTFileSystem.list0`, `ABSENT` on a Linux
+>   image and deliberately stated anyway, because `FS_IMAGE_NATIVE` carries both
+>   spellings and the platform question is settled elsewhere).
+> * **`setDirect0`, the Windows census, and `SocketDispatcher.close` are all
+>   answered** — see
+>   [`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md),
+>   which also found that **76 % of the `undecl` bucket is not dead** (1,612
+>   inherited shadows, 308 abstract, 19 uncredited bridges; only 603 dead).
+> * **The `java.lang.Process` abstract-registration hazard is inert, and the
+>   hazard is the CONCRETE registrations instead.** An abstract method must be
+>   overridden by any concrete subclass, so dispatch finds the override and never
+>   reaches the native. The concrete ones are what a subclass does *not*
+>   override, so dispatch walks up to `java/lang/Process` and the native wins —
+>   returning `isAlive()==false` for a live process and `pid()==0` where the spec
+>   requires `UnsupportedOperationException`. Filed with a committed repro:
+>   [`process-natives-answer-for-user-subclasses.md`](process-natives-answer-for-user-subclasses.md).
+>   Item 5 below has the model backwards.
+> * **The row counts in this file are ~11 % too large.** The census emits one row
+>   per *registration*, not per slot, so a triple registered twice appears twice
+>   and only the last can dispatch. 1,237 of 11,876 rows own no slot; 1,092 of
+>   them are in the unadjudicated `Bridge` population. `java/lang/Process` is the
+>   visible case: 21 rows for 13 methods, because `native-io/src/process.rs`
+>   overwrites `native-builtins/src/phases_late.rs` for eight of them — so this
+>   file's "13 rows on `java.lang.Process` itself" is the method count, not the
+>   row count. `owns_slot` is now a census column and
+>   `scripts/jdk-only-adjudicate.py` prints the split.
+>
+> **Still open from this file:** the `cratonvm/synthetic/Process*` cluster (item
+> 1), which is **37 rows and not 25** — the count below omits
+> `cratonvm/synthetic/AnonymousObject$2` (4) and miscounts the pipe streams. All
+> 37 are `bridge`, all with zero invocations on the census workload.
+
 > **PARTLY SUPERSEDED 2026-08-05 by a wider measurement.** Three verdicts
 > below rest on a census that asks one class in one image, and two of them do
 > not survive:

@@ -39,6 +39,14 @@ and pass its TSV back here as `--inherited <out.tsv>` to have section 2 broken
 out rather than lumped.  Likewise `absent` is a superset: a class missing from
 a Linux image may be the correct registration for Windows -- see
 `scripts/jdk-only-platform-diff.py`.
+
+And the ROW COUNT itself is a superset of "registrations that matter": the
+census emits one row per registration, not per slot, so a triple registered
+twice appears twice and only the last one can be dispatched.  Measured on
+JDK 25 (2026-08-06): 1,237 of 11,876 rows own no slot, and 1,092 of them are in
+the unadjudicated `Bridge` population below -- an 11 % overstatement of the
+reclassification backlog.  Section 2 breaks it out from the `owns_slot`
+column.
   4. Which source file each unadjudicated group comes from, so the
      reclassification wave can be cut into subsystem-sized batches.
 
@@ -128,6 +136,34 @@ inherited_bad = [r for r in bad if not r["kind_stated"]]
 print(f"    ...of which inherited an ambient set_category: {len(inherited_bad)}")
 print(f"    ...and were actually dispatched this run:      "
       f"{sum(1 for r in bad if r['invocations'] > 0)}")
+
+# A registration that no longer owns its slot cannot be dispatched, so its kind
+# decides nothing -- but it is still a row here, and every reader of this table
+# has been sizing the reclassification backlog off a number that includes them.
+# This is the fourth way this census gets misread (the other three are in
+# `census-asks-one-class-on-one-platform.md`): a *superseded* registration
+# counted as a live one.
+#
+# `owns_slot` is a census column, not an inference. It was briefly derivable
+# from row order -- within a triple the last row owns the slot -- and that is an
+# ordering guarantee no external script should be resting on.
+if any("owns_slot" in r for r in rows):
+    superseded_bad = [r for r in bad if not r.get("owns_slot", True)]
+    live_bad = len(bad) - len(superseded_bad)
+    print(f"    ...superseded (own no slot, can never dispatch): {len(superseded_bad)}")
+    print(f"    => LIVE unadjudicated BRIDGE surface:            {live_bad}")
+    print(f"       (the {len(bad)} above is L6's ratchet population and is left"
+          f" whole on purpose)")
+    if superseded_bad:
+        by_file = Counter(r["registered_by"].split(":")[0]
+                          for r in superseded_bad if r.get("registered_by"))
+        print("       superseded rows by registrar (top 8):")
+        for where, n in by_file.most_common(8):
+            print(f"         {n:>5}  {where}")
+else:
+    print("    ...superseded split: NOT AVAILABLE -- this census predates the")
+    print("       `owns_slot` column, so an unknown share of the rows above own")
+    print("       no slot and cannot be dispatched. Re-dump with a current build.")
 
 if INHERITED_TSV:
     # The hierarchy pass, so `undecl` stops being a superset.

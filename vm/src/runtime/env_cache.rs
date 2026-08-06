@@ -419,6 +419,41 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
+/// `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` — arm §1.4 enforcement at
+/// `try_stackless_invoke` step 1 under `--jdk-only`.
+///
+/// Step 1 always *observes* a `Bridge` standing in front of concrete bytecode
+/// now (see `resolve_step1_native`), so the census is truthful either way. This
+/// dial decides whether the observation is also acted on — whether the bridge
+/// yields and the real bytecode runs.
+///
+/// **Default off, and that is a measurement, not a preference.** Turning it on
+/// takes the `--jdk-only` regression corpus from **32 passed / 17 failed to 3
+/// passed / 46 failed** (Azure Linux, JDK 25, 2026-08-06). The failures are not
+/// dispatch faults: `System.props` is null, `Charset.forName` hands out an
+/// instance of the ABSTRACT `java.nio.charset.Charset`, `String`'s coder does
+/// not match its `value[]`. Under `--jdk-only` the surviving bridges ARE the
+/// object model for large parts of `java.base`, so yielding them to bytecode
+/// hands real code objects it cannot service. §1.4's remedy for those is to
+/// retire the registration once the class's state is real (wave-2 item 4), not
+/// to yield at dispatch — this dial exists so that migration can re-take the
+/// measurement one subsystem at a time instead of arguing about it.
+///
+/// All five blocker families, with symptoms, are in
+/// `docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
+///
+/// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
+#[inline]
+pub fn jdk_only_enforce_shadow() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JDK_ONLY_ENFORCE_SHADOW") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
+    })
+}
+
 /// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
 /// the non-invoke null-deref opcodes (`getfield`/`putfield`, `arraylength`,
 /// the array load/store family, `monitorenter`/`monitorexit`, `athrow`) emit
@@ -867,6 +902,19 @@ cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
 // environment on every dispatch.
 cached_is_set!(dbg_vdisp, "CRATONVM_DBG_VDISP");
 cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
+/// `CRATONVM_DBG_TPE_SHAPE` — report every outcome of the
+/// `ThreadPoolExecutor.execute` receiver-shape probe
+/// (`threadpool_executor_has_real_workers`), one line per call, as
+/// `[tpe-shape] real=<bool> class=<receiver class>`.
+///
+/// The lane this exists for (jdk-only wave 2, L10) has to prove the predicate
+/// is **universally true**, and that is two claims, not one: no `real=false`
+/// line, and at least one `real=true` line. Printing only the failures would
+/// make "the probe never ran" — a probe that stopped reaching the sites at all,
+/// or a workload that never built an executor — indistinguishable from "the
+/// probe ran and always said yes", which is the exact shape of a guard that
+/// reads green because it is dead.
+cached_is_set!(dbg_tpe_shape, "CRATONVM_DBG_TPE_SHAPE");
 // `CRATONVM_DBG_HANG_SAMPLE` -- temporary diagnostic for the AOT
 // bean-registration hang investigation (2026-07-13). Periodically samples
 // the method being invoked in `execute_invoke_kind` (every Nth call) so a
