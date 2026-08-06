@@ -111,6 +111,15 @@ public final class IssuerBudgetProbe {
 			return;
 		}
 
+		// `soak <iters>` -- the same exchange, zero server delay, repeated, with
+		// every slow one reported. Run several of these concurrently: if the
+		// 500 ms budget can be blown here, the repro no longer needs the Spring
+		// class or MockWebServer, and the stall becomes freely instrumentable.
+		if (args.length > 0 && args[0].equals("soak")) {
+			soak(args.length > 1 ? Integer.parseInt(args[1]) : 60);
+			return;
+		}
+
 		int[] delays = { 0, 200, 400, 600, 900, 1500, 3000 };
 		if (args.length > 0) {
 			String[] parts = args[0].split(",");
@@ -206,6 +215,33 @@ public final class IssuerBudgetProbe {
 						+ outcome);
 			}
 		}
+		System.out.println("PROBE-DONE");
+	}
+
+	/** Repeat the exchange at zero delay, reporting every slow one and any failure. */
+	private static void soak(int iters) throws Exception {
+		long worst = 0;
+		int failures = 0;
+		int slow = 0;
+		for (int i = 0; i < iters; i++) {
+			long[] elapsed = new long[1];
+			boolean ok = attempt(0, elapsed);
+			if (!ok) {
+				failures++;
+			}
+			if (elapsed[0] > worst) {
+				worst = elapsed[0];
+			}
+			// 400 ms of a 500 ms budget on a zero-delay localhost exchange is
+			// already a near-miss worth seeing, not just the outright failures.
+			if (elapsed[0] > 400 || !ok) {
+				slow++;
+				System.out.println("[soak] iter=" + i + " ms=" + elapsed[0] + " ok=" + ok);
+				System.out.flush();
+			}
+		}
+		System.out.println("SOAK-RESULT iters=" + iters + " failures=" + failures + " slow=" + slow + " worstMs="
+				+ worst);
 		System.out.println("PROBE-DONE");
 	}
 

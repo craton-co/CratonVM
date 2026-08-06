@@ -109,6 +109,21 @@ bytes into ~10 ms of server-side latency. Read one way it "confirmed" a 100 ms
 CratonVM latency deficit; the deficit was the instrument. A probe that reads
 differently from the thing it models measures itself.
 
+### The probe alone does not reproduce it — bounded negative
+
+Shrinking the repro to the probe was tried and **failed**, which is worth
+knowing before anyone tries again. `IssuerBudgetProbe soak 40` run 6-wide (240
+exchanges, zero server delay, JIT on) produced **0 failures**, though it does get
+close: 58 of 240 exchanges exceeded 400 ms and the worst was 1651 ms. The
+per-request 500 ms read budget was never blown, because a slow *exchange* is not
+a slow *read* — the budget is per read, and the probe's two reads stayed inside
+it even when the surrounding work did not.
+
+So the trigger needs what the probe lacks: 52 test methods each building a Spring
+context, and MockWebServer, i.e. far more class loading and compilation churn
+than two HTTP requests generate. Keep the 6-lane class repro; do not spend more
+time trying to shrink it to a probe without a new idea about the mechanism.
+
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 
 Not the cause of this flake — MockWebServer reads through buffered Okio segments
