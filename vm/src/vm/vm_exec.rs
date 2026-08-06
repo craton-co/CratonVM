@@ -7792,6 +7792,36 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             ..Default::default()
         };
 
+        // `java.lang.instrument` transform-on-load, native half.
+        //
+        // This is the single backend for every "define a class from raw bytes"
+        // entry point — `ClassLoader.defineClass1/2/0`, `Unsafe.defineClass`,
+        // `MethodHandles.Lookup.defineClass`/`defineHiddenClass` — which is
+        // where a user-defined loader's classes come from. The load-time hook in
+        // `runtime::instrument` only covers the built-in delegation chain, so
+        // without this a `-javaagent:` would be offered the JDK and the
+        // classpath but not a single webapp / Spring / OSGi class.
+        //
+        // The chain runs here, before the define, with no class-manager lock
+        // held. Two exclusions, both deliberate: HIDDEN classes have no binding
+        // name, `Instrumentation.isModifiableClass` reports them unmodifiable,
+        // and the JDK does not offer them to transformers either; and a
+        // REDEFINE already ran the chain in `native_redefine_classes0`, so
+        // running it again here would weave the same class twice.
+        let transformed;
+        let bytes = if !opts.hidden
+            && !opts.allow_redefine
+            && !name.is_empty()
+            && crate::runtime::instrument::transformers_armed(self.shared.vm_identity)
+        {
+            transformed = crate::runtime::instrument::run_load_time_transform_chain(
+                self, name, cl_id, bytes,
+            );
+            &transformed[..]
+        } else {
+            bytes
+        };
+
         let cid = {
             let mut cm = self.shared.classes.class_manager_write();
             cm.define_class_with_options(name, bytes, cl_id, define_opts)

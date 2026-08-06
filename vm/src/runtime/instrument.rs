@@ -1184,6 +1184,28 @@ pub fn run_load_time_transform_chain(
     initial_bytes: &[u8],
 ) -> Vec<u8> {
     use cratonvm_types::ClassLoaderId;
+    // Re-entrancy guard — see [`TRANSFORM_IN_FLIGHT`]. A transformer that,
+    // while rewriting `X`, causes `X` itself to be loaded (ByteBuddy's type
+    // pool does exactly this) would otherwise transform `X` to transform `X`
+    // forever. Declining the nested offer costs coverage of one already-covered
+    // class and is what makes the first `-javaagent:` run terminate.
+    let already = TRANSFORM_IN_FLIGHT.with(|s| s.borrow().iter().any(|n| n == class_name));
+    if already {
+        return initial_bytes.to_vec();
+    }
+    TRANSFORM_IN_FLIGHT.with(|s| s.borrow_mut().push(class_name.to_string()));
+    /// Pops the in-flight entry on every exit path, including an unwind out of
+    /// the transformer.
+    struct InFlightGuard;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            TRANSFORM_IN_FLIGHT.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
+    let _in_flight = InFlightGuard;
+
     let loader = match loader_id {
         // The bootstrap loader IS `null` in the Java API — not "unknown".
         ClassLoaderId::Bootstrap => None,
@@ -1465,19 +1487,6 @@ pub fn pre_transform_for_load(
         // former; either way there is nothing to transform here.
         Err(_) => return,
     };
-
-    TRANSFORM_IN_FLIGHT.with(|s| s.borrow_mut().push(name.to_string()));
-    // Everything below must run to the `pop` — including the early returns —
-    // so the guard is released by a scope guard rather than by hand.
-    struct InFlightGuard;
-    impl Drop for InFlightGuard {
-        fn drop(&mut self) {
-            TRANSFORM_IN_FLIGHT.with(|s| {
-                s.borrow_mut().pop();
-            });
-        }
-    }
-    let _in_flight = InFlightGuard;
 
     for supertype in class_file_supertypes(&bytes) {
         pre_transform_for_load(shared, thread, &supertype, depth + 1);
