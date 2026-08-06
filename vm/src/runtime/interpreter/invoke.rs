@@ -1717,7 +1717,7 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs nothing on a healthy run: the whole check is two string compares
     // that fail, and it is only reached at a dispatch terminal. See
-    // `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`,
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`,
     // whose "what to try next" asked for exactly this — the two
     // `CloneNotSupportedException` occurrences it recorded produced no verdict
     // because nothing on the clone path consulted the heap.

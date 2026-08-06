@@ -3223,7 +3223,7 @@ pub(crate) fn native_class_is_primitive(
     // that that's where THIS JDK build's compiled `java/lang/Class` happens
     // to place the `primitive` field — the exact "answering true for a
     // class that is not primitive" hazard flagged in
-    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-FIXED-20260803.md.
+    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md.
     // Resolve it the same way the writer does (`resolve_class_mirror_slots`
     // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
     // `java/lang/Class`), so reader and writer agree by construction instead

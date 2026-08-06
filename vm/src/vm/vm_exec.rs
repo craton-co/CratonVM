@@ -4448,7 +4448,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+    /// See `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
