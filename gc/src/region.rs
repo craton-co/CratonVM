@@ -772,9 +772,9 @@ impl RegionHeap {
                             (*dst_hdr).shape = (*src_hdr).shape;
                             (*dst_hdr).gc_age = (*src_hdr).gc_age;
                             (*dst_hdr).gc_flags = (*src_hdr).gc_flags;
-                            // `forwarding_ptr` published as a single naturally-aligned
-                            // pointer-sized store — no torn read possible.
-                            (*dst_hdr).forwarding_ptr = (*src_hdr).forwarding_ptr;
+                            // Forwarding rides in `mark_word` since the 32 -> 24
+                            // header shrink, so re-publishing that word below
+                            // carries it too — there is no separate field left.
                             // Re-publish the atomic mark_word last.
                             let mark = (*src_hdr)
                                 .mark_word

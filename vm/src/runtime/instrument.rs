@@ -3120,31 +3120,32 @@ mod tests {
 
     #[test]
     fn approximate_object_size_object() {
-        // The compact header folds locking state into its metadata words:
-        // header (32) + 5 legacy Value slots * 16 = 112.
+        // header + 5 legacy Value slots * 16. Derived, because these four
+        // sizes moved together by exactly the 8 bytes the 2026-08-06 header
+        // shrink returned, and a literal only records which day it was written.
         let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
-        assert_eq!(sz, 112);
+        assert_eq!(sz as usize, cratonvm_types::HEADER_SIZE + 5 * cratonvm_types::SLOT_SIZE);
     }
 
     #[test]
     fn approximate_object_size_byte_array() {
-        // Header (32) + 10 bytes aligned up to 8 = 48.
+        // Header + 10 bytes aligned up to 8.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Byte, 10, 0);
-        assert_eq!(sz, 48);
+        assert_eq!(sz as usize, cratonvm_types::HEADER_SIZE + 16);
     }
 
     #[test]
     fn approximate_object_size_long_array() {
-        // Header (32) + 4 * 8 = 64.
+        // Header + 4 * 8.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Long, 4, 0);
-        assert_eq!(sz, 64);
+        assert_eq!(sz as usize, cratonvm_types::HEADER_SIZE + 32);
     }
 
     #[test]
     fn approximate_object_size_ref_array() {
-        // Header (32) + 3 refs * 8 = 56.
+        // Header + 3 refs * 8, rounded to the 8-byte grid.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Reference, 3, 0);
-        assert_eq!(sz, 56);
+        assert_eq!(sz as usize, cratonvm_types::HEADER_SIZE + 24);
     }
 
     #[test]

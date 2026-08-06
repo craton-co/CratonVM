@@ -8347,7 +8347,6 @@ impl GenerationalHeap {
                                 }
                                 // SAFETY: dst is a freshly written object header.
                                 let dhdr = unsafe { &mut *(dst as *mut ObjectHeader) };
-                                dhdr.forwarding_ptr = std::ptr::null_mut();
                                 dhdr.gc_flags |= GC_FLAG_OLD_GEN;
                                 dhdr.gc_flags &= !GC_FLAG_MARKED;
                                 // Forwarding-pointer install into the young
@@ -8385,8 +8384,7 @@ impl GenerationalHeap {
                 // anchor-verified stretch; writing its forwarding_ptr field
                 // is the install the copy loop deferred.
                 unsafe {
-                    std::ptr::addr_of_mut!((*(src_addr as *mut ObjectHeader)).forwarding_ptr)
-                        .write(dst);
+                    (*(src_addr as *const ObjectHeader)).set_forwarding_address(dst);
                 }
             }
             // Age the not-yet-tenurable survivors — same anchor-verified
@@ -8480,7 +8478,7 @@ impl GenerationalHeap {
                         // (e.g. a span retained by the main sweep's
                         // bad-forward check in an earlier cycle) must not
                         // rewrite live references to a garbage target.
-                        let fwd = h.forwarding_ptr;
+                        let fwd = h.forwarding_address();
                         if old_gen.contains(fwd) {
                             Some(fwd as usize)
                         } else {
@@ -9592,7 +9590,7 @@ impl GenerationalHeap {
                 // target outside it is a phantom write from a desynced walk
                 // (or header corruption) — retain the span instead of zeroing
                 // and freeing what may be a live object's interior.
-                let fwd = header.forwarding_ptr;
+                let fwd = header.forwarding_address();
                 if watchref_dbg() && crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
                     eprintln!(
                         "[watchref] non-moving sweep: watched address @0x{:x} was EVACUATED to old gen @{:p} (should already be in evac_map from selective promotion)",
@@ -9969,7 +9967,7 @@ impl GenerationalHeap {
                     let bh = unsafe { &*(base as *const ObjectHeader) };
                     let hdr_marked = bh.gc_flags & GC_FLAG_MARKED != 0;
                     let hdr_forwarded = bh.is_forwarded();
-                    let hdr_fwd = bh.forwarding_ptr as usize;
+                    let hdr_fwd = bh.forwarding_address() as usize;
                     let hdr_cid = bh.class_id.as_u32();
                     let was_candidate = conservative_candidates.binary_search(&addr).is_ok();
                     eprintln!(
@@ -12489,7 +12487,6 @@ impl GenerationalHeap {
             owned.shape = std::ptr::addr_of!((*h).shape).read();
             owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
             owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
-            owned.forwarding_ptr = std::ptr::addr_of!((*h).forwarding_ptr).read();
             // `mark_word` is an `AtomicU64`: read it through an atomic load so
             // the access is well-defined under the memory model.
             owned.mark_word.store(
@@ -12840,7 +12837,6 @@ impl GenerationalHeap {
         // Update the new header
         // SAFETY: `new_ptr` was just allocated and the object was copied there; its header is valid and mutable.
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
-        new_header.forwarding_ptr = std::ptr::null_mut();
 
         let landed_in_old_gen = should_promote && old_gen.contains(new_ptr);
         if landed_in_old_gen {
@@ -12857,7 +12853,7 @@ impl GenerationalHeap {
         // `&mut ObjectHeader` is ever live alongside another reference to this
         // header (we earlier read an owned copy rather than borrowing it).
         unsafe {
-            std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr).write(new_ptr);
+            (*(old_ptr as *const ObjectHeader)).set_forwarding_address(new_ptr);
         }
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
@@ -14778,7 +14774,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             // slot, unless the forwarding target is not actually in old gen
             // (a phantom write) — in which case retain, as the sequential
             // walk does.
-            let fwd = header.forwarding_ptr as usize;
+            let fwd = header.forwarding_address() as usize;
             if fwd >= ctx.old_lo && fwd < ctx.old_hi {
                 push_dead(&mut out.dead, cursor, total_size, header);
             }
@@ -17357,7 +17353,7 @@ mod tests {
             "the object an interior conservative root points into was promoted \
              (forwarding_ptr={:#x}); the root cannot be rewritten, so its young \
              source is about to be zeroed under it",
-            header.forwarding_ptr as usize,
+            header.forwarding_address() as usize,
         );
         assert_eq!(
             header.class_id.as_u32(),
@@ -19963,7 +19959,7 @@ mod tests {
                 // SAFETY: `obj_ptr` is from `old_gen.walk_objects()`, pointing to a valid old-gen object header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 assert!(
-                    header.forwarding_ptr.is_null(),
+                    !header.is_forwarded(),
                     "Forwarding pointer should be cleared after compaction"
                 );
                 assert_eq!(
