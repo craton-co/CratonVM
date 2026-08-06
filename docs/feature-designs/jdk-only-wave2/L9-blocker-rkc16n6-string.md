@@ -145,24 +145,41 @@ first looked like it had to be, and did not:
   the `TAG_CONST` constant — and a probe written to separate them is the only
   reason it did not ship half-fixed with its own reproducer green.
 
-## Residual
+## Residual — RESOLVED 2026-08-06
 
-`resolve_step1_native` still passes `bytecode_available: false`. That is the
-actual §1.4 hole, and it is why the lists could be inert while the natives kept
-winning.
+`resolve_step1_native` used to pass `bytecode_available: false`, and this
+section called that "the actual §1.4 hole … why the lists could be inert while
+the natives kept winning". **Half of that is right, and it is the half that is
+now closed.**
 
-**Attempted and reverted 2026-08-05, with numbers** —
-[record](../../known-issues/jdk-only/step1-bytecode-available-attempted-and-reverted.md).
-Two of this paragraph's original claims turned out to be wrong: **4,796** is a
-static count of registrations, not of dispatches (the observed change is 10 → 24
-shadow observations on the matrix workload), and the default `--real-jdk` path
-costs nothing because both consumers of the flag are `is_jdk_only()`-gated — the
-392-case matrix stayed byte-identical.
+Full record:
+[`docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`](../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md).
+Two of this paragraph's original claims were already known wrong: **4,796** is a
+static count of registrations, not of dispatches (10 → 24 shadow observations on
+the matrix workload), and the default `--real-jdk` path costs nothing because
+every consumer of the flag is `is_jdk_only()`-gated — the 392-case matrix stayed
+byte-identical.
 
-It fails for a different reason than cost: step 1 runs BEFORE method resolution,
-so it has the class name but not the resolved method, and `has_code` derived
-from access flags on the named class is the wrong question when the hierarchy is
-involved. `CharsetDecoder.decodeLoop` is abstract on the named class and
-concrete on its subclasses; `--jdk-only` then dies with `AbstractMethodError:
-... has no Code attribute`. The record proposes two restructurings and states
-the acceptance test that this attempt failed.
+The record's own proposal 2 — resolve lazily in the `Bridge` arm, walking the
+hierarchy the way the invoke will — is implemented and landed. It produces the
+**same** `AbstractMethodError`, and the reason is not resolution:
+`Charset.forName` under `--jdk-only` hands back an instance of the ABSTRACT
+`java.nio.charset.Charset`, and `newDecoder()` an instance of the abstract
+`CharsetDecoder` (`probes/CsShape`, diffed against HotSpot). The resolution is
+correct; the receiver was never real. Arming the yield takes the `--jdk-only`
+regression corpus from **32 passed / 17 failed to 3 / 46** — `System.props`
+null, `String`'s coder against its `value[]`, `SharedSecrets.javaLangAccess`
+null, `TreeMap` ordering. Under strict mode the surviving bridges **are** the
+object model.
+
+So the lever is registration, not dispatch — which is where this tree already
+puts it (`NativeMethodRegistry::register`'s real-JDK `String` drop: "Registration
+was always the real gate"), and it is wave-2 item 4. What landed instead:
+
+* step 1 now **observes** every `Bridge` that dispatches in front of real bytes,
+  as a `NativeShadowsBytecode` row tagged `bridge-ran-over-bytecode` plus an
+  exact `refusals.interpreter_shadow_unenforced` counter. That is the inert-lists
+  complaint above, closed: the census can now see the shadows that actually
+  dispatch, not only the ones some other site catches.
+* the **enforcement** is `CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1`, off by default,
+  so item 4 can re-take that 32/17-vs-3/46 measurement one subsystem at a time.

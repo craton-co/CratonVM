@@ -505,7 +505,9 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `synthetic_stub_field_model`; the third entry point,
     `resolve_field_index_by_class_id`, is deliberately left alone because
     wiring it moves five unrelated tests. See
-    [mock-native-context-by-name-writes-were-silent.md](mock-native-context-by-name-writes-were-silent.md).
+    the retired `mock-native-context-by-name-writes-were-silent` write-up
+    (RETIRED 2026-08-06; §4–§7 there add the mirror-image defect — the mock
+    answering a *different* slot — and the fourth by-name entry point).
 
     **`java/security/CodeSource` is still open** and is the same shape: its
     model is `(location, certs)` — constructor order again — where the class

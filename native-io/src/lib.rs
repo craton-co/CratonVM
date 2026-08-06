@@ -6469,11 +6469,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_is_read_n_bytes_buf,
     );
-    registry.register(
+    // `SyntheticStub`, stated. `java.io.InputStream.transferTo` is ordinary
+    // bytecode in `java.base` — a read/write loop — so contract §1.5 cannot call
+    // this a bridge, and `phases_late/zip_streams.rs` registers the same triple
+    // as a stub. Left on the ambient `Bridge` this copy was the one `--jdk-only`
+    // kept, because the stub copy is refused at the door: the fake outlived the
+    // mode built to remove it, decided by which of two files was tagged what.
+    registry.register_with_kind(
         "java/io/InputStream",
         "transferTo",
         "(Ljava/io/OutputStream;)J",
         native_is_transfer_to,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // --- java.io.OutputStream (base class fallback) ---

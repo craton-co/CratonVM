@@ -197,7 +197,10 @@ When your PR adds a feature, fixes a bug, or changes behavior:
    `CRATONVM_NO_STUBS`, and under `--jdk-only`, `register()` **refuses** a
    `SyntheticStub` outright, so a mis-tagged bridge is never registered at all
    and the failure surfaces far from its cause. Background:
-   [`docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`](docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md).
+   the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
+   (RETIRED 2026-08-06 — the ambient default no longer decides anything; the
+   reclassification it pointed at is in
+   [`docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md`](docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)).
 
 4. **Use `NativeContext`** — the `ctx` parameter provides:
    - `ctx.alloc_object(class_id)` — allocate a new object

@@ -216,7 +216,7 @@ defines a `NativeKind::Bridge` as what an `ACC_NATIVE` method binds to;
 **10,084 of the 10,844 `Bridge` registrations have no `ACC_NATIVE` target**,
 every one of them inherited its kind from an ambient `set_category`, and until
 this gate nothing stopped that number rising. See
-[`docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`](../docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md).
+the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
 
 ```bash
 JAVA_HOME=/path/to/jdk25 sh regression-suite/bridge-ratchet.sh

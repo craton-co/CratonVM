@@ -1659,7 +1659,18 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
 /// mechanism instead, so this stub doesn't fire — and is harmless if the
 /// classes happen to be present, because last-writer-wins on the native
 /// registry just leaves the real bytecode dispatch in place.)
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: the SLF4J binder surface is application bytecode this
+// VM stands in front of; nothing here is a VM/OS boundary.
 pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // FIX (log4j2loggingsystemtests-correlationid-mdc-binder-shadowed): same
     // bug class as `micrometer-metrics-logbackcondition-wrong-binder-20260724`
     // below (`StaticLoggerBinder`), just never applied here too — these three
@@ -2260,6 +2271,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `LogMessage.toString()` native. Real Logback bytecode now owns logger
     // creation, appender attachment, and the filterAndLog → appender
     // dispatch chain.
+    registry.set_category(__prev_cat);
 }
 
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK

@@ -131,7 +131,71 @@ use cratonvm_types::compat::CompatibilityMode;
 /// method is ordinary bytecode in `java.base`, so deleting the registration is
 /// the whole fix. This is the direction the gate exists to encourage: one
 /// fewer fake, and the count follows.
-const BASELINE_SYNTHETIC_STUBS: usize = 553;
+///
+/// # 553 -> 632, 2026-08-06 (lies removed from the census, not fakes added)
+///
+/// **No new synthetic stub exists, and no slot the VM dispatches changed kind.**
+/// Measured, not asserted: two `--dump-native-registry` censuses from a real
+/// JDK 25 boot, before and after, agree on the effective kind of all **10,639**
+/// registered triples — zero differences (`scripts/jdk-only-kind-map.py`, and
+/// a last-write-wins fold over both files).
+///
+/// This gate counts *registrations*, superseded rows included, and that is
+/// where the 79 moved. Nine registrars had no `set_category` scope over them at
+/// all, so each of their callers imposed its own — and registration is
+/// last-write-wins, so what shipped was decided by call ORDER while the
+/// superseded rows were left claiming a kind nothing ever used.
+///
+///  * `register_stamped_lock_natives` is called three times. Two callers had
+///    `Bridge` in effect and one had none: 62 rows here (`StampedLock` and its
+///    two view classes).
+///  * `register_service_loader_natives`, `register_url_codec`,
+///    `register_p59_bulk_stream_transfer` and the netty/tomcat/slf4j shim
+///    registrars: the remaining 17.
+///
+/// All nine state `SyntheticStub` now, which is what their surviving row always
+/// was and what the classes deserve — `java.util.ServiceLoader`,
+/// `java.net.URLEncoder`/`URLDecoder`, `java.io.InputStream.transferTo` and
+/// `java.util.concurrent.locks.StampedLock` are ordinary bytecode in
+/// `java.base` and JDK 25 declares no `ACC_NATIVE` method on any of them, so
+/// contract §1.5 cannot call them bridges.
+///
+/// **`--jdk-only` changed, and this is the fix, not the fallout.** A strict
+/// census A/B shows 48 triples that strict mode used to ADMIT and now refuses,
+/// and none in the other direction. It admitted them because the drop happens
+/// at registration: the later `SyntheticStub` row was refused at the door and
+/// the earlier `Bridge` row therefore survived to own the slot. Contract §11's
+/// "zero synthetic-stub invocations through any path" was false for 48 triples,
+/// by registration order, invisibly. See
+/// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
+/// # 632 -> 642, 2026-08-06 (ten fakes `--jdk-only` was keeping, by file order)
+///
+/// The same shape as the re-freeze above, found by asking the question the
+/// other way round: which triples does `--real-jdk` call a stub while
+/// `--jdk-only` registers something? Twenty did, because a **second file**
+/// registers the same triple under a `Bridge` scope, and strict mode refuses
+/// the stub at the door — so the copy that survived to own the slot was the
+/// one that was not a stub. Ten are now stated `SyntheticStub` at their second
+/// site:
+///
+///  * `Function$Identity.apply` and `UnaryOperator.identity` in
+///    `phases_late/streams.rs`. L7 item 4 retagged the `lib.rs` cluster; these
+///    two copies kept `--jdk-only` minting a `Function$Identity` /
+///    `UnaryOperator$Identity` whose class contract §5 forbids fabricating.
+///    That is the "successor defect" the ambient-category record names, still
+///    live in a file that lane did not open.
+///  * five `CountDownLatch` and two `CyclicBarrier` registrations in a
+///    surefire bootstrap block — the same callbacks `util_concurrent_ext`
+///    installs and states as stubs.
+///  * `java.io.InputStream.transferTo` in `native-io`, whose other copy in
+///    `phases_late/zip_streams.rs` is a stub.
+///
+/// A strict census A/B: 10 triples refused that were admitted, none the other
+/// way, and **zero** effective-kind changes in `--real-jdk`. The ten left
+/// alone are `java.util.Set.of`, whose strict kind is `Intrinsic` — an
+/// intrinsic shadowing concrete bytecode is what an intrinsic is (554 of 678
+/// `Intrinsic` rows do), so that is a reclassification question, not a fake.
+const BASELINE_SYNTHETIC_STUBS: usize = 642;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
@@ -212,6 +276,63 @@ fn census() -> (usize, usize) {
         .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
         .count();
     (synthetic, rows.len())
+}
+
+/// THE GATE FOR STEP 3 OF
+/// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up:
+/// *"flip the default last — once every registration states its kind,
+/// `current_category` can default to something that fails loudly (or be
+/// deleted)."*
+///
+/// It cannot be phrased as "every registration states its kind", because
+/// `kind_stated` is true only for `register_with_kind` (849 of ~11,900) and is
+/// deliberately false on every row a `with_category` scope covers on purpose.
+/// The answerable form is the one the record actually needs: **no registration
+/// may be made with no scope covering it at all**, so the conservative
+/// `SyntheticStub` fallback in `NativeMethodRegistry::effective_category` is
+/// dead code that can be deleted the day `NativeKind` gains a `Refuse` arm.
+///
+/// The count was **one** when this gate was written — `MergedAnnotation$Adapt
+/// .isIn`, the first `register` in `register_essential_natives_with_shims`,
+/// which ran before any `set_category` in the whole boot and therefore took the
+/// constructor's default by accident rather than by decision. It is stated now.
+///
+/// Note what this gate is NOT. It does not say the kinds are right; the bridge
+/// ratchet asks that. It does not say anybody adjudicated a row; `kind_stated`
+/// and `scripts/jdk-only-kind-map.py` ask that. It says only that the *default*
+/// decides nothing any more, which is the specific property step 3 names.
+#[test]
+fn no_registration_runs_on_the_ambient_default() {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    let rows = registry.census();
+    let unchosen: Vec<_> = rows.iter().filter(|r| !r.kind_chosen).collect();
+
+    println!(
+        "unchosen: {} of {} registrations were made with no category scope in effect",
+        unchosen.len(),
+        rows.len()
+    );
+    for r in unchosen.iter().take(40) {
+        println!(
+            "  {}.{}{}  kind={}  at {}",
+            r.class,
+            r.name,
+            r.descriptor,
+            r.kind.as_str(),
+            r.registered_by.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    assert!(
+        unchosen.is_empty(),
+        "{} registration(s) inherited the registry's conservative default \
+         because no `set_category` / `with_category` / `register_with_kind` \
+         covered them. That is not a tag, it is the absence of one, and under \
+         `--jdk-only` it is the difference between a native being registered \
+         and being refused at the door. Wrap the call site in a category scope \
+         or state its kind with `register_with_kind`; see the list above.",
+        unchosen.len()
+    );
 }
 
 /// The old, essentials-only census, kept for exactly one purpose: to assert
@@ -395,6 +516,85 @@ fn strict_census() -> (usize, usize, Vec<(String, String, String)>) {
         })
         .collect();
     (synthetic, total, refused)
+}
+
+/// Every registration the strict boot makes, as `census_rows` does for the
+/// compatible one.
+fn strict_rows() -> Vec<(String, String, String, NativeKind)> {
+    let mut registry = NativeMethodRegistry::new();
+    registry.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_boot_path(&mut registry);
+    registry
+        .dump_registrations()
+        .into_iter()
+        .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
+        .collect()
+}
+
+/// **A fake must not outlive `--jdk-only` because a SECOND file called it a
+/// bridge.** Contract §11's "zero synthetic-stub invocations through any path",
+/// asserted per triple instead of per row count.
+///
+/// `strict_registry_drops_only_the_stubs` bounds row *counts*, and its own
+/// comment names the reason that cannot express this: "a triple can be
+/// registered with two different kinds". When it is, the drop happening **at
+/// registration** decides the outcome — strict mode refuses the `SyntheticStub`
+/// row at the door, so the `Bridge` row registered by the other file survives to
+/// own the slot, and the method the mode exists to remove goes on being served
+/// by the fake. Compatible mode, where nothing is refused, keeps the stub
+/// instead: **the two modes run different implementations of the same method**,
+/// and which is which is a property of the order two files happen to run in.
+///
+/// Measured on JDK 25 / linux, 2026-08-06, by diffing a `--jdk-only` census
+/// against a `--real-jdk` one: 58 triples, in two families —
+/// `StampedLock`/`ServiceLoader`/`URLCodec` (the registrar had no category at
+/// all, so its callers disagreed) and `Function$Identity.apply` /
+/// `UnaryOperator.identity` / `CountDownLatch` / `CyclicBarrier` /
+/// `InputStream.transferTo` (a second file under a `Bridge` scope). The first
+/// two of those are the successor defect the retired
+/// `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up names: a
+/// surviving `Bridge` whose receiver class contract §5 forbids fabricating.
+///
+/// `Intrinsic` is not flagged. A triple that is a stub in compatible mode and an
+/// intrinsic in strict is a *different implementation*, not a surviving fake —
+/// `java.util.Set.of` is the whole of that set today — and an intrinsic
+/// shadowing concrete bytecode is what an intrinsic is.
+#[test]
+fn no_fake_survives_strict_mode_as_someone_elses_bridge() {
+    let mut compat: std::collections::BTreeMap<(String, String, String), NativeKind> =
+        std::collections::BTreeMap::new();
+    for (c, m, d, k) in census_rows() {
+        // Last write wins, exactly as the registry's slot does.
+        compat.insert((c, m, d), k);
+    }
+
+    let mut survivors: Vec<String> = Vec::new();
+    for (c, m, d, k) in strict_rows() {
+        if k != NativeKind::Bridge {
+            continue;
+        }
+        if compat.get(&(c.clone(), m.clone(), d.clone())) == Some(&NativeKind::SyntheticStub) {
+            survivors.push(format!("{c}.{m}{d}"));
+        }
+    }
+    survivors.sort();
+    survivors.dedup();
+
+    println!(
+        "stub-ratchet(strict): {} triple(s) are a SyntheticStub in compatible mode \
+         and a Bridge in strict",
+        survivors.len()
+    );
+    assert!(
+        survivors.is_empty(),
+        "{} triple(s) are tagged `SyntheticStub` where compatible mode dispatches \
+         them and `Bridge` where strict mode does, so `--jdk-only` runs the fake \
+         the mode exists to remove — and it does so only because the stub \
+         registration is refused at the door, leaving the other file's `Bridge` \
+         row to own the slot. Decide the kind ONCE, at both sites:\n  {}",
+        survivors.len(),
+        survivors.join("\n  ")
+    );
 }
 
 /// Acceptance criterion (contract §11): **the final native registry in strict

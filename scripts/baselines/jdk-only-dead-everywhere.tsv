@@ -70,8 +70,6 @@ java/security/AccessController$1	getProtectDomains	(Ljava/security/AccessControl
 java/util/ArrayDeque$Itr	hasNext	()Z	bridge	native-collections/src/lib.rs:34658	class-absent
 java/util/ArrayDeque$Itr	next	()Ljava/lang/Object;	bridge	native-collections/src/lib.rs:34659	class-absent
 java/util/ArrayDeque$Itr	remove	()V	bridge	native-collections/src/lib.rs:34671	class-absent
-java/util/Comparator$Native	compare	(Ljava/lang/Object;Ljava/lang/Object;)I	synthetic-stub	native-collections/src/lib.rs:27274	class-absent
-java/util/Comparator$Native	writeReplace	()Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:27283	class-absent
 java/util/Enumeration$Impl	hasMoreElements	()Z	bridge	native-builtins/src/classloader.rs:5648	class-absent
 java/util/Enumeration$Impl	hasNext	()Z	bridge	native-builtins/src/classloader.rs:5673	class-absent
 java/util/Enumeration$Impl	next	()Ljava/lang/Object;	bridge	native-builtins/src/classloader.rs:5683	class-absent
@@ -129,8 +127,6 @@ java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	updateAndGet
 java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	weakCompareAndSet	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z	bridge	native-builtins/src/atomic_updater.rs:1004	class-absent
 java/util/function/Consumer$AndThen	accept	(Ljava/lang/Object;)V	bridge	native-builtins/src/phases_late/streams.rs:2924	class-absent
 java/util/function/Function$Compose	apply	(Ljava/lang/Object;)Ljava/lang/Object;	bridge	native-builtins/src/phases_late/streams.rs:2866	class-absent
-java/util/function/Function$Identity	andThen	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:37954	class-absent
-java/util/function/Function$Identity	compose	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:37960	class-absent
 java/util/function/Predicate$$Lambda$And	test	(Ljava/lang/Object;)Z	bridge	native-builtins/src/phases_late/streams.rs:2581	class-absent
 java/util/function/Predicate$$Lambda$Negate	test	(Ljava/lang/Object;)Z	bridge	native-builtins/src/phases_late/streams.rs:2671	class-absent
 java/util/function/Predicate$$Lambda$Or	test	(Ljava/lang/Object;)Z	bridge	native-builtins/src/phases_late/streams.rs:2626	class-absent
@@ -586,7 +582,6 @@ java/util/concurrent/CopyOnWriteArraySet	<init>	(I)V	bridge	native-collections/s
 java/util/concurrent/CopyOnWriteArraySet	<init>	(IF)V	bridge	native-collections/src/lib.rs:11334	method-nowhere
 java/util/concurrent/locks/StampedLock	isLocked	()Z	bridge	native-builtins/src/util_concurrent_ext.rs:5788	method-nowhere
 java/util/concurrent/locks/StampedLock	isLocked	()Z	bridge	native-builtins/src/util_concurrent_ext.rs:5788	method-nowhere
-java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:5788	method-nowhere
 java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	bridge	native-builtins/src/lib.rs:8285	method-nowhere
 java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	bridge	native-builtins/src/phases_late/jar_manifest.rs:746	method-nowhere
 java/util/jar/Attributes$Name	MANIFEST_VERSION	Ljava/util/jar/Attributes$Name;	bridge	native-builtins/src/lib.rs:8279	method-nowhere

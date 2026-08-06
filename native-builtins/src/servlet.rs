@@ -4304,6 +4304,36 @@ fn s2_typed_view_byte_start(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 /// shim left slot 0 pointing at the byte[] source, which our native
 /// `charAt` interpreted as one char per byte (truncated UTF-16
 /// high bytes to zero).
+/// The real `ByteBufferAsCharBuffer{B,L}` for this byte order, when the class
+/// library actually has one.
+///
+/// `None` in synthetic-JDK mode (where the class does not exist, or exists only
+/// as a fabricated stub with no method bodies), which is what keeps the copying
+/// fallback below reachable.
+fn s2_bbacb_view_class(ctx: &mut dyn NativeContext, order: i32) -> Option<&'static str> {
+    let cls = if order == 1 {
+        "java/nio/ByteBufferAsCharBufferL"
+    } else {
+        "java/nio/ByteBufferAsCharBufferB"
+    };
+    // `class_id_by_name` alone answers "already loaded", and nothing loads this
+    // class before the first `asCharBuffer` — so asking that way said "absent"
+    // on a real JDK and silently kept the copying fallback. Drive the load.
+    //
+    // The return value of `ensure_class_initialized` is not the test:
+    // `--jdk-only` aside, it fabricates a bare stub rather than failing. Ask
+    // the property instead — a stub has no method bodies, so handing one back
+    // would trade `AbstractMethodError` for a buffer whose every method is a
+    // no-op.
+    if ctx.ensure_class_initialized(cls).is_err() {
+        return None;
+    }
+    if ctx.is_class_synthetic_stub(cls) {
+        return None;
+    }
+    Some(cls)
+}
+
 fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let pos = s2_bb_pos(ctx, this) as usize;
@@ -4311,6 +4341,50 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let order = s2_bb_order(ctx, this); // 0 = BIG_ENDIAN, 1 = LITTLE_ENDIAN
     let rem_bytes = lim.saturating_sub(pos);
     let rem_chars = rem_bytes / 2;
+
+    // Real-JDK: hand back a genuine `ByteBufferAsCharBuffer{B,L}` over the SAME
+    // ByteBuffer, which is what `asCharBuffer` is specified to return.
+    //
+    // The copying fallback below stamps the ABSTRACT `java/nio/CharBuffer` and
+    // that is wrong three ways at once, all of them measured against HotSpot by
+    // `probes/NioBufferStampProbe`:
+    //
+    //   * `slice`, `duplicate`, `asReadOnlyBuffer`, `put(int,char)` and bulk
+    //     `put(CharBuffer)` have no native on the abstract class, so they
+    //     resolve to the abstract declaration and throw
+    //     `AbstractMethodError: ... has no Code attribute`. Adding a native per
+    //     method is whack-a-mole; a concrete receiver gets all of them from the
+    //     JDK's own bodies.
+    //   * A copy is not a view. `bb.asCharBuffer().put('A')` left the backing
+    //     ByteBuffer untouched — HotSpot writes through. A lost write is the
+    //     worse failure of the two, because nothing reports it.
+    //   * `hasArray()` answered `true` (the copy has a `char[]`); a real char
+    //     view over a ByteBuffer has no accessible array.
+    //
+    // `address` is the whole aliasing mechanism: the JDK computes each element's
+    // byte offset as `(i << 1) + address`, and seeds `address` to the source's
+    // own address plus its position. Carry that across so the existing
+    // `ByteBufferAsCharBuffer*` natives — and the JDK bodies — index the same
+    // bytes the source does.
+    if let Some(view_cls) = s2_bbacb_view_class(ctx, order) {
+        let src_address = match ctx.get_field_by_name(this, "address") {
+            Value::Long(v) => v,
+            Value::Int(v) => i64::from(v),
+            // No `address` on the receiver (a synthetic-layout source): fall
+            // back to the ARRAY_BYTE_BASE_OFFSET seeding `bb_write_hb` uses.
+            _ => 16,
+        };
+        let read_only = matches!(ctx.get_field_by_name(this, "isReadOnly"), Value::Int(1));
+        let vb = alloc_concurrent_synthetic(ctx, view_cls, 0);
+        ctx.set_field_by_name(vb, "bb", Value::Object(Some(this)));
+        ctx.set_field_by_name(vb, "mark", Value::Int(-1));
+        ctx.set_field_by_name(vb, "position", Value::Int(0));
+        ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
+        ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
+        ctx.set_field_by_name(vb, "isReadOnly", Value::Int(i32::from(read_only)));
+        ctx.set_field_by_name(vb, "address", Value::Long(src_address + pos as i64));
+        return Ok(Some(Value::Object(Some(vb))));
+    }
     // Transcode bytes → chars using the source ByteBuffer's byte order.
     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, rem_chars);
     // Storage-aware byte reads (heap incl. array-base offset, or direct) —

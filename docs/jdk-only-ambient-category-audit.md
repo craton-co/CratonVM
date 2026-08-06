@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Wave 1, measurement only. No behaviour was changed by this audit. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) — the interface contract. This document does not define semantics. |
-| **Companions** | [`jdk-only-audit.md`](jdk-only-audit.md) §2 (static inventory) · [`jdk-only-native-review.md`](jdk-only-native-review.md) (the promotion checklist this audit feeds) · [`known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`](known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md) (the problem statement; this document is its measurement) |
+| **Companions** | [`jdk-only-audit.md`](jdk-only-audit.md) §2 (static inventory) · [`jdk-only-native-review.md`](jdk-only-native-review.md) (the promotion checklist this audit feeds) · the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up (the problem statement; this document is its measurement — RETIRED 2026-08-06, the mechanism is fixed and the reclassification moved to [`known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md`](known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)) |
 | **Scope** | Every crate that calls `NativeMethodRegistry::register`. |
 | **Evidence date** | 2026-07-31, against a JDK 25 image (`javap -p -s`) on Windows. |
 
