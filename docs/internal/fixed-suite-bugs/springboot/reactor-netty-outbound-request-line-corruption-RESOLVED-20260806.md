@@ -147,11 +147,18 @@ pushed. Check that branch out to re-run the A/B above.
   (4/33 on 2026-08-05; 33/33 on `dev` now, 10 serial + 8 concurrent on Azure,
   5 serial + 3 concurrent-equivalent on Windows).
 
-## The other anomaly in the original log, still unexplained
+## The other anomaly in the original log — now explained, and its own page
 
 268 × `Selector.select() returned prematurely 512 times in a row; rebuilding
-Selector` — roughly one rebuild per 10 ms for the length of the run. It did not
-appear in ANY of the ~40 runs here, defect-on or defect-off, on either host. It
-is therefore not part of this defect, and it is not established to be a defect
-at all; but a Netty client whose selector is being rebuilt every 10 ms is not in
-a normal state. If it recurs, it is its own page.
+Selector`, roughly one rebuild per 10 ms for the length of the run. It appeared
+in NONE of the ~40 runs here, defect-on or defect-off, so it is not part of the
+recycled-address defect.
+
+It is a separate, real defect, found and fixed on 2026-08-06:
+[`selector-interest-nudge-makes-the-next-select-return-immediately`](../selector-interest-nudge-makes-the-next-select-return-immediately-FIXED-20260806.md).
+CratonVM's interest-change nudge had no in-flight gate on Linux, so an
+`interestOps()` call with no select parked left a byte in the wakeup pipe and
+the NEXT `select(timeout)` returned in ~0 ms with nothing ready — exactly the
+condition Netty counts. A Netty event loop sets interest ops between selects,
+so it hit it every iteration. The field storm is still not reproduced; the
+mechanism is, deterministically.
