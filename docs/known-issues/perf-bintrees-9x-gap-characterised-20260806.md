@@ -146,31 +146,85 @@ calls                             21
 That is why a peephole cannot close this gap: the body is dominated by
 machinery, not by shuffling.
 
-**The largest inline item is the register spill, and its layout contradicts its
-own comment.** The leaf-allocation path — taken for every leaf `Node`, half of
-the 68M — runs a full 15-GPR spill into the SavedRegisters region *before* the
-inline TLAB bump:
+**The largest inline item is the register spill.** The leaf-allocation path —
+taken for every leaf `Node`, half of the 68M — runs a full GPR spill into the
+reserved spill region *before* the inline TLAB bump:
 
 ```
 15b: jg 0x3e8                  <- depth > 0 leaves for the recursive path
-161: mov [rbp-8],r12
-165: mov [rbp-260h],rax        <- 15 GPR stores, inline, on the fast path
+161: mov [rbp-8],r12           <- register-homed LOCAL flush
+165: mov [rbp-260h],rax        <- 14 blind GPR stores, inline, on the fast path
 ...
 1c0: mov [rbp-2C8h],r15
-1c7: mov rax,4                 <- safepoint id
-1e8: jne 0x275                 <- guard; its slow path is the helper call
+1c7: mov rax,4                 <- safepoint id (bci 4 = the leaf `new`)
+1e8: jne 0x275                 <- TLAB-full guard; its slow path is the helper
 1ee..270:                      <- inline TLAB bump
 ```
 
-The only emitter of a 16-GPR spill in the tree is `x64/deopt_stubs.rs:1345`,
-whose own comment says it is placed so that "the guard `JB` **reaches here**
-with every GPR still holding its trapping-instant value" — i.e. it is meant to
-sit behind a taken guard, not ahead of one.
+### Correction: the emitter
 
-**Start here.** It is the largest inline cost in the hottest method, it has a
-single emitter, and the comment and the emitted layout disagree. Confirm with a
-taken-branch count before concluding, because being wrong about this one is a
-deopt correctness bug, not a slow benchmark.
+This page first attributed that run to `x64/deopt_stubs.rs:1345` and read its
+comment ("the guard `JB` **reaches here** with every GPR still holding its
+trapping-instant value") as evidence that the emitted layout contradicted its
+own design. **That was wrong, and the arithmetic said so.** The deopt stub
+spills 16 GPRs *and* 16 XMMs; this run is 14 stores with no `movq`, and
+`-0x260 + 13*8 = -0x2C8` lands exactly on the last of fourteen. The emitter is
+`x64/safepoint.rs`'s `safepoint_reg_spill_all` loop over the 14-entry
+`ALL_SPILL_GPRS` — the SB-CRASH-04 / Keycloak-Gap-9 blind spill, default-on
+since 2026-08-03 via `precise_reg_spill_disabled()`. The deopt stub is not on
+this path at all. Count the stores before naming the emitter.
+
+### What it costs: 1.178x
+
+`CRATONVM_NO_PRECISE_REG_SPILL=1` removes the blind spill at *every* safepoint —
+98 of `bottomUpTree`'s 692 instructions (692 → 594, `len=3874` → `3188`), which
+is 7 safepoints x 14. Measured on `-Xmx16g`, 10 interleaved pairs with the order
+flipped on alternate pairs, per-**process** user CPU because the host was at
+load 25:
+
+| | user CPU per run | median |
+|---|---|---:|
+| default | 2.20 2.18 2.18 2.18 2.23 2.08 2.12 2.20 2.13 2.12 | 2.18s |
+| `NO_PRECISE_REG_SPILL=1` | 1.79 1.82 1.84 1.74 1.87 1.87 1.86 1.83 1.88 1.86 | **1.85s** |
+
+**1.178x, ranges disjoint.** That is the ceiling for any work on this spill.
+
+### What can be claimed from it, and what cannot
+
+Not all of it. The spill exists so the conservative `[scanner_sp, entry_sp)`
+walk can see an oop that lives only in a register when the collector stops the
+world, and a collector only stops a thread at a safepoint. So the question at
+each safepoint is: *can a collection actually be reached from here?*
+
+* **Self-call safepoints — yes.** `bottomUpTree` and `itemCheck` are directly
+  self-recursive, and a call collects. `can_elide_self_call_register_spill`
+  exists for exactly this shape and correctly refuses both: `itemCheck(Node n)`
+  has a reference local in a register, and `bottomUpTree`'s recursive site has
+  the half-built `Node` live on the operand stack, so
+  `collect_live_oop_homes()` is non-empty and moving-young needs the precise
+  publication. Roughly two thirds of the executed spills are these, and they
+  stay. (This also retires the "`CRATONVM_JIT_MY_SELFCALL_PROOF=0` is inert"
+  observation below: the proof was never firing, and it should not.)
+* **`new` safepoints — no.** Under `skip_post_init_helper` the inline-TLAB arm
+  emits **no call at all** between the safepoint and the merge point: layout
+  guard, cached-thread load, cursor bump, header stores, cursor commit, jump.
+  Nothing there can collect, so all 14 stores are dead on the path that
+  actually allocates. They are live only on the three slow-path edges, which
+  converge on `new_object`.
+
+`perf/alloc-spill-sink-20260806` sinks them: the three registers the fast path
+clobbers (RAX, R10, R11) stay at the safepoint, the other eleven move to the
+slow-path label, where their value is still their safepoint value precisely
+because the fast path does not touch them. Same fourteen slots, same layout.
+A partition test pins `ALLOC_FAST_PATH_CLOBBERS` and its complement against
+`ALL_SPILL_GPRS`, because a gap there is not a slow benchmark but a live oop
+the root scan never sees.
+
+It also drops the inline `get_current_thread` fallback — a CALL clobbers the
+whole caller-saved file, which would invalidate the eleven registers spilled
+later, and `emit_prologue` writes that slot on every entry anyway, so a null
+read means a genuinely non-Java thread and the fallback would have diverted
+too.
 
 ## Things that were tried and are NOT the answer
 
