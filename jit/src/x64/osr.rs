@@ -223,6 +223,12 @@ pub(super) fn publish_entry_metadata(
     // orig_code_len` when the rewriter is unarmed. A mismatch is treated
     // exactly like a contract violation at the end of this function — no OSR
     // metadata at all — because it is the same trade for the same reason.
+    // Output-pc-space snapshot of "is this pc an OSR entry at all", taken
+    // BEFORE the conversion below moves the vector into bci space. The
+    // seed-collision check runs in output-pc space (that is the space
+    // `osr_block_live_in` is in) and must not flag a block start that OSR can
+    // never enter.
+    let is_entry_pc: Vec<bool> = osr_entry_native.iter().map(|&o| o >= 0).collect();
     let mut coordinates_agree = true;
     let entry_in_bci_space = match loop_xform {
         Some(x) => {
@@ -339,7 +345,21 @@ pub(super) fn publish_entry_metadata(
         // is masked if (and only if) its register is genuinely shared.
         let kinds = classify_local_kinds(code, code_len, num_locals);
         let high_halves = wide_local_high_halves(code, code_len);
-        for hh in pure_high_halves(&kinds, &high_halves) {
+        // Defect switch, default OFF. `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES=1`
+        // restores the pre-`14a2740859` strip — every slot the whole-method scan
+        // calls a high half, including the ones that are a live cat-1 local in a
+        // disjoint range. That is the `Arrays.sort(long[])` miscompile, and it
+        // exists so `[osr-seed-stripped]` can be shown going RED on a known
+        // defect before any run of it is read as a clean bill of health.
+        let strip: Vec<usize> =
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES")
+                .is_some()
+            {
+                (0..num_locals).filter(|&i| high_halves.contains(&i)).collect()
+            } else {
+                pure_high_halves(&kinds, &high_halves)
+            };
+        for hh in strip {
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
             }
@@ -432,6 +452,110 @@ pub(super) fn publish_entry_metadata(
         }
         osr_dead_mask[pc] = hazardous;
     }
+    // ── The seed-collision invariant ──────────────────────────────────
+    //
+    // The three mechanisms above (the pure-high-half strip, the per-PC dead
+    // mask, the hazardous refinement) exist to guarantee one thing: at an entry
+    // the trampoline can take, seeding locals into their homes in ASCENDING
+    // INDEX ORDER must not destroy a value it needs. Nothing asserted it.
+    //
+    // Two filters make the difference between a detector and a false-alarm
+    // generator, and both were learned by getting them wrong:
+    //
+    // * **Only entries OSR can take.** `osr_block_live_in` holds EVERY basic
+    //   block start; OSR enters a loop header with `osr_entry_native >= 0` and
+    //   a ZERO mask (`can_osr_enter_with` refuses a non-zero one outright).
+    // * **Only when the overwritten local is LIVE.** Two DEAD locals sharing a
+    //   register overwrite each other harmlessly, and the 2026-07-27 refinement
+    //   deliberately permits exactly that. Counting those reported 5251
+    //   "collisions" on a `SortProbe` run that passes — a detector nobody would
+    //   ever be able to act on.
+    //
+    // What survives both is the real hazard: a seed that lands on a live value.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SEED_COLLISION").is_some() {
+        let (mut takeable, mut hits) = (0usize, 0usize);
+        for &(pc, live_in) in osr_block_live_in {
+            if !is_entry_pc.get(pc).copied().unwrap_or(false) {
+                continue;
+            }
+            let m = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            if m != 0 {
+                continue; // `can_osr_enter` refuses this entry outright
+            }
+            takeable += 1;
+            for c in seed_collisions_at(m, num_locals, &osr_local_assignments, &osr_xmm_assignments)
+            {
+                if (live_in >> c.first) & 1 == 0 {
+                    continue; // the destroyed value was dead anyway
+                }
+                hits += 1;
+                eprintln!(
+                    "[osr-seed-collision] {method_label} entry_pc={pc} {} {} holds LIVE local {}                      then OVERWRITTEN by local {} (live_in={live_in:#x})",
+                    c.file, c.reg, c.first, c.second
+                );
+            }
+        }
+        // The SECOND invariant in this family, and the one that actually
+        // produced `Arrays.sort(long[])`'s garbage index: a local the compiled
+        // body reads from a REGISTER, that is LIVE at the entry, and whose OSR
+        // register assignment was stripped — so the trampoline seeds only its
+        // frame slot and the body reads a register nobody wrote.
+        //
+        // `reg_for_local` is deliberately unaffected by the strip above, so the
+        // two vectors disagreeing on a live local is exactly that bug. It is a
+        // different shape from a seed collision (nothing is overwritten; a value
+        // is simply never delivered) and no amount of collision-scanning finds
+        // it, which is why it gets its own pass over the same entries.
+        let mut stripped_live = 0usize;
+        for &(pc, live_in) in osr_block_live_in {
+            if !is_entry_pc.get(pc).copied().unwrap_or(false) {
+                continue;
+            }
+            if osr_dead_mask.get(pc).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            for i in 0..num_locals.min(64) {
+                if (live_in >> i) & 1 == 0 {
+                    continue;
+                }
+                let body_home = local_assignments.get(i).copied().flatten();
+                let seeded = osr_local_assignments.get(i).copied().flatten();
+                if body_home.is_some() && seeded.is_none() {
+                    stripped_live += 1;
+                    eprintln!(
+                        "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{} in the body but the trampoline seeds no register for it",
+                        body_home.unwrap()
+                    );
+                }
+            }
+        }
+        // Always emit the denominators: "0" and "the filter excluded
+        // everything" are otherwise the same output, and this filter has
+        // already been wrong in exactly that direction once.
+        eprintln!(
+            "[osr-seed-scan] {method_label} takeable_entries={takeable}              live_collisions={hits} stripped_live={stripped_live}"
+        );
+    }
+    // ── The seed-collision invariant ─────────────────────────────────
+    //
+    // Measure the PRECONDITION instead of hunting the corruption. Every OSR
+    // miscompile in this family — `Arrays.sort(long[])`'s garbage index, the
+    // ES-tdigest XMM one — is downstream of one mechanical fact: the trampoline
+    // seeds locals into registers in ASCENDING INDEX ORDER, so if two locals it
+    // seeds at the same entry PC share a register, the higher index silently
+    // overwrites the lower one. Everything above (the pure-high-half strip, the
+    // per-PC dead mask, the hazardous refinement) exists to make that
+    // impossible. Nothing checked it.
+    //
+    // This asks the question directly, per entry PC, over the metadata about to
+    // be published. It is a *detector*, not a guard: it reports and does not
+    // refuse, because a false positive would silently disable OSR on a hot
+    // method and that trade needs evidence first.
+    //
+    // One run over a workload answers "does this program contain a method whose
+    // OSR metadata would clobber?" and NAMES it — the question the loader/zip
+    // cluster page could not ask, because its only oracle was a failure that had
+    // stopped occurring.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
         // Report the mask that is actually published, alongside the blanket
         // "every dead register-resident local" set it is refined from, so the
@@ -545,5 +669,145 @@ pub(super) fn publish_entry_metadata(
         cm.osr_dead_mask = None;
         cm.osr_local_assignments = None;
         cm.osr_xmm_assignments = None;
+    }
+}
+
+/// One "the trampoline would overwrite a value it already seeded" event.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SeedCollision {
+    /// `"GPR"` or `"XMM"` — different register files, never aliasing.
+    pub file: &'static str,
+    /// The shared home, e.g. `r12` / `x9`.
+    pub reg: String,
+    /// The lower local index — seeded first, then lost.
+    pub first: usize,
+    /// The higher local index, which overwrites it.
+    pub second: usize,
+}
+
+/// Every seed collision the OSR trampoline would commit at one entry PC.
+///
+/// The trampoline loads `jit_locals[i]` into local `i`'s home **in ascending
+/// index order**, skipping any `i` set in `dead_mask`. So if two locals it does
+/// seed share a home, the higher index silently overwrites the lower — which is
+/// the mechanical root of every miscompile in this family
+/// (`arrays-sort-long-osr-miscompile`, the ES-tdigest XMM one).
+///
+/// Three mechanisms in `publish_entry_metadata` exist to make this impossible:
+/// the pure-high-half strip, the per-entry-PC dead mask, and the 2026-07-27
+/// hazardous refinement. This is the assertion that they succeeded. It is a
+/// pure function of the published metadata precisely so it can be tested
+/// against a *known* collision — a detector whose only evidence is "it printed
+/// nothing on a workload" is indistinguishable from one that cannot print.
+pub(crate) fn seed_collisions_at(
+    dead_mask: u64,
+    num_locals: usize,
+    gpr: &[Option<u8>],
+    xmm: &[Option<u8>],
+) -> Vec<SeedCollision> {
+    let mut out = Vec::new();
+    let mut seen_gpr: [Option<usize>; 16] = [None; 16];
+    let mut seen_xmm: [Option<usize>; 16] = [None; 16];
+    for i in 0..num_locals.min(64) {
+        if (dead_mask >> i) & 1 == 1 {
+            continue; // the trampoline skips this one
+        }
+        if let Some(r) = gpr.get(i).copied().flatten() {
+            let slot = &mut seen_gpr[(r & 0x0F) as usize];
+            if let Some(prev) = *slot {
+                out.push(SeedCollision {
+                    file: "GPR",
+                    reg: format!("r{r}"),
+                    first: prev,
+                    second: i,
+                });
+            }
+            *slot = Some(i);
+        }
+        if let Some(r) = xmm.get(i).copied().flatten() {
+            let slot = &mut seen_xmm[(r & 0x0F) as usize];
+            if let Some(prev) = *slot {
+                out.push(SeedCollision {
+                    file: "XMM",
+                    reg: format!("x{r}"),
+                    first: prev,
+                    second: i,
+                });
+            }
+            *slot = Some(i);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod seed_collision_tests {
+    use super::*;
+
+    /// The shape `mixedInsertionSort` actually had: slot 7 is `long ai`'s dead
+    /// high half in one region and the live `int i` counter in another, so it
+    /// keeps a register — and if the mask does not cover it at a PC where it is
+    /// the dead half, its seed lands on top of the live local sharing that home.
+    #[test]
+    fn an_unmasked_shared_home_is_reported_with_both_local_indices() {
+        // locals 5 and 7 both homed in r12; nothing masked.
+        let gpr = vec![None, None, None, None, None, Some(12u8), None, Some(12u8)];
+        let found = seed_collisions_at(0, 8, &gpr, &[]);
+        assert_eq!(
+            found,
+            vec![SeedCollision { file: "GPR", reg: "r12".into(), first: 5, second: 7 }],
+            "the detector must NAME both locals, not just count"
+        );
+    }
+
+    /// The same metadata with the mask doing its job is silent. This is the
+    /// arm that makes a field zero meaningful.
+    #[test]
+    fn masking_the_dead_one_silences_it() {
+        let gpr = vec![None, None, None, None, None, Some(12u8), None, Some(12u8)];
+        assert!(seed_collisions_at(1 << 7, 8, &gpr, &[]).is_empty());
+        assert!(seed_collisions_at(1 << 5, 8, &gpr, &[]).is_empty());
+    }
+
+    /// GPR r9 and XMM x9 are different register files and must never be
+    /// reported as sharing a home.
+    #[test]
+    fn gpr_and_xmm_with_the_same_number_do_not_alias() {
+        let gpr = vec![Some(9u8), None];
+        let xmm = vec![None, Some(9u8)];
+        assert!(seed_collisions_at(0, 2, &gpr, &xmm).is_empty());
+    }
+
+    /// Two XMM locals sharing a home is the ES-tdigest shape.
+    #[test]
+    fn xmm_sharing_is_caught_too() {
+        let xmm = vec![Some(8u8), Some(8u8)];
+        let found = seed_collisions_at(0, 2, &[], &xmm);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, "XMM");
+        assert_eq!((found[0].first, found[0].second), (0, 1));
+    }
+
+    /// Three locals on one register report two overwrites, each naming the
+    /// value that was actually lost — not one aggregate "r12 is crowded".
+    #[test]
+    fn each_overwrite_names_the_value_it_destroyed() {
+        let gpr = vec![Some(13u8), Some(13u8), Some(13u8)];
+        let found = seed_collisions_at(0, 3, &gpr, &[]);
+        assert_eq!(
+            found.iter().map(|c| (c.first, c.second)).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2)]
+        );
+    }
+
+    /// Locals at index >= 64 never get a register home (`color_graph` caps at
+    /// 64), and the mask is a u64, so the scan must stop there rather than
+    /// index past the bitset.
+    #[test]
+    fn the_scan_respects_the_64_local_cap() {
+        let mut gpr = vec![None; 70];
+        gpr[64] = Some(12u8);
+        gpr[65] = Some(12u8);
+        assert!(seed_collisions_at(0, 70, &gpr, &[]).is_empty());
     }
 }

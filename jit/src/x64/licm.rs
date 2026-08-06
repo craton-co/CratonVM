@@ -1491,6 +1491,54 @@ pub(super) const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
 
+/// The registers the inline-TLAB `new` fast path clobbers between the
+/// safepoint and its slow-path exits — and therefore the only ones whose
+/// blind spill cannot be sunk out of the fast path (see
+/// [`alloc_spill_sink_enabled`]).
+///
+/// `emit_inline_tlab_new`'s preamble, under the sink, is exactly:
+///
+/// ```asm
+/// mov  r11, imm64 / mov eax, [r11] / cmp eax, imm32 / jne slow   ; layout guard
+/// mov  rax, [rbp-thread_slot] / test rax,rax / je slow           ; cached thread
+/// mov  r10, rax / mov r11, [r10+cursor]                          ; cursor
+/// add  r11, 7 / and r11, -8 / lea rax, [r11+size]                ; bump
+/// cmp  rax, [r10+end] / ja slow                                  ; TLAB full
+/// ```
+///
+/// which writes RAX, R10 and R11 and nothing else. The sink additionally
+/// *requires* that shape: the `get_current_thread` fallback CALL the
+/// un-sunk path emits when the cached slot reads null would clobber the
+/// whole caller-saved file here, so under the sink a null cached thread
+/// diverts to the slow path (`new_object` resolves its own thread) instead.
+pub(super) const ALLOC_FAST_PATH_CLOBBERS: [u8; 3] = [RAX, R10, R11];
+
+/// Whether the per-safepoint blind GPR spill at an inline-TLAB `new` is sunk
+/// into the allocation's slow path. Default ON; opt out with
+/// `CRATONVM_JIT_NO_ALLOC_SPILL_SINK=1`.
+///
+/// The spill exists so the conservative `[scanner_sp, entry_sp)` frame walk
+/// can see an oop that lives only in a register when the collector stops the
+/// world. A stop only happens at a safepoint, and the inline-TLAB fast path
+/// under `skip_post_init_helper` contains **no call and no poll** — the
+/// header stores and the cursor commit are plain memory writes — so no
+/// collector can observe the frame between the `new` safepoint and the
+/// merge point. The 11 sinkable stores are therefore dead on the fast path
+/// and live only on the three slow-path edges, where they are emitted.
+///
+/// Measured ceiling for the whole blind spill on `CratonBench bintrees`:
+/// 1.178x (per-process user CPU, 10 interleaved pairs, disjoint ranges) via
+/// `CRATONVM_NO_PRECISE_REG_SPILL=1`, which removes it at every safepoint.
+/// This sink claims only the allocation sites' share of that; the self-call
+/// safepoints keep their spill, because a call genuinely can collect.
+pub(super) fn alloc_spill_sink_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ALLOC_SPILL_SINK").is_none()
+    })
+}
+
 /// Whether any local that could hold an object reference currently lives only in
 /// a register — the "must spill at this safepoint" question, factored out of
 /// [`Compiler::can_elide_self_call_register_spill`] so it is unit-testable

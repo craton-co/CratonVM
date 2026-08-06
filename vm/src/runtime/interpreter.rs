@@ -4558,11 +4558,12 @@ fn execute_frame_from_index(
         // Handle any pending runtime error from the previous iteration's fast path.
         if let Some((re, invoke_pc)) = pending_runtime_error.take() {
             if aioobe2_dbg() {
-                if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &re {
+                if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &re {
                     let f = &thread.frames[frame_idx];
                     eprintln!(
-                        "[AIOOBE2] index={} class={} method={}{} pc={}",
+                        "[AIOOBE2] index={} message={} class={} method={}{} pc={}",
                         index,
+                        message.as_deref().unwrap_or("<none>"),
                         f.class_name(),
                         f.method_name(),
                         f.method_descriptor(),
@@ -6488,7 +6489,7 @@ fn execute_frame_from_index(
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
-                                RuntimeError::ArrayIndexOutOfBoundsException { index },
+                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
                                 saved_pc,
                             ));
                             continue;
@@ -6503,7 +6504,7 @@ fn execute_frame_from_index(
                             Err(i) => {
                                 let _ = frame;
                                 pending_runtime_error = Some((
-                                    RuntimeError::ArrayIndexOutOfBoundsException { index: i },
+                                    RuntimeError::aioobe(i, shared.mem.heap.array_length(arr_ref) as i32),
                                     saved_pc,
                                 ));
                                 continue;
@@ -6554,7 +6555,7 @@ fn execute_frame_from_index(
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
-                                RuntimeError::ArrayIndexOutOfBoundsException { index },
+                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
                                 saved_pc,
                             ));
                             continue;
@@ -6570,7 +6571,7 @@ fn execute_frame_from_index(
                             Err(i) => {
                                 let _ = frame;
                                 pending_runtime_error = Some((
-                                    RuntimeError::ArrayIndexOutOfBoundsException { index: i },
+                                    RuntimeError::aioobe(i, shared.mem.heap.array_length(arr_ref) as i32),
                                     saved_pc,
                                 ));
                                 continue;
@@ -6602,7 +6603,7 @@ fn execute_frame_from_index(
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
-                                RuntimeError::ArrayIndexOutOfBoundsException { index },
+                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
                                 saved_pc,
                             ));
                             continue;
@@ -6653,7 +6654,7 @@ fn execute_frame_from_index(
                             Err(i) => {
                                 let _ = frame;
                                 pending_runtime_error = Some((
-                                    RuntimeError::ArrayIndexOutOfBoundsException { index: i },
+                                    RuntimeError::aioobe(i, shared.mem.heap.array_length(arr_ref) as i32),
                                     saved_pc,
                                 ));
                                 continue;
@@ -8152,7 +8153,9 @@ fn alloc_multi_array(
                 .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
-                .map_err(|idx| RuntimeError::ArrayIndexOutOfBoundsException { index: idx })?;
+                .map_err(|idx| {
+                    RuntimeError::aioobe(idx, shared.mem.heap.array_length(arr) as i32)
+                })?;
         }
         Ok(arr)
     }

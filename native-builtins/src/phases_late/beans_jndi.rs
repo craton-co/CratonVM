@@ -11,7 +11,7 @@
 use super::*;
 
 // =============================================================================
-// java.util.prefs.Preferences — 2-field synthetic (data=0 HashMap, name=1 String)
+// java.util.prefs.Preferences — 6-field synthetic (see `p72_alloc_prefs`)
 // =============================================================================
 
 /// Synthetic `java.util.prefs.Preferences` layout:
@@ -20,6 +20,7 @@ use super::*;
 ///   2: parent   (Preferences — null for a root, per `Preferences.parent()`)
 ///   3: children (HashMap<String,Preferences> — nodes created via `node()`)
 ///   4: removed  (int flag — set by `removeNode()`)
+///   5: user     (int flag — 1 = user tree, 0 = system tree)
 ///
 /// Slots 2 and 3 were added in stub-removal wave 2: without a parent link
 /// `parent()` could only ever answer null, and without a child registry
@@ -32,8 +33,15 @@ use super::*;
 /// (`AbstractPreferences.sync2()` is a removed-check, a `syncSpi()` that is
 /// empty when there is no persistent store, and a recursion over cached
 /// children) — without it those two really were unconditional no-ops.
-pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 5);
+///
+/// Slot 5 was added with `isUserNode()`. `userRoot()` and `systemRoot()` used
+/// to return objects that were indistinguishable in every observable way, so
+/// there was nothing `isUserNode()` could have answered from — it was simply
+/// not registered, and `AbstractPreferences.toString()`, which is defined as
+/// `(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()`,
+/// had no state to render.
+pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> ObjectRef {
+    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 6);
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
@@ -51,8 +59,26 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(prefs, 2, Value::Object(None));
     ctx.set_field(prefs, 3, Value::Object(None));
     ctx.set_field(prefs, 4, Value::Int(0));
+    ctx.set_field(prefs, 5, Value::Int(if user { 1 } else { 0 }));
     ctx.unpin_native_roots(prefs_pin);
     prefs
+}
+
+/// Whether this node belongs to the user tree rather than the system tree.
+///
+/// A receiver with no slot 5 — a node built against an older layout, or a
+/// foreign `AbstractPreferences` subclass that reached this shim through the
+/// inheritance walk — answers `true`, matching `Preferences`' own bias toward
+/// the user tree (`userRoot`/`userNodeForPackage` are the documented default
+/// entry points, and the system tree is the one a caller has to ask for by
+/// name).
+fn p72_prefs_is_user(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if ctx.object_num_fields(this) > 5 {
+        if let Value::Int(v) = ctx.get_field(this, 5) {
+            return v != 0;
+        }
+    }
+    true
 }
 
 /// Ancestor-walk bound — a `Preferences` tree cannot cycle, but slot 2 is a raw
@@ -80,6 +106,180 @@ fn p72_prefs_removed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
         }
     }
     false
+}
+
+/// The root of this node's tree: the ancestor with no parent.
+///
+/// `Preferences` paths beginning with `/` are resolved from here, and `"/"`
+/// names it outright. Bounded by `PREFS_MAX_DEPTH` for the same reason
+/// `p72_prefs_removed` is.
+fn p72_prefs_root(ctx: &dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    let mut cur = this;
+    for _ in 0..PREFS_MAX_DEPTH {
+        if ctx.object_num_fields(cur) < 3 {
+            return cur;
+        }
+        match ctx.get_field(cur, 2) {
+            Value::Object(Some(parent)) => cur = parent,
+            _ => return cur,
+        }
+    }
+    cur
+}
+
+/// `Preferences.MAX_NAME_LENGTH`.
+const PREFS_MAX_NAME_LENGTH: usize = 80;
+
+/// Validate and split the non-root part of a `Preferences` path into its name
+/// segments.
+///
+/// `AbstractPreferences` walks this with a `StringTokenizer(path, "/", true)`
+/// that hands back the separators as tokens, and rejects two shapes: a `/`
+/// where a name was expected (`"Consecutive slashes in path"`), and a path
+/// that runs out of tokens right after a separator (`"Path ends with slash"`).
+/// Splitting on `/` and asking WHICH segment came back empty is the same test
+/// — a trailing empty segment is the second case, an empty segment anywhere
+/// else is the first — and it keeps the messages identical to the ones a
+/// caller catching `IllegalArgumentException` would see on HotSpot.
+fn p72_prefs_split_path(rest: &str) -> Result<Vec<&str>, String> {
+    let segments: Vec<&str> = rest.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            return Err(if i == last {
+                "Path ends with slash".to_string()
+            } else {
+                "Consecutive slashes in path".to_string()
+            });
+        }
+        if seg.len() > PREFS_MAX_NAME_LENGTH {
+            return Err(format!("Node name {seg} too long"));
+        }
+    }
+    Ok(segments)
+}
+
+/// Resolve ONE path segment to a child node, creating it if absent.
+///
+/// This is the whole of the old `node()` closure body, lifted out so the path
+/// walk can reuse it segment by segment instead of duplicating the pinning
+/// discipline: every map call and every allocation below can trigger a moving
+/// young collection, and each live reference is carried across it through
+/// `pin_native_root` / `read_native_pin` (native stale-local family).
+fn p72_prefs_child_or_create(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_val: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let Some(children) = p72_prefs_children(ctx, this) else {
+        // Pre-wave-2 layout (no child registry): fall back to the old
+        // detached-node behaviour rather than failing.
+        let user = p72_prefs_is_user(ctx, this);
+        let name_pin = pinned_object_value(ctx, name_val);
+        let p = p72_alloc_prefs(ctx, user);
+        let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+        ctx.set_field(p, 1, name_val);
+        if let Some((h, _)) = name_pin {
+            ctx.unpin_native_roots(h);
+        }
+        return Ok(p);
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let children_pin = ctx.pin_native_root(children);
+    let name_pin = pinned_object_value(ctx, name_val);
+    let existing = cratonvm_native_collections::native_map_get_pub(
+        ctx,
+        &[Value::Object(Some(children)), name_val],
+    )?;
+    if let Some(Value::Object(Some(found))) = existing {
+        ctx.unpin_native_roots(this_pin);
+        return Ok(found);
+    }
+    // The child belongs to whichever tree its parent does — `isUserNode()` is
+    // a property of the TREE, not of the node. `this` is re-read through its
+    // pin first: the map lookup above can have moved it.
+    let this = ctx.read_native_pin(this_pin, this);
+    let user = p72_prefs_is_user(ctx, this);
+    let child = p72_alloc_prefs(ctx, user);
+    let child_pin = ctx.pin_native_root(child);
+    let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.set_field(child, 1, name_val);
+    let this = ctx.read_native_pin(this_pin, this);
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.set_field(child, 2, Value::Object(Some(this)));
+    let children = ctx.read_native_pin(children_pin, children);
+    let child = ctx.read_native_pin(child_pin, child);
+    cratonvm_native_collections::native_map_put_pub(
+        ctx,
+        &[
+            Value::Object(Some(children)),
+            name_val,
+            Value::Object(Some(child)),
+        ],
+    )?;
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.unpin_native_roots(this_pin);
+    Ok(child)
+}
+
+/// Resolve one path segment WITHOUT creating anything — `nodeExists`'s half of
+/// the pair, which the JDK splits the same way (`getChild` rather than
+/// `childSpi`).
+fn p72_prefs_child_lookup(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_val: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if ctx.object_num_fields(this) < 4 {
+        return Ok(None);
+    }
+    // Read slot 3 directly rather than through `p72_prefs_children`: a pure
+    // query must not create the registry as a side effect.
+    let Value::Object(Some(children)) = ctx.get_field(this, 3) else {
+        return Ok(None);
+    };
+    let found = cratonvm_native_collections::native_map_get_pub(
+        ctx,
+        &[Value::Object(Some(children)), name_val],
+    )?;
+    Ok(match found {
+        Some(Value::Object(Some(child))) => Some(child),
+        _ => None,
+    })
+}
+
+/// Walk a validated path from `start`, resolving each segment with `step`.
+///
+/// `start` is re-pinned around every `create_string`, because that allocation
+/// can move it and the next step is a field read on it.
+fn p72_prefs_walk<F>(
+    ctx: &mut dyn NativeContext,
+    start: ObjectRef,
+    segments: &[&str],
+    mut step: F,
+) -> Result<Option<ObjectRef>, MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, ObjectRef, Value) -> Result<Option<ObjectRef>, MethodCallFailed>,
+{
+    let mut cur = start;
+    for seg in segments {
+        let cur_pin = ctx.pin_native_root(cur);
+        let name = ctx.create_string(seg);
+        let here = ctx.read_native_pin(cur_pin, cur);
+        let next = step(ctx, here, Value::Object(Some(name)))?;
+        ctx.unpin_native_roots(cur_pin);
+        match next {
+            Some(child) => cur = child,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// `IllegalArgumentException` with the message `AbstractPreferences` uses.
+fn p72_prefs_bad_path(message: String) -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException { message }.into()
 }
 
 /// `IllegalStateException("Node has been removed.")` — the exact message
@@ -147,7 +347,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, true);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -156,7 +356,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, false);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -165,7 +365,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, true);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -174,7 +374,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, false);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -203,6 +403,13 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             if ctx.object_num_fields(this) > 4 {
                 ctx.set_field(this, 4, Value::Int(0));
             }
+            // Slot 5 (user/system tree). Real `isUserNode()` is
+            // `root == Preferences.userRoot()`, so a node that roots ITSELF —
+            // which is what a no-arg `new` produces — is not in the user tree
+            // however it was built, and HotSpot renders it "System".
+            if ctx.object_num_fields(this) > 5 {
+                ctx.set_field(this, 5, Value::Int(0));
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         });
@@ -221,62 +428,41 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;)Ljava/util/prefs/Preferences;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
-                // Per the Preferences spec the empty path names THIS node.
-                let name_txt = match name_val {
+                let path = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
-                if name_txt.is_empty() {
+                if p72_prefs_removed(ctx, this) {
+                    return Err(p72_prefs_removed_ex());
+                }
+                // Per the Preferences spec the empty path names THIS node and
+                // `"/"` names the root.
+                if path.is_empty() {
                     return Ok(Some(Value::Object(Some(this))));
                 }
-                let Some(children) = p72_prefs_children(ctx, this) else {
-                    // Pre-wave-2 layout (no child registry): fall back to the
-                    // old detached-node behaviour rather than failing.
-                    let name_pin = pinned_object_value(ctx, name_val);
-                    let p = p72_alloc_prefs(ctx);
-                    let name_val = read_pinned_object_value(ctx, name_pin, name_val);
-                    ctx.set_field(p, 1, name_val);
-                    if let Some((h, _)) = name_pin {
-                        ctx.unpin_native_roots(h);
-                    }
-                    return Ok(Some(Value::Object(Some(p))));
-                };
-                // Pin everything carried across the map calls and the child
-                // allocation below — each can trigger a moving young GC
-                // (native stale-local family).
-                let this_pin = ctx.pin_native_root(this);
-                let children_pin = ctx.pin_native_root(children);
-                let name_pin = pinned_object_value(ctx, name_val);
-                let existing = cratonvm_native_collections::native_map_get_pub(
-                    ctx,
-                    &[Value::Object(Some(children)), name_val],
-                )?;
-                if let Some(v @ Value::Object(Some(_))) = existing {
-                    ctx.unpin_native_roots(this_pin);
-                    return Ok(Some(v));
+                if path == "/" {
+                    return Ok(Some(Value::Object(Some(p72_prefs_root(ctx, this)))));
                 }
-                let child = p72_alloc_prefs(ctx);
-                let child_pin = ctx.pin_native_root(child);
-                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
-                let child = ctx.read_native_pin(child_pin, child);
-                ctx.set_field(child, 1, name_val);
-                let this = ctx.read_native_pin(this_pin, this);
-                let child = ctx.read_native_pin(child_pin, child);
-                ctx.set_field(child, 2, Value::Object(Some(this)));
-                let children = ctx.read_native_pin(children_pin, children);
-                let child = ctx.read_native_pin(child_pin, child);
-                cratonvm_native_collections::native_map_put_pub(
-                    ctx,
-                    &[
-                        Value::Object(Some(children)),
-                        name_val,
-                        Value::Object(Some(child)),
-                    ],
-                )?;
-                let child = ctx.read_native_pin(child_pin, child);
-                ctx.unpin_native_roots(this_pin);
-                Ok(Some(Value::Object(Some(child))))
+                // A leading `/` makes the path ABSOLUTE — resolved from the
+                // root of this node's tree, not from this node. Treating the
+                // whole argument as one child name (what this did before) meant
+                // `node("x/y/z")` produced a single node literally called
+                // "x/y/z": `absolutePath()` happened to render the same text,
+                // but `name()` answered `x/y/z` where every real
+                // implementation answers `z`, and `nodeExists("x")` was false
+                // immediately after creating it.
+                let (start, rest) = match path.strip_prefix('/') {
+                    Some(rest) => (p72_prefs_root(ctx, this), rest),
+                    None => (this, path.as_str()),
+                };
+                let segments = match p72_prefs_split_path(rest) {
+                    Ok(segments) => segments,
+                    Err(message) => return Err(p72_prefs_bad_path(message)),
+                };
+                let resolved = p72_prefs_walk(ctx, start, &segments, |ctx, here, name| {
+                    p72_prefs_child_or_create(ctx, here, name).map(Some)
+                })?;
+                Ok(Some(Value::Object(resolved)))
             },
         );
         r.register(
@@ -581,9 +767,50 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 1)))
         });
+        // absolutePath() — the slash-separated path from the root, which is
+        // what the method is FOR. It used to return slot 1, i.e. the same
+        // string as `name()`: a child of the root rendered as `alpha` where
+        // every real Preferences implementation says `/alpha`, and a root
+        // rendered as the empty string where the spec says `/`. The comment on
+        // `parent()` just below already noted that "absolutePath()-style upward
+        // walks terminated immediately" — this is that walk.
         r.register(cls, "absolutePath", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            let mut segments: Vec<String> = Vec::new();
+            let mut cur = this;
+            for _ in 0..PREFS_MAX_DEPTH {
+                if ctx.object_num_fields(cur) < 3 {
+                    break;
+                }
+                // A node with no parent is the root, and the root's own name
+                // is NOT part of the path — `/` is the whole of it.
+                let Value::Object(Some(parent)) = ctx.get_field(cur, 2) else {
+                    break;
+                };
+                if let Value::Object(Some(s)) = ctx.get_field(cur, 1) {
+                    segments.push(ctx.read_string(s).unwrap_or_default());
+                }
+                cur = parent;
+            }
+            segments.reverse();
+            let path = if segments.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", segments.join("/"))
+            };
+            let s = ctx.create_string(&path);
+            Ok(Some(Value::Object(Some(s))))
+        });
+        // isUserNode() — was not registered at all, because until slot 5 there
+        // was nothing to answer from: `userRoot()` and `systemRoot()` returned
+        // objects that differed in no observable way.
+        r.register(cls, "isUserNode", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(if p72_prefs_is_user(ctx, this) {
+                1
+            } else {
+                0
+            })))
         });
         // parent() — the node that created this one via `node()`, or null for
         // a root (`userRoot`/`systemRoot`/`*NodeForPackage`), which is exactly
@@ -609,43 +836,165 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         // told it does not exist. Answers from the slot-3 child registry now.
         // The empty path names this node, which exists unless it was removed
         // (we have no removeNode, so it always does).
+        // nodeExists(path) — the same path grammar as `node()`, resolved
+        // without creating anything. The two must agree: before this walked
+        // the path, `node("a/b")` created a node that `nodeExists("a/b")`
+        // then reported as present while `nodeExists("a")` said false.
         r.register(cls, "nodeExists", "(Ljava/lang/String;)Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
-            let name_txt = match name_val {
+            let path = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            if name_txt.is_empty() {
+            // The empty path asks about THIS node, and is the one query a
+            // removed node answers (`!removed`) rather than throwing.
+            if path.is_empty() {
+                return Ok(Some(Value::Int(if p72_prefs_removed(ctx, this) {
+                    0
+                } else {
+                    1
+                })));
+            }
+            if p72_prefs_removed(ctx, this) {
+                return Err(p72_prefs_removed_ex());
+            }
+            if path == "/" {
                 return Ok(Some(Value::Int(1)));
             }
-            if ctx.object_num_fields(this) < 4 {
-                return Ok(Some(Value::Int(0)));
-            }
-            // Read slot 3 directly rather than through `p72_prefs_children`:
-            // a pure query must not create the registry as a side effect.
-            let Value::Object(Some(children)) = ctx.get_field(this, 3) else {
-                return Ok(Some(Value::Int(0)));
+            let (start, rest) = match path.strip_prefix('/') {
+                Some(rest) => (p72_prefs_root(ctx, this), rest),
+                None => (this, path.as_str()),
             };
-            let found = cratonvm_native_collections::native_map_contains_key_pub(
-                ctx,
-                &[Value::Object(Some(children)), name_val],
-            )?;
-            let exists = matches!(found, Some(Value::Int(n)) if n != 0);
-            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
+            let segments = match p72_prefs_split_path(rest) {
+                Ok(segments) => segments,
+                Err(message) => return Err(p72_prefs_bad_path(message)),
+            };
+            let resolved = p72_prefs_walk(ctx, start, &segments, p72_prefs_child_lookup)?;
+            Ok(Some(Value::Int(if resolved.is_some() { 1 } else { 0 })))
         });
+        // toString() — `AbstractPreferences.toString`'s own definition:
+        //
+        //     (isUserNode() ? "User" : "System") + " Preference Node: "
+        //         + absolutePath()
+        //
+        // composed through VIRTUAL calls rather than by reading slot 1. That
+        // distinction is the whole point of this registration, and
+        // `shim_inheritance_guard` is what enforces it: a native on
+        // `java/util/prefs/AbstractPreferences` is inherited by every subclass
+        // that does not override the method — including user subclasses this
+        // VM has never seen, whose slot 1 is not a node name and may not exist
+        // at all. The previous shim rendered `Preferences[<slot 1>]`, which was
+        // neither the JDK's text nor safe to inherit; going through
+        // `isUserNode()`/`absolutePath()` means a subclass that overrides
+        // either one is rendered with ITS answer, exactly as the real
+        // implementation would.
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let name_val = ctx.get_field(this, 1);
-            let name = if let Value::Object(Some(s)) = name_val {
-                ctx.read_string(s).unwrap_or_default()
-            } else {
-                String::new()
+            let user = matches!(
+                ctx.invoke_virtual(this, "isUserNode", "()Z", &[])?,
+                Some(Value::Int(v)) if v != 0
+            );
+            let path = match ctx.invoke_virtual(this, "absolutePath", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
             };
-            let s = ctx.create_string(&format!("Preferences[{}]", name));
+            let tree = if user { "User" } else { "System" };
+            let s = ctx.create_string(&format!("{tree} Preference Node: {path}"));
             Ok(Some(Value::Object(Some(s))))
         });
     }
+
+    // AbstractPreferences(AbstractPreferences parent, String name) — the real
+    // protected constructor, and the thing that makes
+    // `class X extends AbstractPreferences` constructible at all. Without it a
+    // subclass's `super(parent, name)` raised NoSuchMethodError, so the
+    // contract `toString` is built on — "a subclass overrides an accessor and
+    // the rendering follows it" — could not be exercised at runtime in this
+    // mode, only asserted at the registry level.
+    //
+    // Registered on `AbstractPreferences` ONLY: `java.util.prefs.Preferences`
+    // declares no such constructor, and inventing one there would answer for a
+    // signature no caller can legally compile against.
+    r.register(
+        abs_pref,
+        "<init>",
+        "(Ljava/util/prefs/AbstractPreferences;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let parent = match args.get(1) {
+                Some(Value::Object(Some(p))) => Some(*p),
+                _ => None,
+            };
+            let name = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // The constructor's own validation, message for message. These are
+            // the only three things it can refuse, and a subclass author who
+            // trips one gets the same text HotSpot gives them.
+            match parent {
+                None if !name.is_empty() => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Root name '{name}' must be \"\""),
+                    }
+                    .into())
+                }
+                Some(_) if name.contains('/') => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Name '{name}' contains '/'"),
+                    }
+                    .into())
+                }
+                Some(_) if name.is_empty() => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "Illegal name: empty string".to_string(),
+                    }
+                    .into())
+                }
+                _ => {}
+            }
+            // `isUserNode()` is `root == Preferences.userRoot()`: a node that
+            // roots itself is not in the user tree, and a child is in whichever
+            // tree its parent is. Read before the allocations below, while the
+            // reference is still fresh.
+            let user = match parent {
+                Some(p) => p72_prefs_is_user(ctx, p),
+                None => false,
+            };
+            // Pin across the map/string allocations — each can move `this` and
+            // `parent` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let parent_pin = parent.map(|p| (ctx.pin_native_root(p), p));
+            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map_pin = ctx.pin_native_root(map);
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+            let this = ctx.read_native_pin(this_pin, this);
+            let map = ctx.read_native_pin(map_pin, map);
+            ctx.set_field(this, 0, Value::Object(Some(map)));
+            let name_str = ctx.create_string(&name);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this, 1, Value::Object(Some(name_str)));
+            let parent_val = match parent_pin {
+                Some((handle, p)) => Value::Object(Some(ctx.read_native_pin(handle, p))),
+                None => Value::Object(None),
+            };
+            // Guarded per slot, like the no-arg constructor above: a subclass
+            // whose layout is narrower than this synthetic one must not have
+            // writes land past its end.
+            if ctx.object_num_fields(this) > 3 {
+                ctx.set_field(this, 2, parent_val);
+                ctx.set_field(this, 3, Value::Object(None));
+            }
+            if ctx.object_num_fields(this) > 4 {
+                ctx.set_field(this, 4, Value::Int(0));
+            }
+            if ctx.object_num_fields(this) > 5 {
+                ctx.set_field(this, 5, Value::Int(if user { 1 } else { 0 }));
+            }
+            ctx.unpin_native_roots(this_pin);
+            Ok(None)
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -3002,4 +3351,61 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// Tests — the `Preferences` path grammar
+// =============================================================================
+
+#[cfg(test)]
+mod prefs_path_tests {
+    use super::{p72_prefs_split_path, PREFS_MAX_NAME_LENGTH};
+
+    /// The two malformed shapes `AbstractPreferences` names, with its exact
+    /// messages. The text matters: it is what a caller catching
+    /// `IllegalArgumentException` reads, and it was measured against HotSpot 25
+    /// rather than invented.
+    #[test]
+    fn split_path_rejects_the_two_shapes_the_jdk_rejects() {
+        assert_eq!(
+            p72_prefs_split_path("a/").unwrap_err(),
+            "Path ends with slash"
+        );
+        assert_eq!(
+            p72_prefs_split_path("a//b").unwrap_err(),
+            "Consecutive slashes in path"
+        );
+        // `node("//a")` reaches this function as "/a", because the caller has
+        // already stripped ONE leading slash to resolve from the root. An
+        // empty first segment is therefore a doubled slash, not a leading one.
+        assert_eq!(
+            p72_prefs_split_path("/a").unwrap_err(),
+            "Consecutive slashes in path"
+        );
+    }
+
+    /// A chain splits into its segments in order — this is the whole point of
+    /// the change: `node("x/y/z")` used to produce ONE node named `x/y/z`.
+    #[test]
+    fn split_path_yields_one_segment_per_name() {
+        assert_eq!(p72_prefs_split_path("x/y/z").unwrap(), vec!["x", "y", "z"]);
+        assert_eq!(p72_prefs_split_path("solo").unwrap(), vec!["solo"]);
+    }
+
+    /// 80 is the limit, not one past it. Asserting only the rejection would
+    /// pass against an off-by-one that rejects every legal 80-char name.
+    #[test]
+    fn split_path_bounds_the_name_length_at_the_jdk_limit() {
+        let at_limit = "z".repeat(PREFS_MAX_NAME_LENGTH);
+        assert!(
+            p72_prefs_split_path(&at_limit).is_ok(),
+            "a name of exactly MAX_NAME_LENGTH is legal"
+        );
+        let over = "z".repeat(PREFS_MAX_NAME_LENGTH + 1);
+        let message = p72_prefs_split_path(&over).unwrap_err();
+        assert!(
+            message.ends_with(" too long"),
+            "message names the offending node: {message}"
+        );
+    }
 }

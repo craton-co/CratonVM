@@ -186,15 +186,54 @@ real JDK bytecode instead of writing through to the backing collection. On the
 strict path the alternative was never a working `remove()` — it was an
 iteration that did not reach `next()`.
 
-### Still true, and not fixed here
+### The `--real-jdk` residual — CLOSED 2026-08-06, and it was a 5.4x speedup
 
-`StrictIterPrimitivesProbe` records one divergence that remains under
-`--real-jdk`: `Arrays.asList(a).iterator().getClass()` reports
-`java.util.HashMap$KeyItr` where HotSpot says `java.util.Arrays$ArrayItr`.
-Default mode still fabricates the iterator, because the fallback is reached
-only through the refusal. Converting the idiom outright would change every
-snapshot iterator in the VM, which is a measured decision of its own and not
-this change.
+`StrictIterPrimitivesProbe` recorded one divergence that survived the change
+above: `Arrays.asList(a).iterator().getClass()` reported
+`java.util.HashMap$KeyItr` where HotSpot says `java.util.Arrays$ArrayItr`,
+because default mode still fabricated the iterator and only the refusal path
+reached a real one. It was left open on the grounds that converting the idiom
+would change every snapshot iterator in the VM and so deserved its own
+measurement.
+
+It did. The measurement went the other way: building the real class is not a
+cost, it is **5.4x faster** (`probes/SnapshotIteratorCostProbe`, 50k iterations
+× 8 elements, interleaved in both orders across four alternations, identical
+checksums in every arm):
+
+| arm | ms |
+|---|---:|
+| fabricated `HashMap$KeyItr` | ~655 |
+| real `Arrays$ArrayItr` | **~120** |
+| HotSpot 25, for scale | ~1–11 |
+
+At 300k iterations the fabricated arm also degrades across rounds (3537 → 4046
+→ 4302 ms) where the real one stays flat.
+
+The reason is not the field write the arithmetic suggested. **A fabricated class
+has no bytecode**, so `hasNext`/`next` have to be registered natives — two
+`safe_native_call` trips per ELEMENT. The real class runs ordinary bytecode the
+JIT compiles and inlines. A fabricated stand-in is a performance tax and not
+only a fidelity bug, and that generalises past this site: wherever a
+`cratonvm/internal/*` or invented `java.util.*` class carries natives that a
+real class would execute as bytecode, the honest version is likely the fast one
+too.
+
+Choosing the replacement is the whole trick, and the rule is narrower than "use
+a real class": it has to be one whose fields are declared and writable BY NAME,
+so filling them is construction rather than fabrication —
+
+```text
+java.util.Arrays$ArrayItr                             cursor:int  a:Object[]
+java.util.concurrent.CopyOnWriteArrayList$COWIterator cursor:int  snapshot:Object[]
+```
+
+`probes/SnapshotIteratorShapeProbe` is the oracle, and it caught a second
+divergence it EXPOSED rather than introduced: `CopyOnWriteArrayList.iterator()`
+reported the generic iterator where HotSpot says `COWIterator`. It was equally
+wrong before, as `HashMap$KeyItr`; no probe had covered it. Diffing only the one
+line named in this record would have shipped a differently-wrong answer and
+called the residual closed.
 
 ## Verification, on both platforms
 

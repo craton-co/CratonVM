@@ -197,7 +197,10 @@ struct ThreadEntry {
     jmx_contended_monitor: Mutex<Option<ObjectRef>>,
     jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
     jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
-    jmx_locked_synchronizers: Mutex<Vec<ObjectRef>>,
+    /// Shared, so the owning thread can reach its own list without going
+    /// through [`ThreadRegistry::threads`] — see
+    /// [`ThreadRegistry::jmx_locked_synchronizers_of`].
+    jmx_locked_synchronizers: Arc<Mutex<Vec<ObjectRef>>>,
     jmx_contended_started: Mutex<Option<Instant>>,
     jmx_wait_started: Mutex<Option<Instant>>,
     jmx_blocked_count: AtomicU64,
@@ -455,7 +458,7 @@ impl ThreadRegistry {
             jmx_contended_monitor: Mutex::new(None),
             jmx_waiting_monitor: Mutex::new(None),
             jmx_locked_monitors: Mutex::new(Vec::new()),
-            jmx_locked_synchronizers: Mutex::new(Vec::new()),
+            jmx_locked_synchronizers: Arc::new(Mutex::new(Vec::new())),
             jmx_contended_started: Mutex::new(None),
             jmx_wait_started: Mutex::new(None),
             jmx_blocked_count: AtomicU64::new(0),
@@ -1360,6 +1363,101 @@ impl ThreadRegistry {
     /// A stale index entry naming a thread that has since exited resolves to
     /// `None` in `threads.get` and is simply dropped — the same no-op the scan
     /// performed for a thread whose entry was already gone.
+    /// This thread's own `jmx_locked_synchronizers` list, as a handle it can
+    /// hold and reach directly.
+    ///
+    /// The same shape as [`Self::gc_block_state_of`], and for the same reason:
+    /// a thread that needs its own entry on a hot path should not be taking the
+    /// registry-wide `RwLock` to find itself in a map. `None` for a thread that
+    /// is not registered, whose caller must then use the general
+    /// [`Self::set_jmx_owned_synchronizer`].
+    ///
+    /// Fetch once and keep it: the entry for a given `ThreadId` is inserted
+    /// exactly once (`next_id` is monotonic, so ids are never reused), so the
+    /// handle cannot go stale while the thread lives. After the thread is
+    /// reaped the handle keeps an orphaned list alive and nothing reads it,
+    /// which is the correct outcome for a thread that is gone.
+    pub fn jmx_locked_synchronizers_of(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<Mutex<Vec<ObjectRef>>>> {
+        self.threads
+            .read()
+            .get(&thread_id)
+            .map(|entry| Arc::clone(&entry.jmx_locked_synchronizers))
+    }
+
+    /// [`Self::set_jmx_owned_synchronizer`] for the case AQS actually performs:
+    /// the calling thread is the transition's subject, and its own list is the
+    /// only one that changes.
+    ///
+    /// `acquire` passes `Thread.currentThread()` and `release` passes `null`,
+    /// both from the owning thread, so `previous` is either `None` or the caller
+    /// itself on every transition a `ReentrantLock` generates. The general form
+    /// reads the registry `RwLock` and hashes the owner's `ThreadId` to find the
+    /// list it already knows — measured at 45.4 ns for one acquire/release pair
+    /// in `jit::helpers::jit_native_dispatch_profile`, on a path that runs twice
+    /// per uncontended lock/unlock pair.
+    ///
+    /// A genuine cross-thread steal (`previous` naming a peer) still takes the
+    /// registry route for that peer's list, so the recorded state is identical
+    /// either way — this only removes a lookup from the case that does not need
+    /// one. `own_list` must be the handle [`Self::jmx_locked_synchronizers_of`]
+    /// returned for `self_id`; passing any other list would silently split the
+    /// record the JMX snapshot reads from the one this writes.
+    pub fn set_jmx_owned_synchronizer_own(
+        &self,
+        self_id: ThreadId,
+        own_list: &Mutex<Vec<ObjectRef>>,
+        owner: Option<ThreadId>,
+        synchronizer: ObjectRef,
+    ) {
+        debug_assert!(
+            owner.is_none() || owner == Some(self_id),
+            "set_jmx_owned_synchronizer_own is for a self-owned transition;              owner={owner:?} self={self_id:?}"
+        );
+        let key = synchronizer.as_ptr() as usize;
+        let previous = {
+            let mut index = self.synchronizer_owner.lock();
+            match owner {
+                Some(owner) => index.insert(key, owner),
+                None => index.remove(&key),
+            }
+        };
+        match previous {
+            // Ownership was stolen from a peer without it releasing. Not a
+            // shape AQS produces; keep it exact rather than fast.
+            Some(previous) if previous != self_id => {
+                {
+                    let threads = self.threads.read();
+                    if let Some(entry) = threads.get(&previous) {
+                        entry
+                            .jmx_locked_synchronizers
+                            .lock()
+                            .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+                    }
+                }
+                if owner == Some(self_id) {
+                    own_list.lock().push(synchronizer);
+                }
+            }
+            // The caller already held it: a release clears it, and a repeated
+            // acquire (a reentrant setter re-run) must not double-count.
+            Some(_) => {
+                if owner.is_none() {
+                    own_list
+                        .lock()
+                        .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+                }
+            }
+            None => {
+                if owner == Some(self_id) {
+                    own_list.lock().push(synchronizer);
+                }
+            }
+        }
+    }
+
     pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
         let key = synchronizer.as_ptr() as usize;
         let previous = {
@@ -2655,6 +2753,91 @@ mod tests {
             .jmx_lock_snapshot(tid)
             .map(|snapshot| snapshot.3.iter().map(|o| o.as_ptr() as usize).collect())
             .unwrap_or_default()
+    }
+
+    /// [`ThreadRegistry::set_jmx_owned_synchronizer_own`] must record exactly
+    /// what the general form records, for **every** (previous owner, new owner)
+    /// combination — not only the two AQS actually generates.
+    ///
+    /// The fast form exists because the general one reads the registry-wide
+    /// `RwLock` to find a list the calling thread could have held a handle to.
+    /// That is only sound if the two are indistinguishable in their effect, and
+    /// the interesting combinations are the ones AQS does *not* produce: a
+    /// steal from a peer, and a release of a lock a peer owns. Both take the
+    /// fast form's fallback arm, and a divergence there would surface as a
+    /// `ThreadInfo.getLockedSynchronizers()` that names two owners for one lock
+    /// — silently, and only under JMX inspection.
+    ///
+    /// Driven as a table so a future arm cannot be added without a case.
+    #[test]
+    fn the_own_handle_transition_records_what_the_general_one_records() {
+        // (label, previous owner, new owner)
+        let cases: [(&str, Option<ThreadId>, Option<ThreadId>); 6] = [
+            ("first acquire by self", None, Some(ThreadId(1))),
+            ("reentrant acquire by self", Some(ThreadId(1)), Some(ThreadId(1))),
+            ("release by self", Some(ThreadId(1)), None),
+            ("steal from a peer", Some(ThreadId(2)), Some(ThreadId(1))),
+            ("release of a peer's lock", Some(ThreadId(2)), None),
+            ("release of an unowned lock", None, None),
+        ];
+        let (me, peer) = (ThreadId(1), ThreadId(2));
+        let lock = fake_synchronizer(0x2000);
+
+        for (label, previous, owner) in cases {
+            // Two registries, seeded identically, then driven one call apart.
+            let general = ThreadRegistry::new();
+            let own = ThreadRegistry::new();
+            for registry in [&general, &own] {
+                registry.register(me, "me", None);
+                registry.register(peer, "peer", None);
+                if let Some(previous) = previous {
+                    registry.set_jmx_owned_synchronizer(Some(previous), lock);
+                }
+            }
+
+            general.set_jmx_owned_synchronizer(owner, lock);
+            let own_list = own
+                .jmx_locked_synchronizers_of(me)
+                .expect("the handle must exist for a registered thread");
+            own.set_jmx_owned_synchronizer_own(me, &own_list, owner, lock);
+
+            for tid in [me, peer] {
+                assert_eq!(
+                    owned_synchronizers(&general, tid),
+                    owned_synchronizers(&own, tid),
+                    "{label}: the two forms disagree about what {tid:?} owns"
+                );
+            }
+        }
+    }
+
+    /// The handle must be the *same* list the JMX snapshot reads.
+    ///
+    /// This is the one way the fast form can be wrong without any of its own
+    /// logic being wrong: hand it a list that is not the registry's, and every
+    /// write lands somewhere `jmx_lock_snapshot` will never look. The `Arc` is
+    /// what makes them one list, and nothing else in the type system says so.
+    #[test]
+    fn the_handle_and_the_snapshot_are_the_same_list() {
+        let registry = ThreadRegistry::new();
+        let me = ThreadId(1);
+        registry.register(me, "me", None);
+        let handle = registry.jmx_locked_synchronizers_of(me).expect("registered");
+        handle.lock().push(fake_synchronizer(0x3000));
+        assert_eq!(
+            owned_synchronizers(&registry, me),
+            vec![0x3000],
+            "a write through the handle was invisible to jmx_lock_snapshot — \
+             the handle is not the registry's list"
+        );
+    }
+
+    /// An unregistered thread has no handle, which is what sends its caller to
+    /// the general form rather than to a private list nobody reads.
+    #[test]
+    fn an_unregistered_thread_has_no_synchronizer_handle() {
+        let registry = ThreadRegistry::new();
+        assert!(registry.jmx_locked_synchronizers_of(ThreadId(77)).is_none());
     }
 
     /// An AQS ownership transition must leave the synchronizer recorded against

@@ -68,6 +68,10 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
+// EINTR-transparent socket I/O — the shared retry primitive the blocking
+// socket and TLS paths funnel through. See the module docs for why
+// `SA_RESTART` does not cover the sockets CratonVM actually uses.
+pub mod eintr;
 pub mod nio_native;
 pub mod random_access_file;
 // T16.5: MulticastSocket overrides + shared helpers for async channels.
@@ -843,18 +847,14 @@ fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
 fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
     if off < 0 || len < 0 {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { len },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 { off } else { len }),
         )));
     }
     let end = (off as usize).checked_add(len as usize);
     match end {
         Some(end) if end <= arr_len => Ok(()),
         _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: off.saturating_add(len),
-            },
+            RuntimeError::aioobe_index_only(off.saturating_add(len)),
         ))),
     }
 }
@@ -1532,13 +1532,11 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 {
+                off
+            } else {
+                off.saturating_add(len)
+            }),
         )));
     }
     let off = off as usize;
@@ -1998,13 +1996,11 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 {
-                    off
-                } else {
-                    off.saturating_add(len)
-                },
-            },
+            RuntimeError::aioobe_index_only(if off < 0 {
+                off
+            } else {
+                off.saturating_add(len)
+            }),
         )));
     }
     let off = off as usize;

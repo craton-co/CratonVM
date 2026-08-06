@@ -2230,6 +2230,31 @@ pub struct ClassManager {
     /// Unbound until [`Self::bind_vm_id`] runs; see that method for the
     /// ordering requirement.
     metadata_realm: MetadataRealm,
+
+    /// Class files a `java.lang.instrument` agent has already rewritten, waiting
+    /// for the load that asked for them. Keyed by internal class name.
+    ///
+    /// # Why the bytes arrive from outside instead of a hook in here
+    ///
+    /// The JVMTI/`java.lang.instrument` contract is that a registered
+    /// `ClassFileTransformer` is handed every class file *before* it is parsed,
+    /// and the transformer is **Java code**. Every definition path in this file
+    /// runs under the VM's L10 class-manager write lock, and running Java under
+    /// that lock deadlocks the first time the transformer touches a class.
+    ///
+    /// So the transform runs one level up, in the VM crate, on a thread that
+    /// holds no class-manager lock (`SharedVm::load_class_transformed`): it
+    /// looks the bytes up with [`Self::find_class_bytes_delegated`], invokes the
+    /// chain, stages the result here, and then calls the ordinary load. The
+    /// staged entry is consumed by [`Self::load_class`] at the point the
+    /// untransformed bytes would otherwise have been read, so the whole rest of
+    /// the load — the per-name lock, the circularity guard, the class-bytes
+    /// cache, `ClassLoad`/`ClassPrepare` — is unchanged and sees only the final
+    /// bytes.
+    ///
+    /// Consumed on read (`remove`), so a staged entry can never outlive the load
+    /// it was produced for. Empty on every run with no agent installed.
+    pending_transformed_classes: FxHashMap<String, (SharedBytes, ClassLoaderId)>,
 }
 
 /// What the class-name index knows about a name, with the three "no single
@@ -2666,6 +2691,7 @@ impl ClassManager {
             // exists, so it has no `vm_identity` to record yet. `vm_init` calls
             // `bind_vm_id` as soon as it does.
             metadata_realm: MetadataRealm::new(),
+            pending_transformed_classes: FxHashMap::default(),
         }
     }
 
@@ -4584,6 +4610,21 @@ impl ClassManager {
 
         debug!(class = name, "Loading class (parent delegation)");
 
+        // A `java.lang.instrument` agent already rewrote this class file, one
+        // level up, off the lock (see `pending_transformed_classes`). Those
+        // bytes replace what parent delegation would have read — that IS the
+        // transform landing — and everything downstream (parse, class-bytes
+        // cache, ClassLoad/ClassPrepare) sees only the final definition, so the
+        // agent's view and the VM's view cannot diverge.
+        if let Some((bytes, loader_id)) = self.pending_transformed_classes.remove(name) {
+            return self.define_class_shared_with_options(
+                name,
+                bytes,
+                loader_id,
+                DefineClassOptions::default(),
+            );
+        }
+
         // Parent delegation: try bootstrap → extension → application
         match self.find_class_bytes_delegated(name) {
             Ok((bytes, loader_id)) => {
@@ -4815,6 +4856,46 @@ impl ClassManager {
     }
 
     /// Find class bytes using parent delegation.
+    /// Locate `name`'s class file through the built-in delegation chain
+    /// (bootstrap → extension → application) **without defining it**.
+    ///
+    /// The `java.lang.instrument` load-time transform needs the raw bytes and
+    /// the loader that would own them before it can offer them to an agent, and
+    /// it must do that with no class-manager lock held (see
+    /// [`Self::pending_transformed_classes`]). This is that read-only half of
+    /// [`Self::load_class`], exposed for exactly that caller; it takes `&self`,
+    /// so it can run under the read lock.
+    pub fn find_class_bytes_for_transform(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<u8>, ClassLoaderId), VmError> {
+        let (bytes, loader_id) = self.find_class_bytes_delegated(name)?;
+        Ok((bytes.to_vec(), loader_id))
+    }
+
+    /// Stage agent-transformed bytes for the next load of `name`.
+    ///
+    /// See [`Self::pending_transformed_classes`]. The caller has already run the
+    /// transformer chain; this hands the result to the load that will ask for
+    /// it. A second stage for the same name overwrites the first — the last
+    /// transform wins, which is the only ordering a single load can observe.
+    pub fn stage_transformed_class(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        loader_id: ClassLoaderId,
+    ) {
+        self.pending_transformed_classes
+            .insert(name.to_string(), (bytes.into(), loader_id));
+    }
+
+    /// Drop a staged entry without defining it. Used when the transform path
+    /// bails after staging (an aborted load must not leave bytes behind for an
+    /// unrelated later load of the same name to pick up).
+    pub fn discard_staged_transformed_class(&mut self, name: &str) {
+        self.pending_transformed_classes.remove(name);
+    }
+
     fn find_class_bytes_delegated(
         &self,
         name: &str,
@@ -11857,8 +11938,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // natives look implemented and store nothing.
         "java/net/DatagramSocket" => instance_fields(4),
         // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
-        // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
-        // map=0, name=1, parent=2, children=3, removed=4) per
+        // `net_channels::register_p72_datagram`, and Preferences = 6 (backing
+        // map=0, name=1, parent=2, children=3, removed=4, user=5) per
         // `beans_jndi::register_p72_preferences`.
         //
         // Both were ABSENT and fell to the `_ => vec![]` arm below, so a
@@ -11868,7 +11949,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // drops the write rather than erroring, so the natives looked
         // implemented while storing nothing.
         "java/net/DatagramPacket" => instance_fields(5),
-        "java/util/prefs/Preferences" => instance_fields(5),
+        // 6, not 5, since `isUserNode()` gained slot 5. A `new` that allocated
+        // 5 would drop the write silently — exactly the failure the comment
+        // above describes — and every node would then answer `isUserNode()`
+        // with the default rather than the tree it was created for.
+        "java/util/prefs/Preferences" => instance_fields(6),
+        // Same layout, and it is reachable now that
+        // `AbstractPreferences(AbstractPreferences, String)` is registered: a
+        // user `class X extends AbstractPreferences` is constructed through
+        // that constructor, and its slots have to exist before the constructor
+        // writes them.
+        "java/util/prefs/AbstractPreferences" => instance_fields(6),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -14010,7 +14101,8 @@ fn native_constant_surface_raw_slot_layout_audit() {
     for (class, minimum_slots) in [
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),
-        ("java/util/prefs/Preferences", 5),
+        ("java/util/prefs/Preferences", 6),
+        ("java/util/prefs/AbstractPreferences", 6),
         ("com/sun/net/httpserver/HttpServer", 6),
         ("com/sun/net/httpserver/HttpServerImpl", 6),
         ("sun/net/httpserver/HttpServerImpl", 6),

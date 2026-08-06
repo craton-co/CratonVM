@@ -803,9 +803,7 @@ fn native_unsafe_set_memory_consolidated(
                 if crate::unsafe_array_write_bytes(ctx, obj_ref, off, &fill) {
                     return Ok(None);
                 }
-                return Err(
-                    RuntimeError::ArrayIndexOutOfBoundsException { index: off as i32 }.into(),
-                );
+                return Err(RuntimeError::aioobe_index_only(off as i32).into());
             }
             // Object-field (non-array) target. `bytes` is treated as a slot
             // count in this slot-based model, so it MUST be bounded by the
@@ -920,9 +918,7 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
             _ => return Ok(None),
         };
         let buf = crate::unsafe_array_read_bytes(ctx, src_obj, src_addr as usize, bytes)
-            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException {
-                index: src_addr as i32,
-            })?;
+            .ok_or_else(|| RuntimeError::aioobe_index_only(src_addr as i32))?;
         if !ctx.copy_to_native_memory(dst_addr, &buf) {
             invalidate_arena_cache();
             return Err(RuntimeError::IllegalArgumentException {
@@ -951,10 +947,7 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
             .into());
         }
         if !crate::unsafe_array_write_bytes(ctx, dst_obj, dst_addr as usize, &buf) {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: dst_addr as i32,
-            }
-            .into());
+            return Err(RuntimeError::aioobe_index_only(dst_addr as i32).into());
         }
         return Ok(None);
     }
@@ -1168,23 +1161,20 @@ pub(crate) fn native_unsafe_define_class(
     let off = match args.get(3) {
         Some(Value::Int(o)) if *o >= 0 => *o as usize,
         Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
         _ => 0,
     };
     let len = match args.get(4) {
         Some(Value::Int(l)) if *l >= 0 => *l as usize,
         Some(Value::Int(_)) => {
-            return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into());
+            return Err(RuntimeError::aioobe_index_only(-1).into());
         }
         _ => 0,
     };
     let arr_len = ctx.array_length(byte_array);
     if off.saturating_add(len) > arr_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: off.saturating_add(len) as i32,
-        }
-        .into());
+        return Err(RuntimeError::aioobe_index_only(off.saturating_add(len) as i32).into());
     }
     let mut bytes = Vec::with_capacity(len);
     for i in 0..len {
