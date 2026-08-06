@@ -526,14 +526,77 @@ pub fn class_origin_epoch() -> u64 {
 impl Class {
     // ----- Provenance ------------------------------------------------------
 
+    /// **Question (2), and only question (2):** does this class have no class
+    /// file behind it, so dispatch must look for a native registered under its
+    /// **own exact name** instead of walking the hierarchy to an inherited
+    /// `java/lang/Object` body?
+    ///
+    /// [`is_synthetic_stub`](Self::is_synthetic_stub) used to answer two
+    /// unrelated questions at once:
+    ///
+    /// 1. *is this a compatibility substitution?* — the census and `--jdk-only`
+    ///    policy question. [`Class::origin`] is authoritative for that one, and
+    ///    `origin.is_compatibility_stub()` is how you ask it.
+    /// 2. *does this class have no bytecode of its own?* — this one, which the
+    ///    dispatch sites were actually asking.
+    ///
+    /// The two coincided only because every class the VM fabricated was tagged
+    /// `CompatibilityStub`, including ones that are not compatibility
+    /// substitutions at all. `java/lang/reflect/Proxy$Instance` — the shared
+    /// synthetic supertype of every generated `$ProxyN` — is
+    /// [`ClassOrigin::VmInternal`]: a generation artefact, not a stand-in for
+    /// absent bytes. Correcting its census row must not silently move it off
+    /// the dispatch branches it needs.
+    ///
+    /// # Why not `!origin.has_real_bytes()`
+    ///
+    /// Because [`ClassOrigin::VmInternal`] and [`ClassOrigin::VmArray`] both
+    /// answer "no real bytes", so that spelling would ALSO move every
+    /// `cratonvm/synthetic/AnonymousObject$N` (the allocation shape behind every
+    /// `HashMap` node in the VM) and every `cratonvm/synthetic/AmbiguousName$…`
+    /// stand-in onto branches they take today's non-stub arm of. That is a
+    /// `Compatible`-mode behaviour change on the busiest allocation shape there
+    /// is.
+    ///
+    /// # Why the method table is the discriminator
+    ///
+    /// A fabricated class's *only* callable surface is the native registered
+    /// under its own name; `synthetic_stub_ctor_methods` declares NATIVE-flagged
+    /// entries for exactly the fabricated names that have one. An
+    /// `AnonymousObject$N` has an empty method table and no registration —
+    /// nothing to find under its own name, so it belongs on the non-stub arm,
+    /// which is where it already is. `Proxy$Instance` has a NATIVE-flagged
+    /// `<init>` and native registrations in `reflect_annotations.rs`, so it
+    /// belongs on the stub arm, which is also where it already is.
+    ///
+    /// This predicate is therefore **equal to `is_synthetic_stub` for every
+    /// class in the store today**, before and after the `Proxy$Instance` flip —
+    /// which is the property `jdk_only_class_origin.rs`'s
+    /// `dispatch_predicate_matches_the_stub_bit` pins.
+    ///
+    /// Cost: one enum discriminant test for every real class (the common case
+    /// returns on the `_` arm without touching `methods`). Only the fabricated
+    /// and VM-internal classes, whose method tables hold 0–12 entries, pay the
+    /// scan.
+    pub fn dispatch_lacks_class_file(&self) -> bool {
+        match &self.origin {
+            // Fabricated: no class file was ever found, by definition.
+            ClassOrigin::CompatibilityStub { .. } => true,
+            // VM-invented: only the ones that carry native-backed methods under
+            // their own name need the exact-name lookup.
+            ClassOrigin::VmInternal => self.methods.iter().any(|m| m.is_native()),
+            _ => false,
+        }
+    }
+
     /// Record where this class came from, keeping the derived
     /// [`is_synthetic_stub`](Self::is_synthetic_stub) mirror in sync.
     ///
     /// **Every write to either field must go through here.** `is_synthetic_stub`
     /// is `true` if and only if the origin is a
     /// [`ClassOrigin::CompatibilityStub`], so setting one without the other
-    /// splits the VM's view of the class: the ~160 sites still reading the bool
-    /// would disagree with the census and with the `--jdk-only` policy check.
+    /// splits the VM's view of the class: the sites still reading the bool would
+    /// disagree with the census and with the `--jdk-only` policy check.
     ///
     /// The in-place "a real `.class` turned up, upgrade the stub" path in
     /// `ClassManager::upgrade_synthetic_class` is the case that matters most —

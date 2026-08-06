@@ -15945,7 +15945,12 @@ pub fn invoke_or_native(
             receiver_class_id.or_else(|| cm.get_loaded_class_id(effective_class))
         {
             if let Some(class) = cm.class_store.get(class_id) {
-                if !class.is_synthetic_stub {
+                // Question (2): only route to bytecode-style dispatch on a
+                // class that HAS a method table to dispatch on. A class whose
+                // only entries are NATIVE-flagged synthetic ctors has nothing
+                // for `invoke_on_class_shared` to find, and must fall through
+                // to `invoke_shared`. See `Class::dispatch_lacks_class_file`.
+                if !class.dispatch_lacks_class_file() {
                     drop(cm);
                     super::ensure_class_initialized_shared(shared, thread, class_id)?;
                     return invoke_on_class_shared(
@@ -19383,8 +19388,16 @@ fn invoke_on_class_shared_inner(
         // performs on the SAME cache line — the identical contention this
         // coalescing exists to reduce (the JIT's dispatch memo holds its names
         // as `Rc<str>` for the same reason).
+        // `dispatch_lacks_class_file`, NOT `is_synthetic_stub`: this branch is
+        // asking question (2) — "does this class have no bytecode of its own,
+        // so a native registered under its exact name is the only thing that
+        // can answer?" — not question (1), "is this a compatibility
+        // substitution?". They gave the same answer for every class until
+        // `java/lang/reflect/Proxy$Instance` was correctly reclassified
+        // `VmInternal`; it still needs this branch, and now says so
+        // structurally. See `Class::dispatch_lacks_class_file`.
         let stub_or_interface = class
-            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .map(|c| c.dispatch_lacks_class_file() || c.is_interface())
             .unwrap_or(false);
         let prefer = stub_or_interface || class_name.starts_with("cratonvm/internal/");
         (class_name, prefer)

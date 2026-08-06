@@ -467,3 +467,161 @@ fn no_compatibility_stub_class_is_created_while_strict() {
          mode fabricated {new:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Splitting `is_synthetic_stub`'s two meanings (JDK-only wave 2, 2026-08-06)
+// ---------------------------------------------------------------------------
+
+/// `Class::dispatch_lacks_class_file` answers question (2) — "does this class
+/// have no class file, so dispatch must look for a native under its own exact
+/// name?" — and gives the SAME answer as the old `is_synthetic_stub` bit for
+/// every class in a live store.
+///
+/// That equality is the whole safety argument for reclassifying
+/// `java/lang/reflect/Proxy$Instance` as `VmInternal`: three dispatch read
+/// sites in `vm` (`invoke_or_native`'s exact-name native preference,
+/// `invoke_virtual_shared`'s `invoke_on_class_shared` arm, and
+/// `validate_native_coverage`'s all-classes scan) selected on the bool, and
+/// that class needs all three. Flipping the origin without the split would
+/// have moved it off them.
+///
+/// The one deliberate exception is `Proxy$Instance` itself, which is exactly
+/// what this asserts: no longer a compatibility stub, still dispatch-lacking-a-
+/// class-file.
+#[test]
+fn dispatch_predicate_matches_the_stub_bit() {
+    let mut mgr = ClassManager::new(&[], &[], &[]);
+
+    // A spread of shapes: fabricated stand-ins with and without a
+    // NATIVE-flagged method table, a VM-internal allocation shape, an array,
+    // and the VM's own proxy supertype.
+    for name in [
+        "com/example/Plain",
+        "java/lang/IllegalStateException",
+        "org/jboss/modules/Module",
+        "java/net/InetSocketAddress",
+        "java/lang/reflect/Proxy$Instance",
+    ] {
+        let _ = mgr.ensure_synthetic_class(name, 3);
+    }
+    let _ = mgr.load_class("java/lang/Object");
+    let _ = mgr.load_class("[Ljava/lang/Object;");
+
+    let mut checked = 0usize;
+    let mut proxy_seen = false;
+    for id in 0..mgr.class_store.slot_count() as u32 {
+        let Some(class) = mgr.class_store.get(ClassId::new(id)) else {
+            continue;
+        };
+        checked += 1;
+        if &*class.name == "java/lang/reflect/Proxy$Instance" {
+            proxy_seen = true;
+            assert!(
+                !class.origin.is_compatibility_stub(),
+                "Proxy$Instance is a generation artefact, not a compatibility \
+                 substitution: it must not be counted as one in the census"
+            );
+            assert_eq!(class.origin, ClassOrigin::VmInternal);
+            assert!(
+                class.dispatch_lacks_class_file(),
+                "Proxy$Instance has a NATIVE-flagged <init> and native \
+                 registrations under its own exact name, and no class file \
+                 anywhere. It must stay on the dispatch branches that look for \
+                 those — that is the whole reason the bool had to be split \
+                 before the origin could be flipped."
+            );
+            continue;
+        }
+        assert_eq!(
+            class.dispatch_lacks_class_file(),
+            class.origin.is_compatibility_stub(),
+            "{}: the dispatch predicate and the compatibility-substitution \
+             question disagree. They may differ only for names the VM invents \
+             that also carry native-backed methods (today: Proxy$Instance). If \
+             you added another, say so here; if this fired for a REAL class, \
+             something is fabricating a class file's worth of NATIVE methods \
+             under `ClassOrigin::VmInternal` and the census is now wrong.",
+            class.name
+        );
+    }
+    assert!(proxy_seen, "the Proxy$Instance fixture was not created");
+    assert!(checked > 5, "only {checked} classes reached the scan");
+}
+
+/// An allocation shape is NOT on the exact-name-native dispatch branch.
+///
+/// `!origin.has_real_bytes()` was the obvious way to spell question (2) and is
+/// wrong for exactly this reason: `VmInternal` and `VmArray` both answer "no
+/// real bytes", so it would have moved every `cratonvm/synthetic/AnonymousObject$N`
+/// — the shape behind every `HashMap` node in the VM — onto branches it takes
+/// the other arm of today. That is a `Compatible`-mode behaviour change on the
+/// busiest allocation shape there is.
+#[test]
+fn vm_internal_allocation_shapes_stay_off_the_dispatch_branch() {
+    let mut mgr = ClassManager::new(&[], &[], &[]);
+    let id = mgr.ensure_generated_class("cratonvm/synthetic/AnonymousObject$4", 4, ClassOrigin::VmInternal);
+    let class = mgr.class_store.get(id).expect("just created");
+    assert_eq!(class.origin, ClassOrigin::VmInternal);
+    assert!(!class.origin.has_real_bytes(), "premise of the test");
+    assert!(
+        !class.dispatch_lacks_class_file(),
+        "an allocation shape has an empty method table and no native \
+         registered under its name; there is nothing to find by exact name, so \
+         it must stay on the non-stub arm where it has always been"
+    );
+}
+
+/// A fabricated class whose NAME is one of the generated families is reported
+/// as what generated it, not as a compatibility substitution — the same answer
+/// `classify_defined_origin` gives when those names arrive with real bytes.
+///
+/// Neither path may report the same class differently depending on whether it
+/// happened to be fabricated. Measured on a strict boot and both jdk-only
+/// probes: none of these fires in practice, which is why this is a
+/// classification guard rather than a bug fix.
+#[test]
+fn fabricated_generated_names_are_not_compatibility_stubs() {
+    let mut mgr = ClassManager::new(&[], &[], &[]);
+    for (name, expected) in [
+        (
+            "com/example/Owner$$Lambda$17",
+            ClassOrigin::GeneratedLambda { host: None },
+        ),
+        (
+            "com/example/$Proxy42",
+            ClassOrigin::GeneratedProxy {
+                interfaces: Arc::from(Vec::new()),
+            },
+        ),
+        (
+            "jdk/internal/reflect/GeneratedMethodAccessor3",
+            ClassOrigin::ReflectionAccessor { host: None },
+        ),
+        (
+            "java/lang/reflect/Proxy$Instance",
+            ClassOrigin::VmInternal,
+        ),
+    ] {
+        let id = mgr.ensure_synthetic_class(name, 2);
+        let class = mgr.class_store.get(id).expect("just created");
+        assert_eq!(class.origin, expected, "{name} got the wrong origin");
+        assert!(
+            !class.origin.is_compatibility_stub(),
+            "{name} is a VM generation artefact; counting it as a \
+             compatibility substitution over-reports the stub backlog"
+        );
+        assert!(
+            class.origin.allowed_in(CompatibilityMode::JdkOnly),
+            "{name} is legal in strict mode (contract §1 item 6)"
+        );
+    }
+
+    // The control: an ordinary missing class is still a compatibility stub.
+    let id = mgr.ensure_synthetic_class("com/example/GenuinelyMissing", 2);
+    assert!(mgr
+        .class_store
+        .get(id)
+        .expect("just created")
+        .origin
+        .is_compatibility_stub());
+}

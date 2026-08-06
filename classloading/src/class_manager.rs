@@ -3449,7 +3449,7 @@ impl ClassManager {
         let fabricated = self.fabricate_class(
             name,
             num_fields,
-            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
+            fabricated_origin_for_name(name),
             // Record the `--jdk-only` violation, then fabricate anyway — there
             // is no error channel on this signature. NOTE: `enforce` governs
             // only the jdk-only refusal. The ambiguity refusal added below is
@@ -3500,12 +3500,7 @@ impl ClassManager {
         name: &str,
         num_fields: usize,
     ) -> Result<ClassId, VmError> {
-        self.fabricate_class(
-            name,
-            num_fields,
-            ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
-            true,
-        )
+        self.fabricate_class(name, num_fields, fabricated_origin_for_name(name), true)
     }
 
     /// Register a VM-generated class with an explicit, legitimate provenance.
@@ -3622,41 +3617,39 @@ impl ClassManager {
     /// allocation of a stub-backed container re-enters here), and counting
     /// them would bury the handful of names that actually have no bytes.
     ///
-    // JDK-ONLY-WAVE2: every class minted here is labelled with whatever
-    // `origin` the caller passed, and `ensure_synthetic_class` — still the
-    // overwhelming majority of the traffic — passes `CompatibilityStub`. That
-    // over-reports: two of its callers are not compatibility substitutions at
-    // all.
+    // JDK-ONLY-WAVE2, CLOSED 2026-08-06: every class minted here is labelled
+    // with whatever `origin` the caller passed. `ensure_synthetic_class` used to
+    // pass `CompatibilityStub` unconditionally, which over-reported two of its
+    // callers. Both are now classified by name in
+    // [`fabricated_origin_for_name`], so the caller no longer decides:
     //   * `cratonvm/synthetic/AnonymousObject$N` — the untyped allocation
     //     shape behind every `HashMap`/`LinkedHashMap` node and friends
-    //     (`alloc_concurrent_synthetic` in `native-builtins`). It is
-    //     `ClassOrigin::VmInternal`: a VM bookkeeping type that never had, and
-    //     never will have, a class file. **DONE (2026-08-04)** — the minting
-    //     site in `vm_exec::heap_alloc_object` now calls
-    //     [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
-    //     because the class is inert at every `is_synthetic_stub` read site:
-    //     no native is registered on it, neither real-protected-stub allow-list
-    //     names it, and the `Proxy$Instance` / collection-iterator special
-    //     cases below key on the *name*, not the origin.
-    //   * `java/lang/reflect/Proxy$Instance` — the synthetic supertype of
-    //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). It is
-    //     a generation artefact, not a stand-in for absent bytes. **STILL
-    //     OPEN**, and the original prescription of `GeneratedProxy` was wrong:
-    //     that variant carries `interfaces: Arc<[ClassId]>`, which the shared
-    //     *supertype* has no meaningful value for, and
-    //     `is_generated_proxy_name` in this file already says in terms that
-    //     `Proxy$Instance` "must NOT be counted as a generated proxy". The
-    //     right origin is `VmInternal`. What is not yet established is whether
-    //     flipping it is safe: unlike `AnonymousObject$N` it has a
-    //     NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods`, is
-    //     special-cased twice in this function, and is the superclass every
-    //     `$ProxyN` links against — so it needs the regression suite, not an
-    //     argument.
-    // Classifying either honestly flips the derived `is_synthetic_stub` bool
-    // from `true` to `false` for classes that ~181 read sites already reason
-    // about, which is a *Compatible-mode* behaviour change. That is why the
-    // flavour is also kept in the `reason` string, and why the two are being
-    // migrated one at a time with evidence rather than as a pair.
+    //     (`alloc_concurrent_synthetic` in `native-builtins`). **DONE
+    //     (2026-08-04)** — the minting site in `vm_exec::heap_alloc_object`
+    //     calls [`Self::ensure_generated_class`] with `VmInternal`. Safe to flip
+    //     because the class is inert at every read site: no native is registered
+    //     on it, neither real-protected-stub allow-list names it, and the
+    //     `Proxy$Instance` / collection-iterator special cases below key on the
+    //     *name*, not the origin.
+    //   * `java/lang/reflect/Proxy$Instance` — the VM's own supertype for
+    //     every generated `$ProxyN` (`proxy_gen` / the `Proxy` natives). A
+    //     generation artefact, not a stand-in for absent bytes. **DONE
+    //     (2026-08-06)**, as `VmInternal`: `GeneratedProxy` was the wrong
+    //     prescription (it carries `interfaces: Arc<[ClassId]>`, which the
+    //     shared *supertype* has no value for) and `is_generated_proxy_name`
+    //     already says in terms that this name "must NOT be counted as a
+    //     generated proxy".
+    //
+    // What made the second one hard: unlike `AnonymousObject$N` it has a
+    // NATIVE-flagged `<init>` from `synthetic_stub_ctor_methods` and native
+    // registrations of its own, so it genuinely needs the dispatch branches
+    // that used to be selected by the derived `is_synthetic_stub` bool —
+    // flipping the origin alone would have moved it off three of them. The
+    // prerequisite was splitting that bool's two meanings; those sites now ask
+    // [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
+    // which answers the dispatch question directly and gives the same answer for
+    // this class before and after. See
+    // `docs/internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
     #[track_caller]
     fn fabricate_class(
         &mut self,
@@ -10682,6 +10675,69 @@ fn is_generated_proxy_name(name: &str) -> bool {
 fn is_reflection_accessor_name(name: &str) -> bool {
     let simple = simple_name_of(name);
     simple.starts_with("Generated") && simple.contains("Accessor")
+}
+
+/// This VM's own invented supertype for dynamic proxies.
+///
+/// `java/lang/reflect/Proxy$Instance` is a name no JDK declares and no class
+/// file can ever back. `proxy_gen` emits every `$ProxyN` extending it (unless
+/// `CRATONVM_REAL_PROXY_SUPER=0` is unset — by default `real_proxy_super()` is
+/// on and `$ProxyN` extends the real `java.lang.reflect.Proxy` instead), and
+/// `reflect_annotations.rs` registers `<init>` / `getProxyInterfacesNative`
+/// natives on it. That makes it a *generation artefact*, not a stand-in for
+/// bytes that should have been found.
+pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
+    name == "java/lang/reflect/Proxy$Instance"
+}
+
+/// The origin a **fabricated** class deserves on the strength of its name
+/// alone.
+///
+/// [`ClassManager::ensure_synthetic_class`] and
+/// [`ClassManager::try_ensure_synthetic_class`] used to hard-code
+/// [`ClassOrigin::CompatibilityStub`] for everything they minted. That is right
+/// for the overwhelming majority — a name whose real bytes were not found — and
+/// wrong for the handful of names the VM *invents*, which have no real bytes to
+/// find and are not standing in for anyone's class:
+///
+/// * `java/lang/reflect/Proxy$Instance` → [`ClassOrigin::VmInternal`].
+///   `is_generated_proxy_name` above already says in terms that it "must NOT be
+///   counted as a generated proxy", and [`ClassOrigin::GeneratedProxy`] carries
+///   an `interfaces` list the shared *supertype* has no value for. The
+///   dispatch consequences of the flip are handled by
+///   [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
+///   which is what the three read sites that can observe this class now ask.
+/// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
+///   `Generated*Accessor*` is what generated it, exactly as
+///   [`ClassManager::classify_defined_origin`] already reports for the same
+///   names when they arrive with real bytes. Neither path may report the same
+///   class differently depending on whether it happened to be fabricated.
+///   Measured 2026-08-05 (L7) and again 2026-08-06: **none of the three fires**
+///   on a strict boot, `JdkOnlyCensusLoadProbe` or `JdkOnlyBreadthProbe`. They
+///   are here so the classification cannot drift, not because anything hits
+///   them — which is the permanent form of the one-off audit the wave-2 record
+///   asked for.
+///
+/// `host`/`interfaces` are empty rather than guessed: this path has no class
+/// file, so there is no nest host to read and no resolved interface set. A
+/// fabricated generated-name class is a pathology worth seeing in the census
+/// with its producer named, not a place to invent metadata.
+fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
+    if is_vm_proxy_supertype_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_generated_lambda_name(name) {
+        return ClassOrigin::GeneratedLambda { host: None };
+    }
+    if is_generated_proxy_name(name) {
+        return ClassOrigin::GeneratedProxy {
+            interfaces: Arc::from(Vec::new()),
+        };
+    }
+    if is_reflection_accessor_name(name) {
+        return ClassOrigin::ReflectionAccessor { host: None };
+    }
+    ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON)
 }
 
 fn is_jdk_class(name: &str) -> bool {

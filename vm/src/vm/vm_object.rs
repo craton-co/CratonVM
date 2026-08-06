@@ -1831,8 +1831,12 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
             Some(c) => c,
             None => continue,
         };
-        // Only scan real (non-synthetic) classes
-        if class.is_synthetic_stub {
+        // Only scan classes that HAVE a class file. A fabricated class's
+        // NATIVE-flagged entries exist precisely because a native is registered
+        // for them, so reporting them as "covered"/"missing" measures this
+        // VM's own bookkeeping rather than the JDK surface this census is for.
+        // Question (2), not (1) — see `Class::dispatch_lacks_class_file`.
+        if class.dispatch_lacks_class_file() {
             continue;
         }
         for method in &class.methods {
