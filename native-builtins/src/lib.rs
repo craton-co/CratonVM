@@ -36883,7 +36883,21 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/io/FileNotFoundException",
         "java/io/UncheckedIOException",
         "java/io/NotSerializableException",
-        "java/io/InvalidClassException",
+        // `java/io/InvalidClassException` is deliberately NOT in this list, for
+        // the same reason `java/util/regex/PatternSyntaxException` is not: it
+        // OVERRIDES `getMessage()`, prepending the offending class name to the
+        // detail message. A blanket bridge in front of that override returns
+        // the bare `Throwable.detailMessage`, so
+        // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
+        // reported "bad serialVersionUID" where HotSpot reports
+        // "com.example.Foo; bad serialVersionUID" -- and deserialization
+        // diagnostics lose the one field that says WHICH class failed.
+        //
+        // Found 2026-08-05 by checking `javap -p` for a declared
+        // getMessage/getLocalizedMessage/toString across every class in these
+        // two lists; it and `NullPointerException` were the only two left after
+        // PatternSyntaxException. See
+        // `docs/internal/a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",
