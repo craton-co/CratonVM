@@ -117,6 +117,20 @@ registrar rather than to the methods this probe happened to cover, and a fix
 belongs with its own verification of the real-subprocess arm (which this probe
 does not exercise — it never spawns anything).
 
+**The other receiver of these same registrations** is
+`cratonvm/synthetic/Process`, for which reading `PROC_FIELD_*` by fixed index is
+correct and necessary — that object does not extend `java.lang.Process` and
+inherits nothing from it, so the natives are the only reason it answers at all.
+The two records are one registration seen from its two receivers; see
+[`synthetic-process-cluster-and-the-supertype-lie.md`](synthetic-process-cluster-and-the-supertype-lie.md),
+which is why the guard has to be a receiver check and not a deletion.
+
+**The generalisable test**, from the contrast with `native-collections`' abstract
+family (which is measured inert for arbitrary layouts): does the native **ask the
+receiver**, or does it **index into a layout it assumes**? The collections
+natives call `size()`/`toArray()`/`iterator()` and survive any subclass; these
+read `PROC_FIELD_HANDLE` and believe what they find.
+
 **The general question underneath it** is the one
 `native-kind-is-ambient-and-defaults-to-syntheticstub.md` and
 `ensure-synthetic-class-cannot-enforce-only-record.md` both circle: a native
