@@ -1,6 +1,17 @@
 # `PulsarAutoConfigurationTests` — intermittent `ClassCastException: Object cannot be cast to MultiValueMap` inside `OnBeanCondition$Spec`, 2026-08-06
 
-**Status: OPEN — reproduced once, did not reproduce on immediate rerun.**
+**Status: OPEN — reproduced once; 5 further attempts clean.**
+
+**2026-08-06 update.** Two things changed, neither of them a fix:
+
+* The `spring-bean-attribute-type-null-flake` cause (recycled-`JitInvokeInfo`
+  aliasing, `383e7f5cf`) is **ruled out by ancestry** — see the OnBeanCondition
+  comparison below. This flake survived that fix.
+* 4 more attempts, 4 lanes concurrent on the Windows box: **74/74 clean each**
+  (`tests=74 failed=0 skipped=2`). With the original 1-in-2, that is 1 failure
+  in 6 known attempts. Concurrency alone does not raise the rate the way it does
+  for the OAuth2 read-timeout flake, so whatever the trigger is, it is not
+  simple load.
 
 ## Symptom
 
@@ -113,11 +124,17 @@ this as new:
   different concrete failure: an `IdentityHashMap` primitive-wrapper lookup
   returning `null` inside `TypeMappedAnnotation.adaptForAttribute`, not a
   `Stream.collect` result failing a checkcast. Not folded in — different code
-  path, different exception class, no confirmed shared cause. Its resolution
-  does, however, make a shared cause **plausible** in a way it was not when
-  this was written: the mechanism there was one call site returning another's
-  value, which is a general-purpose way to fail a checkcast. Worth re-testing
-  under the single-run lever above rather than treating as settled.
+  path, different exception class, no confirmed shared cause.
+
+  **Ruled out 2026-08-06 by ancestry, not by argument.** That page resolved to
+  the recycled-`JitInvokeInfo` aliasing defect (`383e7f5cf`, landed 08-05
+  13:22), whose signature is exactly "a call returns the wrong object" — so it
+  was a live candidate here. It is not: the binary this Pulsar failure was
+  found on was built from `origin/dev @ 65a3085f5` (08-05 22:12), which
+  **contains** that fix (`git merge-base --is-ancestor 383e7f5cf 65a3085f5`).
+  The flake survived it. An earlier revision of this section argued the
+  opposite from symptom shape; one ancestry check settles it, and it is the
+  check to run FIRST whenever a symptom resembles a known dispatch bug.
 
 ## Affected classes
 
