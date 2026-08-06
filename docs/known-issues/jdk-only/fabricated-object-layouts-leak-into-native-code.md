@@ -847,7 +847,7 @@ finding, not a general rule.
 * `docs/known-issues/jdk-only/README.md` — index.
 * The `StringJoiner` divergence between the two real-protected-stub allow-lists
   is a *separate* consequence of the same class's layout drift; see
-  [real-protected-stub allow-lists diverge](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) (reconciled 2026-08-04).
+  real-protected-stub allow-lists diverge (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`) (reconciled 2026-08-04).
 * [`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md)
   — the companion audit. The original filing recorded that this file did not
   exist; **it does now**, and it is the right starting point for the sweep in

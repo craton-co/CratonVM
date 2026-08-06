@@ -19,7 +19,7 @@
 //! with no cast and no error. It is the loader-namespace analogue of the
 //! array-class defect this branch already fixed, where `X[]` from two loaders
 //! collapsed to one runtime class
-//! (`docs/array-class-defining-loader.md`).
+//! (`array-class-defining-loader.md`).
 //!
 //! A workspace-wide grep for "loader constraint" before this module found
 //! nothing but comments. §5.3.4 was unimplemented.

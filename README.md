@@ -86,7 +86,7 @@ published nothing **retired 46 NOPs on entry, on every invocation** — and
 Fixed 2026-08-05: **1.74x** recovered against its own parent commit (8
 interleaved pairs, user CPU time, disjoint ranges), all seven phase checksums
 unchanged
-([docs/internal/perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md](docs/internal/perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md)).
+(`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`).
 The number above is the **pre-fix** measurement and is refreshed on the next
 quiet-window run; the fix is on `dev`, this row is not yet.
 
@@ -108,7 +108,7 @@ backend, and the IR body was 6.4x slower than the C1 body it replaced. Fixed
 single-pass backend would lower better, and what that backend can do and the IR
 tier cannot is enumerated rather than discovered one regression at a time
 (`jit/src/x64/single_pass_only.rs`,
-[docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md](docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md)).
+`perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

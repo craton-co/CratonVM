@@ -85,7 +85,17 @@ re-issued, which a single-class run may never do — so "quiet runs are green"
 is weak evidence either way, and eight copies of ONE class is not the same
 churn as 1975 different ones.
 
-**What would settle it:** the next full-suite run on a post-`383e7f5cf`
+**Corroboration, on other classes.**
+`apps/spring-boot-suite-runner/RESULTS-20260805-jit-site-cache-aliasing-verify.md`
+takes five classes the same full-suite run left red — `FlywayAutoConfigurationTests`
+(HANG -> 73/73), `WebMvcAutoConfigurationTests` (88/93 FAIL -> 93/93),
+`WebMvcObservationAutoConfigurationTests`, `ServletComponentScanIntegrationTests`,
+`WebTestClientAutoConfigurationTests` — and shows every one of them going
+FAIL -> PASS across exactly this fix, pre-fix binary against fixed binary, on
+both hosts. That is a real A/B for the commit; it is not one for THIS class,
+which is not in that set.
+
+**What would settle it here:** the next full-suite run on a post-`383e7f5cf`
 binary. If this class passes there, retire the page citing that run. If it
 fails there, the byte table above is where to start, and the first question to
 answer is whether it is `writeByte`'s ARGUMENT or its receiver's write INDEX

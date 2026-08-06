@@ -14,7 +14,7 @@
 > is gone, and the opcode gap is down to 13 events. `cov-03` is the whole
 > remaining builder story. Line numbers moved too (`0xb4` at `ir.rs:5343`,
 > `0xb5` at `ir.rs:5387` with all three lanes in); re-derive both. See
-> [`cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+> `cov-04-the-invoke-arms-RETIRED-20260803.md`.
 
 ## The finding
 

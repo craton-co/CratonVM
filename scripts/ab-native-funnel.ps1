@@ -2,7 +2,7 @@
 # Copyright 2024-2026 Craton Software Company
 #
 # Interleaved A/B for the native-call funnel work
-# (docs/internal/native-call-funnel-per-call-floor-RETIRED-20260804.md).
+# (native-call-funnel-per-call-floor-RETIRED-20260804.md).
 #
 # Runs `probes/NativeShapeProbe` alternately on two binaries in A-B-B-A order
 # and reports the MINIMUM last-pass ns/op per rung for each arm.

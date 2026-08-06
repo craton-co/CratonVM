@@ -5,7 +5,7 @@
 item 3.
 **Effort:** L as scoped. The work that closed it was a different shape; see
 below.
-**Outcome:** [`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
+**Outcome:** `forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`
 
 ## Closed, and the premise was false
 
@@ -105,7 +105,7 @@ first looked like it had to be, and did not:
 
 * `String.hashCode()` was **wrong for UTF-16 strings** — it hashed the backing
   BYTES sign-extended, not the code units. **Root-caused and FIXED 2026-08-05**
-  ([record](../../internal/string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md)).
+  (record (`string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md`)).
   The defect was never in `String` or `StringUTF16` bytecode: it was the
   `ArraysSupport.vectorizedHashCode` **native**, which read one array slot per
   element for every `BasicType`. `StringUTF16.hashCode` calls it with `T_CHAR`
@@ -132,7 +132,7 @@ first looked like it had to be, and did not:
   callers of `Preconditions` still get `ArrayIndexOutOfBoundsException` where
   the JDK throws `IndexOutOfBoundsException`.
 * `+` concatenation loses an unpaired surrogate. **FIXED 2026-08-05**
-  ([record](../../internal/string-concat-loses-unpaired-surrogates-FIXED-20260805.md)).
+  (record (`string-concat-loses-unpaired-surrogates-FIXED-20260805.md`)).
   `execute_string_concat` accumulated into a Rust `String`, which cannot
   represent one. It now accumulates `Vec<u16>`. It was **three** loss points,
   not the one the record named — the argument, the folded recipe literal, and
