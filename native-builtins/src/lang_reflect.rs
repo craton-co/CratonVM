@@ -167,20 +167,36 @@ pub(crate) fn native_accessible_set_accessible(
 // ---------------------------------------------------------------------------
 //
 // Returns true iff the reflective member can be invoked / read with the
-// given receiver. For static members the receiver must be null. For
-// instance members the receiver's class must be assignable to the
-// declaring class. Public members of public modules / classes always
-// succeed; non-public members require the override flag.
+// given receiver.
+//
+// Two questions, and until 2026-08-06 only the first was asked. (1) Is the
+// receiver the right SHAPE: null for a static member, an instance of the
+// declaring class otherwise. (2) Is the member ACCESSIBLE from here at all:
+// `setAccessible(true)` already granted, or the JLS 6.6.1 + JPMS check passes
+// unaided. Skipping (2) made `canAccess` answer true for a private `java.base`
+// field the caller could not read — `probes/SetAccessibleModuleProbe.java`'s
+// `afterDenied isAccessible` line, where HotSpot 25 says false.
 
 fn can_access_member(
     ctx: &mut dyn NativeContext,
     member: ObjectRef,
     obj_arg: Value,
     is_static: bool,
+    modifiers: i32,
 ) -> bool {
     // Static member: receiver MUST be null per spec.
     if is_static {
-        return matches!(obj_arg, Value::Object(None));
+        if !matches!(obj_arg, Value::Object(None)) {
+            return false;
+        }
+        let declaring_id = match method_clazz_value(ctx, member) {
+            Value::Object(Some(m)) => mirror_class_id(ctx, m),
+            _ => None,
+        };
+        let Some(declaring_id) = declaring_id else {
+            return false;
+        };
+        return member_is_accessible_here(ctx, member, declaring_id, modifiers);
     }
 
     // Instance member: receiver MUST be non-null AND assignable to the
@@ -201,7 +217,24 @@ fn can_access_member(
     let receiver_id = ctx.class_id_of_object(receiver);
     // is_subclass(child, parent) returns true iff `child` is `parent` or a
     // subclass of it; equivalently, `parent.isAssignableFrom(child)`.
-    ctx.is_subclass(receiver_id, declaring_id)
+    if !ctx.is_subclass(receiver_id, declaring_id) {
+        return false;
+    }
+    member_is_accessible_here(ctx, member, declaring_id, modifiers)
+}
+
+/// The second half of `canAccess`: the override flag, else the unaided access
+/// check. Split out so the static and instance arms cannot drift apart.
+fn member_is_accessible_here(
+    ctx: &mut dyn NativeContext,
+    member: ObjectRef,
+    declaring_id: cratonvm_types::ClassId,
+    modifiers: i32,
+) -> bool {
+    if crate::lang_class::accessible_override_is_set(ctx, member) {
+        return true;
+    }
+    crate::lang_class::verify_member_access(ctx, declaring_id, modifiers)
 }
 
 pub(crate) fn native_method_can_access(
@@ -215,7 +248,7 @@ pub(crate) fn native_method_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -230,7 +263,7 @@ pub(crate) fn native_field_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -241,8 +274,19 @@ pub(crate) fn native_constructor_can_access(
     let this = obj_arg(args, 0)?;
     // Constructors are never static — receiver must be null per spec.
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = matches!(obj, Value::Object(None));
-    let _ = this; // unused but required for arity
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let declaring_id = match method_clazz_value(ctx, this) {
+        Value::Object(Some(m)) => mirror_class_id(ctx, m),
+        _ => None,
+    };
+    let ok = matches!(obj, Value::Object(None))
+        && match declaring_id {
+            Some(id) => member_is_accessible_here(ctx, this, id, modifiers),
+            None => false,
+        };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 

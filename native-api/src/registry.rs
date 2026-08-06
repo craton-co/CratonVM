@@ -1090,6 +1090,21 @@ pub trait NativeClassAccess {
         None
     }
 
+    /// Do `bytes` fingerprint-match the class file `class_id`'s current
+    /// definition came from?
+    ///
+    /// `None` means the VM recorded no fingerprint and cannot adjudicate.
+    /// Used by `Instrumentation.retransformClasses` when `class_bytes` misses
+    /// (that cache is size-capped and FIFO-evicted) and the retransformation
+    /// base has to be re-read from the classpath: the classpath is searched
+    /// bootstrap → extension → application, *not* through the class's defining
+    /// loader, so what it returns can be a different build of the same name.
+    /// Matching `this_class` does not catch that; this does. Default impl
+    /// returns `None` so test mocks compile.
+    fn class_bytes_match_base(&self, _class_id: ClassId, _bytes: &[u8]) -> Option<bool> {
+        None
+    }
+
     /// Return a URL string (e.g. `file:/...` or `jar:file:/...!/...`) for
     /// every classpath entry that contains a resource with the given name.
     /// Used by `ClassLoader.getResources` / `getSystemResources`.
@@ -1537,6 +1552,30 @@ pub trait NativeClassAccess {
         accessor_class_id: ClassId,
         target_class_id: ClassId,
     ) -> Result<(), String>;
+
+    /// Is the package declaring `target_class_id` *exported* (not opened) to
+    /// the module of `accessor_class_id`?
+    ///
+    /// This is the narrower JPMS question `AccessibleObject
+    /// .checkCanSetAccessible` asks once the `opens` test has failed. JDK 17+
+    /// still permits `setAccessible(true)` on a **public** member of a
+    /// **public** class when the declaring package is merely *exported* — no
+    /// `--add-opens` needed. An `opens`-only gate therefore over-denies in
+    /// exactly the place HotSpot allows, which is why this second query
+    /// exists rather than being folded into the one above.
+    ///
+    /// Default `false` (fail closed): it is only ever consulted to widen a
+    /// decision [`check_deep_reflection_access`] has already refused, so a
+    /// mock that does not implement it simply keeps that refusal.
+    ///
+    /// [`check_deep_reflection_access`]: NativeContext::check_deep_reflection_access
+    fn reflective_export_to_accessor(
+        &self,
+        _accessor_class_id: ClassId,
+        _target_class_id: ClassId,
+    ) -> bool {
+        false
+    }
 
     // -- T13 java/lang/Class reflection metadata --
 

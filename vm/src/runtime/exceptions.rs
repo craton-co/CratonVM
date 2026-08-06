@@ -1696,7 +1696,7 @@ pub fn throw_runtime_error(
         return MethodCallFailed::InternalError(VmError::Runtime(error));
     };
 
-    match create_exception_object(shared, thread, class_name, message) {
+    match create_exception_object(shared, thread, class_name, message.as_deref()) {
         Ok(obj_ref) => {
             populate_pattern_syntax_fields(shared, obj_ref, &error);
             MethodCallFailed::ExceptionThrown(obj_ref)

@@ -11,7 +11,7 @@
 use super::*;
 
 // =============================================================================
-// java.util.prefs.Preferences — 2-field synthetic (data=0 HashMap, name=1 String)
+// java.util.prefs.Preferences — 6-field synthetic (see `p72_alloc_prefs`)
 // =============================================================================
 
 /// Synthetic `java.util.prefs.Preferences` layout:
@@ -20,6 +20,7 @@ use super::*;
 ///   2: parent   (Preferences — null for a root, per `Preferences.parent()`)
 ///   3: children (HashMap<String,Preferences> — nodes created via `node()`)
 ///   4: removed  (int flag — set by `removeNode()`)
+///   5: user     (int flag — 1 = user tree, 0 = system tree)
 ///
 /// Slots 2 and 3 were added in stub-removal wave 2: without a parent link
 /// `parent()` could only ever answer null, and without a child registry
@@ -32,8 +33,15 @@ use super::*;
 /// (`AbstractPreferences.sync2()` is a removed-check, a `syncSpi()` that is
 /// empty when there is no persistent store, and a recursion over cached
 /// children) — without it those two really were unconditional no-ops.
-pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 5);
+///
+/// Slot 5 was added with `isUserNode()`. `userRoot()` and `systemRoot()` used
+/// to return objects that were indistinguishable in every observable way, so
+/// there was nothing `isUserNode()` could have answered from — it was simply
+/// not registered, and `AbstractPreferences.toString()`, which is defined as
+/// `(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()`,
+/// had no state to render.
+pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> ObjectRef {
+    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 6);
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
@@ -51,8 +59,26 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(prefs, 2, Value::Object(None));
     ctx.set_field(prefs, 3, Value::Object(None));
     ctx.set_field(prefs, 4, Value::Int(0));
+    ctx.set_field(prefs, 5, Value::Int(if user { 1 } else { 0 }));
     ctx.unpin_native_roots(prefs_pin);
     prefs
+}
+
+/// Whether this node belongs to the user tree rather than the system tree.
+///
+/// A receiver with no slot 5 — a node built against an older layout, or a
+/// foreign `AbstractPreferences` subclass that reached this shim through the
+/// inheritance walk — answers `true`, matching `Preferences`' own bias toward
+/// the user tree (`userRoot`/`userNodeForPackage` are the documented default
+/// entry points, and the system tree is the one a caller has to ask for by
+/// name).
+fn p72_prefs_is_user(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if ctx.object_num_fields(this) > 5 {
+        if let Value::Int(v) = ctx.get_field(this, 5) {
+            return v != 0;
+        }
+    }
+    true
 }
 
 /// Ancestor-walk bound — a `Preferences` tree cannot cycle, but slot 2 is a raw
@@ -147,7 +173,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, true);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -156,7 +182,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, false);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -165,7 +191,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, true);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -174,7 +200,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx);
+                let p = p72_alloc_prefs(ctx, false);
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -202,6 +228,14 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             // Slot 4 (removed flag) — separately guarded for the same reason.
             if ctx.object_num_fields(this) > 4 {
                 ctx.set_field(this, 4, Value::Int(0));
+            }
+            // Slot 5 (user/system tree). A bare `new` carries no information
+            // about which tree it belongs to — real `AbstractPreferences` has
+            // no no-arg constructor at all and derives the flag from its
+            // parent — so this defaults to the user tree, the same default
+            // `p72_prefs_is_user` documents.
+            if ctx.object_num_fields(this) > 5 {
+                ctx.set_field(this, 5, Value::Int(1));
             }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
@@ -233,8 +267,9 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 let Some(children) = p72_prefs_children(ctx, this) else {
                     // Pre-wave-2 layout (no child registry): fall back to the
                     // old detached-node behaviour rather than failing.
+                    let user = p72_prefs_is_user(ctx, this);
                     let name_pin = pinned_object_value(ctx, name_val);
-                    let p = p72_alloc_prefs(ctx);
+                    let p = p72_alloc_prefs(ctx, user);
                     let name_val = read_pinned_object_value(ctx, name_pin, name_val);
                     ctx.set_field(p, 1, name_val);
                     if let Some((h, _)) = name_pin {
@@ -256,7 +291,14 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                     ctx.unpin_native_roots(this_pin);
                     return Ok(Some(v));
                 }
-                let child = p72_alloc_prefs(ctx);
+                // The child belongs to whichever tree its parent does —
+                // `isUserNode()` is a property of the TREE, not of the node.
+                // `this` is re-read through its pin first: the map lookup above
+                // can trigger a moving young collection (native stale-local
+                // family), and this is a field read.
+                let this = ctx.read_native_pin(this_pin, this);
+                let user = p72_prefs_is_user(ctx, this);
+                let child = p72_alloc_prefs(ctx, user);
                 let child_pin = ctx.pin_native_root(child);
                 let name_val = read_pinned_object_value(ctx, name_pin, name_val);
                 let child = ctx.read_native_pin(child_pin, child);
@@ -581,9 +623,50 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 1)))
         });
+        // absolutePath() — the slash-separated path from the root, which is
+        // what the method is FOR. It used to return slot 1, i.e. the same
+        // string as `name()`: a child of the root rendered as `alpha` where
+        // every real Preferences implementation says `/alpha`, and a root
+        // rendered as the empty string where the spec says `/`. The comment on
+        // `parent()` just below already noted that "absolutePath()-style upward
+        // walks terminated immediately" — this is that walk.
         r.register(cls, "absolutePath", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            let mut segments: Vec<String> = Vec::new();
+            let mut cur = this;
+            for _ in 0..PREFS_MAX_DEPTH {
+                if ctx.object_num_fields(cur) < 3 {
+                    break;
+                }
+                // A node with no parent is the root, and the root's own name
+                // is NOT part of the path — `/` is the whole of it.
+                let Value::Object(Some(parent)) = ctx.get_field(cur, 2) else {
+                    break;
+                };
+                if let Value::Object(Some(s)) = ctx.get_field(cur, 1) {
+                    segments.push(ctx.read_string(s).unwrap_or_default());
+                }
+                cur = parent;
+            }
+            segments.reverse();
+            let path = if segments.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", segments.join("/"))
+            };
+            let s = ctx.create_string(&path);
+            Ok(Some(Value::Object(Some(s))))
+        });
+        // isUserNode() — was not registered at all, because until slot 5 there
+        // was nothing to answer from: `userRoot()` and `systemRoot()` returned
+        // objects that differed in no observable way.
+        r.register(cls, "isUserNode", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(if p72_prefs_is_user(ctx, this) {
+                1
+            } else {
+                0
+            })))
         });
         // parent() — the node that created this one via `node()`, or null for
         // a root (`userRoot`/`systemRoot`/`*NodeForPackage`), which is exactly
@@ -634,15 +717,34 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let exists = matches!(found, Some(Value::Int(n)) if n != 0);
             Ok(Some(Value::Int(if exists { 1 } else { 0 })))
         });
+        // toString() — `AbstractPreferences.toString`'s own definition:
+        //
+        //     (isUserNode() ? "User" : "System") + " Preference Node: "
+        //         + absolutePath()
+        //
+        // composed through VIRTUAL calls rather than by reading slot 1. That
+        // distinction is the whole point of this registration, and
+        // `shim_inheritance_guard` is what enforces it: a native on
+        // `java/util/prefs/AbstractPreferences` is inherited by every subclass
+        // that does not override the method — including user subclasses this
+        // VM has never seen, whose slot 1 is not a node name and may not exist
+        // at all. The previous shim rendered `Preferences[<slot 1>]`, which was
+        // neither the JDK's text nor safe to inherit; going through
+        // `isUserNode()`/`absolutePath()` means a subclass that overrides
+        // either one is rendered with ITS answer, exactly as the real
+        // implementation would.
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let name_val = ctx.get_field(this, 1);
-            let name = if let Value::Object(Some(s)) = name_val {
-                ctx.read_string(s).unwrap_or_default()
-            } else {
-                String::new()
+            let user = matches!(
+                ctx.invoke_virtual(this, "isUserNode", "()Z", &[])?,
+                Some(Value::Int(v)) if v != 0
+            );
+            let path = match ctx.invoke_virtual(this, "absolutePath", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
             };
-            let s = ctx.create_string(&format!("Preferences[{}]", name));
+            let tree = if user { "User" } else { "System" };
+            let s = ctx.create_string(&format!("{tree} Preference Node: {path}"));
             Ok(Some(Value::Object(Some(s))))
         });
     }

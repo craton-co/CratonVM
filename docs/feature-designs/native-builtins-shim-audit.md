@@ -80,6 +80,7 @@ These are the ones where a wrong answer is a wrong *program*.
 | `equals`, `hashCode`, `toString` | `java/lang/Record` | S | yes | yes — the real `java.lang.Record` leaves all three **abstract** (JLS 8.10.3), so there is no bytecode to shadow | ✅ confirmed correct |
 | `equals`, `hashCode`, `toString`, `clone` | `java/lang/Object` | ES / S | yes, universally | yes — `hashCode` uses `ctx.identity_hash_code` (stable across relocation, unlike a raw address) and `toString` calls `hashCode()` **virtually**, so a receiver that overrides it is rendered with its own value | ✅ confirmed correct — this is the fallback the refusals above depend on |
 | `toString` | `java/nio/CharBuffer` | ES | yes | yes — remaining chars from the receiver's own backing store | ✅ |
+| `toString` | `java/util/prefs/AbstractPreferences` | S | **yes** — every `Preferences` subclass that does not override it, including user ones | **was NO** — rendered `Preferences[<slot 1>]`, a hardcoded slot index that is not a node name on a foreign subclass, and not the JDK's text on any receiver | ✅ **FIXED — the JDK's own formula through virtual accessors** (`phases_late/beans_jndi.rs`), see *Fix 5* |
 | `hashCode` | `java/util/AbstractSet` | — | yes — `TreeSet`, `LinkedHashSet`, `EnumSet`, `Collections$UnmodifiableSet` and user subclasses all inherit it | **suspect** — points at `native_hs_hash_code`, a `HashSet`-layout reader, where the real answer is the sum of element hashes | ❌ **CROSS-CRATE** — `native-collections/src/lib.rs:10499`, see *Cross-crate 1* |
 | `toArray` ×2, `contains` | `java/util/AbstractCollection` | — | yes — every Collection that does not override them | **suspect** — `native_al_*`, ArrayList-layout readers | ❌ **CROSS-CRATE** — `native-collections/src/lib.rs:3235`, `:3246`, `:3252` |
 
@@ -109,7 +110,8 @@ re-derived.
 | `java/util/concurrent/ForkJoinTask` | 19 | ES + S | `RecursiveTask`/`RecursiveAction`/user subclasses inherit |
 | `java/util/TimeZone`, `java/time/ZoneId` | 23 | ES + S | |
 | `java/util/concurrent/AbstractExecutorService` | 4 | ES | `submit` ×3 + `invokeAny`; inherited by `ThreadPoolExecutor`, `ScheduledThreadPoolExecutor`, `ForkJoinPool` and third-party executors |
-| `java/security/Policy`, `java/lang/reflect/AccessibleObject`/`Executable`, `java/io/Filter*Stream`, `javax/net/*SocketFactory`, `java/net/URLConnection`/`ProxySelector`/`SocketAddress`, `java/util/prefs/*`, AQS/AOS, `java/util/EnumSet`, `java/security/MessageDigestSpi`, `java/nio/Buffer`, `java/nio/channels/SelectableChannel` | ~90 | mixed | no identity/equality methods among them |
+| `java/security/Policy`, `java/lang/reflect/AccessibleObject`/`Executable`, `java/io/Filter*Stream`, `javax/net/*SocketFactory`, `java/net/URLConnection`/`ProxySelector`/`SocketAddress`, AQS/AOS, `java/util/EnumSet`, `java/security/MessageDigestSpi`, `java/nio/Buffer`, `java/nio/channels/SelectableChannel` | ~90 | mixed | no identity/equality methods among them |
+| `java/util/prefs/*` | ~30 | S | **moved OUT of the row above on 2026-08-06**: it carried `toString`, so "no identity/equality methods among them" was wrong when written. Now a Tier-1 row, fixed. |
 
 ### Tier 3 — interfaces (≈950 registrations, LOW risk, and why)
 
@@ -293,6 +295,49 @@ fallback the fixes depend on — gating it would forbid the fix), and
 are registered through loops over a class-name list rather than string literals,
 so a static enumeration of them is not trustworthy enough to freeze. All of them
 appear in the census table above with an explicit verdict.
+
+### Fix 5 — `AbstractPreferences.toString` rendered a slot index, and had nothing better to render (MEDIUM)
+
+Caught by the gate from *Fix 4*, not by this census — the census had put
+`java/util/prefs/*` in the "no identity/equality methods among them" catch-all,
+which was simply wrong: `register_p72_preferences` registers `toString` on both
+`java/util/prefs/Preferences` and `java/util/prefs/AbstractPreferences`. The
+latter is an inheritance-intercepting base, so the shim answered for every
+`Preferences` subclass that does not override `toString`.
+
+It rendered `Preferences[<slot 1>]`. Two things wrong with that, in order of
+severity: slot 1 is this VM's own synthetic "name" field, which on a foreign
+subclass is some other field or none at all; and even on our own node it is not
+what a `Preferences` renders. Real `AbstractPreferences.toString` is
+
+```java
+(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()
+```
+
+The shim could not have produced that, because neither accessor could answer:
+
+* `isUserNode()` **was not registered at all**, and could not have been —
+  `userRoot()` and `systemRoot()` both called `p72_alloc_prefs` and returned
+  objects that differed in no observable way.
+* `absolutePath()` returned slot 1, i.e. the same string as `name()`. A child
+  of the root answered `alpha` where the spec says `/alpha`, and a root
+  answered `""` where the spec says `/`. The comment on `parent()` directly
+  below it already observed that "`absolutePath()`-style upward walks
+  terminated immediately" — that walk had never been written.
+
+So the fix is three parts, and the first two are what make the third possible:
+slot 5 carries user-vs-system (set by the four static factories, inherited by
+`node()` children); `isUserNode()` is registered against it; `absolutePath()`
+walks the parent chain. `toString` is then the JDK's formula composed through
+**virtual** calls to those two, so a subclass that overrides either is rendered
+with ITS answer — which is what earns the allowlist row in
+`shim_inheritance_guard.rs` rather than a waiver.
+`abstract_preferences_to_string_composes_from_virtual_accessors` pins the two
+accessors the row's justification depends on, so a later edit cannot delete one
+and leave the row asserting something untrue.
+
+Measured against HotSpot 25 (`PrefsProbe`, 13 printed values including a
+subclass that overrides only the two accessors): all thirteen now match.
 
 ## Handed-over item 1 — `ensure_synthetic_class` must become fallible: BLOCKED, cross-crate
 
