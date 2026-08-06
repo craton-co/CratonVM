@@ -6920,6 +6920,11 @@ pub(super) fn resolve_step1_native(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    // The loader-precise dispatch class the call site already computed, when it
+    // has one. Only consumed by the strict-mode `bytecode_available` probe
+    // below, and only to start the hierarchy walk at the same class the invoke
+    // itself will — see [`step1_dispatch_has_code`].
+    dispatch_class_override: Option<crate::classloading::ClassId>,
     id_out: &mut Option<cratonvm_native_api::NativeMethodId>,
     refusal: &mut Option<cratonvm_types::error::JdkOnlyViolation>,
 ) -> Option<cratonvm_native_api::NativeCallback> {
@@ -6933,8 +6938,36 @@ pub(super) fn resolve_step1_native(
     let kind = registry
         .kind_of_id(id)
         .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+    let policy = crate::vm::dispatch_policy(shared);
+    // §7 step 3's input, resolved LAZILY and only where it is both consulted
+    // and affordable.
+    //
+    // Step 1 runs before method resolution so the common "no native registered"
+    // case never touches the class manager — `resolve_id(..)?` above has
+    // already returned for every such triple, so this walk only ever runs for a
+    // triple that HAS a registration. Narrowing further, `Bridge` is the only
+    // kind `resolve_native_dispatch_wave1` consults the flag for
+    // (`SyntheticStub` is refused and `Intrinsic` is taken regardless), and
+    // both consumers are `is_jdk_only()`-gated. So a default `--real-jdk` run
+    // pays one `Copy` field read and one enum compare, and nothing else.
+    //
+    // The 2026-08-05 attempt failed here by asking the cheaper question —
+    // "does the NAMED class declare bytecode", from access flags. That is not
+    // the same question as "does the method this call will actually run have a
+    // `Code` attribute" the moment a hierarchy is involved, and answering the
+    // first one strands `--jdk-only` on `AbstractMethodError: ... has no Code
+    // attribute`. `step1_dispatch_has_code` asks the second.
+    let bytecode_available = policy.is_jdk_only()
+        && kind == cratonvm_native_api::NativeKind::Bridge
+        && step1_dispatch_has_code(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+            dispatch_class_override,
+        );
     match crate::vm::resolve_native_dispatch_wave1(
-        crate::vm::dispatch_policy(shared),
+        policy,
         class_name,
         method_name,
         descriptor,
@@ -6945,12 +6978,7 @@ pub(super) fn resolve_step1_native(
         // AFTER this chain (see the `native_cb` rebindings below); wave 2 folds
         // them in as the real `compat_native_wins`.
         true,
-        // Step 1 runs before any method resolution — deliberately, so the
-        // common "no native registered" case never touches the class manager.
-        // §7 step 3's input is therefore unknown here; `false` reproduces
-        // today's behaviour, and step 6 (which has resolved bytecode) passes
-        // the real value.
-        false,
+        bytecode_available,
     ) {
         Some(crate::vm::DispatchDecision::Reject(violation)) => {
             *refusal = Some(violation);
@@ -6968,6 +6996,49 @@ pub(super) fn resolve_step1_native(
         // JdkOnly, §7 step 3: concrete bytecode beats this bridge.
         None => None,
     }
+}
+
+/// Does the method this invoke is about to run have a `Code` attribute?
+///
+/// This is §7 step 3's real input, and it is deliberately NOT "does the class
+/// named at the call site declare bytecode". `java/nio/charset/CharsetDecoder`
+/// declares `decodeLoop` **abstract** and every concrete decoder overrides it;
+/// answering from the named class's access flags therefore says "no code" for a
+/// call that will run a subclass body, and "code" for one that will not.
+/// `find_method_recursive` is the same resolution the interpreter's own
+/// dispatch uses — superclass chain first, preferring a non-abstract match,
+/// then interface defaults, then an abstract declaration as a last resort — so
+/// the answer here is the answer at the invoke.
+///
+/// Two deliberate conservatisms, both of which reproduce the pre-2026-08-06
+/// "native wins" behaviour rather than inventing a new one:
+///
+/// * The class is looked up with `get_loaded_class_id`, never loaded. Step 1
+///   must not be able to trigger class loading (and with it `<clinit>`) from
+///   inside a dispatch decision, and a class that is not loaded has no bytecode
+///   to prefer yet.
+/// * An abstract or `ACC_NATIVE` resolution has no `Code`, so it is `false` and
+///   the bridge keeps the call. That is the case the failed attempt got wrong
+///   in the other direction.
+///
+/// Cost is one class-manager read lock plus one hierarchy walk, paid only under
+/// `--jdk-only` and only for a triple that already has a `Bridge` registration.
+fn step1_dispatch_has_code(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    dispatch_class_override: Option<crate::classloading::ClassId>,
+) -> bool {
+    let cm = shared.classes.class_manager.read();
+    // Same start class the call site's own superclass walk uses: the
+    // loader-precise override when the caller resolved one, else the flat
+    // name lookup.
+    let Some(start) = dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name)) else {
+        return false;
+    };
+    crate::classloading::find_method_recursive(start, method_name, descriptor, &cm.class_store)
+        .is_some_and(|(method, _declaring_id)| method.code().is_some())
 }
 
 /// Resolve the complete identity stored by a warmed native invoke target.
