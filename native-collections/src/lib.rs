@@ -45524,7 +45524,28 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
     {
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
-            let (_, n) = al_state(ctx, backing);
+            // The SIZE must not come from `al_state` alone -- it reads an
+            // `elementData`-shaped backing and reports 0 for every other List
+            // shape, so this pre-check rejected PERFECTLY VALID indices on a
+            // view over a LinkedList or an Arrays$ArrayList, while the same
+            // list iterated fine (iteration does not come through here):
+            //
+            //   Collections.unmodifiableList(new LinkedList<>(List.of("x","y")))
+            //       .get(0)  -> AIOOBE    (HotSpot: "x")
+            //
+            // and it is `unmod_delegate` below, not this check, that produces
+            // the right answer once the index is allowed through. See
+            // `unmod_view_size`. This is the registration that actually serves
+            // `Collections.unmodifiableList(..).get(i)` --
+            // `--dump-native-registry` names it
+            // `cratonvm/internal/UnmodifiableList.get`.
+            let al_size = al_state(ctx, backing).1;
+            let n = unmod_view_size(al_size, || {
+                match ctx.invoke_virtual(backing, "size", "()I", &[]) {
+                    Ok(Some(Value::Int(v))) => Some(v),
+                    _ => None,
+                }
+            });
             if *index < 0 || *index >= n {
                 return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
             }
