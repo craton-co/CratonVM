@@ -1851,8 +1851,29 @@ fn dbg_kcbool_report_miss(
     }
 }
 
-/// Create an iterator backed by a snapshot array of the given size.
-/// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
+/// Create an iterator over a snapshot array of the given size.
+///
+/// Returns a real `java.util.Arrays$ArrayItr` — the JDK's own `Object[]`
+/// iterator — so `getClass()`, `hasNext()`, `next()` and the `remove()` that
+/// throws are all the real thing. It falls back to the historical
+/// `HashMap$KeyItr` shape (field 0 = array, 1 = cursor, 2 = total) only when
+/// the image has no `Arrays$ArrayItr` to build, i.e. a `synthetic-jdk` build.
+///
+/// This used to mint `HashMap$KeyItr` unconditionally, and two things were
+/// wrong with that. The visible one: no JDK declares that class, so
+/// `Arrays.asList(a).iterator().getClass()` reported `java.util.HashMap$KeyItr`
+/// where HotSpot says `java.util.Arrays$ArrayItr` — measured by
+/// `probes/StrictIterPrimitivesProbe`. The structural one: it minted through
+/// the INFALLIBLE `alloc_synthetic` while three sibling sites used the fallible
+/// spelling, so under `--jdk-only` the refusal was order-dependent rather than
+/// a policy — `Arrays.asList(a).iterator()` created the class and every LATER
+/// `try_alloc_synthetic` for that name then found it and succeeded, which is
+/// why `linkedhashset.iterator()` passed in a probe that had called
+/// `Arrays.asList` first and threw `NoClassDefFoundError` in one that had not.
+///
+/// Building the real class costs one allocation and two field writes, against
+/// one allocation and three writes for the fabricated shape, so the honest
+/// version is not the expensive one — see `probes/SnapshotIteratorCostProbe`.
 pub fn make_iterator_from_array(
     ctx: &mut dyn NativeContext,
     snapshot_array: ObjectRef,
@@ -1864,23 +1885,53 @@ pub fn make_iterator_from_array(
     // through their pins. Covered by
     // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
     let array_pin = ctx.pin_native_root(snapshot_array);
-    // Fallible since 2026-08-05: this was the LAST infallible `HashMap$KeyItr`
-    // fabrication, and while it stood the refusal at the other three sites was
-    // order-dependent rather than a policy. `probes/StrictIterPrimitivesProbe`
-    // caught it under `--jdk-only`: `Arrays.asList(a).iterator()` reaches this
-    // helper, fabricates the class, and every LATER `try_alloc_synthetic` for
-    // the same name then finds it and succeeds — so
-    // `linkedhashset.iterator()` passed in a probe that had called
-    // `Arrays.asList` first and threw `NoClassDefFoundError` in one that had
-    // not. Route the refusal here too, so no snapshot iterator anywhere wears
-    // a fabricated class name in strict mode.
+    // The real iterator reads `a.length`, so a caller that over-allocated its
+    // snapshot has to be trimmed first — `real_snapshot_iterator` does that and
+    // then builds the same shape.
+    if ctx.array_length(snapshot_array) != size {
+        let cur = ctx.read_native_pin(array_pin, snapshot_array);
+        match real_snapshot_iterator(ctx, cur, size) {
+            Ok(v) => {
+                ctx.unpin_native_roots(array_pin);
+                return Ok(v);
+            }
+            // Only reachable in an image with no `Arrays$ArrayItr`. Re-read the
+            // array through its pin BEFORE dropping it: `real_snapshot_iterator`
+            // allocated, so the bare local above is stale by now, and handing a
+            // from-space reference to the fallback would store a dead array in
+            // the iterator. Nothing allocates between this unpin and the re-pin
+            // the callee takes as its first action.
+            Err(_) => {
+                let cur = ctx.read_native_pin(array_pin, snapshot_array);
+                ctx.unpin_native_roots(array_pin);
+                return make_fabricated_iterator_from_array(ctx, cur, size);
+            }
+        }
+    }
+    let snapshot_array_cur = ctx.read_native_pin(array_pin, snapshot_array);
+    if let Some(itr) = alloc_real_array_iterator(ctx, snapshot_array_cur) {
+        ctx.unpin_native_roots(array_pin);
+        return Ok(Some(Value::Object(Some(itr))));
+    }
+    let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
+    ctx.unpin_native_roots(array_pin);
+    make_fabricated_iterator_from_array(ctx, snapshot_array, size)
+}
+
+/// The pre-2026-08-06 snapshot-iterator shape, kept for images with no real
+/// `java.util.Arrays$ArrayItr` to build (`synthetic-jdk`). Under `--jdk-only`
+/// the fabrication is refused, and correctly: no JDK declares this class.
+fn make_fabricated_iterator_from_array(
+    ctx: &mut dyn NativeContext,
+    snapshot_array: ObjectRef,
+    size: usize,
+) -> MethodCallResult {
+    let array_pin = ctx.pin_native_root(snapshot_array);
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3) {
         Ok(itr) => itr,
-        Err(_refused) => {
-            let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
-            let real = real_snapshot_iterator(ctx, snapshot_array, size);
+        Err(refused) => {
             ctx.unpin_native_roots(array_pin);
-            return real;
+            return Err(refused);
         }
     };
     let itr_pin = ctx.pin_native_root(itr);
@@ -1946,32 +1997,102 @@ fn real_snapshot_iterator(
         }
         exact
     };
-    let arr_pin = ctx.pin_native_root(arr);
-    let list = ctx.new_object_initialized(
-        "java/util/Arrays$ArrayList",
-        "([Ljava/lang/Object;)V",
-        &[Value::Object(Some(arr))],
-    );
-    ctx.unpin_native_roots(arr_pin);
-    match list? {
-        Some(Value::Object(Some(list))) => {
-            ctx.invoke_virtual_bytecode_only(list, "iterator", "()Ljava/util/Iterator;", &[])
-        }
-        // No real `Arrays$ArrayList` to wrap it in. Nothing is left to fall
-        // back TO — returning the fabricated shape here would defeat the whole
-        // point — so surface a refusal naming the class that is actually
-        // missing, rather than the synthetic one the caller asked for.
-        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+    match alloc_real_array_iterator(ctx, arr) {
+        Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+        // Nothing is left to fall back TO — returning the fabricated shape
+        // here would defeat the whole point — so surface a refusal naming the
+        // class that is actually missing, not the synthetic one the caller
+        // asked for.
+        None => Err(cratonvm_native_api::refusal_to_java_failure(
             ctx,
             cratonvm_native_api::ClassIdentityError::Refused {
-                name: "java/util/Arrays$ArrayList".to_string(),
-                reason: "--jdk-only: a snapshot iterator needs the real \
-                         fixed-size list to stand in for the refused \
+                name: "java/util/Arrays$ArrayItr".to_string(),
+                reason: "--jdk-only: a snapshot iterator needs the real array \
+                         iterator to stand in for the refused \
                          `java.util.HashMap$KeyItr`, and this image has none"
                     .to_string(),
             },
         )),
     }
+}
+
+/// Allocate a real `java.util.Arrays$ArrayItr` over `arr`, or `None` when this
+/// image has no such class.
+///
+/// `Arrays$ArrayItr` is the JDK's own iterator over a bare `Object[]`, and it
+/// declares exactly the two fields a snapshot iterator needs:
+///
+/// ```text
+///   cursor : int
+///   a      : Object[]   (final)
+/// ```
+///
+/// So this is construction, not a fabricated layout: both fields are declared
+/// by the real class, both are written by NAME, and both receive a value of the
+/// declared type — the same thing `ArrayItr(E[] a)` does, minus running a
+/// constructor whose entire body is `this.a = a`. Everything the iterator then
+/// does — `hasNext`, `next`, and the inherited `remove` that throws — is real
+/// JDK bytecode reading real fields.
+///
+/// `arr` must ALREADY be exactly the logical length: `hasNext()` is
+/// `cursor < a.length`, so an over-allocated snapshot would iterate trailing
+/// nulls. Both callers trim first.
+///
+/// Returns `None` rather than fabricating anything, so a build without the real
+/// `java.util` (the `synthetic-jdk` feature) keeps its old shape instead of
+/// losing the ability to make an iterator at all.
+fn alloc_real_array_iterator(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Option<ObjectRef> {
+    alloc_real_snapshot_iterator_of(ctx, "java/util/Arrays$ArrayItr", "a", arr)
+}
+
+/// Build a real snapshot iterator of `class_name`, whose backing array lives in
+/// the field `array_field` and whose position lives in `cursor`.
+///
+/// The JDK has more than one iterator of exactly this shape, and which one is
+/// correct depends on the collection that produced it:
+///
+/// ```text
+///   java.util.Arrays$ArrayItr                            a         cursor
+///   java.util.concurrent.CopyOnWriteArrayList$COWIterator snapshot cursor
+/// ```
+///
+/// Both are array-plus-position, both snapshot at creation, and both inherit or
+/// declare a `remove()` that throws — which is why one helper serves both and
+/// why the choice is the CALLER's: returning an `Arrays$ArrayItr` from
+/// `CopyOnWriteArrayList.iterator()` iterates correctly but reports the wrong
+/// `getClass()`, and `probes/SnapshotIteratorShapeProbe` measures exactly that.
+pub fn alloc_real_snapshot_iterator_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    array_field: &str,
+    arr: ObjectRef,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    // `ensure_class_initialized` reports success with another class's id for
+    // some loader fallbacks. The real class or nothing.
+    if ctx.class_name_of_id(cid).unwrap_or_default() != class_name {
+        return None;
+    }
+    let a_slot = ctx.resolve_field_index(class_name, array_field)?;
+    let cursor_slot = ctx.resolve_field_index(class_name, "cursor")?;
+    let n_fields = ctx
+        .class_num_total_fields(cid)
+        .max(a_slot.max(cursor_slot) + 1);
+    // GC-SAFETY: `alloc_object` collects, and `arr` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins — the contract `make_iterator_from_array`
+    // documents, and what `gc_native_pins` covers.
+    let arr_pin = ctx.pin_native_root(arr);
+    let itr = ctx.alloc_object(cid, n_fields);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(itr, a_slot, Value::Object(Some(arr)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(arr_pin);
+    Some(itr)
 }
 
 fn native_unsorted_set_comparator(
