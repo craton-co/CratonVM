@@ -488,7 +488,7 @@ blocks covering many triples each):
 
 This is the largest single wave-2 deletion in the tree and the one most directly
 blocked by
-[`NativeKind` is ambient](native-kind-is-ambient-and-defaults-to-syntheticstub.md):
+the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up:
 reclassifying 217 disjuncts' worth of entries is only safe once each native's
 kind is a stated fact rather than an inherited one.
 

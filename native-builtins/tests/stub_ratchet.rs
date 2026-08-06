@@ -167,8 +167,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the earlier `Bridge` row therefore survived to own the slot. Contract §11's
 /// "zero synthetic-stub invocations through any path" was false for 48 triples,
 /// by registration order, invisibly. See
-/// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
-const BASELINE_SYNTHETIC_STUBS: usize = 632;
+/// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
+/// # 632 -> 642, 2026-08-06 (ten fakes `--jdk-only` was keeping, by file order)
+///
+/// The same shape as the re-freeze above, found by asking the question the
+/// other way round: which triples does `--real-jdk` call a stub while
+/// `--jdk-only` registers something? Twenty did, because a **second file**
+/// registers the same triple under a `Bridge` scope, and strict mode refuses
+/// the stub at the door — so the copy that survived to own the slot was the
+/// one that was not a stub. Ten are now stated `SyntheticStub` at their second
+/// site:
+///
+///  * `Function$Identity.apply` and `UnaryOperator.identity` in
+///    `phases_late/streams.rs`. L7 item 4 retagged the `lib.rs` cluster; these
+///    two copies kept `--jdk-only` minting a `Function$Identity` /
+///    `UnaryOperator$Identity` whose class contract §5 forbids fabricating.
+///    That is the "successor defect" the ambient-category record names, still
+///    live in a file that lane did not open.
+///  * five `CountDownLatch` and two `CyclicBarrier` registrations in a
+///    surefire bootstrap block — the same callbacks `util_concurrent_ext`
+///    installs and states as stubs.
+///  * `java.io.InputStream.transferTo` in `native-io`, whose other copy in
+///    `phases_late/zip_streams.rs` is a stub.
+///
+/// A strict census A/B: 10 triples refused that were admitted, none the other
+/// way, and **zero** effective-kind changes in `--real-jdk`. The ten left
+/// alone are `java.util.Set.of`, whose strict kind is `Intrinsic` — an
+/// intrinsic shadowing concrete bytecode is what an intrinsic is (554 of 678
+/// `Intrinsic` rows do), so that is a reclassification question, not a fake.
+const BASELINE_SYNTHETIC_STUBS: usize = 642;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
@@ -252,7 +279,7 @@ fn census() -> (usize, usize) {
 }
 
 /// THE GATE FOR STEP 3 OF
-/// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`:
+/// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up:
 /// *"flip the default last — once every registration states its kind,
 /// `current_category` can default to something that fails loudly (or be
 /// deleted)."*

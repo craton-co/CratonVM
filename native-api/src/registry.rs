@@ -4482,7 +4482,7 @@ pub struct NativeCensusEntry {
     /// row covered by one is not on the default.
     ///
     /// This is the column step 3 of
-    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
     /// is scored against: *"flip the default last — once every registration
     /// states its kind, `current_category` can default to something that fails
     /// loudly (or be deleted)"*. `kind_stated` cannot score it, because it is
@@ -4703,7 +4703,7 @@ pub struct NativeMethodRegistry {
     /// This is the discriminator the 157-entry reclassification needs: today
     /// the census can say a registration is a `SyntheticStub` and where it was
     /// written, but not whether anyone *decided* that. See
-    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
     next_kind_stated: bool,
     /// Per-registration copy of [`Self::next_kind_stated`], index-parallel with
     /// `registrations` and `categories`.
@@ -5132,7 +5132,7 @@ impl NativeMethodRegistry {
     /// registrar last ran.
     ///
     /// This is the migration target for
-    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up.
     /// `register` takes four arguments, none of them a kind; the kind comes
     /// from a mutable field on the registry that some *ancestor* frame set. The
     /// consequence runs in both directions and is silent at the point of the

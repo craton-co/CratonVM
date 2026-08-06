@@ -10371,17 +10371,42 @@ pub fn register_essential_natives_with_shims(
     // Surefire command bootstrap uses j.u.c synchronizers in CommandReader
     // initialization paths. Ensure these core concurrency natives are present
     // in minimal real-JDK bootstrap runs before later phase registrars execute.
+    //
+    // `SyntheticStub`, stated: these are the SAME five callbacks
+    // `util_concurrent_ext::register_concurrent_natives` installs, and that
+    // registrar states `SyntheticStub` for them. Left on this function's
+    // ambient `Bridge` they became a second copy that `--jdk-only` kept —
+    // strict mode refuses the stub at the door, so the surviving row was
+    // whichever copy was NOT a stub, and `CountDownLatch` went on being served
+    // by the synthetic implementation in the mode that exists to remove it.
+    // Measured 2026-08-06 by diffing a `--jdk-only` census against a
+    // `--real-jdk` one: five triples, plus the two `CyclicBarrier` constructors
+    // below. `java.util.concurrent` is pure Java; JDK 25 declares no
+    // `ACC_NATIVE` method on either class.
     let surefire_cdl = "java/util/concurrent/CountDownLatch";
-    registry.register(surefire_cdl, "<init>", "(I)V", native_cdl_init);
-    registry.register(surefire_cdl, "countDown", "()V", native_cdl_count_down);
-    registry.register(surefire_cdl, "await", "()V", native_cdl_await);
-    registry.register(
+    registry.register_with_kind(surefire_cdl, "<init>", "(I)V", native_cdl_init, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
+        surefire_cdl,
+        "countDown",
+        "()V",
+        native_cdl_count_down,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
+    registry.register_with_kind(surefire_cdl, "await", "()V", native_cdl_await, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
         surefire_cdl,
         "await",
         "(JLjava/util/concurrent/TimeUnit;)Z",
         native_cdl_await_timeout,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
-    registry.register(surefire_cdl, "getCount", "()J", native_cdl_get_count);
+    registry.register_with_kind(
+        surefire_cdl,
+        "getCount",
+        "()J",
+        native_cdl_get_count,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
     // Keep Semaphore's real JDK constructor and methods when real AQS is in
     // use.  The synthetic representation stores its permit state in an int[]
     // in Semaphore.sync, which is safe only while every Semaphore operation is
@@ -10439,13 +10464,15 @@ pub fn register_essential_natives_with_shims(
     }
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
+    // `SyntheticStub` for the same reason as the latch above.
     let surefire_cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(surefire_cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
+    registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register_with_kind(
         surefire_cb,
         "<init>",
         "(ILjava/lang/Runnable;)V",
         native_cb_init_action,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     // If CommandReader.<clinit> still fails, surefire wraps the cause in
     // UnsatisfiedLinkError / ExceptionInInitializerError very early.

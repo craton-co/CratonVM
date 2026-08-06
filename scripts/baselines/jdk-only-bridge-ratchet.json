@@ -1,29 +1,29 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4605,
-      "bridge_without_acc_native": 9581,
+      "bridge_shadows_bytecode": 4596,
+      "bridge_without_acc_native": 9571,
       "jdk_version": "25.0.3",
       "mode": "compatible",
-      "note": "Ambient-category scoping: current_category is an Option, nine registrars that had no scope now state SyntheticStub, and the 48 triples --jdk-only was admitting by registration order are refused. Effective kind of all 10,639 triples byte-identical; the counts fall because superseded rows stopped claiming a kind nothing used.",
+      "note": "The ten fakes --jdk-only kept because a second file registered the same triple under a Bridge scope: Function$Identity.apply and UnaryOperator.identity (the copies L7 item 4 did not reach), five CountDownLatch, two CyclicBarrier, InputStream.transferTo. Strict census A/B: 10 triples refused, 0 admitted, 0 effective-kind changes in --real-jdk.",
       "observed": {
         "bridge": {
           "abstract_method": 1322,
           "acc_native": 774,
-          "class_absent": 1190,
+          "class_absent": 1189,
           "class_present_method_undeclared": 2464,
-          "rows": 10355,
-          "shadows_bytecode": 4605,
-          "without_acc_native": 9581
+          "rows": 10345,
+          "shadows_bytecode": 4596,
+          "without_acc_native": 9571
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10355,
+          "bridge": 10345,
           "intrinsic": 687,
-          "synthetic-stub": 834
+          "synthetic-stub": 844
         },
         "schema": 1,
         "total_rows": 11876

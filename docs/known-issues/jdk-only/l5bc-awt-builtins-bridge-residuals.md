@@ -22,6 +22,27 @@ Sibling record for the crate L5 did first:
 share a method and a conclusion; this one is where the *scale* of the ambient
 default shows up.
 
+> **This record now owns the reclassification question, 2026-08-06.** The
+> retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up used
+> to carry it. That record is closed: `current_category` is an `Option` and is
+> scoped by the save/restore idiom the tree already used, so it restores the
+> *absence* of a choice as well as the kind; nine registrars that had no scope
+> at all now state theirs; no registration in a real boot runs on the
+> constructor default (`kind_chosen: false` on 0 of 11,876); and
+> `scripts/jdk-only-kind-map.py` freezes the kind of **every** registration, so
+> a one-line ambient edit is a reviewable per-row diff instead of a silent
+> thousand-row change. It also closed 58 triples `--jdk-only` was admitting
+> because the drop happens at registration and the *surviving* copy of a
+> twice-registered triple was whichever one was not tagged a stub.
+>
+> **None of that reclassified anything, and it could not have.** The 7,748 rows
+> below are unchanged in kind; what changed is that nothing can move them
+> quietly any more. The tree-wide figure is **9,571** `Bridge` registrations
+> with no `ACC_NATIVE` target (JDK 25 / linux, 2026-08-06), ratcheted slack-free
+> by `regression-suite/bridge-ratchet.sh`. Lowering it is this record's job and
+> contract §8's wave, one subsystem at a time, with the census re-taken after
+> each.
+
 ## What L5b/L5c did
 
 L5 established the rule on `native-io`: a registration may state

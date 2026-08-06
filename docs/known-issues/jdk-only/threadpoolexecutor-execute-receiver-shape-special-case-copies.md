@@ -195,7 +195,7 @@ Per the wave-1 marker, all of them collapse into one structural rule:
 * Reclassifying `native_es_execute` to `SyntheticStub` while
   `CRATONVM_NO_STUBS` / `--jdk-only` is in play **drops the registration
   entirely** (see
-  [`NativeKind` is ambient](native-kind-is-ambient-and-defaults-to-syntheticstub.md)),
+  the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up),
   so synthetic-receiver executors lose their only implementation. Step 4 (real
   field initialisation) must land first, or strict mode loses
   `Executors.new*ThreadPool()`.

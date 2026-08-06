@@ -20,7 +20,7 @@
 #
 # See L6-unadjudicated-bridge-ratchet-DONE-20260805.md (the lane
 # brief, retired 2026-08-05 when this landed) and
-# docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md.
+# the retired native-kind-is-ambient-and-defaults-to-syntheticstub write-up.
 #
 # Contract §1.5 defines a `Bridge` as what an `ACC_NATIVE` method binds to.
 # 10,084 of the 10,844 `Bridge` registrations have no such target, every one of

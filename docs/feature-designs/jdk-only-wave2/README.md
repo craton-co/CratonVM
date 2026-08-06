@@ -41,6 +41,18 @@ can work on what, simultaneously, without colliding.**
 | [L11](L11-delete-the-hardcoded-lists.md) | Items 3 + 7: delete the lists — **item 3 DONE 2026-08-04** | `native_override.rs`, `vm_exec.rs` ⚠ | ~~L9~~, L10 | M |
 | [L12](L12-item11-residuals.md) | Item 11 §2/§4/§6/§8/§9/§10/§11 | mixed — see doc | partly L5 | L |
 
+**Lane L6 grew a second gate, 2026-08-06.** `regression-suite/bridge-ratchet.sh`
+now scores `scripts/jdk-only-kind-map.py` over the same census: a per-registration
+freeze of `NativeKind`, because L6's two counts cannot see the dangerous
+direction — a `Bridge`→`SyntheticStub` mass re-tag takes rows *out* of the
+`Bridge` population, so both numbers fall and the gate says "IMPROVED". Landed
+with the ambient-category fix that retired
+`known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`:
+`current_category` is an `Option` and scoped, nine unscoped registrars state
+their kind, and 58 triples `--jdk-only` was admitting by registration order are
+refused — including the `Function$Identity` / `UnaryOperator.identity` copies in
+`phases_late/streams.rs` that L7 item 4 did not reach.
+
 **Every lane is done.** (L1–L8 landed; L9 is closed. L10 is the
 remaining blocker, and L11/L12 are gated behind it.)
 

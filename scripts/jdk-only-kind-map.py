@@ -4,7 +4,7 @@
 """KIND-MAP GATE — a per-registration freeze of `NativeKind`, so an ambient
 `set_category` edit cannot re-tag a thousand natives in silence.
 
-`docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`
+The retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
 opens with a warning this gate exists to make false:
 
 > **DANGEROUS: causes silent misclassification, not a clean failure, and it

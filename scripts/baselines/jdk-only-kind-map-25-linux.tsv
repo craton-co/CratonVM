@@ -9,7 +9,7 @@
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
 # rows: 11876
 # unchosen: 0
-# note: Ambient-category scoping: current_category is an Option, nine registrars that had no scope now state SyntheticStub, and the 48 triples --jdk-only was admitting by registration order are refused. Effective kind of all 10,639 triples byte-identical; the counts fall because superseded rows stopped claiming a kind nothing used.
+# note: The ten fakes --jdk-only kept because a second file registered the same triple under a Bridge scope: Function$Identity.apply and UnaryOperator.identity (the copies L7 item 4 did not reach), five CountDownLatch, two CyclicBarrier, InputStream.transferTo. Strict census A/B: 10 triples refused, 0 admitted, 0 effective-kind changes in --real-jdk.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -1365,7 +1365,7 @@ java/io/InputStream	readAllBytes	()[B	0	bridge	0	1
 java/io/InputStream	readNBytes	(I)[B	0	bridge	0	1
 java/io/InputStream	readNBytes	([BII)I	0	bridge	0	1
 java/io/InputStream	skip	(J)J	0	bridge	0	1
-java/io/InputStream	transferTo	(Ljava/io/OutputStream;)J	0	bridge	0	1
+java/io/InputStream	transferTo	(Ljava/io/OutputStream;)J	0	synthetic-stub	1	1
 java/io/InputStream	transferTo	(Ljava/io/OutputStream;)J	1	synthetic-stub	0	1
 java/io/LineNumberInputStream	<init>	(Ljava/io/InputStream;)V	0	bridge	0	1
 java/io/LineNumberInputStream	<init>	(Ljava/io/InputStream;)V	1	bridge	0	1
@@ -7739,20 +7739,20 @@ java/util/concurrent/CopyOnWriteArraySet	toArray	()[Ljava/lang/Object;	0	bridge	
 java/util/concurrent/CopyOnWriteArraySet	toArray	(Ljava/util/function/IntFunction;)[Ljava/lang/Object;	0	bridge	0	1
 java/util/concurrent/CopyOnWriteArraySet	toArray	([Ljava/lang/Object;)[Ljava/lang/Object;	0	bridge	0	1
 java/util/concurrent/CopyOnWriteArraySet	toString	()Ljava/lang/String;	0	bridge	0	1
-java/util/concurrent/CountDownLatch	<init>	(I)V	0	bridge	0	1
+java/util/concurrent/CountDownLatch	<init>	(I)V	0	synthetic-stub	1	1
 java/util/concurrent/CountDownLatch	<init>	(I)V	1	synthetic-stub	0	1
-java/util/concurrent/CountDownLatch	await	()V	0	bridge	0	1
+java/util/concurrent/CountDownLatch	await	()V	0	synthetic-stub	1	1
 java/util/concurrent/CountDownLatch	await	()V	1	synthetic-stub	0	1
-java/util/concurrent/CountDownLatch	await	(JLjava/util/concurrent/TimeUnit;)Z	0	bridge	0	1
+java/util/concurrent/CountDownLatch	await	(JLjava/util/concurrent/TimeUnit;)Z	0	synthetic-stub	1	1
 java/util/concurrent/CountDownLatch	await	(JLjava/util/concurrent/TimeUnit;)Z	1	synthetic-stub	0	1
-java/util/concurrent/CountDownLatch	countDown	()V	0	bridge	0	1
+java/util/concurrent/CountDownLatch	countDown	()V	0	synthetic-stub	1	1
 java/util/concurrent/CountDownLatch	countDown	()V	1	synthetic-stub	0	1
-java/util/concurrent/CountDownLatch	getCount	()J	0	bridge	0	1
+java/util/concurrent/CountDownLatch	getCount	()J	0	synthetic-stub	1	1
 java/util/concurrent/CountDownLatch	getCount	()J	1	synthetic-stub	0	1
 java/util/concurrent/CountDownLatch	toString	()Ljava/lang/String;	0	synthetic-stub	0	1
-java/util/concurrent/CyclicBarrier	<init>	(I)V	0	bridge	0	1
+java/util/concurrent/CyclicBarrier	<init>	(I)V	0	synthetic-stub	1	1
 java/util/concurrent/CyclicBarrier	<init>	(I)V	1	synthetic-stub	0	1
-java/util/concurrent/CyclicBarrier	<init>	(ILjava/lang/Runnable;)V	0	bridge	0	1
+java/util/concurrent/CyclicBarrier	<init>	(ILjava/lang/Runnable;)V	0	synthetic-stub	1	1
 java/util/concurrent/CyclicBarrier	<init>	(ILjava/lang/Runnable;)V	1	synthetic-stub	0	1
 java/util/concurrent/CyclicBarrier	await	()I	0	synthetic-stub	0	1
 java/util/concurrent/CyclicBarrier	await	(JLjava/util/concurrent/TimeUnit;)I	0	synthetic-stub	0	1
@@ -8271,7 +8271,7 @@ java/util/function/Function	identity	()Ljava/util/function/Function;	1	synthetic
 java/util/function/Function$AndThen	apply	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 java/util/function/Function$Compose	apply	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 java/util/function/Function$Identity	andThen	(Ljava/util/function/Function;)Ljava/util/function/Function;	0	synthetic-stub	0	1
-java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
+java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
 java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	1	synthetic-stub	0	1
 java/util/function/Function$Identity	compose	(Ljava/util/function/Function;)Ljava/util/function/Function;	0	synthetic-stub	0	1
 java/util/function/IntBinaryOperator	applyAsInt	(II)I	0	bridge	0	1
@@ -8297,7 +8297,7 @@ java/util/function/ToDoubleFunction	applyAsDouble	(Ljava/lang/Object;)D	0	bridge
 java/util/function/ToIntFunction	applyAsInt	(Ljava/lang/Object;)I	0	bridge	0	1
 java/util/function/ToLongFunction	applyAsLong	(Ljava/lang/Object;)J	0	bridge	0	1
 java/util/function/UnaryOperator	apply	(Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-java/util/function/UnaryOperator	identity	()Ljava/util/function/UnaryOperator;	0	bridge	0	1
+java/util/function/UnaryOperator	identity	()Ljava/util/function/UnaryOperator;	0	synthetic-stub	1	1
 java/util/function/UnaryOperator	identity	()Ljava/util/function/UnaryOperator;	1	synthetic-stub	0	1
 java/util/jar/Attributes	<init>	()V	0	bridge	0	1
 java/util/jar/Attributes	<init>	(I)V	0	bridge	0	1

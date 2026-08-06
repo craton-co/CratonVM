@@ -2218,8 +2218,22 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             )
         },
     );
-    // UnaryOperator.identity()
-    r.register(
+    // UnaryOperator.identity() — `SyntheticStub`, not the enclosing registrar's
+    // `Bridge`. Same reasoning as L7 item 4 applied to `Function.identity` a few
+    // hundred lines below, and this is the copy that lane missed: a strict
+    // census A/B on 2026-08-06 found this registration and
+    // `Function$Identity.apply` still ALIVE under `--jdk-only`, because L7
+    // retagged the `native-builtins/src/lib.rs` cluster and these two sit in a
+    // different file under a different scope.
+    //
+    // `java.util.function.UnaryOperator.identity()` is a one-line
+    // `invokedynamic` returning `t -> t`, so a working real-bytecode fallback
+    // plainly exists — which is exactly what `Bridge` asserts there is not. And
+    // the stand-in it mints, `UnaryOperator$Identity`, has no class file
+    // anywhere: contract §5 forbids fabricating it under `JdkOnly`, so the
+    // `Bridge` tag was keeping alive a bridge to a receiver the policy says may
+    // not exist. Dropped here, strict mode runs `java.base`'s own lambda.
+    r.register_with_kind(
         uo,
         "identity",
         "()Ljava/util/function/UnaryOperator;",
@@ -2229,6 +2243,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0);
             Ok(Some(Value::Object(Some(proxy))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // BinaryOperator<T> extends BiFunction<T,T,T> — apply is inherited
@@ -2912,12 +2927,19 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Function$Identity.apply(x) = x
-    r.register(
+    // Function$Identity.apply(x) = x — `SyntheticStub`, the other half of the
+    // copy L7 item 4 missed. `lib.rs`'s registration of this same triple is
+    // already `SyntheticStub`; this one was `Bridge`, and under `--jdk-only`
+    // the stub is refused at the door so THIS row survived to own the slot.
+    // With both stated, no `Function$Identity` is minted under `--jdk-only` and
+    // the method is unreachable, which is the point: the class has no bytes
+    // anywhere and §5 forbids fabricating it.
+    r.register_with_kind(
         "java/util/function/Function$Identity",
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         |_ctx, args| Ok(Some(args[1])),
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // Consumer$AndThen.accept(x) = first.accept(x); after.accept(x);
