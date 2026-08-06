@@ -34756,9 +34756,11 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::NullPointerException { message: None }
-                ))
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException { message: None }
+                    )
+                )
             ),
             "HotSpot dereferences the Class argument: NullPointerException with \
              no detail message, not an Object[5] — got {err:?}"
