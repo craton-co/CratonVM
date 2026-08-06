@@ -1904,10 +1904,9 @@ thread_local! {
 /// Record/verify what this `JitSiteKey` names. Called at the
 /// top of both dispatch entry points, so it is independent of WHICH memo a
 /// given site would have consulted.
+#[cold]
+#[inline(never)]
 fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
-    if !site_alias_detect_enabled() {
-        return;
-    }
     SITE_IDENTITY.with(|m| {
         let mut m = m.borrow_mut();
         match m.get(&info_key) {
@@ -2490,7 +2489,7 @@ unsafe fn route_implicit_exc_through_callee(
         args_slice
             .first()
             .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
-            .map(|obj| vm.mem.heap.class_id_of(obj))
+            .map(|obj| vm.mem.heap.class_id_of_validated(obj))
             .unwrap_or_else(|| ClassId::new(0))
     } else {
         ClassId::new(0)
@@ -2835,7 +2834,7 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     let receiver_class_id = args_slice
         .first()
         .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
-        .map(|obj| vm.mem.heap.class_id_of(obj))
+        .map(|obj| vm.mem.heap.class_id_of_validated(obj))
         .unwrap_or_else(|| ClassId::new(0));
     match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, args_slice) {
         Some(v) => v,
@@ -3129,6 +3128,7 @@ unsafe fn try_resume_trapped_callee(
 pub(crate) const INLINE_JIT_NATIVE_ARGS: usize = 8;
 type JitDecodedArgs = smallvec::SmallVec<[Value; INLINE_JIT_NATIVE_ARGS]>;
 
+
 /// Decode a JIT dispatch helper's raw `i64` argument slice into the
 /// `Value` slice the interpreter expects. Centralised so that the slow
 /// path in `jit_invoke_dispatch` and the three `try_call_compiled_entry`
@@ -3150,27 +3150,67 @@ unsafe fn decode_dispatch_values(
     info: &JitInvokeInfo,
     args_slice: &[i64],
 ) -> JitDecodedArgs {
-    let mut values = JitDecodedArgs::with_capacity(args_slice.len());
+    let mut values = JitDecodedArgs::new();
+    decode_dispatch_values_into(vm, info, args_slice, None, &mut values);
+    values
+}
+
+/// [`decode_dispatch_values`] writing into a caller-owned buffer, with an
+/// optional already-resolved receiver.
+///
+/// Two costs the by-value form carried, both measured in
+/// `jit_native_dispatch_profile`:
+///
+///  * **`SmallVec::with_capacity`.** `JitDecodedArgs` is a
+///    `SmallVec<[Value; 8]>` — eight 16-byte `Value`s plus a capacity word,
+///    ~144 bytes. The zero-argument rung (`decode: static, ()J`) measured
+///    **10.5 ns** with no argument work to do at all, and building the buffer
+///    with `new()` in a caller-owned local took the same rung to **0.2 ns**.
+///    The first guess was the return move; it was not — `with_capacity` is an
+///    outlined call, so the whole value has to be materialised in memory for
+///    it, while `new()` inlines and the buffer stays in registers for a decode
+///    this small. Worth recording because the by-value shape reads like the
+///    expensive part and is not.
+///  * **A third validation of the receiver.** `try_jit_site_cached_native_dispatch`
+///    resolves the receiver through `is_object_address` to guard the site, and
+///    passes the resolved `ObjectRef` here rather than handing back the raw word
+///    for this function to validate again. `None` keeps the original behaviour
+///    for callers that have not resolved one.
+#[inline]
+unsafe fn decode_dispatch_values_into(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    receiver: Option<Option<ObjectRef>>,
+    values: &mut JitDecodedArgs,
+) {
+    values.clear();
     let mut desc_iter = DescriptorParamIter::new(info.descriptor);
 
     if info.invoke_kind != 3 {
         if !args_slice.is_empty() {
-            let ptr = args_slice[0];
-            if ptr == 0 {
-                values.push(Value::Object(None));
-            } else {
-                // Defensive: tagged-long bits in an L-typed receiver slot
-                // are downgraded to null instead of being treated as a
-                // heap pointer (else GC SEGVs walking a bogus oop).
-                let bits = ptr as u64;
-                let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                    vm.mem.heap.is_object_address(bits as usize)
-                } else {
-                    None
-                };
-                match validated {
-                    Some(obj) => values.push(Value::Object(Some(obj))),
-                    None => values.push(Value::Object(None)),
+            match receiver {
+                // The caller already ran the validator on this very slot.
+                Some(resolved) => values.push(Value::Object(resolved)),
+                None => {
+                    let ptr = args_slice[0];
+                    if ptr == 0 {
+                        values.push(Value::Object(None));
+                    } else {
+                        // Defensive: tagged-long bits in an L-typed receiver slot
+                        // are downgraded to null instead of being treated as a
+                        // heap pointer (else GC SEGVs walking a bogus oop).
+                        let bits = ptr as u64;
+                        let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                            vm.mem.heap.is_object_address(bits as usize)
+                        } else {
+                            None
+                        };
+                        match validated {
+                            Some(obj) => values.push(Value::Object(Some(obj))),
+                            None => values.push(Value::Object(None)),
+                        }
+                    }
                 }
             }
         }
@@ -3205,7 +3245,6 @@ unsafe fn decode_dispatch_values(
         };
         values.push(val);
     }
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -8912,7 +8951,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     flush_raw_entry_dispatch_caches();
     let info_key = jit_site_key(vm.vm_identity, info_ptr as usize);
     // Diagnostic (`CRATONVM_DBG_SITE_ALIAS`): does this key still name its site?
-    note_site_identity(info_key, info);
+    // The gate is here rather than inside, so an all-off run does not make the
+    // call at all — it measured 2.2 ns switched off, which is a fifth of the
+    // argument decode it precedes.
+    if site_alias_detect_enabled() {
+        note_site_identity(info_key, info);
+    }
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
     // probes); this early block only serves sites the cache has already
@@ -8936,7 +8980,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             let receiver_raw = args_slice[0] as u64;
             if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
                 if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
-                    if vm.mem.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                    if vm.mem.heap.class_id_of_validated(receiver).as_u32()
+                        == entry.receiver_class_id
+                    {
                         if let Some((thread, _guard)) = jit_thread_mut() {
                             if let Some(result) = call_object_native_raw(
                                 vm, thread, info, receiver, args_slice, entry,
@@ -9347,7 +9393,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let receiver_raw = args_slice[0] as u64;
         if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
             if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
-                let receiver_class_id = vm.mem.heap.class_id_of(receiver).as_u32();
+                let receiver_class_id = vm.mem.heap.class_id_of_validated(receiver).as_u32();
                 if !class_was_redefined(vm, ClassId::new(receiver_class_id)) {
                     let cached = OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                         cache
@@ -9423,7 +9469,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // direct path before allocating decoded Values for the generic fallback.
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
         if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
-            let proxy_class_id = vm.mem.heap.class_id_of(proxy);
+            let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
             if vm
                 .classes
                 .lambda_proxies
@@ -9722,6 +9768,12 @@ unsafe fn try_jit_site_cached_native_dispatch(
     }
     // The receiver's runtime class both selects the override to resolve and
     // guards a warm entry. A static site has neither.
+    // The resolved receiver is threaded through to `decode_dispatch_values_into`
+    // and to `class_id_of_validated`, so this is the ONLY conservative header
+    // validation on the path. It used to be three: here, again inside
+    // `VmHeap::class_id_of`, and a third time in the argument decode — 3.2 ns
+    // each on a ~100 ns call (`jit_native_dispatch_profile`).
+    let mut receiver = None;
     let receiver_class_id = if info.invoke_kind == 3 {
         None
     } else {
@@ -9730,7 +9782,10 @@ unsafe fn try_jit_site_cached_native_dispatch(
             return site_refusal::note_and_decline(0);
         }
         match vm.mem.heap.is_object_address(raw as usize) {
-            Some(obj) => Some(vm.mem.heap.class_id_of(obj)),
+            Some(obj) => {
+                receiver = Some(obj);
+                Some(vm.mem.heap.class_id_of_validated(obj))
+            }
             None => return site_refusal::note(0).map(|_| 0),
         }
     };
@@ -9753,12 +9808,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
     if entry.receiver_class_id != receiver_class_id.map(|cid| cid.as_u32()) {
         return None;
     }
-    if class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
-        return None;
-    }
-    if let Some(cid) = receiver_class_id {
-        if class_was_redefined(vm, cid) {
+    // Both of these open with the same process-global `any_class_redefined()`
+    // load and answer `false` for every run in which nothing was ever
+    // redefined. Hoisting that one test out costs a redefining run nothing and
+    // saves every other run a second cross-crate call (1.2 ns each, measured).
+    if crate::classloading::any_class_redefined() {
+        if class_id_or_name_was_redefined(vm, info.declaring_class_id, info.class_name) {
             return None;
+        }
+        if let Some(cid) = receiver_class_id {
+            if class_was_redefined(vm, cid) {
+                return None;
+            }
         }
     }
 
@@ -9776,7 +9837,13 @@ unsafe fn try_jit_site_cached_native_dispatch(
         thread.native_pending_return = Some(obj);
         return Some(obj.as_ptr() as i64);
     }
-    let values = decode_dispatch_values(vm, info, args_slice);
+    // `JitDecodedArgs::new()` and not `with_capacity(args_slice.len())`: the
+    // latter is an outlined call whose ~144-byte return the caller has to
+    // materialise, and it measured 10.3 ns for a zero-argument decode that has
+    // nothing to do (`jit_native_dispatch_profile`). This is the buffer the
+    // decode fills in place.
+    let mut values = JitDecodedArgs::new();
+    decode_dispatch_values_into(vm, info, args_slice, receiver.map(Some), &mut values);
     if entry.leaf {
         LEAF_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
@@ -15451,4 +15518,430 @@ pub extern "C" fn jit_frem(a: f32, b: f32) -> f32 {
 pub extern "C" fn jit_drem(a: f64, b: f64) -> f64 {
     crate::jit::conservative_roots::note_jit_boundary();
     a % b
+}
+
+/// The argument decode's two receiver routes must agree.
+///
+/// `try_jit_site_cached_native_dispatch` resolves the receiver to guard the site
+/// and then hands the resolved `ObjectRef` to the decode instead of the raw
+/// word, so the conservative header validator runs once per call rather than
+/// three times. That is only sound while the two routes produce the same
+/// `Value`, and the raw route has three arms the resolved one skips: null, a
+/// tagged/non-canonical word, and an address the validator rejects. A
+/// divergence would put a `Value::Object` the funnel then pins into a slot the
+/// old route would have nulled.
+#[cfg(test)]
+mod decode_receiver_routes {
+    use super::*;
+    use crate::config::VmConfig;
+    use std::sync::Arc;
+
+    static PROBE_INFO: JitInvokeInfo = JitInvokeInfo {
+        class_name: "p/Probe",
+        method_name: "m",
+        descriptor: "()I",
+        num_jit_args: 1,
+        return_type: b'I',
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    };
+
+    #[test]
+    fn a_resolved_receiver_decodes_to_what_the_raw_word_decodes_to() {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let raw = obj.as_ptr() as i64;
+
+        let mut resolved = JitDecodedArgs::new();
+        let mut unresolved = JitDecodedArgs::new();
+        // SAFETY: `[raw]` holds a live heap address from `alloc_object`.
+        unsafe {
+            decode_dispatch_values_into(
+                &shared,
+                &PROBE_INFO,
+                &[raw],
+                Some(Some(obj)),
+                &mut resolved,
+            );
+            decode_dispatch_values_into(&shared, &PROBE_INFO, &[raw], None, &mut unresolved);
+        }
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(&resolved[..], &unresolved[..]);
+        assert!(matches!(resolved[0], Value::Object(Some(o)) if o.as_ptr() == obj.as_ptr()));
+    }
+
+    /// The buffer is reused across calls, so a longer previous call must not
+    /// leave arguments behind for a shorter one.
+    #[test]
+    fn a_reused_buffer_does_not_leak_the_previous_calls_arguments() {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        static TWO_INT_INFO: JitInvokeInfo = JitInvokeInfo {
+            class_name: "p/Probe",
+            method_name: "m",
+            descriptor: "(II)I",
+            num_jit_args: 3,
+            return_type: b'I',
+            invoke_kind: 0,
+            declaring_class_id: 0,
+        };
+        let mut buf = JitDecodedArgs::new();
+        // SAFETY: slot 0 is a live heap address; the rest are plain ints.
+        unsafe {
+            decode_dispatch_values_into(
+                &shared,
+                &TWO_INT_INFO,
+                &[obj.as_ptr() as i64, 7, 9],
+                Some(Some(obj)),
+                &mut buf,
+            );
+            assert_eq!(buf.len(), 3);
+            decode_dispatch_values_into(
+                &shared,
+                &PROBE_INFO,
+                &[obj.as_ptr() as i64],
+                Some(Some(obj)),
+                &mut buf,
+            );
+        }
+        assert_eq!(
+            buf.len(),
+            1,
+            "the reused buffer still holds the previous call's arguments"
+        );
+    }
+}
+
+/// Where a **compiled-code** native call's fixed cost goes, step by step.
+///
+/// `native-funnel-fixed-cost-is-the-remaining-wall-RETIRED-20260806.md` bounded the
+/// cost from Java and then said so itself: *"Nobody has profiled it. This
+/// document asserts a bound, not a line."* Its companion,
+/// `native-call-funnel-per-call-floor-item2-20260805.md`, profiled
+/// `safe_native_call_impl`'s **body** (`vm_exec.rs`, `native_funnel_profile`)
+/// and found it to be ~23-30 ns for one argument. That leaves the larger half
+/// of a compiled native call unmeasured: everything `jit_invoke_dispatch` and
+/// [`try_jit_site_cached_native_dispatch`] do *around* the funnel — the
+/// boundary bookkeeping, the memo flushes, the receiver guard, the argument
+/// decode and the return coercion.
+///
+/// This module times those, one at a time, in one process against a bare
+/// [`SharedVm`] with a real heap object as the receiver. `#[ignore]`d because
+/// it is a measurement, not an assertion — a timing threshold here would be a
+/// flake on a shared build host. Run it:
+///
+/// ```text
+/// cargo test --release -p cratonvm-vm --lib jit_native_dispatch -- --ignored --nocapture
+/// ```
+///
+/// Multi-pass by construction: a rung that has not gone flat is not a
+/// measurement.
+#[cfg(test)]
+mod jit_native_dispatch_profile {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::{JvmThread, ThreadId};
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const PASSES: usize = 4;
+    const ROUNDS: u32 = 400_000;
+
+    fn noop_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> crate::error::MethodCallResult {
+        Ok(None)
+    }
+
+    fn rung(label: &str, mut f: impl FnMut()) {
+        print!("{label:<56}");
+        for _ in 0..PASSES {
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                f();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+            print!("{ns:>10.1}");
+        }
+        println!();
+    }
+
+    /// An `AtomicInteger.get()`-shaped site: instance receiver, no arguments.
+    static GET_INFO: JitInvokeInfo = JitInvokeInfo {
+        class_name: "java/util/concurrent/atomic/AtomicInteger",
+        method_name: "get",
+        descriptor: "()I",
+        num_jit_args: 1,
+        return_type: b'I',
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    };
+
+    /// A `setExclusiveOwnerThread(Thread)`-shaped site: receiver + one object.
+    static SET_OWNER_INFO: JitInvokeInfo = JitInvokeInfo {
+        class_name: "java/util/concurrent/locks/AbstractOwnableSynchronizer",
+        method_name: "setExclusiveOwnerThread",
+        descriptor: "(Ljava/lang/Thread;)V",
+        num_jit_args: 2,
+        return_type: b'V',
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    };
+
+    /// A `System.nanoTime()`-shaped site: static, no arguments.
+    static NANO_INFO: JitInvokeInfo = JitInvokeInfo {
+        class_name: "java/lang/System",
+        method_name: "nanoTime",
+        descriptor: "()J",
+        num_jit_args: 0,
+        return_type: b'J',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    };
+
+    #[test]
+    #[ignore = "measurement, not an assertion — see the module doc"]
+    fn compiled_native_call_step_breakdown() {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "jit-dispatch-profile");
+        let recv = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let other = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let recv_raw = recv.as_ptr() as i64;
+        let other_raw = other.as_ptr() as i64;
+        let one_arg: [i64; 1] = [recv_raw];
+        let two_args: [i64; 2] = [recv_raw, other_raw];
+        let no_args: [i64; 0] = [];
+        let cb: cratonvm_native_api::NativeCallback = noop_native;
+        let key = jit_site_key(shared.vm_identity, &GET_INFO as *const _ as usize);
+
+        // Seed the site cache so the probe below measures a HIT, which is the
+        // steady state every one of these numbers is about.
+        NATIVE_SITE_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                key,
+                (
+                    shared.natives.native_methods.generation(),
+                    Some(NativeSiteCache {
+                        kind: LeafNativeKind::Callback,
+                        leaf: true,
+                        callback: cb,
+                        native_id: None,
+                        receiver_class_id: Some(0),
+                    }),
+                ),
+            );
+        });
+
+        print!("{:<56}", "rung");
+        for i in 1..=PASSES {
+            print!("{i:>10}");
+        }
+        println!("   (ns/op per pass; read the LAST)");
+
+        // --- the receiver validator, and how many times it is paid ---------
+        rung("heap.is_object_address(receiver)", || {
+            black_box(shared.mem.heap.is_object_address(recv_raw as usize));
+        });
+        rung("heap.class_id_of(receiver)", || {
+            black_box(shared.mem.heap.class_id_of(recv));
+        });
+        rung("heap.class_id_of_validated(receiver)", || {
+            black_box(shared.mem.heap.class_id_of_validated(recv));
+        });
+        rung("heap.load_and_forward(receiver)", || {
+            black_box(shared.mem.heap.load_and_forward(recv));
+        });
+
+        println!();
+
+        // --- jit_invoke_dispatch's preamble, per step ----------------------
+        rung("note_jit_boundary()", || {
+            crate::jit::conservative_roots::note_jit_boundary();
+        });
+        rung("heap.flush_thread_satb()", || {
+            shared.mem.heap.flush_thread_satb();
+        });
+        rung("mic_prof::dump_maybe_disp()", || {
+            mic_prof::dump_maybe_disp();
+        });
+        rung("env_cache::disable_jit()", || {
+            black_box(crate::runtime::env_cache::disable_jit());
+        });
+        rung("forward_jit_reference_args: 1 recv, ()I", || {
+            black_box(forward_jit_reference_args(&shared, &GET_INFO, &one_arg));
+        });
+        rung("forward_jit_reference_args: recv+obj, (LThread;)V", || {
+            black_box(forward_jit_reference_args(
+                &shared,
+                &SET_OWNER_INFO,
+                &two_args,
+            ));
+        });
+        rung("flush_raw_entry_dispatch_caches()", || {
+            flush_raw_entry_dispatch_caches();
+        });
+        rung("jit_site_key()", || {
+            black_box(jit_site_key(
+                shared.vm_identity,
+                &GET_INFO as *const _ as usize,
+            ));
+        });
+        rung("site_alias_detect_enabled() gate [off]", || {
+            if black_box(site_alias_detect_enabled()) {
+                note_site_identity(key, &GET_INFO);
+            }
+        });
+        rung("OBJECT_NATIVE_DISPATCH_CACHE probe (miss)", || {
+            black_box(OBJECT_NATIVE_DISPATCH_CACHE.with(|c| c.borrow().get(&key).copied()));
+        });
+
+        println!();
+
+        // --- try_jit_site_cached_native_dispatch, per step -----------------
+        rung("native_site_cache_enabled()", || {
+            black_box(native_site_cache_enabled());
+        });
+        rung("native_methods.generation()", || {
+            black_box(shared.natives.native_methods.generation());
+        });
+        rung("NATIVE_SITE_CACHE probe (hit)", || {
+            black_box(NATIVE_SITE_CACHE.with(|c| c.borrow().get(&key).copied()));
+        });
+        rung("class_id_or_name_was_redefined()", || {
+            black_box(class_id_or_name_was_redefined(
+                &shared,
+                GET_INFO.declaring_class_id,
+                GET_INFO.class_name,
+            ));
+        });
+        rung("class_was_redefined()", || {
+            black_box(class_was_redefined(&shared, ClassId::new(0)));
+        });
+        rung("jit_thread_mut()", || {
+            // SAFETY: measurement-only; no JIT thread is installed, so this
+            // takes the null arm — which is exactly the TLS read being priced.
+            black_box(unsafe { jit_thread_mut() }.is_some());
+        });
+        rung("decode_dispatch_values: 1 recv, ()I", || {
+            // SAFETY: `one_arg` holds a validated heap address for `recv`.
+            black_box(unsafe { decode_dispatch_values(&shared, &GET_INFO, &one_arg) });
+        });
+        rung("decode_dispatch_values: recv+obj, (LThread;)V", || {
+            // SAFETY: both slots hold validated heap addresses.
+            black_box(unsafe { decode_dispatch_values(&shared, &SET_OWNER_INFO, &two_args) });
+        });
+        rung("decode_dispatch_values: static, ()J", || {
+            // SAFETY: an empty slice is trivially in-bounds.
+            black_box(unsafe { decode_dispatch_values(&shared, &NANO_INFO, &no_args) });
+        });
+        let mut buf = JitDecodedArgs::new();
+        rung("decode_..._into: 1 recv (resolved), ()I", || {
+            // SAFETY: `one_arg[0]` is `recv`, already validated above.
+            unsafe {
+                decode_dispatch_values_into(
+                    &shared,
+                    &GET_INFO,
+                    &one_arg,
+                    Some(Some(recv)),
+                    &mut buf,
+                )
+            };
+            black_box(&mut buf);
+        });
+        rung("decode_..._into: recv+obj (resolved), (LThread;)V", || {
+            // SAFETY: both slots hold validated heap addresses.
+            unsafe {
+                decode_dispatch_values_into(
+                    &shared,
+                    &SET_OWNER_INFO,
+                    &two_args,
+                    Some(Some(recv)),
+                    &mut buf,
+                )
+            };
+            black_box(&mut buf);
+        });
+        rung("decode_..._into: static, ()J", || {
+            // SAFETY: an empty slice is trivially in-bounds.
+            unsafe { decode_dispatch_values_into(&shared, &NANO_INFO, &no_args, None, &mut buf) };
+            black_box(&mut buf);
+        });
+
+        rung("record_invocation() [no id]", || {
+            count_jit_native_dispatch(&shared, None);
+        });
+        rung("coerce_native_return(Int, \"()I\")", || {
+            black_box(crate::vm::coerce_native_return(
+                Some(Value::Int(3)),
+                GET_INFO.descriptor,
+            ));
+        });
+
+        println!();
+
+        // --- the two call wrappers, for scale ------------------------------
+        let recv_val = [Value::Object(Some(recv))];
+        rung("safe_native_call_leaf: 1 object arg", || {
+            black_box(crate::vm::safe_native_call_leaf(
+                &shared,
+                &mut thread,
+                cb,
+                &recv_val,
+            ))
+            .ok();
+        });
+        rung("safe_native_call_prevalidated: 1 object arg", || {
+            black_box(crate::vm::safe_native_call_prevalidated_objects(
+                &shared,
+                &mut thread,
+                cb,
+                &recv_val,
+            ))
+            .ok();
+        });
+        let two_vals = [Value::Object(Some(recv)), Value::Object(Some(other))];
+        rung("safe_native_call_prevalidated: 2 object args", || {
+            black_box(crate::vm::safe_native_call_prevalidated_objects(
+                &shared,
+                &mut thread,
+                cb,
+                &two_vals,
+            ))
+            .ok();
+        });
+
+        println!();
+
+        // --- the one native body on the AQS path that is not a field write ---
+        // `setExclusiveOwnerThread` is intercepted for `ThreadMXBean`, not for
+        // speed, and the interception's whole cost is this index update: a
+        // global mutex over a `HashMap`, the thread-registry `RwLock`, and a
+        // per-thread `Mutex` over a `Vec`. It runs twice per uncontended
+        // `ReentrantLock.lock()`/`unlock()` pair.
+        let registry = &shared.threads.thread_registry;
+        rung("ThreadRegistry::set_jmx_owned_synchronizer (acquire+release)", || {
+            registry.set_jmx_owned_synchronizer(Some(crate::threading::jvm_thread::ThreadId(0)), recv);
+            registry.set_jmx_owned_synchronizer(None, recv);
+        });
+        // The own-handle form, for the same acquire/release pair. A bare
+        //  has no registered thread, so the handle is built here
+        // rather than fetched — which is what the owning thread holds.
+        let own_list: parking_lot::Mutex<Vec<ObjectRef>> = parking_lot::Mutex::new(Vec::new());
+        rung("  ... _own (acquire+release, no registry RwLock)", || {
+            registry.set_jmx_owned_synchronizer_own(
+                crate::threading::jvm_thread::ThreadId(0),
+                &own_list,
+                Some(crate::threading::jvm_thread::ThreadId(0)),
+                recv,
+            );
+            registry.set_jmx_owned_synchronizer_own(
+                crate::threading::jvm_thread::ThreadId(0),
+                &own_list,
+                None,
+                recv,
+            );
+        });
+    }
 }
