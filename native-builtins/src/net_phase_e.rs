@@ -6522,7 +6522,8 @@ fn http_exchange_rustls(
     // root-scan `SIGUSR2` surfaced here as
     // `IOException: TLS handshake read: Interrupted system call (os error 4)`.
     // See `cratonvm_native_io::eintr` and
-    // `internal/fixed-suite-bugs/springboot/jdk-httpclient-sslbundle-tls-handshake-eintr-*`.
+    // `fixed-suite-bugs/springboot/`
+    // `jdk-httpclient-sslbundle-tls-handshake-eintr-FIXED-20260806.md`.
     while tls.conn.is_handshaking() {
         if tls.conn.wants_write() {
             tls.sock

@@ -6,7 +6,7 @@
 | **Cause** | the TLS handshake is a bare `read_tls`/`write_tls` pair with no EINTR retry, on a socket carrying `SO_RCVTIMEO` — which Linux excludes from `SA_RESTART`. The signal is CratonVM's own: `jit::xt_root_scan` `SIGUSR2`s every thread for a cross-thread stop-the-world root scan |
 | **Fixed by** | this branch — `cratonvm_native_io::eintr` plus 36 converted socket-backed TLS I/O sites |
 | **Severity** | medium — a random mid-request `IOException` under load, on any HTTPS client or server path |
-| **HotSpot** | clean (32/32, `hotspot-baseline-latest.tsv`) |
+| **HotSpot** | clean — 32/32, as reported by the original page from `hotspot-baseline-latest.tsv`. Not re-measured here: that file has since been overwritten by a 6-row partial run, and a HotSpot arm cannot answer the question anyway, since the switch below is a CratonVM knob |
 | **Filed** | 2026-08-05, OPEN, "root cause not yet pinned — needs further investigation" |
 
 ## What it was
@@ -85,13 +85,21 @@ Converted:
 | file | sites |
 |---|---|
 | `t27_tls.rs` | 29 — client connect, server accept, `wrap_existing_socket`, and the server-side `SSLSocket` stream read/write |
-| `http_url_connection.rs` | 3 + the post-handshake request write/flush and the pooled-connection probe read |
-| `net_phase_e.rs` | 2 + `write_all`/`flush`, and the `native_tls` socket, wrapped whole |
-| `http_client.rs` | 2 + the HTTP/2 flushes |
+| `http_url_connection.rs` | 3 + the post-handshake request flush and the pooled-connection probe read |
+| `net_phase_e.rs` | 2 + the two TLS `flush`es, and the `native_tls` socket, wrapped whole |
+| `http_client.rs` | 2 + the HTTP/2 and HTTP/1.1 flushes |
 | `async_socket.rs` | the two worker-thread blocking reads and the blocking accept |
 | `socket_channel.rs` | `accept_close_aware` — its Unix-domain sibling had carried the arm since it was written; the TCP one never did |
 
-Two things deliberately **not** converted:
+Three things deliberately **not** converted:
+
+* Every `write_all` / `read_exact` / `read_to_end`. `std`'s defaults already
+  reissue on `Interrupted` **and** advance past the bytes they placed;
+  `retry_eintr` can only restart the whole call, so wrapping a partially
+  completed write would resend it from offset 0. The first cut of this branch
+  wrapped four of them — inert (nothing that reaches them carries both a
+  non-`Interrupted` kind and errno 4) but stating a contract this module cannot
+  honour, so they came back out.
 
 * The three in-memory `read_tls`/`write_tls` calls — the `SSLEngine`
   `wrap`/`unwrap` lane feeds `rustls` from a `Cursor`, which cannot be
@@ -125,9 +133,61 @@ built in, and it produces the identical evidence on either host:
 | `CRATONVM_DBG_EINTR_INJECT=<n>` | synthesise an `EINTR` on every *n*-th operation through `eintr` (floor of 2) |
 | `CRATONVM_DBG_EINTR_NO_RETRY=1` | do not absorb it — i.e. behave exactly as the code did before this branch |
 
-One binary, both arms, **positive control first**.
+One binary, all arms, **positive control first**. Windows box,
+`cratonvm-tlseintr-20260806.exe` (release, `b7706a982`), `-jit`,
+`JdkClientHttpRequestFactoryBuilderTests` via
+`apps/spring-boot-suite-runner/run-single-class.ps1`:
 
-<!-- RESULTS -->
+| arm | `INJECT` | `NO_RETRY` | result | seconds |
+|---|---|---|---|---:|
+| **positive control** | 2 | 1 | **`tests=32 failed=4`** — 8 log lines carrying the reported message | 78 |
+| fix on | 2 | — | `tests=32 failed=0 containersFailed=0` | 79 |
+| flag-only control | — | 1 | `tests=32 failed=0 containersFailed=0` | 81 |
+| baseline | — | — | `tests=32 failed=0 containersFailed=0` | 81 |
+
+The defect arm reproduces the 2026-08-05 report **verbatim**, on the reported
+method, both parameterisations:
+
+```
+JUnit Jupiter:JdkClientHttpRequestFactoryBuilderTests:connectWithSslBundle(String):[2] httpMethod = "POST"
+  => java.io.IOException: HttpClient request failed: TLS handshake read: Interrupted system call (os error 4)
+```
+
+The flag-only arm is what separates the injection from the switch: with
+`NO_RETRY` set and nothing injected the class is still 32/32, so the four
+failures above come from the interrupted syscall and not from the knob.
+
+The first attempt used `INJECT=20` and was **green in the defect arm** — a
+false negative. One in twenty operations is not dense enough to land on the two
+`read_tls` calls of a handshake that is over in a few round trips, and a green
+positive control proves nothing. `INJECT=2` lands on them every time. Anyone
+re-running this: check that the defect arm goes red *before* reading anything
+into the fix arm.
+
+### Nothing else in the module moved
+
+Same binary, no flags, then again at `INJECT=2` with the retry on — the second
+sweep is the one that shows the retry holds across the Reactor Netty, Apache
+HttpComponents and Jetty client stacks too, not just the JDK one:
+
+| class | tests | baseline | `INJECT=2`, fix on |
+|---|---:|---|---|
+| `ReactorClientHttpRequestFactoryBuilderTests` | 33 | 0 failed | 0 failed |
+| `HttpComponentsClientHttpRequestFactoryBuilderTests` | 32 | 0 failed | 0 failed |
+| `JettyClientHttpRequestFactoryBuilderTests` | 32 | 0 failed | 0 failed |
+| `SimpleClientHttpRequestFactoryBuilderTests` | 19 | 0 failed | 0 failed |
+| `ReflectiveComponentsClientHttpRequestFactoryBuilderTests` | 21 | 0 failed | — |
+
+Note that `connectWithSslBundle` stands an embedded Tomcat up on an `SslBundle`
+connector **in the same VM**, so all four of these runs drive CratonVM's TLS
+*server* path (`t27_tls`) as well as its client path — the 29 converted sites in
+that file are exercised, not merely compiled.
+
+Rust side: `cargo test -p cratonvm-types -p cratonvm-native-io` — 398 + 493
+pass, including the six new `eintr` unit tests; `cargo test -p
+cratonvm-native-builtins --test eintr_ratchet` — 3 pass. (`types`' two
+`doc_citation_paths` guards are red on `dev` too, at 10 and 5 violations; this
+branch leaves both counts unchanged.)
 
 ## Affected classes
 
