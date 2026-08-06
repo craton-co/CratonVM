@@ -416,11 +416,7 @@ fn offer_native_shadow_observation(
 /// **Only call this under `JdkOnly`**, same as its sibling.
 #[cold]
 #[inline(never)]
-pub fn record_native_shadow_ran_over_bytecode(
-    class: &str,
-    method: &str,
-    descriptor: &str,
-) {
+pub fn record_native_shadow_ran_over_bytecode(class: &str, method: &str, descriptor: &str) {
     JDK_ONLY_NATIVE_SHADOW_UNENFORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     offer_native_shadow_observation(class, method, descriptor, JDK_ONLY_SHADOW_UNENFORCED_TAG);
 }
