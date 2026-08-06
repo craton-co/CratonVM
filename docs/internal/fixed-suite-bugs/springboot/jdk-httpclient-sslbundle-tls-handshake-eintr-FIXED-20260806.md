@@ -5,7 +5,7 @@
 | **Status** | ✅ **FIXED** — retired from `docs/known-issues/springboot/` on 2026-08-06 |
 | **Cause** | the TLS handshake is a bare `read_tls`/`write_tls` pair with no EINTR retry, on a socket carrying `SO_RCVTIMEO` — which Linux excludes from `SA_RESTART`. The signal is CratonVM's own: `jit::xt_root_scan` `SIGUSR2`s every thread for a cross-thread stop-the-world root scan |
 | **Fixed by** | this branch — `cratonvm_native_io::eintr` plus 36 converted socket-backed TLS I/O sites |
-| **Severity** | medium — a random mid-request `IOException` under load, on any HTTPS client or server path |
+| **Severity** | medium — a random mid-request `IOException` under load, on any HTTPS client or server path. Measured 1 run in 16 on Azure Linux at load 31–72, on stock `dev`, with no injection |
 | **HotSpot** | clean — 32/32, as reported by the original page from `hotspot-baseline-latest.tsv`. Not re-measured here: that file has since been overwritten by a 6-row partial run, and a HotSpot arm cannot answer the question anyway, since the switch below is a CratonVM knob |
 | **Filed** | 2026-08-05, OPEN, "root cause not yet pinned — needs further investigation" |
 
@@ -191,11 +191,57 @@ connector **in the same VM**, so all four of these runs drive CratonVM's TLS
 *server* path (`t27_tls`) as well as its client path — the 29 converted sites in
 that file are exercised, not merely compiled.
 
-Rust side: `cargo test -p cratonvm-types -p cratonvm-native-io` — 398 + 493
+Rust side: `cargo test -p cratonvm-types -p cratonvm-native-io` — 402 + 497
 pass, including the six new `eintr` unit tests; `cargo test -p
-cratonvm-native-builtins --test eintr_ratchet` — 3 pass. (`types`' two
-`doc_citation_paths` guards are red on `dev` too, at 10 and 5 violations; this
-branch leaves both counts unchanged.)
+cratonvm-native-builtins` — 3279 + the 3 `eintr_ratchet` guards + the lock
+ratchet, 0 failed. (`types`' two `doc_citation_paths` guards are red on clean
+`origin/dev` too, at exactly 10 and 5 violations; this branch leaves both counts
+unchanged.)
+
+### And then it reproduced for real, with no injection at all, on Linux
+
+The switch above is a *model* of the defect. This is the defect: Azure Linux,
+16 cores, load 31→72, the 07-18 Spring Boot fixture, **stock `origin/dev`
+@ `2f5887fb3`** — no flags, no injection, nothing but a class that starts eight
+HTTPS Tomcats in-process while the JIT root scanner signals every thread.
+
+Iteration 4 of 16:
+
+```
+JUnit Jupiter:JdkClientHttpRequestFactoryBuilderTests:connectWithSslBundle(String):[2] httpMethod = "POST"
+  => java.io.IOException: HttpClient request failed: TLS handshake read: Interrupted system call (os error 4)
+     org.springframework.http.client.JdkClientHttpRequest.executeInternal(JdkClientHttpRequest.java:118)
+     org.springframework.boot.http.client.AbstractClientHttpRequestFactoryBuilderTests.connectWithSslBundle(...:119)
+```
+
+Same method, same **`POST`** parameterisation, same line 119 — the 2026-08-05
+report, unaltered, arriving on its own.
+
+| binary | runs | with the reported EINTR |
+|---|---:|---:|
+| stock `origin/dev` @ `2f5887fb3` | 16 | **1** |
+| this branch, `NO_RETRY=1` | 16 | 0 |
+| this branch, default | 16 | 0 |
+
+The `NO_RETRY` arm's zero is a **null result, not a green**: no root scan
+happened to land inside a handshake in those 16 runs, which is exactly the
+1-in-16 rarity the control just demonstrated. It is the Windows injection A/B
+above, not this table, that carries the switched-defect evidence. What this
+table adds is that the mechanism is real outside the injector.
+
+### Two other failures in these runs, neither of them this defect
+
+Reported because a page that lists only the failure it likes is not a record.
+
+* **`received fatal alert: CertificateRequired`** on `connectWithSslBundle`,
+  once in 16 branch runs — and **once in 16 stock-`dev` runs** (iteration 1).
+  Present on both sides, so it is not this branch's. A server-side alert cannot
+  be caused by a client-side EINTR retry in any case. Unexplained, pre-existing,
+  and not investigated here.
+* **`HttpClient request timed out`** on the *insecure* leg (line 115), in a run
+  that took 182 s against a normal 8 s, while a 16-core `cargo build` had the
+  box. Load, not logic. Stock `dev` produced its own 344 s FAIL and a 901 s
+  HANG under the same conditions.
 
 ## Affected classes
 
