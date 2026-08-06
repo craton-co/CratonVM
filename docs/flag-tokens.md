@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-401 tokens.
+403 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -111,6 +111,7 @@ export inherited from a parent shell.
 | `classpath` | `CRATONVM_DBG_CLASSPATH` |
 | `cleaners` | `CRATONVM_DBG_NO_CLEANERS` |
 | `clinit-fail` | `CRATONVM_DBG_CLINIT_FAIL` |
+| `clinit-order` | `CRATONVM_DBG_CLINIT_ORDER` |
 | `clone` | `CRATONVM_DBG_CLONE` |
 | `coerce` | `CRATONVM_DBG_COERCE` |
 | `compact-inline` | `CRATONVM_DBG_COMPACT_INLINE` |
@@ -119,6 +120,7 @@ export inherited from a parent shell.
 | `component-type` | `CRATONVM_DBG_COMPONENT_TYPE` |
 | `corrupt-frames` | `CRATONVM_DBG_CORRUPT_FRAMES` |
 | `ctor-fix` | `CRATONVM_DBG_CTOR_FIX` |
+| `dbb-elem` | `CRATONVM_DBG_DBB_ELEM` |
 | `debug-sfi` | `CRATONVM_DEBUG_SFI` |
 | `debug-stack-tag` | `CRATONVM_DEBUG_STACK_TAG` |
 | `debug-stackwalk` | `CRATONVM_DEBUG_STACKWALK` |
@@ -467,7 +469,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-154 tokens.
+155 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -582,6 +584,7 @@ export inherited from a parent shell.
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
+| `field-site-slots` | `CRATONVM_JIT_FIELD_SITE_SLOTS` |
 | `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
 | `loop-work-tierup` | `CRATONVM_JIT_LOOP_WORK_TIERUP` |
 | `shadow-nopush` | `CRATONVM_SHADOW_NOPUSH` |
@@ -669,14 +672,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-25 tokens.
+24 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
 | `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
 | `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |
-| `buffered-writer` | `CRATONVM_SYNTHETIC_BUFFERED_WRITER` |
 | `dsa` | `CRATONVM_SYNTHETIC_DSA` |
 | `ec` | `CRATONVM_SYNTHETIC_EC` |
 | `eqe` | `CRATONVM_SYNTHETIC_EQE` |

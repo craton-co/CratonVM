@@ -16,6 +16,11 @@ agreeing line for line.
 All three divergences **pre-dated** the bulk-copy rewrite, confirmed at the
 time by a byte-identical checksum on the pre-fix binary.
 
+Sibling page: the direct-buffer reclamation bug found alongside this one was
+fixed independently by a concurrent session — see
+`direct-bytebuffers-are-never-reclaimed-FIXED-20260805.md` and its still-open
+residual `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
+
 ## 1. Absolute `get(int)` / `put(int, byte)` were not bounds-checked against the limit — FIXED
 
 `java.nio.Buffer`'s absolute accessors check the index against the **limit**,

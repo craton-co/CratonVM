@@ -38,7 +38,7 @@
 use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
@@ -542,23 +542,26 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ---- Inet4AddressImpl ----
-    r.register(
+    r.register_with_kind(
         INET4_IMPL,
         "lookupAllHostAddr",
         "(Ljava/lang/String;)[Ljava/net/InetAddress;",
         |ctx, args| lookup_all_host_addr_impl(ctx, args, Some(true)),
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         INET4_IMPL,
         "getHostByAddr",
         "([B)Ljava/lang/String;",
         get_host_by_addr_impl,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         INET4_IMPL,
         "getLocalHostName",
         "()Ljava/lang/String;",
         get_local_host_name_impl,
+        NativeKind::Bridge,
     );
     r.register(INET4_IMPL, "isReachable0", "([BII[BI)Z", is_reachable0_impl);
     r.register(INET4_IMPL, "isReachable0", "([BII)Z", is_reachable0_impl);
@@ -575,23 +578,26 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[Ljava/net/InetAddress;",
         |ctx, args| lookup_all_host_addr_impl(ctx, args, None),
     );
-    r.register(
+    r.register_with_kind(
         INET6_IMPL,
         "getHostByAddr",
         "([B)Ljava/lang/String;",
         get_host_by_addr_impl,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         INET6_IMPL,
         "getLocalHostName",
         "()Ljava/lang/String;",
         get_local_host_name_impl,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         INET6_IMPL,
         "isReachable0",
         "([BII[BII)Z",
         is_reachable0_impl,
+        NativeKind::Bridge,
     );
     r.register(INET6_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
@@ -599,7 +605,7 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // The public `getAllByName` etc. are owned by `net_phase_e.rs`. Here we
     // register the static `init` symbol that real-JDK's `InetAddress.<clinit>`
     // calls to pull in the address-impl singletons.
-    r.register(INET_ADDRESS, "init", "()V", |_ctx, _args| Ok(None));
+    r.register_with_kind(INET_ADDRESS, "init", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
     // Real-JDK also exposes `lookupAllHostAddr` directly on InetAddress via
     // the package-private impl-delegate path — register it here so callers
     // that bypass the public `getAllByName` (e.g. internal JDK code) still
@@ -622,17 +628,19 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // diagnostics swallow keeps the VM alive but `InetAddress.impl` stays
     // null and any subsequent access NPEs. We also register
     // `isIPv4Available()` since `initializePlatformLookupPolicy` uses it.
-    r.register(
+    r.register_with_kind(
         INET_ADDRESS,
         "isIPv6Supported",
         "()Z",
         native_inet_address_is_ipv6_supported,
+        NativeKind::Bridge,
     );
-    r.register(
+    r.register_with_kind(
         INET_ADDRESS,
         "isIPv4Available",
         "()Z",
         native_inet_address_is_ipv4_available,
+        NativeKind::Bridge,
     );
     // JDK 17 declares the host-family probes on InetAddressImplFactory instead
     // of InetAddress. Register both owners so real-JDK boot code can choose the
@@ -655,12 +663,12 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // native `init()V` invoked from their own `<clinit>` (Inet4Address.java
     // line 144, Inet6Address.java line 394). The `*Impl` versions are
     // already registered above; these are the top-level (non-Impl) ones.
-    r.register("java/net/Inet4Address", "init", "()V", |_ctx, _args| {
+    r.register_with_kind("java/net/Inet4Address", "init", "()V", |_ctx, _args| {
         Ok(None)
-    });
-    r.register("java/net/Inet6Address", "init", "()V", |_ctx, _args| {
+    }, NativeKind::Bridge);
+    r.register_with_kind("java/net/Inet6Address", "init", "()V", |_ctx, _args| {
         Ok(None)
-    });
+    }, NativeKind::Bridge);
 
     // Touch CString so the `use std::ffi::CString;` import isn't dead in the
     // (rare) builds that cull both `unix` and `windows`.

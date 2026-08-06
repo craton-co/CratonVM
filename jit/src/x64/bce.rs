@@ -298,6 +298,33 @@ pub(super) fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize>
     hi
 }
 
+/// The subset of [`wide_local_high_halves`] whose OSR register home may be
+/// stripped: the slots that are NOTHING BUT a cat-2 high half.
+///
+/// `wide_local_high_halves` is a whole-method scan — every `lstore N`/`dstore N`
+/// anywhere marks `N+1` — so on its own it also names slots that are a live
+/// cat-1 local in a disjoint range, which legal JVM slot reuse produces
+/// constantly. Stripping one of those leaves the OSR trampoline seeding only its
+/// FRAME slot while the compiled body keeps reading its REGISTER, and the loop
+/// then runs on whatever the caller left there. That has now cost two separate
+/// bugs — an `int` loop counter in `DualPivotQuicksort.mixedInsertionSort`
+/// (`Arrays.sort(long[])` walked off the front of the array) and a `byte[]`
+/// reference in Tomcat's annotation scan (a SIGSEGV on Windows, a silently wrong
+/// checksum on Linux) — so the filter has ONE name, used by the publication in
+/// `x64::osr` and asserted directly by the tests, rather than a predicate spelled
+/// out at each.
+///
+/// [`classify_local_kinds`] already draws the distinction: an independently
+/// accessed high half is [`LocalKind::Ambiguous`] (or its own kind, when the base
+/// never settles on cat-2 either), an untouched one is [`LocalKind::HighHalf`].
+pub(super) fn pure_high_halves(kinds: &[LocalKind], high_halves: &[usize]) -> Vec<usize> {
+    high_halves
+        .iter()
+        .copied()
+        .filter(|&hh| matches!(kinds.get(hh), Some(LocalKind::HighHalf)))
+        .collect()
+}
+
 /// deopt-osr P2: the JVM value kind of a local slot, derived for the deopt
 /// snapshot's width/type source. See [`classify_local_kinds`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -465,7 +492,7 @@ impl AmbiguousLocalKinds {
 /// Forward reaching-kind dataflow for the ambiguous locals only.
 ///
 /// See the module-level rationale on [`AmbiguousLocalKinds`] and the fix note
-/// in `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`. Uses the same
+/// in the retired `h2-jitban-longtail1` write-up. Uses the same
 /// successor relation as the precise oop-mask pass so the two agree about
 /// control flow, and seeds every exception-handler entry TOP because a handler
 /// is reachable from any point in its protected range.

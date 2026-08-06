@@ -63,7 +63,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -3971,6 +3971,177 @@ fn scan_source_opt(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Arc<s
     scan_sources().lock().get(&key).cloned()
 }
 
+/// The last match a `Scanner` operation produced, for `Scanner.match()`.
+///
+/// Real `Scanner` keeps a live `java.util.regex.Matcher` in its `matcher` field
+/// and a `matchValid` flag, and `match()` is `matcher.toMatchResult()`. Our
+/// natives tokenize with Rust string scanning and never touch either field, so
+/// `match()` — real JDK bytecode, since nothing registered it — threw
+/// `IllegalStateException` on every path.
+///
+/// What is recorded here is enough to reproduce that match with the REAL regex
+/// engine on demand: the input, the pattern, and the byte span. `match()` then
+/// builds `Pattern.compile(p).matcher(input)`, positions it with `find(start)`,
+/// and returns its `toMatchResult()` — a genuine JDK object, produced by JDK
+/// code. Nothing here fabricates a `MatchResult`; the sibling case is why. The
+/// old `useDelimiter` poked two fields into an uncompiled `Pattern`, which
+/// satisfied every census and still threw `ArrayIndexOutOfBoundsException`
+/// inside `Matcher.search` the moment real JDK code used it.
+///
+/// **Deliberately lazy**, which is a departure from the filed note's proposed
+/// shape (drive a real `Matcher` eagerly on every token operation and store it
+/// in the receiver's `matcher` field). Eager would materialize a Java `String`
+/// of the WHOLE input, plus three Java calls, on every `next()` — so a
+/// `while (sc.hasNext()) sc.next()` loop, which is linear today, would do O(n)
+/// work per token. That is a structural argument, not a measured one: the eager
+/// version was never built.
+///
+/// What IS measured is what this costs, since a cheap-looking design still has
+/// to be shown cheap. `probes/ScannerTokenCostProbe`, 50k tokens, interleaved
+/// against the pre-fix binary in both orders, 6 runs each: **63.7 ms before,
+/// 64.5 ms after**, means, with a per-run spread (55–70 ms) that covers the
+/// difference. The recording is not visible at this resolution. Only an actual
+/// `match()` call pays for a `Matcher`.
+///
+/// The `Arc<str>` is the same allocation `SCAN_SOURCES` holds, not a copy — a
+/// refcount bump. It is cloned in rather than looked up because `match()` must
+/// keep working after `close()`, which HotSpot allows and which drops the
+/// source entry. A scanner that matched therefore retains its input until the
+/// process ends; that is the price of the `after-close` line in
+/// `probes/ScannerMatchStateProbe`, and it is one shared allocation per such
+/// scanner.
+#[derive(Clone)]
+struct ScanMatch {
+    input: Arc<str>,
+    /// A pattern that matches exactly this span at this position. For a token
+    /// or a line that is a literal quote of the text — real `Scanner` matches
+    /// tokens against a generated pattern with no capture groups, and a quoted
+    /// literal reproduces its `group()`, offsets and `groupCount() == 0`. For
+    /// `findInLine` / `findWithinHorizon` / `skip` it is the caller's own
+    /// pattern, so that `group(1)` and `groupCount()` survive — measured: the
+    /// probe's `groups.count=2` line fails against a quoted literal.
+    pattern: String,
+    /// Byte offsets into `input`. Java reports CHAR indices; the conversion
+    /// happens at materialization, not here — see `utf16_index_of_byte`.
+    start: usize,
+    end: usize,
+}
+
+static SCAN_MATCHES: OnceLock<Mutex<HashMap<ScanKey, ScanMatch>>> = OnceLock::new();
+
+fn scan_matches() -> &'static Mutex<HashMap<ScanKey, ScanMatch>> {
+    SCAN_MATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A regex that matches `text` literally, by escaping metacharacters rather
+/// than by wrapping in `\\Q…\\E`.
+///
+/// `Pattern.quote` produces the `\\Q…\\E` form, and CratonVM's regex engine gets
+/// that wrong for non-ASCII text — measured against Temurin 25.0.3:
+///
+/// ```text
+///   Pattern.compile(Pattern.quote("éé")).matcher("éé ab").find(0)
+///     HotSpot: true @0,2      CratonVM: false
+///   Pattern.compile("é+").matcher("éé ab").find(0)
+///     HotSpot: true @0,2      CratonVM: true @0,2
+/// ```
+///
+/// so the defect is specifically the quoted-literal path, and it is the regex
+/// engine's, not this file's. Escaping per character sidesteps it and is the
+/// more portable spelling anyway. Filed separately; without this the probe's
+/// `nonascii.first` line is the one divergence in eighteen.
+///
+/// Every ASCII character that is not alphanumeric and not whitespace is
+/// backslash-escaped, which Java always reads as a literal — the rule it
+/// rejects is a backslash before an ALPHABETIC character that names no
+/// construct. Whitespace and non-ASCII are already literal.
+fn scan_quote_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        if ch.is_ascii() && !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace() {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The Java (UTF-16) index of a byte offset into a UTF-8 string.
+///
+/// Our positions are byte offsets; every offset `MatchResult` reports is a char
+/// index. They coincide for ASCII and diverge for anything else — the probe's
+/// `nonascii.second=[ab]@3,5` line is 3 and 5, where the byte offsets are 5 and
+/// 7.
+fn utf16_index_of_byte(input: &str, byte_pos: usize) -> usize {
+    let upto = byte_pos.min(input.len());
+    input[..upto].chars().map(char::len_utf16).sum()
+}
+
+/// Record a match whose text is matched literally — a token or a line.
+fn scan_record_literal_match(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    input: &Arc<str>,
+    start: usize,
+    end: usize,
+) {
+    let pattern = scan_quote_literal(&input[start..end]);
+    scan_record_match(ctx, this, input, pattern, start, end);
+}
+
+fn scan_record_match(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    input: &Arc<str>,
+    pattern: String,
+    start: usize,
+    end: usize,
+) {
+    let key = scan_key(ctx, this);
+    scan_matches().lock().insert(
+        key,
+        ScanMatch {
+            input: Arc::clone(input),
+            pattern,
+            start,
+            end,
+        },
+    );
+}
+
+/// Drop the recorded match. Measured, not assumed: a plain `hasNext()` and a
+/// search that finds nothing both leave `match()` throwing, where
+/// `hasNextLine()` and `hasNextInt()` leave the LOOKAHEAD's match available.
+fn scan_clear_match(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let key = scan_key(ctx, this);
+    scan_matches().lock().remove(&key);
+}
+
+/// A typed lookahead (`hasNextInt`, `hasNextDouble`, …) leaves the LOOKED-AHEAD
+/// token's match available without moving the position; if there is no usable
+/// token it leaves none. HotSpot 25:
+/// `after-nextInt-then-hasNextInt=[8]@2,3`.
+fn scan_record_lookahead(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    input: &Arc<str>,
+    pos: usize,
+    delim: &str,
+    matched: bool,
+) {
+    match (matched, scanner_next_token(input, pos, delim)) {
+        (true, Some((token, end))) => {
+            scan_record_literal_match(ctx, this, input, end - token.len(), end)
+        }
+        _ => scan_clear_match(ctx, this),
+    }
+}
+
+fn scan_last_match(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ScanMatch> {
+    let key = scan_key(ctx, this);
+    scan_matches().lock().get(&key).cloned()
+}
+
 /// What the real `Scanner.ensureOpen()` throws on every read after `close()`.
 fn ise_scanner_closed() -> MethodCallFailed {
     RuntimeError::IllegalStateException {
@@ -4368,6 +4539,7 @@ fn native_scanner_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let delim = scan_delimiter(ctx, this);
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => {
+            scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
             scan_set_pos(ctx, this, new_pos)?;
             let s = ctx.create_string(&token);
             Ok(Some(Value::Object(Some(s))))
@@ -4385,6 +4557,10 @@ fn native_scanner_next_line(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let pos = scan_pos(ctx, this);
     match scanner_next_line(&input, pos) {
         Some((line, new_pos)) => {
+            // The match spans the line INCLUDING its terminator: HotSpot
+            // reports the line plus its newline for nextLine(), and length 3
+            // for a CRLF line. `new_pos` is already past it.
+            scan_record_literal_match(ctx, this, &input, pos, new_pos);
             scan_set_pos(ctx, this, new_pos)?;
             let s = ctx.create_string(&line);
             Ok(Some(Value::Object(Some(s))))
@@ -4408,6 +4584,7 @@ fn native_scanner_next_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i32::from_str_radix(token.trim(), radix) {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v)))
             }
@@ -4432,6 +4609,7 @@ fn native_scanner_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i64::from_str_radix(token.trim(), radix) {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Long(v)))
             }
@@ -4452,6 +4630,7 @@ fn native_scanner_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match token.trim().parse::<f64>() {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Double(v)))
             }
@@ -4472,6 +4651,7 @@ fn native_scanner_next_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match token.trim().parse::<f32>() {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Float(v)))
             }
@@ -4493,9 +4673,11 @@ fn native_scanner_next_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some((token, new_pos)) => {
             let trimmed = token.trim().to_lowercase();
             if trimmed == "true" {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(1)))
             } else if trimmed == "false" {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(0)))
             } else {
@@ -4518,6 +4700,7 @@ fn native_scanner_next_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i8::from_str_radix(token.trim(), radix) {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v as i32)))
             }
@@ -4539,6 +4722,7 @@ fn native_scanner_next_short(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     match scanner_consume_token(&input, pos, &delim) {
         Some((token, new_pos)) => match i16::from_str_radix(token.trim(), radix) {
             Ok(v) => {
+                scan_record_literal_match(ctx, this, &input, new_pos - token.len(), new_pos);
                 scan_set_pos(ctx, this, new_pos)?;
                 Ok(Some(Value::Int(v as i32)))
             }
@@ -4559,6 +4743,12 @@ fn native_scanner_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let pos = scan_pos(ctx, this);
     let delim = scan_delimiter(ctx, this);
     let found = scanner_peek_token(&input, pos, &delim).is_some();
+    // A plain `hasNext()` CLEARS the recorded match, where the typed
+    // lookaheads below leave the looked-ahead token's match available.
+    // Measured, not derived: `probes/ScannerMatchStateProbe` prints
+    // `after-next-then-hasNext=IllegalStateException` and
+    // `after-nextInt-then-hasNextInt=[8]@2,3` on HotSpot 25.
+    scan_clear_match(ctx, this);
     Ok(Some(Value::Int(i32::from(found))))
 }
 
@@ -4569,6 +4759,13 @@ fn native_scanner_has_next_line(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
+    // The lookahead leaves ITS match available, spanning the rest of the line
+    // and its terminator, without moving the position: HotSpot prints
+    // `after-next-then-hasNextLine=[ cd]@2,5` on `"ab cd"`.
+    match scanner_next_line(&input, pos) {
+        Some((_, line_end)) => scan_record_literal_match(ctx, this, &input, pos, line_end),
+        None => scan_clear_match(ctx, this),
+    }
     Ok(Some(Value::Int(i32::from(pos < input.len()))))
 }
 
@@ -4586,6 +4783,7 @@ fn native_scanner_has_next_int(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let delim = scan_delimiter(ctx, this);
     let ok = scanner_peek_token(&input, pos, &delim)
         .is_some_and(|t| i32::from_str_radix(t.trim(), radix).is_ok());
+    scan_record_lookahead(ctx, this, &input, pos, &delim, ok);
     Ok(Some(Value::Int(i32::from(ok))))
 }
 
@@ -4600,6 +4798,7 @@ fn native_scanner_has_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let delim = scan_delimiter(ctx, this);
     let ok = scanner_peek_token(&input, pos, &delim)
         .is_some_and(|t| i64::from_str_radix(t.trim(), radix).is_ok());
+    scan_record_lookahead(ctx, this, &input, pos, &delim, ok);
     Ok(Some(Value::Int(i32::from(ok))))
 }
 
@@ -4613,6 +4812,7 @@ fn native_scanner_has_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -
     let delim = scan_delimiter(ctx, this);
     let ok =
         scanner_peek_token(&input, pos, &delim).is_some_and(|t| t.trim().parse::<f64>().is_ok());
+    scan_record_lookahead(ctx, this, &input, pos, &delim, ok);
     Ok(Some(Value::Int(i32::from(ok))))
 }
 
@@ -4626,6 +4826,7 @@ fn native_scanner_has_next_float(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let delim = scan_delimiter(ctx, this);
     let ok =
         scanner_peek_token(&input, pos, &delim).is_some_and(|t| t.trim().parse::<f32>().is_ok());
+    scan_record_lookahead(ctx, this, &input, pos, &delim, ok);
     Ok(Some(Value::Int(i32::from(ok))))
 }
 
@@ -4644,6 +4845,7 @@ fn native_scanner_has_next_boolean(
         let lower = t.trim().to_lowercase();
         lower == "true" || lower == "false"
     });
+    scan_record_lookahead(ctx, this, &input, pos, &delim, ok);
     Ok(Some(Value::Int(i32::from(ok))))
 }
 
@@ -4761,6 +4963,120 @@ fn native_scanner_delimiter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
 }
 
+/// `Scanner.match()` — the `MatchResult` for the last successful operation.
+///
+/// Real `Scanner.match()` is `matcher.toMatchResult()` behind a `matchValid`
+/// check. Our natives keep no live `Matcher`, so this rebuilds one through the
+/// JDK from what `scan_record_match` recorded: `Pattern.compile(p)`,
+/// `.matcher(input)`, `.find(start)`, `.toMatchResult()`. Every object handed
+/// back is a genuine JDK object produced by JDK code — nothing here pokes
+/// fields into a fabricated `MatchResult`, which is the failure mode the
+/// `useDelimiter` `Pattern` demonstrated: two writes that landed on the right
+/// fields, satisfied every census, and still threw inside `Matcher.search` the
+/// moment real code used it.
+///
+/// `find(start)` rather than a region: the position is where OUR scan matched,
+/// and the extent is then whatever the real engine matches there, which is the
+/// authoritative answer for `end()` and for every capture group. For a token or
+/// a line the recorded pattern is a quoted literal, so the two cannot disagree.
+fn native_scanner_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(ise_no_match()),
+    };
+    let Some(rec) = scan_last_match(ctx, this) else {
+        return Err(ise_no_match());
+    };
+    // Java counts in UTF-16 code units; our spans are byte offsets.
+    let start_char = utf16_index_of_byte(&rec.input, rec.start);
+
+    let src = ctx.create_string(&rec.pattern);
+    let src_pin = ctx.pin_native_root(src);
+    let text = ctx.create_string(&rec.input);
+    let text_pin = ctx.pin_native_root(text);
+    let src = ctx.read_native_pin(src_pin, src);
+    let pattern = match ctx.invoke(
+        "java/util/regex/Pattern",
+        "compile",
+        "(Ljava/lang/String;)Ljava/util/regex/Pattern;",
+        &[Value::Object(Some(src))],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => {
+            ctx.unpin_native_roots(src_pin);
+            return Err(ise_no_match());
+        }
+    };
+    let pattern_pin = ctx.pin_native_root(pattern);
+    let text = ctx.read_native_pin(text_pin, text);
+    let pattern = ctx.read_native_pin(pattern_pin, pattern);
+    let matcher = match ctx.invoke_virtual(
+        pattern,
+        "matcher",
+        "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+        &[Value::Object(Some(text))],
+    ) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => {
+            ctx.unpin_native_roots(src_pin);
+            return Err(ise_no_match());
+        }
+    };
+    let matcher_pin = ctx.pin_native_root(matcher);
+    let matcher = ctx.read_native_pin(matcher_pin, matcher);
+    let found = ctx.invoke_virtual(
+        matcher,
+        "find",
+        "(I)Z",
+        &[Value::Int(safe_pos_to_i32(start_char)?)],
+    );
+    let matcher = ctx.read_native_pin(matcher_pin, matcher);
+    if !matches!(found, Ok(Some(Value::Int(1)))) {
+        // The recorded span did not re-match under the real engine. That can
+        // only happen where the two engines disagree about a caller-supplied
+        // pattern; report no match rather than invent one.
+        ctx.unpin_native_roots(src_pin);
+        return Err(ise_no_match());
+    }
+    // Prefer the JDK's own snapshot, which is what HotSpot hands back
+    // (`Matcher$ImmutableMatchResult`).
+    //
+    // It is unreachable under `--jdk-only`, and not because of anything here:
+    // `Matcher.toMatchResult()` throws `NoClassDefFoundError:
+    // cratonvm/internal/UnmodifiableMap` in strict mode from PLAIN JAVA, with
+    // no Scanner involved — one of the bootstrap compatibility classes
+    // `--jdk-only` deliberately refuses to fabricate, reached through our
+    // `Collections.unmodifiableMap` native. Filed separately.
+    //
+    // The fallback is the `Matcher` itself, which `implements MatchResult`, so
+    // `group`/`start`/`end`/`groupCount` are the same real bytecode reading the
+    // same real state. The observable difference is `getClass()`, and
+    // `probes/ScannerMatchStateProbe` prints it rather than hiding it: strict
+    // mode reports `java.util.regex.Matcher` where HotSpot reports
+    // `Matcher$ImmutableMatchResult`. When the fabrication defect is fixed,
+    // this path stops being taken with no change here.
+    let snapshot = ctx.invoke_virtual(
+        matcher,
+        "toMatchResult",
+        "()Ljava/util/regex/MatchResult;",
+        &[],
+    );
+    let matcher = ctx.read_native_pin(matcher_pin, matcher);
+    ctx.unpin_native_roots(src_pin);
+    match snapshot {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(Some(matcher)))),
+    }
+}
+
+/// What real `Scanner.match()` throws when no match is available.
+fn ise_no_match() -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: "No match result available".to_string(),
+    }
+    .into()
+}
+
 fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4851,12 +5167,126 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(current_line) {
             let matched = m.as_str();
+            // The caller's own pattern, so `groupCount()` and `group(1)` survive
+            // into the `MatchResult` — a quoted literal of the matched text
+            // would return the same string with the groups dropped.
+            scan_record_match(ctx, this, &input, pattern_str, pos + m.start(), pos + m.end());
             scan_set_pos(ctx, this, pos.checked_add(m.end()).unwrap_or(usize::MAX))?;
             let s = ctx.create_string(matched);
             return Ok(Some(Value::Object(Some(s))));
         }
     }
+    // A search that finds nothing clears the previous match, measured:
+    // `after-failed-findInLine=IllegalStateException`.
+    scan_clear_match(ctx, this);
     Ok(Some(Value::Object(None)))
+}
+
+/// The window `findWithinHorizon` is allowed to search: `horizon` CODE POINTS
+/// from `pos`, or the whole remainder when `horizon == 0`.
+///
+/// The horizon is counted in characters, not bytes — the javadoc says the
+/// scanner "will never search more than horizon code points beyond its current
+/// position". The implementation this replaces (in `phases_early.rs`, never
+/// registered) added the horizon to a byte offset and then walked back to a
+/// char boundary, which is the same number only for ASCII.
+fn scanner_horizon_window(input: &str, pos: usize, horizon: i32) -> &str {
+    let remaining = &input[pos..];
+    if horizon == 0 {
+        return remaining;
+    }
+    match remaining.char_indices().nth(horizon as usize) {
+        Some((byte_end, _)) => &remaining[..byte_end],
+        // Fewer than `horizon` characters left: the window is the remainder.
+        None => remaining,
+    }
+}
+
+/// `Scanner.findWithinHorizon(String|Pattern, int)`.
+///
+/// Shared by both overloads. Returns the matched text and the new position, or
+/// `None` for no match — in which case the position must not move.
+fn scanner_find_within_horizon(
+    input: &str,
+    pos: usize,
+    pattern: &str,
+    horizon: i32,
+) -> Option<(String, usize)> {
+    if pos >= input.len() {
+        return None;
+    }
+    let hay = scanner_horizon_window(input, pos, horizon);
+    let re = regex::Regex::new(pattern).ok()?;
+    let m = re.find(hay)?;
+    Some((m.as_str().to_string(), pos + m.end()))
+}
+
+fn scanner_find_within_horizon_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    pattern_str: String,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let horizon = match args.get(2) {
+        Some(Value::Int(h)) => *h,
+        _ => 0,
+    };
+    if horizon < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("horizon < 0: {horizon}"),
+        }
+        .into());
+    }
+    let input = scan_input(ctx, this)?;
+    let pos = scan_pos(ctx, this);
+    match scanner_find_within_horizon(&input, pos, &pattern_str, horizon) {
+        Some((matched, new_pos)) => {
+            scan_record_match(
+                ctx,
+                this,
+                &input,
+                pattern_str,
+                new_pos - matched.len(),
+                new_pos,
+            );
+            scan_set_pos(ctx, this, new_pos)?;
+            let s = ctx.create_string(&matched);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => {
+            scan_clear_match(ctx, this);
+            Ok(Some(Value::Object(None)))
+        }
+    }
+}
+
+fn native_scanner_find_within_horizon_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
+}
+
+fn native_scanner_find_within_horizon_pattern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `Pattern`'s first instance field is `pattern:String` on both layouts.
+    let pattern_str = match args.get(1) {
+        Some(Value::Object(Some(p))) => match ctx.get_field(*p, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        },
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    scanner_find_within_horizon_native(ctx, args, pattern_str)
 }
 
 fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4875,12 +5305,18 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let input = scan_input(ctx, this)?;
     let pos = scan_pos(ctx, this);
     let remaining = &input[pos..];
+    let mut skipped = false;
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(remaining) {
             if m.start() == 0 {
+                scan_record_match(ctx, this, &input, pattern_str, pos, pos + m.end());
+                skipped = true;
                 scan_set_pos(ctx, this, pos.checked_add(m.end()).unwrap_or(usize::MAX))?;
             }
         }
+    }
+    if !skipped {
+        scan_clear_match(ctx, this);
     }
     Ok(Some(Value::Object(Some(this))))
 }
@@ -5023,11 +5459,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // Registered here (not inside the synthetic-jdk-gated `register_nio_natives`)
     // so it is present in real-JDK mode, where the module finder runs the
     // genuine JDK bytecode.
-    registry.register(
+    registry.register_with_kind(
         "jdk/internal/jimage/NativeImageBuffer",
         "getNativeMap",
         "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
         native_jimage_get_native_map,
+        NativeKind::Bridge,
     );
 
     // Phase B (RB.3 / RB.4): real-mode sun.nio.cs.StreamDecoder /
@@ -5352,19 +5789,33 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `initIDs` only caches jfieldIDs for HotSpot's own JNI code; CratonVM
     // resolves fields by name, so there is nothing to cache and an empty body
     // is the spec-correct implementation.
-    registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "open0",
         "(Ljava/lang/String;)V",
         native_fis_open0,
+        NativeKind::Bridge,
     );
-    registry.register("java/io/FileInputStream", "read0", "()I", native_fis_read);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "read0",
+        "()I",
+        native_fis_read,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "readBytes",
         "([BII)I",
         native_fis_read_bytes,
+        NativeKind::Bridge,
     );
     // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
     // scanning reaches this signature directly, so route it to the same native
@@ -5387,12 +5838,19 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_fis_read_bytes,
     );
-    registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileInputStream",
+        "skip0",
+        "(J)J",
+        native_fis_skip,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "available0",
         "()I",
         native_fis_available,
+        NativeKind::Bridge,
     );
     // `length0`/`position0` both returned a hardcoded 0 — i.e. "this file is
     // empty and we are at its start" for EVERY file. JDK 25's
@@ -5402,58 +5860,76 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // fd table: `file_size` is the real length, and `available()` (already
     // used by the `available0` native) is bytes-remaining, so
     // `position = length - available`.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "length0",
         "()J",
         native_fis_length0,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "position0",
         "()J",
         native_fis_position0,
+        NativeKind::Bridge,
     );
     // Previously hardcoded "not a regular file" so that `readAllBytes()`
     // avoided the `length0()`-sized fast path, which the stub above would
     // have sized at zero. With `length0`/`position0` real, this can report
     // the truth: `file_size` only succeeds for fd-table entries that really
     // are files (sockets/pipes/stdin fail), which is precisely the predicate.
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileInputStream",
         "isRegularFile0",
         "(Ljava/io/FileDescriptor;)Z",
         native_fis_is_regular_file0,
+        NativeKind::Bridge,
     );
 
     // FileOutputStream: open0, write(I,Z), writeBytes
     // Same as `FileInputStream.initIDs` above — jfieldID caching only, which
     // CratonVM's by-name field resolution does not need.
-    registry.register("java/io/FileOutputStream", "initIDs", "()V", native_noop);
-    registry.register(
+    registry.register_with_kind(
+        "java/io/FileOutputStream",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "open0",
         "(Ljava/lang/String;Z)V",
         native_fos_init_string_append,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "write",
         "(IZ)V",
         native_fos_write_byte_ignore_append,
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/io/FileOutputStream",
         "writeBytes",
         "([BIIZ)V",
         native_fos_write_bytes_ignore_append,
+        NativeKind::Bridge,
     );
 
     // FileDescriptor.close0() — the real-JDK `FileInputStream.close()` /
     // `FileOutputStream.close()` bytecode routes through
     // `FileDescriptor.closeAll` -> `FileDescriptor.close()` -> `close0()`.
     // Releases the OS fd stashed on the descriptor's own `fd`/`handle`.
-    registry.register("java/io/FileDescriptor", "close0", "()V", native_fd_close0);
+    registry.register_with_kind(
+        "java/io/FileDescriptor",
+        "close0",
+        "()V",
+        native_fd_close0,
+        NativeKind::Bridge,
+    );
 
     // sun.nio.ch.UnixDispatcher.close0(FileDescriptor) — the static
     // NativeDispatcher-family close used by java.net.MulticastSocket's
@@ -5466,11 +5942,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
     // either way (an explicit static parameter here vs. `this` there) —
     // so the same handler applies unchanged.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "close0",
         "(Ljava/io/FileDescriptor;)V",
         native_fd_close0,
+        NativeKind::Bridge,
     );
 
     /// Platform `sockaddr_in`/`sockaddr_in6` ABI facts for the
@@ -5554,77 +6031,89 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // implementations do (`offsetof`/`sizeof` on `struct sockaddr_in*`). These
     // are not stubbed values standing in for runtime state.
     use sockaddr_abi as sa;
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "AFINET",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "AFINET6",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR4))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr6",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR6))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofFamily",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_FAMILY))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetFamily",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_FAMILY))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Port",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_PORT))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Addr",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_ADDR))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Port",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_PORT))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Addr",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_ADDR))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6ScopeId",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_SCOPE_ID))),
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6FlowInfo",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_FLOWINFO))),
+        NativeKind::Bridge,
     );
 
     // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
@@ -6454,6 +6943,55 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "skip",
         "(Ljava/util/regex/Pattern;)Ljava/util/Scanner;",
         native_scanner_skip,
+    );
+    // `findWithinHorizon` had an implementation in
+    // `native-builtins/src/phases_early.rs` that NOTHING registered: its only
+    // registrar, `register_t2_3_completion_natives`, has no call site, and
+    // `--dump-native-registry` showed no such row among the 35 live
+    // `java/util/Scanner` entries. So the call reached real JDK bytecode, which
+    // reads `buf`, `matcher` and `source` — none of which these natives
+    // populate — and threw `NullPointerException` in both modes, measured by
+    // `probes/L3ScannerSearchProbe`. It lives here now, beside `findInLine` and
+    // `skip`, which share its state accessors and its regex engine.
+    //
+    // Registered as INTRINSIC, with the kind STATED rather than inherited.
+    // `java.util.Scanner` declares no ACC_NATIVE method, so a `Bridge` tag —
+    // which contract §1.5 defines by an ACC_NATIVE target — would be wrong,
+    // and the L6 ratchet says so in as many words: two new Bridge rows
+    // shadowing concrete bytecode is a regression it refuses, and raising the
+    // baseline is explicitly not the fix. Intrinsic is what these are: a Rust
+    // fast path replicating a method that HAS real bytecode and has to match
+    // it, which is the category the implementation in `phases_early.rs` used
+    // before it moved here.
+    //
+    // The other 35 registrations in this function are still `Bridge` by
+    // inheritance and still wrong for the same reason — see the
+    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
+    // GOOD direction and belongs with whoever re-freezes it.
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/lang/String;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_string,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
+    registry.register_with_kind(
+        c,
+        "findWithinHorizon",
+        "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
+        native_scanner_find_within_horizon_pattern,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
+    // `match()` is Intrinsic for the same reason as `findWithinHorizon` above:
+    // `java.util.Scanner` declares no ACC_NATIVE method, so contract §1.5's
+    // `Bridge` does not describe it, and the L6 ratchet refuses a new Bridge
+    // row that shadows concrete bytecode.
+    registry.register_with_kind(
+        c,
+        "match",
+        "()Ljava/util/regex/MatchResult;",
+        native_scanner_match,
+        cratonvm_native_api::NativeKind::Intrinsic,
     );
 
     // Interface dispatch: Iterator
@@ -10379,11 +10917,12 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // available through this VM" answer, and the JDK's own
     // `UnixNativeDispatcher` treats it exactly that way by taking its portable
     // fallbacks. Claiming a capability we do not implement is what would break.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "init",
         "()I",
         |_ctx, _args| Ok(Some(cratonvm_types::Value::Int(0))),
+        NativeKind::Bridge,
     );
     // `UnixUserPrincipals.fromUid(uid)` / `fromGid(gid)` — reached from
     // `UnixFileAttributes.owner()`/`group()`, i.e. from `Files.getOwner` and
@@ -10395,7 +10934,7 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // `fromUid`/`fromGid` then fall back to the decimal id as the name; we
     // return those same decimal bytes directly rather than synthesising a
     // `UnixException`, which is indistinguishable to every caller.
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getpwuid",
         "(I)[B",
@@ -10407,8 +10946,9 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getgrgid",
         "(I)[B",
@@ -10420,8 +10960,9 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/nio/fs/UnixNativeDispatcher",
         "getcwd",
         "()[B",
@@ -10433,6 +10974,7 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
             ctx.write_byte_array_from(arr, 0, bytes);
             Ok(Some(Value::Object(Some(arr))))
         },
+        NativeKind::Bridge,
     );
 
     // Paths factory
@@ -16264,6 +16806,10 @@ const EVENT_CREATE: i32 = 1;
 const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
+/// `#[track_caller]` so the class-origin census's `requested_by` names the
+/// native that wanted the shape, not this one forwarding line — see the
+/// matching note on `NativeContext::ensure_synthetic_class`.
+#[track_caller]
 fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
@@ -19200,6 +19746,87 @@ mod io_tests {
     #[test]
     fn scanner_consume_token_empty() {
         assert!(scanner_consume_token("", 0, r"\s+").is_none());
+    }
+
+    // T2.3.12 - `findWithinHorizon`, ported from `phases_early.rs` when the
+    // implementation moved here. These exercise the pure helper rather than the
+    // native, so they need no mock heap; the horizon boundary and the
+    // no-match-does-not-move-the-position rule are what they are for.
+
+    #[test]
+    fn scan_quote_literal_escapes_metacharacters_and_leaves_text_alone() {
+        assert_eq!(scan_quote_literal("ab"), "ab");
+        assert_eq!(scan_quote_literal("a.b*c"), r"a\.b\*c");
+        assert_eq!(scan_quote_literal("[x]"), r"\[x\]");
+        // Non-ASCII is already literal, and must NOT be escaped: a backslash
+        // before an alphabetic character is what Java rejects, and the
+        // `\Q…\E` form this replaced is what CratonVM's regex engine gets
+        // wrong for non-ASCII.
+        assert_eq!(scan_quote_literal("\u{e9}\u{e9}"), "\u{e9}\u{e9}");
+        // Whitespace is not a metacharacter and stays as itself, so a line
+        // match keeps its terminator.
+        assert_eq!(scan_quote_literal("a b\n"), "a b\n");
+    }
+
+    #[test]
+    fn utf16_index_of_byte_counts_java_chars() {
+        // Two 2-byte characters then ASCII: byte 5 is char 3, which is what a
+        // `MatchResult` reports.
+        let s = "\u{e9}\u{e9} ab";
+        assert_eq!(utf16_index_of_byte(s, 0), 0);
+        assert_eq!(utf16_index_of_byte(s, 4), 2);
+        assert_eq!(utf16_index_of_byte(s, 5), 3);
+        // A surrogate pair is TWO Java chars for one Rust char.
+        let emoji = "\u{1f600}x";
+        assert_eq!(utf16_index_of_byte(emoji, 4), 2);
+        // Past the end clamps rather than panicking.
+        assert_eq!(utf16_index_of_byte(s, 999), 5);
+    }
+
+    #[test]
+    fn scanner_fwh_finds_first_match_and_reports_the_new_position() {
+        let (text, pos) =
+            scanner_find_within_horizon("prefix abc123 suffix", 0, r"\d+", 0).unwrap();
+        assert_eq!(text, "123");
+        assert_eq!(pos, "prefix abc123".len());
+    }
+
+    #[test]
+    fn scanner_fwh_no_match_is_none() {
+        assert!(scanner_find_within_horizon("only letters here", 0, r"\d+", 0).is_none());
+    }
+
+    #[test]
+    fn scanner_fwh_respects_the_horizon() {
+        // Horizon 4 sees only "aaaa" - no digits in that window.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 4).is_none());
+        // One more character and the digits are reachable.
+        assert!(scanner_find_within_horizon("aaaa12345", 0, r"\d+", 5).is_some());
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_counts_characters_not_bytes() {
+        // Four 2-byte characters then a digit: a horizon of 4 must NOT reach
+        // the digit, and a horizon of 5 must. Counting bytes would let a
+        // horizon of 4 see nothing and a horizon of 8 see the digit - which is
+        // what the implementation this replaced did.
+        let s = "\u{e9}\u{e9}\u{e9}\u{e9}7";
+        assert!(scanner_find_within_horizon(s, 0, r"\d", 4).is_none());
+        assert_eq!(scanner_find_within_horizon(s, 0, r"\d", 5).unwrap().0, "7");
+    }
+
+    #[test]
+    fn scanner_fwh_horizon_past_the_end_is_the_remainder() {
+        assert_eq!(scanner_horizon_window("abc", 0, 99), "abc");
+        assert_eq!(scanner_horizon_window("abc", 1, 0), "bc");
+    }
+
+    #[test]
+    fn scanner_fwh_searches_from_the_given_position() {
+        // The first match is behind `pos`; only the one after it counts.
+        let (text, pos) = scanner_find_within_horizon("11 22", 3, r"\d+", 0).unwrap();
+        assert_eq!(text, "22");
+        assert_eq!(pos, 5);
     }
 
     #[test]

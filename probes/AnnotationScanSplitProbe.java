@@ -36,9 +36,14 @@ import org.apache.tomcat.util.bcel.classfile.ClassParser;
  * it buries the thing being compared. The first draft of this probe repeated
  * that mistake. If you add a stage, add it as a static method.
  *
- * ⚠️ This probe is ALSO the reproduction for a JIT miscompile: on CratonVM it
- * SIGSEGVs in `arrayRead` on the real Tomcat classpath. See
- * `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`.
+ * This probe WAS also the reproduction for a JIT miscompile: it SIGSEGVd in
+ * `arrayRead` on the real Tomcat classpath (Windows), and on Linux the same
+ * defect silently summed the wrong bytes without failing anything, because
+ * `sink` is discarded here. Fixed 2026-08-04 by `14a274085` — a slot javac
+ * reuses as both a live reference and a `long`'s high half must keep its OSR
+ * register home. `probes/OsrRefSlotReuseProbe.java` is the minimised,
+ * self-checking version and is the regression guard; see the retired
+ * `annotation-scan-arrayread-sigsegv` write-up.
  */
 public class AnnotationScanSplitProbe {
 

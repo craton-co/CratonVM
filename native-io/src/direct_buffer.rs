@@ -299,65 +299,76 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
 // Allocation core
 // ---------------------------------------------------------------------------
 
-/// [`dbb_allocate`] with the JDK's own collect-and-retry on a reservation
-/// failure, for the callers that have a `NativeContext` to collect with.
+/// Allocate `size` bytes for a new DirectByteBuffer.  Tries the pool
+/// first, then falls back to the system allocator.  All addresses
+/// returned are 8-byte aligned (sufficient for any primitive type used
+/// by `Unsafe.put*` writes through the buffer).  Returns the raw
+/// address as a u64 the JDK can stash in `DirectByteBuffer.address`.
+/// [`dbb_allocate`] with the same reclaim-and-retry [`bits_reserve_memory`]
+/// performs, for the callers that have a `NativeContext` to collect with.
 ///
-/// `java.nio.Bits.reserveMemory` does exactly this: when the direct-memory
-/// budget is exhausted it runs `System.gc()` and retries rather than throwing
-/// on the first miss, precisely because a dropped-but-uncollected direct
-/// buffer's memory is only released once its `Cleaner` runs. CratonVM had no
-/// equivalent anywhere on this path, and — critically — *nothing else would
-/// ever trigger the collection*: a direct-buffer workload allocates ~100 bytes
-/// of Java heap per buffer, so it can exhaust a 1 GiB direct budget without
-/// ever pushing the heap hard enough to cause an allocation-triggered GC. The
-/// forced GC here also runs pending cleaner actions
-/// (`force_gc_from_native` → `run_cleaner_actions`), which is what actually
-/// refunds the reservation.
+/// `bits_reserve_memory`'s retry does not cover the path that matters most in
+/// REAL-JDK mode, because that native never runs there: `java/nio/Bits` is not
+/// in `force_native_over_real_jdk_bytecode`, and `Bits.reserveMemory` is
+/// ordinary Java, so the JDK's own bytecode wins and our accounting is only
+/// consulted from the `Unsafe.allocateMemory0` that the real
+/// `DirectByteBuffer(int)` constructor calls. That call had NO retry at all —
+/// the first refusal threw.
 ///
-/// Three rounds, matching the JDK's bounded retry. Each is a full collection,
-/// so this is only reached on the failure path; a workload whose live set
-/// genuinely exceeds the cap pays three GCs once and then gets its
-/// `OutOfMemoryError`, exactly as before.
+/// The two budgets are separate counters and drift: ours also counts every
+/// other `Unsafe.allocateMemory` caller, so it can saturate while the JDK's
+/// `Bits` still believes there is room, and the JDK's own `System.gc()`-and-
+/// retry never gets a chance to run. That is the shape reported in
+/// `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`,
+/// whose `OutOfMemoryError: Direct buffer memory: tried …, used …, max …`
+/// message is this module's, raised from `try_reserve` below, on an H2
+/// background writer thread.
 ///
-/// Note the reservation the retry is waiting on is refunded from a Java-side
-/// `Deallocator.run()` invoked *by* `force_gc`, so the retry must re-read the
-/// accounting after the GC returns rather than caching anything across it.
+/// Three rounds, bounded exactly as the sibling above and as the JDK bounds
+/// its own retry, and with the same "no progress means nothing is
+/// reclaimable" early exit so a genuinely exhausted cap still surfaces
+/// promptly.
 fn dbb_allocate_collecting(
     ctx: &mut dyn NativeContext,
     size: i64,
 ) -> Result<u64, MethodCallFailed> {
-    match dbb_allocate(size) {
+    let first_failure = match dbb_allocate(size) {
         Ok(addr) => return Ok(addr),
-        Err(e) if !is_reservation_failure(size) => return Err(e),
-        Err(_) => {}
+        Err(e) => e,
+    };
+    // Only a reservation refusal is worth collecting for. A negative size, an
+    // unrepresentable layout, or the system allocator itself returning null
+    // are not things a collection can change.
+    if !is_reservation_failure(size) {
+        return Err(first_failure);
     }
-    for _ in 0..3 {
+    const RECLAIM_ROUNDS: u32 = 3;
+    for _ in 0..RECLAIM_ROUNDS {
+        let before = bits().reserved.load(Ordering::Acquire);
         ctx.force_gc();
         match dbb_allocate(size) {
             Ok(addr) => return Ok(addr),
             Err(e) if !is_reservation_failure(size) => return Err(e),
             Err(_) => {}
         }
+        if bits().reserved.load(Ordering::Acquire) >= before {
+            break;
+        }
     }
-    dbb_allocate(size)
+    Err(first_failure)
 }
 
-/// Would a reservation of `size` still fail against the current budget?
-///
-/// Distinguishes "over the direct-memory cap" (worth collecting for — a
-/// `Cleaner` may still refund it) from every other `dbb_allocate` failure
-/// (negative size, unrepresentable layout, the system allocator itself
-/// returning null), which no amount of collecting can change.
+/// Would a reservation of `size` still exceed the direct-memory cap?
+#[inline]
 fn is_reservation_failure(size: i64) -> bool {
     let b = bits();
-    size > 0 && b.reserved.load(Ordering::Acquire).saturating_add(size) > b.max.load(Ordering::Relaxed)
+    size > 0
+        && b.reserved
+            .load(Ordering::Acquire)
+            .saturating_add(size)
+            > b.max.load(Ordering::Relaxed)
 }
 
-/// Allocate `size` bytes for a new DirectByteBuffer.  Tries the pool
-/// first, then falls back to the system allocator.  All addresses
-/// returned are 8-byte aligned (sufficient for any primitive type used
-/// by `Unsafe.put*` writes through the buffer).  Returns the raw
-/// address as a u64 the JDK can stash in `DirectByteBuffer.address`.
 fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     if size < 0 {
         return Err(oom(format!("negative direct buffer size: {size}")));
@@ -605,29 +616,47 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
 /// "size" (the raw byte count to reserve) and "cap" (the capacity
 /// reported back to the user, sometimes inflated to a page boundary).
 /// Our accounting only cares about `size`.
+/// `java.nio.Bits.reserveMemory(long size, long cap)`.
+///
+/// The JDK's contract is NOT "reserve or throw" — it is "reserve, and if the
+/// cap is reached, make the collector reclaim unreachable direct buffers and try
+/// again; throw only when that fails too". `Bits.reserveMemory` spells this out:
+/// wait for reference processing, then `System.gc()`, then retry with an
+/// exponential back-off before it constructs an `OutOfMemoryError`.
+///
+/// That retry is load-bearing, because direct memory is invisible to the heap's
+/// own occupancy trigger: a program can churn gigabytes of `allocateDirect`
+/// while the Java heap stays nearly empty, so nothing else on the VM's side has
+/// any reason to collect. This used to throw on the first refusal, which turned
+/// "the buffers you dropped have not been reclaimed *yet*" into a hard
+/// `OutOfMemoryError: Direct buffer memory`.
 fn bits_reserve_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = arg_long(args, 0);
     if size < 0 {
         return Err(oom(format!("negative reserveMemory: {size}")));
     }
-    // Same collect-and-retry as `dbb_allocate_collecting`, and for the same
-    // reason: the real `java.nio.Bits.reserveMemory` runs `System.gc()` and
-    // retries before giving up, because the budget it is checking is only
-    // refunded when a dropped buffer's `Cleaner` runs. (This native is only
-    // reached in synthetic mode — in real-JDK mode the JDK's own `Bits`
-    // bytecode wins, since this triple is not in
-    // `force_native_over_real_jdk_bytecode` — but the two paths should not
-    // differ in whether they collect.)
-    if try_reserve(size).is_err() {
-        for _ in 0..3 {
-            ctx.force_gc();
-            if try_reserve(size).is_ok() {
-                return Ok(None);
-            }
+    let Err(first_failure) = try_reserve(size) else {
+        return Ok(None);
+    };
+    // Reclaim-and-retry. Each round forces a collection — which runs reference
+    // processing and, through it, the `jdk.internal.ref.Cleaner` every
+    // `DirectByteBuffer` registers — and then re-attempts the reservation.
+    // Bounded so a genuinely exhausted cap still surfaces the OOM promptly
+    // rather than spinning; the JDK bounds its own retry the same way.
+    const RECLAIM_ROUNDS: u32 = 3;
+    for _ in 0..RECLAIM_ROUNDS {
+        let before = bits().reserved.load(Ordering::Acquire);
+        ctx.force_gc();
+        if try_reserve(size).is_ok() {
+            return Ok(None);
         }
-        try_reserve(size)?;
+        // No progress at all from a full collection means nothing is
+        // reclaimable; further rounds would only add latency to the OOM.
+        if bits().reserved.load(Ordering::Acquire) >= before {
+            break;
+        }
     }
-    Ok(None)
+    Err(first_failure)
 }
 
 fn bits_unreserve_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -877,17 +906,12 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// records the (addr, size) so `freeMemory(addr)` can reclaim it
 /// accurately.
 ///
-/// In REAL-JDK mode this is also the direct-buffer allocation path, despite
-/// what the sentence below used to claim: `java.nio.Bits.reserveMemory` is
-/// not in `force_native_over_real_jdk_bytecode`, so the JDK's own `Bits`
-/// bytecode runs and our `bits_reserve_memory` never fires — the only place
-/// our accounting is consulted for a `ByteBuffer.allocateDirect` is the
-/// `allocateMemory0` the real `DirectByteBuffer(int)` constructor calls right
-/// here. That is why the collect-and-retry lives on this path: without it the
-/// first over-budget request threw, with no collection ever attempted (the
-/// measured `OutOfMemoryError: Direct buffer memory: tried 8388608, used
-/// 1073741824, max 1073741824` came from exactly this call, reported against
-/// `DirectByteBuffer.<init>`). Synthetic mode uses `dbb_allocate_direct0`.
+/// This IS the `ByteBuffer.allocateDirect` path in real-JDK mode, contrary to
+/// what this comment used to say: the real `DirectByteBuffer(int)` constructor
+/// calls `Unsafe.allocateMemory`, and `bits_reserve_memory` — which would
+/// otherwise have reserved first — never runs there, because the JDK's own
+/// `java.nio.Bits` bytecode wins. `dbb_allocate_direct0` is the SYNTHETIC-mode
+/// path. Hence the reclaim-and-retry here; see `dbb_allocate_collecting`.
 fn unsafe_allocate_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = unsafe_long_arg(args);
     let addr = dbb_allocate_collecting(ctx, size)?;
@@ -1267,7 +1291,7 @@ fn cleaners_pending_count() -> usize {
 // ---------------------------------------------------------------------------
 //
 // PERF (H2 `TestFileSystem.testConcurrent` on `nioMemLZF:`, residual 4 of
-// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`). These two methods
+// retired `h2-jitban-longtail1` write-up). These two methods
 // are real-JDK bytecode, and each one expands to a try/finally around five
 // nested invocations:
 //
@@ -1300,7 +1324,34 @@ fn cleaners_pending_count() -> usize {
 //     pointer) — the bytecode path raises whatever the JDK raises.
 //
 // The bail is a real virtual dispatch to the class-file body, so it can never
-// re-enter this native.
+// re-enter this native. It is also why these four cannot be registered as LEAF
+// natives (`NativeMethodRegistry::set_leaf`): a leaf must not re-enter Java, and
+// the bail does exactly that.
+//
+// WHERE THIS STANDS (2026-08-05). Collapsing the chain was necessary but not
+// sufficient: with the natives in place the cost was still ~650 ns per element
+// against HotSpot's 0.4 ns, essentially all of it dispatch. The general
+// per-call-site native cache and the native funnel's own refcount fix took that
+// to ~270-320 ns, i.e. `nioMemLZF:` from ~101 to ~50 ms/op against HotSpot's
+// 0.55 (`probes/DbbElemProbe.java`, `probes/LzfProbe.java`).
+//
+// Two facts bound what is left, and both were measured rather than assumed:
+//
+//   * **These four cannot claim LEAF** (`NativeMethodRegistry::set_leaf`), which
+//     is why the general leaf bypass does not reach them: the bail above
+//     re-enters Java and the leaf contract forbids that. Claiming it anyway was
+//     measured at ~15% (46 -> 39 ms/op interleaved) and reverted. The cheap way
+//     to earn the claim is to stop bailing — raise the JDK's own
+//     `IndexOutOfBoundsException` from here instead of deferring to bytecode for
+//     it — which would leave only the unresolvable-layout case behind.
+//   * **`ByteBuffer.allocateDirect` memory is an `Unsafe`-arena handle, not a
+//     real pointer** — `CRATONVM_DBG_DBB_ELEM=1` reports `raw-pointer=0
+//     arena-handle=N`. So the structural answer, a JIT intrinsic lowering the
+//     element access inline with no call at all, cannot be emitted as things
+//     stand: inline code cannot do a locked map probe to resolve a handle.
+//
+// Both are a bounded project of their own and are deliberately not attempted
+// here.
 
 /// Field indices this native family reads out of a `DirectByteBuffer`.
 #[derive(Clone, Copy)]
@@ -1316,6 +1367,102 @@ struct DbbElemFields {
     is_read_only: usize,
     /// `java.nio.Buffer.position` — the cursor the relative accessors bump.
     position: usize,
+}
+
+/// `CRATONVM_DBG_DBB_ELEM` — per-accessor census for the element natives.
+///
+/// The four accessors are the whole of the `nioMemLZF:` throughput gap, and the
+/// two questions that decide what to do about it are invisible from a profile:
+/// how often each one *bails* to the real bytecode (a bail is ~6 nested
+/// dispatches, so a small bail rate dominates the average), and whether the
+/// `address` they resolve is a real pointer or a tagged
+/// `Unsafe.allocateMemory` arena handle (an inline JIT lowering could only be
+/// emitted for the former). Both are counted here.
+mod elem_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(super) const GET_ABS: usize = 0;
+    pub(super) const PUT_ABS: usize = 1;
+    pub(super) const GET_REL: usize = 2;
+    pub(super) const PUT_REL: usize = 3;
+    const NAMES: [&str; 4] = ["get(int)", "put(int,byte)", "get()", "put(byte)"];
+
+    /// `unsafe_natives_ext::unsafe_arena::ARENA_TAG` — the reserved high bit
+    /// every `Unsafe.allocateMemory` handle carries and no real OS pointer ever
+    /// has. Duplicated as a constant rather than imported because `native-io`
+    /// does not depend on `native-builtins`; the invariant it encodes is
+    /// documented at the definition.
+    const ARENA_TAG: i64 = 1 << 62;
+    /// Print the running census every this many accesses. Rust does not drop
+    /// statics at exit and this module has no VM-shutdown hook, so an interval
+    /// dump is the only form guaranteed to be seen.
+    const DUMP_EVERY: u64 = 2_000_000;
+
+    static SERVED: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static BAILED: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static TAGGED: AtomicU64 = AtomicU64::new(0);
+    static RAW: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DBB_ELEM").is_some())
+    }
+
+    /// Record a served access and classify its resolved address. `addr` is the
+    /// absolute element address, so its tag bit is the buffer's.
+    #[inline]
+    pub(super) fn served(kind: usize, addr: i64) {
+        if !enabled() {
+            return;
+        }
+        SERVED[kind].fetch_add(1, Ordering::Relaxed);
+        if addr & ARENA_TAG != 0 {
+            TAGGED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            RAW.fetch_add(1, Ordering::Relaxed);
+        }
+        tick();
+    }
+
+    #[inline]
+    pub(super) fn bailed(kind: usize) {
+        if !enabled() {
+            return;
+        }
+        BAILED[kind].fetch_add(1, Ordering::Relaxed);
+        tick();
+    }
+
+    fn tick() {
+        if (TOTAL.fetch_add(1, Ordering::Relaxed) + 1) % DUMP_EVERY != 0 {
+            return;
+        }
+        for k in 0..4 {
+            let s = SERVED[k].load(Ordering::Relaxed);
+            let b = BAILED[k].load(Ordering::Relaxed);
+            if s | b != 0 {
+                eprintln!("[dbb-elem] {:14} served={s} bailed={b}", NAMES[k]);
+            }
+        }
+        eprintln!(
+            "[dbb-elem] address kind: raw-pointer={} arena-handle={}",
+            RAW.load(Ordering::Relaxed),
+            TAGGED.load(Ordering::Relaxed),
+        );
+    }
 }
 
 /// Resolve (once) the field indices used by the element accessors.
@@ -1346,23 +1493,38 @@ fn dbb_elem_addr(
     for_write: bool,
 ) -> Option<i64> {
     let fields = dbb_elem_fields(ctx)?;
-    let limit = match ctx.get_field(this, fields.limit) {
-        Value::Int(v) => v,
-        _ => return None,
+    // One batched, descriptor-hinted read rather than three separate
+    // `get_field` calls. The descriptors are fixed by `java.nio.Buffer`'s own
+    // declarations, so they are exactly the answer the per-read metadata lookup
+    // inside `get_field` would have produced — and on the one-byte-per-call
+    // path, that lookup (and the reference forwarding in front of it) ran three
+    // times per element moved. `isReadOnly` is read unconditionally: for a read
+    // access its value is simply unused, which is cheaper than splitting the
+    // batch.
+    let mut vals = [Value::Int(0); 3];
+    ctx.get_fields_typed(
+        this,
+        &[
+            (fields.limit, b'I'),
+            (fields.address, b'J'),
+            (fields.is_read_only, b'Z'),
+        ],
+        &mut vals,
+    );
+    let Value::Int(limit) = vals[0] else {
+        return None;
     };
     if index < 0 || index >= limit {
         return None;
     }
     if for_write {
-        match ctx.get_field(this, fields.is_read_only) {
-            // `Value::Int(0)` is the only shape that proves writability.
-            Value::Int(0) => {}
-            _ => return None,
+        // `Value::Int(0)` is the only shape that proves writability.
+        if !matches!(vals[2], Value::Int(0)) {
+            return None;
         }
     }
-    let address = match ctx.get_field(this, fields.address) {
-        Value::Long(v) => v,
-        _ => return None,
+    let Value::Long(address) = vals[1] else {
+        return None;
     };
     if address <= 0 {
         return None;
@@ -1388,6 +1550,7 @@ fn dbb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     if !ctx.copy_from_native_memory(addr, &mut byte) {
         return dbb_elem_bail_get(ctx, this, args);
     }
+    elem_census::served(elem_census::GET_ABS, addr);
     // `ByteBuffer.get` returns a Java `byte` — signed. Route through `i8` so a
     // value >= 0x80 sign-extends the way every `b < 0` caller expects.
     Ok(Some(Value::Int(i32::from(byte[0] as i8))))
@@ -1409,6 +1572,7 @@ fn dbb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     if !ctx.copy_to_native_memory(addr, &[byte as u8]) {
         return dbb_elem_bail_put(ctx, this, args);
     }
+    elem_census::served(elem_census::PUT_ABS, addr);
     // `put(int, byte)` returns `this`.
     Ok(Some(Value::Object(Some(this))))
 }
@@ -1418,6 +1582,7 @@ fn dbb_elem_bail_get(
     this: ObjectRef,
     args: &[Value],
 ) -> MethodCallResult {
+    elem_census::bailed(elem_census::GET_ABS);
     ctx.invoke_virtual_bytecode_only(this, "get", "(I)B", &args[1..])
 }
 
@@ -1426,6 +1591,7 @@ fn dbb_elem_bail_put(
     this: ObjectRef,
     args: &[Value],
 ) -> MethodCallResult {
+    elem_census::bailed(elem_census::PUT_ABS);
     ctx.invoke_virtual_bytecode_only(this, "put", "(IB)Ljava/nio/ByteBuffer;", &args[1..])
 }
 
@@ -1444,13 +1610,20 @@ fn dbb_rel_addr(
     for_write: bool,
 ) -> Option<(i64, i32)> {
     let fields = dbb_elem_fields(ctx)?;
-    let position = match ctx.get_field(this, fields.position) {
-        Value::Int(v) => v,
-        _ => return None,
-    };
-    let limit = match ctx.get_field(this, fields.limit) {
-        Value::Int(v) => v,
-        _ => return None,
+    // One batched read — see `dbb_elem_addr`.
+    let mut vals = [Value::Int(0); 4];
+    ctx.get_fields_typed(
+        this,
+        &[
+            (fields.position, b'I'),
+            (fields.limit, b'I'),
+            (fields.address, b'J'),
+            (fields.is_read_only, b'Z'),
+        ],
+        &mut vals,
+    );
+    let (Value::Int(position), Value::Int(limit)) = (vals[0], vals[1]) else {
+        return None;
     };
     // `position < 0` cannot happen through the public API, but a bail costs
     // nothing and keeps the arithmetic below provably non-negative.
@@ -1459,15 +1632,11 @@ fn dbb_rel_addr(
         // real `nextGetIndex()` / `nextPutIndex()`.
         return None;
     }
-    if for_write {
-        match ctx.get_field(this, fields.is_read_only) {
-            Value::Int(0) => {}
-            _ => return None,
-        }
+    if for_write && !matches!(vals[3], Value::Int(0)) {
+        return None;
     }
-    let address = match ctx.get_field(this, fields.address) {
-        Value::Long(v) => v,
-        _ => return None,
+    let Value::Long(address) = vals[2] else {
+        return None;
     };
     if address <= 0 {
         return None;
@@ -1481,12 +1650,15 @@ fn dbb_get_rel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         return Ok(Some(Value::Int(0)));
     };
     let Some((addr, position)) = dbb_rel_addr(ctx, this, false) else {
+        elem_census::bailed(elem_census::GET_REL);
         return ctx.invoke_virtual_bytecode_only(this, "get", "()B", &[]);
     };
     let mut byte = [0u8; 1];
     if !ctx.copy_from_native_memory(addr, &mut byte) {
+        elem_census::bailed(elem_census::GET_REL);
         return ctx.invoke_virtual_bytecode_only(this, "get", "()B", &[]);
     }
+    elem_census::served(elem_census::GET_REL, addr);
     dbb_commit_position(ctx, this, position + 1);
     Ok(Some(Value::Int(i32::from(byte[0] as i8))))
 }
@@ -1498,14 +1670,25 @@ fn dbb_put_rel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
     let byte = match args.get(1) {
         Some(Value::Int(b)) => *b,
-        _ => return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]),
+        _ => {
+            elem_census::bailed(elem_census::PUT_REL);
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "put",
+                "(B)Ljava/nio/ByteBuffer;",
+                &args[1..],
+            );
+        }
     };
     let Some((addr, position)) = dbb_rel_addr(ctx, this, true) else {
+        elem_census::bailed(elem_census::PUT_REL);
         return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
     };
     if !ctx.copy_to_native_memory(addr, &[byte as u8]) {
+        elem_census::bailed(elem_census::PUT_REL);
         return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
     }
+    elem_census::served(elem_census::PUT_REL, addr);
     dbb_commit_position(ctx, this, position + 1);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -1668,12 +1851,31 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // We back it with the same pool/accounting machinery as the
     // DirectByteBuffer path so a 4 KiB tight-loop allocate/free
     // stays RSS-bounded regardless of which API the JDK picks.
+    // `jdk.internal.misc.Unsafe.allocateMemory0`/`freeMemory0` are ACC_NATIVE on
+    // both the Linux and the Windows JDK 25 image; the un-suffixed pair is the
+    // Java wrapper that calls them (a §1.4 shadow), and `sun.misc.Unsafe`
+    // declares none of the four on either image. Only what the image backs
+    // states its kind.
     for cls in ["jdk/internal/misc/Unsafe", "sun/misc/Unsafe"] {
         r.register(cls, "allocateMemory", "(J)J", unsafe_allocate_memory);
-        r.register(cls, "allocateMemory0", "(J)J", unsafe_allocate_memory);
         r.register(cls, "freeMemory", "(J)V", unsafe_free_memory);
-        r.register(cls, "freeMemory0", "(J)V", unsafe_free_memory);
     }
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "allocateMemory0",
+        "(J)J",
+        unsafe_allocate_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "freeMemory0",
+        "(J)V",
+        unsafe_free_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register("sun/misc/Unsafe", "allocateMemory0", "(J)J", unsafe_allocate_memory);
+    r.register("sun/misc/Unsafe", "freeMemory0", "(J)V", unsafe_free_memory);
 
     // Synthetic helper used by JDK-side Cleaner runnables that
     // capture (addr, size) at allocation time — see module docs.

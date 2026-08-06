@@ -35,6 +35,23 @@ SPRING_JVM_ARGS=(
   -Djunit.platform.discovery.issue.severity.critical=INFO
 )
 
+# Modules may add their OWN test system properties on top of
+# TestConventions, and spring-test does. `spring-test/spring-test.gradle`
+# sets `junit.vintage.discovery.issue.reporting.enabled=false` with the
+# comment "we disable reporting of the 'deprecated' discovery issue,
+# because that would otherwise fail the build" — spring-test is the module
+# that deliberately keeps the JUnit Vintage engine (it runs JUnit 4 tests),
+# and Vintage reports its own deprecation as an INFO discovery issue, which
+# TestConventions' `discovery.issue.severity.critical=INFO` then promotes to
+# critical. Measured 2026-08-02: without this, `test.context.aot
+# .AotIntegrationTests#endToEndTests` fails on HOTSPOT with
+# `DiscoveryIssueException: TestEngine with ID 'junit-vintage' encountered a
+# critical issue during test discovery`, and passes with it.
+case "$MOD" in
+  */spring-test)
+    SPRING_JVM_ARGS+=(-Djunit.vintage.discovery.issue.reporting.enabled=false) ;;
+esac
+
 CLS="$1"; shift
 cd "$MOD" && exec timeout "${HS_TO:-300}" /home/victor/jdk25/bin/java \
   "${SPRING_JVM_ARGS[@]}" -Xshare:off "$@" -cp "$CP" KRun "$CLS"

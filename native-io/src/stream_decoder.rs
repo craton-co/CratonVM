@@ -961,7 +961,10 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
             .get(&key)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "UTF-8".to_string());
-        let s = ctx.create_string(&name);
+        // The real `StreamDecoder.encodingName()` reports the HISTORICAL name
+        // for any `HistoricallyNamedCharset`, which is most of `java.base`:
+        // `new InputStreamReader(in, UTF_8).getEncoding()` is "UTF8".
+        let s = ctx.create_string(engine::historical_charset_name(&name));
         Ok(Some(Value::Object(Some(s))))
     });
     registry.set_category(__prev_cat);

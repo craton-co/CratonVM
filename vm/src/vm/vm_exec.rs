@@ -1451,6 +1451,18 @@ fn blockgc_dbg() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some())
 }
 
+/// Cached `CRATONVM_DBG_HEAPCOPY` gate — the managed-heap-destination tripwire
+/// on `copy_to_native_memory`. PERF: that tripwire sat on the single-byte
+/// `DirectByteBuffer.put` path, so an uncached `runtime_var_os` probe ran once
+/// per byte written through a direct buffer. Same read-once treatment as
+/// [`blockgc_dbg`] and for the same reason.
+#[inline]
+fn heapcopy_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some())
+}
+
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
 thread_local! {
@@ -4129,112 +4141,7 @@ impl<'a> NativeContextImpl<'a> {
     ///
     /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
-        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        const PROBE_BUDGET: u64 = 200_000;
-        let heap = &self.shared.mem.heap;
-        // Nothing this thread holds can have been reclaimed since the last
-        // time this walk proved it clean unless a COLLECTION ran in between,
-        // so that is the audit's real precondition — and it is what bounds the
-        // cost. Both call sites sit on the blocked-region entry/exit path,
-        // which a workload doing file or socket I/O crosses thousands of times
-        // between two collections; without this gate the audit would walk
-        // every frame's locals and stack on each of those crossings, doubling
-        // a `deposit_root_snapshot` that already walks exactly the same slots.
-        // With it the audit costs at most one frame walk per collection per
-        // thread, which is the rate at which it can possibly have anything new
-        // to say.
-        //
-        // Thread-local because both sites run ON the owning thread, and it is
-        // seeded to `u64::MAX` so the first audit on a thread always runs.
-        // Updated on every audit rather than only at block entry, so a wake
-        // with no matching entry (or a nested blocked region) still compares
-        // against the last time THIS thread looked.
-        thread_local! {
-            static LAST_AUDITED_GC_COUNT: std::cell::Cell<u64> =
-                const { std::cell::Cell::new(u64::MAX) };
-        }
-        let gc_count = heap.collection_count();
-        if LAST_AUDITED_GC_COUNT.with(|c| c.replace(gc_count)) == gc_count {
-            return;
-        }
-        let probe = |addr: usize, ctx: &dyn Fn() -> String| {
-            if PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PROBE_BUDGET {
-                return;
-            }
-            // Free-list membership FIRST, and only then the full report. A
-            // zeroed header is ambiguous on its own — `java.lang.Object` is
-            // `ClassId(0)` and so is a genuine `new Object()` — and the young
-            // span ring cannot settle it either, because the allocator
-            // re-serves young spans. Asking the heap whether the address is
-            // inside a hole right now is the one question with no false
-            // positives: a live object is never in a free block, never past
-            // the allocation frontier, and never in the inactive semispace.
-            if heap.reclaimed_hole_at(addr).is_none() {
-                return;
-            }
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
-                self.shared,
-                addr,
-                site,
-                &ctx(),
-                0,
-            );
-        };
-        for (fi, fr) in self.thread.frames.iter().enumerate() {
-            let check = |o: cratonvm_types::ObjectRef, what: &str, idx: usize| {
-                let a = o.as_ptr() as usize;
-                // Region membership first: a lost-tag slot can hold a
-                // non-address, and the header read below is a raw
-                // dereference.
-                if heap.is_heap_addr(a).is_none() {
-                    return;
-                }
-                // `ClassId(0)` alone is not the face. A PRIMITIVE ARRAY also
-                // reads back class id 0 — array headers carry the COMPONENT
-                // class id (JVMS §4.4.1; see `virtual_dispatch_target_cached`)
-                // and `long[]`/`int[]` have none — so gating on the class id
-                // alone flags every `long[] toc` local in
-                // `FileStore.dropUnusedChunks` on every wake. Requiring
-                // `kind == Object` costs one more byte load and drops that
-                // whole population; the all-zero header the collector leaves
-                // behind reads `kind == Object` because that is discriminant
-                // zero.
-                if heap.class_id_of(o).as_u32() != 0
-                    || heap.kind_of(o) != cratonvm_types::ObjectKind::Object
-                {
-                    return;
-                }
-                probe(a, &|| {
-                    format!(
-                        "tid={} frame#{fi} {}.{} pc={} {what}[{idx}]",
-                        self.thread.thread_id.0,
-                        fr.class_name(),
-                        fr.method_name(),
-                        fr.pc,
-                    )
-                });
-            };
-            // Only locals the collector itself would have rooted. A local
-            // the liveness analysis calls dead is SUPPOSED to be reclaimable:
-            // `H2ConcurrentUpdateLoop.main` slot 8 holds the seed loop's
-            // `PreparedStatement` for the rest of the method and read back as
-            // a free block on every wake. Counting those separately keeps the
-            // signal — a LIVE local the collector took anyway — visible.
-            let live_mask = fr.live_locals_mask_here();
-            for li in 0..fr.locals_len() {
-                if li < 64 && live_mask & (1u64 << li) == 0 {
-                    continue;
-                }
-                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
-                    check(o, "local", li);
-                }
-            }
-            for si in 0..fr.stack.len() {
-                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
-                    check(o, "stack", si);
-                }
-            }
-        }
+        crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
 
     /// Deposit a root snapshot of this thread's frames into the shared registry.
@@ -4281,6 +4188,7 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
+        crate::memory::reclaim_guard::note_root_publish(self.shared, self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -9678,6 +9586,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     // -- Heap access methods --
 
+    fn get_field_typed(&self, obj: ObjectRef, index: usize, descriptor: u8) -> Value {
+        // Same decode as `get_field`, minus `resolve_field_descriptor_byte_cached`
+        // — the caller supplied the answer that lookup would have produced.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        self.shared.mem.heap.get_field_as(obj, index, descriptor)
+    }
+
+    fn get_fields_typed(&self, obj: ObjectRef, slots: &[(usize, u8)], out: &mut [Value]) {
+        // One forwarding read for the whole batch — that is the point.
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        for (slot, dst) in slots.iter().zip(out.iter_mut()) {
+            *dst = self.shared.mem.heap.get_field_as(obj, slot.0, slot.1);
+        }
+    }
+
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let obj = self.shared.mem.heap.load_and_forward(obj);
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
@@ -11050,6 +10973,40 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         queue: Option<ObjectRef>,
     ) {
         use cratonvm_gc::ReferenceType;
+        let ref_addr = reference_obj.as_ptr() as usize;
+        let referent_addr = referent.as_ptr() as usize;
+        let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
+        // processor is told about, not just its numeric type tag. The tag
+        // cannot distinguish an ordinary `PhantomReference` from a
+        // `jdk.internal.ref.Cleaner`, because a `Cleaner` IS a phantom: its
+        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
+        // native and arrives here as `2`. This is the instrument that answered
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md`'s open question
+        // ("find where a real-JDK `jdk.internal.ref.Cleaner` is actually
+        // discovered"), and it is placed BEFORE the type-4 branch below so it
+        // reports whichever wire value a given build's discovery site chose.
+        if crate::runtime::interpreter::dbg_refdisc_enabled() {
+            let cn = self
+                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[refdisc] wire={ref_type} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
+            );
+        }
+        // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
+        // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
+        // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
+        // rather than a referent, so it must never reach the pre-GC
+        // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        if ref_type == 4 {
+            self.shared
+                .mem
+                .ref_processor
+                .lock()
+                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            return;
+        }
         let rt = match ref_type {
             0 => ReferenceType::Weak,
             1 => ReferenceType::Soft,
@@ -11057,26 +11014,6 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        let ref_addr = reference_obj.as_ptr() as usize;
-        let referent_addr = referent.as_ptr() as usize;
-        let queue_addr = queue.map(|q| q.as_ptr() as usize);
-        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
-        // processor is told about, not just its type tag. Asked for by
-        // `direct-bytebuffers-are-never-reclaimed-20260805.md`: "find where a
-        // real-JDK `jdk.internal.ref.Cleaner` is actually discovered", which
-        // the numeric `ref_type` alone cannot answer — a `Cleaner` reaches
-        // here as a PHANTOM (it is a `PhantomReference` subclass, and its
-        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
-        // native), so the tag says "2" for both an ordinary phantom and a
-        // cleaner.
-        if crate::runtime::interpreter::dbg_refdisc_enabled() {
-            let cn = self
-                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            eprintln!(
-                "[refdisc] type={rt:?} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
-            );
-        }
         self.shared.mem.ref_processor.lock().discover_reference(
             rt,
             ref_addr,
@@ -13814,9 +13751,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // routed here with a heap dst). Catch it with the live Java stack so
         // the offending call site is pinned. is_heap_addr is region-membership
         // only (no header read) so it is safe on an arbitrary address.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some()
-            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
-        {
+        if heapcopy_dbg() && self.shared.mem.heap.is_heap_addr(addr as usize).is_some() {
             let n = data.len().min(16);
             eprintln!(
                 "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
@@ -13903,6 +13838,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         self.shared.system_properties.write().remove(&normalized)
     }
 
+    #[track_caller]
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         // Prefer the real class if it can be loaded — `ensure_synthetic_class`
         // returns the existing id when the name is already registered, so a
@@ -13950,6 +13886,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     /// out of the returned `VmError`: the classifier is the authority on
     /// *which* refusal this is, and matching on an error's shape would make
     /// this mapping quietly wrong the day a third refusal is added.
+    #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -15066,7 +15003,7 @@ pub(super) fn convert_element_value(
 // `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
 // proves the VM is dispatching and says nothing about *what*, which is the
 // entire diagnosis: the `nioMemLZF:` residual in
-// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` read as "a long
+// the retired `h2-jitban-longtail1` write-up read as "a long
 // interpreter tail with no second hot spot to attack" for two revisions purely
 // because nobody had the callee histogram.
 //
@@ -18638,7 +18575,22 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             _ => {}
         }
     }
-    // Element not found вЂ” return null/default.
+    // Element not found — return null/default. This is the last stop for every
+    // "annotation member reads back as null" report (Byte Buddy's
+    // `AnnotationDescription$ForLoadedAnnotation.getValue` NPEs on it, Spring's
+    // `AnnotationsScanner` treats the annotation as absent), so name the
+    // annotation and the member when the dispatch trace is on.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() {
+        let type_desc = match shared.mem.heap.get_field(proxy, 0) {
+            Value::Object(Some(s)) => {
+                super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        eprintln!(
+            "[ANN-PROXY-MISS] type={type_desc} member={method_name} elements={n} -> null"
+        );
+    }
     Ok(Some(Value::Object(None)))
 }
 
@@ -19250,11 +19202,29 @@ fn invoke_on_class_shared_inner(
     // Resolve it here, after the reflective Method target is known but before
     // bytecode selection, so it cannot dispatch through the unsupported
     // socket/provider protocol.
-    let class_name = {
+    // ONE read guard for both of the questions the hot prefix asks about
+    // `class_id`: its name, and whether it is a class whose exact-name native
+    // must be preferred over an inherited bytecode body. They used to be two
+    // separate `class_manager.read()` calls on every single invoke; see the
+    // block comment on `prefer_exact_class_native` below for what the second
+    // one decides, and `docs/known-issues/h2/` for the profile that made the
+    // acquisition count worth counting.
+    let (class_name, prefer_exact_class_native) = {
         let cm = shared.classes.class_manager.read();
-        cm.get_class(class_id)
+        let class = cm.get_class(class_id);
+        let class_name = class
             .map(|class| class.name.to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A `String`, not an `Arc<str>` clone: the name outlives this guard,
+        // and `Arc::clone` on a hot class is an atomic RMW that every mutator
+        // performs on the SAME cache line — the identical contention this
+        // coalescing exists to reduce (the JIT's dispatch memo holds its names
+        // as `Rc<str>` for the same reason).
+        let stub_or_interface = class
+            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .unwrap_or(false);
+        let prefer = stub_or_interface || class_name.starts_with("cratonvm/internal/");
+        (class_name, prefer)
     };
     // `cratonvm/internal/*` classes (`UnmodifiableList`/`Map`/`Set`/
     // `Collection`/`EntrySet`/`Itr`/`ListItr`/`MapEntry`, ...) are pure
@@ -19292,15 +19262,7 @@ fn invoke_on_class_shared_inner(
     // invokevirtual, a different, already-correct dispatch path) did not.
     // Lambda-proxy receivers are already handled and returned above, so
     // they never reach this branch.
-    if class_name.starts_with("cratonvm/internal/")
-        || shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_synthetic_stub || c.is_interface())
-            .unwrap_or(false)
-    {
+    if prefer_exact_class_native {
         // Generalises the `cratonvm/internal/*` case above: ANY synthetic-
         // stub class (no real bytecode -- either a permanently-synthetic
         // VM-internal representation, e.g. the concrete class CratonVM
@@ -23183,13 +23145,27 @@ fn invoke_on_class_shared_inner(
                 // docs/known-issues/h2/
                 // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                    crate::memory::reclaim_guard::report_reclaimed_receiver(
+                    let addr = recv.as_ptr() as usize;
+                    if crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
-                        recv.as_ptr() as usize,
+                        addr,
                         "invoke dispatch",
                         &format!("{class_name}.{method_name}{descriptor}"),
                         class_id.as_u32(),
-                    );
+                    ) {
+                        // The free-list verdict fired, so this receiver really
+                        // is reclaimed memory. Say where it stood in THIS
+                        // thread's own root bookkeeping — the collector cannot
+                        // answer that about a peer, and it is the question the
+                        // 2026-08-05 `DriverManager.getConnection` witness
+                        // leaves open.
+                        crate::memory::reclaim_guard::report_root_slice_provenance(
+                            shared,
+                            thread,
+                            addr,
+                            "invoke dispatch",
+                        );
+                    }
                 }
                 // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
                 // to bare `java/lang/Object` is the stale-ObjectRef family's
@@ -26428,16 +26404,41 @@ mod tests {
             add_real_class_with_field_descriptors(&shared, "cratonvm/test/EpochStill", &["I"]);
         // Sampled AFTER the class is added: defining a class bumps the epoch
         // too (a new class can be someone's previously-missing ancestor).
-        let before = cratonvm_classloading::class_origin_epoch();
-        // Resolving does not touch provenance.
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        assert_eq!(
-            cratonvm_classloading::class_origin_epoch(),
-            before,
+        //
+        // `class_origin_epoch` is PROCESS-GLOBAL, and libtest runs this test
+        // concurrently with every other one that defines a class or calls
+        // `set_origin` -- each of which bumps it. A bare `assert_eq!(after,
+        // before)` therefore asserts something this test does not control, and
+        // it failed for real: `left: 12459, right: 12451`, eight bumps that
+        // arrived from other threads while these two reads ran.
+        //
+        // What the test means is "the READS contribute nothing". A window
+        // interrupted by someone else's write is not evidence against that --
+        // it is a spoiled sample. So retry until one window comes through
+        // clean. If the reads really did bump the epoch then EVERY window is
+        // dirty and this still fails, which is what keeps it honest.
+        const ATTEMPTS: usize = 64;
+        let mut quiet = false;
+        for _ in 0..ATTEMPTS {
+            let before = cratonvm_classloading::class_origin_epoch();
+            // Resolving does not touch provenance.
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            if cratonvm_classloading::class_origin_epoch() == before {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(
+            quiet,
             "reads must not bump the epoch, or every memo is invalidated \
-             immediately and the lock is back on the hot path"
+             immediately and the lock is back on the hot path -- no quiet \
+             window in {ATTEMPTS} attempts"
         );
+        // Re-sampled for the second half: the loop above may have exited on
+        // any attempt, and a concurrent bump between the two halves would
+        // otherwise be attributed to `set_origin` below.
+        let before = cratonvm_classloading::class_origin_epoch();
         {
             let mut cm = shared.classes.class_manager_write();
             let cls = cm.class_store.get_mut(cid).expect("class present");

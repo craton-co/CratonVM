@@ -115,9 +115,10 @@ OutOfMemoryError: Direct buffer memory: tried 9756672, used 1069355008, max 1073
 ```
 
 That is a **third, unrelated gap**: direct `ByteBuffer`s are never reclaimed.
-Filed with a ten-line reproducer as
-`docs/internal/fixed-suite-bugs/direct-bytebuffers-are-never-reclaimed-20260805-FIXED.md`
-(FIXED 2026-08-05).
+Filed with a ten-line reproducer, and **fixed later the same day** — see the
+retired `direct-bytebuffers-are-never-reclaimed-20260805` write-up. With that
+fix in, `TestMVStore` no longer hits `OutOfMemoryError: Direct buffer memory`
+at all.
 
 Note the class cannot pass on this host on **either** VM: stock HotSpot fails it
 earlier, at `testCacheSize` (`Cache 1Mb, reads: 2800 expected: 1750`), an
