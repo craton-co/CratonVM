@@ -49,9 +49,27 @@ does not finish either. This is **not** the "CratonVM's default heap is capped
 at 4 GiB while HotSpot's is an uncapped RAM/4 = 8.4 GiB" story.
 
 `-Xlog:gc` on HotSpot at `-Xmx512m` puts its live set after a young collection
-at **~180 MB** (`326M->180M(352M)` near the end of the run). CratonVM's live
-set for the same test, from `jcmd <pid> GC.class_histogram` and
-`GC.heap_info`, is **1.2 GB and still climbing** — roughly 8x.
+at **~180 MB** (`326M->180M(352M)` near the end of the run).
+
+**The corresponding CratonVM number is NOT yet measured — do not quote one.**
+An earlier revision of this doc claimed CratonVM's live set was "1.2 GB and
+still climbing, roughly 8x". That was wrong, and the way it was wrong is worth
+recording:
+
+* `jcmd GC.heap_info`'s young "used" is `young_from_used()` — the from-space
+  **bump-allocation cursor**, i.e. everything allocated since the last young
+  collection, live or not. It is not a live-set figure.
+* `jcmd GC.class_histogram` (`SharedVm::class_histogram`, `vm/src/vm/vm_init.rs`)
+  calls `heap.walk_objects()` with **no preceding collection and no liveness
+  mark** — it histograms every object in the heap, garbage included. HotSpot's
+  `GC.class_histogram` reports live objects.
+
+So the comparison was CratonVM-allocated against HotSpot-live, which proves
+nothing. Getting a real number needs a forced collection immediately before the
+walk, or an instrument that marks. See
+[[verify-what-the-instrument-measures-before-believing-it]] — this is that
+lesson, paid for again.
+
 
 ## Heap accounting: nothing is promoted
 
@@ -62,10 +80,12 @@ Young Generation: 1.2 GB / 2.0 GB (58.9% used)      Young: 1.4 GB / 2.0 GB (70.0
 Old   Generation: 13.1 MB / 4.0 GB (0.3% used)      Old:   13.1 MB / 4.0 GB (0.3% used)
 ```
 
-Old gen is **frozen at 13.1 MB** across many collections while young grows.
-Long-lived data that should have aged out is not aging out — the histogram
-shows `RootBeanDefinition` at 20 003 instances (= 2 x 10001 + 1), which the
-bean factory holds for the whole test, sitting in young.
+Old gen is **frozen at 13.1 MB** across many collections. That figure comes
+from `old_gen_stats()`, which is a real used-bytes accounting rather than a
+cursor, so the flatness is meaningful — but "nothing is promoted" is one
+reading and "promoted then collected by a major GC" is another, and these two
+samples cannot tell them apart. The young column beside it is the allocation
+cursor (above) and should not be read as growth of live data.
 
 Eliminations, so the next person does not redo them:
 
@@ -82,6 +102,144 @@ Eliminations, so the next person does not redo them:
   elapsed time, which is suggestive of conservative JIT roots retaining
   garbage) but the run did not finish inside 900 s either, so it neither
   confirms nor rules that out. This is the most promising next thread.
+
+
+## 2026-08-05 FINAL: three failures deep, each one uncovering the next
+
+This page has now been through three distinct causes for the same test. Each
+fix moved the failure later:
+
+| | failure | status |
+|---|---|---|
+| 1 | `OutOfMemoryError` in javac at a 4 GiB heap | gone on current `dev` (plausibly the 2026-08-04 `defrag-promote` change) |
+| 2 | `ArrayIndexOutOfBoundsException` in `CharBuffer.putBuffer` | **FIXED** — heap CharBuffer carried `address = -1`; see below |
+| 3 | `ClassCastException` in javac's `Resolve.staticKind` | **OPEN**, and it is the current failure |
+
+Failure 3, measured on the fixed binary (`rc=0`, 3222 s, `aioobe=0`, so the
+test now runs to completion rather than dying in `BaseFileManager.decode`):
+
+```
+An exception has occurred in the compiler (25.0.3)
+java.lang.ClassCastException: com.sun.tools.javac.code.Symbol$MethodSymbol
+    cannot be cast to com.sun.tools.javac.comp.Resolve$ReferenceLookupResult$StaticKind
+  at com.sun.tools.javac.comp.Resolve$ReferenceLookupResult.staticKind(Resolve.java:3317)
+  at com.sun.tools.javac.comp.Resolve$ReferenceLookupResult.<init>(Resolve.java:3301)
+  at com.sun.tools.javac.comp.Resolve.resolveMemberReference(Resolve.java:3173)
+```
+
+`StaticKind` is a nested **enum**; a `MethodSymbol` reaching a cast to it is
+type confusion on CratonVM, not a javac bug (HotSpot compiles the same sources).
+That is the next thing to chase, and it is a *correctness* defect, not
+throughput or footprint. Whoever picks it up should start by reducing it the
+way failure 2 was reduced — a standalone probe around a method reference whose
+resolution goes through `ReferenceLookupResult`, rather than the 55-minute
+Spring run.
+
+## 2026-08-05 UPDATE: on current `dev` this is no longer a heap failure
+
+Re-run against `dev` of 2026-08-05 (+882 commits), the test **no longer OOMs at
+all** — it runs to completion (`rc=0`, 1677 s) and fails with
+
+```
+java.lang.RuntimeException: java.lang.ArrayIndexOutOfBoundsException
+  at com.sun.tools.javac.api.JavacTaskImpl.invocationHelper
+Caused by: java.lang.ArrayIndexOutOfBoundsException
+  at java.nio.CharBuffer.putBuffer(CharBuffer.java:1143)
+  at java.nio.CharBuffer.put(CharBuffer.java:1050)
+  at com.sun.tools.javac.file.BaseFileManager.decode(BaseFileManager.java:366)
+```
+
+That is a **VM correctness bug, not a footprint one**: a heap `CharBuffer`
+carried `address = -1` instead of `ARRAY_CHAR_BASE_OFFSET` (16), so every
+`CharBuffer.put(CharBuffer)` threw. Fixed separately (`cb_write_hb` in
+`native-builtins/src/phases_late/charset_buffers.rs`); repro in
+`docs/known-issues/repros/charbuffer-address/`. javac's `BaseFileManager.decode`
+grows its CharBuffer and copies the old one in, so every source file it reads
+hit it.
+
+Something in dev's 882 commits — plausibly the 2026-08-04 `defrag-promote`
+change, which the flag table describes as replacing a non-moving young sweep
+that "promoted only" a subset — appears to have relieved the heap pressure this
+page was written about. **The footprint analysis below still describes real
+object widths, but it is no longer the thing failing this test.**
+
+### Compressed oops measured, and it did NOT help
+
+With hole 1's unblock in tree, the same binary was run both ways on the same
+box, same test:
+
+| | result |
+|---|---|
+| `CRATONVM_COMPRESSED_OOPS` unset | completes in 1677 s (fails on the CharBuffer bug) |
+| `CRATONVM_COMPRESSED_OOPS=1` | **does not finish** — killed at the 2700 s ceiling |
+
+So narrowing references is not a demonstrated win for this workload. Part of
+that is self-inflicted: hole 1's unblock refuses the inlined String intrinsics
+under narrow oops, which is a real throughput cost. Do not cite compressed oops
+as the fix for this page without re-measuring after hole 1 has a proper narrow
+arm in `emit_load_string_value_ptr` rather than the blanket refusal.
+
+## Why CratonVM needs more heap: object width, measured
+
+Per-object *sizes* from `GC.class_histogram` are exact regardless of liveness
+(each entry's bytes/instances is that class's real instance size), so unlike
+the totals they can be compared directly. Confirmed against the `[layout]`
+diagnostic (`CRATONVM_DBG_LAYOUT=1`), which prints each class's compact body:
+
+| class | CratonVM | HotSpot (compressed oops) |
+|---|--:|--:|
+| `java/lang/String` | 56 (32 hdr + 24 body) | 24 |
+| `java/util/HashMap$Node` | 64 (32 + 32) | 32 |
+| `com/sun/tools/javac/util/List` | 48 | 24 |
+| `java/util/HashMap` | **320** | ~48 |
+| `java/util/LinkedHashMap` | **400** | ~48 |
+| `java/util/ArrayList` | **112** | ~24 |
+
+Two separate effects:
+
+1. **A broad ~2-2.5x** on everything, from a 32-byte `ObjectHeader`
+   (`types/src/heap_types.rs`, vs HotSpot's 12) and 8-byte reference fields
+   (vs 4 narrow). This is the dominant term, because it applies to the millions
+   of small nodes javac allocates. Note the nodes themselves are *fine* —
+   `HashMap$Node` gets the compact layout (`body=32 refs=3 fields=4`).
+
+2. **A ~7x on a few container classes.** `HashMap`, `LinkedHashMap` and
+   `ConcurrentHashMap` print `LEGACY, no compact layout` and fall back to the
+   uniform 16-byte tagged-`Value` cell (320 = 32 + 18x16). This is
+   **deliberate**, not a bug: `build_compact_layout`
+   (`classloading/src/class.rs`) refuses any class with a *padded* slot — a slot
+   with no field descriptor — because native code stores mixed types into those
+   raw slots (`map_alloc_node` writes `Int(hash)` into one and refs into
+   others), and guessing they are references makes the GC scan a primitive as a
+   pointer and corrupt the heap. The legacy cell self-describes via its tag.
+   `IdentityHashMap` (`body=40`) and `WeakHashMap` (`body=64`) have no padded
+   slots and are compact, which is the control.
+
+Effect 2 is bounded (one object per map). **Effect 1 is the lever**, and the
+fix already exists behind a gate.
+
+## The lever: compressed oops, gated off by two named holes
+
+`gc/src/compressed_oops.rs` narrows reference instance fields and reference
+array elements from 8 bytes to 4 under `-XX:+UseCompressedOops` /
+`CRATONVM_COMPRESSED_OOPS=1`, **off by default**. Its header is explicit that
+the gate is off for correctness, not throughput, and names both holes:
+
+1. `emit_load_string_value_ptr` (`jit/src/x64.rs`) emits an unconditional
+   64-bit load of `String.value` and is not gated on
+   `narrow_oops_block_inline_fields` the way the getfield/putfield arms are, so
+   under narrow oops every inlined `charAt`/`length`/`hashCode`/... is a
+   deterministic wild-pointer SIGSEGV.
+2. `mark_young_to_old_refs` and `rewrite_stretch_conservatively`
+   (`gc/src/gen_heap.rs`) rescan unparseable heap stretches in aligned 8-byte
+   words; a pair of adjacent narrow oops never matches, so marks are missed
+   (premature reclamation) and refs to moved objects are left dangling.
+
+Hole 1 has a one-line unblock the header itself prescribes — refuse
+`try_resolve_string_intrinsic` under `narrow_oops_enabled()`, trading the
+intrinsic's throughput for correctness. **That unblock is now in tree** (it is
+inert while the gate is off). Hole 2 is untouched, so the gate must stay off;
+`enable_for_live_heap` still prints its unsoundness warning.
 
 ## What the profile says
 
