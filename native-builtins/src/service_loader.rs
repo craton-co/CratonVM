@@ -2469,7 +2469,22 @@ fn native_sl_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     result
 }
 
+// JDK-ONLY-CLASSIFY: stub — stated for the whole registrar, not adjudicated
+// per row. Every one of these was among the 200 registrations the real boot
+// made with NO category scope over them, which `--dump-native-registry`
+// could not report until `current_category` became an `Option`: the old
+// `category_chosen` flag was set by the first `set_category` in boot and
+// never cleared, so everything after it claimed to have been chosen.
+// `SyntheticStub` is the kind these carried before and after — verified by
+// a census A/B — and it is the right one on the merits: `java.util.ServiceLoader` is pure Java. These eleven
+// were the sharp end of the measurement: with no scope over them the
+// downgrade rule handed them the *previous* registration's `Bridge`, so
+// `--jdk-only` would have started admitting a surface it had been
+// refusing. Stating the kind is what keeps that from happening by
+// accident in either direction.
 pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let sl = "java/util/ServiceLoader";
     r.register(
         sl,
@@ -2536,6 +2551,7 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)V",
         native_stream_collector_accept,
     );
+    r.set_category(__prev_cat);
 }
 
 #[cfg(test)]

@@ -98,7 +98,7 @@ and now state their kind. The other 117 do not, and this file is the list.** The
 were deliberately left on the ambient category: leaving them inherited is what
 keeps the census able to say "nobody adjudicated this", which is exactly the
 property the record
-[`native-kind-is-ambient-and-defaults-to-syntheticstub.md`](native-kind-is-ambient-and-defaults-to-syntheticstub.md)
+the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
 exists to protect. Stating `Bridge` on all 204 would have been a codemod that
 made the census report 204 adjudicated bridges where the truth is 87.
 
@@ -234,7 +234,7 @@ mints**: `cratonvm/synthetic/Process`, `…/ProcessExitWaiter`,
 them alive under `--jdk-only`, and under `--jdk-only` contract §5 forbids
 fabricating exactly that kind of class. This is the same unresolved shape as the
 `Function$Identity` successor defect in
-[`native-kind-is-ambient-and-defaults-to-syntheticstub.md`](native-kind-is-ambient-and-defaults-to-syntheticstub.md):
+the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up:
 a surviving `Bridge` whose receiver class the policy says may not exist, held
 together today only because
 [`ensure_synthetic_class` cannot enforce](ensure-synthetic-class-cannot-enforce-only-record.md).

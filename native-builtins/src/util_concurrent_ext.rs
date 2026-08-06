@@ -940,6 +940,22 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         register_synthetic_aqs_natives(registry);
     } // end if !real_aqs
 
+    // JDK-ONLY-CLASSIFY: stub — the CountDownLatch and CyclicBarrier blocks
+    // below (14 registrations). `java.util.concurrent` is pure Java: JDK 25
+    // declares no `ACC_NATIVE` method on either class, so contract §1.5 cannot
+    // call these bridges. `SyntheticStub` is also what they carry today — it is
+    // what the ambient category happened to hold when this function ran — so
+    // stating it changes no kind. What it changes is that the kind is no longer
+    // a property of whoever called us.
+    //
+    // These fourteen were among the 45 registrations that turned out to have NO
+    // category scope over them at all once `current_category` became an
+    // `Option`. Before that, `category_chosen` was sticky: it was set by the
+    // first `set_category` in boot and never cleared, so every later
+    // registration reported "chosen" and this hole was invisible.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+
     // --- CountDownLatch ---
     let cdl = "java/util/concurrent/CountDownLatch";
     registry.register(cdl, "<init>", "(I)V", native_cdl_init);
@@ -986,6 +1002,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
     registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
     registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---
     // Two supported layouts:
@@ -5725,7 +5742,29 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     register_stamped_lock_natives(registry);
 }
 
+/// JDK-ONLY-CLASSIFY: stub — all 31 registrations, and the reason is a
+/// measurement rather than a reading of the class.
+///
+/// This function sets its own category now. It did not, and the consequence was
+/// the ambient-category defect in its purest form: **the same registration site
+/// produced a `Bridge` row and a `SyntheticStub` row in one boot**, because
+/// this function is called from three places and the callers disagreed about
+/// what was in effect. `--dump-native-registry` on JDK 25 / linux, 2026-08-06:
+/// every one of the 25 `StampedLock` triples appears three times, twice
+/// `bridge` and once `synthetic-stub`, and registration is last-write-wins, so
+/// what actually shipped was decided by call ORDER.
+///
+/// `SyntheticStub` is what shipped, and it is also the right tag on the merits:
+/// `java.util.concurrent.locks.StampedLock` is pure Java and JDK 25 declares no
+/// `ACC_NATIVE` method on it or on its two view classes, so contract §1.5
+/// cannot call these bridges. Under `--jdk-only` the whole surface is refused
+/// together and the real class runs — which is the shape
+/// `stampedlock-surface-must-be-complete-not-partial` asks for; a *partial*
+/// surface is the failure mode there, and an ambient tag that depends on call
+/// order is exactly how you get one.
 pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let sl = "java/util/concurrent/locks/StampedLock";
     registry.register(sl, "<init>", "()V", native_stamped_init);
     registry.register(sl, "readLock", "()J", native_stamped_read_lock);
@@ -5822,6 +5861,7 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl_rv, "lock", "()V", native_stamped_read_view_lock);
     registry.register(sl_rv, "tryLock", "()Z", native_stamped_read_view_try_lock);
     registry.register(sl_rv, "unlock", "()V", native_stamped_read_view_unlock);
+    registry.set_category(__prev_cat);
 }
 
 // The four `native_rwl_*` stubs that used to sit here were dead code: nothing

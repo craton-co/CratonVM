@@ -2629,13 +2629,18 @@ impl SharedVm {
             );
             // Real close() (see `quarkus_runner_class_loader_close`): closes each
             // distinct ClassLoadingResource once and skips the null map values
-            // the real bytecode NPEs on. Left at the default (SyntheticStub)
-            // category so `CRATONVM_NO_STUBS` still falls through to bytecode.
-            native_methods.register(
+            // the real bytecode NPEs on. `SyntheticStub` so `CRATONVM_NO_STUBS`
+            // still falls through to bytecode — the same intent this comment
+            // always stated, now stated to the registry instead of relying on
+            // the default. That reliance was the only one left in the VM crate,
+            // and a `set_category` anywhere upstream would have silently
+            // retagged it.
+            native_methods.register_with_kind(
                 "io/quarkus/bootstrap/runner/RunnerClassLoader",
                 "close",
                 "()V",
                 quarkus_runner_class_loader_close,
+                cratonvm_native_api::NativeKind::SyntheticStub,
             );
             cratonvm_native_builtins::classloader_real::register_classloader_real_natives(
                 &mut native_methods,
@@ -4183,7 +4188,7 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
-    ///       "kind_stated": true,
+    ///       "kind_stated": true, "kind_chosen": true,
     ///       "owns_slot": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
     ///                                  "acc_native": true, "has_code": false },
@@ -4429,6 +4434,10 @@ impl SharedVm {
             // `set_category`?" — the discriminator the 157-entry
             // reclassification needs. See `NativeCensusEntry::kind_stated`.
             out.push_str(&format!("      \"kind_stated\": {},\n", row.kind_stated));
+            // "…or did nobody have an opinion at all?" — `kind_stated` is false
+            // on every row a deliberate `with_category` scope covers, so it
+            // cannot answer that. See `NativeCensusEntry::kind_chosen`.
+            out.push_str(&format!("      \"kind_chosen\": {},\n", row.kind_chosen));
             // "Would a dispatch of this triple reach THIS row?" A superseded
             // registration answers `false` and can never be dispatched, so it
             // is not a registration any reclassification wave has to decide.

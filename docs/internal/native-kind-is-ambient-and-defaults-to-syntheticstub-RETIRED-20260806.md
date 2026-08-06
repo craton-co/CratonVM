@@ -1,9 +1,190 @@
 # `NativeKind` is ambient state, not a `register()` argument — and one line can mis-tag a thousand registrations
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **DANGEROUS: causes silent
-misclassification, not a clean failure, and it misclassifies in both
-directions.**
+**Status:** RETIRED 2026-08-06. The ambient mechanism is gone as a *decider*:
+`current_category` is an `Option`, it is scoped by the same save/restore the
+codebase already used, no registration in a real boot runs on the default, and
+every registration's kind is frozen per row so a one-line edit can no longer
+move a thousand of them in silence. Filed 2026-07-31.
+
+**The reclassification wave this record kept pointing at is NOT closed and was
+never this record's** — contract §8 puts it elsewhere. It lives on in
+[`l5bc-awt-builtins-bridge-residuals.md`](../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md),
+[`l5-native-io-bridge-residuals.md`](../known-issues/jdk-only/l5-native-io-bridge-residuals.md)
+and
+[`census-asks-one-class-on-one-platform.md`](../known-issues/jdk-only/census-asks-one-class-on-one-platform.md),
+with 9,571 unadjudicated `Bridge` registrations and a slack-free ratchet on the
+number. What is closed is the thing this record is named after.
+
+---
+
+## What closed it, 2026-08-06
+
+### 1. The instrument was measuring nothing, and that came first
+
+Schema 2 added `kind_stated` — true only for `register_with_kind` — and the
+2026-08-04 entry below correctly says it cannot answer *"did anybody have an
+opinion?"*, because it is false on every row a deliberate `with_category` scope
+covers. The registry already had a wider field for that, `category_chosen`, and
+it was **not exposed in the census**. Exposing it (`kind_chosen`) produced a
+number that looked like victory and was an artefact:
+
+> 11,875 of 11,876 registrations "chosen"; exactly one on the default.
+
+`category_chosen` was a sticky `bool`. `set_category` set it; nothing cleared
+it. The restore half of the idiom this codebase uses in 564 places —
+`let prev = registry.current_category(); … registry.set_category(prev);` — put
+the *kind* back and left the flag true. So after the first `set_category`
+anywhere in boot, every later registration reported that someone had chosen it.
+
+**The fix is a type.** `current_category: Option<NativeKind>`, so the idiom
+restores the absence of a choice along with the kind. `set_category` takes
+`impl Into<Option<NativeKind>>`, which is why all 567
+`set_category(NativeKind::…)` sites and all 564 restores compiled unchanged —
+**one** call site in the whole workspace needed touching, and it was a test.
+The conservative `SyntheticStub` fallback now lives in exactly one function,
+`effective_category`, and every registration that reaches it is counted.
+
+### 2. With a working instrument: 200 registrations, nine registrars, no scope at all
+
+And one of them is this record's thesis with the evidence attached.
+`register_stamped_lock_natives` set no category and is called from three
+places. Two callers had `Bridge` in effect and one had none, so **the same
+registration site produced a `bridge` row and a `synthetic-stub` row in one
+boot** — 25 `StampedLock` triples, three rows each, and registration is
+last-write-wins, so what shipped was decided by call *order*.
+
+The other eight: `register_service_loader_natives`, `register_url_codec`,
+`register_p59_bulk_stream_transfer`, `register_p59_zip_output_primitives`,
+`register_tomcat_jni_natives`, `register_slf4j_binder_stubs_pub`,
+`register_netty_internal_tcnative_natives`, and the `CountDownLatch` /
+`CyclicBarrier` block of `register_concurrent_natives`. All nine state
+`SyntheticStub` now — what their surviving row always was, and what the classes
+deserve: `java.util.ServiceLoader`, `java.net.URLEncoder`/`URLDecoder`,
+`java.io.InputStream.transferTo`, `java.util.zip.ZipOutputStream`'s bookkeeping
+and `java.util.concurrent.locks.StampedLock` are ordinary bytecode in
+`java.base`, and JDK 25 declares no `ACC_NATIVE` method on any of them.
+
+One more, in `vm/src/vm/vm_init.rs`, whose comment had said out loud what all
+200 were doing: *"Left at the default (SyntheticStub) category so
+`CRATONVM_NO_STUBS` still falls through to bytecode."* Same intent, stated to
+the registry now instead of to the reader.
+
+### 3. `--jdk-only` was admitting 48 fakes, decided by registration order
+
+This is the concrete defect the record predicted in the abstract, and it is
+contract §11 (*"zero synthetic-stub invocations through any path"*) being false
+without anything saying so.
+
+The drop happens **at registration**. When one triple is registered twice —
+once under a `Bridge` scope and once as a stub — strict mode refuses the stub
+*at the door*, so the earlier `Bridge` row survives to own the slot. The fake
+outlives the mode built to remove it, and which copy wins is a property of the
+order two files happen to run in.
+
+A `--jdk-only` census A/B across the fix: **48 triples strict mode used to
+admit and now refuses, none in the other direction** —
+`java.util.concurrent.locks.StampedLock` (25 + its two view classes),
+`java.util.ServiceLoader` (10), `java.net.URLDecoder` / `URLEncoder` (6),
+`cratonvm/internal/StreamCollector`.
+
+Then the same query, run the other way, found the rest of the pattern: **20
+more triples whose `--real-jdk` kind is `synthetic-stub` and whose `--jdk-only`
+kind is not**, because a *second file* registers the same triple under a
+`Bridge` scope. Ten of those are the successor defect this record names by
+itself, plus its shape repeated:
+
+* `java/util/function/Function$Identity.apply` and
+  `java/util/function/UnaryOperator.identity`, in
+  `phases_late/streams.rs`. **L7 item 4 retagged the `native-builtins/src/lib.rs`
+  cluster and these two copies, in another file, kept the surface alive** —
+  `--jdk-only` was still minting a `Function$Identity` / `UnaryOperator$Identity`
+  whose class §5 forbids fabricating. Both are `SyntheticStub` now, so strict
+  mode runs `java.base`'s own `t -> t`.
+* five `CountDownLatch` and two `CyclicBarrier` registrations in a surefire
+  bootstrap block, the same callbacks `util_concurrent_ext` installs;
+* `java.io.InputStream.transferTo` in `native-io`.
+
+`java.util.Set.of` is the one left alone deliberately: its strict kind is
+`Intrinsic`, and an intrinsic shadowing concrete bytecode is what an intrinsic
+*is* (554 of 678 `Intrinsic` rows do). That is a reclassification question, not
+a fake.
+
+### 4. The silence itself — `scripts/jdk-only-kind-map.py`
+
+The record's banner called this DANGEROUS because it is *silent*, and until now
+nothing in the tree could have caught a one-line ambient edit. **The aggregate
+ratchet provably cannot**: `bridge-ratchet.sh` freezes
+`bridge.without_acc_native` and `bridge.shadows_bytecode`, so flipping a
+`with_category` line from `Bridge` to `SyntheticStub` takes a registrar's worth
+of rows *out of the Bridge population*, both numbers **fall**, and the gate
+prints "IMPROVED — lock it in". The 2026-07-14 `java.util.Properties` regression
+would have read as a win.
+
+The kind map freezes `(class, method, descriptor, ordinal) -> (kind,
+kind_stated, kind_chosen)` for all 11,876 registrations and asks exactly one
+question: *did a registration that already existed change kind?* Added and
+removed rows pass — those belong to the bridge ratchet and `stub_ratchet` — and
+`kind_stated` / `kind_chosen` are one-way, because losing an adjudication means
+the next ambient edit moves that row silently again.
+
+It scores **the same census** `bridge-ratchet.sh` already takes. Two boots would
+be two objects, and `stub_ratchet.rs` records what happened the last time two
+ratchets over "the same" VM turned out to be measuring different ones: they
+disagreed by 364 registrations for weeks. 13 hermetic self-tests, including a
+1,350-row registrar-sized re-tag and two registrations of one triple swapping
+kinds.
+
+### 5. Step 3's "flip the default", in the only form that is answerable
+
+`no_registration_runs_on_the_ambient_default` in
+`native-builtins/tests/stub_ratchet.rs`. The record's own phrasing — *"once
+every registration states its kind"* — cannot be gated, because `kind_stated`
+is deliberately false on the thousands of rows a `with_category` scope covers
+on purpose. **"No registration is made with no scope over it"** can be, and it
+is zero: in the real boot census, `kind_chosen: false` on 0 of 11,876.
+
+The conservative `SyntheticStub` fallback in `effective_category` is therefore
+dead code on every path anyone has measured, and can be deleted outright the
+day `NativeKind` gains a refusing arm. That is a smaller change than it was;
+it is left undone deliberately, because a `cfg(windows)` registrar this Linux
+census cannot see would turn a silent mis-tag into a boot panic, and the gate
+above catches it on whatever platform CI builds instead.
+
+### What none of it moved
+
+Effective kind of all **10,639** registered triples is byte-identical across
+the whole change, measured by folding both censuses last-write-wins.
+`scripts/jdk-only-strict-probes.sh` scores 5 divergent sections of 5 baselined
+on both binaries with the same section failures. The counts that did move,
+moved down and for one reason — superseded rows stopped claiming a kind nothing
+used: `stub_ratchet` 553 → 642, bridge ratchet 9,675/4,686 → 9,571/4,596, each
+re-frozen from a single census with the reason attached.
+
+## What is still open, and where it lives now
+
+**Reclassification.** 9,571 `Bridge` registrations have no `ACC_NATIVE` target
+and nobody has adjudicated them. That is a different question from this
+record's: it asks whether a kind is *right*, not whether anything decided it.
+Contract §8 assigns it to its own wave, and the evidence and per-crate tables
+are in `l5bc-awt-builtins-bridge-residuals.md` (the largest share),
+`l5-native-io-bridge-residuals.md`, `census-asks-one-class-on-one-platform.md`
+(the two ways the census's verdict is too narrow) and
+`scripts/baselines/jdk-only-dead-everywhere.tsv` (796 dead registrations, four
+images, three workloads). The ratchet keeps the number from rising; only that
+wave can lower it.
+
+**The `cratonvm/synthetic/Process*` cluster**, 25 `Bridge` registrations on
+VM-minted classes, is the `Function$Identity` shape in a third place and is
+filed in the `native-io` residual record. It is not fixed here because unlike
+`Function$Identity` it has no obvious bytecode fallback — `ProcessBuilder.start`
+is itself shadowed — so it needs a subprocess differential under `--jdk-only`
+before anything is retagged.
+
+---
+
+*Everything below is the record as it stood, kept because the measurements in
+it are the reason the fix above is shaped the way it is. Counts in the dated
+sections are superseded by the section above where they conflict.*
 
 ## What changed on 2026-08-05 (second pass) — the instrument was narrower than the question
 
@@ -14,7 +195,7 @@ directions.**
 What that pass actually found is bigger than the count. **Two of the
 adjudications L5/L5b made were wrong, and both were wrong for the same reason:
 `image_declaring_method` asks about ONE class in ONE image.** Filed in full as
-[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md),
+[`census-asks-one-class-on-one-platform.md`](../known-issues/jdk-only/census-asks-one-class-on-one-platform.md),
 with the two instruments that close it. In short:
 
 * **Inheritance.** Of the 2,542 rows the census calls *class present, method
@@ -105,13 +286,13 @@ different verdicts, because one `for cls in [...]` loop registers the same
 native under several platform class names and at most one of those names is the
 declarer on any given image. **The unit of adjudication is the row, not the
 registrar and not even the call site.** The 117 rows L5 declined to claim are
-filed as [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md);
+filed as [`l5-native-io-bridge-residuals.md`](../known-issues/jdk-only/l5-native-io-bridge-residuals.md);
 the largest group there is 25 `Bridge` registrations on VM-minted
 `cratonvm/synthetic/Process*` classes — the `Function$Identity` shape found in a
 second place.
 
 **L5b/L5c then measured the same thing at crate scale**
-([`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md)),
+([`l5bc-awt-builtins-bridge-residuals.md`](../known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)),
 and added three facts this record should carry:
 
 * **The marker is the starting point; the image is the evidence.** The only
@@ -326,7 +507,7 @@ directions.
 
 This is the finding that inverts the original premise of this record. It came
 out of the ambient-category audit
-([`docs/jdk-only-ambient-category-audit.md`](../../jdk-only-ambient-category-audit.md))
+([`docs/jdk-only-ambient-category-audit.md`](../jdk-only-ambient-category-audit.md))
 and is recorded in code as a `JDK-ONLY-CLASSIFY` verdict on
 `register_collections_natives` in `native-collections/src/lib.rs` (~1484):
 
@@ -431,7 +612,7 @@ adjudicated:
 So under `--jdk-only` the surviving `Bridge` native is a bridge to a receiver
 whose class the policy says may not exist. Today nothing breaks, because
 `ensure_synthetic_class` records the violation and fabricates anyway (see
-[`ensure_synthetic_class` cannot enforce](ensure-synthetic-class-cannot-enforce-only-record.md)) —
+[`ensure_synthetic_class` cannot enforce](../known-issues/jdk-only/ensure-synthetic-class-cannot-enforce-only-record.md)) —
 the two defects are cancelling each other out. Fixing either one alone exposes
 the other. The real fix is upstream: `Function.identity()` should return the
 real lambda, not a VM-minted stand-in.
