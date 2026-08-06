@@ -223,6 +223,39 @@ implementation.
 
 ---
 
+## Verification
+
+`scripts/jdk-only-strict-probes.sh`, three arms, JDK 25 / linux — the same gate
+that filed this. The `agent` line is now byte-identical across all three:
+
+```text
+[hotspot] agent premain=true transformed=positive retransform=true selfSeen=true
+          ifaceMethods=17 rtName=true rtSpec=true rtArgs=true attach=list-ok
+[real]    agent premain=true transformed=positive retransform=true selfSeen=true
+          ifaceMethods=17 rtName=true rtSpec=true rtArgs=true attach=list-ok
+[strict]  agent premain=true transformed=positive retransform=true selfSeen=true
+          ifaceMethods=17 rtName=true rtSpec=true rtArgs=true attach=list-ok
+```
+
+and the ratchet reports both of this doc's baseline lines as converged:
+
+```text
+NO LONGER DIVERGING (not a failure — re-freeze to keep the ratchet tight):
+  - JdkOnlyPlatformProbe/real/agent
+  - JdkOnlyPlatformProbe/strict/agent
+RESULT: PASS
+```
+
+`probes/NioAttrProbe` is byte-identical to HotSpot in both CratonVM modes,
+including the error contract (`unknownName=IllegalArgumentException
+unknownView=UnsupportedOperationException`).
+
+`vm-cli/tests/cli_javaagent_transform.rs` is the committed regression test; it
+asserts the *effect* of a real rewrite rather than a counter the agent keeps,
+because the original failure was invisible from inside the agent.
+
+---
+
 ## What the fix does *not* cover
 
 * **Classes an agent registers a transformer too late to see.** Classes loaded
