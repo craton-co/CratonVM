@@ -226,6 +226,56 @@ later, and `emit_prologue` writes that slot on every entry anyway, so a null
 read means a genuinely non-Java thread and the fallback would have diverted
 too.
 
+### Measured (both arms built from the same base, `4cd9af346` vs `e089f1ec3`)
+
+The codegen check is the one that can falsify the design, so it comes first.
+Runs of consecutive blind-spill stores in `bottomUpTree`:
+
+| safepoint | base | fix |
+|---|---|---|
+| 0xdf | 14 | 14 |
+| **0x165** (`new`) | **14** | **3**, + 11 at 0x20f (slow path) |
+| **0x3d3** (`new`) | **14** | **3**, + 11 at 0x47d (slow path) |
+| 0x514 0x6d2 0x8ab 0xa86 | 14 each | 14 each |
+
+Exactly the two allocation sites, exactly 3 + 11, exactly at the slow-path
+labels. 692 → 682 instructions overall (the 22 reappear on the slow paths; the
+net 10 is the dropped fallback at both sites).
+
+| | fix | base | |
+|---|---:|---:|---|
+| `-Xmx16g` | 1.96s | 2.07s | **1.056x** |
+| `-Xmx8g` | 2.82s | 3.02s | **1.071x** |
+
+10 interleaved pairs each, order flipped on alternate pairs, per-process user
+CPU at host load ~20. All seven phase checksums identical; `CRATONVM_GC_STATS`
+identical on both arms (`minor=1`, same fallback reason, same counts); zero
+`alloc-spill-sink-unconsumed` compile bails across the whole suite.
+
+### What is NOT evidence here — the benchmark cannot see this class of bug
+
+The obvious oracle is "squeeze the heap until it collects continuously and diff
+the checksum". Done: `-Xmx2g/1g/700m` (6/12/18 minor collections), both young
+lanes, 3 reps each — 18/18 correct on both arms.
+
+**That result is worthless, and the positive control says so.** Running the
+*base* binary with `CRATONVM_NO_PRECISE_REG_SPILL=1` — which removes the blind
+spill at **every** safepoint, a far larger violation than this sink — is also
+green, 12/12, both lanes, at 18 collections. The full bench at squeezed heaps
+agrees: base, fix and no-spill-at-all produce identical checksums.
+
+So no CratonBench phase holds a live oop only in a register at a safepoint; the
+operand-stack and local flushes already cover everything, and the blind spill is
+pure belt-over-braces *on this workload*. It exists for the ones where the oop
+tracker misses something (SB-CRASH-04, Keycloak Gap 9), and only those can
+validate a change to it.
+
+The sink therefore rests on the structural argument plus the codegen check
+above, not on a green benchmark — and on `CRATONVM_JIT_NO_ALLOC_SPILL_SINK=1`
+being a one-variable rollback. **If you extend this to the call safepoints, find
+a workload where the spill is load-bearing first, and prove it goes red without
+it.** Anything else is measuring nothing.
+
 ## Things that were tried and are NOT the answer
 
 - **Tiering.** `bottomUpTree` never reaches the optimizing tier at the default
@@ -233,7 +283,10 @@ too.
   by 1 ms (1,266 vs 1,267). `CRATONVM_JIT_FORCE_C2=1` is **25x slower**
   (31,630 ms). More C2 is not a direction here.
 - **`CRATONVM_JIT_MY_SELFCALL_PROOF=0`** — inert. Same 43 spill stores, same
-  `len=3874`.
+  `len=3874`. *Now explained, and it is a non-finding:* the self-call spill
+  elision was never firing in either arm, because
+  `can_elide_self_call_register_spill` correctly refuses both methods (see the
+  section above). Turning off a proof that never succeeds changes nothing.
 - **`CRATONVM_JIT_MY_SHADOW_EMISSION=0`** — 1%, and it was separately proven
   inert (byte-identical codegen) during the PERF-02 work. Do not read that 1%
   as a measurement of anything.
@@ -276,6 +329,18 @@ The two structural levers are large:
    non-moving sweep into a copy of a nursery that is almost entirely garbage.
 2. **Shrink the object header.** 32 → 16 would take `Node` from 48 to 32 bytes
    and cut the memory traffic and both zeroing costs by a third.
+
+The JIT lead is now spent, and the arithmetic says so. The blind spill is the
+whole of what the single-pass backend has to give here — 1.178x if it vanished
+entirely — and only the allocation sites' share of it was reachable by a local
+argument. That share has been taken (1.056–1.071x). The self-call two thirds
+would need to prove that a callee's own blind spill covers its caller's
+registers, which is true for callee-saved registers by ABI but false the moment
+the callee reaches a Rust helper before its first safepoint — a whole-callee
+property a single-pass compiler does not have.
+
+So `9.66x → ~9.1x`, and the rest of it is the two structural items above. That
+is the finding: a 9x row does not have a JIT-shaped fix.
 
 Neither is a small change, and the per-call shadow-push cost is not removable
 without giving up precise roots. A 9.66x row does not have a cheap fix; that is
