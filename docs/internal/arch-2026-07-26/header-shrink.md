@@ -584,3 +584,38 @@ identical; correct 3/3 at 1g, 700m and 512m on both arms, with moving-young
 relocating every cycle.
 
 5,889 tests pass across the four crates (types 505, gc 979, jit 1964, vm 2441).
+
+### 9.6 The snapshot is correct, and I could not build an oracle for it
+
+§4.3 rates a mistake here as "silent monitor corruption ... the one place where
+a mistake is silent rather than a crash". Two probes were written to catch it
+and **neither can**, which is worth recording as loudly as the fix.
+
+* **v1** — 8 threads, contended monitors, allocation inside the critical
+  section, `-Xmx256m`. Green. **Vacuous**: `minor=88` but
+  `moving_young cycles=0` and `major=0`. Every one of those collections was a
+  non-moving sweep, which forwards nothing.
+* **v2** — same, plus a 60k-element retained set with the lock targets
+  interleaved and `System.gc()` called from *inside* the synchronized block, so
+  compaction runs while monitors are held. `major=36`. Green on both arms.
+* **The positive control** — the same binary with the Phase 3 mark-word restore
+  deleted, i.e. exactly the bug — is **also green**, `major=36`, exact counts,
+  no failures.
+
+The reason is `MonitorTable` (`vm/src/threading/monitor.rs`): inflated monitors
+are indexed in a sharded `FxHashMap<usize, Arc<Monitor>>` keyed by object
+address, with its own `remap_after_gc`. **The mark word is a cache over that
+table, not the sole owner of the monitor.** Clobbering it loses the fast path;
+`enter` re-finds the monitor through the table and mutual exclusion holds, and
+the `Arc` does not drop because the table holds a reference too.
+
+So the honest severity is lower than §4.3 states — for *inflated* monitors. It
+is not zero: a thin lock's owner/recursion has no side table, and a live object
+left with a stale `FORWARDED` word answers `is_forwarded()` true forever, which
+a young collector would read as "already copied". Keep the snapshot; it costs
+one store per slid object.
+
+**But do not read the green suites as evidence that the fold is safe.** Nothing
+available here can distinguish the fix from its absence. That is the reason to
+put this branch through a real concurrent suite (Spring Boot / Tomcat) before
+landing it, rather than on unit tests and a benchmark.
