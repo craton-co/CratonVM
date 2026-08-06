@@ -1,5 +1,11 @@
 # `ObjectHeader` shrink — what is achievable, what it is worth, and what blocks the rest
 
+> **LANDED 2026-08-06 — `HEADER_SIZE = 24`.** This document planned the shrink;
+> §6 was its handoff list and it was accurate. Two items it did NOT name are
+> recorded in §9 below, both of which would have been silent corruption, and
+> both of which were found by tests rather than by reading. The 16-byte target
+> in §3 remains blocked for exactly the reasons given there.
+
 *Session slug: `header-shrink`. Written against `arch/wave1-integration-20260726` merged at
 `bfddf0fbc73d03c4dbfff9bbc172d09021ad5f8d` (`HEADER_SIZE = 32`, `MARK_WORD_OFFSET = 24`
 confirmed on the merged tree). Scope of edits: `types/src/heap_types.rs`,
@@ -481,3 +487,100 @@ deliberately left alone (§6.7).
   release-compiled-out `debug_assert`. The JIT's unrounded `new_cursor = aligned +
   total_size` continues to agree with `Tlab::alloc_initialized`'s rounded footprint for
   the same reason.
+
+---
+
+## 9. What landing it actually took (2026-08-06)
+
+§6's handoff list was accurate and complete for the *mechanical* surface. Two
+consequences were not on it, and neither is mechanical.
+
+### 9.1 Old-gen compaction SLIDES — the forward destroys lock state before the copy
+
+§4.3 states the ordering contract for a **copying** collector: copy first, then
+clobber the source. `OldGen::compact_region` is not one. It computes forwarding
+addresses in Phase 1, rewrites references in Phase 2, and only slides the
+objects in Phase 3 — so the write that says "forwarded" lands on the source
+*before* the copy that would have carried its mark word to the destination.
+
+Under the fold that destroys, for every live old-gen object: a thin lock's owner
+and recursion count, and — worse — an `INFLATED` word's single strong
+`Arc<Monitor>` reference, leaving the slid survivor with no monitor and the
+`Arc` leaked. Silent, and only observable later as a monitor that has forgotten
+its owner.
+
+Fixed by widening `live_objects` from `(src, size, dest)` to
+`(src, size, dest, saved_mark)`: Phase 1 snapshots the mark word before
+installing the forward, Phase 3 restores it after the copy. The restore also
+*is* the "clear the forwarding slot" step the old code did by nulling the field,
+so the two obligations collapse into one store.
+
+**Any other sliding or in-place-forwarding path added later inherits this.** The
+rule is: if you install a forward on an object you have not yet copied, you owe
+its mark word a snapshot.
+
+### 9.2 G1's forwarding CAS was a zero test, and zero is now a legal state
+
+§4.3 flagged `g1.rs:444` as "the single largest correctness item" and it was
+right, though not quite for the stated reason. The site aliases the forwarding
+slot as an `AtomicUsize` and CASes `0 -> new_addr`, using **zero** as "not
+forwarded".
+
+The mark word's unforwarded value is not zero — it is `NEUTRAL` (which happens
+to be 0), `THIN_LOCKED`, or `INFLATED` (which are not). So a naive port would
+have:
+
+* failed to forward **any locked object**, forever, because the CAS expected 0;
+* and on the evacuation-failure arm, installed a forward *over* an `INFLATED`
+  word — writing a relocation address into bits a monitor pointer occupies.
+
+It is now a tagged CAS against the word observed at entry, with the loser arm
+decoding defensively rather than assuming a lost race means "forwarded". The
+destination's mark word is stored from that same pre-copy snapshot instead of a
+fresh load, so a racing worker's forward cannot be stamped onto the copy.
+
+### 9.3 Two tripwires fired; both were re-derived, not relaxed
+
+* **`disp.rs`** asserted that a legacy object with six fields addresses past
+  127, i.e. that the field accessors can never narrow to disp8. At 24 the sixth
+  field is at 120 and *does* fit. The bound moved to seven fields (136). This is
+  the tripwire working exactly as designed.
+* **The vector gate** proved element-zero 16-byte alignment on a 16-aligned base
+  only because `HEADER_SIZE` was a multiple of 16. At 24 it is not, so element
+  zero is no longer provably 16-aligned. **This costs nothing today** — x86 uses
+  `MOVDQU`, and `PROVEN_OBJECT_ALIGNMENT` is 8 so a 16-aligned base is never
+  actually proven — but a strict-alignment ISA would have to start
+  `HEADER_SIZE % 16` bytes into the array. §5 audited object *alignment* and
+  correctly found it 8 everywhere; it did not consider that the header's own
+  size was carrying a 16-alignment property for the data area. Note it before
+  attempting §3.
+
+### 9.4 Fixtures that restated the layout
+
+§6.5 named one (`jit/tests/intrinsic_arrays_ops.rs`) and it had already been
+converted. Three more were found the hard way:
+
+* `jit/src/x64/tests.rs::fake_object_ref_cell` read `o[4]` with the comment
+  "HEADER_SIZE == 32 == 4 * 8, so the cell is word 4". At 24 it read the wrong
+  word and the assertion compared two unrelated values.
+* `g1.rs::evacuation_failure_self_forwards_does_not_drop` sized its heap fill by
+  a literal object count. At 40 bytes per node the same count fits in ONE of the
+  two regions, so "zero free regions for to-space" quietly became "one free
+  region", and the test then asserted that a **successful** collection freed
+  nothing.
+* `vec_emit`'s expected-byte arrays and `compact_header`'s `bytes_saved`
+  (production code, not a test) baked the header as a constant.
+
+All four are now derived from `cratonvm_types::HEADER_SIZE`.
+
+### 9.5 Measured
+
+`Node{Node,Node}`: **48 -> 40 bytes**, confirmed in the emitted inline TLAB bump
+(`lea rax,[r11+30h]` -> `lea rax,[r11+28h]`). Collection counts on
+`CratonBench bintrees` fall in exactly the size ratio — 18 -> 15 at `-Xmx700m`
+and 12 -> 10 at `-Xmx1g`, both 40/48 — which is an independent confirmation that
+the allocation *rate in bytes* dropped by a sixth. All seven phase checksums
+identical; correct 3/3 at 1g, 700m and 512m on both arms, with moving-young
+relocating every cycle.
+
+5,889 tests pass across the four crates (types 505, gc 979, jit 1964, vm 2441).
