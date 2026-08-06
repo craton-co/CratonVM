@@ -5375,12 +5375,39 @@ fn reloc_emit_enabled() -> bool {
                 self.push_call_exc_patch(exception_patch);
             }
             Op::Return => {
+                let mut returned_a_value = false;
                 if node.inputs.len() > 1 {
                     // Has return value — move to RAX
                     let val_id = node.inputs[1];
                     if val_id != NO_NODE {
                         self.load_to_rax(self.slot_of(val_id));
+                        returned_a_value = true;
                     }
+                }
+                if !returned_a_value {
+                    // Zero RAX on the normal VOID-return path, exactly as the
+                    // single-pass backend's `0xb1` arm has always done.
+                    //
+                    // `i64::MIN` in the return register is this VM's "the callee
+                    // trapped" sentinel, and a void method has no return value —
+                    // so without this, RAX carries whatever the method's last
+                    // operation left there. Every consumer reads that raw
+                    // register: the single-pass inline MIC/PIC cascade's
+                    // `emit_inline_callee_deopt_check`, the megamorphic hashed
+                    // stub's, `jit_invoke_virtual_mic`'s `rc == i64::MIN`, and
+                    // the interpreter's post-JIT drain. A false positive is not
+                    // a wasted branch: `handle_compiled_callee_deopt_sentinel`
+                    // resumes a stashed callee frame and drains the thread's
+                    // entire pending-signal record.
+                    //
+                    // Measured on the Hazelcast XSD failure: one `Config.load()`
+                    // serviced 11 callee "deopts" and EVERY ONE was a void
+                    // callee — `QName.setValues`, `XMLAttributesImpl
+                    // .addAttributeNS`, `ValidatorHandlerImpl.fillXMLAttribute`
+                    // and `.fillXMLAttributes2` — none of which can throw.
+                    //
+                    // XOR EAX, EAX (31 C0) — zero-extends to RAX.
+                    self.buf.emit(&[0x31, 0xC0]);
                 }
                 self.emit_epilogue();
             }
