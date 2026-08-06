@@ -4297,6 +4297,15 @@ fn run() -> Result<()> {
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
+            // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
+            // `suppressed` counts times the memo answered "clean" while a scan
+            // of the same range found a frame — i.e. oops that went unmarked
+            // and a cycle that was never told to avoid moving them.
+            // `shortcircuits` is the denominator: without it a zero cannot be
+            // told apart from an audit that never ran.
+            let sc = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
+            let sup = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED.load(O::Relaxed);
+            eprintln!("[GC] unreg_memo: shortcircuits={sc} SUPPRESSED={sup}");
         }
     }
 

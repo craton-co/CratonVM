@@ -403,6 +403,166 @@ captured while that sweep ran: `root_coverage=complete` / `INCOMPLETE` /
 `any_thread_in_jit()` hint, so zero passes means the scan never looked, which is
 the opposite conclusion from zero unclassified peers.
 
+### The take-over contributes nothing here (2026-08-05)
+
+With the summary made unconditional, every arm reports the same thing:
+
+```text
+[GC] xt_peer_scan: unclassified_peers=0 cycles_with_unclassified=0
+     taken_over=0 xt_roots=0 helper_windows=253 resignals=16
+     classified_after_retry=0 enabled=true
+```
+
+**`taken_over=0` and `xt_roots=0` on 6 of 7 runs measured.** The seventh
+reported `taken_over=1 xt_roots=1298`, so the take-over is not dead — it is
+rare, and when it does fire it contributes a lot. The routine case is that it
+freezes nobody: cross-thread coverage in this workload comes almost entirely
+from the helper-window pass (100-570 windows per run), which handles peers
+blocked in native code with JIT frames below them.
+
+That is consistent with the dose-response above — a deadline on a pass that
+usually classifies nobody has little to act on — and it retires the take-over
+deadline as a factor here. It does NOT say the take-over is useless; a single
+pass contributing 1298 conservative roots is the opposite of useless, and that
+run is a reminder to keep the counter rather than the impression.
+
+It also confirms what the retry does: `resignals=16` with `unclassified=0`,
+against **16** unclassified peers on the pre-retry twin run. Those sixteen were
+converted to definite `STATE_NOT_JIT` answers. (The `classified_after_retry`
+counter read 0 while doing so — it only incremented in the `STATE_PARKED` arm —
+and has been corrected to count every definitive answer that needed a
+re-signal.)
+
+### The unregistered-JIT-frame memo is unsound across a re-descend (2026-08-05)
+
+Found by reading, then given both a fix and a direct measurement.
+
+`scan_active_jit_frames` detects a JIT frame that is live WITHOUT having pushed
+an entry guard — the A5 case — by looking for a JIT return address in the band
+above the registered chain. On a hit it conservatively marks that band and flags
+the cycle non-moving. Miss it and that frame's oops are never marked, so the
+non-moving sweep frees them while it is live: this family's exact face.
+
+The detection is memoized by `UNREG_JIT_VERIFIED_LO`, justified as:
+
+> nothing above our current stack pointer can change while we are nested below it
+
+That statement is true, and it does not support the memo, because **the memo
+outlives the nesting**. `verified_lo` only ever moves deeper. A thread that
+returns above it, enters an already-compiled method — which pushes no guard and
+adds no code range — and descends again will short-circuit the detection over a
+band that was rewritten in between, for the rest of its life. The memo's only
+staleness guard is `jit_code_range_count()`, which changes when a method
+COMPILES, not when one is ENTERED. The sibling cache in the same file
+(`JIT_SCAN_CACHE`) keys on `JIT_BOUNDARY_GEN` for the analogous reason; this one
+never did.
+
+It applies to peers as well as to the collecting thread: the same memo gates the
+per-native-call `update_root_snapshot`, so a parked peer's *published* snapshot
+inherits the stale verdict.
+
+**Fix.** Track the shallowest stack pointer observed since verification. Rising
+to `hiwater` pops every frame below it and leaves everything at or above it
+untouched, so the still-clean floor is `max(verified_lo, hiwater)` and the band
+between is rescanned. A thread that only descends — the perpetually-deepening
+recursion the incremental path was written for — sees `hiwater == verified_lo`
+and behaves exactly as before; a regression test asserts that, and another
+asserts the returning-thread sequence the old rule got wrong (it also pins the
+old rule's wrong answer, so the fix cannot be silently reverted).
+`CRATONVM_JIT_UNREG_MEMO_HIWATER=0` restores the old rule for A/B.
+
+**Measurement.** `CRATONVM_DBG_UNREG_MEMO_AUDIT=1` runs the detection scan even
+when the memo says clean and counts the disagreement, reported unconditionally
+as `[GC] unreg_memo: shortcircuits=N SUPPRESSED=M`. It marks nothing and changes
+no collector decision, so unlike most instruments on this page it cannot perturb
+what it measures. `SUPPRESSED > 0` means the memo hid a real unregistered JIT
+frame. The denominator is printed beside it for the reason this page has now
+learned twice: a zero with no denominator is not a measurement.
+
+### The memo suppresses real detections, measured (2026-08-05)
+
+`CRATONVM_DBG_UNREG_MEMO_AUDIT=1`, one `TestMultiThread` run at `--Xmx 1g`:
+
+```text
+[GC] unreg_memo: shortcircuits=222869 SUPPRESSED=972
+```
+
+The memo answered "no unregistered JIT frame above here" 222,869 times without
+scanning, and in **972** of those a scan of the same range found one. Each is a
+detection that did not happen — so that frame's oops were not conservatively
+marked and the cycle was not forced off the moving path, which is the mechanism
+that leaves a live object unmarked for the non-moving sweep to free.
+
+The denominator is the point of the line. `SUPPRESSED=0` beside
+`shortcircuits=0` means the audit never ran; beside `shortcircuits=222869` it
+would mean the memo is honest. Those must not look alike — see the
+`if peers > 0` mistake above, which is the same error one instrument earlier.
+
+**Measured with the hi-water rule already ON.** So that rule is a real but
+PARTIAL improvement: it can only react to stack-pointer rises it happens to
+observe, and a thread that returns above the verified point and re-descends
+entirely between two root-snapshot calls never presents one. It is not the fix
+and is not claimed as one.
+
+#### The hi-water A/B, and what it does not show
+
+Same binary, same class, same heap, arms run CONCURRENTLY so host load (which
+ranged 20-124 during this session) hits both:
+
+| arm | hi-water | short-circuits | SUPPRESSED |
+|-----|----------|----------------|------------|
+| AU  | ON       | 222 869        | 972        |
+| AU  | ON       | 228 108        | 431        |
+| AU  | ON       | 277 271        | 754        |
+| AU2 | OFF      | 276 145        | 790        |
+
+**No measurable effect on either column.** The ON runs straddle the OFF run on
+both metrics and their own spread (431-972 suppressed, 223 K-277 K
+short-circuits) is wider than any gap to the control.
+
+An intermediate reading of the first two ON samples looked like a ~19% reduction
+in short-circuits; the third sample (277 271, with the rule ON) removed it. Two
+points against one is not a measurement on a host whose load ranged 20-124
+during this session — see the standing note on interleaved A/B here.
+
+The rule is kept anyway, described for what it is: a sound tightening of an
+argument that was plainly wrong as written (`verified_lo` alone claims the
+verdict holds for the life of the thread), with no demonstrated effect on this
+workload. It is **not** credited with fixing anything, and the correctness
+argument rests entirely on the authoritative reset below.
+
+### Two caches, one invalidation hook (2026-08-05) — the load-bearing fix
+
+`conservative_roots.rs` memoizes two different per-native-call scans:
+
+| cache | what it decides | keyed on |
+|-------|-----------------|----------|
+| `JIT_SCAN_CACHE` | the conservative root set | `JIT_BOUNDARY_GEN` |
+| the unregistered-frame memo | whether an unguarded live JIT frame exists above the chain | `jit_code_range_count()` only |
+
+`invalidate_scan_cache_for_gc()` exists because such a cache can be stale by GC
+time. Its own doc states the rule — *"we only need the **authoritative** GC root
+scans to be fresh"* — and it is called from all four authoritative sites:
+`collect_roots`, the safepoint publish, the pre-park publish, and the
+blocked-path deposit. It bumps the boundary generation, which discards the first
+cache and **does nothing to the second**, because the second is keyed on a
+question the hook does not answer.
+
+So the identical soundness gap was diagnosed and closed for one cache and left
+open on the other, forty lines away — and the one left open is the more
+dangerous: a stale root snapshot drops individual references, while a stale
+unregistered-frame verdict drops an entire frame's worth AND leaves the
+collector believing it may relocate.
+
+**Fix:** reset the memo in `invalidate_scan_cache_for_gc` too. Suppression on
+the paths a collector actually consumes becomes impossible by construction,
+because every one of them invalidates first. The cost is one band rescan per GC
+root collection instead of per native call — exactly the trade that function
+already documents, and the reason the memo can stay for its hot purpose.
+`a_reset_memo_demands_a_full_rescan_at_any_depth` pins the property that a reset
+memo asks for a FULL rescan rather than an incremental band over a prefix
+nothing has verified.
+
 ### A marking fail-open found while reading (2026-08-05)
 
 `compact_oop_scan` returns `None` for an object that carries `GC_FLAG_COMPACT`
