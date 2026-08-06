@@ -4418,6 +4418,23 @@ pub(crate) fn drain_spliterator(
     ctx: &mut dyn NativeContext,
     spliterator: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // Ask the policy BEFORE minting, because `alloc_concurrent_synthetic` is
+    // the infallible funnel and would fabricate under `--jdk-only` anyway.
+    // While any one site did that, every other site's refusal was
+    // order-dependent rather than a policy — `probes/StrictIterPrimitivesProbe`
+    // caught the same shape in the iterator family, where
+    // `Arrays.asList(a).iterator()` minted `HashMap$KeyItr` and the next
+    // `try_alloc_synthetic` for that name then found it and succeeded.
+    if ctx
+        .try_ensure_synthetic_class("cratonvm/internal/StreamCollector", 2)
+        .is_err()
+    {
+        return cratonvm_native_collections::drain_spliterator_via_real_iterator(
+            ctx,
+            spliterator,
+            1_000_000,
+        );
+    }
     // Allocate the collector consumer.
     let collector = alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);

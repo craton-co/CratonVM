@@ -2292,6 +2292,16 @@ fn drain_real_spliterator(
     ctx: &mut dyn NativeContext,
     spliterator: cratonvm_types::ObjectRef,
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    // The third of the three `StreamCollector` mints. Ask the policy first for
+    // the same reason as the other two: an infallible fabrication anywhere
+    // makes the refusal everywhere else depend on which path ran first.
+    if ctx.try_ensure_synthetic_class(STREAM_COLLECTOR_CLASS, 2).is_err() {
+        return cratonvm_native_collections::drain_spliterator_via_real_iterator(
+            ctx,
+            spliterator,
+            SAFETY_CAP,
+        );
+    }
     let spl_pin = ctx.pin_native_root(spliterator);
     let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
     let col_pin = ctx.pin_native_root(collector);

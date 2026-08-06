@@ -8388,10 +8388,16 @@ pub fn try_resolve_string_intrinsic(
     // prescribes: it costs throughput (the calls fall back to native
     // dispatch) and costs nothing when the gate is off, which is the default.
     // The real fix is a narrow arm in that emitter, mirroring
-    // `emit_narrow_ref_aload_regs`. This does NOT make `-XX:+UseCompressedOops`
-    // sound on its own - hole 2 (the conservative 8-byte-word rescan in
-    // `gen_heap`'s `mark_young_to_old_refs` / `rewrite_stretch_conservatively`)
-    // is still open, and `enable_for_live_heap` still warns.
+    // `emit_narrow_ref_aload_regs`.
+    //
+    // Hole 2 — the conservative 8-byte-word rescan in `gen_heap`'s
+    // `mark_young_to_old_refs` / `rewrite_stretch_conservatively` — is CLOSED
+    // (2026-08-06): both now go through `for_each_conservative_ref_slot`, which
+    // visits narrow slots at 4 bytes as well. So the two holes that made the
+    // gate unsound are covered: this one by refusal, that one by a fix.
+    // `enable_for_live_heap` still warns, and the default stays off, because
+    // "no known unsoundness" is not the same as "measured sound" — nothing has
+    // yet run a corpus with the gate ON. See gc/src/compressed_oops.rs.
     if cratonvm_types::narrow_oop::narrow_oops_enabled() {
         return None;
     }
