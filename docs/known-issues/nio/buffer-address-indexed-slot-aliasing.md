@@ -85,6 +85,22 @@ a binary that did **not** have the fix and getting `fails=0`:
   is why that half was a live defect (it broke every source file javac read).
   Item 4, the slice/offset half, is live for the same reason.
 
+**`--dump-native-registry` answers "does this registration run?" directly** and
+would have saved the round below. Its `invocations` field is per-registration,
+so it names the *winner* of a duplicate triple, not just the last registrar. On
+a `CBSLICE` run: **522** buffer registrations exist, **12** ever dispatched, and
+every site fixed here is among them —
+
+```
+  1  java/nio/CharBuffer.wrap([C)Ljava/nio/CharBuffer;   by=charset_buffers.rs:874
+  2  java/nio/CharBuffer.flip()Ljava/nio/CharBuffer;     by=charset_buffers.rs:1330
+  1  java/nio/CharBuffer.clear()Ljava/nio/CharBuffer;    by=charset_buffers.rs:1341
+  1  java/nio/CharBuffer.rewind()Ljava/nio/CharBuffer;   by=charset_buffers.rs:1352
+```
+
+while nothing from `native-io`'s nio block appears at all, which is the same
+conclusion as the `cfg` gate above, arrived at by measurement.
+
 **The probe was wrong twice before it measured anything.** `BUFALL.java` took a
 `java.nio.Buffer` parameter, so `b.flip()` compiled to `invokevirtual
 java/nio/Buffer.flip()Ljava/nio/Buffer;` — and the natives are registered on the
