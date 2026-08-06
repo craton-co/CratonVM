@@ -15,15 +15,6 @@ JdkOnlyBreadthProbe/strict/PROBE2
 JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
 JdkOnlyBreadthProbe/strict/serialization
 JdkOnlyPlatformProbe/real/agent
-<<<<<<< HEAD
-JdkOnlyPlatformProbe/real/security
 JdkOnlyPlatformProbe/real/vthreads
 JdkOnlyPlatformProbe/strict/agent
-JdkOnlyPlatformProbe/strict/security
-=======
-JdkOnlyPlatformProbe/real/jni
-JdkOnlyPlatformProbe/real/vthreads
-JdkOnlyPlatformProbe/strict/agent
-JdkOnlyPlatformProbe/strict/jni
->>>>>>> origin/dev
 JdkOnlyPlatformProbe/strict/vthreads
