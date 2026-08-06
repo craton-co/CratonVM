@@ -6405,23 +6405,73 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
     }
 
     let cm = shared.classes.class_manager.read();
-    cm.get_loaded_class_id(class_name)
-        .and_then(|cid| {
-            cm.get_class(cid).and_then(|cls| {
-                if cls.is_synthetic_stub {
-                    None
-                } else {
-                    crate::classloading::find_method_recursive(
-                        cid,
-                        method_name,
-                        descriptor,
-                        &cm.class_store,
-                    )
-                    .map(|(m, _)| !m.is_native() && m.code().is_some())
-                }
-            })
-        })
-        .unwrap_or(false)
+    let (verdict, why) = match cm.get_loaded_class_id(class_name) {
+        None => (false, "class not loaded"),
+        Some(cid) => match cm.get_class(cid) {
+            None => (false, "class id not in the store"),
+            Some(cls) if cls.is_synthetic_stub => (false, "loaded class is itself a synthetic stub"),
+            Some(_) => match crate::classloading::find_method_recursive(
+                cid,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            ) {
+                None => (false, "method not found on the real class or its supers"),
+                Some((m, _)) if m.is_native() => (false, "real method is ACC_NATIVE"),
+                Some((m, _)) if m.is_abstract() => (false, "real method is ACC_ABSTRACT"),
+                Some((m, _)) if m.code().is_none() => (false, "Code attribute NOT YET DECODED"),
+                Some(_) => (true, "real bytecode wins"),
+            },
+        },
+    };
+    if dbg_stub_yield() {
+        eprintln!("[STUB-YIELD] {class_name}.{method_name}{descriptor} yield={verdict} — {why}");
+    }
+    verdict
+}
+
+/// `CRATONVM_DBG_STUB_YIELD` — trace every allow-listed `SyntheticStub`
+/// arbitration and the term that decided it.
+///
+/// A refusal here is silent (the stub simply runs), so "the allow-list says
+/// protect this class, and the census says its stub ran anyway" had no way to
+/// name which of the five terms disagreed — and those five have five different
+/// fixes.
+pub(crate) fn dbg_stub_yield() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_YIELD").is_some())
+}
+
+/// Name the dispatch path that is about to run an allow-listed `SyntheticStub`.
+///
+/// The arbitration answers "yield to real bytecode" every time it is ASKED, and
+/// the census still counts thousands of stub dispatches — so the question is
+/// which path never asks. A per-site tag answers that directly; deducing it
+/// from the publish-site conditions did not, because the conditions that look
+/// decisive on the page (`receiver_has_own_bytecode`, `method.is_native()`)
+/// exclude the very class that keeps dispatching.
+///
+/// Diagnostic only, and gated: on a healthy run this is one atomic load.
+pub(crate) fn note_stub_dispatch_site(
+    shared: &SharedVm,
+    id: cratonvm_native_api::NativeMethodId,
+    site: &'static str,
+) {
+    if !dbg_stub_yield() {
+        return;
+    }
+    let registry = &shared.natives.native_methods;
+    if registry.kind_of_id(id) != Some(cratonvm_native_api::NativeKind::SyntheticStub) {
+        return;
+    }
+    let Some((class_name, method_name, descriptor)) = registry.triple_of(id) else {
+        return;
+    };
+    if !real_protected_stub_class(class_name) {
+        return;
+    }
+    eprintln!("[STUB-DISPATCH] site={site} {class_name}.{method_name}{descriptor}");
 }
 
 
