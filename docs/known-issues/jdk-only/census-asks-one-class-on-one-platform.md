@@ -1,13 +1,14 @@
 # The census asks one class, on one platform — and ~2,000 rows were filed under the wrong verdict
 
-**Status:** OPEN as a *reading* problem; the two instruments that close it now
-exist and ship (`scripts/jdk-only-inherited-decl.sh`,
-`scripts/jdk-only-platform-diff.py`). What is still open is that every
-consumer of `image_declaring_method` — including
-[`scripts/jdk-only-adjudicate.py`](../../../scripts/jdk-only-adjudicate.py)'s
-summary table, L6's ratchet narrative, and three records in this directory —
-was written against the narrower reading. Filed 2026-08-05 while closing the
-L5/L5b/L5c residuals.
+**Status:** the reading is fixed and the instruments ship. `undecl` is broken
+out by `scripts/jdk-only-adjudicate.py --inherited`, the platform question is
+answered by `scripts/jdk-only-platform-diff.py`, and the abstract-interception
+blast radius by `scripts/jdk-only-interception.py`. **What remains OPEN is a
+disposition question, not a measurement one:** 1,612 rows are shadows nobody has
+adjudicated, 11 natives were measured standing in front of an *application*
+class, and 254 registrations are dead on every JDK 25 image. Filed 2026-08-05
+while closing the L5/L5b/L5c residuals; the three follow-ups were closed the
+same day and are recorded under *What the follow-ups measured* below.
 
 **Nothing here is a crash and no native's kind changed.** The defect is in what
 the measurement *means*.
@@ -87,27 +88,95 @@ version (25.0.4+7), only `--java-home` differing:
   wider reading: `NOT-FOUND` in the hierarchy, `ABSENT` on both platforms.
   The L5 record's verdict on them stands.
 
+## What the follow-ups measured
+
+### 1. `jdk-only-adjudicate.py` no longer lets `undecl` read as "dead"
+
+Its header now states that the column is a superset, and
+`--inherited <tsv>` adds a section **2b** that breaks the bucket into
+`INHERITED code` / `INHERITED abstract` / `INHERITED native` / `NOT-FOUND`, and
+lists the 19 rows section 2 counts as unadjudicated and should not. Without
+the flag it prints, in place of the section, a line saying the split was not
+run — an absent measurement announces itself rather than looking clean.
+
+### 2. The abstract-interception blast radius, measured
+
+`--dump-class-origins` rows now carry a **`supertypes`** column (direct
+superclass and interfaces), which is the piece the join was missing: the native
+census names the declaring class, the class census names every class the run
+loaded, and only the supertypes edge connects them.
+`scripts/jdk-only-interception.py` walks it.
+
+On `JdkOnlyCensusLoadProbe` (JDK 25, 2026-08-05) — 705 classes loaded, 1,635
+abstract-target natives, and **11 of them stand in front of a class the
+application defined**:
+
+| native | intercepts |
+|---|---|
+| `java/util/Collection.{isEmpty,iterator,size,toArray}` | `JdkOnlyCensusLoadProbe$MyCollection` |
+| `java/util/Map.{containsKey,entrySet,get,keySet,put,size,values}` | `JdkOnlyCensusLoadProbe$MyMap` |
+
+That is the `register_interface_natives` hazard, reproduced with a named
+example instead of a worry: a user class implements `Map`, and eleven of its
+methods resolve to a VM native written for `java.util`'s own implementations.
+`invocations` is 0 for all eleven in this run — the probe builds the classes
+but does not exercise every method — which is exactly why the surface matters
+more than a receiver log.
+
+**What it measures:** the interception *surface* — every loaded class that
+inherits the intercepted method. Not a per-invocation receiver log. The VM's
+dispatch sites do not uniformly hold the receiver, and threading one through
+them would put work on the hottest path in the interpreter to buy a narrower
+answer: the surface is what the registration *can* capture, and it does not
+depend on whether this workload happened to call it.
+
+### 3. "Dead on both images" was six times smaller than the count suggested
+
+The 1,735 figure is **not** a deletion list, and this record said it was. Split
+by namespace (`scripts/jdk-only-platform-diff.py` now prints this):
+
+* **254** are in a JDK namespace (`java.`, `javax.`, `jdk.`, `sun.`,
+  `com.sun.`) — names that should be in the image and are in neither. Those are
+  the deletion candidates. Concentrated in `plain_socket.rs` (34),
+  `atomic_updater.rs` (32), `nio_native.rs` (28), `native-collections` (21),
+  `shared_secrets_bridge.rs` (18), `watch.rs` (18).
+* **1,481** are third-party or VM-minted names — `org.springframework.`,
+  `io.netty.`, `groovy.`, `cratonvm/synthetic/…`. They are absent from a JDK
+  image *by construction* and live whenever the application supplies them.
+  Deleting one because a JDK census called it `ABSENT` would remove a working
+  native.
+
+And the 254 carry their own caveat, which the tool now prints: **a registration
+dead on JDK 25 may be the live one on JDK 21.** The diff sees one version. A
+deletion wave has to sweep the versions the project supports first.
+
 ## What is still open
 
-1. **`scripts/jdk-only-adjudicate.py`'s section 2 labels the bucket "class
-   present, method not declared" and its consumers gloss that as "dead".** The
-   script is L6's file and is not changed here beyond a pointer at the new
-   tool; the honest fix is a fourth column.
-2. **L6's ratchet counts `has_code` on the named class only.** By the wider
-   reading the true shadow population is 4,696 + 1,612 = **6,308**, not 4,696.
-   The ratchet's *number* is well defined and unmoved — do not re-baseline it —
-   but any prose that calls 4,696 "the shadows" understates by a third.
-3. **308 inherited-abstract rows** are the `register_interface_natives` hazard
-   in a second place: a native on a method that is abstract on a supertype
-   intercepts every implementor, including user subclasses. Nothing has counted
-   which of them are dispatched against a user class.
-4. **1,735 rows dead on both platforms.** That is a deletion list, and deleting
-   is a different wave than stating.
+1. **L6's ratchet counts `has_code` on the named class only.** By the wider
+   reading the true shadow population is 4,693 + 1,612 = **6,305**. The
+   ratchet's *number* is well defined — it is a frozen count of a precisely
+   named thing, and it is what the gate should keep measuring — but prose that
+   calls it "the shadows" understates by a third.
+2. **1,612 inherited shadows have no disposition.** Measured now, adjudicated
+   by nobody. Contract §1.4 lets a `Bridge` lose to concrete bytecode, so none
+   of them is wrong *today*; each is a registration standing in front of real
+   Java that someone should either justify or delete.
+3. **The 11 natives that intercept an application class.** The measurement
+   exists; the decision does not. `java.util.Map`/`Collection` natives
+   intercepting a user implementor is the `register_interface_natives` verdict
+   this directory has been deferring since the ambient-category audit.
+4. **The 254 JDK-namespace dead registrations**, pending a multi-version sweep.
+5. **A workload broader than one probe.** Every interception set above is as
+   wide as what `JdkOnlyCensusLoadProbe` loaded — 705 classes. Take the same
+   three artefacts from H2 or Spring Boot and the user-implementor list will
+   grow; an empty set means "nothing loaded under it here", never "nothing
+   can".
 
 ## Reproducing
 
 ```sh
-# the census (both instruments consume it)
+# the census (all three instruments consume it; add --dump-class-origins for
+# the interception join)
 cratonvm --real-jdk --java-home "$JAVA_HOME" --explain-jdk-only \
     --dump-native-registry census.json -cp probes L5rProbe
 
@@ -118,6 +187,13 @@ JAVA_HOME=<same image> sh scripts/jdk-only-inherited-decl.sh census.json
 cratonvm --real-jdk --java-home <windows-jdk> --explain-jdk-only \
     --dump-native-registry census-win.json -cp probes L5rProbe
 python3 scripts/jdk-only-platform-diff.py census.json census-win.json linux windows
+
+# 3. abstract-method interception, including application classes
+python3 scripts/jdk-only-interception.py --registry census.json \
+    --classes classes.json --inherited undecl-out.tsv --only-user
+
+# and the adjudication table with the bucket broken out
+python3 scripts/jdk-only-adjudicate.py census.json --inherited undecl-out.tsv
 ```
 
 Both refuse rather than print zeroes when the census lacks

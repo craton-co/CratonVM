@@ -59,10 +59,10 @@ CratonVM-specific.
 No existing doc found for `WeakConcurrentMap.put` NPE,
 `InlineDelegateByteBuddyMockMaker.doCreateMock` NPE, `TypeCache.findOrInsert`
 NPE, or `LazyProjection.resolve()`-returns-null (searched `docs/known-issues/`
-and `docs/internal/` by symptom). The closest prior docs
-(`docs/internal/mockito-redefine-makes-every-call-40us-20260726.md`,
-`docs/internal/fixed-suite-bugs/springboot/otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang-FIXED.md`,
-`docs/internal/fixed-suite-bugs/springboot/jta-testdatabase-mockito-cold-selfattach-mockmethodadvice-FIXED.md`)
+and the internal record tree by symptom). The closest prior docs
+(`mockito-redefine-makes-every-call-40us-20260726.md`,
+`fixed-suite-bugs/springboot/otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang-FIXED.md`,
+`fixed-suite-bugs/springboot/jta-testdatabase-mockito-cold-selfattach-mockmethodadvice-FIXED.md`)
 cover a Mockito self-attach *performance* regression, a *hang*, and a cold
 *classloading* NPE respectively — none describe these three NPE shapes.
 

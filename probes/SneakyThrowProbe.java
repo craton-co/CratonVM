@@ -1,6 +1,6 @@
 // Minimal, Hibernate-free repro for the "compiled `checkcast erased-T; athrow`
 // fails to throw" defect documented in
-// docs/known-issues/hibernate/offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804.md
+// fixed-suite-bugs/hibernate/offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md
 //
 // `throwAs` is the JUnit Platform `ExceptionUtils` sneaky-throw shape: a
 // `void`-returning method whose entire body is `checkcast <erased-to-Throwable>`

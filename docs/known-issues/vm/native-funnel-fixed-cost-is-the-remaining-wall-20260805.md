@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | OPEN — measured, bounded, and never profiled |
 | **Severity** | high — it is the last large term on `java.util.concurrent`, and it is per-call on every native the VM has |
-| **Opened** | 2026-08-05, closing [`uncontended-reentrantlock-pair-mostly-unattributed`](../../internal/uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md) |
+| **Opened** | 2026-08-05, closing `uncontended-reentrantlock-pair-mostly-unattributed` (`uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md`) |
 | **Inherits** | `TestAsyncMessagesPerformance.testAsyncTiming`, and the `SmokeTests` concurrency ceiling as a suspected relative |
 
 ## What is left, and why it is the funnel
@@ -77,7 +77,7 @@ plausible and none has been weighed.
 ## Do not re-run these
 
 Ruled out and measured — see
-`docs/internal/aqs-thread-handoff-latency-RETIRED-20260805.md`:
+`aqs-thread-handoff-latency-RETIRED-20260805.md`:
 
 * the AQS pre-park spin (the uncontended path never spins)
 * "16 nested Java calls at a per-call floor" (a Java call is 7.9 ns; 16 is ~130 ns)
