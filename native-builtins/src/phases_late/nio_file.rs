@@ -5362,6 +5362,42 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `FileSystemProvider.readAttributes(Path, String, LinkOption...)` — the
+    // name-keyed sibling of the `Class`-keyed form above.
+    //
+    // In the real JDK this is implemented on `sun.nio.fs.AbstractFileSystemProvider`
+    // and every concrete provider inherits it; `java.nio.file.spi.FileSystemProvider`
+    // itself only declares it, abstract. CratonVM's default-filesystem provider
+    // object is stamped with that abstract class (`FileSystems.getDefault()
+    // .provider()` reports a concrete name only through `getClass()` display
+    // remapping), so real-JDK bytecode calling this method resolved the abstract
+    // declaration and died with
+    // `AbstractMethodError: ... readAttributes ... has no Code attribute`.
+    //
+    // That is not a corner: `Files.readAttributes(path, "basic:*")`,
+    // `Files.getAttribute`, and everything layered on them route here. It is
+    // also why `com.sun.tools.attach.VirtualMachine.list()` threw
+    // `InternalError` — jvmstat's `PlatformSupportImpl` reads `unix:dev` on the
+    // temp directory during container detection, and the `AbstractMethodError`
+    // came back out wrapped two deep.
+    //
+    // Args: `[this, path, attributes, options]`.
+    r.register(
+        fsp,
+        "readAttributes",
+        "(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/nio/file/LinkOption;)Ljava/util/Map;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let spec = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let nofollow =
+                matches!(args.get(3), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
+            read_named_attributes(ctx, path_obj, &spec, nofollow)
+        },
+    );
+
     r.register(
         fsp,
         "newDirectoryStream",
@@ -15235,6 +15271,472 @@ fn windows_supports_file_attributes_type(class_name: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Name-keyed attribute reads — `readAttributes(path, "view:attrs", options)`
+// ---------------------------------------------------------------------------
+
+/// Split a `"view:attrs"` attribute spec. No colon means the `basic` view,
+/// exactly as `java.nio.file.Files` does it.
+pub(crate) fn split_attribute_spec(spec: &str) -> (&str, &str) {
+    match spec.find(':') {
+        Some(i) => (&spec[..i], &spec[i + 1..]),
+        None => ("basic", spec),
+    }
+}
+
+/// The attribute names a given view answers, in the JDK's own vocabulary.
+///
+/// Kept as one table rather than spread across the reader below so the `*`
+/// expansion and the per-name lookup can never disagree about what a view
+/// contains — a mismatch there is exactly how "`*` returned it but asking for
+/// it by name threw" bugs happen.
+fn attribute_names_for_view(view: &str) -> Option<&'static [&'static str]> {
+    const BASIC: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "size",
+        "isRegularFile",
+        "isDirectory",
+        "isSymbolicLink",
+        "isOther",
+        "fileKey",
+    ];
+    const POSIX: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "size",
+        "isRegularFile",
+        "isDirectory",
+        "isSymbolicLink",
+        "isOther",
+        "fileKey",
+        "permissions",
+        "owner",
+        "group",
+    ];
+    const UNIX: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "size",
+        "isRegularFile",
+        "isDirectory",
+        "isSymbolicLink",
+        "isOther",
+        "fileKey",
+        "permissions",
+        "owner",
+        "group",
+        "mode",
+        "ino",
+        "dev",
+        "rdev",
+        "nlink",
+        "uid",
+        "gid",
+        "ctime",
+    ];
+    const DOS: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "size",
+        "isRegularFile",
+        "isDirectory",
+        "isSymbolicLink",
+        "isOther",
+        "fileKey",
+        "readonly",
+        "hidden",
+        "archive",
+        "system",
+    ];
+    const OWNER: &[&str] = &["owner"];
+    match view {
+        "basic" => Some(BASIC),
+        "posix" => Some(POSIX),
+        "unix" => Some(UNIX),
+        "dos" => Some(DOS),
+        "owner" => Some(OWNER),
+        _ => None,
+    }
+}
+
+/// Everything one `stat` tells us, in the shapes the attribute names want.
+struct StatFacts {
+    is_dir: bool,
+    is_regular: bool,
+    is_symlink: bool,
+    size: i64,
+    modified_millis: i64,
+    access_millis: i64,
+    creation_millis: i64,
+    mode: i32,
+    nlink: i32,
+    uid: i32,
+    gid: i32,
+    dev: i64,
+    ino: i64,
+    rdev: i64,
+    ctime_millis: i64,
+    readonly: bool,
+    hidden: bool,
+}
+
+fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
+    let meta = if nofollow {
+        std::fs::symlink_metadata(path)?
+    } else {
+        std::fs::metadata(path)?
+    };
+    let ft = meta.file_type();
+    #[allow(unused_mut)]
+    let mut facts = StatFacts {
+        is_dir: meta.is_dir(),
+        is_regular: meta.is_file(),
+        is_symlink: ft.is_symlink(),
+        size: meta.len() as i64,
+        modified_millis: meta.modified().ok().map(system_time_to_millis).unwrap_or(0),
+        access_millis: meta.accessed().ok().map(system_time_to_millis).unwrap_or(0),
+        creation_millis: meta.created().ok().map(system_time_to_millis).unwrap_or(0),
+        mode: 0,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        dev: 0,
+        ino: 0,
+        rdev: 0,
+        ctime_millis: 0,
+        readonly: meta.permissions().readonly(),
+        // `isOther`/`hidden` are the two the JDK derives rather than stats.
+        hidden: std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.')),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        facts.mode = meta.mode() as i32;
+        facts.nlink = meta.nlink() as i32;
+        facts.uid = meta.uid() as i32;
+        facts.gid = meta.gid() as i32;
+        facts.dev = meta.dev() as i64;
+        facts.ino = meta.ino() as i64;
+        facts.rdev = meta.rdev() as i64;
+        facts.ctime_millis = meta
+            .ctime()
+            .saturating_mul(1000)
+            .saturating_add(meta.ctime_nsec() / 1_000_000);
+    }
+    Ok(facts)
+}
+
+/// `Set<PosixFilePermission>` for a Unix mode word, built from the enum's own
+/// nine singleton constants so it compares equal to anything the JDK produced.
+fn posix_permission_set(ctx: &mut dyn NativeContext, mode: i32) -> Option<ObjectRef> {
+    const NAMES: [&str; 9] = [
+        "OWNER_READ",
+        "OWNER_WRITE",
+        "OWNER_EXECUTE",
+        "GROUP_READ",
+        "GROUP_WRITE",
+        "GROUP_EXECUTE",
+        "OTHERS_READ",
+        "OTHERS_WRITE",
+        "OTHERS_EXECUTE",
+    ];
+    const BITS: [i32; 9] = [
+        0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+    ];
+    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return None,
+    };
+    let set_pin = ctx.pin_native_root(set);
+    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let _ = ctx.ensure_class_initialized(pfp);
+    let cid = ctx.class_id_by_name(pfp);
+    for i in 0..9 {
+        if mode & BITS[i] == 0 {
+            continue;
+        }
+        let Some(c) = cid else { break };
+        let Some(slot) = ctx.static_field_index_by_name(c, NAMES[i]) else {
+            continue;
+        };
+        let constant = ctx.get_static_field(c, slot);
+        if !matches!(constant, Value::Object(Some(_))) {
+            continue;
+        }
+        let set = ctx.read_native_pin(set_pin, set);
+        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[constant]);
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
+    Some(set)
+}
+
+/// Read `path`'s attributes named by `spec` into a `java.util.HashMap`.
+///
+/// This is the whole of `Files.readAttributes(Path, String, LinkOption...)`,
+/// `Files.getAttribute` and `FileSystemProvider.readAttributes(Path, String,
+/// LinkOption...)`. It follows the JDK's error contract rather than degrading:
+/// an unknown view is `UnsupportedOperationException`, an unknown attribute name
+/// is `IllegalArgumentException`, and a missing file is `NoSuchFileException`.
+/// An empty map is never a valid answer here — the previous implementation
+/// returned one for every call, and every caller reads the map with `get`, so
+/// the failure surfaced as a `null` attribute arbitrarily far away.
+pub(crate) fn read_named_attributes(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    spec: &str,
+    nofollow: bool,
+) -> MethodCallResult {
+    let (view, requested) = split_attribute_spec(spec);
+    let Some(known) = attribute_names_for_view(view) else {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    };
+    if !supported_attribute_view_names().contains(&view) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    }
+    if requested.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{spec}' not recognized"),
+        }
+        .into());
+    }
+    let wildcard = requested == "*";
+    let names: Vec<&str> = if wildcard {
+        known.to_vec()
+    } else {
+        let mut out = Vec::new();
+        for name in requested.split(',') {
+            let name = name.trim();
+            if !known.iter().any(|k| *k == name) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("'{view}:{name}' not recognized"),
+                }
+                .into());
+            }
+            out.push(name);
+        }
+        out
+    };
+
+    let path = p57_read_path(ctx, path_obj);
+    let facts = match stat_facts(&path, nofollow) {
+        Ok(f) => f,
+        Err(_) => return Err(p57_no_such_file(ctx, &path)),
+    };
+
+    let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        // The class library could not give us a Map. Refuse rather than hand
+        // back a shape the caller will silently read `null` out of.
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: format!("readAttributes({spec}): could not allocate the result map"),
+            }
+            .into())
+        }
+    };
+    let map_pin = ctx.pin_native_root(map);
+
+    // `owner`/`group` come from the attribute object the rest of this file
+    // already builds, so principals stay one implementation.
+    let mut owner_group: Option<ObjectRef> = None;
+    if names.iter().any(|n| *n == "owner" || *n == "group") {
+        if let Ok(Some(Value::Object(Some(attrs)))) =
+            p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj))])
+        {
+            owner_group = Some(attrs);
+        }
+    }
+    let attrs_pin = owner_group.map(|a| ctx.pin_native_root(a));
+
+    for name in names {
+        // The key is built and pinned BEFORE the value, and nothing between the
+        // value and the `put` allocates. The other order — value, then
+        // `create_string(name)` — holds a fresh, unrooted attribute object
+        // across an allocation, which is the native stale-local family: a young
+        // collection there relocates it and the map gets a dangling entry.
+        let key = ctx.create_string(name);
+        let key_pin = ctx.pin_native_root(key);
+        let value: Value = match name {
+            "lastModifiedTime" => Value::Object(Some(filetime_alloc(ctx, facts.modified_millis))),
+            "lastAccessTime" => Value::Object(Some(filetime_alloc(ctx, facts.access_millis))),
+            "creationTime" => Value::Object(Some(filetime_alloc(ctx, facts.creation_millis))),
+            "ctime" => Value::Object(Some(filetime_alloc(ctx, facts.ctime_millis))),
+            "size" => box_long(ctx, facts.size),
+            "isRegularFile" => box_boolean(ctx, facts.is_regular),
+            "isDirectory" => box_boolean(ctx, facts.is_dir),
+            "isSymbolicLink" => box_boolean(ctx, facts.is_symlink),
+            "isOther" => box_boolean(ctx, !facts.is_regular && !facts.is_dir && !facts.is_symlink),
+            // The JDK's Unix fileKey is `(dev, ino)`. We have both; render them
+            // as the same `String` the JDK's `UnixFileKey.toString` produces so
+            // two reads of the same file compare equal.
+            "fileKey" => {
+                if facts.dev == 0 && facts.ino == 0 {
+                    Value::Object(None)
+                } else {
+                    let s = ctx
+                        .create_string(&format!("(dev={:x},ino={})", facts.dev as u64, facts.ino));
+                    Value::Object(Some(s))
+                }
+            }
+            "mode" => box_int(ctx, facts.mode),
+            "nlink" => box_int(ctx, facts.nlink),
+            "uid" => box_int(ctx, facts.uid),
+            "gid" => box_int(ctx, facts.gid),
+            "dev" => box_long(ctx, facts.dev),
+            "ino" => box_long(ctx, facts.ino),
+            "rdev" => box_long(ctx, facts.rdev),
+            "readonly" => box_boolean(ctx, facts.readonly),
+            "hidden" => box_boolean(ctx, facts.hidden),
+            // DOS-only flags with no Unix counterpart. `false` is what the JDK
+            // reports for them on a non-DOS filesystem.
+            "archive" | "system" => box_boolean(ctx, false),
+            "permissions" => match posix_permission_set(ctx, facts.mode) {
+                Some(set) => Value::Object(Some(set)),
+                None => continue,
+            },
+            "owner" | "group" => {
+                let Some((attrs, pin)) = owner_group.zip(attrs_pin) else {
+                    continue;
+                };
+                let attrs = ctx.read_native_pin(pin, attrs);
+                let (method, desc) = if name == "owner" {
+                    ("owner", "()Ljava/nio/file/attribute/UserPrincipal;")
+                } else {
+                    ("group", "()Ljava/nio/file/attribute/GroupPrincipal;")
+                };
+                match ctx.invoke_virtual(attrs, method, desc, &[]) {
+                    Ok(Some(v @ Value::Object(Some(_)))) => v,
+                    // Not answerable on this platform/path. Omitting it from a
+                    // `*` read matches what the JDK does for a view it cannot
+                    // fully serve; an explicit request says so out loud.
+                    _ if wildcard => continue,
+                    _ => {
+                        ctx.unpin_native_roots(map_pin);
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!("'{view}:{name}' is not available for {path}"),
+                        }
+                        .into());
+                    }
+                }
+            }
+            _ => continue,
+        };
+        let key = ctx.read_native_pin(key_pin, key);
+        let map = ctx.read_native_pin(map_pin, map);
+        let put = ctx.invoke_virtual(
+            map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key)), value],
+        );
+        if let Err(e) = put {
+            // Release the pin frame before unwinding: `?` here would leave the
+            // map (and the attribute object) pinned for the rest of the VM's
+            // life.
+            ctx.unpin_native_roots(map_pin);
+            return Err(e);
+        }
+    }
+
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.unpin_native_roots(map_pin);
+    Ok(Some(Value::Object(Some(map))))
+}
+
+#[cfg(test)]
+mod named_attribute_tests {
+    use super::{attribute_names_for_view, split_attribute_spec, supported_attribute_view_names};
+
+    /// `Files` treats a spec with no colon as the `basic` view. Getting this
+    /// wrong turns `readAttributes(p, "size")` into a request for a view named
+    /// `size`.
+    #[test]
+    fn a_spec_without_a_colon_is_the_basic_view() {
+        assert_eq!(split_attribute_spec("size"), ("basic", "size"));
+        assert_eq!(split_attribute_spec("*"), ("basic", "*"));
+        assert_eq!(split_attribute_spec("unix:dev"), ("unix", "dev"));
+        assert_eq!(split_attribute_spec("posix:*"), ("posix", "*"));
+        // Only the FIRST colon splits; the JDK's own rule.
+        assert_eq!(split_attribute_spec("unix:a:b"), ("unix", "a:b"));
+    }
+
+    /// Every view this VM advertises through `supportedFileAttributeViews()`
+    /// must have a name table, or `readAttributes` answers
+    /// `UnsupportedOperationException` for a view the same VM just claimed to
+    /// support. `user` is the documented exception: it is the extended-attribute
+    /// view, which has no fixed attribute names at all.
+    #[test]
+    fn every_advertised_view_except_user_has_a_name_table() {
+        for view in supported_attribute_view_names() {
+            if *view == "user" || *view == "acl" {
+                continue;
+            }
+            assert!(
+                attribute_names_for_view(view).is_some(),
+                "view `{view}` is advertised by supportedFileAttributeViews() but \
+                 readAttributes has no name table for it"
+            );
+        }
+    }
+
+    /// A wider view must be a superset of `basic`: the JDK's `PosixFileAttributes`
+    /// and `UnixFileAttributes` extend `BasicFileAttributes`, so
+    /// `readAttributes(p, "unix:*")` returning fewer keys than
+    /// `readAttributes(p, "basic:*")` would be a silent regression for every
+    /// caller that widened its view to get one extra field.
+    #[test]
+    fn posix_unix_and_dos_all_contain_the_basic_names() {
+        let basic = attribute_names_for_view("basic").expect("basic");
+        for view in ["posix", "unix", "dos"] {
+            let names = attribute_names_for_view(view).expect(view);
+            for b in basic {
+                assert!(
+                    names.contains(b),
+                    "view `{view}` is missing basic attribute `{b}`"
+                );
+            }
+        }
+    }
+
+    /// The `unix` view is the one `sun.jvmstat.PlatformSupportImpl` reads during
+    /// container detection, and that read is what made
+    /// `com.sun.tools.attach.VirtualMachine.list()` throw `InternalError`.
+    #[test]
+    fn the_unix_view_carries_the_stat_fields_jvmstat_asks_for() {
+        let unix = attribute_names_for_view("unix").expect("unix");
+        for name in ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "ctime"] {
+            assert!(unix.contains(&name), "unix view is missing `{name}`");
+        }
+    }
+}
+
+fn box_long(ctx: &mut dyn NativeContext, v: i64) -> Value {
+    crate::lang_class::box_value(ctx, Value::Long(v), "J")
+}
+
+fn box_int(ctx: &mut dyn NativeContext, v: i32) -> Value {
+    crate::lang_class::box_value(ctx, Value::Int(v), "I")
+}
+
+fn box_boolean(ctx: &mut dyn NativeContext, v: bool) -> Value {
+    crate::lang_class::box_value(ctx, Value::Int(i32::from(v)), "Z")
+}
+
 pub(crate) fn p59_files_read_attributes(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17382,22 +17884,76 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(bytes.len() as i64)))
         },
     );
+    // `Files.readAttributes(path, "view:attrs", options)` — the name-keyed form.
+    //
+    // This used to hand back an EMPTY HashMap for every call, which is the
+    // shape of answer that is worse than an exception: the contract is that a
+    // requested attribute is present or the call throws
+    // (`IllegalArgumentException` for an unknown name,
+    // `UnsupportedOperationException` for an unknown view), so every caller
+    // dereferences `map.get(name)` unconditionally and got `null`.
+    // `Files.getAttribute` is a thin wrapper over exactly this and returned
+    // null for every attribute of every file.
+    //
+    // Args (static): `[path, attributes, options]`.
     r.register(
         f,
         "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/nio/file/LinkOption;)Ljava/util/Map;",
-        |ctx, _args| {
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            // Pin across the buckets alloc below — a moving young GC there
-            // would relocate the fresh map (native stale-local family).
-            let map_pin = ctx.pin_native_root(map);
-            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            let map = ctx.read_native_pin(map_pin, map);
-            ctx.set_field(map, 0, Value::Object(Some(buckets)));
-            ctx.set_field(map, 1, Value::Int(0));
-            ctx.set_field(map, 2, Value::Int(16));
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let spec = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let nofollow =
+                matches!(args.get(2), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
+            read_named_attributes(ctx, path_obj, &spec, nofollow)
+        },
+    );
+    // `Files.getAttribute(path, "view:name", options)` — one attribute, by name.
+    //
+    // The real body is `readAttributes(path, name, options).get(name)`; register
+    // it explicitly so synthetic-JDK mode (where there is no `Files` bytecode to
+    // run) answers the same as real-JDK mode rather than falling through to a
+    // missing method.
+    r.register(
+        f,
+        "getAttribute",
+        "(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/nio/file/LinkOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let spec = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let nofollow =
+                matches!(args.get(2), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
+            let (_, attr) = split_attribute_spec(&spec);
+            // `getAttribute` takes a SINGLE name; `*` and comma lists are only
+            // legal in `readAttributes`.
+            if attr == "*" || attr.contains(',') {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("'{spec}' not recognized"),
+                }
+                .into());
+            }
+            let map = read_named_attributes(ctx, path_obj, &spec, nofollow)?;
+            let map_obj = match map {
+                Some(Value::Object(Some(m))) => m,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let map_pin = ctx.pin_native_root(map_obj);
+            let key = ctx.create_string(attr);
+            let map_obj = ctx.read_native_pin(map_pin, map_obj);
+            let got = ctx.invoke_virtual(
+                map_obj,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key))],
+            );
             ctx.unpin_native_roots(map_pin);
-            Ok(Some(Value::Object(Some(map))))
+            Ok(Some(got?.unwrap_or(Value::Object(None))))
         },
     );
     // Was null. `Files.getFileStore` never returns null in the real JDK, so

@@ -9381,6 +9381,130 @@ fn test_inline_tlab_new_falls_through_on_null_thread() {
     );
 }
 
+/// The allocation spill sink splits ONE 14-store blind spill across two
+/// program points: the registers the inline-TLAB fast path clobbers stay at
+/// the safepoint, the rest move to the allocation's slow-path label. The two
+/// halves are selected by complementary predicates over the same table, so a
+/// register can only be lost if `ALLOC_FAST_PATH_CLOBBERS` names something
+/// `ALL_SPILL_GPRS` does not contain — and a lost register is not a slow
+/// benchmark, it is a live oop the conservative root scan never sees.
+#[test]
+fn alloc_spill_sink_partitions_the_gpr_file_exactly_once() {
+    let hot: Vec<u8> = ALL_SPILL_GPRS
+        .iter()
+        .copied()
+        .filter(|r| ALLOC_FAST_PATH_CLOBBERS.contains(r))
+        .collect();
+    let sunk: Vec<u8> = ALL_SPILL_GPRS
+        .iter()
+        .copied()
+        .filter(|r| !ALLOC_FAST_PATH_CLOBBERS.contains(r))
+        .collect();
+    // Every clobbered register must be IN the spilled file, or the hot half
+    // silently drops it and the sunk half captures a post-clobber value.
+    for r in ALLOC_FAST_PATH_CLOBBERS {
+        assert!(
+            ALL_SPILL_GPRS.contains(&r),
+            "fast-path clobber {r} is not in ALL_SPILL_GPRS"
+        );
+    }
+    assert_eq!(hot.len(), ALLOC_FAST_PATH_CLOBBERS.len(), "hot half");
+    assert_eq!(
+        hot.len() + sunk.len(),
+        ALL_SPILL_GPRS.len(),
+        "the halves must cover the file"
+    );
+    let mut union: Vec<u8> = hot.iter().chain(sunk.iter()).copied().collect();
+    union.sort_unstable();
+    let mut expected = ALL_SPILL_GPRS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(union, expected, "partition must be exact — no gap, no overlap");
+}
+
+/// Sink form of the inline-TLAB preamble: it drops the `get_current_thread`
+/// fallback CALL (whose caller-saved clobbers would invalidate the eleven
+/// registers spilled later at the slow-path label) and treats a null cached
+/// thread slot as a divert to `new_object`. This is the same end state the
+/// fallback produced — it too fell through to the slow path once the helper
+/// returned null — so the observable behaviour must be unchanged.
+///
+/// `test_inline_tlab_new_falls_through_on_null_thread` covers the un-sunk arm
+/// with `(has_prim_init, has_finalizer) = (true, true)`; this one flips both to
+/// false so `skip_helper` holds and the site actually requests the sink.
+#[test]
+fn alloc_spill_sink_still_diverts_to_the_helper_on_a_null_thread() {
+    // SAFETY: extern "C" test stub with no arguments and no dereferences; it only
+    // returns a null pointer, so there are no preconditions for the caller to uphold.
+    unsafe extern "C" fn null_thread() -> *mut std::ffi::c_void {
+        std::ptr::null_mut()
+    }
+    // SAFETY: extern "C" test stub; ignores all i64 arguments and dereferences nothing,
+    // returning a fixed sentinel value, so it cannot violate memory safety.
+    unsafe extern "C" fn fake_new_object(_vm: i64, _cid: i64, _nf: i64) -> i64 {
+        0x51DE_5152i64
+    }
+    // SAFETY: extern "C" test stub that immediately panics; it touches no arguments
+    // and performs no memory access, so it imposes no safety obligations on callers.
+    unsafe extern "C" fn unreachable_post_init(_vm: i64, _o: i64, _c: i64, _n: i64) -> i64 {
+        panic!("skip_post_init_helper is set — the helper must not be emitted");
+    }
+
+    let mut helpers = test_helpers();
+    // Cast: fn pointer to usize helper address
+    helpers.get_current_thread = null_thread as *const () as usize;
+    // Cast: fn pointer to usize helper address
+    helpers.tlab_post_init = unreachable_post_init as *const () as usize;
+    // Cast: fn pointer to usize helper address
+    helpers.new_object = fake_new_object as *const () as usize;
+    helpers.tlab_cursor_offset_in_thread = 0;
+    helpers.tlab_end_offset_in_thread = 8;
+
+    // new #1; astore_1; aload_1; areturn (cls=42, 3 fields).
+    let code: Vec<u8> = vec![0xbb, 0x00, 0x01, 0x4c, 0x2b, 0xb0, 0, 0];
+    // (pc, class_id, num_fields, has_prim_init, has_finalizer) — both false, so
+    // `skip_helper` holds and the `new` arm raises `sink_alloc_blind_spill`.
+    let new_info: Vec<(usize, u32, usize, bool, bool)> = vec![(0, 42, 3, false, false)];
+
+    let compiled = compile(
+        &code,
+        6,
+        0,
+        2,
+        true,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        new_info,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots — no PIC sites in this stub
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("sink-form inline-TLAB new should compile");
+
+    // SAFETY: Calling JIT-compiled machine code with a sentinel VM pointer.
+    // The fake_new_object stub does not touch the pointer.
+    let result = unsafe {
+        compiled
+            .try_call_with_context(0xCAFE_F00D, &[])
+            .expect("test JIT call")
+    };
+    assert_eq!(
+        result, 0x51DE_5152i64,
+        "a null cached thread must still reach new_object under the spill sink"
+    );
+}
+
 #[cfg(feature = "vm-tests")]
 #[test]
 fn test_jit_new_object_codegen() {

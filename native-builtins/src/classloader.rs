@@ -4584,7 +4584,7 @@ pub fn cl_get_resource_essential(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// `NoSuchMethodError java/lang/String.findResource` and broke every
 /// `getSystemResource` caller (kafka-codec / hadoop-conf / hbase-conf
 /// regression-pool probes).
-fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+pub(crate) fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let mut cur = ctx.class_id_of_object(obj);
     for _ in 0..64 {
         match ctx.class_name_of_id(cur) {

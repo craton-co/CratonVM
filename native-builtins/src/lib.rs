@@ -15705,20 +15705,20 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        // Same encapsulation gate the typed `setAccessible` natives apply --
-        // this shorthand variant must not become a way around it.
-        if flag != 0 {
-            if let Err(msg) =
-                lang_class::check_class_loader_define_class_is_encapsulated(ctx, this)
-            {
-                return Err(
-                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                        message: msg,
-                    }
-                    .into(),
-                );
-            }
-        }
+        // The full JEP 403 gate, not just the `ClassLoader.defineClass` edge.
+        //
+        // This registration is the LAST writer for
+        // `{Field,Method,Constructor,AccessibleObject}.setAccessible(Z)V` in
+        // `register_essential_natives_with_shims`, and the registry is
+        // last-writer-wins, so it silently replaced the module-checking
+        // `lang_class::native_field_set_accessible` registered ~1150 lines
+        // above. Real-JDK mode ran this body and nothing else: every
+        // `setAccessible(true)` into `java.base` succeeded, where HotSpot 25
+        // throws `InaccessibleObjectException`
+        // (`probes/ThreadGroupLayoutProbe.java`, the `ref *` lines). Calling
+        // the shared gate is what makes the duplicate harmless instead of
+        // load-bearing.
+        lang_class::enforce_set_accessible_gate(ctx, this, flag, "member")?;
         ctx.set_field_by_name(this, "override", Value::Int(flag));
         Ok(None)
     }
@@ -32113,8 +32113,12 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         // StringCharBuffer. Honor the JDK layout instead of treating the null
         // hb as an error (Netty cookie decoding uses
         // `CharBuffer.wrap(String,start,end).charAt(0)`).
+        // `&mut` rather than `&dyn`: the wrapped `str` is any `CharSequence`,
+        // and reading a non-`String` one needs a virtual `toString()`. See
+        // `charset_buffers::read_wrapped_char_sequence` — without it every
+        // `CharBuffer.wrap(charChunk)` reads back empty.
         fn string_cb_state(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
         ) -> Option<(Vec<u16>, i32, i32, i32)> {
             let cid = ctx.class_id_of_object(this);
@@ -32126,7 +32130,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => return None,
             };
-            let text = ctx.read_string(str_obj)?;
+            let text = crate::phases_late::charset_buffers::read_wrapped_char_sequence(
+                ctx, str_obj,
+            );
             let pos = match ctx.get_field_by_name(this, "position") {
                 Value::Int(v) => v,
                 _ => match ctx.get_field(this, 1) {
@@ -32148,8 +32154,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((text.encode_utf16().collect(), pos, lim, off))
         }
 
+        #[allow(dead_code)]
         fn string_cb_char_at(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
             absolute_index: i32,
         ) -> Option<Value> {
@@ -32480,7 +32487,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     .ok_or(RuntimeError::IllegalStateException {
                         message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
                     })?;
-                    let _ = lim;
+                    // `ByteBufferAsCharBuffer.subSequence` opens with
+                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
+                    // `lim` was read and then explicitly discarded here, so the
+                    // range was never checked: `subSequence(0, 99)` on a
+                    // six-char view decoded 93 code units from past the end of
+                    // the underlying `byte[]` and handed them back as content.
+                    // Same defect, same day, as `CharBuffer.subSequence` —
+                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
+                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
+                        return Err(RuntimeError::ioobe(
+                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                                i64::from(start),
+                                i64::from(end),
+                                i64::from(lim.saturating_sub(pos)),
+                            ),
+                        )
+                        .into());
+                    }
                     let n = (end - start).max(0) as usize;
                     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
                     for i in 0..n {

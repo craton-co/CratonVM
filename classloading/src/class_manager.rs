@@ -1182,6 +1182,22 @@ fn fire_class_file_load_hook(
     }
 }
 
+/// Fingerprint a class file as `(length, content hash)`.
+///
+/// Non-cryptographic on purpose: this distinguishes two *builds* of the same
+/// class, not an attacker's forgery — the bytes it guards are already going
+/// through the full class-file parser and the Pass-2/Pass-3 verifier. FxHash
+/// over a class file is a handful of microseconds, which matters because this
+/// runs once per `define_class`.
+fn class_bytes_digest(bytes: &[u8]) -> (u32, u64) {
+    use std::hash::Hasher;
+    let mut hasher = crate::fx_hash::FxHasher::default();
+    hasher.write(bytes);
+    // Length is carried separately rather than folded in: a length mismatch is
+    // the common case and reads far better in a diagnostic than a hash diff.
+    (bytes.len() as u32, hasher.finish())
+}
+
 /// Write the class bytes a `redefine_class` verification rejected to
 /// `$CRATONVM_DBG_REDEFINE_DUMP/<mangled-name>.class`, so the rejection can be
 /// disassembled with `javap` instead of reasoned about from an offset.
@@ -1943,6 +1959,26 @@ pub struct ClassManager {
     /// Set to `usize::MAX` to disable eviction (legacy keep-forever).
     class_bytes_cache_cap: usize,
 
+    /// `(length, content hash)` of the bytes each class's **current definition**
+    /// came from — the JVMTI retransformation base. Never evicted.
+    ///
+    /// [`Self::class_bytes_cache`] is FIFO-evicted at a soft cap, so by the time
+    /// a JVMTI agent retransforms a class (Mockito's inline mock maker and
+    /// JaCoCo both do, late and on demand) the base bytes are usually gone and
+    /// `retransformClasses0` falls back to a classpath resource lookup. That
+    /// lookup searches bootstrap → extension → application, **not the class's
+    /// defining loader**, and Spring Boot's test infrastructure routinely
+    /// defines classes through `ModifiedClassPathClassLoader` /
+    /// `FilteredClassLoader` / per-test `URLClassLoader`s that resolve a
+    /// *different copy* of the same name. Matching `this_class` — the only
+    /// check the fallback had — does not catch a different **version** of the
+    /// same class: the transformer would then weave version A's method bodies
+    /// and `retransform_class` would install them over the live version B.
+    ///
+    /// 16 bytes per loaded class buys the adjudication the byte cache can no
+    /// longer make. See [`Self::class_bytes_match_base`].
+    class_bytes_base_digest: FxHashMap<ClassId, (u32, u64)>,
+
     /// CDS-cached class bytes: class name -> raw .class bytes.
     /// Populated from the CDS archive at startup, checked before classpath delegation.
     /// T10.9.B: FxHashMap — keys are internal class names loaded from a trusted
@@ -2194,6 +2230,31 @@ pub struct ClassManager {
     /// Unbound until [`Self::bind_vm_id`] runs; see that method for the
     /// ordering requirement.
     metadata_realm: MetadataRealm,
+
+    /// Class files a `java.lang.instrument` agent has already rewritten, waiting
+    /// for the load that asked for them. Keyed by internal class name.
+    ///
+    /// # Why the bytes arrive from outside instead of a hook in here
+    ///
+    /// The JVMTI/`java.lang.instrument` contract is that a registered
+    /// `ClassFileTransformer` is handed every class file *before* it is parsed,
+    /// and the transformer is **Java code**. Every definition path in this file
+    /// runs under the VM's L10 class-manager write lock, and running Java under
+    /// that lock deadlocks the first time the transformer touches a class.
+    ///
+    /// So the transform runs one level up, in the VM crate, on a thread that
+    /// holds no class-manager lock (`SharedVm::load_class_transformed`): it
+    /// looks the bytes up with [`Self::find_class_bytes_delegated`], invokes the
+    /// chain, stages the result here, and then calls the ordinary load. The
+    /// staged entry is consumed by [`Self::load_class`] at the point the
+    /// untransformed bytes would otherwise have been read, so the whole rest of
+    /// the load — the per-name lock, the circularity guard, the class-bytes
+    /// cache, `ClassLoad`/`ClassPrepare` — is unchanged and sees only the final
+    /// bytes.
+    ///
+    /// Consumed on read (`remove`), so a staged entry can never outlive the load
+    /// it was produced for. Empty on every run with no agent installed.
+    pending_transformed_classes: FxHashMap<String, (SharedBytes, ClassLoaderId)>,
 }
 
 /// What the class-name index knows about a name, with the three "no single
@@ -2601,6 +2662,7 @@ impl ClassManager {
             class_bytes_cache_fifo: std::collections::VecDeque::with_capacity(128),
             class_bytes_cache_size: 0,
             class_bytes_cache_cap: DEFAULT_CLASS_BYTES_CACHE_CAP,
+            class_bytes_base_digest: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             loading_guard: FxHashSet::default(),
             loader_constraints: crate::loader_constraints::LoaderConstraints::new(),
@@ -2629,6 +2691,7 @@ impl ClassManager {
             // exists, so it has no `vm_identity` to record yet. `vm_init` calls
             // `bind_vm_id` as soon as it does.
             metadata_realm: MetadataRealm::new(),
+            pending_transformed_classes: FxHashMap::default(),
         }
     }
 
@@ -4547,6 +4610,21 @@ impl ClassManager {
 
         debug!(class = name, "Loading class (parent delegation)");
 
+        // A `java.lang.instrument` agent already rewrote this class file, one
+        // level up, off the lock (see `pending_transformed_classes`). Those
+        // bytes replace what parent delegation would have read — that IS the
+        // transform landing — and everything downstream (parse, class-bytes
+        // cache, ClassLoad/ClassPrepare) sees only the final definition, so the
+        // agent's view and the VM's view cannot diverge.
+        if let Some((bytes, loader_id)) = self.pending_transformed_classes.remove(name) {
+            return self.define_class_shared_with_options(
+                name,
+                bytes,
+                loader_id,
+                DefineClassOptions::default(),
+            );
+        }
+
         // Parent delegation: try bootstrap → extension → application
         match self.find_class_bytes_delegated(name) {
             Ok((bytes, loader_id)) => {
@@ -4778,6 +4856,46 @@ impl ClassManager {
     }
 
     /// Find class bytes using parent delegation.
+    /// Locate `name`'s class file through the built-in delegation chain
+    /// (bootstrap → extension → application) **without defining it**.
+    ///
+    /// The `java.lang.instrument` load-time transform needs the raw bytes and
+    /// the loader that would own them before it can offer them to an agent, and
+    /// it must do that with no class-manager lock held (see
+    /// [`Self::pending_transformed_classes`]). This is that read-only half of
+    /// [`Self::load_class`], exposed for exactly that caller; it takes `&self`,
+    /// so it can run under the read lock.
+    pub fn find_class_bytes_for_transform(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<u8>, ClassLoaderId), VmError> {
+        let (bytes, loader_id) = self.find_class_bytes_delegated(name)?;
+        Ok((bytes.to_vec(), loader_id))
+    }
+
+    /// Stage agent-transformed bytes for the next load of `name`.
+    ///
+    /// See [`Self::pending_transformed_classes`]. The caller has already run the
+    /// transformer chain; this hands the result to the load that will ask for
+    /// it. A second stage for the same name overwrites the first — the last
+    /// transform wins, which is the only ordering a single load can observe.
+    pub fn stage_transformed_class(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        loader_id: ClassLoaderId,
+    ) {
+        self.pending_transformed_classes
+            .insert(name.to_string(), (bytes.into(), loader_id));
+    }
+
+    /// Drop a staged entry without defining it. Used when the transform path
+    /// bails after staging (an aborted load must not leave bytes behind for an
+    /// unrelated later load of the same name to pick up).
+    pub fn discard_staged_transformed_class(&mut self, name: &str) {
+        self.pending_transformed_classes.remove(name);
+    }
+
     fn find_class_bytes_delegated(
         &self,
         name: &str,
@@ -7618,6 +7736,37 @@ impl ClassManager {
                 // store is not concurrently modified (we hold
                 // `&mut self`).
                 match self.class_store.get(class_id) {
+                    // A redefine must not be judged by a STRICTER policy than
+                    // the definition it replaces.
+                    //
+                    // `define_class_with_options` defers the Pass-3 *type-state*
+                    // verdict for any class whose defining loader is
+                    // `UserDefined` while `loader_aware_resolution()` is on
+                    // (the default), because this hierarchy adapter cannot
+                    // preserve both loader identities through every
+                    // pre-definition edge and produces false areturn/checkcast
+                    // rejections for otherwise valid forked bytecode. It
+                    // enforces the hierarchy-independent structural half and
+                    // moves on.
+                    //
+                    // This path used to run the FULL `verify_class`
+                    // unconditionally. So every application class in a Spring /
+                    // WildFly / H2 / Elasticsearch run — all of them defined by
+                    // user loaders — was excused from Pass 3 when it loaded and
+                    // then held to it the moment a JVMTI agent retransformed it.
+                    // Mockito's inline mock maker retransforms every class it
+                    // mocks, so the class of false rejection the deferral exists
+                    // to avoid was reachable there and nowhere else: the class
+                    // loads, the mock is created, and `retransformClasses0` logs
+                    // an `UnsupportedClassRedefinitionError` naming a verifier
+                    // complaint about bytecode the VM already accepted.
+                    Some(cls)
+                        if loader_aware_resolution()
+                            && matches!(cls.loader_id, ClassLoaderId::UserDefined(_)) =>
+                    {
+                        crate::verifier::verify_class_structure(cls, &self.class_store)
+                            .and_then(|()| crate::verifier::verify_class_structural_bytecode(cls))
+                    }
                     Some(cls) => crate::verifier::verify_class(cls, &self.class_store, &hierarchy),
                     None => Err(LinkageError::VerifyError {
                         class_name: existing_name.clone(),
@@ -7811,6 +7960,11 @@ impl ClassManager {
     pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: impl Into<SharedBytes>) {
         let bytes = bytes.into();
         let new_size = bytes.len();
+        // Record the retransformation base's fingerprint BEFORE the FIFO can
+        // evict the bytes themselves. This map is never evicted; see the field
+        // docs on `class_bytes_base_digest`.
+        self.class_bytes_base_digest
+            .insert(class_id, class_bytes_digest(&bytes));
         // If we already had an entry for this class, subtract its size
         // and remove it from the FIFO before re-appending.
         if let Some(prev) = self.class_bytes_cache.remove(&class_id) {
@@ -7863,6 +8017,22 @@ impl ClassManager {
                 self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_sub(b.len());
             }
         }
+    }
+
+    /// Do `bytes` fingerprint-match the class file `class_id`'s current
+    /// definition came from?
+    ///
+    /// `None` means no fingerprint was recorded (a synthetic stub, or a class
+    /// defined before this bookkeeping existed) and the caller must decide for
+    /// itself. `Some(false)` means the caller is holding a **different class
+    /// file that happens to carry the same name** — see the field docs on
+    /// [`Self::class_bytes_base_digest`] for how a retransform reaches that
+    /// state and why installing the result would be a silently wrong class
+    /// definition.
+    pub fn class_bytes_match_base(&self, class_id: ClassId, bytes: &[u8]) -> Option<bool> {
+        self.class_bytes_base_digest
+            .get(&class_id)
+            .map(|recorded| *recorded == class_bytes_digest(bytes))
     }
 
     /// Current total bytes held by [`Self::class_bytes_cache`].
@@ -11768,8 +11938,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // natives look implemented and store nothing.
         "java/net/DatagramSocket" => instance_fields(4),
         // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
-        // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
-        // map=0, name=1, parent=2, children=3, removed=4) per
+        // `net_channels::register_p72_datagram`, and Preferences = 6 (backing
+        // map=0, name=1, parent=2, children=3, removed=4, user=5) per
         // `beans_jndi::register_p72_preferences`.
         //
         // Both were ABSENT and fell to the `_ => vec![]` arm below, so a
@@ -11779,7 +11949,11 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // drops the write rather than erroring, so the natives looked
         // implemented while storing nothing.
         "java/net/DatagramPacket" => instance_fields(5),
-        "java/util/prefs/Preferences" => instance_fields(5),
+        // 6, not 5, since `isUserNode()` gained slot 5. A `new` that allocated
+        // 5 would drop the write silently — exactly the failure the comment
+        // above describes — and every node would then answer `isUserNode()`
+        // with the default rather than the tree it was created for.
+        "java/util/prefs/Preferences" => instance_fields(6),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -13921,7 +14095,7 @@ fn native_constant_surface_raw_slot_layout_audit() {
     for (class, minimum_slots) in [
         ("java/net/DatagramSocket", 4),
         ("java/net/DatagramPacket", 5),
-        ("java/util/prefs/Preferences", 5),
+        ("java/util/prefs/Preferences", 6),
         ("com/sun/net/httpserver/HttpServer", 6),
         ("com/sun/net/httpserver/HttpServerImpl", 6),
         ("sun/net/httpserver/HttpServerImpl", 6),
@@ -18989,6 +19163,74 @@ mod tests {
     // coverage lives in tests/wp2_4b_redefine.rs which uses compiled
     // .class fixtures.
     // ----------------------------------------------------------------
+
+    // ----------------------------------------------------------------
+    // Retransformation-base fingerprint (`class_bytes_base_digest`)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn class_bytes_base_digest_outlives_the_byte_cache_eviction() {
+        // The whole point: `class_bytes_cache` is FIFO-evicted at a soft cap,
+        // and by the time a JVMTI agent retransforms a class its bytes are
+        // usually gone. The fingerprint must still be there to adjudicate the
+        // classpath fallback — otherwise the only check left is `this_class`,
+        // which cannot tell two builds of one class apart.
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        mgr.set_class_bytes_cache_cap(64);
+
+        let a = ClassId::new(1);
+        let base: Vec<u8> = (0u8..=200).collect();
+        mgr.insert_class_bytes(a, base.clone());
+
+        // Push enough other classes through to evict `a`'s bytes.
+        for i in 2..12u32 {
+            mgr.insert_class_bytes(ClassId::new(i), vec![i as u8; 64]);
+        }
+        assert!(
+            !mgr.class_bytes_cache.contains_key(&a),
+            "cap is 64 bytes; a 201-byte entry must have been evicted by now"
+        );
+
+        assert_eq!(mgr.class_bytes_match_base(a, &base), Some(true));
+
+        // Same length, one byte different — a rebuild of the same source.
+        let mut rebuilt = base.clone();
+        rebuilt[100] ^= 0xFF;
+        assert_eq!(
+            mgr.class_bytes_match_base(a, &rebuilt),
+            Some(false),
+            "a same-length different build must not read as the base"
+        );
+
+        // Different length — the common version-skew case.
+        let mut longer = base.clone();
+        longer.extend_from_slice(&[0u8; 8]);
+        assert_eq!(mgr.class_bytes_match_base(a, &longer), Some(false));
+    }
+
+    #[test]
+    fn class_bytes_match_base_answers_none_for_an_unrecorded_class() {
+        // `None` is "cannot tell", not "wrong": callers must fall back to the
+        // name check rather than refusing every synthetic stub.
+        let mgr = ClassManager::new(&[], &[], &[]);
+        assert_eq!(
+            mgr.class_bytes_match_base(ClassId::new(4_242), b"anything"),
+            None
+        );
+    }
+
+    #[test]
+    fn class_bytes_base_digest_follows_a_redefine() {
+        // An explicit `redefineClasses` (not a retransform) moves the base, so
+        // the fingerprint has to move with it — otherwise the next retransform
+        // would refuse the very bytes the class is now defined from.
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let a = ClassId::new(7);
+        mgr.insert_class_bytes(a, vec![1u8; 32]);
+        mgr.insert_class_bytes(a, vec![2u8; 48]);
+        assert_eq!(mgr.class_bytes_match_base(a, &vec![2u8; 48]), Some(true));
+        assert_eq!(mgr.class_bytes_match_base(a, &vec![1u8; 32]), Some(false));
+    }
 
     #[test]
     fn redefine_class_unknown_id_rejected_lib() {

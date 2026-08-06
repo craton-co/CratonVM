@@ -841,6 +841,19 @@ pub(crate) fn resolve_class_loader_aware(
     referencing_class_id: ClassId,
     name: &str,
 ) -> Result<ClassId, MethodCallFailed> {
+    // (0-pre) `java.lang.instrument` transform-on-load. Every branch below ends
+    //     in a `load_class_concurrent*` or a user `loadClass`, and neither can
+    //     run a Java `ClassFileTransformer` — the first holds the class-manager
+    //     write lock while it defines, the second is the loader's own business.
+    //     This is the last point on the constant-pool resolution path where a
+    //     Java thread is in hand and no class-manager lock is held, so it is
+    //     where the chain gets its shot at the bytes. The hook stages the
+    //     rewritten class file; whichever branch below actually defines the
+    //     class picks it up. A VM with no registered transformer pays one
+    //     relaxed atomic load and a not-taken branch.
+    if crate::runtime::instrument::transformers_armed(shared.vm_identity) {
+        crate::runtime::instrument::pre_transform_for_load(shared, thread, name, 0);
+    }
     // (0) An array reference resolves its COMPONENT type with the same
     //     initiating loader as the array reference itself (JVMS 5.3.3: the
     //     array class is synthesised from the resolved component; no class

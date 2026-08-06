@@ -342,6 +342,13 @@ fn accept_close_aware(
                 }
                 std::thread::sleep(ACCEPT_CLOSE_POLL);
             }
+            // Reissue on EINTR rather than reporting it. The Unix-domain
+            // sibling below has carried this arm since it was written; this
+            // TCP one did not, so a CratonVM cross-thread JIT root-scan
+            // `SIGUSR2` landing on a parked accept surfaced as
+            // `IOException: Interrupted system call`. See
+            // `crate::eintr` for why `SA_RESTART` does not cover it.
+            Err(e) if crate::eintr::is_eintr(&e) => continue,
             Err(e) => return Err(e),
         }
     }

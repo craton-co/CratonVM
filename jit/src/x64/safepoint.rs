@@ -39,6 +39,21 @@ impl Compiler {
     }
 
     fn emit_pre_safepoint_spill_impl(&mut self, publish_shadow: bool) {
+        // Handshake with `emit_inline_tlab_new` (see `alloc_spill_sink_enabled`).
+        // The `new` site raises `sink_alloc_blind_spill` immediately before
+        // calling us; we withhold every register the allocation fast path does
+        // NOT clobber and acknowledge on `deferred_alloc_blind_spill`, which the
+        // inline emitter consumes at its slow-path label.
+        //
+        // Taken ABOVE the `failed` guard so an abandoned compile cannot leave the
+        // request standing for a LATER safepoint, which would withhold eleven
+        // registers with nobody to emit them. Cleared unconditionally so a
+        // request this safepoint cannot honour (spill disabled, `nostore`, or the
+        // callee-saved-only `=1` mode, whose slot layout is `alloc_used_regs`-
+        // indexed rather than `ALL_SPILL_GPRS`-indexed) leaves the consumer with
+        // nothing to emit and the full spill in place.
+        let sink = std::mem::take(&mut self.sink_alloc_blind_spill);
+        self.deferred_alloc_blind_spill = false;
         if self.failed {
             return;
         }
@@ -123,9 +138,11 @@ impl Compiler {
             // arg registers here does not perturb the pending call's arguments.
             // Default path is unchanged (`=1` → callee-saved only).
             if self.safepoint_reg_spill_all {
-                for (i, &reg) in ALL_SPILL_GPRS.iter().enumerate() {
-                    let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
-                    self.emit_store_local(off, reg);
+                if sink {
+                    self.emit_blind_reg_spill(|reg| ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+                    self.deferred_alloc_blind_spill = true;
+                } else {
+                    self.emit_blind_reg_spill(|_| true);
                 }
             } else {
                 for i in 0..self.alloc_used_regs.len() {
@@ -165,6 +182,37 @@ impl Compiler {
             self.pending_shadow.clear();
             self.pending_shadow_coverage_complete = false;
         }
+    }
+
+    /// Emit the `=all` blind GPR spill for the registers `want` selects, into
+    /// their fixed `reg_spill_base + i*8` slots. The slot layout is indexed by
+    /// position in [`ALL_SPILL_GPRS`] and does not depend on the selection, so a
+    /// spill split across two program points (the sink) writes exactly the slots
+    /// a single full spill would have.
+    fn emit_blind_reg_spill(&mut self, want: impl Fn(u8) -> bool) {
+        for (i, &reg) in ALL_SPILL_GPRS.iter().enumerate() {
+            if !want(reg) {
+                continue;
+            }
+            let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+            self.emit_store_local(off, reg);
+        }
+    }
+
+    /// Emit the half of the blind GPR spill that
+    /// [`Self::emit_pre_safepoint_spill`] withheld at an inline-TLAB `new`, at
+    /// the allocation's slow-path label. Returns whether anything was emitted.
+    ///
+    /// Every register written here is one the fast path provably does not touch
+    /// (see [`ALLOC_FAST_PATH_CLOBBERS`]), so its value at the slow-path label
+    /// is still its value at the safepoint. The three it does touch were already
+    /// spilled at the safepoint itself.
+    pub(super) fn emit_deferred_alloc_blind_spill(&mut self) -> bool {
+        if !std::mem::take(&mut self.deferred_alloc_blind_spill) || self.failed {
+            return false;
+        }
+        self.emit_blind_reg_spill(|reg| !ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+        true
     }
 
     /// Publish the precise-map safepoint id without conservatively copying the

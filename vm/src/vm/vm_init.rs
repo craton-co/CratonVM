@@ -5805,6 +5805,32 @@ impl SharedVm {
         self.load_class_concurrent_for(name, None)
     }
 
+    /// [`Self::load_class_concurrent`], offering the class file to this VM's
+    /// `java.lang.instrument` transformer chain first.
+    ///
+    /// This is the entry point every class load that has a Java thread in hand
+    /// should use, because running a `ClassFileTransformer` means running Java,
+    /// and that needs a thread. Callers with no thread (VM bootstrap, the JIT's
+    /// own resolution, JNI helpers before attach) keep `load_class_concurrent`;
+    /// they load classes an agent could not have been registered in time to see
+    /// anyway.
+    ///
+    /// Strictly additive: with no agent installed
+    /// (`instrument::transformers_armed` is false) this is
+    /// `load_class_concurrent` plus one relaxed atomic load, and even with an
+    /// agent installed a chain that declines every class changes nothing about
+    /// how the load proceeds.
+    pub fn load_class_transformed(
+        &self,
+        thread: &mut crate::threading::JvmThread,
+        name: &str,
+    ) -> Result<crate::classloading::ClassId, cratonvm_types::error::VmError> {
+        if crate::runtime::instrument::transformers_armed(self.vm_identity) {
+            crate::runtime::instrument::pre_transform_for_load(self, thread, name, 0);
+        }
+        self.load_class_concurrent(name)
+    }
+
     /// [`Self::load_class_concurrent`], naming the Java frame that asked.
     ///
     /// `requester` is `(owner_class, method_name, descriptor)` of the frame
