@@ -5816,10 +5816,10 @@ impl SharedVm {
     /// anyway.
     ///
     /// Strictly additive: with no agent installed
-    /// ([`instrument::transformers_armed`] is false) this is
-    /// `load_class_concurrent` plus one map probe, and even with an agent
-    /// installed a chain that declines every class changes nothing about how the
-    /// load proceeds.
+    /// (`instrument::transformers_armed` is false) this is
+    /// `load_class_concurrent` plus one relaxed atomic load, and even with an
+    /// agent installed a chain that declines every class changes nothing about
+    /// how the load proceeds.
     pub fn load_class_transformed(
         &self,
         thread: &mut crate::threading::JvmThread,
