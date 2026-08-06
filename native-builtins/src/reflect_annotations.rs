@@ -2432,116 +2432,129 @@ pub(crate) fn register_reflect_array_natives(registry: &mut NativeMethodRegistry
         native_array_set,
         cratonvm_native_api::NativeKind::Bridge,
     );
-    registry.register_with_kind(
-        a,
-        "getInt",
-        "(Ljava/lang/Object;I)I",
-        native_array_get_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setInt",
-        "(Ljava/lang/Object;II)V",
-        native_array_set_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "getLong",
-        "(Ljava/lang/Object;I)J",
-        native_array_get_long,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setLong",
-        "(Ljava/lang/Object;IJ)V",
-        native_array_set_long,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "getFloat",
-        "(Ljava/lang/Object;I)F",
-        native_array_get_float,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setFloat",
-        "(Ljava/lang/Object;IF)V",
-        native_array_set_float,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "getDouble",
-        "(Ljava/lang/Object;I)D",
-        native_array_get_double,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setDouble",
-        "(Ljava/lang/Object;ID)V",
-        native_array_set_double,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
+    // Each primitive accessor carries the type it was ASKED for. These used
+    // to collapse onto two untyped bodies -- `getInt` served `getBoolean`,
+    // `getByte`, `getShort` and `getChar` as well -- so the widening rule had
+    // nothing to test against and `Array.getInt(new long[4], 0)` returned a
+    // fabricated 0. See `widens_to`.
     registry.register_with_kind(
         a,
         "getBoolean",
         "(Ljava/lang/Object;I)Z",
-        native_array_get_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setBoolean",
-        "(Ljava/lang/Object;IZ)V",
-        native_array_set_int,
+        |ctx, args| {
+            reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Boolean)
+        },
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register_with_kind(
         a,
         "getByte",
         "(Ljava/lang/Object;I)B",
-        native_array_get_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setByte",
-        "(Ljava/lang/Object;IB)V",
-        native_array_set_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "getShort",
-        "(Ljava/lang/Object;I)S",
-        native_array_get_int,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
-    registry.register_with_kind(
-        a,
-        "setShort",
-        "(Ljava/lang/Object;IS)V",
-        native_array_set_int,
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Byte),
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register_with_kind(
         a,
         "getChar",
         "(Ljava/lang/Object;I)C",
-        native_array_get_int,
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Char),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "getShort",
+        "(Ljava/lang/Object;I)S",
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Short),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "getInt",
+        "(Ljava/lang/Object;I)I",
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Int),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "getLong",
+        "(Ljava/lang/Object;I)J",
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Long),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "getFloat",
+        "(Ljava/lang/Object;I)F",
+        |ctx, args| reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Float),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "getDouble",
+        "(Ljava/lang/Object;I)D",
+        |ctx, args| {
+            reflect_array_get_primitive(ctx, args, cratonvm_types::ArrayElementType::Double)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setBoolean",
+        "(Ljava/lang/Object;IZ)V",
+        |ctx, args| {
+            reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Boolean)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setByte",
+        "(Ljava/lang/Object;IB)V",
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Byte),
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register_with_kind(
         a,
         "setChar",
         "(Ljava/lang/Object;IC)V",
-        native_array_set_int,
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Char),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setShort",
+        "(Ljava/lang/Object;IS)V",
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Short),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setInt",
+        "(Ljava/lang/Object;II)V",
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Int),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setLong",
+        "(Ljava/lang/Object;IJ)V",
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Long),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setFloat",
+        "(Ljava/lang/Object;IF)V",
+        |ctx, args| reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Float),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        a,
+        "setDouble",
+        "(Ljava/lang/Object;ID)V",
+        |ctx, args| {
+            reflect_array_set_primitive(ctx, args, cratonvm_types::ArrayElementType::Double)
+        },
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register(
