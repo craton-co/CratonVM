@@ -1864,7 +1864,25 @@ pub fn make_iterator_from_array(
     // through their pins. Covered by
     // `gc_native_pins::generic_snapshot_iterator_roots_array_and_shell_across_allocation`.
     let array_pin = ctx.pin_native_root(snapshot_array);
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3);
+    // Fallible since 2026-08-05: this was the LAST infallible `HashMap$KeyItr`
+    // fabrication, and while it stood the refusal at the other three sites was
+    // order-dependent rather than a policy. `probes/StrictIterPrimitivesProbe`
+    // caught it under `--jdk-only`: `Arrays.asList(a).iterator()` reaches this
+    // helper, fabricates the class, and every LATER `try_alloc_synthetic` for
+    // the same name then finds it and succeeds — so
+    // `linkedhashset.iterator()` passed in a probe that had called
+    // `Arrays.asList` first and threw `NoClassDefFoundError` in one that had
+    // not. Route the refusal here too, so no snapshot iterator anywhere wears
+    // a fabricated class name in strict mode.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", 3) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
+            let real = real_snapshot_iterator(ctx, snapshot_array, size);
+            ctx.unpin_native_roots(array_pin);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let snapshot_array = ctx.read_native_pin(array_pin, snapshot_array);
@@ -1876,6 +1894,84 @@ pub fn make_iterator_from_array(
     let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.unpin_native_roots(array_pin);
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// The `--jdk-only` stand-in for a snapshot iterator, built out of real JDK
+/// classes only.
+///
+/// Every snapshot iterator this crate hands back wears the class name
+/// `java.util.HashMap$KeyItr` or `java.util.TreeSet$Itr`. No JDK declares
+/// either — the real ones are `HashMap$KeyIterator` and `TreeMap$KeyIterator`
+/// — so under `--jdk-only` the fabrication is refused and the iteration dies
+/// with `NoClassDefFoundError` before it starts. That was six of the seven
+/// strict-mode divergences left in `probes/JdkOnlyCollectionViewProbe`:
+/// `Collections.unmodifiable{Set,Map,SortedSet,NavigableSet}`, `Map.of` and
+/// `Map.copyOf` all reach a set/entry-set iterator.
+///
+/// The snapshot itself needs nothing fabricated: it is an `Object[]`, and the
+/// JDK already ships the fixed-size list for exactly that shape. Wrapping it in
+/// a real `Arrays$ArrayList` and asking THAT for its iterator yields a real
+/// `java.util.Arrays$ArrayItr` running real bytecode — same elements, same
+/// order, and a `getClass()` that finally tells the truth.
+///
+/// `invoke_virtual_bytecode_only`, not `invoke_virtual`: this crate registers a
+/// native over `Arrays$ArrayList.iterator` that routes straight back into
+/// [`make_iterator_from_array`], i.e. back to the fabricated class this
+/// function exists to avoid.
+///
+/// One behaviour genuinely differs, and it is loud rather than silent:
+/// `remove()` on the fabricated iterator writes through to the backing
+/// collection (`native_map_key_itr_remove` / `native_ts_itr_remove`), while a
+/// fixed-size list's iterator raises `UnsupportedOperationException` from real
+/// JDK bytecode. On the strict path the alternative is not a working
+/// `remove()` — it is an iteration that never reaches `next()`.
+fn real_snapshot_iterator(
+    ctx: &mut dyn NativeContext,
+    elems: ObjectRef,
+    count: usize,
+) -> MethodCallResult {
+    // `Arrays$ArrayList` derives `size()` from `a.length`, so the array it is
+    // handed has to be exactly the logical length. Callers over-allocate:
+    // `native_ts_iterator` snapshots into `size.max(1)` slots, which would
+    // otherwise report an empty TreeSet as a one-element list of `null`.
+    let arr = if ctx.array_length(elems) == count {
+        elems
+    } else {
+        let (elems, exact) = rooted_across1(ctx, elems, |ctx| alloc_ref_array(ctx, count));
+        // Neither accessor allocates, so no GC point separates the read from
+        // the store and both refs stay live for the whole copy.
+        for i in 0..count {
+            let v = ctx.get_array_element(elems, i);
+            ctx.set_array_element(exact, i, v);
+        }
+        exact
+    };
+    let arr_pin = ctx.pin_native_root(arr);
+    let list = ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(arr))],
+    );
+    ctx.unpin_native_roots(arr_pin);
+    match list? {
+        Some(Value::Object(Some(list))) => {
+            ctx.invoke_virtual_bytecode_only(list, "iterator", "()Ljava/util/Iterator;", &[])
+        }
+        // No real `Arrays$ArrayList` to wrap it in. Nothing is left to fall
+        // back TO — returning the fabricated shape here would defeat the whole
+        // point — so surface a refusal naming the class that is actually
+        // missing, rather than the synthetic one the caller asked for.
+        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+            ctx,
+            cratonvm_native_api::ClassIdentityError::Refused {
+                name: "java/util/Arrays$ArrayList".to_string(),
+                reason: "--jdk-only: a snapshot iterator needs the real \
+                         fixed-size list to stand in for the refused \
+                         `java.util.HashMap$KeyItr`, and this image has none"
+                    .to_string(),
+            },
+        )),
+    }
 }
 
 fn native_unsorted_set_comparator(
@@ -3781,6 +3877,26 @@ fn try_delegate_real_collection(
 /// after `Set.of` is assigned to a `HashSet`-typed local, and what these tests
 /// do — found no backing map and answered 0. Unwrapping first makes the
 /// concrete-class entry points agree with the wrapper's.
+/// The size to bounds-check an unmodifiable view's `get(index)` against.
+///
+/// `al_state` reads an `elementData`-shaped backing and reports **0** for every
+/// other List shape. Taking that at face value made
+/// `Collections.unmodifiableList(x).get(i)` throw on a perfectly valid index
+/// whenever `x` was a `LinkedList`, an `Arrays$ArrayList`, or anything else —
+/// on a list that iterates fine, because iteration does not come through here.
+///
+/// So a reported 0 means "could not read it", not "empty", and the caller has
+/// to ask the backing itself. A genuinely empty backing answers 0 either way,
+/// which is why the fallback is safe to take on 0 rather than needing a
+/// separate "unreadable" signal.
+fn unmod_view_size(al_state_data: Option<ObjectRef>, al_state_size: i32) -> Option<i32> {
+    // The DATA slot, not the size, is the readability signal. A size of 0 is
+    // ambiguous — it is what `al_state` reports both for a genuinely empty
+    // array-backed list and for a backing it could not read at all — and
+    // conflating those is the whole defect.
+    al_state_data.map(|_| al_state_size.max(0))
+}
+
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
@@ -3922,11 +4038,38 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // 1-2 element `ArrayList` (which wants the plain class). Reproducing the
         // split would mean guessing; keeping the status quo for this path is the
         // honest option, and it is right for 0 and 3+ elements.
-        let (_, n) = al_state(ctx, b);
-        if index < 0 || index >= n {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+        //
+        // The SIZE, though, must not come from `al_state`. That reads an
+        // `elementData`-shaped backing and reports 0 for anything else, so an
+        // unmodifiable view over a `LinkedList`, an `Arrays$ArrayList`, or any
+        // other List threw on a PERFECTLY VALID index -- on a list that
+        // iterates fine, because iteration takes a different path:
+        //
+        //   Collections.unmodifiableList(new LinkedList<>(List.of("x","y")))
+        //       .get(0)   -> AIOOBE       (HotSpot: "x")
+        //   Collections.unmodifiableList(Arrays.asList("p","q"))
+        //       .get(0)   -> AIOOBE       (HotSpot: "p")
+        //
+        // That is what fails Spring's `CompileWithForkedClassLoaderExtension
+        // .runTest:140` -- `summary.getFailures().get(0)`, where
+        // `SummaryGeneratingListener.getFailures()` hands back exactly such a
+        // view -- and with it both `AotIntegrationTests` end-to-end tests. The
+        // nested run's REAL failure is destroyed on the way out and replaced by
+        // this AIOOBE. Repro: docs/known-issues/repros/junit-summary-failures/
+        // (SUM.java, 3 seconds) and .../list-get-oob/UM.java.
+        //
+        // Ask the backing for its own size, and read through its own `get`, so
+        // any List shape works. `unmod_receiver_backing` is `None` for a plain
+        // ArrayList, so the virtual call cannot come back here forever: the
+        // innermost backing takes the normal path below.
+        let (data, al_size) = al_state(ctx, b);
+        if let Some(n) = unmod_view_size(data, al_size) {
+            if index < 0 || index >= n {
+                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            }
         }
-        return native_al_get(ctx, &[Value::Object(Some(b)), Value::Int(index)]);
+        // Unreadable backing: stand aside, exactly as `native_unmod_get` does.
+        return ctx.invoke_virtual(b, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)]);
     }
     // `Collections$SingletonList` keeps its one element in a field, not in an
     // `elementData` array, so `al_state` reports size 0 and every index looked
@@ -12271,11 +12414,16 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // of the real bytecode. Refuse there, naming the class.
     // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
     // `unpin_native_roots` below would strand it and everything pinned above it.
+    // A refusal is not the end of the road: `real_snapshot_iterator` hands back
+    // the same elements through a real `Arrays$ArrayItr`. Only `remove()`
+    // differs, and loudly (see that function).
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
         Ok(itr) => itr,
-        Err(err) => {
+        Err(_refused) => {
+            let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
+            let real = real_snapshot_iterator(ctx, keys_arr, total);
             ctx.unpin_native_roots(this_pin);
-            return Err(err);
+            return real;
         }
     };
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
@@ -16051,6 +16199,108 @@ fn stream_lazy_spliterator(ctx: &dyn NativeContext, stream: ObjectRef) -> Option
     }
 }
 
+/// Drain a real `Spliterator` into an `Object[]` without fabricating anything —
+/// the `--jdk-only` path for every `cratonvm/internal/StreamCollector` drain in
+/// the workspace.
+///
+/// The collector those drains hand to `tryAdvance` is a VM-internal object that
+/// exists only to BE a `Consumer`, and strict mode refuses to fabricate it. It
+/// stands in for no JDK class, so unlike the refused iterator shapes there is
+/// nothing to substitute for it — which is why this takes the other road and
+/// removes the need for a `Consumer` at all.
+///
+/// `java.util.Spliterators.iterator(Spliterator)` is public JDK API and returns
+/// a real `java.util.Spliterators$1Adapter` that is *itself* both the `Iterator`
+/// and the `Consumer`, driving `tryAdvance` from real bytecode.
+/// `probes/StrictIterPrimitivesProbe` measures that adapter working under
+/// `--jdk-only` (`adapter.class=java.util.Spliterators$1Adapter`), which is what
+/// makes this viable where a hand-built Consumer is not. `Spliterators` carries
+/// no native override for `iterator`, so the call reaches the real method.
+///
+/// The accumulator is a real `java.util.ArrayList` rather than a Rust `Vec`:
+/// every `next()` re-enters Java and may move the heap, and elements parked in
+/// a Rust local across that are exactly the stale-ObjectRef family this file
+/// keeps paying for. Growth is the JDK's problem, and only the iterator and the
+/// list need pinning.
+///
+/// `safety_cap` keeps the guarantee the fabricated path had: an infinite
+/// spliterator (`Stream.iterate`, a hand-rolled generator) stops rather than
+/// exhausting the heap.
+pub fn drain_spliterator_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    safety_cap: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let spl_pin = ctx.pin_native_root(spl);
+    let spl_cur = ctx.read_native_pin(spl_pin, spl);
+    let adapter = ctx.invoke(
+        "java/util/Spliterators",
+        "iterator",
+        "(Ljava/util/Spliterator;)Ljava/util/Iterator;",
+        &[Value::Object(Some(spl_cur))],
+    );
+    ctx.unpin_native_roots(spl_pin);
+    let it = match adapter? {
+        Some(Value::Object(Some(it))) => it,
+        _ => return Ok(alloc_ref_array(ctx, 0)),
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let list = ctx.new_object_initialized("java/util/ArrayList", "()V", &[]);
+    let list = match list {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        Ok(_) => {
+            ctx.unpin_native_roots(it_pin);
+            return Ok(alloc_ref_array(ctx, 0));
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(it_pin);
+            return Err(e);
+        }
+    };
+    // Pinned ABOVE `it_pin`, so the single `unpin_native_roots(it_pin)` below
+    // releases both — the pins are a stack, and unwinding to the lower base
+    // drops everything above it.
+    let list_pin = ctx.pin_native_root(list);
+    let mut n = 0usize;
+    let outcome = loop {
+        if n >= safety_cap {
+            break Ok(());
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let has_next = match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            Ok(_) => false,
+            Err(e) => break Err(e),
+        };
+        if !has_next {
+            break Ok(());
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let elem = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Object(None),
+            Err(e) => break Err(e),
+        };
+        // `elem` goes straight into the next Java call, whose argument list is
+        // rooted for it — no allocation separates the two.
+        let list_cur = ctx.read_native_pin(list_pin, list);
+        if let Err(e) = ctx.invoke_virtual(list_cur, "add", "(Ljava/lang/Object;)Z", &[elem]) {
+            break Err(e);
+        }
+        n += 1;
+    };
+    let list_cur = ctx.read_native_pin(list_pin, list);
+    let arr = match outcome {
+        Ok(()) => ctx.invoke_virtual(list_cur, "toArray", "()[Ljava/lang/Object;", &[]),
+        Err(e) => Err(e),
+    };
+    ctx.unpin_native_roots(it_pin);
+    match arr? {
+        Some(Value::Object(Some(a))) => Ok(a),
+        _ => Ok(alloc_ref_array(ctx, 0)),
+    }
+}
+
 /// Drain a real `Spliterator` into an exact-sized `Object[]` via its
 /// `tryAdvance(Consumer)` contract with a `cratonvm/internal/StreamCollector`
 /// (the accept native, registered globally, appends + grows). Pins both objects
@@ -16075,8 +16325,13 @@ fn drain_spliterator_to_array_capped(
     spl: ObjectRef,
     safety_cap: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7).
-    let collector = try_alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2)?;
+    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). The refusal is not
+    // fatal: `drain_spliterator_via_real_iterator` gets the same elements out
+    // through public JDK API and keeps the same cap.
+    let collector = match try_alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2) {
+        Ok(c) => c,
+        Err(_refused) => return drain_spliterator_via_real_iterator(ctx, spl, safety_cap),
+    };
     let storage = alloc_ref_array(ctx, 16);
     ctx.set_field(collector, 0, Value::Object(Some(storage)));
     ctx.set_field(collector, 1, Value::Int(0));
@@ -39392,10 +39647,15 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // contract) rather than throwing UnsupportedOperationException.
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
-    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
-    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class
+    // — and then hand back the snapshot through a real iterator anyway.
+    let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
         try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    })?;
+    });
+    let itr = match refused {
+        Ok(itr) => itr,
+        Err(_) => return real_snapshot_iterator(ctx, snap, size as usize),
+    };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -39963,9 +40223,15 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
     // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
     // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
-    let itr = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
+    let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
         try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
-    })?;
+    });
+    let itr = match refused {
+        Ok(itr) => itr,
+        // The snapshot is already reversed, so the real iterator walks it in
+        // descending order without further work.
+        Err(_) => return real_snapshot_iterator(ctx, snap, n),
+    };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
     ctx.set_field(itr, 2, Value::Object(Some(this)));
@@ -45477,10 +45743,34 @@ fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if let (Some(Value::Object(Some(this))), Some(Value::Int(index))) = (args.first(), args.get(1))
     {
         if let Some(backing) = unmod_receiver_backing(ctx, *this) {
-            let (_, n) = al_state(ctx, backing);
-            if *index < 0 || *index >= n {
-                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+            // The SIZE must not come from `al_state` alone -- it reads an
+            // `elementData`-shaped backing and reports 0 for every other List
+            // shape, so this pre-check rejected PERFECTLY VALID indices on a
+            // view over a LinkedList or an Arrays$ArrayList, while the same
+            // list iterated fine (iteration does not come through here):
+            //
+            //   Collections.unmodifiableList(new LinkedList<>(List.of("x","y")))
+            //       .get(0)  -> AIOOBE    (HotSpot: "x")
+            //
+            // and it is `unmod_delegate` below, not this check, that produces
+            // the right answer once the index is allowed through. See
+            // `unmod_view_size`. This is the registration that actually serves
+            // `Collections.unmodifiableList(..).get(i)` --
+            // `--dump-native-registry` names it
+            // `cratonvm/internal/UnmodifiableList.get`.
+            let (data, al_size) = al_state(ctx, backing);
+            if let Some(n) = unmod_view_size(data, al_size) {
+                if *index < 0 || *index >= n {
+                    return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: *index }.into());
+                }
             }
+            // `None` = `al_state` could not read this backing. STAND ASIDE and
+            // let `unmod_delegate` below bounds-check: the backing's own `get`
+            // does it correctly and throws the JDK's own exception for its
+            // shape. Asking the backing for its `size()` here instead would
+            // cost a full VM dispatch on EVERY get -- two per element for the
+            // `for (i..n) list.get(i)` loop that is the common shape -- for a
+            // check the delegate is about to do anyway.
         }
     }
     unmod_delegate(ctx, args, "get", "(I)Ljava/lang/Object;")
@@ -52262,6 +52552,33 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Collections.unmodifiableList(x).get(i)` bounds-checked against
+    /// `al_state`'s SIZE, which is 0 both for a genuinely empty array-backed
+    /// list and for a backing it could not read at all -- so a view over a
+    /// LinkedList or an `Arrays$ArrayList` threw AIOOBE on a VALID index while
+    /// iterating fine. The DATA slot is the readability signal, not the size.
+    /// That destroyed the real failure inside Spring's
+    /// `SummaryGeneratingListener.getFailures().get(0)` and failed both
+    /// `AotIntegrationTests` end-to-end tests.
+    #[test]
+    fn unmod_view_size_stands_aside_when_al_state_cannot_read_the_backing() {
+        // A readable array-backed list: pre-check with the size it reported.
+        let data = Some(unsafe { ObjectRef::from_raw(0x1000 as *mut u8) });
+        assert_eq!(unmod_view_size(data, 3), Some(3));
+        // Readable AND genuinely empty -- still a pre-check, so `List.of()`
+        // keeps throwing the AIOOBE that HotSpot throws for it.
+        assert_eq!(unmod_view_size(data, 0), Some(0));
+        // THE BUG: no data slot means al_state could not read the backing, and
+        // its 0 is "cannot tell", not "empty". Pre-check must stand aside so
+        // the delegate answers -- returning Some(0) here is what rejected
+        // `unmodifiableList(new LinkedList<>(List.of("x","y"))).get(0)`.
+        assert_eq!(unmod_view_size(None, 0), None);
+        assert_eq!(unmod_view_size(None, 7), None);
+        // A negative size can never widen the bounds.
+        assert_eq!(unmod_view_size(data, -5), Some(0));
+    }
+
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
