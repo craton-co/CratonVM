@@ -327,8 +327,8 @@ Stated here rather than left to be discovered:
    `synthetic_stub_fields`; a native that indexes a real JDK class with no arm
    in that table is outside this instrument entirely. The access-site cross-type
    check still covers it; nothing else does.
-4. **Three probes is still not Spring Boot.** Every number above is a floor for
-   the same reason it was before.
+4. ~~**Three probes is still not Spring Boot.**~~ **DISCHARGED 2026-08-05 — and
+   it was right.** See "The breadth run" below.
 5. **A `_vmN` slot says a value has no home; it does not fix one.** The five
    `VM` rows are open kind-3 defects, filed in
    `docs/known-issues/jdk-only/files-newbufferedwriter-parks-an-fd-in-writebuffer.md`.
@@ -372,3 +372,55 @@ declared in `INVENTORY` with no fixture row, so `flag_surface` and
 `flag_docs_generated` were red before this change touched anything. Registering
 `overlay-nodedup` meant regenerating those files anyway, so the seven were added
 in the same pass and all four flag tests are green again.
+
+---
+
+## The breadth run, 2026-08-05 — the caveat was right
+
+This design's fourth caveat said every number in it is a floor, because three
+small probes are not a real workload. Discharged by running the same census
+under three of the repo's own smoke suites — `ri4_commons_lang`, `ri5_jackson`,
+`ri7_tomcat` (`scripts/smoke/`) — which between them load **185 modelled
+classes** and ~2,100 layout lines, against 13 classes from the probes.
+
+**The twelve fixes hold at scale: zero NAME rows on any of them.** The five
+`_vm` rows are the expected `java.io` set.
+
+**And it found a live one the probes could not reach:**
+`java.util.logging.Logger` and `LogManager`, six NAME rows and one TYPE.
+
+| class | slot | model said | image declares | what landed there |
+|---|---:|---|---|---|
+| `Logger` | 0 | `name:String` | `config:Logger$ConfigurationData` | a **String** |
+| `Logger` | 1 | `level:Level` | `manager:LogManager` | a `Level` |
+| `Logger` | 2 | `parent:Logger` | `name:String` | a **Logger** |
+| `LogManager` | 0 | `properties` | `props` | (right slot, wrong name) |
+| `LogManager` | 1 | `loggerRegistry` | `systemContext` | |
+| `LogManager` | 2 | `rootLogger:Logger` | `userContext:LoggerContext` | |
+| `LogManager` | 3 | `ready:I` | `rootLogger:Logger` | an **Int** on a reference field |
+
+Writing sites, not dormant model rows — the census counted the writes. The last
+row is the dangerous shape: an `int` where the collector's reference map says a
+`Logger` lives, which is the corruption `stream_encoder.rs`'s module doc records
+being caught the hard way once already.
+
+JUL is loaded by essentially everything, which is exactly why three probes never
+reached it and three real workloads reached it immediately. **The instrument was
+never the limitation; the workload was.**
+
+Fixed the same day, the same way: real declaration order from
+`javap -p --module java.logging`, with the values that have no real field to
+live in — `Logger`'s level (a real `Logger` has no `level` field; the effective
+level lives inside `config`), `LogManager`'s `loggerRegistry` and `ready` —
+anchored PAST the real field count, onto padding nobody owns. That is the target
+shape this design names for kind 3, and the diff reports such a slot as `pad`.
+
+Census across the three workloads: **143 → 136** unique disagreeing class+slot
+pairs, all seven JUL rows gone, none added. Remaining: 131 `TYPE` (the
+"anonymous model slot over a real primitive is a map entry, not a defect"
+category, item 2 above) and 5 `VM`. **Zero NAME rows tree-wide, under real
+workloads.**
+
+All three smokes still pass, and their output is identical across the arms apart
+from Tomcat's ephemeral port — including the `INFO [org.apache.coyote…]` lines,
+which are JUL output, so the changed path is exercised and unchanged.

@@ -849,6 +849,17 @@ pub enum RuntimeError {
 
     #[error("ArrayIndexOutOfBoundsException: index {index}")]
     ArrayIndexOutOfBoundsException { index: i32 },
+    /// Plain `java.lang.IndexOutOfBoundsException` -- the SUPERCLASS of the
+    /// Array/String variants above, and not interchangeable with them.
+    ///
+    /// Added 2026-08-05. Code that needed this previously reached for
+    /// `ArrayIndexOutOfBoundsException`, which is a *subclass*: a
+    /// `catch (IndexOutOfBoundsException)` still catches it, but anything
+    /// testing the class, and the JDK's own contracts, do not agree. Two
+    /// callers need the exact class: `Preconditions.outOfBounds` with a null
+    /// formatter, and `Matcher.appendReplacement`'s "No group N".
+    #[error("IndexOutOfBoundsException: {message:?}")]
+    IndexOutOfBoundsException { message: Option<String> },
 
     #[error("ArithmeticException: {message}")]
     ArithmeticException { message: String },
@@ -868,8 +879,17 @@ pub enum RuntimeError {
     #[error("ArrayStoreException: {message}")]
     ArrayStoreException { message: String },
 
+    /// `message` carries HotSpot's exact text ("Index 3 out of bounds for
+    /// length 2", "Range [0, 5) out of bounds for length 2"). It was absent
+    /// until 2026-08-05, which is why every SIOOBE this VM threw had a null
+    /// message -- 13 rows of `StringPolicyMatrixProbe` differed from HotSpot on
+    /// nothing but that. Build it with the `sioobe_*` constructors below rather
+    /// than by hand, so the wording stays in one place.
     #[error("StringIndexOutOfBoundsException: index {index}")]
-    StringIndexOutOfBoundsException { index: i32 },
+    StringIndexOutOfBoundsException {
+        index: i32,
+        message: Option<String>,
+    },
 
     #[error("ClassNotFoundException: {class_name}")]
     ClassNotFoundException { class_name: String },
@@ -1018,8 +1038,20 @@ pub enum RuntimeError {
     /// That is exactly what `String.matches` / `replaceAll` / `replaceFirst`
     /// did until 2026-08-04 — `"Hello, World".matches("[")` returned `false`
     /// where HotSpot throws.
-    #[error("PatternSyntaxException: {message}")]
-    PatternSyntaxException { message: String },
+    #[error("PatternSyntaxException: {description} near index {index} in {pattern}")]
+    /// The three fields `java.util.regex.PatternSyntaxException` actually
+    /// stores. NOT a pre-formatted message: that class **overrides**
+    /// `getMessage()` and builds its three-line report from `desc`, `pattern`
+    /// and `index`, using `System.lineSeparator()` -- so formatting it here
+    /// would hard-code `\n` where HotSpot emits `\r\n` on Windows, and would
+    /// still leave `getDescription()` / `getPattern()` / `getIndex()` empty.
+    /// The throw site sets the fields and lets the JDK's own bytecode format
+    /// them. `index` is -1 when unknown.
+    PatternSyntaxException {
+        description: String,
+        pattern: String,
+        index: i32,
+    },
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -1033,6 +1065,65 @@ fn format_optional_message(message: &Option<String>) -> String {
 }
 
 impl RuntimeError {
+    /// `StringIndexOutOfBoundsException` with HotSpot's `checkIndex` wording.
+    ///
+    /// The three `sioobe_*` constructors reproduce `jdk.internal.util
+    /// .Preconditions`'s three message shapes verbatim. Reproduced rather than
+    /// invented: the JDK builds these in `Preconditions.outOfBounds*` and real
+    /// code greps them, so the wording is behaviour, not decoration. Keep them
+    /// here so the format strings cannot drift between the dozen call sites.
+    pub fn sioobe_index(index: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index,
+            message: Some(format!("Index {index} out of bounds for length {length}")),
+        }
+    }
+
+    /// HotSpot's `checkFromToIndex` wording: a half-open `[from, to)` range.
+    pub fn sioobe_range(from: i32, to: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: if from < 0 { from } else { to },
+            message: Some(format!(
+                "Range [{from}, {to}) out of bounds for length {length}"
+            )),
+        }
+    }
+
+    /// HotSpot's `checkFromIndexSize` wording: `[from, from + size)`. Note the
+    /// message prints the ADDITION unevaluated, which is not the same string as
+    /// `sioobe_range(from, from + size, length)` -- and `from + size` can
+    /// overflow, which is exactly why the JDK does not evaluate it.
+    pub fn sioobe_range_size(from: i32, size: i32, length: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: if from < 0 { from } else { size },
+            message: Some(format!(
+                "Range [{from}, {from} + {size}) out of bounds for length {length}"
+            )),
+        }
+    }
+
+    /// Plain `IndexOutOfBoundsException` with a message.
+    ///
+    /// Use where the JDK throws the SUPERCLASS -- `Preconditions` with no
+    /// exception formatter, and `Matcher`'s "No group N". Reaching for
+    /// `ArrayIndexOutOfBoundsException` there is wrong in the direction that
+    /// breaks a `catch`.
+    pub fn ioobe(message: impl Into<String>) -> Self {
+        RuntimeError::IndexOutOfBoundsException {
+            message: Some(message.into()),
+        }
+    }
+
+    /// A SIOOBE whose call site does not know the length, so it cannot build
+    /// HotSpot's text. Prefer one of the three above; this exists so the
+    /// remaining sites say so explicitly rather than silently passing `None`.
+    pub fn sioobe_no_length(index: i32) -> Self {
+        RuntimeError::StringIndexOutOfBoundsException {
+            index,
+            message: None,
+        }
+    }
+
     /// The Java throwable this error materialises as: `(internal class name,
     /// detail message)`, or `None` when it has no Java counterpart
     /// ([`RuntimeError::NotImplemented`], which must stay an internal error).
@@ -1075,6 +1166,9 @@ impl RuntimeError {
             RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
                 ("java/lang/ArrayIndexOutOfBoundsException", None)
             }
+            RuntimeError::IndexOutOfBoundsException { message } => {
+                ("java/lang/IndexOutOfBoundsException", message.as_deref())
+            }
             RuntimeError::ClassCastException { message } => {
                 ("java/lang/ClassCastException", Some(message.as_str()))
             }
@@ -1099,9 +1193,10 @@ impl RuntimeError {
                 "java/lang/IllegalMonitorStateException",
                 Some(message.as_str()),
             ),
-            RuntimeError::StringIndexOutOfBoundsException { index: _ } => {
-                ("java/lang/StringIndexOutOfBoundsException", None)
-            }
+            RuntimeError::StringIndexOutOfBoundsException { message, .. } => (
+                "java/lang/StringIndexOutOfBoundsException",
+                message.as_deref(),
+            ),
             RuntimeError::NumberFormatException { message } => {
                 ("java/lang/NumberFormatException", Some(message.as_str()))
             }
@@ -1199,10 +1294,12 @@ impl RuntimeError {
             // `getMessage()` — the same `msg=null` the real `Pattern.compile`
             // bridge already produces. Getting the class right is the part that
             // changes control flow; the description text is a separate gap.
-            RuntimeError::PatternSyntaxException { message } => (
-                "java/util/regex/PatternSyntaxException",
-                Some(message.as_str()),
-            ),
+            // `None`: the real class leaves `Throwable.detailMessage` null and
+            // overrides `getMessage()`. The throw site fills `desc`/`pattern`/
+            // `index` right after construction.
+            RuntimeError::PatternSyntaxException { .. } => {
+                ("java/util/regex/PatternSyntaxException", None)
+            }
             RuntimeError::NotImplemented { feature: _ } => return None,
         };
         Some(pair)
@@ -1458,7 +1555,7 @@ mod tests {
 
     #[test]
     fn runtime_error_string_index_out_of_bounds() {
-        let err = RuntimeError::StringIndexOutOfBoundsException { index: 99 };
+        let err = RuntimeError::sioobe_no_length(99);
         assert_eq!(
             format!("{err}"),
             "StringIndexOutOfBoundsException: index 99"

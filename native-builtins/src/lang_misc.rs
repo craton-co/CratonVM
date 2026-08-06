@@ -2229,7 +2229,21 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         "java/io/FileNotFoundException",
         "java/io/UncheckedIOException",
         "java/io/NotSerializableException",
-        "java/io/InvalidClassException",
+        // `java/io/InvalidClassException` is deliberately NOT in this list, for
+        // the same reason `java/util/regex/PatternSyntaxException` is not: it
+        // OVERRIDES `getMessage()`, prepending the offending class name to the
+        // detail message. A blanket bridge in front of that override returns
+        // the bare `Throwable.detailMessage`, so
+        // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
+        // reported "bad serialVersionUID" where HotSpot reports
+        // "com.example.Foo; bad serialVersionUID" -- and deserialization
+        // diagnostics lose the one field that says WHICH class failed.
+        //
+        // Found 2026-08-05 by checking `javap -p` for a declared
+        // getMessage/getLocalizedMessage/toString across every class in these
+        // two lists; it and `NullPointerException` were the only two left after
+        // PatternSyntaxException. See
+        // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",
@@ -2243,7 +2257,17 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         "java/util/concurrent/ExecutionException",
         "java/util/concurrent/BrokenBarrierException",
         "java/text/ParseException",
-        "java/util/regex/PatternSyntaxException",
+        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+        // list. It is the one exception here that OVERRIDES `getMessage()`:
+        // the JDK builds a three-line report ("Unclosed character class near
+        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+        // fields and never sets `Throwable.detailMessage`. A blanket
+        // `getMessage` bridge in front of that override returns the null
+        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+        // where HotSpot gives the full report. Its real constructor is
+        // `(String,String,int)V`, which is not among the `<init>` shapes
+        // registered here either, so every bridge this loop would add is
+        // either dead or actively wrong. Removed 2026-08-05.
         "java/lang/NegativeArraySizeException",
         "java/lang/AssertionError",
         "java/lang/MatchException",

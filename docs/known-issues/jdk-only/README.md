@@ -7,7 +7,7 @@ implementation findings; re-verified against the re-landed tree the same day.
 >
 > **This directory is the evidence base** — what is broken, how it was measured,
 > what the blast radius is. One record per defect; a record moves to
-> `docs/internal/` when it is fixed.
+> the internal record tree when it is fixed.
 >
 > **The parallel execution plan is
 > [`docs/feature-designs/jdk-only-wave2/`](../../feature-designs/jdk-only-wave2/README.md)** —
@@ -26,15 +26,15 @@ record carries a **What changed on 2026-08-04** section stating what was done
 and what it did *not* do. Read that section before working an item; the body
 below it is the original filing.
 
-**Closed and moved to `docs/internal/`:**
+**Closed and moved to the internal record tree:**
 
 | Was | Now |
 |---|---|
-| 9 — the observability surface | [`jdk-only-observability-surface-FIXED-20260804.md`](../../internal/jdk-only-observability-surface-FIXED-20260804.md) |
-| 10 — `System.exit` bypasses the census | [`jdk-only-system-exit-census-FIXED-20260804.md`](../../internal/jdk-only-system-exit-census-FIXED-20260804.md) |
-| 8 — the real-protected-stub allow-lists | [`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) |
+| 9 — the observability surface | `jdk-only-observability-surface-FIXED-20260804.md` |
+| 10 — `System.exit` bypasses the census | `jdk-only-system-exit-census-FIXED-20260804.md` |
+| 8 — the real-protected-stub allow-lists | `jdk-only-real-protected-stub-allowlists-FIXED-20260804.md` |
 
-## 2026-08-05 — two records added
+## 2026-08-05 — three records added
 
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
 `native-io` `Bridge` registrations that L5's `register_with_kind` migration
@@ -53,8 +53,16 @@ measured rather than assumed — that the tree's only `bridge` marker outside
 `native-collections` has **zero** rows a migration could ever state, and that
 `ABSENT` on a platform-named class means "not measured here", not "dead".
 
+[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md)
+— and then the two instruments that answer both of those. The census asks about
+one class in one image, so **1,939 of the 2,542 "method not declared" rows are
+actually inherited** (19 of them from an `ACC_NATIVE` supertype) and **59
+registrations are a genuine bridge only on Windows**, provable from the Linux
+host because CratonVM adjudicates an image it cannot run. Corrects three
+verdicts in the two records above.
+
 **Found and fixed while working this list, not filed here before:**
-[`--jdk-only` could not start a thread](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).
+`--jdk-only` could not start a thread (`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`).
 §7 step 3's decline fell through to `UnsatisfiedLinkError` rather than to the
 bytecode, so every `new Thread(…)` died, every `ExecutorService` had no live
 workers, a workload that joined on one **hung**, and `FileChannel.size()`
@@ -207,11 +215,11 @@ behaviour** — no exception, no log line, no failing test.
 | 7 | [The `ThreadPoolExecutor.execute` receiver-shape case is copied eight times](threadpoolexecutor-execute-receiver-shape-special-case-copies.md) | Wave 1's markers name four. There are **eight** dispatch sites in the `vm` crate plus one unconditional `force_native` arm they all exist to override. A mechanical "delete every marked site" sweep leaves half the duplication enforcing a policy the other half no longer applies. The marker undercount is unchanged by the re-land. |
 
 Item 8 left this table on 2026-08-04:
-[the real-protected-stub allow-lists](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md)
+the real-protected-stub allow-lists (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`)
 are one predicate now.
 
 Item 3 left it the same day:
-[the forced-native `String` policy](../../internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
+the forced-native `String` policy (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`)
 is gone — all four copies of it, the fourth having gone uncounted by this
 record. The lists were removed after being MEASURED inert (a binary without
 them produced a byte-identical 392-case `String` transcript in both modes and
@@ -234,9 +242,9 @@ accurately; what changed is how much of each is left, and in one case (item 8's
 
 ### Tier 2 — the instruments the tier-1 items must be measured with
 
-**Both closed 2026-08-04**, and moved to `docs/internal/`:
-[the observability surface](../../internal/jdk-only-observability-surface-FIXED-20260804.md)
-and [the `System.exit` census](../../internal/jdk-only-system-exit-census-FIXED-20260804.md).
+**Both closed 2026-08-04**, and moved to the internal record tree:
+the observability surface (`jdk-only-observability-surface-FIXED-20260804.md`)
+and the `System.exit` census (`jdk-only-system-exit-census-FIXED-20260804.md`).
 
 Their outputs are what the tier-1 items should now be worked from. In
 particular: `requested_by` names the Rust call site of every fabrication, the

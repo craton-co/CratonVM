@@ -114,6 +114,29 @@ they would vectorise a loop in this method, and declines it if so.
 Closeout
 · [brief](perf-01-sieve-ir-body-6x-slower-than-c1.md).
 
+~~`perf-02`~~ **FIXED 2026-08-05**, same day it was found — and a different
+animal from `perf-01`, despite also surfacing as "the IR tier took a bench
+method and it got slower". Nothing was wrong with the IR *body*: both backends
+erase the dead shadow-stack thread fetch from the prologue, and the single-pass
+backend had been jumping over the erased span since June while the IR backend
+only NOP-filled it. So **every IR method that published nothing retired 46
+one-byte NOPs on entry, on every invocation** — `CratonBench fib`, a two-line
+static method entered 2.27e9 times, paid it 2.27e9 times and ran 1.96x slower.
+One shared `ExecutableBuffer::erase_range_with_jump_over` now serves both
+backends. 1.74x recovered, checksums unchanged on all seven phases. The 1.32x
+residual against the pre-regression body is *mostly not a defect*: the frame
+record and the per-call safepoint-id store are precise-root and deopt metadata
+the IR tier emits and the single-pass backend does not. Only the epilogue
+savetop-restore is genuinely dead (~1.32x -> 1.27x); the rest is `perf-01`'s
+still-open policy question about replacing a C1 body without evidence.
+closeout (`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`)
+· [brief](perf-02-ir-methods-run-46-nops-on-entry.md).
+
+Worth keeping the pair in mind together: `perf-01` was a worse body and the fix
+was to *decline the method*; `perf-02` was a fine body carrying dead weight and
+the fix was to *delete the weight*. A widening lane that makes a benchmark
+slower is not automatically evidence against the lane.
+
 **The general form was taken on the same day.** What the single-pass backend
 can do and the IR tier cannot is now enumerated in
 `jit/src/x64/single_pass_only.rs` — seven classes, each consumed by a
@@ -158,6 +181,7 @@ read each lane's "first increment".
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
 | ~~`cov-07`~~ | ~~one `ir_compatible` conjunct~~ | ~~89~~ | **CLOSED 2026-08-04** — the question answered itself: `athrow` reuses the exact sentinel-drain protocol `checkcast` (cov-05) already uses, not a second answer to where an exception goes. `scan.has_athrow` refusals 46 → **0** on `ConditionalOnPropertyTests`. Closeout |
 | ~~`meas-02`~~ **closed 2026-08-03** | `regression-suite/perf/`, `bench/` | — | the gate records its own C2 reach now — `meas-02-bench-suite-c2-reach-RETIRED-20260803.md` |
+| ~~`perf-02`~~ **FIXED 2026-08-05** | `IrLowerer::finish_lazy_thread_fetch` | — | the IR backend NOP-filled the erased shadow thread fetch instead of jumping over it, so every IR method that published nothing ran **46 NOPs on entry**; `fib` 1.96x. 1.74x recovered, checksums unchanged. The 1.32x residual is mostly precise-root/deopt metadata the single-pass body never carried, not dead code; only the epilogue savetop-restore is erasable. Closeout · [brief](perf-02-ir-methods-run-46-nops-on-entry.md) |
 
 Three of them (`cov-05`, `cov-06`, `cov-07`) each delete **exactly one**
 conjunct from `ir_compatible`, which is one small function. Four of them

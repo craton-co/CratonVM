@@ -3110,6 +3110,22 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// `Method.exceptionTypes` and applies JLS-spec UndeclaredThrowable-
 /// Exception wrapping for non-`RuntimeException` / non-`Error`
 /// mismatches (item 6).
+/// The declared return-type descriptor of the annotation member `method_obj`
+/// describes, e.g. `Z` for `boolean nullIfImpossible()`. Falls back to
+/// `Ljava/lang/Object;`, which is what this call site used unconditionally
+/// before — correct for every already-boxed member value, wrong only for the
+/// unboxed `AnnotationDefault` fallback.
+fn annotation_member_return_descriptor(
+    ctx: &mut dyn NativeContext,
+    method_obj: cratonvm_types::ObjectRef,
+) -> String {
+    let full = crate::lang_class::method_descriptor_for_invoke(ctx, method_obj);
+    match full.rfind(')') {
+        Some(i) if i + 1 < full.len() => full[i + 1..].to_string(),
+        _ => "Ljava/lang/Object;".to_string(),
+    }
+}
+
 fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let proxy = match args.first() {
         Some(Value::Object(Some(p))) => *p,
@@ -3167,10 +3183,35 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // generated-body path. Without this, the 2nd access of a given
     // (proxyClass, method) returns null (e.g. repeatable `getAnnotationsByType`).
     if handler_class == "java/lang/annotation/AnnotationProxy" {
-        let mname = match ctx.get_field_by_name(method_obj, "name") {
+        // The member NAME is the whole routing key here. Reading it off the
+        // `Method`'s `name` FIELD only works while the receiver has the layout
+        // this code assumes: `get_field_by_name` answers `Object(None)` for a
+        // name it cannot resolve, and an empty name then falls through to the
+        // generic `handler.invoke(...)` tail below — which asks an
+        // `AnnotationProxy` for a member literally called `invoke`, finds none,
+        // and hands back **null for every annotation member regardless of its
+        // declared type**. That is indistinguishable, at the call site, from a
+        // genuinely absent member: Byte Buddy's
+        // `AnnotationDescription$ForLoadedAnnotation.getValue` turns it into
+        // `asValue(null, int.class)` → null → NPE on `.filter(...)`, whether
+        // the member is an `int`, an enum or a `Class`. Fall back to the real
+        // `Method.getName()` before giving up.
+        let mut mname = match ctx.get_field_by_name(method_obj, "name") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
+        if mname.is_empty() {
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(method_obj, "getName", "()Ljava/lang/String;", &[])
+            {
+                mname = ctx.read_string(s).unwrap_or_default();
+            }
+            if crate::nbflags().dbg_annproxy_wrap {
+                eprintln!(
+                    "[DBG_WRAP] invokeProxy: Method.name field was unreadable; getName() -> {mname:?}"
+                );
+            }
+        }
         // Object-inherited methods: `ctx.invoke("AnnotationProxy", mname, ...)`
         // below does not reliably resolve these (the by-name path used by this
         // 2nd call site doesn't reach `annotation_proxy_dispatch_impl`'s
@@ -3297,16 +3338,66 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     ann_args.push(ctx.get_array_element(arr, i));
                 }
             }
-            // Routing into the AnnotationProxy interception is by class+name; the
-            // descriptor only governs result unboxing, and the AnnotationProxy
-            // hands back an already-boxed value (Object) — exactly what
-            // invokeProxy must return.
-            return ctx.invoke(
+            // Routing into the AnnotationProxy interception is by class+name;
+            // the descriptor governs result coercion.
+            //
+            // `()Ljava/lang/Object;` is right for every member the proxy stores
+            // — those are already boxed — but NOT for the one case it does not
+            // store: a member ABSENT from the proxy's parallel arrays whose
+            // value comes from the interface's `AnnotationDefault`.
+            // `annotation_proxy_dispatch_impl` returns those UNBOXED
+            // (`Value::Int`/`Long`/`Float`/`Double`), because the primary
+            // interpreter door passes the member's REAL descriptor (`()Z`,
+            // `()I`, …) and unboxes against it. Here the declared descriptor is
+            // `Object`, and `coerce_native_return` maps a raw `Value::Int(0)`
+            // onto `Object(None)` — so an omitted `boolean … default false`
+            // member reads back as **null**.
+            //
+            // That is not hypothetical: Byte Buddy's `SuperCall$Binder.bind`
+            // does `annotation.getValue(NULL_IF_IMPOSSIBLE).resolve(Boolean.class)
+            // .booleanValue()` on `@SuperCall.nullIfImpossible()` — declared
+            // `boolean default false` and omitted at every use site — and NPEs
+            // on the null, failing `Mockito.mock(<interface>)` outright. It is
+            // intermittent because this door is only reached once the generated
+            // `$ProxyN` body has been JIT-compiled, so it tracks compile timing
+            // and therefore machine load.
+            //
+            // Keep asking with `()Ljava/lang/Object;` — the AnnotationProxy
+            // interception is descriptor-agnostic and every STORED member value
+            // is already a wrapper, which passes an `L` slot untouched. Box only
+            // the raw primitive, using the member's own declared return type, so
+            // both representations leave here as objects — the same thing the
+            // `hashCode`/`equals` arms above already do.
+            let result = ctx.invoke(
                 "java/lang/annotation/AnnotationProxy",
                 &mname,
                 "()Ljava/lang/Object;",
                 &ann_args,
-            );
+            )?;
+            let boxed = match result {
+                Some(v @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_))) => {
+                    let ret_desc = annotation_member_return_descriptor(ctx, method_obj);
+                    if crate::nbflags().dbg_annproxy_wrap {
+                        eprintln!(
+                            "[DBG_WRAP] invokeProxy: {mname}() returned raw {v:?}; boxing as {ret_desc}"
+                        );
+                    }
+                    Some(crate::lang_class::box_value(ctx, v, &ret_desc))
+                }
+                other => other,
+            };
+            if crate::nbflags().dbg_annproxy_wrap {
+                let shape = match &boxed {
+                    Some(Value::Object(Some(o))) => {
+                        format!("Object({})", crate::lang_class::ctx_class_name_of(ctx, *o))
+                    }
+                    Some(Value::Object(None)) => "Object(null)".to_string(),
+                    Some(other) => format!("{other:?}"),
+                    None => "void".to_string(),
+                };
+                eprintln!("[DBG_WRAP] invokeProxy {mname}() -> {shape}");
+            }
+            return Ok(boxed);
         }
     }
 
@@ -3493,7 +3584,7 @@ pub(crate) fn define_or_get_proxy_class(
             ordered.push(c);
         }
     }
-    let cache_key = (loader_id, ordered.clone());
+    let cache_key = (ctx.vm_identity(), loader_id, ordered.clone());
 
     {
         let guard = PROXY_CLASS_CACHE.read();
@@ -3655,10 +3746,21 @@ pub(crate) fn resolve_serialized_proxy_class(
     // an in-process write→read round-trip (e.g. Spring's
     // `SerializableTypeWrapper`) — always hits here because the write side
     // created the proxy class via `Proxy.newProxyInstance` first.
+    //
+    // "Regardless of the loader namespace" is deliberate; "regardless of the
+    // VM" is not. This scan ignores the key's `loader_id` on purpose, so it
+    // MUST filter on `vm_identity` explicitly — the `ClassId`s on both sides
+    // of the comparison, and the one returned, belong to one class manager.
+    // Left unfiltered it was the widest of the three ways this cache leaked
+    // a foreign proxy class.
+    let vm = ctx.vm_identity();
     {
         let guard = PROXY_CLASS_CACHE.read();
         if let Some(map) = guard.as_ref() {
-            for ((_ns, key), &cid) in map.iter() {
+            for ((row_vm, _ns, key), &cid) in map.iter() {
+                if *row_vm != vm {
+                    continue;
+                }
                 let mut key_set = key.clone();
                 key_set.sort_by_key(|c| c.as_u32());
                 key_set.dedup();

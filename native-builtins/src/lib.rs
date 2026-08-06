@@ -2624,7 +2624,7 @@ mod bootstrap_property_fallback_tests {
     /// scope, because every reader here runs on this thread.
     fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = env_lock();
-        let previous = std::env::var_os("JBOSS_HOME");
+        let previous = cratonvm_types::flags::runtime_var_os("JBOSS_HOME");
         match home {
             Some(v) => std::env::set_var("JBOSS_HOME", v),
             None => std::env::remove_var("JBOSS_HOME"),
@@ -6496,13 +6496,47 @@ fn populate_real_thread_holder(
         Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
         None => target,
     };
+    // A new thread's priority is NOT a constant. The JDK's
+    // `Thread(ThreadGroup g, ...)` takes the CREATING thread's priority and
+    // then caps it at the group's ceiling:
+    //
+    //     int priority = parent.getPriority();
+    //     if (priority > g.getMaxPriority()) priority = g.getMaxPriority();
+    //
+    // This site hard-coded `NORM_PRIORITY`, so a thread created in a group
+    // lowered to 3 still reported 5 — `probes/ThreadGroupPriorityProbe`
+    // measures 5 where Temurin 25.0.3 gives 3. That defeats the point of
+    // lowering a pool's group, which is to cap the threads it will hold.
+    // `setPriority` already clamped against the group correctly; only
+    // construction skipped the step.
+    let creator_priority = {
+        let creator = ctx.current_thread_object();
+        match ctx.get_field_by_name(creator, "holder") {
+            Value::Object(Some(h)) => ctx
+                .get_field_by_name(h, "priority")
+                .as_int()
+                .filter(|p| (1..=10).contains(p))
+                .unwrap_or(5),
+            // JDK 17 shape (no FieldHolder), or a mirror still under
+            // construction: NORM_PRIORITY is the JDK's own default.
+            _ => 5,
+        }
+    };
+    let group_ceiling = match group {
+        Value::Object(Some(g)) => ctx
+            .get_field_by_name(g, "maxPriority")
+            .as_int()
+            .filter(|p| (1..=10).contains(p))
+            .unwrap_or(10),
+        _ => 10,
+    };
     let args = [
         Value::Object(Some(holder)),
         group,
         target,
         Value::Long(0), // stackSize
-        Value::Int(5),  // priority = NORM_PRIORITY
-        Value::Int(0),  // daemon = false
+        Value::Int(creator_priority.min(group_ceiling)),
+        Value::Int(0), // daemon = false
     ];
     let ctor_ok = ctx
         .invoke(
@@ -7651,7 +7685,7 @@ pub fn register_essential_natives_with_shims(
     // for every non-Latin-1 `String` key in the VM, which is not an edge case:
     // it is every `HashMap<String,_>` with a non-ASCII key. The underlying
     // `StringUTF16` defect is filed separately — see
-    // `docs/known-issues/string-utf16-hashcode-reads-bytes-not-code-units.md`
+    // `string-utf16-hashcode-reads-bytes-not-code-units-FIXED-20260805.md`
     // — and when it is fixed this registration should be re-measured and
     // probably deleted, because at that point it becomes a pure perf
     // optimisation again and has to argue for itself on those terms.
@@ -7683,10 +7717,25 @@ pub fn register_essential_natives_with_shims(
     // are interleaved.) Kept registered because synthetic-jdk mode still needs
     // it -- there the drop does not apply.
     //
-    // Re-examine with suite numbers when they are available: this is one
-    // microbenchmark on a loaded host, and `String.hashCode` is hot in every
-    // real workload. If it comes back, it comes back with those numbers and a
-    // `register_with_kind` stating the kind.
+    // Those numbers were asked to be re-checked against a real workload on the
+    // Linux host before this was final. Done, same day, on two dev-tip binaries
+    // differing only in this registration's kind: in-VM `javac` over 60 classes
+    // whose constants are UTF-16 `HashMap` keys, A-B-B-A, two rounds —
+    //
+    //   native    97408  95020  95599  87269 ms
+    //   bytecode  98888  86560  90650  87245 ms
+    //
+    // — fully overlapping, on a corpus picked to maximise the effect. The
+    // microbenchmark above also reproduced independently (medians: cold 100 vs
+    // 108 latin1, 148 vs 150 utf16; warm 6/7 vs 3/2; map 120 vs 121). So the
+    // native does not come back.
+    //
+    // A first, NON-interleaved pass of that javac A/B reported 49.8 s against
+    // 71.0 s — a clean 1.43x, every native round below every bytecode round —
+    // and it did not survive A-B-B-A on a loaded host. That is the third perf
+    // claim in this feature to fail re-measurement and the second where the
+    // ordering of the runs decided the answer. On this host an A/B that is not
+    // A-B-B-A interleaved is not a measurement.
     registry.register(
         "java/lang/String",
         "hashCode",
@@ -11151,12 +11200,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11177,12 +11234,20 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if index < 0 || index >= length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: index,
-                    }
-                    .into(),
-                )
+                // `Preconditions.outOfBounds` with a null formatter throws the
+                // SUPERCLASS, `IndexOutOfBoundsException` -- never
+                // `ArrayIndexOutOfBoundsException`, which is a subclass and so
+                // wrong in the direction that breaks a `catch`. The message is
+                // `checkIndex`'s, verbatim.
+                //
+                // The `BiFunction` formatter is still not invoked here; the
+                // String-domain callers are intercepted upstream by the three
+                // `java/lang/String.check*` natives. See
+                // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Index {index} out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(index)))
             }
@@ -11207,12 +11272,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11236,12 +11299,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             if from < 0 || from > to || to > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {to}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -11265,13 +11326,13 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            if from < 0 || size < 0 || from + size > length {
-                Err(
-                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                        index: from,
-                    }
-                    .into(),
-                )
+            // Overflow-safe: `from + size` can wrap for large arguments, which
+            // is why the JDK's own message prints the addition unevaluated.
+            if from < 0 || size < 0 || (from as i64 + size as i64) > length as i64 {
+                Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+                    "Range [{from}, {from} + {size}) out of bounds for length {length}"
+                ))
+                .into())
             } else {
                 Ok(Some(Value::Int(from)))
             }
@@ -14602,7 +14663,13 @@ pub fn register_essential_natives_with_shims(
 
     // Win32-side filesystem init — noop in our VM (path canonicalization
     // and FS flags are built in Rust, not JNI).
-    registry.register("java/io/WinNTFileSystem", "initIDs", "()V", native_noop);
+    registry.register_with_kind(
+        "java/io/WinNTFileSystem",
+        "initIDs",
+        "()V",
+        native_noop,
+        NativeKind::Bridge,
+    );
     registry.register_with_kind(
         "java/io/UnixFileSystem",
         "initIDs",
@@ -14872,7 +14939,7 @@ pub fn register_essential_natives_with_shims(
     );
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
-    registry.register(
+    registry.register_with_kind(
         "java/lang/ProcessEnvironment",
         "environmentBlock",
         "()Ljava/lang/String;",
@@ -14887,6 +14954,7 @@ pub fn register_essential_natives_with_shims(
             block.push('\0');
             Ok(Some(Value::Object(Some(ctx.create_string(&block)))))
         },
+        NativeKind::Bridge,
     );
     // Executable/Method/Constructor accessors with the same synthetic layout.
     registry.register(
@@ -16835,7 +16903,13 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`. See the
+            // slot table in `logmanager.rs`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -16851,7 +16925,12 @@ pub fn register_essential_natives_with_shims(
             };
             let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(logger, 0, Value::Object(Some(name_obj)));
+            // Slot 0 is `Logger.config` on a real layout, not `name`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name_obj)),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -20323,7 +20402,7 @@ pub fn register_essential_natives_with_shims(
     // path instead of failing during resolver initialization.
     // `notifyAddrChange0()` drives the optional network-change listener —
     // see its own registration below for why it must NOT answer 0.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "init0",
         "()V",
@@ -20342,8 +20421,9 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "loadDNSconfig0",
         "()V",
@@ -20362,6 +20442,7 @@ pub fn register_essential_natives_with_shims(
             );
             Ok(None)
         },
+        NativeKind::Bridge,
     );
     // `notifyAddrChange0()` is NOT a passive query — it is a BLOCKING wait,
     // and `ResolverConfigurationImpl$AddressChangeListener.run()` is
@@ -20375,11 +20456,12 @@ pub fn register_essential_natives_with_shims(
     // notification mechanism" answer: the listener returns and the thread
     // exits. CratonVM's resolver configuration is read once at init0 and
     // never reloaded, so there is nothing for a listener to observe anyway.
-    registry.register(
+    registry.register_with_kind(
         "sun/net/dns/ResolverConfigurationImpl",
         "notifyAddrChange0",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(-1))),
+        NativeKind::Bridge,
     );
 
     // JNDI DNS uses PortConfig to select a UDP source port. These are native
@@ -36936,13 +37018,37 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/util/FormatterClosedException",
         "java/util/NoSuchElementException",
         "java/text/ParseException",
-        "java/util/regex/PatternSyntaxException",
+        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+        // list. It is the one exception here that OVERRIDES `getMessage()`:
+        // the JDK builds a three-line report ("Unclosed character class near
+        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+        // fields and never sets `Throwable.detailMessage`. A blanket
+        // `getMessage` bridge in front of that override returns the null
+        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+        // where HotSpot gives the full report. Its real constructor is
+        // `(String,String,int)V`, which is not among the `<init>` shapes
+        // registered here either, so every bridge this loop would add is
+        // either dead or actively wrong. Removed 2026-08-05.
         "java/util/InputMismatchException",
         "java/io/IOException",
         "java/io/FileNotFoundException",
         "java/io/UncheckedIOException",
         "java/io/NotSerializableException",
-        "java/io/InvalidClassException",
+        // `java/io/InvalidClassException` is deliberately NOT in this list, for
+        // the same reason `java/util/regex/PatternSyntaxException` is not: it
+        // OVERRIDES `getMessage()`, prepending the offending class name to the
+        // detail message. A blanket bridge in front of that override returns
+        // the bare `Throwable.detailMessage`, so
+        // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
+        // reported "bad serialVersionUID" where HotSpot reports
+        // "com.example.Foo; bad serialVersionUID" -- and deserialization
+        // diagnostics lose the one field that says WHICH class failed.
+        //
+        // Found 2026-08-05 by checking `javap -p` for a declared
+        // getMessage/getLocalizedMessage/toString across every class in these
+        // two lists; it and `NullPointerException` were the only two left after
+        // PatternSyntaxException. See
+        // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
         "java/io/EOFException",
         "java/io/UnsupportedEncodingException",
         "java/net/MalformedURLException",
@@ -38806,13 +38912,44 @@ fn native_array_new_instance_multi(
 static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WP2.5-B — generated-proxy-class cache, keyed on
-/// `(loader_id, ordered_iface_class_ids)`. One generated `$ProxyN` class
-/// per (loader, ordered-interface-list) — the JDK `ProxyGenerator` does the
-/// same, keying on interface order so `getInterfaces()` round-trips the
-/// user-requested order.
+/// `(vm_identity, loader_id, ordered_iface_class_ids)`. One generated
+/// `$ProxyN` class per (VM, loader, ordered-interface-list) — the JDK
+/// `ProxyGenerator` does the same minus the VM, keying on interface order so
+/// `getInterfaces()` round-trips the user-requested order.
+///
+/// The `vm_identity` is load-bearing, not hygiene. Every other component of
+/// this entry is a per-VM number: `loader_id` is a small per-VM integer, the
+/// key's `ClassId`s are minted per VM from zero, and **the VALUE is a
+/// `ClassId`** — a handle that means nothing outside the class manager that
+/// issued it. Without the partition, VM B asking for a proxy over its
+/// interface `ClassId(42)` hit VM A's entry and was handed VM A's generated
+/// `$ProxyN` id. `class_name_of_id` then answered `None` for it, which is the
+/// `?` in the `ClassCastException: ? cannot be cast to …` that made the
+/// proxy/annotation corpus tests flip in roughly half of all parallel runs —
+/// in both directions, since the borrowed id sometimes happened to satisfy
+/// the cast and sometimes not.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
-    Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
+    Option<
+        rustc_hash::FxHashMap<
+            (usize, u32, Vec<cratonvm_types::ClassId>),
+            cratonvm_types::ClassId,
+        >,
+    >,
 > = parking_lot::RwLock::new(None);
+
+/// Drop every generated-proxy-class row belonging to `vm_identity`. Called
+/// from `release_vm_native_state`; the rows hold `ClassId`s into a class
+/// manager that is going away.
+pub fn forget_vm_proxy_classes(vm_identity: usize) {
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, _), _| *vm != vm_identity);
+    }
+    let mut modules = PROXY_LOADER_MODULES.write();
+    if let Some(map) = modules.as_mut() {
+        map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
 
 /// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
 /// per-loader counters; a global counter is sufficient here since the

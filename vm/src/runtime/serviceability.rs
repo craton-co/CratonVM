@@ -4259,6 +4259,7 @@ mod tests {
         const CLASS_ID: u32 = 61_001;
 
         register_class_layout(
+            cratonvm_types::FIRST_LAYOUT_DOMAIN,
             CLASS_ID,
             Arc::new(CompactLayout {
                 field_offsets: vec![0],

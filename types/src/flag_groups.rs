@@ -215,6 +215,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "classpath", on_key: Some("CRATONVM_DBG_CLASSPATH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cleaners", on_key: None, off_key: Some("CRATONVM_DBG_NO_CLEANERS"), off_word: None },
     E { group: Group::DBG, token: "clinit-fail", on_key: Some("CRATONVM_DBG_CLINIT_FAIL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "clinit-order", on_key: Some("CRATONVM_DBG_CLINIT_ORDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "clone", on_key: Some("CRATONVM_DBG_CLONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "coerce", on_key: Some("CRATONVM_DBG_COERCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "compact-inline", on_key: Some("CRATONVM_DBG_COMPACT_INLINE"), off_key: None, off_word: None },
@@ -414,6 +415,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nonmoving-reclaim", on_key: None, off_key: Some("CRATONVM_DBG_NO_NONMOVING_RECLAIM"), off_word: None },
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "unreg-memo-audit", on_key: Some("CRATONVM_DBG_UNREG_MEMO_AUDIT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "redefine-dump", on_key: Some("CRATONVM_DBG_REDEFINE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-trace", on_key: Some("CRATONVM_DBG_NPE_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "nsee-trace", on_key: Some("CRATONVM_NSEE_TRACE"), off_key: None, off_word: None },
@@ -787,6 +791,15 @@ pub const INVENTORY: &[E] = &[
     // a one-flag bisect for the false-positive filter in
     // `conservative_roots::is_plausible_return_pc`.
     E { group: Group::JIT, token: "retpc-validate", on_key: None, off_key: Some("CRATONVM_JIT_NO_RETPC_VALIDATE"), off_word: None },
+    // Default-ON kill switch, hence `off_key` only:
+    // `CRATONVM_JIT=-native-site-cache` takes the JIT's per-call-site native
+    // fast path out of a run. It exists because that path spent 2026-08-05 as
+    // the prime suspect for the Spring Boot corruption family — it reads a memo
+    // keyed on a `JitInvokeInfo` ADDRESS, and while those were recyclable
+    // (`383e7f5cf`) it was the loudest way that hazard surfaced — with no way to
+    // remove it from a run short of a rebuild. See
+    // `jit::helpers::native_site_cache_enabled` for the measured rates.
+    E { group: Group::JIT, token: "native-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache", on_key: Some("CRATONVM_ROOTSNAP_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache-survive-gc", on_key: Some("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "safepoint-polls", on_key: Some("CRATONVM_JIT_SAFEPOINT_POLLS"), off_key: None, off_word: None },
@@ -797,6 +810,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache-loader", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-slots", on_key: Some("CRATONVM_JIT_FIELD_SITE_SLOTS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "method-site-cache", on_key: Some("CRATONVM_JIT_METHOD_SITE_CACHE"), off_key: None, off_word: None },
@@ -844,7 +859,6 @@ pub const INVENTORY: &[E] = &[
     // Interpreter-side, but it lives with the execution-engine knobs like
     // `rootsnap-cache`. Default-ON; `0`/`off`/`false`/`no` is the kill switch.
     E { group: Group::JIT, token: "trivial-getter", on_key: Some("CRATONVM_TRIVIAL_GETTER"), off_key: None, off_word: Some("0") },
-    E { group: Group::JIT, token: "unban-junitcore", on_key: Some("CRATONVM_JIT_UNBAN_JUNITCORE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unroll", on_key: Some("CRATONVM_JIT_UNROLL"), off_key: Some("CRATONVM_DISABLE_UNROLL"), off_word: None },
     // Vectorized emission (`x64::vec_emit::VecEmitPolicy::from_flags`).
     // Default-**OFF**: unset answers `Disabled`, so unsetting the key is the off
@@ -874,6 +888,7 @@ pub const INVENTORY: &[E] = &[
     // means the built-in 20 ms, and `0` is rejected by the parser's own filter,
     // so there is no off state to spell.
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
@@ -934,7 +949,6 @@ pub const INVENTORY: &[E] = &[
     // the single call site that reads both.
     E { group: Group::REAL, token: "annotations", on_key: Some("CRATONVM_REAL_ANNOTATIONS"), off_key: Some("CRATONVM_SYNTHETIC_ANNOTATIONS"), off_word: None },
     E { group: Group::REAL, token: "aqs", on_key: Some("CRATONVM_REAL_AQS"), off_key: Some("CRATONVM_SYNTHETIC_AQS"), off_word: None },
-    E { group: Group::REAL, token: "buffered-writer", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_BUFFERED_WRITER"), off_word: None },
     E { group: Group::REAL, token: "dsa", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_DSA"), off_word: None },
     E { group: Group::REAL, token: "ec", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EC"), off_word: None },
     E { group: Group::REAL, token: "eqe", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_EQE"), off_word: None },

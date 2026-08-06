@@ -1694,7 +1694,7 @@ pub(crate) fn safe_native_call_prevalidated_objects(
 ///   other native does and the JIT's post-invoke drain sees what it expects.
 ///
 /// Measured effect: `probes/NativeShapeProbe.java`, and
-/// `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+/// `native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
 pub(crate) fn safe_native_call_leaf(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -4188,6 +4188,7 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
+        crate::memory::reclaim_guard::note_root_publish(self.shared, self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -5833,7 +5834,7 @@ fn array_element_type_of(shared: &SharedVm, object: ObjectRef) -> Option<ArrayEl
 /// as a coder is what made `compact_java_strings_equal` answer "not equal" for
 /// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
 /// every String key the same map had just stored
-/// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+/// (`chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
 /// So when the positional probe does not describe a String, resolve `value`
 /// and `coder` by NAME off the receiver's own class before giving up.
 fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
@@ -10975,6 +10976,24 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let ref_addr = reference_obj.as_ptr() as usize;
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        // `CRATONVM_DBG_REFDISC=1` — name the CLASS of every reference the
+        // processor is told about, not just its numeric type tag. The tag
+        // cannot distinguish an ordinary `PhantomReference` from a
+        // `jdk.internal.ref.Cleaner`, because a `Cleaner` IS a phantom: its
+        // `super(referent, dummyQueue)` runs the `PhantomReference.<init>`
+        // native and arrives here as `2`. This is the instrument that answered
+        // `direct-bytebuffers-are-never-reclaimed-20260805.md`'s open question
+        // ("find where a real-JDK `jdk.internal.ref.Cleaner` is actually
+        // discovered"), and it is placed BEFORE the type-4 branch below so it
+        // reports whichever wire value a given build's discovery site chose.
+        if crate::runtime::interpreter::dbg_refdisc_enabled() {
+            let cn = self
+                .class_name_of_id(self.shared.mem.heap.class_id_of(reference_obj))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[refdisc] wire={ref_type} class={cn} ref=0x{ref_addr:x} referent=0x{referent_addr:x} queue={queue_addr:x?}"
+            );
+        }
         // 4 = `jdk.internal.ref.Cleaner`: a phantom that RUNS instead of being
         // enqueued. Deliberately not `ReferenceType::Cleaner` — that variant is
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
@@ -12557,7 +12576,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // victim only sees a flag), so the only way to attribute one is to
         // record the producer. Kept permanently and env-gated for the same
         // reason CRATONVM_DBG_CCE_BT is.
-        if std::env::var_os("CRATONVM_DBG_INTERRUPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INTERRUPT").is_some() {
             eprintln!(
                 "CRATONVM_DBG_INTERRUPT: target_obj=0x{:x} target_tid={:?} by_tid={}",
                 thread_obj.as_ptr() as usize,
@@ -18556,7 +18575,22 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             _ => {}
         }
     }
-    // Element not found вЂ” return null/default.
+    // Element not found — return null/default. This is the last stop for every
+    // "annotation member reads back as null" report (Byte Buddy's
+    // `AnnotationDescription$ForLoadedAnnotation.getValue` NPEs on it, Spring's
+    // `AnnotationsScanner` treats the annotation as absent), so name the
+    // annotation and the member when the dispatch trace is on.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() {
+        let type_desc = match shared.mem.heap.get_field(proxy, 0) {
+            Value::Object(Some(s)) => {
+                super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        eprintln!(
+            "[ANN-PROXY-MISS] type={type_desc} member={method_name} elements={n} -> null"
+        );
+    }
     Ok(Some(Value::Object(None)))
 }
 
@@ -20836,7 +20870,7 @@ fn invoke_on_class_shared_inner(
                         // `NativeMethodRegistry::register`'s real-JDK drop —
                         // and a shape that must lose to real bytecode is simply
                         // not registered. See
-                        // `docs/internal/forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
+                        // `forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`.
                         //
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
@@ -23126,6 +23160,7 @@ fn invoke_on_class_shared_inner(
                         // 2026-08-05 `DriverManager.getConnection` witness
                         // leaves open.
                         crate::memory::reclaim_guard::report_root_slice_provenance(
+                            shared,
                             thread,
                             addr,
                             "invoke dispatch",
@@ -24627,7 +24662,7 @@ mod tests {
     /// read its slot 1 (the cached hash) as a coder, reject the value, and
     /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
     /// String-keyed CHM missed every key it held
-    /// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    /// (`chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     #[test]
     fn equal_strings_compare_equal_in_the_embedded_string_layout() {
         let shared = test_shared();
@@ -25675,15 +25710,84 @@ mod tests {
         }
     }
 
+    /// Two live VMs in one process alias each other's compact field layouts.
+    ///
+    /// `ClassStore` hands out `ClassId::new(self.classes.len())`, so ids are
+    /// per-VM indices that every VM restarts from 0. The compact-layout
+    /// registry behind `compact_object_field_storage`
+    /// (`types/src/field_layout.rs`) is PROCESS-GLOBAL and keyed on
+    /// `(class_id, field_count)` alone — no VM in the key — and
+    /// `register_class_layout` overwrites. So two VMs that each define a
+    /// one-field class at the same id share one layout entry, last writer
+    /// wins, and both then decode their objects through the other's storage
+    /// kinds and offsets.
+    ///
+    /// This is the root cause of the `vm --lib` flakes that only ever appeared
+    /// under the full suite: `Float(3.25)` read back as `Int(1078984704)` —
+    /// 0x40500000, the same four bytes through the wrong storage kind —
+    /// `Double(2.5)` as `Double(0.0)`, `Long(1)` as `Long(0)`, and a reference
+    /// slot as `None`. Proven not to be a collector problem: the failing run
+    /// reported `minor GCs so far in this VM: 0`.
+    ///
+    /// Ignored: it documents a defect that is still OPEN. Un-ignore it as the
+    /// acceptance test for the fix. See
+    /// `docs/known-issues/vm/compact-layout-registry-is-process-global-20260805.md`
+    /// — including two fixes that were tried and are NOT sufficient.
+    #[test]
+    fn two_vms_must_not_share_a_compact_layout_for_the_same_class_id() {
+        let vm_a = test_shared();
+        let vm_b = test_shared();
+
+        // Same slot count, different storage: `F` is a 4-byte float, `D` an
+        // 8-byte double. Whichever registers second owns the shared entry.
+        let (cid_a, _) =
+            add_real_class_with_field_descriptors(&vm_a, "cratonvm/test/AliasF", &["F"]);
+        let (cid_b, _) =
+            add_real_class_with_field_descriptors(&vm_b, "cratonvm/test/AliasD", &["D"]);
+        assert_eq!(
+            cid_a, cid_b,
+            "precondition: both VMs must hand out the same ClassId for their \
+             first application class — if this ever stops holding, the aliasing \
+             is gone and so is this test's premise"
+        );
+
+        let obj_a = vm_a.mem.heap.alloc_object(cid_a, 1);
+        vm_a.mem.heap.set_field(obj_a, 0, Value::Float(3.25));
+        let obj_b = vm_b.mem.heap.alloc_object(cid_b, 1);
+        vm_b.mem.heap.set_field(obj_b, 0, Value::Double(2.5));
+
+        assert_eq!(
+            vm_a.mem.heap.get_field(obj_a, 0),
+            Value::Float(3.25),
+            "VM A's float field must not be decoded through VM B's layout"
+        );
+        assert_eq!(
+            vm_b.mem.heap.get_field(obj_b, 0),
+            Value::Double(2.5),
+            "VM B's double field must not be decoded through VM A's layout"
+        );
+    }
+
     #[test]
     fn box_double_value() {
         let shared = test_shared();
         let boxed = proxy_box_value(&shared, Value::Double(2.5));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Double(2.5));
+                // Same unexplained full-suite-only flake as
+                // `t19_h6_cas_field_double_field_roundtrip`; name the class and
+                // the slot so the next occurrence carries its own evidence
+                // instead of just a value mismatch.
+                let got = shared.mem.heap.get_field(obj, 0);
+                assert_eq!(
+                    got,
+                    Value::Double(2.5),
+                    "boxed Double slot 0 held {got:?}; box class_id={:?} kind={:?}",
+                    shared.mem.heap.class_id_of(obj),
+                    shared.mem.heap.kind_of(obj),
+                );
             }
-            _ => panic!("Expected Object(Some(...))"),
+            _ => panic!("Expected Object(Some(...)), got {boxed:?}"),
         }
     }
 
@@ -26369,16 +26473,41 @@ mod tests {
             add_real_class_with_field_descriptors(&shared, "cratonvm/test/EpochStill", &["I"]);
         // Sampled AFTER the class is added: defining a class bumps the epoch
         // too (a new class can be someone's previously-missing ancestor).
-        let before = cratonvm_classloading::class_origin_epoch();
-        // Resolving does not touch provenance.
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
-        assert_eq!(
-            cratonvm_classloading::class_origin_epoch(),
-            before,
+        //
+        // `class_origin_epoch` is PROCESS-GLOBAL, and libtest runs this test
+        // concurrently with every other one that defines a class or calls
+        // `set_origin` -- each of which bumps it. A bare `assert_eq!(after,
+        // before)` therefore asserts something this test does not control, and
+        // it failed for real: `left: 12459, right: 12451`, eight bumps that
+        // arrived from other threads while these two reads ran.
+        //
+        // What the test means is "the READS contribute nothing". A window
+        // interrupted by someone else's write is not evidence against that --
+        // it is a spoiled sample. So retry until one window comes through
+        // clean. If the reads really did bump the epoch then EVERY window is
+        // dirty and this still fails, which is what keeps it honest.
+        const ATTEMPTS: usize = 64;
+        let mut quiet = false;
+        for _ in 0..ATTEMPTS {
+            let before = cratonvm_classloading::class_origin_epoch();
+            // Resolving does not touch provenance.
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            let _ = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+            if cratonvm_classloading::class_origin_epoch() == before {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(
+            quiet,
             "reads must not bump the epoch, or every memo is invalidated \
-             immediately and the lock is back on the hot path"
+             immediately and the lock is back on the hot path -- no quiet \
+             window in {ATTEMPTS} attempts"
         );
+        // Re-sampled for the second half: the loop above may have exited on
+        // any attempt, and a concurrent bump between the two halves would
+        // otherwise be attributed to `set_origin` below.
+        let before = cratonvm_classloading::class_origin_epoch();
         {
             let mut cm = shared.classes.class_manager_write();
             let cls = cm.class_store.get_mut(cid).expect("class present");
@@ -26508,9 +26637,35 @@ mod tests {
             shared: &shared,
             thread: &mut thread,
         };
+        // Read the slot back BEFORE the CAS, so a failure reports what was
+        // actually there rather than only that the CAS said no. This test
+        // fails in roughly 1 of 25 full-suite runs and never in 30 isolated
+        // runs of `vm::vm_exec::tests`; the bare "must succeed" message is a
+        // large part of why the cause is still unknown, since it cannot
+        // separate a mis-decoded descriptor from a slot holding something
+        // else entirely.
+        let desc_before = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        let before_cas = ctx.get_field_volatile(obj, 0);
+        // Did a collection run between the write and this read? A slot holding
+        // freshly-zeroed memory when we wrote 2.5 to it is what a moved or
+        // reclaimed object looks like from a stale `ObjectRef` — but that has
+        // to be PROVEN, not inferred, so count the collections.
+        let gcs = shared.mem.heap.debug_minor_gc_count();
         let swapped = ctx.compare_and_swap_field(obj, 0, Value::Double(2.5), Value::Double(7.5));
-        assert!(swapped, "Double CAS with same-tag expected must succeed");
-        assert_eq!(ctx.get_field_volatile(obj, 0), Value::Double(7.5));
+        assert!(
+            swapped,
+            "Double CAS with same-tag expected must succeed; the slot held \
+             {before_cas:?} just before the CAS, expected Double(2.5), \
+             descriptor resolved to {:?}, minor GCs so far in this VM: {gcs}",
+            desc_before.map(|b| b as char)
+        );
+        let after = ctx.get_field_volatile(obj, 0);
+        assert_eq!(
+            after,
+            Value::Double(7.5),
+            "descriptor was {:?} before the CAS",
+            desc_before.map(|b| b as char)
+        );
     }
 
     /// compare_and_swap_field on an int field вЂ” regression check that
@@ -26556,6 +26711,11 @@ mod tests {
             shared: &shared,
             thread: &mut thread,
         };
+        // Diagnostics for a full-suite-only flake: both assertions below depend
+        // on the descriptor resolving to `J`, and a bare pass/fail cannot tell
+        // "the descriptor was lost" from "the slot held something else".
+        let desc_before = resolve_field_descriptor_byte_cached(&shared, cid, 0);
+        let slot_before = ctx.get_field_volatile(obj, 0);
         // Caller passes args with drifted Double tag (bits = 0).
         let swapped = ctx.compare_and_swap_field(
             obj,
@@ -26563,12 +26723,21 @@ mod tests {
             Value::Double(f64::from_bits(0)),
             Value::Double(f64::from_bits(1)),
         );
-        assert!(swapped, "CAS must succeed by bit-pattern equivalence");
+        assert!(
+            swapped,
+            "CAS must succeed by bit-pattern equivalence; slot held \
+             {slot_before:?}, descriptor resolved to {:?}",
+            desc_before.map(|b| b as char)
+        );
         // Round-trip: storage must persist as Long(1) (descriptor-aware set).
+        let after = ctx.get_field_volatile(obj, 0);
         assert_eq!(
-            ctx.get_field_volatile(obj, 0),
+            after,
             Value::Long(1),
-            "successful CAS must persist with the declared `J` tag"
+            "successful CAS must persist with the declared `J` tag; got \
+             {after:?}, descriptor resolved to {:?} before the CAS and {:?} after",
+            desc_before.map(|b| b as char),
+            resolve_field_descriptor_byte_cached(&shared, cid, 0).map(|b| b as char)
         );
     }
 

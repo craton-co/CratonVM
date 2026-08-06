@@ -138,11 +138,67 @@ serial blocks. That is the third time in this feature a "this native is a
 performance win" claim has failed to survive measurement, and the second time
 the measurement *method* changed the answer.
 
-## Residual
+## Residual — CLOSED 2026-08-05 on the Linux host
 
-Re-examine with suite numbers when the Linux host is available: this is one
-microbenchmark, and `String.hashCode` is hot in every real workload. If the
-native comes back, it comes back with those numbers and a `register_with_kind`
-stating the kind — `string_hash_code_is_left_to_the_bytecode` in
-`vm/tests/wp8_10_9_string_contains_native.rs` makes that a decision rather than
+The residual read: *"Re-examine with suite numbers when the Linux host is
+available: this is one microbenchmark, and `String.hashCode` is hot in every
+real workload. If the native comes back, it comes back with those numbers and a
+`register_with_kind` stating the kind."*
+
+Done, on the Azure Linux host, against **`dev` tip**, on two binaries built
+there and differing only in whether that one registration is
+`register_with_kind(.., Intrinsic)` (native survives the real-JDK drop) or
+`register` (dropped, bytecode runs). **The native does not come back.**
+
+### The application workload the residual asked for
+
+In-VM `javac` (`com.sun.tools.javac.Main` under `--real-jdk`) compiling 60
+generated classes whose constants are UTF-16 `HashMap` keys — 2,400 non-Latin-1
+`String` literals plus explicit `hashCode()` calls, i.e. a corpus deliberately
+weighted toward the thing being measured. A-B-B-A, two rounds, all runs 60/60
+classes:
+
+```
+native    97408  95020  95599  87269 ms
+bytecode  98888  86560  90650  87245 ms
+```
+
+Fully overlapping. **No app-level signal**, on a workload chosen to maximise
+one.
+
+That is not what a first, non-A-B-B-A pass said. Run A,B,A,B,A,B on a quieter
+host earlier the same day it gave native 49.8 s against bytecode 71.0 s — a
+clean 1.43x with every native round below every bytecode round, which is exactly
+what a real effect looks like. It did not survive A-B-B-A on a loaded host.
+**Three separate perf claims in this feature have now failed to survive
+re-measurement, and in two of them the ordering of the runs changed the
+answer.** On this host, treat any A/B that is not A-B-B-A interleaved as
+unmeasured.
+
+### The microbenchmark, independently reproduced
+
+`probes/StringHashCostProbe`, A-B-B-A, three rounds, on the same two dev-tip
+binaries (medians, ms — a second measurement by a different session, not the
+one the table above this section came from):
+
+| arm | cold latin1 | cold utf16 | warm latin1 | warm utf16 | map utf16 |
+|---|---:|---:|---:|---:|---:|
+| native | 100 | 148 | 6 | 7 | 120 |
+| bytecode | 108 | 150 | **3** | **2** | 121 |
+
+Same verdict as the original table and close to its numbers: a few percent on
+the cold fold, **2-3.5x slower on the cached read**, a wash on the map. HotSpot
+25 for scale: 15 / 16 / 0 / 0 / 15.
+
+### The fix itself, independently verified
+
+`probes/StringUtf16HashProbe` on a `dev`-tip binary built on the Linux host:
+`agree=true` on all eight rows plus the cached second call, `GREEK` 924359,
+`TURKISH` -1606790304, `SUPPLEMENT` 274045986, `LONE-SURR` 1829648, and
+`SAME-CONTENT` identical across all three constructions — matching HotSpot 25
+run on the same probe.
+
+So `String.hashCode()` stays with the bytecode, and
+`string_hash_code_is_left_to_the_bytecode` in
+`vm/tests/wp8_10_9_string_contains_native.rs` keeps that a decision rather than
 a reflex.

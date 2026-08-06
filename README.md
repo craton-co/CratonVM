@@ -56,7 +56,7 @@ the window opened). Full methodology in [BENCHMARK.md](BENCHMARK.md).
 | Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
 |-------------------------|-----------|-----------|-----------|---------------|---------------|
 | Arithmetic (2B ops)     | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
-| Fibonacci(44)           | 1,444 ms  | 8,503 ms  | 5.89x     | 3.5% | 2.79x |
+| Fibonacci(44)           | 1,444 ms  | 8,503 ms‡ | 5.89x‡    | 3.5% | 2.79x |
 | Sieve (100K × 20K)      | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
 | Matrix 1280×1280        | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
 | HashMap (10M put/get)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | 1.75x |
@@ -68,10 +68,27 @@ the durable content; absolute times are this host on this day.
 
 **Two rows are now at parity with HotSpot C2** — Matrix (from 2.93x) and Sieve.
 Arithmetic and String/Regex also closed materially against the July figures.
-Fibonacci, HashMap and Binary Trees moved the other way against numbers taken
-in July on a since-re-provisioned host, and those July absolutes were never
-re-measured under the current protocol — see BENCHMARK.md before reading the
-three as regressions.
+HashMap and Binary Trees moved the other way against numbers taken in July on a
+since-re-provisioned host, and those July absolutes were never re-measured
+under the current protocol — see BENCHMARK.md before reading the two as
+regressions.
+
+‡ **Fibonacci was a real regression, and this row predates its fix.** Unlike
+HashMap and Binary Trees, it does not need the caveat above: it was confirmed
+on *one* host in *one* interleaved window — 4,240 ms on a 2026-07-23 build
+against 8,400 ms on `dev`, same JDK, same classes, **1.96x**. The cause was
+found on 2026-08-05 and is not a tiering or optimizer decision. Both JIT
+backends erase the dead shadow-stack thread fetch from the prologue; the
+single-pass backend has jumped over the erased ~46-byte span since June, while
+the IR backend only overwrote it with one-byte `NOP`s. So every IR method that
+published nothing **retired 46 NOPs on entry, on every invocation** — and
+`fib`, a two-line static method entered 2.27e9 times, paid it 2.27e9 times.
+Fixed 2026-08-05: **1.74x** recovered against its own parent commit (8
+interleaved pairs, user CPU time, disjoint ranges), all seven phase checksums
+unchanged
+(`perf-02-ir-thread-fetch-nop-sled-FIXED-20260805.md`).
+The number above is the **pre-fix** measurement and is refreshed on the next
+quiet-window run; the fix is on `dev`, this row is not yet.
 
 † **Sieve's HotSpot column is pooled across two runs, and that is not a
 convenience.** HotSpot on this phase is *bimodal*: across 18 samples it lands
@@ -91,7 +108,7 @@ backend, and the IR body was 6.4x slower than the C1 body it replaced. Fixed
 single-pass backend would lower better, and what that backend can do and the IR
 tier cannot is enumerated rather than discovered one regression at a time
 (`jit/src/x64/single_pass_only.rs`,
-[docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md](docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md)).
+`perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

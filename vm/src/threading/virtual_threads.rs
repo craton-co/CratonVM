@@ -2833,11 +2833,27 @@ mod tests {
         // Schedule a wakeup after 50ms
         mgr.schedule_wakeup(id, std::time::Duration::from_millis(50));
 
-        // Wait for the timer to fire
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Poll for the resubmission rather than sleeping a fixed 150 ms and
+        // then looking exactly once. The property under test is that the timer
+        // FIRES; a fixed sleep additionally asserts that this machine schedules
+        // the timer thread promptly, which it does not do under the full
+        // suite's load — `left: None, right: Some(1)`, 1 of 30 full-suite runs
+        // and never in isolation.
+        //
+        // The deadline is generous because it bounds only the failure case: a
+        // working timer satisfies this in ~50 ms, and a broken one is still
+        // reported, just later.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut task = None;
+        while std::time::Instant::now() < deadline {
+            task = mgr.scheduler().next_task(0);
+            if task.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         // The scheduler should have the task resubmitted
-        let task = mgr.scheduler().next_task(0);
         assert_eq!(
             task,
             Some(id),

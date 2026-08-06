@@ -1083,7 +1083,7 @@ pub(crate) fn no_class_def_found_error(
 /// delegation answer with a synthetic stub again, as it did before 2026-07-27.
 fn stub_may_answer_load_class() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
 }
 
 /// GC-SAFETY wrapper — the real-JDK sibling of

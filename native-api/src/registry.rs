@@ -2642,7 +2642,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// dispatching `String.equals`. An implementation must never report `false`
     /// for a pair it did not actually read: doing so silently turned every
     /// `ConcurrentHashMap.get` on a String key into a miss (see
-    /// `docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
+    /// `chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }
@@ -4613,6 +4613,28 @@ pub struct NativeMethodRegistry {
     /// Per-registration copy of [`Self::next_kind_stated`], index-parallel with
     /// `registrations` and `categories`.
     kind_stated: Vec<bool>,
+    /// Whether ANYONE chose `current_category`, as opposed to it still being
+    /// the constructor's `SyntheticStub` default.
+    ///
+    /// Deliberately **wider** than [`Self::next_kind_stated`], which the census
+    /// documents as "adjudicated at the registration site" and which only
+    /// `register_with_kind` sets. `set_category` and `with_category` are just
+    /// as much a choice — `with_category`'s own doc calls it "how a whole
+    /// `register_*` function tags all of its registrations" — they simply
+    /// express it once for a group instead of per call.
+    ///
+    /// The distinction is load-bearing for the downgrade rule in `register`.
+    /// A first cut keyed that rule on `kind_stated` alone and promptly
+    /// preserved a stated `Bridge` over a `with_category(Intrinsic)`
+    /// re-registration of `java/lang/Float.intBitsToFloat`, which is a
+    /// downgrade of exactly the kind the rule exists to prevent, in the
+    /// opposite direction. Caught by diffing `--dump-native-registry` across
+    /// the change; it is the only kind that moved, which is why a one-line
+    /// census diff was worth running before believing the rule.
+    category_chosen: bool,
+    /// Per-registration copy of [`Self::category_chosen`], index-parallel with
+    /// `registrations` and `categories`.
+    category_chosen_log: Vec<bool>,
     /// Strict "no synthetic stubs" mode. When true, `register()` DROPS any
     /// registration whose `current_category` is `SyntheticStub` — it is never
     /// inserted, so a call to that method falls through to real JDK bytecode
@@ -4779,6 +4801,8 @@ impl NativeMethodRegistry {
             current_leaf: false,
             next_kind_stated: false,
             kind_stated: Vec::new(),
+            category_chosen: false,
+            category_chosen_log: Vec::new(),
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
@@ -4924,6 +4948,7 @@ impl NativeMethodRegistry {
     /// scoped set/restore.
     pub fn set_category(&mut self, kind: NativeKind) {
         self.current_category = kind;
+        self.category_chosen = true;
     }
 
     /// The category currently applied to new registrations. Useful for a
@@ -4937,9 +4962,12 @@ impl NativeMethodRegistry {
     /// of its registrations without touching individual `register()` calls.
     pub fn with_category(&mut self, kind: NativeKind, f: impl FnOnce(&mut Self)) {
         let prev = self.current_category;
+        let prev_chosen = self.category_chosen;
         self.current_category = kind;
+        self.category_chosen = true;
         f(self);
         self.current_category = prev;
+        self.category_chosen = prev_chosen;
     }
 
     /// Declare that subsequent `register()` calls install **leaf** natives.
@@ -4968,7 +4996,7 @@ impl NativeMethodRegistry {
     /// arithmetic: the bodies for which the funnel's ~180-330 ns of pinning,
     /// STW probing, thread-state transitions and unwind bookkeeping is the
     /// entire cost of the call. Measured on `probes/NativeShapeProbe.java`;
-    /// see `docs/internal/native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
+    /// see `native-call-funnel-is-the-per-call-floor-RETIRED-20260805.md`.
     ///
     /// The claim rides on the **callback**, not on the triple: it is captured
     /// into the slot by `register()` alongside the category, so a later phase
@@ -5042,11 +5070,14 @@ impl NativeMethodRegistry {
         // point exists to remove.
         let prev = self.current_category;
         let prev_stated = self.next_kind_stated;
+        let prev_chosen = self.category_chosen;
         self.current_category = kind;
         self.next_kind_stated = true;
+        self.category_chosen = true;
         self.register(class_name, method_name, descriptor, callback);
         self.current_category = prev;
         self.next_kind_stated = prev_stated;
+        self.category_chosen = prev_chosen;
     }
 
     /// The category a native was registered under, or `None` if no native is
@@ -5855,6 +5886,7 @@ impl NativeMethodRegistry {
         // inherited? Only `register_with_kind` sets the flag, and only for the
         // duration of its own inner call.
         self.kind_stated.push(self.next_kind_stated);
+        self.category_chosen_log.push(self.category_chosen);
         // Provenance, index-parallel with the two pushes above. `overwrote` is
         // read HERE — before the `match prior_slot` arm below rewrites
         // `slot.kind` in place — because that is the last moment the displaced
@@ -5875,7 +5907,67 @@ impl NativeMethodRegistry {
         // a new one: that is what makes a `NativeMethodId` handed out earlier
         // stay valid (and pick up the new callback, matching the documented
         // last-registration-wins behavior of `register`).
-        let category = self.current_category;
+        // AN AMBIENT CATEGORY IS "NO OPINION", AND NO-OPINION MUST NOT
+        // OVERWRITE AN ADJUDICATED ONE.
+        //
+        // `current_category` defaults to `SyntheticStub` and is ambient state,
+        // so a registrar that never calls `set_category` / `with_category` /
+        // `register_with_kind` tags everything it registers a stub by default
+        // rather than by anyone's judgement. That is harmless for a fresh
+        // triple. It is not harmless on a RE-registration: a later phase that
+        // re-registers a triple purely to win last-write-wins on the CALLBACK
+        // — which is exactly why `register_service_loader_natives` re-registers
+        // `StreamSupport.stream`, saying so in its own comment — silently
+        // downgraded the slot's kind as a side effect.
+        //
+        // Measured 2026-08-05 on a Spring Boot run: of the 72 slots dispatching
+        // a `SyntheticStub` over loaded real bytecode, **not one** had
+        // `kind_stated`, and **24** had displaced an explicitly-stated `Bridge`
+        // or `Intrinsic` — every `StampedLock` method, all of `ServiceLoader`,
+        // `CountDownLatch`, seven `Set.of` arities, and `StreamSupport.stream`.
+        //
+        // The downgrade is not cosmetic: `NativeKind` decides three separate
+        // things. `CompatibilityMode::JdkOnly` REFUSES a `SyntheticStub`,
+        // `CRATONVM_NO_STUBS` DROPS one, and
+        // `synthetic_stub_kind_should_yield_to_real_bytecode` only arbitrates
+        // for one. A bridge mis-tagged this way therefore stops dispatching
+        // under `--jdk-only` while its stated original would have been allowed.
+        //
+        // So: keep the prior kind when the incoming registration expressed no
+        // opinion and the prior one did. A registrar that genuinely means to
+        // reclassify still can — `set_category`, `with_category` and
+        // `register_with_kind` all count as choosing, and a chosen kind always
+        // wins. `categories[reg_index]` is updated to match so the census row
+        // reports the kind that actually took effect rather than the one this
+        // registration would have imposed.
+        //
+        // "Chose it" is `category_chosen`, NOT the census's `kind_stated`.
+        // Keying on the latter was the first cut and it was wrong in the
+        // mirror-image way: it preserved a `Bridge` over a
+        // `with_category(Intrinsic)` re-registration of
+        // `java/lang/Float.intBitsToFloat`, because `with_category` is an
+        // opinion that `kind_stated` deliberately does not record. The census
+        // diff across the change caught it — one kind moved, and it was that
+        // one.
+        let prior_chosen_kind = prior_slot
+            .and_then(|idx| self.slots.get(idx as usize))
+            .map(|s| s.reg_index)
+            .filter(|ri| {
+                self.category_chosen_log
+                    .get(*ri as usize)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .and_then(|ri| self.categories.get(ri as usize).copied());
+        let category = match prior_chosen_kind {
+            Some(prior) if !self.category_chosen => {
+                if let Some(slot) = self.categories.get_mut(reg_index) {
+                    *slot = prior;
+                }
+                prior
+            }
+            _ => self.current_category,
+        };
         // The leaf claim is a property of the CALLBACK being registered, not of
         // the triple: it travels with `current_leaf` exactly like `category`
         // does, so a later phase that re-registers the same triple with a
@@ -6660,6 +6752,94 @@ mod tests {
 
     fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(42)))
+    }
+
+    /// A re-registration that expresses NO opinion about the kind must not
+    /// downgrade one that did.
+    ///
+    /// `current_category` defaults to `SyntheticStub`, so a registrar that
+    /// re-registers a triple purely to win last-write-wins on the CALLBACK —
+    /// which several deliberately do — used to demote the slot's kind as a
+    /// side effect. That is not cosmetic: `JdkOnly` refuses a `SyntheticStub`,
+    /// `CRATONVM_NO_STUBS` drops one, and only a `SyntheticStub` is subject to
+    /// the yield-to-real-bytecode arbitration.
+    ///
+    /// Both directions are asserted. Keeping only the first would pass on an
+    /// implementation that froze the kind at its first value and made
+    /// `register_with_kind` unable to reclassify anything.
+    #[test]
+    fn an_unstated_reregistration_does_not_downgrade_a_stated_kind() {
+        let desc = "()V";
+        let mut r = NativeMethodRegistry::new();
+
+        // Someone adjudicated this as a Bridge.
+        r.register_with_kind("java/util/Demo", "m", desc, dummy_native, NativeKind::Bridge);
+        assert_eq!(r.kind_of("java/util/Demo", "m", desc), Some(NativeKind::Bridge));
+
+        // A later phase re-registers to win the callback, saying nothing about
+        // the kind. The callback must change; the adjudicated kind must not.
+        r.register("java/util/Demo", "m", desc, dummy_native_2);
+        assert_eq!(
+            r.kind_of("java/util/Demo", "m", desc),
+            Some(NativeKind::Bridge),
+            "an ambient SyntheticStub default must not overwrite a stated Bridge"
+        );
+        let id = r.resolve_id("java/util/Demo", "m", desc).expect("registered");
+        let cb = r.callback_of(id).expect("callback");
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(
+            cb(&mut ctx, &[]).expect("call"),
+            Some(Value::Int(42)),
+            "last-registration-wins on the CALLBACK is unchanged"
+        );
+
+        // The other direction: a STATED reclassification still takes effect.
+        r.register_with_kind(
+            "java/util/Demo",
+            "m",
+            desc,
+            dummy_native,
+            NativeKind::SyntheticStub,
+        );
+        assert_eq!(
+            r.kind_of("java/util/Demo", "m", desc),
+            Some(NativeKind::SyntheticStub),
+            "register_with_kind must still be able to reclassify downward"
+        );
+
+        // `set_category` / `with_category` are opinions too, even though the
+        // census's `kind_stated` deliberately does not record them. Keying the
+        // rule on `kind_stated` preserved a Bridge over a
+        // `with_category(Intrinsic)` re-registration of
+        // `java/lang/Float.intBitsToFloat` on a real run — the same downgrade
+        // this rule exists to stop, pointing the other way.
+        let mut chosen = NativeMethodRegistry::new();
+        chosen.register_with_kind(
+            "java/util/Demo",
+            "p",
+            desc,
+            dummy_native,
+            NativeKind::Bridge,
+        );
+        chosen.with_category(NativeKind::Intrinsic, |r| {
+            r.register("java/util/Demo", "p", desc, dummy_native_2);
+        });
+        assert_eq!(
+            chosen.kind_of("java/util/Demo", "p", desc),
+            Some(NativeKind::Intrinsic),
+            "with_category is a choice and must win over an earlier stated kind"
+        );
+
+        // Two registrations that both left the category untouched keep plain
+        // last-write-wins — the rule is about opinions, not about order.
+        let mut amb = NativeMethodRegistry::new();
+        amb.register("java/util/Demo", "n", desc, dummy_native);
+        amb.register("java/util/Demo", "n", desc, dummy_native_2);
+        assert_eq!(
+            amb.kind_of("java/util/Demo", "n", desc),
+            Some(NativeKind::SyntheticStub),
+            "neither registration chose a kind, so last-write-wins still applies"
+        );
     }
 
     /// The leaf claim is a property of the registered CALLBACK, and a later

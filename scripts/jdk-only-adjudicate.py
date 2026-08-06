@@ -23,6 +23,22 @@ The questions, in the order the record asks them:
      binds to, so `acc_native: false` on a Bridge is a registration nobody
      adjudicated.
   3. How many natives of ANY kind shadow concrete bytecode (`has_code`)?
+
+The `undecl` column below is a SUPERSET of "dead registration", and reading it
+as one is a mistake this script cannot detect on its own.  `image_declaring_method`
+asks the image about ONE class: a native registered on
+`sun/nio/ch/SocketDispatcher.close` comes back `declared: false` while the
+method is concrete bytecode on `sun.nio.ch.UnixDispatcher` two frames up.
+Measured on JDK 25 (2026-08-05): **1,939 of 2,542 `undecl` rows are inherited**
+-- 1,612 concrete shadows, 308 abstract, and 19 ACC_NATIVE bridges this table
+does not credit.  Only 603 are dead.  Split them with
+
+    sh scripts/jdk-only-inherited-decl.sh <census.json>
+
+and pass its TSV back here as `--inherited <out.tsv>` to have section 2 broken
+out rather than lumped.  Likewise `absent` is a superset: a class missing from
+a Linux image may be the correct registration for Windows -- see
+`scripts/jdk-only-platform-diff.py`.
   4. Which source file each unadjudicated group comes from, so the
      reclassification wave can be cut into subsystem-sized batches.
 
@@ -43,7 +59,15 @@ _spec = importlib.util.spec_from_file_location("jdk_only_bridge_ratchet", _GATE)
 ratchet = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ratchet)
 
+INHERITED_TSV = None
 argv = sys.argv[1:]
+if "--inherited" in argv:
+    i = argv.index("--inherited")
+    if i + 1 >= len(argv):
+        sys.exit("--inherited needs the TSV written by "
+                 "scripts/jdk-only-inherited-decl.sh")
+    INHERITED_TSV = argv[i + 1]
+    del argv[i:i + 2]
 json_out = None
 if "--json" in argv:
     i = argv.index("--json")
@@ -105,7 +129,57 @@ print(f"    ...of which inherited an ambient set_category: {len(inherited_bad)}"
 print(f"    ...and were actually dispatched this run:      "
       f"{sum(1 for r in bad if r['invocations'] > 0)}")
 
+if INHERITED_TSV:
+    # The hierarchy pass, so `undecl` stops being a superset.
+    resolved = {}
+    try:
+        with open(INHERITED_TSV, encoding="utf-8") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) >= 6:
+                    resolved[(f[0], f[1], f[2])] = (f[3], f[4], f[5])
+    except OSError as exc:
+        sys.exit(f"cannot read --inherited {INHERITED_TSV}: {exc}")
+    print("\n=== 2b. what the 'undecl' rows actually resolve to (hierarchy) ===")
+    split = Counter()
+    creditable = []
+    for r in rows:
+        if not (img(r).get("image_has_class") and not img(r).get("declared")):
+            continue
+        verdict, declarer, mods = resolved.get(
+            (r["class"], r["name"], r["descriptor"]), ("NOT-MEASURED", "-", "-"))
+        bucket = verdict
+        if verdict == "INHERITED":
+            bucket = "INHERITED " + mods.split(",")[0]
+            if "native" in mods:
+                creditable.append((r, declarer))
+        split[bucket] += 1
+    for bucket, n in sorted(split.items(), key=lambda kv: -kv[1]):
+        print(f"  {bucket:<22}{n:>7}")
+    print(f"\n  ACC_NATIVE on a SUPERTYPE -- section 2 counts these as "
+          f"unadjudicated and they are not: {len(creditable)}")
+    for r, declarer in creditable[:20]:
+        print(f"    {r['class']}.{r['name']}{r['descriptor']}  ->  {declarer}")
+    if len(creditable) > 20:
+        print(f"    ... and {len(creditable) - 20} more")
+else:
+    print("\n=== 2b. hierarchy split of the 'undecl' rows: NOT RUN ===")
+    print("  `undecl` above is a superset of 'dead'. Pass --inherited <tsv>")
+    print("  (from scripts/jdk-only-inherited-decl.sh) to break it out.")
+
 print("\n=== 3. natives shadowing concrete bytecode (image has_code) ===")
+if INHERITED_TSV:
+    # `has_code` is asked of the NAMED class. A native over a method the
+    # class inherits concretely is just as much a shadow, and this column
+    # cannot see one.
+    extra = sum(1 for r in rows
+                if resolved.get((r["class"], r["name"], r["descriptor"]),
+                                ("", "", ""))[0] == "INHERITED"
+                and "code" in resolved[(r["class"], r["name"],
+                                        r["descriptor"])][2])
+    print(f"  + {extra} more shadow bytecode they INHERIT, invisible to the"
+          f" has_code column below")
+    print(f"    (true shadow population = the total below + {extra})")
 shadow = [r for r in rows if img(r).get("has_code")]
 print(f"  total {len(shadow)}; dispatched this run {sum(1 for r in shadow if r['invocations'] > 0)}")
 by_kind = Counter(r["kind"] for r in shadow)

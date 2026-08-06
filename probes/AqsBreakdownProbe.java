@@ -8,7 +8,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * Where does an AQS handoff's time actually go?
  *
- * `docs/internal/aqs-thread-handoff-latency-RETIRED-20260805.md` measured
+ * `aqs-thread-handoff-latency-RETIRED-20260805.md` measured
  * `Condition.signal -> await` at 96.9 us against HotSpot's 7.4 us and blamed
  * `AbstractQueuedSynchronizer.acquire`'s pre-park spin. That was inference.
  * This probe measures the AQS operations that involve NO contention, NO

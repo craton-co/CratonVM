@@ -2065,8 +2065,17 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     let long_desc = "(Ljava/lang/Object;JJJ)J";
     let ref_desc = "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 
-    for name in [
+    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images). The
+    // `Acquire`/`Release`/`weak*` spellings are not declared at all — the JDK
+    // lowers those to the plain form in `VarHandle` — so they stay ambient.
+    registry.register_with_kind(
+        u2,
         "compareAndExchangeInt",
+        int_desc,
+        native_unsafe_cae_int,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    for name in [
         "compareAndExchangeIntAcquire",
         "compareAndExchangeIntRelease",
         "weakCompareAndExchangeInt",
@@ -2076,8 +2085,17 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         registry.register(u2, name, int_desc, native_unsafe_cae_int);
     }
 
-    for name in [
+    // Only the un-suffixed form is ACC_NATIVE on JDK 25 (both images). The
+    // `Acquire`/`Release`/`weak*` spellings are not declared at all — the JDK
+    // lowers those to the plain form in `VarHandle` — so they stay ambient.
+    registry.register_with_kind(
+        u2,
         "compareAndExchangeLong",
+        long_desc,
+        native_unsafe_cae_long,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    for name in [
         "compareAndExchangeLongAcquire",
         "compareAndExchangeLongRelease",
         "weakCompareAndExchangeLong",
@@ -2087,8 +2105,19 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         registry.register(u2, name, long_desc, native_unsafe_cae_long);
     }
 
-    for name in [
+    // `compareAndExchangeReference` is the one ACC_NATIVE spelling on JDK 25
+    // (both images). The memory-order variants and the legacy `Object` names
+    // are not declared anywhere -- `VarHandle` lowers them to the plain form --
+    // and neither is anything on `sun.misc.Unsafe`, so only the first states
+    // its kind.
+    registry.register_with_kind(
+        u2,
         "compareAndExchangeReference",
+        ref_desc,
+        native_unsafe_cae_object,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    for name in [
         "compareAndExchangeReferenceAcquire",
         "compareAndExchangeReferenceRelease",
         "compareAndExchangeObject",

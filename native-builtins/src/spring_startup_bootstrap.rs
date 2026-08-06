@@ -142,7 +142,7 @@ fn report_env_bootstrap_failure(reason: &str) {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    if std::env::var("CRATONVM_QUIET_ENV_FALLBACK").is_ok_and(|v| v != "0") {
+    if cratonvm_types::flags::runtime_var("CRATONVM_QUIET_ENV_FALLBACK").is_ok_and(|v| v != "0") {
         return;
     }
     let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));

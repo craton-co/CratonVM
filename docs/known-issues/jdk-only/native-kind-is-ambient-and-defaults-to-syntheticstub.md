@@ -5,11 +5,43 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-05 (second pass) — the instrument was narrower than the question
+
+`kind_stated` is now true on **843 rows** (`native-builtins` 637, `native-io`
+173, `native-awt` 23, `vm` 10) after the L5 residual pass took the remaining
+`unknown`-marked registrars, the mixed sites, and `vm/src/runtime/instrument.rs`.
+
+What that pass actually found is bigger than the count. **Two of the
+adjudications L5/L5b made were wrong, and both were wrong for the same reason:
+`image_declaring_method` asks about ONE class in ONE image.** Filed in full as
+[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md),
+with the two instruments that close it. In short:
+
+* **Inheritance.** Of the 2,542 rows the census calls *class present, method
+  not declared*, **1,939 are inherited** — 1,612 concrete (§1.4 shadows), 308
+  abstract (the every-implementor hazard), and **19 `ACC_NATIVE`** (§1.5
+  bridges the census did not credit). Only 603 are genuinely dead.
+  `sun/nio/ch/SocketDispatcher.close`, which this record's L5 residual called
+  "dispatched 3× while resolving to no declared method", is one of them: the
+  method is concrete on `sun.nio.ch.UnixDispatcher`. Mystery closed, and it was
+  never a mystery — it was a column that could not see a supertype.
+* **Platform.** CratonVM adjudicates an image it cannot *run*, so a Windows JDK
+  unpacked on the Linux host yields a full census. **59 registrations are a
+  genuine `ACC_NATIVE` bridge only on Windows** and 78 only on Linux;
+  **1,735 are dead on both**. Every "needs a Windows-image census" in this
+  directory is answerable with one command now.
+
+Two concrete corrections to what is written elsewhere: the
+`sun/awt/PlatformGraphicsInfo.hasDisplays0` marker was **right** (it is a
+bridge, on the platform that has it), and `sun/nio/ch/WindowsFileDispatcherImpl`
+exists on **neither** image — the Windows JDK names that class
+`FileDispatcherImpl` too, so its 28 rows are dead everywhere.
+
 ## What changed on 2026-08-05 — the number is now PINNED, and re-measured
 
 Still open, and still nothing reclassified. What is new is that the number can
 no longer rise unnoticed: wave-2 lane L6 shipped a slack-free ratchet on it
-([`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`](../../internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md)).
+(`L6-unadjudicated-bridge-ratchet-DONE-20260805.md`).
 
 ```sh
 JAVA_HOME=<JDK25> sh regression-suite/bridge-ratchet.sh
@@ -216,7 +248,7 @@ Reading the three `java/lang/Thread` rows — `start0()V` `acc_native: true`,
 nobody was looking for: under `--jdk-only` this VM **could not start a thread**,
 because §7 step 3's decline fell through to `UnsatisfiedLinkError` instead of to
 the bytecode. Fixed, with the evidence, in
-[`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md).
+`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`.
 The other 4,795 shadowing `Bridge` rows can all reach that same path.
 
 ### What the census does *not* settle

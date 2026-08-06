@@ -324,6 +324,61 @@ impl Drop for ClinitDepthGuard {
 ///    then check the final state.
 /// 4. `InitializationError` в†’ return `NoClassDefFoundError`.
 /// 5. Any other state в†’ run the full initialization sequence.
+/// `CRATONVM_DBG_CLINIT_ORDER=1` — name every class this thread claims for
+/// `<clinit>`, in order, nested by depth, with the frame that triggered it.
+///
+/// The sibling `CRATONVM_DBG_CLINIT_FAIL` reports a Rust backtrace for an
+/// initializer that *threw*. This reports the ORDER, which is the different
+/// question — and the only one that can be answered for a JDK circular-init
+/// cycle such as `java/lang/constant/ConstantDescs` <->
+/// `jdk/internal/constant/PrimitiveClassDescImpl`, whose correctness is
+/// entirely "which of the two is entered first, and at which statement".
+/// Diffing this between two arms of a flag matrix is what identified the
+/// `CRATONVM_BG_COMPILE=0` `<clinit>` first-call-compile defect: the failing
+/// arm reached `PrimitiveClassDescImpl` after 16 nested inits instead of 36,
+/// and its trigger frame never advanced past the caller — i.e. the enclosing
+/// `<clinit>` was not executing its own statements at all.
+///
+/// Off by default; one `OnceLock<bool>` read per class initialization, which is
+/// not a hot path.
+fn clinit_order_trace(shared: &SharedVm, thread: &JvmThread, class_id: ClassId, phase: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CLINIT_ORDER").is_some()
+    }) {
+        return;
+    }
+    use std::cell::Cell;
+    thread_local! { static DEPTH: Cell<usize> = const { Cell::new(0) }; }
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<cid {class_id}>"));
+    let d = DEPTH.with(|d| d.get());
+    if phase == "claim" {
+        // The TRIGGERING site, not just the class: for a JDK circular-init cycle
+        // the question is always "which statement of the enclosing <clinit>
+        // reached this", and a bare class list cannot answer it.
+        let top: Vec<String> = thread
+            .frames
+            .iter()
+            .rev()
+            .take(3)
+            .map(|f| format!("{}.{}@{}", f.class_name(), f.method_name(), f.last_instr_pc))
+            .collect();
+        let from = format!("depth={} [{}]", thread.frames.len(), top.join(" <- "));
+        eprintln!("[clinit-order] {:width$}> {name}   from {from}", "", width = d * 2);
+        DEPTH.with(|x| x.set(d + 1));
+    } else {
+        let nd = d.saturating_sub(1);
+        DEPTH.with(|x| x.set(nd));
+        eprintln!("[clinit-order] {:width$}< {name} {phase}", "", width = nd * 2);
+    }
+}
+
 pub fn ensure_class_initialized_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -626,7 +681,10 @@ pub fn ensure_class_initialized_shared(
                     if let Some(name) = &class_state_name {
                         thread.set_vm_state(format!("class-init:initialize:{name}"));
                     }
-                    return initialize_class_shared(shared, thread, class_id);
+                    clinit_order_trace(shared, thread, class_id, "claim");
+                    let r = initialize_class_shared(shared, thread, class_id);
+                    clinit_order_trace(shared, thread, class_id, if r.is_ok() { "done" } else { "FAIL" });
+                    return r;
                 }
                 // Another thread claimed it вЂ” loop back to wait
                 continue;
@@ -826,7 +884,7 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
 /// class that is plainly on the classpath" can only be chased by breakpoint.
 fn dbg_clinit_fail() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_CLINIT_FAIL").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CLINIT_FAIL").is_some())
 }
 
 fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {

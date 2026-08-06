@@ -937,6 +937,36 @@ pub(crate) fn native_string_init_abstract_string_builder(
     Ok(None)
 }
 
+/// Which field slot holds `String.hash`, from the element type of the string's
+/// backing `value` array — or `None` when this receiver cannot decide it.
+///
+/// JDK 9+ compact layout is `{value:[B, coder:B, hash:I, hashIsZero:Z}`, so the
+/// hash is slot **2**; the legacy synthetic-stub layout is `{value:[C, hash:I}`,
+/// so it is slot **1**. A `Boolean` element type is the byte-array alias this
+/// VM uses in some paths and means the compact layout too.
+///
+/// **`None` is the case that matters, and it used to be folded into slot 1.**
+/// `string_char_array` returns `None` for a `String` whose `value` field is
+/// null — an object allocated but not yet initialised. That receiver carries no
+/// evidence about the layout, and the caller latches this answer in a
+/// process-wide `OnceLock` that is never reset. Guessing 1 there, against the
+/// JDK 25 layout, selects `coder`: every later call would read the coder as a
+/// cached hash (so every UTF-16 string hashes to `1`) and, on the recompute
+/// path, WRITE the computed hash into `coder` — silent corruption of the
+/// string's encoding flag, for the whole process, decided by whichever string
+/// happened to be hashed first.
+///
+/// Returning `None` costs nothing: the caller returns 0 for that receiver
+/// either way, and the first readable string still latches the right slot.
+fn hash_slot_for(element_type: Option<cratonvm_types::ArrayElementType>) -> Option<usize> {
+    match element_type {
+        Some(cratonvm_types::ArrayElementType::Byte)
+        | Some(cratonvm_types::ArrayElementType::Boolean) => Some(2),
+        Some(_) => Some(1),
+        None => None,
+    }
+}
+
 pub(crate) fn native_string_hash_code(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -956,18 +986,26 @@ pub(crate) fn native_string_hash_code(
     // call — either by class+field name or by re-reading the value array —
     // was itself the bottleneck that kept cache hits ~20x slower than a plain
     // field read, dwarfing the hashing win.)
+    //
+    // The latch is process-wide and permanent, so it must only ever be set from
+    // a receiver that actually carries the evidence — see `hash_slot_for`.
     static HASH_SLOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let hash_field_index: usize = match HASH_SLOT.get() {
         Some(i) => *i,
         None => {
-            let slot =
-                match string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr)) {
-                    Some(cratonvm_types::ArrayElementType::Byte)
-                    | Some(cratonvm_types::ArrayElementType::Boolean) => 2,
-                    _ => 1,
-                };
-            let _ = HASH_SLOT.set(slot);
-            slot
+            let elem = string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr));
+            match hash_slot_for(elem) {
+                Some(slot) => {
+                    let _ = HASH_SLOT.set(slot);
+                    slot
+                }
+                // Unreadable receiver and no layout learned yet: hash 0 and
+                // latch NOTHING, leaving the decision to the first string that
+                // can answer it. The fall-through below returns 0 for this same
+                // receiver anyway, so the only behaviour that changes is that a
+                // guess no longer becomes permanent.
+                None => return Ok(Some(Value::Int(0))),
+            }
         }
     };
     if let Value::Int(cached) = ctx.get_field(this, hash_field_index) {
@@ -988,7 +1026,16 @@ pub(crate) fn native_string_hash_code(
 
     // For compact strings (byte[] value), inspect the `coder` byte
     // (field 1) to know whether the bytes are LATIN-1 (one byte per char,
-    // unsigned-extended) or UTF-16 (big-endian u16 pairs).
+    // unsigned-extended) or UTF-16 (LITTLE-endian u16 pairs).
+    //
+    // This said "big-endian" while the loop below has always read little-endian.
+    // The identical stale claim on `vectorizedHashCode` is the one that named
+    // the contract that native was not implementing while it hashed bytes for a
+    // day, so these are corrected rather than left as harmless prose. The layout
+    // is little-endian in all four places that touch it: `create_java_string`
+    // writes the low byte at the even index, `decode_string_value` reads it back,
+    // `native_string_index_of_static_helper` decodes the same pairs, and
+    // `StringUTF16.isBigEndian()` answers false.
     let is_utf16 = is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1));
 
     // Strategy: drain the array into a thread-local i32 scratch buffer in
@@ -1107,10 +1154,7 @@ pub(crate) fn native_string_char_at(
     let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => {
-            return Err(
-                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }
-                    .into(),
-            )
+            return Err(cratonvm_types::error::RuntimeError::sioobe_no_length(index).into())
         }
     };
     let is_byte_array = matches!(
@@ -1123,7 +1167,7 @@ pub(crate) fn native_string_char_at(
 
     if index < 0 || index >= char_count as i32 {
         return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::sioobe_index(index, char_count as i32).into(),
         );
     }
 
@@ -1355,12 +1399,7 @@ pub(crate) fn native_string_substring(
     };
 
     if begin < 0 || end < begin || end > char_count as i32 {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: if begin < 0 { begin } else { end },
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -2432,12 +2471,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // [srcBegin, srcEnd) window against the builder length via
     // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: src_begin,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
     }
     let n = (src_end - src_begin) as usize;
     // Destination-range check: the underlying `System.arraycopy` into `dst`
@@ -2566,9 +2600,7 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if index < 0 || index >= count {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
@@ -2606,12 +2638,7 @@ pub(crate) fn native_sb_code_point_at(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -2641,12 +2668,7 @@ pub(crate) fn native_sb_code_point_before(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 <= 0 || (index_i32 as usize) > chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index - 1];
@@ -4040,10 +4062,7 @@ pub(crate) fn native_string_substring_one(
     let end = char_count as i32;
 
     if begin < 0 || begin > end {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }
-                .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
     }
 
     let b = begin as usize;
@@ -4476,7 +4495,9 @@ pub(crate) fn native_string_replace_all(
     // "x")` returned the input unchanged where HotSpot throws — a silently
     // wrong answer produced by the error path of a fast path.
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_all_java(&s, replacement.as_str());
+    let result = re
+        .replace_all_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4500,7 +4521,9 @@ pub(crate) fn native_string_replace_first(
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let re = compile_java_regex(&pattern, 0)?;
-    let result = re.replace_first_java(&s, replacement.as_str());
+    let result = re
+        .replace_first_java(&s, replacement.as_str())
+        .map_err(crate::regex_matcher::no_group_error)?;
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&result),
     ))))
@@ -4770,12 +4793,7 @@ pub(crate) fn native_string_code_point_at(
     let s = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = s.encode_utf16().collect();
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-                index: index_i32,
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -6189,6 +6207,28 @@ pub(crate) fn native_string_formatted(
 // same little-endian layout as CratonVM's Rust code, keeping every code path
 // consistent. `HI_BYTE_SHIFT == 8` in OpenJDK <=> big-endian; here it is 0.
 //
+// # On JDK 25 this registration never fires, and that is not a defect
+//
+// `--dump-native-registry` against Temurin 25.0.3, checked while closing the
+// `String.hashCode` record because it asked whether `HI_BYTE_SHIFT` /
+// `LO_BYTE_SHIFT` are populated at all:
+//
+//   java/lang/StringUTF16.isBigEndian()Z   loaded: true  declared: FALSE
+//                                          has_code: false  invocations: 0
+//
+// `declared: false` — the method does not exist on JDK 25's `StringUTF16`. Its
+// `<clinit>` reads the byte order from `UNSAFE`, which this VM answers through
+// `jdk/internal/misc/UnsafeConstants.BIG_ENDIAN` (the boot log's
+// "UnsafeConstants populated (5/5)"). The statics are populated and
+// little-endian: `probes/StringUtf16ClassShapeProbe` reads them back as
+// `HI_BYTE_SHIFT=0` / `LO_BYTE_SHIFT=8`, identical to HotSpot.
+//
+// So this stays registered for images that DO declare the method (JDK 17/21),
+// where it must give the same answer `UnsafeConstants` gives, which it does. A
+// census row reading `has_code: false` here means "absent from this image", not
+// "an unimplemented native something is waiting on" — the distinction cost a
+// paragraph of doubt in the record that filed the UTF-16 hash defect.
+//
 // Arity is guaranteed by the verifier (`()Z`); we ignore any extra args
 // defensively and return the constant unconditionally.
 pub(crate) fn native_string_utf16_is_big_endian(
@@ -6237,10 +6277,8 @@ pub(crate) fn native_string_utf16_get_chars(
     // StringIndexOutOfBoundsException rather than overflowing Rust arithmetic.
     let count = src_end.wrapping_sub(src_begin);
     let source_len = (ctx.array_length(value) / 2) as i32;
-    if let Some(index) = bounds_off_count_violation(src_begin, count, source_len) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(src_begin, count, source_len).is_some() {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(src_begin, count, source_len).into());
     }
     // The bytecode validates the source before its first destination access.
     // Preserve that ordering when both inputs are invalid/null.
@@ -6327,6 +6365,47 @@ pub(crate) fn native_string_utf16_get_chars(
 //
 // Reference: JDK 25 `java/lang/String.java` and `jdk/internal/util/Preconditions.java`.
 
+/// `static void java.lang.String.checkIndex(int index, int length)`
+///
+/// F4's third member, added 2026-08-05. `String.charAt` -> `StringLatin1
+/// .charAt` -> `StringLatin1.checkIndex` -> `String.checkIndex` ->
+/// `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`, and the generic
+/// `Preconditions` override underneath discards the formatter and throws
+/// `ArrayIndexOutOfBoundsException`. Measured, not assumed:
+///
+/// ```text
+///                 HotSpot                              CratonVM before this
+///   charAt(-1)    SIOOBE "Index -1 out of bounds..."   ArrayIndexOutOfBounds, msg=null
+///   charAt(12)    SIOOBE "Index 12 out of bounds..."   SIOOBE, msg=null
+/// ```
+///
+/// The negative case got the WRONG CLASS -- `catch
+/// (StringIndexOutOfBoundsException)` misses an AIOOBE, so that is a
+/// control-flow defect, not a message defect. The two cases diverged because
+/// only one of them reached `Preconditions`.
+///
+/// Same bypass shape, same rationale and the same load-bearing
+/// `register_with_kind(.., Intrinsic)` as its two siblings below. It goes away
+/// when `Preconditions` honours its formatter -- see
+/// `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+pub(crate) fn native_string_check_index(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let index = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if index < 0 || index >= length {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, length).into());
+    }
+    Ok(None)
+}
+
 /// `static void java.lang.String.checkBoundsBeginEnd(int begin, int end, int length)`
 ///
 /// Spec: throws `StringIndexOutOfBoundsException` iff
@@ -6348,12 +6427,8 @@ pub(crate) fn native_string_check_bounds_begin_end(
         _ => 0,
     };
     if begin < 0 || begin > end || end > length {
-        // Mirror the index the JDK puts in the SIOOBE message: `begin` if it's
-        // the offending arg, otherwise `end`.
-        let index = if begin < 0 { begin } else { end };
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+        // HotSpot's `Preconditions.checkFromToIndex` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, length).into());
     }
     Ok(None)
 }
@@ -6397,10 +6472,9 @@ pub(crate) fn native_string_check_bounds_off_count(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if let Some(index) = bounds_off_count_violation(offset, count, length) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(offset, count, length).is_some() {
+        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
     }
     Ok(Some(Value::Int(offset)))
 }
@@ -6504,10 +6578,9 @@ pub(crate) fn native_string_init_from_char_array_range(
         _ => 0,
     };
     let length = ctx.array_length(arr) as i32;
-    if let Some(index) = bounds_off_count_violation(offset, count, length) {
-        return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
-        );
+    if bounds_off_count_violation(offset, count, length).is_some() {
+        // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
     }
     let mut units = vec![0u16; count as usize];
     let written = ctx.read_char_array_into(arr, offset as usize, &mut units);
@@ -6557,6 +6630,13 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
     // `SIOOBE_FORMATTER`) is not implemented. Fixing that override is what
     // would let these go — see
     // `docs/known-issues/preconditions-ignores-the-exception-formatter.md`.
+    registry.register_with_kind(
+        "java/lang/String",
+        "checkIndex",
+        "(II)V",
+        native_string_check_index,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
     registry.register_with_kind(
         "java/lang/String",
         "checkBoundsBeginEnd",
@@ -6673,7 +6753,9 @@ fn native_string_index_of_str_from(
 /// coder format, we recompute the same answer character-wise from the target
 /// alone if `srcCount` and `coder` are sufficient. Concretely we decode the
 /// `[B` array per `coder` (0 = LATIN1 single-byte zero-extended, 1 = UTF16
-/// big-endian u16 pairs) and search for the target's UTF-16 code units.
+/// LITTLE-endian u16 pairs) and search for the target's UTF-16 code units.
+/// (The doc said big-endian; the code below reads `lo` at `2i` and `hi` at
+/// `2i+1`, which is little-endian and is what the rest of the VM writes.)
 fn native_string_index_of_static_helper(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7443,6 +7525,50 @@ mod tests {
         let s = ctx.create_string("");
         let r = native_string_hash_code(&mut ctx, &[Value::Object(Some(s))]);
         assert_eq!(r.unwrap(), Some(Value::Int(0)));
+    }
+
+    /// A `String` that cannot answer "which layout am I" must not answer it.
+    ///
+    /// `native_string_hash_code` latches the hash field slot in a process-wide
+    /// `OnceLock` that is never reset, from whichever `String` it happens to
+    /// hash first. That is fine for a receiver with a readable `value` array
+    /// and wrong for one without: `string_char_array` returns `None` for a
+    /// `String` allocated but not yet initialised, and folding `None` into
+    /// slot 1 — as this did — points every later call at `coder` on the JDK 25
+    /// layout. The read side returns `1` as the hash of every UTF-16 string;
+    /// the write side stores the hash INTO `coder`, silently corrupting the
+    /// encoding flag of every string the process hashes afterwards.
+    ///
+    /// The `OnceLock` makes the whole-native version of this untestable — one
+    /// latch per test binary — so the decision lives in a pure function and the
+    /// test is on that. `None => None` is the entire fix; the two `Some` arms
+    /// are here so a rewrite cannot quietly swap the layouts.
+    #[test]
+    fn hash_slot_is_never_guessed_from_an_unreadable_string() {
+        use cratonvm_types::ArrayElementType;
+
+        assert_eq!(
+            hash_slot_for(None),
+            None,
+            "a String with a null `value` carries no layout evidence; latching a \
+             guess from it points the whole process at `coder` (slot 1) and makes \
+             every later hash write corrupt the string it hashed"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Byte)),
+            Some(2),
+            "compact JDK 9+ layout: value:[B, coder:B, hash:I, hashIsZero:Z"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Boolean)),
+            Some(2),
+            "boolean[] is this VM's byte[] alias, so it is the compact layout too"
+        );
+        assert_eq!(
+            hash_slot_for(Some(ArrayElementType::Char)),
+            Some(1),
+            "legacy synthetic-stub layout: value:[C, hash:I"
+        );
     }
 
     // -----------------------------------------------------------------------

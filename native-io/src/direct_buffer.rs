@@ -304,6 +304,71 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
 /// returned are 8-byte aligned (sufficient for any primitive type used
 /// by `Unsafe.put*` writes through the buffer).  Returns the raw
 /// address as a u64 the JDK can stash in `DirectByteBuffer.address`.
+/// [`dbb_allocate`] with the same reclaim-and-retry [`bits_reserve_memory`]
+/// performs, for the callers that have a `NativeContext` to collect with.
+///
+/// `bits_reserve_memory`'s retry does not cover the path that matters most in
+/// REAL-JDK mode, because that native never runs there: `java/nio/Bits` is not
+/// in `force_native_over_real_jdk_bytecode`, and `Bits.reserveMemory` is
+/// ordinary Java, so the JDK's own bytecode wins and our accounting is only
+/// consulted from the `Unsafe.allocateMemory0` that the real
+/// `DirectByteBuffer(int)` constructor calls. That call had NO retry at all —
+/// the first refusal threw.
+///
+/// The two budgets are separate counters and drift: ours also counts every
+/// other `Unsafe.allocateMemory` caller, so it can saturate while the JDK's
+/// `Bits` still believes there is room, and the JDK's own `System.gc()`-and-
+/// retry never gets a chance to run. That is the shape reported in
+/// `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`,
+/// whose `OutOfMemoryError: Direct buffer memory: tried …, used …, max …`
+/// message is this module's, raised from `try_reserve` below, on an H2
+/// background writer thread.
+///
+/// Three rounds, bounded exactly as the sibling above and as the JDK bounds
+/// its own retry, and with the same "no progress means nothing is
+/// reclaimable" early exit so a genuinely exhausted cap still surfaces
+/// promptly.
+fn dbb_allocate_collecting(
+    ctx: &mut dyn NativeContext,
+    size: i64,
+) -> Result<u64, MethodCallFailed> {
+    let first_failure = match dbb_allocate(size) {
+        Ok(addr) => return Ok(addr),
+        Err(e) => e,
+    };
+    // Only a reservation refusal is worth collecting for. A negative size, an
+    // unrepresentable layout, or the system allocator itself returning null
+    // are not things a collection can change.
+    if !is_reservation_failure(size) {
+        return Err(first_failure);
+    }
+    const RECLAIM_ROUNDS: u32 = 3;
+    for _ in 0..RECLAIM_ROUNDS {
+        let before = bits().reserved.load(Ordering::Acquire);
+        ctx.force_gc();
+        match dbb_allocate(size) {
+            Ok(addr) => return Ok(addr),
+            Err(e) if !is_reservation_failure(size) => return Err(e),
+            Err(_) => {}
+        }
+        if bits().reserved.load(Ordering::Acquire) >= before {
+            break;
+        }
+    }
+    Err(first_failure)
+}
+
+/// Would a reservation of `size` still exceed the direct-memory cap?
+#[inline]
+fn is_reservation_failure(size: i64) -> bool {
+    let b = bits();
+    size > 0
+        && b.reserved
+            .load(Ordering::Acquire)
+            .saturating_add(size)
+            > b.max.load(Ordering::Relaxed)
+}
+
 fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     if size < 0 {
         return Err(oom(format!("negative direct buffer size: {size}")));
@@ -652,7 +717,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let addr = dbb_allocate(cap)?;
+    let addr = dbb_allocate_collecting(ctx, cap)?;
     let cleaner_id = if cap > 0 {
         register_cleaner(addr, cap)
     } else {
@@ -871,11 +936,17 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// `jdk.internal.misc.Unsafe.allocateMemory(long size) -> long` —
 /// records the (addr, size) so `freeMemory(addr)` can reclaim it
-/// accurately. JVM users who go via `ByteBuffer.allocateDirect` use
-/// `dbb_allocate_direct0` above and don't touch this path.
-fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// accurately.
+///
+/// This IS the `ByteBuffer.allocateDirect` path in real-JDK mode, contrary to
+/// what this comment used to say: the real `DirectByteBuffer(int)` constructor
+/// calls `Unsafe.allocateMemory`, and `bits_reserve_memory` — which would
+/// otherwise have reserved first — never runs there, because the JDK's own
+/// `java.nio.Bits` bytecode wins. `dbb_allocate_direct0` is the SYNTHETIC-mode
+/// path. Hence the reclaim-and-retry here; see `dbb_allocate_collecting`.
+fn unsafe_allocate_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = unsafe_long_arg(args);
-    let addr = dbb_allocate(size)?;
+    let addr = dbb_allocate_collecting(ctx, size)?;
     if addr != 0 {
         record_unsafe_alloc(addr, size);
     }
@@ -1812,12 +1883,31 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // We back it with the same pool/accounting machinery as the
     // DirectByteBuffer path so a 4 KiB tight-loop allocate/free
     // stays RSS-bounded regardless of which API the JDK picks.
+    // `jdk.internal.misc.Unsafe.allocateMemory0`/`freeMemory0` are ACC_NATIVE on
+    // both the Linux and the Windows JDK 25 image; the un-suffixed pair is the
+    // Java wrapper that calls them (a §1.4 shadow), and `sun.misc.Unsafe`
+    // declares none of the four on either image. Only what the image backs
+    // states its kind.
     for cls in ["jdk/internal/misc/Unsafe", "sun/misc/Unsafe"] {
         r.register(cls, "allocateMemory", "(J)J", unsafe_allocate_memory);
-        r.register(cls, "allocateMemory0", "(J)J", unsafe_allocate_memory);
         r.register(cls, "freeMemory", "(J)V", unsafe_free_memory);
-        r.register(cls, "freeMemory0", "(J)V", unsafe_free_memory);
     }
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "allocateMemory0",
+        "(J)J",
+        unsafe_allocate_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "jdk/internal/misc/Unsafe",
+        "freeMemory0",
+        "(J)V",
+        unsafe_free_memory,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register("sun/misc/Unsafe", "allocateMemory0", "(J)J", unsafe_allocate_memory);
+    r.register("sun/misc/Unsafe", "freeMemory0", "(J)V", unsafe_free_memory);
 
     // Synthetic helper used by JDK-side Cleaner runnables that
     // capture (addr, size) at allocation time — see module docs.

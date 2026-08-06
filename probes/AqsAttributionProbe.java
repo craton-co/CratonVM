@@ -14,7 +14,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * calls at the `safe_native_call` funnel — but 5 x 330-810 ns is ~2.5-4 us and
  * the 16 nested Java calls are ~138 ns, against a 10,502 ns pair. Two thirds
  * had no owner. See
- * `docs/internal/uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md`.
+ * `uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md`.
  *
  * So this probe does not ask "what is expensive". It BUILDS THE PAIR UP from
  * its parts, so every rung is a subtraction from the next:

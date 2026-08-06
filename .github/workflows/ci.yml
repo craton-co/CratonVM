@@ -126,7 +126,7 @@ jobs:
       # Contract 1.5 defines a `Bridge` by its `ACC_NATIVE` target; 10,069 of the
       # 10,842 `Bridge` registrations have none, every one of them inherited its
       # kind from an ambient `set_category`, and this is what stops that number
-      # rising. See docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
+      # rising. See L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
       #
       # WHY HERE AND NOT ONLY IN THE ADVISORY `jdk-only` JOB. That job is
       # advisory for two documented reasons — wave 1 is measurement, and the
@@ -157,6 +157,41 @@ jobs:
       - name: Bridge ratchet (unadjudicated Bridge registrations)
         if: matrix.os == 'ubuntu-latest'
         run: sh regression-suite/bridge-ratchet.sh
+
+      # ACCEPTANCE CRITERION (design §11, criterion 6): the strict corpus is
+      # green. Unmeasured until 2026-08-04, and measuring it immediately found
+      # that `--jdk-only` could not start a thread; the widening on 2026-08-05
+      # found seven more defects, two of them JNI binding failures that had been
+      # hiding five others behind them.
+      #
+      # HERE, IN THE BLOCKING JOB — same reasoning as its sibling directly
+      # above, and the same words apply. L8's own brief says the point is that
+      # "a strict regression fails a build rather than waiting for someone to
+      # look". The `jdk-only` job is `continue-on-error` at the JOB level, so a
+      # step placed only there reports and fails nothing, which is precisely the
+      # decorative-guard shape this wave keeps producing. Its copy in that job
+      # stays as the multi-JDK/multi-OS probe; THIS one is the gate.
+      #
+      # It can block while the corpus is still red because it is a RATCHET, not
+      # a demand for zero: the known divergences are committed per
+      # `<jdk-feature>-<os>` and it fails when that set GROWS. A divergence that
+      # disappears prints "re-freeze" and passes, so a fix is never blocked by
+      # the gate that measured it. An arm that does not complete fails
+      # regardless of the baseline — there is no known-acceptable hang.
+      #
+      # `ubuntu-latest` only, exactly like the bridge ratchet and for the same
+      # reason: `25-linux` is the only committed key, and on the windows leg the
+      # gate would (correctly) refuse with exit 2 rather than look green.
+      #
+      # Prerequisites are already met by earlier steps: `Set up JDK 25` exports
+      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. The script needs a
+      # C compiler and `jar` for its two fixtures; both are present on the
+      # runner, and it degrades to `lib=absent` / `agent=absent` in EVERY arm if
+      # they are not, so the arms still agree and the gate stays honest.
+      - name: Strict corpus ratchet (three arms vs a HotSpot control)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: CV=target/debug/cratonvm TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
 
       # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
       # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an
@@ -892,7 +927,7 @@ jobs:
           fi
 
       # THE BRIDGE RATCHET
-      # (docs/internal/L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+      # (L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
       #
       # Contract §1.5 defines a `Bridge` by its `ACC_NATIVE` target. 10,069 of
       # the 10,842 `Bridge` registrations have none, every one of them inherited
@@ -975,6 +1010,64 @@ jobs:
           CV=target/debug/cratonvm
           [ -x "$CV" ] || CV=target/debug/cratonvm.exe
           CV="$CV" bash regression-suite/run.sh
+
+      # ACCEPTANCE CRITERION (design §11, criterion 6): the strict corpus is
+      # green. This is the criterion that went unmeasured until 2026-08-04, and
+      # measuring it immediately found that `--jdk-only` could not start a
+      # thread; the second widening, on 2026-08-05, found four more divergences
+      # in one run. It is where the defects are, so it runs on every build
+      # rather than when someone remembers to look.
+      #
+      # Three arms on ONE image and ONE set of class files: real HotSpot,
+      # `--real-jdk`, `--jdk-only`. The HotSpot control is not optional — a
+      # divergence present in both CratonVM modes is a compatibility defect
+      # that `--jdk-only` did not introduce, and without the control there is
+      # no way to say which kind you have. The script fails 4 for an arm that
+      # did not complete and 5 for a transcript that diverged, kept separate
+      # because a `timeout` kill prints a truncated transcript that reads
+      # exactly like a clean short run.
+      #
+      # BLOCKING, AND IT IS A RATCHET. The step's whole purpose is that "a
+      # strict regression fails a build rather than waiting for someone to
+      # look", so it carries no `continue-on-error`. It can do that while the
+      # corpus is still red because it does not demand zero divergence: the
+      # known divergences are committed to
+      # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.txt` and the
+      # gate fails when that set GROWS. A divergence that disappears prints
+      # "re-freeze" and passes, so a fix is never blocked by the gate that
+      # measured it.
+      #
+      # It refuses (exit 2) rather than passing when there is no baseline for
+      # this matrix leg's `<feature>-<os>`. That is deliberate: a baseline from
+      # another key cannot adjudicate this one, and "no baseline" must never
+      # read as "nothing diverged". Only `25-linux` is committed today, so the
+      # other three legs refuse and say so — same posture, and the same reason,
+      # as the bridge ratchet being `ubuntu-latest` only.
+      #
+      # The script self-tests its own ratchet hermetically before touching a VM
+      # — it asserts that an injected new section IS flagged and a baselined one
+      # is NOT — and refuses to adjudicate if that fails. A ratchet that has
+      # never been shown to fire is indistinguishable from one that cannot.
+      #
+      # An arm that does not complete fails regardless of the baseline. There is
+      # no such thing as a known-acceptable hang.
+      #
+      # `JAVA_HOME` is what actions/setup-java exported for this matrix leg, so
+      # the corpus is measured against both JDK 21 and JDK 25.
+      - name: Strict corpus ratchet (three-arm probe gate)
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+
+      - name: Upload strict-corpus transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-strict-probes-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: target/jdk-only-strict-probes/logs/
+          if-no-files-found: warn
 
       # Semantic differential gate over the strict-mode seed corpus
       # (difftest/seeds-jdk-only: lambda identity, dynamic proxies, reflection

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-401 tokens.
+406 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -111,6 +111,7 @@ export inherited from a parent shell.
 | `classpath` | `CRATONVM_DBG_CLASSPATH` |
 | `cleaners` | `CRATONVM_DBG_NO_CLEANERS` |
 | `clinit-fail` | `CRATONVM_DBG_CLINIT_FAIL` |
+| `clinit-order` | `CRATONVM_DBG_CLINIT_ORDER` |
 | `clone` | `CRATONVM_DBG_CLONE` |
 | `coerce` | `CRATONVM_DBG_COERCE` |
 | `compact-inline` | `CRATONVM_DBG_COMPACT_INLINE` |
@@ -303,6 +304,9 @@ export inherited from a parent shell.
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
+| `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
+| `unreg-memo-audit` | `CRATONVM_DBG_UNREG_MEMO_AUDIT` |
+| `redefine-dump` | `CRATONVM_DBG_REDEFINE_DUMP` |
 | `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
 | `npe-trace` | `CRATONVM_DBG_NPE_TRACE` |
 | `nsee-trace` | `CRATONVM_NSEE_TRACE` |
@@ -468,7 +472,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-154 tokens.
+158 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -572,6 +576,7 @@ export inherited from a parent shell.
 | `range-scan-legacy` | `CRATONVM_JIT_RANGE_SCAN_LEGACY` |
 | `reassoc` | `CRATONVM_JIT_REASSOC` |
 | `retpc-validate` | `CRATONVM_JIT_NO_RETPC_VALIDATE` |
+| `native-site-cache` | `CRATONVM_JIT_NO_NATIVE_SITE_CACHE` |
 | `rootsnap-cache` | `CRATONVM_ROOTSNAP_CACHE` |
 | `rootsnap-cache-survive-gc` | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` |
 | `safepoint-polls` | `CRATONVM_JIT_SAFEPOINT_POLLS` |
@@ -582,7 +587,10 @@ export inherited from a parent shell.
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
+| `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
+| `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |
 | `field-site-cache-loader` | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` |
+| `field-site-slots` | `CRATONVM_JIT_FIELD_SITE_SLOTS` |
 | `method-site-cache` | `CRATONVM_JIT_METHOD_SITE_CACHE` |
 | `loop-work-tierup` | `CRATONVM_JIT_LOOP_WORK_TIERUP` |
 | `shadow-nopush` | `CRATONVM_SHADOW_NOPUSH` |
@@ -613,7 +621,6 @@ export inherited from a parent shell.
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
-| `unban-junitcore` | `CRATONVM_JIT_UNBAN_JUNITCORE` |
 | `unroll` | `CRATONVM_JIT_UNROLL / CRATONVM_DISABLE_UNROLL` |
 | `vectorize` | `CRATONVM_JIT_VECTORIZE` |
 | `verify-arena-order` | `CRATONVM_JIT_VERIFY_ARENA_ORDER` |
@@ -626,6 +633,7 @@ export inherited from a parent shell.
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
+| `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 
 ## `CRATONVM_GC`
 
@@ -670,14 +678,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-25 tokens.
+24 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
 | `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
 | `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |
-| `buffered-writer` | `CRATONVM_SYNTHETIC_BUFFERED_WRITER` |
 | `dsa` | `CRATONVM_SYNTHETIC_DSA` |
 | `ec` | `CRATONVM_SYNTHETIC_EC` |
 | `eqe` | `CRATONVM_SYNTHETIC_EQE` |

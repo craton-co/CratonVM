@@ -1023,14 +1023,16 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             maybe_concurrent_gc(shared, thread);
             // Run any pending finalizers
             run_finalizers(shared, thread);
-            // Run pending Cleaner actions too. `process_references_after_gc`
-            // has just SUBMITTED them; without a drain here they queue until
-            // something calls `System.gc()` (the only other caller of
-            // `run_cleaner_actions`). Direct memory is off-heap, so a program
-            // churning `ByteBuffer.allocateDirect` never trips the heap's own
-            // occupancy trigger -- H2's `TestMVStore` emitted ~1000 actions
-            // over 40 collections and drained 992 of them in a single late
-            // batch, holding every buffer's reservation until the cap was hit.
+            // ...and any pending Cleaner actions. Until 2026-08-05 this was
+            // called ONLY from the forced `System.gc()` path, so a cleanable
+            // whose referent died during an ordinary allocation-triggered
+            // collection stayed queued indefinitely — its native memory (a
+            // direct `ByteBuffer`'s backing block, a mapped region, a file
+            // descriptor) held until something happened to call `System.gc()`.
+            // `run_finalizers` was already called from here; this is the
+            // missing half of that symmetry, and lead 2 of
+            // `known-issues/direct-memory-still-exhausts-under-sustained-churn-20260805.md`.
+            // Both are cheap no-ops when nothing is pending.
             run_cleaner_actions(shared, thread);
         } else {
             // Multi-threaded path: coordinate via GC barrier
@@ -1156,14 +1158,9 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 maybe_concurrent_gc(shared, thread);
                 // Run any pending finalizers
                 run_finalizers(shared, thread);
-                // Run pending Cleaner actions too. `process_references_after_gc`
-                // has just SUBMITTED them; without a drain here they queue until
-                // something calls `System.gc()` (the only other caller of
-                // `run_cleaner_actions`). Direct memory is off-heap, so a program
-                // churning `ByteBuffer.allocateDirect` never trips the heap's own
-                // occupancy trigger -- H2's `TestMVStore` emitted ~1000 actions
-                // over 40 collections and drained 992 of them in a single late
-                // batch, holding every buffer's reservation until the cap was hit.
+                // ...and any pending Cleaner actions — see the single-threaded
+                // arm above for why an allocation-triggered GC must do this
+                // too, not only the forced `System.gc()` path.
                 run_cleaner_actions(shared, thread);
             } else {
                 // Another thread is already doing GC — just participate
@@ -1248,7 +1245,7 @@ pub(crate) fn create_string_or_oom(
 /// Identical escalation ladder — the only difference is that the source is a
 /// `&[u16]` rather than a `&str`, so an unpaired surrogate survives into the
 /// allocated `String`. String concatenation builds its result this way; see
-/// `docs/known-issues/string-concat-loses-unpaired-surrogates.md`.
+/// `string-concat-loses-unpaired-surrogates-FIXED-20260805.md`.
 pub(crate) fn create_string_from_units_or_oom(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1744,6 +1741,11 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Each entry is the address of a `java/lang/ref/Cleaner$Cleanable`
 /// synthetic. Field 0 holds the Runnable action; field 1 is the cleaned
 /// flag (idempotency guard, also set by user-triggered Cleanable.clean()).
+///
+/// A real-JDK `jdk.internal.ref.Cleaner` also arrives here — the reference
+/// processor emits it as an action rather than enqueuing it onto its
+/// reader-less `dummyQueue` (see `ReferenceEntry::runs_cleaner`). It has a
+/// completely different layout and is handled by invoking its own `clean()`.
 ///
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
@@ -3688,6 +3690,9 @@ pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &c
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     remap_trace_push(shared, thread, "publish", "");
+    // Stamp when this thread last published, so a stale-address report can say
+    // how many collections completed since. See `note_root_publish`.
+    crate::memory::reclaim_guard::note_root_publish(shared, thread);
     // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
     // native returned without `check_post_block_gc` (unpaired exit), this
     // thread is running with an unconsumed fixup chain / slot-origin set —

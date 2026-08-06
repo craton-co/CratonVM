@@ -52,6 +52,22 @@ fn iae_trace_enabled() -> bool {
     *IAE_TRACE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok())
 }
 
+/// Substring filter for the NPE-origin stack dump: set
+/// `CRATONVM_DBG_NPE_MATCH=<substring>` to print the interpreter frame stack
+/// for every `NullPointerException` whose (JEP 358) message contains it.
+///
+/// The two hardcoded predicates below (`isInterface`, `Name is null`) each
+/// exist because someone needed exactly this and had to rebuild the VM to get
+/// it. A caught-and-logged NPE deep inside a framework — Spring's
+/// `AnnotationUtils.handleIntrospectionFailure` logs the message and swallows
+/// the stack — is otherwise invisible: you get the JEP 358 text and no site.
+fn dbg_npe_match() -> Option<&'static str> {
+    static NPE_MATCH: OnceLock<Option<String>> = OnceLock::new();
+    NPE_MATCH
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_NPE_MATCH").ok())
+        .as_deref()
+}
+
 cached_env_flag!(dbg_npe_none, "CRATONVM_DBG_NPE_NONE");
 cached_env_flag!(dbg_aioobe, "CRATONVM_DBG_AIOOBE");
 cached_env_flag!(dbg_bufunder, "CRATONVM_DBG_BUFUNDER");
@@ -1621,6 +1637,27 @@ pub fn throw_runtime_error(
                     }
                 }
             }
+            // Targeted NPE-origin dump: `CRATONVM_DBG_NPE_MATCH=<substring>`.
+            // Narrower than `CRATONVM_IAE_TRACE` (which dumps EVERY NPE, and
+            // Spring startup raises hundreds it catches), so a rare, swallowed
+            // NPE can be located without drowning the log.
+            if let Some(needle) = dbg_npe_match() {
+                if let RuntimeError::NullPointerException { message: Some(m) } = &error {
+                    if m.contains(needle) {
+                        eprintln!("[NPE-MATCH] msg={m}");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
+                            let cn = shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            eprintln!("[NPE-MATCH-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
+                    }
+                }
+            }
             // S111r20: broad NPE trace for spring context NPE hunt
             if iae_trace_enabled() {
                 eprintln!("NPE-TRACE msg={:?}", error);
@@ -1660,7 +1697,10 @@ pub fn throw_runtime_error(
     };
 
     match create_exception_object(shared, thread, class_name, message) {
-        Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
+        Ok(obj_ref) => {
+            populate_pattern_syntax_fields(shared, obj_ref, &error);
+            MethodCallFailed::ExceptionThrown(obj_ref)
+        }
         Err(e) => {
             // If the failure was heap exhaustion (couldn't allocate the
             // exception object or its detail-message String), throw the
@@ -1686,6 +1726,47 @@ pub fn throw_runtime_error(
             MethodCallFailed::InternalError(VmError::Runtime(error))
         }
     }
+}
+
+/// Fill in `PatternSyntaxException`'s `desc` / `pattern` / `index` after the
+/// generic constructor path has allocated it.
+///
+/// That class is the one throwable here whose message is NOT
+/// `Throwable.detailMessage`: it declares only `(String desc, String regex,
+/// int index)`, overrides `getMessage()`, and assembles a three-line report
+/// from the fields. `create_exception_object` knows how to call `()V` and
+/// `(String)V`, neither of which exists on it, so without this the object came
+/// out with all three fields null/zero and `getMessage()` returned
+/// `"null near index 0\r\nnull"`.
+///
+/// A no-op for every other error, and by-name so it cannot depend on the JDK's
+/// private field order.
+fn populate_pattern_syntax_fields(shared: &SharedVm, obj_ref: ObjectRef, error: &RuntimeError) {
+    let RuntimeError::PatternSyntaxException {
+        description,
+        pattern,
+        index,
+    } = error
+    else {
+        return;
+    };
+    let set = |name: &str, value: Value| {
+        let class_id = shared.mem.heap.class_id_of(obj_ref);
+        let cm = shared.classes.class_manager.read();
+        if let Some(i) =
+            crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, name, &cm.class_store)
+        {
+            drop(cm);
+            shared.mem.heap.set_field(obj_ref, i, value);
+        }
+    };
+    if let Some(d) = crate::vm::try_create_java_string_uninterned(shared, description) {
+        set("desc", Value::Object(Some(d)));
+    }
+    if let Some(p) = crate::vm::try_create_java_string_uninterned(shared, pattern) {
+        set("pattern", Value::Object(Some(p)));
+    }
+    set("index", Value::Int(*index));
 }
 
 /// Pre-allocate the singleton `java.lang.OutOfMemoryError` while the heap still
@@ -1806,14 +1887,14 @@ pub fn raise_no_class_def_found_with_cause(
 fn dbg_rterr_filter() -> Option<&'static str> {
     static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FILTER
-        .get_or_init(|| std::env::var("CRATONVM_DBG_RTERR").ok())
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_RTERR").ok())
         .as_deref()
 }
 
 /// Cached `CRATONVM_DBG_LINKAGE_BT` flag (see `linkage_throwable`).
 fn dbg_linkage_bt() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_LINKAGE_BT").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some())
 }
 
 fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
@@ -2461,7 +2542,7 @@ mod tests {
             RuntimeError::IllegalMonitorStateException {
                 message: "not owner".to_string(),
             },
-            RuntimeError::StringIndexOutOfBoundsException { index: 99 },
+            RuntimeError::sioobe_index(99, 5),
             RuntimeError::NoSuchFieldException {
                 field_name: "missing".to_string(),
             },

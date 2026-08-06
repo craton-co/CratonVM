@@ -2018,17 +2018,44 @@ fn reloc_emit_enabled() -> bool {
     /// are ENTERED, not with stack depth.
     ///
     /// The single-pass backend solves this the same way (`shadow_pushed_any`).
-    /// Overwriting with `0x90` rather than shifting the body keeps every
+    /// Erasing in place rather than shifting the body keeps every
     /// already-recorded offset — branch patches, deopt points, oop-map native
     /// pcs — valid, which is why this is an erase and not a removal.
+    ///
+    /// It erases with a JUMP over the span, not with a run of `0x90`. This
+    /// half was missing here while the single-pass backend had it, and the
+    /// asymmetry cost real time: the span is ~46 bytes, so every IR method
+    /// that published nothing retired 46 NOPs on entry, on every invocation.
+    /// `CratonBench fib` — a two-line static method entered 2.27e9 times —
+    /// paid it 2.27e9 times and ran ~2x slower on the IR tier than on the
+    /// single-pass body it displaced. Both backends now share
+    /// [`ExecutableBuffer::erase_range_with_jump_over`] so they cannot drift
+    /// apart again.
     fn finish_lazy_thread_fetch(&mut self) {
         if self.shadow_pushed_any {
             return;
         }
         if let Some((start, end)) = self.thread_fetch_span.take() {
-            for off in start..end {
-                let _ = self.buf.try_patch_byte(off, 0x90);
-            }
+            // Jumping over the span is only safe while nothing branches INTO
+            // its interior: a site patched at `start + 1` would overwrite the
+            // rel8 displacement, and one that TARGETS `start + 1` would decode
+            // the displacement as an opcode. Under the old NOP fill neither
+            // was fatal, so the invariant was never stated — it holds because
+            // the span is emitted at the top of the prologue, before any block
+            // is lowered, so every recorded patch site is past `end`.
+            //
+            // This runs before `patch_branches` / `patch_self_calls`, so both
+            // lists are still intact here and the invariant is checkable
+            // rather than merely true.
+            debug_assert!(
+                self.branch_patches
+                    .iter()
+                    .all(|&(pos, _)| pos < start || pos >= end)
+                    && self.self_call_patches.iter().all(|&pos| pos < start || pos >= end),
+                "a patch site landed inside the erased thread-fetch span {start}..{end}; \
+                 jumping over it would corrupt that patch (or its target)"
+            );
+            self.buf.erase_range_with_jump_over(start, end);
         }
     }
 
@@ -5348,12 +5375,39 @@ fn reloc_emit_enabled() -> bool {
                 self.push_call_exc_patch(exception_patch);
             }
             Op::Return => {
+                let mut returned_a_value = false;
                 if node.inputs.len() > 1 {
                     // Has return value — move to RAX
                     let val_id = node.inputs[1];
                     if val_id != NO_NODE {
                         self.load_to_rax(self.slot_of(val_id));
+                        returned_a_value = true;
                     }
+                }
+                if !returned_a_value {
+                    // Zero RAX on the normal VOID-return path, exactly as the
+                    // single-pass backend's `0xb1` arm has always done.
+                    //
+                    // `i64::MIN` in the return register is this VM's "the callee
+                    // trapped" sentinel, and a void method has no return value —
+                    // so without this, RAX carries whatever the method's last
+                    // operation left there. Every consumer reads that raw
+                    // register: the single-pass inline MIC/PIC cascade's
+                    // `emit_inline_callee_deopt_check`, the megamorphic hashed
+                    // stub's, `jit_invoke_virtual_mic`'s `rc == i64::MIN`, and
+                    // the interpreter's post-JIT drain. A false positive is not
+                    // a wasted branch: `handle_compiled_callee_deopt_sentinel`
+                    // resumes a stashed callee frame and drains the thread's
+                    // entire pending-signal record.
+                    //
+                    // Measured on the Hazelcast XSD failure: one `Config.load()`
+                    // serviced 11 callee "deopts" and EVERY ONE was a void
+                    // callee — `QName.setValues`, `XMLAttributesImpl
+                    // .addAttributeNS`, `ValidatorHandlerImpl.fillXMLAttribute`
+                    // and `.fillXMLAttributes2` — none of which can throw.
+                    //
+                    // XOR EAX, EAX (31 C0) — zero-extends to RAX.
+                    self.buf.emit(&[0x31, 0xC0]);
                 }
                 self.emit_epilogue();
             }
@@ -6048,9 +6102,9 @@ fn reloc_emit_enabled() -> bool {
     /// # One stub per DISTINCT throw-site bci, not one shared stub
     ///
     /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
-    /// flagged and did not own (`docs/known-issues/hibernate/
+    /// flagged and did not own (`fixed-suite-bugs/hibernate/
     /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
-    /// 20260804.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// 20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
     /// as *this* method's throw site and range-tested against `[start_pc,
     /// end_pc)` of every entry in this method's own exception table. Until this
     /// stub stamped it, that field still held whatever the CALLEE's compiled
@@ -12141,6 +12195,68 @@ mod tests {
         graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], None);
         let schedule = ir_schedule::schedule(&graph);
         (graph, schedule)
+    }
+
+    /// `void f(int a) { a + 1; }` — the same shape as [`add_one_graph`] with the
+    /// value dropped from the `Return`, so the only difference between the two
+    /// lowerings is the void exit itself.
+    fn void_return_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let _sum = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// A VOID return must leave a defined value in the return register.
+    ///
+    /// `i64::MIN` there is the VM-wide "the callee trapped" sentinel, and every
+    /// consumer reads the raw register: the single-pass inline MIC/PIC
+    /// cascade's `emit_inline_callee_deopt_check`, the megamorphic hashed
+    /// stub's, `jit_invoke_virtual_mic`'s `rc == i64::MIN`, and the
+    /// interpreter's post-JIT drain. A void method has no return value, so
+    /// unless the exit writes one, RAX carries whatever the last operation left
+    /// there and can equal the sentinel by accident — on behalf of a call that
+    /// neither threw nor deopted. The single-pass backend has always zeroed it
+    /// (`x64/bytecode_walk.rs`, the `0xb1` arm); this backend did not.
+    ///
+    /// Asserted on the BYTES, and as a DIFFERENCE against the value-returning
+    /// twin, so it cannot pass by accident: `try_call` returning 0 would be
+    /// satisfied by an undefined register that merely happened to hold 0.
+    #[test]
+    fn a_void_return_writes_the_return_register() {
+        const XOR_EAX_EAX: [u8; 2] = [0x31, 0xC0];
+
+        let (vg, vs) = void_return_graph();
+        let void_method = lower(&vg, &vs, 1, 1, &no_helpers()).expect("void method must lower");
+        let (ag, as_) = add_one_graph();
+        let value_method = lower(&ag, &as_, 1, 1, &no_helpers()).expect("a+1 must lower");
+
+        let void_zeroes = count_seq(void_method._buffer_slice_for_debug(), &XOR_EAX_EAX);
+        let value_zeroes = count_seq(value_method._buffer_slice_for_debug(), &XOR_EAX_EAX);
+        assert_eq!(
+            void_zeroes,
+            value_zeroes + 1,
+            "the void exit must contribute exactly one `XOR EAX,EAX` the \
+             value-returning exit does not (void={void_zeroes}, value={value_zeroes})",
+        );
+        assert_eq!(
+            unsafe { void_method.try_call(&[41]) },
+            Ok(0),
+            "a void method must not hand its caller the deopt sentinel",
+        );
     }
 
     /// The verifier must not refuse a graph the lowerer handles — otherwise the

@@ -1171,6 +1171,12 @@ mod stub_tests {
         let stream = Stream::for_test();
         let host = [1_u32, 2, 3, 4];
 
+        // SAFETY: this module is `cfg(all(test, not(feature = "cuda")))`, so the
+        // stub backend is the one compiled in and no DMA is ever submitted to a
+        // driver. The borrowed-host contract — `host` must stay valid until the
+        // upload's `last_write` event fires — is therefore vacuous; `host`
+        // outlives the call regardless. Same argument as the `SAFETY` on
+        // `from_host_async`'s own delegation above.
         match unsafe { DeviceBuffer::<u32>::from_host_async_unchecked(&ctx, &host, &stream) } {
             Err(DeviceError::NoDriver) => {}
             Err(other) => panic!("expected NoDriver, got {other:?}"),
@@ -1205,6 +1211,10 @@ mod stub_tests {
         *buf.last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(last_write);
 
         let mut dst = [0.0_f32; 2];
+        // SAFETY: stub-only module (see the sibling upload test), so no DMA is
+        // queued and the borrowed-destination contract — `dst` unread and at a
+        // fixed address until the download completes — is vacuous. `dst` is a
+        // stack local that outlives the call and is only read after it returns.
         match unsafe { buf.to_host_async_unchecked(&mut dst, &stream) } {
             Err(DeviceError::NoDriver) => {}
             Err(other) => panic!("expected NoDriver, got {other:?}"),

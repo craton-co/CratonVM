@@ -158,3 +158,52 @@ hide the single event you are hunting.
   parent bug (Cleaners were discovered but never run at all);
 * the retired `h2-testindex-testmvstore-unmasked-20260802` page — why
   `TestMVStore` got far enough to hit this.
+
+## Merge addendum — a concurrent session landed two of these independently
+
+While this was being measured, `claude/bytebuffer-jdk-contract-e3e6c6` landed on
+`dev`:
+
+* **the same fix 1** (`run_cleaner_actions` beside both ordinary-GC
+  `run_finalizers` calls in `maybe_gc`) — the merge conflict was comment-only
+  and dev's comment was kept;
+* **a third gap this page's original leads did not name**: the
+  `Unsafe.allocateMemory0` path that the real `DirectByteBuffer(int)`
+  constructor uses had no reclaim-and-retry at all, and
+  `dbb_allocate_collecting` now gives it one.
+
+Fix 2 here (the forced drain under a JIT borrow) is independent of both and was
+not landed by that session.
+
+### One correction to the record
+
+That page states our `bits_reserve_memory` is dead code in real-JDK mode,
+because `java/nio/Bits` is not in `force_native_over_real_jdk_bytecode`, and
+concludes its retry "never ran". **Measurement contradicts that.** The
+`[dm] reserveMemory …` traces exist only inside `bits_reserve_memory`, and they
+fire on `TestMVStore` at the fork point `801c89115` — *before* that session's
+changes:
+
+```
+[dm] reserveMemory REFUSED size=9777152 reserved=1065761792 max=1073741824 thread=ThreadId(609)
+[dm] reserveMemory round=0 before=1065761792 after=1065761792 freed=0
+[dm] reserveMemory GIVING UP size=9777152 reserved=1065761792
+```
+
+and after fix 2 the same function is what grants them:
+
+```
+[dm] reserveMemory round=0 before=1068998656 after=8257536 freed=1060741120
+[dm] reserveMemory GRANTED after round=0
+```
+
+So `bits_reserve_memory` is reached on this workload and its retry is
+load-bearing. The `Unsafe.allocateMemory0` path may well *also* have needed its
+own retry — that is a separate, plausible gap — but "our native is dead code"
+is not the reason this page stayed open.
+
+### Combination re-verified
+
+`fix+fix` is not a proven fix, so `TestMVStore` was re-run on the **merged**
+tree rather than on either branch alone. See the verification section above for
+the merged numbers.

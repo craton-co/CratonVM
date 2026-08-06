@@ -281,6 +281,20 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     }
 }
 
+/// Cached `CRATONVM_DBG_REFDISC` gate: trace every `discover_reference` with
+/// the reference object's CLASS NAME. The numeric `ref_type` cannot tell an
+/// ordinary `PhantomReference` from a `jdk.internal.ref.Cleaner` (the latter
+/// is a subclass, so its `super(referent, dummyQueue)` arrives with the same
+/// phantom tag) — which is exactly the question
+/// `direct-bytebuffers-are-never-reclaimed-20260805.md` needed answered
+/// before its Cleaner routing could be written.
+#[inline]
+pub fn dbg_refdisc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFDISC").is_some())
+}
+
 /// Cached `CRATONVM_DBG_NO_CLEANERS` gate (bc math-ec 0x4 bisect): skip ONLY
 /// `run_cleaner_actions` + `run_finalizers` (the Java invokes on queued —
 /// possibly stale — addresses), keeping `process_references_after_gc` live.
@@ -1709,6 +1723,38 @@ pub fn execute(
         );
         #[cfg(not(feature = "gpu-offload"))]
         let gpu_gate_skip = false;
+        // A `<clinit>` must not take the eager FIRST-CALL compile door.
+        //
+        // Not a codegen-quality judgement — an ordering one. Entering a
+        // compiled artifact runs the `static_init_classes` pre-walk a hundred
+        // lines below, which `ensure_class_initialized`s the declaring class of
+        // EVERY getstatic/putstatic site anywhere in the body, before bytecode
+        // zero. For an ordinary method that is a sound approximation of JVMS
+        // §5.5. For a `<clinit>` it inverts the very order the initializer
+        // exists to establish, and the JDK has initializers whose correctness
+        // is exactly that order:
+        //
+        //   `java/lang/constant/ConstantDescs.<clinit>` assigns
+        //   `BSM_PRIMITIVE_CLASS` (line 198) and only then reads
+        //   `PrimitiveClassDescImpl.CD_int` (line 249) — and
+        //   `PrimitiveClassDescImpl.<clinit>`'s own ctor reads
+        //   `ConstantDescs.BSM_PRIMITIVE_CLASS`. Hoisting the line-249 trigger
+        //   to method entry runs that ctor against a null `BSM_PRIMITIVE_CLASS`
+        //   → `NullPointerException` → `ExceptionInInitializerError`, and both
+        //   classes are poisoned for the rest of the process. `ConstantDescs
+        //   .<clinit>` then never executes a single putstatic. Deterministic:
+        //   `MethodHandles.arrayElementVarHandle(int[].class)` reaches it
+        //   through `MethodTypeForm` → `sun/invoke/util/Wrapper.<clinit>`.
+        //
+        // Only reachable with `CRATONVM_BG_COMPILE=0` today, because the
+        // default background pipeline does not first-call-compile here — which
+        // is why the documented opt-out was unusable on any real classpath.
+        //
+        // Refusing costs nothing: a `<clinit>` runs at most once per class per
+        // loader, so a method-entry compile can never amortize its own codegen.
+        // A `<clinit>` with a genuinely hot loop still reaches the OSR door,
+        // which enters mid-body and does not run this pre-walk.
+        let clinit_skip = method_name == "<clinit>";
         if env_disable_jit
             || redefine_jit_quiesced
             || already_skipped
@@ -1716,6 +1762,7 @@ pub fn execute(
             || fjp_skip
             || native_skip
             || gpu_gate_skip
+            || clinit_skip
         {
             // Method has known JIT issues — skip JIT.
             //
@@ -1740,7 +1787,12 @@ pub fn execute(
             // call-site-dependent, not per-method-permanent, so they must NOT
             // poison this method's entry for future calls where those flags
             // may differ.
-            if static_skip_reason.is_some() || fjp_skip || native_skip {
+            // `clinit_skip` joins the sealed set for the same reason the other
+            // three do: it is a pure function of the method name, so recomputing
+            // it on every call is waste. (`<clinit>` is called once, so the seal
+            // rarely pays — but leaving it out would make `already_skipped`
+            // unreachable for it, which is the trap this seal exists to avoid.)
+            if static_skip_reason.is_some() || fjp_skip || native_skip || clinit_skip {
                 note_jit_skip_seal("static-policy-or-native-shadow", &skip_key);
                 shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
