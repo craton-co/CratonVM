@@ -37,7 +37,13 @@ The load-bearing correction: **the gate is not off for throughput reasons.**
 incompleteness". A sweep of every reference-slot access in the workspace found
 two correctness holes on the only backend the gate permits.
 
-### 1.2 Blockers — reachable today under the generational backend
+### 1.2 Blockers — both CLOSED 2026-08-06
+
+> **Status update (2026-08-06).** B1 and B2 below were both closed while
+> retiring `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
+> The descriptions are kept verbatim because they are the derivation; the
+> resolution is recorded under each. `gc/src/compressed_oops.rs`'s header and
+> `warn_known_unsound`'s stderr text were updated in the same change.
 
 **B1. `jit/src/x64.rs:14639` `emit_load_string_value_ptr`.**
 Emits an unconditional 64-bit `MOV dst, [base + compact_offset]` for the
@@ -67,11 +73,46 @@ left unrewritten (dangling). These are fallback paths — but they are the paths
 that run when the parseable walk has already failed, i.e. precisely when
 correctness matters.
 
-**Conclusion: compressed oops must stay off.** This is the moving-young case,
-not the pgo case: the gate is holding back something genuinely unsound, and
-that is the gate working correctly. `enable_for_live_heap` now prints both
-blockers to stderr on the opt-in path so nobody who flips the flag has to find
-out from a crash dump.
+**RESOLVED 2026-08-06 (B1).** `emit_load_string_value_ptr`
+(`jit/src/x64/objects.rs`) has a narrow arm, `emit_load_narrow_ref_field`,
+mirroring `emit_narrow_ref_aload_regs`. It is selected per call site by a new
+`StringFieldLayout::value_compact_is_narrow`, which is true only when a
+`CompactLayout` was actually registered for the String class — the
+no-registered-layout fallback points `value_compact_offset` at the LEGACY
+16-byte cell payload, which is never narrowed and must keep its wide load. The
+emitter borrows R11 for the rebase inside a balanced `PUSH`/`POP` (the register
+allocator has already parked values in the extended registers at these sites,
+unlike the array emitters, and the pair straddles no `CALL` and no RSP-relative
+access). The one-line refusal in `try_resolve_string_intrinsic` — and the
+throughput it cost — is gone. Verified: `StringHot`, a hot loop over
+`charAt`/`length`/`isEmpty`/`hashCode`/`indexOf`/`equals`/`compareTo` over
+LATIN1, UTF-16 and empty receivers, is byte-identical to HotSpot under
+`CRATONVM_COMPRESSED_OOPS=1`.
+
+**RESOLVED 2026-08-06 (B2).** Both scans take a second pass over the stretch at
+4-byte granularity under `narrow_oops_enabled()`, decoding each half as a narrow
+oop. The mark pass is unconditionally safe — over-marking always was, which is
+the property the wide pass already relies on, and the base validation is what
+stops a coincidence from writing a mark bit into a live object's payload. The
+rewrite pass inherits the wide pass's false-positive trade and *more* of it (32
+bits of entropy instead of 64), which is accepted for the same reason — an
+unrewritten reference is a certain dangling pointer — and is bounded by
+`oldgen_compact_enabled` being off by default, so `compact_map` is empty and
+neither pass runs at all unless `CRATONVM_OLDGEN_COMPACT=1` is set.
+
+**Conclusion: compressed oops must still stay off**, but for §1.3's reason
+(G1/ZGC unmigrated behind a load-bearing backend check), not for §1.2's — and
+for a second reason §1.2 was hiding: **it is worth 4.7 %, not 20-30 %.**
+Measured 2026-08-06, interleaved A-B-B-A on spring-beans
+`BeanRegistrationsAotContributionTests`, peak RSS 1850 MB wide vs 1763 MB
+narrow, wall time indistinguishable. The throughput cliff this page's earlier
+measurement recorded (wide finished in 1677 s, narrow did not finish inside
+2700 s) was the B1 stopgap refusing the String intrinsics, not compression.
+That matters for §2's ordering: with the reference width worth only ~5 %, the
+32-byte-to-16-byte `ObjectHeader` shrink is the item with the leverage, and
+this one is a prerequisite for it rather than a win on its own.
+`enable_for_live_heap` still warns on the opt-in path; the text now names what
+is actually left.
 
 ### 1.3 Held off only by the backend check
 

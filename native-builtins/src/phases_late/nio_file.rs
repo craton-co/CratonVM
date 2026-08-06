@@ -6736,7 +6736,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
 
         for name in ["list", "list0"] {
-            r.register(
+            fs_reg(
+                r,
                 fs_cls,
                 name,
                 "(Ljava/io/File;)[Ljava/lang/String;",
