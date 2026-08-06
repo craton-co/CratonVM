@@ -270,6 +270,21 @@ because the original failure was invisible from inside the agent.
   which is what the contract and the probe require; whether it *finds* anything
   depends on `hsperfdata` files CratonVM does not write.
 
+## Seen in passing, not this doc's
+
+* **Strict-mode iterator helpers.** Writing `NioAttrProbe` turned up
+  `NoClassDefFoundError: java/util/TreeSet$Itr` under `--jdk-only` — the same
+  family as the already-baselined `java/util/HashMap$KeyItr` in
+  `JdkOnlyBreadthProbe/strict/time` and `cratonvm/internal/SystemLogger` in
+  `.../serialization`. The probe was rewritten to sort without a `TreeSet` so it
+  measures file attributes rather than that gap; the gap itself belongs to the
+  strict-mode lane and is already on the corpus baseline.
+* **A `ServiceLoader` defect two callers wide.** Fixed here rather than filed,
+  because it is three lines and sits on the very path this doc's row 2 walks —
+  see the `fix(serviceloader)` commit. It is not attach-specific: any real
+  `ServiceLoader` whose `loader` field this VM leaves null took the same wrong
+  branch.
+
 ## Related memory
 
 `native-backed-state-is-invisible-to-real-jdk-bytecode`,
