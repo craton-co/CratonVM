@@ -257,7 +257,7 @@ fn real_field_at_index<'a>(
     let mut cid = Some(class_id);
     while let Some(id) = cid {
         let cls = store.get(id)?;
-        if cls.is_synthetic_stub {
+        if cls.origin.is_compatibility_stub() {
             return None;
         }
         if index >= cls.first_field_index {
@@ -298,7 +298,7 @@ pub fn diff_against_model(
     model: &[ClassFileField],
 ) -> Option<ShadowLayoutDiff> {
     let class: &Class = store.get(class_id)?;
-    if class.is_synthetic_stub {
+    if class.origin.is_compatibility_stub() {
         return None;
     }
     let model_instance: Vec<&ClassFileField> = model.iter().filter(|f| !f.is_static()).collect();
@@ -419,7 +419,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
             array_info: None,
@@ -632,7 +631,7 @@ mod tests {
         let mut store = ClassStore::new();
         let id = store.next_id();
         let mut class = make_class(id, "java/util/Fake", None, anon(2), 0, 2);
-        class.is_synthetic_stub = true;
+        class.origin.is_compatibility_stub() = true;
         store.add(class);
         assert!(diff_against_model(&store, id, &anon(2)).is_none());
     }

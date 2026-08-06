@@ -334,7 +334,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
                 let c = cm
                     .get_class(id)
                     .map(|cls| {
-                        if cls.is_synthetic_stub {
+                        if cls.origin.is_compatibility_stub() {
                             // Synthetic stub — use the hardcoded default (value + hash).
                             STRING_NUM_FIELDS_DEFAULT
                         } else {
@@ -943,7 +943,7 @@ fn resolve_class_mirror_slots(
     class: &crate::classloading::Class,
     mirror_field_count: usize,
 ) -> ClassMirrorSlots {
-    if class.is_synthetic_stub {
+    if class.origin.is_compatibility_stub() {
         let slot = |s: usize| (s < mirror_field_count).then_some(s);
         return ClassMirrorSlots {
             name: slot(LEGACY_NAME_SLOT),
@@ -1046,7 +1046,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
             let c = cm
                 .get_class(id)
                 .map(|cls| {
-                    if cls.is_synthetic_stub {
+                    if cls.origin.is_compatibility_stub() {
                         CLASS_MIRROR_NUM_FIELDS
                     } else {
                         cls.num_total_fields
@@ -1290,7 +1290,7 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
             let c = cm
                 .get_class(id)
                 .map(|cls| {
-                    if cls.is_synthetic_stub {
+                    if cls.origin.is_compatibility_stub() {
                         CLASS_MIRROR_NUM_FIELDS
                     } else {
                         cls.num_total_fields
@@ -1551,7 +1551,7 @@ pub fn pre_init_string_statics(shared: &SharedVm) {
     };
 
     // Only pre-init for real (non-synthetic) String class
-    if cls.is_synthetic_stub {
+    if cls.origin.is_compatibility_stub() {
         return;
     }
 
@@ -1610,7 +1610,7 @@ pub fn pre_init_class_statics(shared: &SharedVm) {
         Some(c) => c,
         None => return,
     };
-    if cls.is_synthetic_stub {
+    if cls.origin.is_compatibility_stub() {
         return;
     }
 

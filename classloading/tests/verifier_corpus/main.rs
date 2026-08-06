@@ -137,7 +137,6 @@ fn verify(bytes: &[u8]) -> Result<(), LinkageError> {
         hidden: false,
         module_name: None,
         origin: ClassOrigin::VmInternal,
-        is_synthetic_stub: false,
         has_finalizer: false,
         code_source: None,
         array_info: None,

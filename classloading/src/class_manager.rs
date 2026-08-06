@@ -2369,11 +2369,13 @@ struct RedefineInvariantSnapshot {
     /// Provenance is an invariant of the class, not of its bytes: JEP 109
     /// swaps method bodies, it does not turn a boot-image class into a
     /// fabricated one (or vice versa). Snapshotting it means a redefine that
-    /// silently rewrote `origin` — and with it the derived
-    /// `is_synthetic_stub` — trips the assertion instead of quietly changing
-    /// what the `--jdk-only` policy sees.
+    /// silently rewrote `origin` trips the assertion instead of quietly
+    /// changing what the `--jdk-only` policy sees.
+    ///
+    /// This used to be snapshotted twice — once as `origin`, once as the
+    /// derived `is_synthetic_stub` bool. The bool is gone (2026-08-06); the
+    /// origin is the single source of truth, and comparing it covers both.
     origin: ClassOrigin,
-    is_synthetic_stub: bool,
     has_finalizer: bool,
     code_source_present: bool,
     array_info_present: bool,
@@ -2418,7 +2420,6 @@ impl RedefineInvariantSnapshot {
             hidden,
             module_name,
             origin,
-            is_synthetic_stub,
             has_finalizer,
             code_source,
             array_info,
@@ -2463,7 +2464,6 @@ impl RedefineInvariantSnapshot {
             hidden: *hidden,
             module_name: module_name.clone(),
             origin: origin.clone(),
-            is_synthetic_stub: *is_synthetic_stub,
             has_finalizer: *has_finalizer,
             code_source_present: code_source.is_some(),
             array_info_present: array_info.is_some(),
@@ -2571,10 +2571,6 @@ impl RedefineInvariantSnapshot {
         debug_assert_eq!(
             self.origin, after.origin,
             "redefine_class mutated Class::origin on {class_name}"
-        );
-        debug_assert_eq!(
-            self.is_synthetic_stub, after.is_synthetic_stub,
-            "redefine_class mutated Class::is_synthetic_stub on {class_name}"
         );
         debug_assert_eq!(
             self.has_finalizer, after.has_finalizer,
@@ -3673,7 +3669,7 @@ impl ClassManager {
             let is_synthetic = self
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             // HIB-DEV-03: skip the full-classpath upgrade rescan once we've
             // learned the real `.class` is absent — otherwise every
@@ -3905,7 +3901,6 @@ impl ClassManager {
             // Overwritten (together with `is_synthetic_stub`) by the
             // `set_origin` call below — the only writer of either field.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -4360,7 +4355,7 @@ impl ClassManager {
                     let is_real = self
                         .class_store
                         .get(class_id)
-                        .map(|c| !c.is_synthetic_stub)
+                        .map(|c| !c.origin.is_compatibility_stub())
                         .unwrap_or(false);
                     if is_real {
                         loaded += 1;
@@ -4559,7 +4554,7 @@ impl ClassManager {
             let is_synthetic = self
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             // HIB-DEV-03: skip the full-classpath upgrade rescan once the real
             // `.class` is known absent (re-armed on classpath extension) so a
@@ -5202,7 +5197,7 @@ impl ClassManager {
                 let is_stub = self
                     .class_store
                     .get(existing_id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if is_stub {
                     self.upgrade_synthetic_class(
@@ -5809,7 +5804,6 @@ impl ClassManager {
             // Installed together with the derived `is_synthetic_stub` by the
             // `set_origin` call below.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false, // computed below
             code_source,
             array_info: None,
@@ -5870,7 +5864,7 @@ impl ClassManager {
         // even when the assignability verdicts are not.
         let skip_all_verification = options.skip_verification
             || self.cds_class_cache.contains_key(name)
-            || class.is_synthetic_stub
+            || class.origin.is_compatibility_stub()
             || class.state == ClassState::Verified;
         if !skip_all_verification {
             let hierarchy = ClassStoreHierarchy {
@@ -7592,7 +7586,7 @@ impl ClassManager {
         let verify_skip = self
             .class_store
             .get(class_id)
-            .map(|c| c.is_synthetic_stub)
+            .map(|c| c.origin.is_compatibility_stub())
             .unwrap_or(false)
             || self.skip_bytecode_verification.contains(&class_id);
 
@@ -8788,7 +8782,6 @@ impl ClassManager {
             module_name: None,
             // Set together with `is_synthetic_stub` by `set_origin` below.
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false, // synthetic stubs don't override finalize()
             signature: None,
             code_source: None,
@@ -9239,7 +9232,6 @@ impl ClassManager {
             // construction. Set directly (not via `set_origin`) because the
             // derived bool is written in the same literal, one line down.
             origin: ClassOrigin::VmArray,
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -16296,7 +16288,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16358,7 +16349,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16397,7 +16387,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16491,7 +16480,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::compatibility_stub("test fixture: hand-built synthetic stub"),
-            is_synthetic_stub: true,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16531,7 +16519,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16717,7 +16704,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -16990,7 +16976,7 @@ mod tests {
             .class_store
             .get(class_id)
             .expect("upgraded class remains registered");
-        assert!(!class.is_synthetic_stub);
+        assert!(!class.origin.is_compatibility_stub());
         assert_eq!(class.state, ClassState::Loaded);
         assert_eq!(class.initializing_thread, None);
         assert_eq!(
@@ -17761,7 +17747,7 @@ mod tests {
             .expect("array class must be registered in ClassStore");
         assert_eq!(&*array_class.name, "[Ljava/util/HashMap;");
         assert!(
-            !array_class.is_synthetic_stub,
+            !array_class.origin.is_compatibility_stub(),
             "array classes are synthesised, not stubbed",
         );
         assert!(
@@ -17810,7 +17796,7 @@ mod tests {
         let inner = mgr
             .get_class(inner_id)
             .expect("inner array class must be registered");
-        assert!(!inner.is_synthetic_stub);
+        assert!(!inner.origin.is_compatibility_stub());
         assert_eq!(&*inner.name, "[Ljava/lang/Object;");
     }
 
@@ -17822,7 +17808,7 @@ mod tests {
 
         let int_arr = mgr.load_class("[I").expect("[I synthesis must succeed");
         let int_arr_class = mgr.get_class(int_arr).unwrap();
-        assert!(!int_arr_class.is_synthetic_stub);
+        assert!(!int_arr_class.origin.is_compatibility_stub());
         assert_eq!(&*int_arr_class.name, "[I");
 
         let int_arr_arr = mgr.load_class("[[I").expect("[[I synthesis must succeed");
@@ -17934,7 +17920,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18074,7 +18059,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18122,7 +18106,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18171,7 +18154,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18239,7 +18221,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18292,7 +18273,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: true,
             signature: None,
             code_source: None,
@@ -18336,7 +18316,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -18517,7 +18496,7 @@ mod tests {
         assert_eq!(&*cls.name, "java/lang/Object");
         assert!(cls.superclass.is_none(), "Object should have no superclass");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Object should NOT be a synthetic stub — it came from real bytecode"
         );
 
@@ -18526,7 +18505,7 @@ mod tests {
             class_id,
             cls.methods.len(),
             cls.fields.len(),
-            cls.is_synthetic_stub
+            cls.origin.is_compatibility_stub()
         );
     }
 
@@ -18663,7 +18642,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -18927,7 +18905,7 @@ mod tests {
         assert!(
             mgr.class_store
                 .get(id)
-                .is_some_and(|c| c.is_synthetic_stub),
+                .is_some_and(|c| c.origin.is_compatibility_stub()),
             "fixture must actually be a compatibility stub",
         );
 
@@ -19054,7 +19032,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -19124,7 +19101,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,
@@ -19203,7 +19179,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: ClassOrigin::default(),
-            is_synthetic_stub: false,
             signature: None,
             has_finalizer: false,
             code_source: None,

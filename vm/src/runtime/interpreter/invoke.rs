@@ -3384,7 +3384,7 @@ pub(super) fn try_stackless_invoke(
     {
         let cm = shared.classes.class_manager.read();
         if let Some(class) = cm.class_store.get(class_id) {
-            if class.is_synthetic_stub {
+            if class.origin.is_compatibility_stub() {
                 return Ok(CachedCallResult::CacheMiss);
             }
         }

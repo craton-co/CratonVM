@@ -2046,7 +2046,7 @@ fn verify_inherited_abstract_methods_implemented(
     // real JDK overrides but our stub's curated method table omits — so this
     // check rejected `Constructor`, and every `Class.getDeclaredMethods()`
     // call (which links `Constructor`) died with a verification error.
-    if class.is_synthetic_stub {
+    if class.origin.is_compatibility_stub() {
         return Ok(());
     }
 
@@ -2490,7 +2490,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: crate::class_origin::ClassOrigin::VmInternal,
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
@@ -2951,7 +2950,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: crate::class_origin::ClassOrigin::VmInternal,
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,

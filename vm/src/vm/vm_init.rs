@@ -3836,7 +3836,7 @@ impl SharedVm {
 
         // Iterate all loaded classes and add non-synthetic ones with cached bytes
         for class in cm.class_store.iter() {
-            if class.is_synthetic_stub {
+            if class.origin.is_compatibility_stub() {
                 continue;
             }
             if let Some(bytes) = cm.class_bytes_cache.get(&class.id) {
@@ -5888,7 +5888,7 @@ impl SharedVm {
                 .read()
                 .class_store
                 .get(id)
-                .map(|c| c.is_synthetic_stub)
+                .map(|c| c.origin.is_compatibility_stub())
                 .unwrap_or(false);
             if !is_synthetic {
                 return Ok(id);
@@ -5921,7 +5921,7 @@ impl SharedVm {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if !is_synthetic {
                     return Ok(id);
@@ -5944,7 +5944,7 @@ impl SharedVm {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false);
                 if !is_synthetic {
                     return Ok(id);
@@ -9800,7 +9800,7 @@ mod tests {
 
         // Verify it's from real bytecode, not a synthetic stub
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Object should come from real bytecode, not a synthetic stub"
         );
 
@@ -9865,7 +9865,7 @@ mod tests {
             "java.lang.Object: {} methods, {} fields, synthetic={}",
             cls.methods.len(),
             cls.fields.len(),
-            cls.is_synthetic_stub
+            cls.origin.is_compatibility_stub()
         );
     }
 
@@ -10142,7 +10142,7 @@ mod tests {
                 .get(id.expect("class id should be loaded"))
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
         }
@@ -10172,7 +10172,7 @@ mod tests {
 
         // Must be loaded from real bytecode, not synthetic
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "String should be real, not synthetic"
         );
 
@@ -10236,7 +10236,7 @@ mod tests {
         let cls = cm.get_class(id).expect("Class not found");
 
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Class should be real, not synthetic"
         );
 
@@ -10457,7 +10457,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
             assert!(
@@ -10941,7 +10941,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode, not synthetic"
             );
         }
@@ -11146,7 +11146,7 @@ mod tests {
         let number = cm
             .get_class(number_id)
             .expect("class should exist in class store");
-        assert!(!number.is_synthetic_stub);
+        assert!(!number.origin.is_compatibility_stub());
         let object_id = cm
             .get_loaded_class_id("java/lang/Object")
             .expect("class java/lang/Object should be loaded");
@@ -11208,7 +11208,7 @@ mod tests {
             .get_class(throwable_id)
             .expect("class should exist in class store");
         assert_eq!(throwable.superclass, Some(object_id));
-        assert!(!throwable.is_synthetic_stub);
+        assert!(!throwable.origin.is_compatibility_stub());
 
         // Exception extends Throwable
         let exception = cm
@@ -11242,7 +11242,7 @@ mod tests {
         let sys = cm
             .get_class(sys_id)
             .expect("class should exist in class store");
-        assert!(!sys.is_synthetic_stub);
+        assert!(!sys.origin.is_compatibility_stub());
 
         // System should have well-known methods
         let method_names: Vec<&str> = sys.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -11279,7 +11279,7 @@ mod tests {
         let int_cls = cm
             .get_class(int_id)
             .expect("class should exist in class store");
-        assert!(!int_cls.is_synthetic_stub);
+        assert!(!int_cls.origin.is_compatibility_stub());
 
         // Integer has one instance field: 'value' (int)
         let instance_fields: Vec<&str> = int_cls
@@ -11346,7 +11346,7 @@ mod tests {
         let thread = cm
             .get_class(thread_id)
             .expect("class should exist in class store");
-        assert!(!thread.is_synthetic_stub);
+        assert!(!thread.origin.is_compatibility_stub());
 
         // Thread should have many methods
         let method_names: Vec<&str> = thread.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -11932,7 +11932,7 @@ mod tests {
             .get_class(hm_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "HashMap should be from real bytecode"
         );
 
@@ -11984,7 +11984,7 @@ mod tests {
             .get_class(al_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "ArrayList should be from real bytecode"
         );
 
@@ -12036,7 +12036,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{name} should be from real bytecode"
             );
         }
@@ -12096,7 +12096,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{name} should be from real bytecode"
             );
         }
@@ -12233,7 +12233,7 @@ mod tests {
             .get_class(node_id)
             .expect("class should exist in class store");
         assert!(
-            !node.is_synthetic_stub,
+            !node.origin.is_compatibility_stub(),
             "HashMap$Node should be from real bytecode"
         );
 
@@ -12524,7 +12524,7 @@ mod tests {
             .get_class(ll_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "LinkedList should be from real bytecode"
         );
 
@@ -12562,7 +12562,7 @@ mod tests {
                 .get_class(hs_id)
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "HashSet should be from real bytecode"
             );
         }
@@ -12592,7 +12592,7 @@ mod tests {
                 .get_class(tm_id)
                 .expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "TreeMap should be from real bytecode"
             );
 
@@ -12624,7 +12624,7 @@ mod tests {
             .get_class(sp_id)
             .expect("class should exist in class store");
         assert!(
-            !cls.is_synthetic_stub,
+            !cls.origin.is_compatibility_stub(),
             "Spliterator should be from real bytecode"
         );
 
@@ -12898,7 +12898,7 @@ mod tests {
                 .get_class(id.expect("class id should be loaded"))
                 .expect("class should exist in store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be from real JDK bytecode, not a synthetic stub"
             );
         }
@@ -13020,7 +13020,7 @@ mod tests {
         let aqs = cm
             .get_class(aqs_id)
             .expect("class should exist in class store");
-        assert!(!aqs.is_synthetic_stub, "AQS should be real bytecode");
+        assert!(!aqs.origin.is_compatibility_stub(), "AQS should be real bytecode");
 
         // AQS should have key methods
         let method_names: Vec<&str> = aqs.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -13052,7 +13052,7 @@ mod tests {
             .get_class(rl_id)
             .expect("class should exist in class store");
         assert!(
-            !rl.is_synthetic_stub,
+            !rl.origin.is_compatibility_stub(),
             "ReentrantLock should be real bytecode"
         );
 
@@ -13090,7 +13090,7 @@ mod tests {
             .get_class(ai_id)
             .expect("class should exist in class store");
         assert!(
-            !ai.is_synthetic_stub,
+            !ai.origin.is_compatibility_stub(),
             "AtomicInteger should be real bytecode"
         );
 
@@ -13382,7 +13382,7 @@ mod tests {
             .get_class(cdl_id)
             .expect("class should exist in class store");
         assert!(
-            !cdl.is_synthetic_stub,
+            !cdl.origin.is_compatibility_stub(),
             "CountDownLatch should be real bytecode"
         );
 
@@ -13414,7 +13414,7 @@ mod tests {
         let sem = cm
             .get_class(sem_id)
             .expect("class should exist in class store");
-        assert!(!sem.is_synthetic_stub, "Semaphore should be real bytecode");
+        assert!(!sem.origin.is_compatibility_stub(), "Semaphore should be real bytecode");
 
         let method_names: Vec<&str> = sem.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13449,7 +13449,7 @@ mod tests {
             .get_class(cb_id)
             .expect("class should exist in class store");
         assert!(
-            !cb.is_synthetic_stub,
+            !cb.origin.is_compatibility_stub(),
             "CyclicBarrier should be real bytecode"
         );
 
@@ -13483,7 +13483,7 @@ mod tests {
             .get_class(es_id)
             .expect("class should exist in class store");
         assert!(
-            !es.is_synthetic_stub,
+            !es.origin.is_compatibility_stub(),
             "ExecutorService should be real bytecode"
         );
         let es_methods: Vec<&str> = es.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -13500,7 +13500,7 @@ mod tests {
             .get_class(tpe_id)
             .expect("class should exist in class store");
         assert!(
-            !tpe.is_synthetic_stub,
+            !tpe.origin.is_compatibility_stub(),
             "ThreadPoolExecutor should be real bytecode"
         );
 
@@ -13512,7 +13512,7 @@ mod tests {
             .get_class(fjp_id)
             .expect("class should exist in class store");
         assert!(
-            !fjp.is_synthetic_stub,
+            !fjp.origin.is_compatibility_stub(),
             "ForkJoinPool should be real bytecode"
         );
 
@@ -13530,7 +13530,7 @@ mod tests {
             .get_class(fjt_id)
             .expect("class should exist in class store");
         assert!(
-            !fjt.is_synthetic_stub,
+            !fjt.origin.is_compatibility_stub(),
             "ForkJoinTask should be real bytecode"
         );
 
@@ -13550,7 +13550,7 @@ mod tests {
         let al = cm
             .get_class(al_id)
             .expect("class should exist in class store");
-        assert!(!al.is_synthetic_stub);
+        assert!(!al.origin.is_compatibility_stub());
 
         let method_names: Vec<&str> = al.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(method_names.contains(&"get"));
@@ -13572,7 +13572,7 @@ mod tests {
         let ar = cm
             .get_class(ar_id)
             .expect("class should exist in class store");
-        assert!(!ar.is_synthetic_stub);
+        assert!(!ar.origin.is_compatibility_stub());
 
         let method_names: Vec<&str> = ar.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(method_names.contains(&"get"));
@@ -13594,7 +13594,7 @@ mod tests {
         let sl = cm
             .get_class(sl_id)
             .expect("class should exist in class store");
-        assert!(!sl.is_synthetic_stub, "StampedLock should be real bytecode");
+        assert!(!sl.origin.is_compatibility_stub(), "StampedLock should be real bytecode");
 
         let method_names: Vec<&str> = sl.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13628,7 +13628,7 @@ mod tests {
         let ph = cm
             .get_class(ph_id)
             .expect("class should exist in class store");
-        assert!(!ph.is_synthetic_stub, "Phaser should be real bytecode");
+        assert!(!ph.origin.is_compatibility_stub(), "Phaser should be real bytecode");
 
         let method_names: Vec<&str> = ph.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -13659,7 +13659,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class_name} should be loaded"));
             let cls = cm.get_class(id).expect("class should exist in class store");
             assert!(
-                !cls.is_synthetic_stub,
+                !cls.origin.is_compatibility_stub(),
                 "{class_name} should be real bytecode"
             );
         }
@@ -14002,7 +14002,7 @@ mod tests {
 
         // Connection should be from real bytecode
         assert!(
-            !conn.is_synthetic_stub,
+            !conn.origin.is_compatibility_stub(),
             "java.sql.Connection should be real bytecode"
         );
 

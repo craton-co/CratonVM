@@ -6363,7 +6363,7 @@ pub(super) fn synthetic_stub_yields_with_cm(
         None => (false, "class not loaded"),
         Some(cid) => match cm.get_class(cid) {
             None => (false, "class id not in the store"),
-            Some(cls) if cls.is_synthetic_stub => (false, "loaded class is itself a synthetic stub"),
+            Some(cls) if cls.origin.is_compatibility_stub() => (false, "loaded class is itself a synthetic stub"),
             Some(_) => match crate::classloading::find_method_recursive(
                 cid,
                 method_name,

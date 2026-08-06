@@ -185,7 +185,7 @@ fn set_origin_keeps_the_derived_mirror_in_sync() {
     });
     assert!(class.origin.is_compatibility_stub());
     assert!(
-        class.is_synthetic_stub,
+        class.origin.is_compatibility_stub(),
         "set_origin(CompatibilityStub) must raise the derived mirror"
     );
 
@@ -195,14 +195,14 @@ fn set_origin_keeps_the_derived_mirror_in_sync() {
     });
     assert!(!class.origin.is_compatibility_stub());
     assert!(
-        !class.is_synthetic_stub,
+        !class.origin.is_compatibility_stub(),
         "the in-place 'upgrade a stub to real bytes' path goes through \
          set_origin, so the mirror must clear with the origin — a stale `true` \
          here is what makes real bytes lose to a fake"
     );
 
     class.set_origin(ClassOrigin::VmArray);
-    assert!(!class.is_synthetic_stub);
+    assert!(!class.origin.is_compatibility_stub());
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +334,7 @@ fn compatible_mode_retains_the_old_fallback_exactly() {
             class.origin.as_str()
         );
         assert!(
-            class.is_synthetic_stub,
+            class.origin.is_compatibility_stub(),
             "the derived mirror must agree with the origin"
         );
     }

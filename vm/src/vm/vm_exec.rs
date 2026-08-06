@@ -3197,7 +3197,7 @@ fn resolve_field_descriptor_byte_cached(
     let desc_byte = {
         let cm = shared.classes.class_manager.read();
         if let Some(concrete_cls) = cm.get_class(class_id) {
-            if concrete_cls.is_synthetic_stub {
+            if concrete_cls.origin.is_compatibility_stub() {
                 // Transient: stub may be promoted to the real class later.
                 None
             } else {
@@ -3235,7 +3235,7 @@ fn resolve_field_descriptor_byte_cached(
                         break;
                     };
                     if let Some(cls) = cm.get_class(cid) {
-                        if cls.is_synthetic_stub {
+                        if cls.origin.is_compatibility_stub() {
                             // Transient: an ancestor stub's descriptors are
                             // unreliable and may change on promotion. Do NOT
                             // memoize вЂ” `cacheable` stays false.
@@ -6295,7 +6295,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 .class_manager
                 .read()
                 .get_class(class_id)
-                .is_some_and(|c| c.is_synthetic_stub),
+                .is_some_and(|c| c.origin.is_compatibility_stub()),
             Err(_) => false,
         }
     }
@@ -6329,7 +6329,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // Also check if it's a synthetic stub (native-only class) вЂ” methods
                 // are registered in the native registry, not in the class file
-                if class.is_synthetic_stub {
+                if class.origin.is_compatibility_stub() {
                     return true; // assume native methods exist
                 }
                 current = class.superclass;
@@ -11617,7 +11617,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             let cm = self.shared.classes.class_manager.read();
             cm.class_store
                 .get(header.class_id)
-                .map(|c| !c.is_synthetic_stub)
+                .map(|c| !c.origin.is_compatibility_stub())
                 .unwrap_or(false)
         };
         if !is_real_jdk_thread && header.num_slots() >= 3 {
@@ -12514,7 +12514,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let (is_real_jdk, num_fields) = {
             let cm = self.shared.classes.class_manager.read();
             match cm.class_store.get(class_id) {
-                Some(c) if !c.is_synthetic_stub => (true, c.num_total_fields.max(3)),
+                Some(c) if !c.origin.is_compatibility_stub() => (true, c.num_total_fields.max(3)),
                 Some(c) => (false, c.num_total_fields.max(3)),
                 _ => (false, 3usize),
             }
@@ -15625,13 +15625,13 @@ pub fn invoke_or_native(
         let name_cid = cm.get_loaded_class_id(effective_class);
         let recv_stub = recv_cid
             .and_then(|c| cm.get_class(c))
-            .map(|c| c.is_synthetic_stub);
+            .map(|c| c.origin.is_compatibility_stub());
         let recv_has_method = recv_cid
             .and_then(|c| cm.get_class(c))
             .map(|c| c.find_method(method_name, descriptor).is_some());
         let name_stub = name_cid
             .and_then(|c| cm.get_class(c))
-            .map(|c| c.is_synthetic_stub);
+            .map(|c| c.origin.is_compatibility_stub());
         let name_has_method = name_cid
             .and_then(|c| cm.get_class(c))
             .map(|c| c.find_method(method_name, descriptor).is_some());
@@ -15702,7 +15702,7 @@ pub fn invoke_or_native(
             cm.get_loaded_class_id(effective_class)
                 .and_then(|cid| {
                     cm.get_class(cid).and_then(|cls| {
-                        if cls.is_synthetic_stub {
+                        if cls.origin.is_compatibility_stub() {
                             None
                         } else {
                             crate::classloading::find_method_recursive(
@@ -23254,7 +23254,7 @@ fn invoke_on_class_shared_inner(
                     .class_manager
                     .read()
                     .get_class(class_id)
-                    .map(|c| c.is_synthetic_stub)
+                    .map(|c| c.origin.is_compatibility_stub())
                     .unwrap_or(false)
                 {
                     " [class not found on any classpath entry — synthetic stub, add the missing jar]"
@@ -26517,7 +26517,7 @@ mod tests {
         {
             let cm = shared.classes.class_manager.read();
             let cls = cm.get_class(cid).expect("stub registered");
-            assert!(cls.is_synthetic_stub, "expected a synthetic stub");
+            assert!(cls.origin.is_compatibility_stub(), "expected a synthetic stub");
         }
         // Resolution must return None so the caller falls back to raw read.
         assert_eq!(resolve_field_descriptor_byte_cached(&shared, cid, 0), None);
@@ -26586,7 +26586,6 @@ mod tests {
             hidden: false,
             module_name: None,
             origin: cratonvm_classloading::ClassOrigin::default(),
-            is_synthetic_stub: false,
             has_finalizer: false,
             signature: None,
             code_source: None,
