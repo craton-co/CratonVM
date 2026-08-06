@@ -123,6 +123,90 @@ fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_DBG_IC_PUBLISH=<substring>` — trace what the helper publishes into
+/// a site's MIC/PIC, matched against `<callee class>.<callee method>`.
+///
+/// The inline cascade emitted by the single-pass backend consumes exactly these
+/// two values and cannot revalidate either: it CALLs `entry_ptrs[i]` and
+/// marshals by `needs_context[i]`. `try_call_compiled_entry_reentrant` — the
+/// path the HELPER takes to the same entry — re-derives the ABI flag from the
+/// resolved `CompiledMethod` and overrides a disagreeing cache, so a wrong flag
+/// is invisible on the helper path and fatal on the inline one. This prints
+/// both the published flag and the entry's own, so the two can be compared at
+/// the moment of publication instead of inferred from the wreckage.
+fn ic_publish_trace_filter() -> &'static Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_IC_PUBLISH").ok())
+}
+
+/// `CRATONVM_JIT_MIC_PUBLISH_IR_CALLEES=0` — keep bodies produced by the
+/// optimizing IR backend OFF the MIC/PIC, the way `callee_barred_by_table`
+/// keeps handler-bearing ones off it.
+///
+/// The inline cascade `CALL`s a published entry raw. The helper reaches the
+/// same entry through `try_call_compiled_entry_reentrant`, which pins the
+/// artifact, re-derives its ABI flag, registers a `JitEntryGuard`, and declines
+/// (falling back to the interpreter) whenever its register tables cannot carry
+/// the arguments. None of that is available to generated code, so "the helper
+/// is green and the inline cascade is red on the same entry" is a question
+/// about what the artifact needs that only the helper supplies. This lever
+/// answers it for one class of artifact at a time.
+fn mic_publish_ir_backend_callees() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MIC_PUBLISH_IR_CALLEES").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+fn callee_barred_as_ir_backend(entry_ptr: u64) -> bool {
+    if entry_ptr == 0 || mic_publish_ir_backend_callees() {
+        return false;
+    }
+    cratonvm_jit::pin_jit_code_range_owner(entry_ptr as usize)
+        .as_deref()
+        .is_some_and(|c| c.used_ir_backend)
+}
+
+fn ic_publish_trace(
+    site: &str,
+    info: &JitInvokeInfo,
+    receiver_cid: u32,
+    receiver_class: &str,
+    entry_ptr: u64,
+    needs_ctx: bool,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) {
+    let Some(want) = ic_publish_trace_filter() else {
+        return;
+    };
+    let key = format!("{}.{}", info.class_name, info.method_name);
+    if !key.contains(want.as_str()) {
+        return;
+    }
+    let owner = cratonvm_jit::pin_jit_code_range_owner(entry_ptr as usize);
+    let owner_ctx = owner
+        .as_deref()
+        .map(|c| c.needs_context().to_string())
+        .unwrap_or_else(|| "<unowned>".to_string());
+    let owner_entry = owner.as_deref().map_or(0, |c| c.entry_ptr() as usize);
+    let owner_backend = owner
+        .as_deref()
+        .map_or("<unowned>", |c| if c.used_ir_backend { "ir" } else { "sp" });
+    eprintln!(
+        "[IC_PUBLISH] {site} {}.{}{} recv={receiver_class}(cid={receiver_cid}) \
+         entry={entry_ptr:#x} needs_ctx={needs_ctx} owner_needs_ctx={owner_ctx} \
+         owner_backend={owner_backend} \
+         owner_entry={owner_entry:#x} mic={mic_ptr:#x} pic={pic_ptr:#x}",
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WS1 diagnostic profiling for the JIT dispatch helpers
 // (env-gated: CRATONVM_DBG_MIC_PROF=1; zero-cost when off beyond one cached
@@ -2734,6 +2818,26 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     let Some((thread, _guard)) = jit_thread_mut() else {
         return i64::MIN;
     };
+    // `CRATONVM_DBG_CALLEE_DEOPT=1` — every servicing of a compiled callee's
+    // `i64::MIN`.
+    //
+    // The inline cascade decides "the callee trapped" by comparing the raw
+    // return register against `i64::MIN`. For a callee whose descriptor returns
+    // VOID there is no return value, so whatever the callee's last helper call
+    // left in RAX is what gets compared — and a false positive here does not
+    // merely waste a helper call: `handle_compiled_callee_deopt_sentinel`
+    // DRAINS the thread's whole pending-signal record. Whether that fires at
+    // all, and for which callee, is not otherwise observable.
+    if crate::runtime::env_cache::jit_callee_deopt_dbg() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seen = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seen < 40 || seen.is_power_of_two() {
+            eprintln!(
+                "[CALLEE_DEOPT] #{seen} {}.{}{} num_args={n} ret={}",
+                info.class_name, info.method_name, info.descriptor, info.return_type as char,
+            );
+        }
+    }
     // The receiver's class id, for the callee-exception-table probe. `Object`
     // arg 0 is the receiver for every invoke kind the inline cascade emits
     // (virtual/interface); a non-object or absent arg 0 simply misses the
@@ -7702,60 +7806,66 @@ pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
     site_refusal::report()
 }
 
-/// How much of the per-call-site native cache is in effect.
+/// How much of the per-call-site native cache is in effect. **Default `All`.**
 ///
-/// The cache resolves a JIT call site's native ONCE and then dispatches it
-/// directly, skipping `invoke_or_native`'s hand-written gate cascade. That is
-/// sound only while the cache's own resolution agrees with what the cascade
-/// would have picked — and for a NON-LEAF native it does not.
+/// ## This lever once carried a wrong conclusion. Read the correction first.
 ///
-/// 836631dcc widened the cache from leaf natives to every registered native on
-/// the argument that skipping `invoke_or_native` is worth more than skipping
-/// the funnel. The arithmetic was right; the premise was not. `invoke_or_native`
-/// resolves on `effective_class` and nothing else, behind ~27 hand-written
-/// gates keyed on class and on receiver shape (annotation proxies, the
-/// `ClassLoader` override, the spring-boot loader helpers, the `MethodHandle`
-/// downcall forms, …). [`resolve_native_owner_for_receiver`] instead starts at
-/// the receiver's runtime class and walks its supers, so a compiled site can
-/// dispatch a native the interpreter would never have reached.
+/// The cache resolves a JIT call site's native ONCE and dispatches it directly,
+/// skipping `invoke_or_native`'s hand-written gate cascade. 836631dcc widened it
+/// from leaf natives to every registered native, and `CacheAutoConfigurationTests`
+/// then failed 53 of 59 with the cache on and 0 with it leaf-only — on one
+/// binary, with this mode as the only variable. That measurement was real. The
+/// conclusion drawn from it, that the widening was the defect, was **wrong**.
 ///
-/// Measured against `CacheAutoConfigurationTests` (59 tests, one binary, the
-/// only variable being this mode):
+/// `dev` landed `383e7f5cf` — "a recycled `JitInvokeInfo` address let one call
+/// site serve another's dispatch" — during the same investigation, and that is
+/// the actual defect. Every memo here is keyed on `(vm_identity, JitInvokeInfo
+/// pointer)`; those boxes are freed with the `CompiledMethod` that owns them, so
+/// the allocator can hand the same address to the next compile and the key then
+/// names a DIFFERENT call site while the memo still holds the old site's answer.
+/// A cache holding a resolved native is the loudest form of that — the reused
+/// site CALLs the previous site's native and returns what it returns — which is
+/// exactly why widening this cache *amplified* the recycled-key defect until it
+/// looked like its cause.
 ///
-/// | mode | failures |
-/// |---|---:|
-/// | `all` — 836631dcc | 53 |
-/// | `no-super-walk` | SIGSEGV mid-run |
-/// | `leaf` — the default | **0** |
-/// | `off` | 0 |
+/// Re-measured on current `dev` (with `383e7f5cf` in), same class, same fixture:
+///
+/// | mode | failures | when |
+/// |---|---:|---|
+/// | `all` | 53 | before `383e7f5cf` |
+/// | `leaf` | 0 | before `383e7f5cf` |
+/// | **`all`** | **0, twice** | **after `383e7f5cf` — the default** |
 ///
 /// The faces were all "a call returned the wrong object": `Function$Identity`
 /// (whose native returns its first argument) dispatched 5 870 times under the
 /// JIT and 0 times under `--nojit`, `StreamSupport.stream(spliterator, false)`
 /// handing back the spliterator, `Proxy$Dispatch.invokeProxy` reached with a
 /// null `Method`. See
-/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-FIXED.md`.
+/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
 ///
-/// The lever is kept rather than deleted with the defect: this divergence is
-/// not a one-off — it reappears whenever a registration or a cascade gate
-/// moves — and a bisect over VM binaries costs ~15 minutes a step while a
-/// bisect over this costs one run.
+/// So `all` is restored. Gating it would cost 836631dcc's win to work around a
+/// defect that no longer exists. **A perf change that makes a latent defect
+/// reproducible is an amplifier, not the cause — merge `dev` and re-measure
+/// before gating one.**
+///
+/// The lever survives its wrong conclusion because the question it answers is
+/// permanent: a bisect over VM binaries costs ~15 minutes a step, and a bisect
+/// over this costs one run. `native_site_cache_enabled()` is the coarse
+/// on/off kill switch beside it; this is the shape selector.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SiteCacheMode {
     /// Every registered native the resolver can reach, including via the
-    /// superclass walk. **Known-divergent — this is the 836631dcc behaviour
-    /// and it corrupts.** Kept only so the perf win it was reaching for can be
-    /// re-measured by whoever makes the resolution faithful.
+    /// superclass walk — the 836631dcc behaviour, and **the default**.
     All,
     /// As `All`, but a native is only served when it is registered on the
     /// dispatch class ITSELF — the rule `invoke_or_native` actually applies
-    /// (`find_with_kind(effective_class, …)`). Still diverges: narrowing the
-    /// resolver does not restore the gate cascade.
+    /// (`find_with_kind(effective_class, …)`).
     NoSuperWalk,
-    /// Leaf natives only. The default, and the behaviour this path shipped
-    /// with before 836631dcc: the leaf claim is made per registration by
-    /// someone who checked that the native may skip the funnel, which is
-    /// exactly the audit the ~12 000 non-leaf registrations have not had.
+    /// Leaf natives only — the behaviour this path shipped with before
+    /// 836631dcc. The leaf claim is made per registration by someone who
+    /// checked that the native may skip the funnel, so this is the narrowest
+    /// mode that still has a fast path at all. No longer the default: see the
+    /// correction on [`SiteCacheMode`].
     Leaf,
     /// No site caching at all; every call runs the generic dispatcher.
     Off,
@@ -7795,15 +7905,15 @@ fn site_cache_mode() -> SiteCacheMode {
 /// once per process cannot be exercised across values from a unit test.
 fn site_cache_mode_from(raw: Option<&str>) -> SiteCacheMode {
     match raw {
-        None => SiteCacheMode::Leaf,
+        None => SiteCacheMode::All,
         Some(v) => match v.trim() {
-            "" | "leaf" => SiteCacheMode::Leaf,
-            "all" => SiteCacheMode::All,
+            "" | "all" => SiteCacheMode::All,
+            "leaf" => SiteCacheMode::Leaf,
             "no-super-walk" => SiteCacheMode::NoSuperWalk,
             "off" => SiteCacheMode::Off,
             other => panic!(
                 "CRATONVM_JIT_SITE_CACHE={other:?} is not one of \
-                 leaf / all / no-super-walk / off"
+                 all / leaf / no-super-walk / off"
             ),
         },
     }
@@ -11964,8 +12074,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
             // sentinel + stashed frame bail through the compiled caller's
             // epilogue past the only point able to resume it precisely.
-            let callee_barred_by_table = !mic_publish_exception_table_callees()
-                && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+            let callee_barred_by_table = (!mic_publish_exception_table_callees()
+                && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info))
+                || callee_barred_as_ir_backend(entry_ptr as u64);
             let callee_has_indy_trap =
                 compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor);
             if callee_barred_by_table
@@ -12004,6 +12115,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // once the address was recycled by a later allocation, the
                 // json-smart "re-parse returned another method's result"
                 // corruption.
+                ic_publish_trace(
+                    "cache-hit",
+                    info,
+                    receiver_cid,
+                    &class_name,
+                    entry_ptr as u64,
+                    needs_ctx,
+                    mic_ptr,
+                    pic_ptr,
+                );
                 mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
@@ -12149,8 +12270,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A machine-code MIC/PIC call has no interpreter boundary at which the
     // callee's local handler can be resumed. Leave such callees on the checked
     // helper path; ordinary handler-free callees retain the raw-entry fast path.
-    let callee_barred_by_table = !mic_publish_exception_table_callees()
-        && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info);
+    let callee_barred_by_table = (!mic_publish_exception_table_callees()
+        && mic_callee_has_exception_table(vm, ClassId::new(receiver_cid), info))
+        || callee_barred_as_ir_backend(entry_ptr);
     // jit-invokedynamic-groovy-regression fix — see the matching gate in the
     // cache-hit branch above: an indy-trap-bearing artifact must stay on the
     // dispatch helper, never in a machine-called MIC/PIC entry.
@@ -12166,6 +12288,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         );
     }
     if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
+        ic_publish_trace(
+            "resolve",
+            info,
+            receiver_cid,
+            &class_name,
+            entry_ptr,
+            needs_ctx,
+            mic_ptr,
+            pic_ptr,
+        );
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
@@ -12708,35 +12840,42 @@ mod tests {
         }
     }
 
-    /// The site cache must serve LEAF natives only.
+    /// The site cache serves EVERY registered native by default.
     ///
-    /// This is the whole content of the `CacheAutoConfigurationTests` fix.
-    /// 836631dcc widened the admission to every registered native; measured on
-    /// one binary with only this mode varying, that took the class from 0
-    /// failures to 53, because a compiled site began dispatching natives
-    /// `invoke_or_native`'s gate cascade would never have reached (see
-    /// [`SiteCacheMode`] for the table and the observed faces).
+    /// This test was written asserting the opposite, on a measurement that was
+    /// correct and a conclusion that was not: `CacheAutoConfigurationTests`
+    /// went 53 failures to 0 when this mode was narrowed to `leaf`, so the
+    /// widening looked like the defect. It was the amplifier —
+    /// `dev`'s `383e7f5cf` (a recycled `JitInvokeInfo` address serving one call
+    /// site's memo to another) was the defect, and with it in, `all` measures 0
+    /// failures twice over. See [`SiteCacheMode`] for the full correction.
+    ///
+    /// It is kept, inverted, because the regression it now guards is the one
+    /// that actually happened: a plausible measurement talking someone into
+    /// gating a perf win around a defect that lives somewhere else.
     ///
     /// Asserted through the mode's own predicates rather than by re-deriving
-    /// the rule, so the test fails if someone flips the default back — which
-    /// is the regression it exists to catch — and asserted in BOTH directions,
-    /// because a predicate that answered `false` for every mode would satisfy
-    /// a one-sided check while making the lever inert.
+    /// the rule, and in BOTH directions — a predicate answering the same for
+    /// every mode would satisfy a one-sided check while making the lever inert.
     #[test]
-    fn site_cache_serves_leaf_natives_only_by_default() {
+    fn site_cache_admits_every_registered_native_by_default() {
         assert_eq!(
             site_cache_mode_from(None),
-            SiteCacheMode::Leaf,
-            "the default must stay leaf-only"
+            SiteCacheMode::All,
+            "the default is `All`: gating it would cost 836631dcc's win to work \
+             around 383e7f5cf's recycled-key defect, which is fixed. See the \
+             correction on `SiteCacheMode`."
         );
         assert!(
-            !SiteCacheMode::Leaf.admits_non_leaf(),
-            "leaf mode must refuse non-leaf natives"
+            SiteCacheMode::All.admits_non_leaf(),
+            "the default must actually admit non-leaf natives, or the fast path \
+             is inert and the default reads as a decision nobody made"
         );
-        // The other direction: the lever can still express the divergent
-        // behaviour, so a future re-measurement has something to turn on.
-        assert!(SiteCacheMode::All.admits_non_leaf());
+        // Both directions. A predicate that answered the same for every mode
+        // would satisfy a one-sided check while making the lever inert, which
+        // is the failure this whole family keeps producing.
         assert!(SiteCacheMode::NoSuperWalk.admits_non_leaf());
+        assert!(!SiteCacheMode::Leaf.admits_non_leaf());
         assert!(!SiteCacheMode::Off.admits_non_leaf());
     }
 
@@ -12745,10 +12884,10 @@ mod tests {
     /// difference", which is exactly the verdict the lever exists to produce.
     #[test]
     fn site_cache_mode_parses_every_spelling() {
-        assert_eq!(site_cache_mode_from(Some("")), SiteCacheMode::Leaf);
-        assert_eq!(site_cache_mode_from(Some("leaf")), SiteCacheMode::Leaf);
-        assert_eq!(site_cache_mode_from(Some(" leaf ")), SiteCacheMode::Leaf);
+        assert_eq!(site_cache_mode_from(Some("")), SiteCacheMode::All);
         assert_eq!(site_cache_mode_from(Some("all")), SiteCacheMode::All);
+        assert_eq!(site_cache_mode_from(Some(" all ")), SiteCacheMode::All);
+        assert_eq!(site_cache_mode_from(Some("leaf")), SiteCacheMode::Leaf);
         assert_eq!(
             site_cache_mode_from(Some("no-super-walk")),
             SiteCacheMode::NoSuperWalk

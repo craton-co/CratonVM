@@ -1,7 +1,7 @@
 # `CacheAutoConfigurationTests`: config-class parse fails with a wrong-receiver `NoSuchMethodError`
 
-**Status: FIXED 2026-08-05** — `fix(jit): the native site cache may serve LEAF
-natives only`. Was
+**Status: FIXED 2026-08-05** — by `383e7f5cf` (`dev`), "a recycled
+`JitInvokeInfo` address let one call site serve another's dispatch". Was
 `docs/known-issues/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-gc-20260805.md`.
 
 `module/spring-boot-cache` · `org.springframework.boot.cache.autoconfigure.CacheAutoConfigurationTests`
@@ -12,12 +12,53 @@ natives only`. Was
 |---|---:|
 | HotSpot 25 control | 0 |
 | CratonVM `--nojit` | 0 |
-| CratonVM on `dev`, before the fix | 51–57 |
-| **CratonVM on `dev`, after the fix** | **0** |
+| CratonVM on `dev`, before `383e7f5cf` | 51–57 |
+| **CratonVM on current `dev`** | **0** |
 
-One defect, in the JIT: `836631dcc perf(jit): site-cache EVERY native from
-compiled code, not just the leaves`, named by a 9-step `git bisect` (53
-failures at that commit, 0 at its parent).
+## CORRECTION (2026-08-05, later the same day)
+
+**This page first named the wrong commit, and the way it got there is the
+lesson.**
+
+A 9-step `git bisect` named `836631dcc perf(jit): site-cache EVERY native from
+compiled code, not just the leaves` — 53 failures at that commit, 0 at its
+parent — and a single binary with `CRATONVM_JIT_SITE_CACHE` as the only
+variable measured `all` at 53 failures and `leaf` at 0. Both measurements are
+real and both reproduce. The conclusion drawn from them, that the widened site
+cache was the defect, was **wrong**, and this page shipped a leaf-only default
+on the strength of it.
+
+`dev` landed `383e7f5cf` during the same investigation: every memo in
+`jit/helpers.rs` is keyed on `(vm_identity, JitInvokeInfo pointer)`, those boxes
+are freed with the `CompiledMethod` that owns them, and the allocator can hand
+the same address to the next compile — so the key names a DIFFERENT call site
+while the memo still holds the old site's answer. Widening the cache to hold a
+resolved *native* made that latent defect reproducible on nearly every test,
+which is why the bisect landed on the widening and why gating the widening
+"fixed" it.
+
+Re-measured on current `dev`, with `383e7f5cf` in, same class and fixture:
+
+| mode | failures | when |
+|---|---:|---|
+| `all` | 53 | before `383e7f5cf` |
+| `leaf` | 0 | before `383e7f5cf` |
+| **`all`** | **0, twice** | **after `383e7f5cf`** |
+
+The leaf-only default is therefore **reverted**; `all` is restored, so
+836631dcc's win is not paid for a defect that no longer exists.
+
+**A bisect names the commit that made a defect REPRODUCIBLE, which is not
+always the commit that introduced it.** When the named commit is a same-day
+perf change and the faces are wrong-object/wrong-dispatch, merge `dev` and
+re-measure before gating it — the amplifier and the cause look identical from
+one binary. See
+[[reference_recycled_jitinvokeinfo_address_aliases_dispatch_memos]] and
+[[reference_bisect_on_exposure_rate_defect_names_a_trigger]].
+
+The rest of this page — the refutation of the GC hypothesis, and the census
+technique that named the mechanism — stands unchanged and is what was actually
+worth keeping.
 
 ## What the original page got wrong, and why it is worth saying
 
@@ -43,25 +84,25 @@ OBJECT currently at it.**
 
 ## The defect
 
-The JIT keeps a per-call-site native resolution cache: resolve the target once,
-then dispatch it directly and skip `invoke_or_native`. 836631dcc widened
-admission from leaf natives to *every* registered native, arguing that skipping
-`invoke_or_native`'s ~27-gate cascade is worth more than skipping the funnel.
-The arithmetic was right — the measured rungs are real — but the premise was
-not.
+Every per-call-site memo in `jit/helpers.rs` is keyed on `(vm_identity,
+JitInvokeInfo pointer)`. Those boxes are freed with the `CompiledMethod` that
+owns them, so the allocator can hand the same address to the next compile's
+info — and the key then names a **different call site** while the memo still
+holds the previous site's answer. `383e7f5cf` fixes that.
 
-`invoke_or_native` resolves the native on `effective_class` and **nothing
-else**, behind gates keyed on class and receiver shape: annotation proxies, the
-`ClassLoader` built-in override, the spring-boot loader helpers, the
-`MethodHandle` downcall forms, and more. The cache's own
-`resolve_native_owner_for_receiver` instead starts at the **receiver's runtime
-class** and walks its superclass chain. Those are different questions, so a
-compiled call site could dispatch a native the interpreter would never reach.
+A memo holding a resolved *native* is the loudest form: the reusing site CALLs
+the previous site's native and returns whatever that returns. So when
+836631dcc widened the native site cache from leaf natives to every registered
+native, it multiplied the number of memos carrying a callable target, and a
+latent aliasing defect became a near-certainty on any class-loading-heavy
+workload. That is why the bisect landed on the widening, and why gating the
+widening made the symptom vanish.
 
-The commit's own text claims the walk "reproduces `invoke_or_native`'s rule
-exactly, including its exception". It reproduces the rule that the rest of the
-dispatch pipeline implements across several steps — not the one function whose
-work it is skipping.
+The widening is not itself unsound, and the evidence that had suggested it was
+— that `resolve_native_owner_for_receiver` walks the receiver's superclass
+chain while `invoke_or_native` resolves on `effective_class` alone — was never
+tied to an observed wrong dispatch. It is worth keeping in view as a question
+about the two resolvers, but it is not what broke this class.
 
 ## How it was caught: `--dump-native-registry`, both arms, diffed
 
@@ -95,41 +136,41 @@ That is the whole "impossible" symptom set, in one line. Downstream it reads as:
 defect.** Every face above is one object standing where another belongs, which
 is what a wrong *target* looks like — and nothing about it requires a collector.
 
-## The fix, and why it is the admission rule rather than the walk
+## What the mode lever measured, and what it did NOT prove
 
-Leaf-only admission, as before 836631dcc. The leaf claim is made per
-registration by someone who checked that the native may skip the funnel; that
-audit is exactly what the non-leaf registrations have not had.
+`CRATONVM_JIT_SITE_CACHE` was added to take the difference apart, and is kept.
+On the pre-`383e7f5cf` binary, one fixture, the mode as the only variable:
 
-`CRATONVM_JIT_SITE_CACHE` was added to take the difference apart, and kept.
-One binary, one fixture, the mode as the only variable:
-
-| mode | failures |
+| mode | failures (pre-`383e7f5cf`) |
 |---|---:|
 | `all` — 836631dcc | 53 |
 | `no-super-walk` | SIGSEGV mid-run |
-| `leaf` — the new default | **0** |
+| `leaf` | **0** |
 | `off` | **0** |
 
-`no-super-walk` is the load-bearing row: restricting the resolver to rule 1 —
-a native registered on the dispatch class itself, which *is* what
-`invoke_or_native` does — still crashes. Narrowing the resolver does not
-restore the gate cascade, so the walk was never the fix.
+Read at the time as "the admission rule is the defect". Read correctly, it is a
+**dose-response curve on how many memos hold a callable target**: `all` fills
+the most, `leaf` far fewer, `off` none — and `no-super-walk`, which narrows the
+*resolution* but not the number of memos, stays broken. That last row was
+treated as evidence the walk was innocent; it is better evidence that
+resolution was never the axis at all.
 
-Everything else 836631dcc landed stays: the superclass walk (sound for leaves),
-the counters, the rename. The leaf fast path is unharmed —
-`CRATONVM_DBG=intrinsic-stats` on an `AtomicInteger.get` loop reports
-**1 995 000** compiled leaf dispatches after the fix, against the 1 995 028 the
-commit itself recorded.
+On current `dev` the whole curve collapses: `all` measures **0 failures,
+twice**. Nothing about the admission rule changed in between — only
+`383e7f5cf`.
+
+**A monotone response to a knob does not tell you the knob is the defect.**
+It can equally mean the knob controls exposure to something else.
 
 Post-fix census, against both prior arms:
 
-| native | fixed | pre-fix (JIT) | `--nojit` |
+| native | current `dev` | pre-`383e7f5cf` (JIT) | `--nojit` |
 |---|---:|---:|---:|
 | `Function$Identity.apply` | **0** | 5 870 | **0** |
 
-The compiled arm now agrees with the interpreter exactly, which is the property
-that was violated.
+The compiled arm agrees with the interpreter exactly, which is the property
+that was violated — and it does so with the site cache at its full `all`
+default, which is the point.
 
 ## Residuals — NOT closed by this fix
 
@@ -164,9 +205,12 @@ that was violated.
 
 ## Reproducing
 
+On current `dev` this class is green in every mode; the split below only
+reproduces on a binary built **before** `383e7f5cf`:
+
 ```bash
-CRATONVM_JIT_SITE_CACHE=all   # 53 failures
-CRATONVM_JIT_SITE_CACHE=leaf  # 0 failures — the default
+CRATONVM_JIT_SITE_CACHE=all   # 53 failures pre-383e7f5cf, 0 after
+CRATONVM_JIT_SITE_CACHE=leaf  # 0 failures either way
 ```
 
 against `module/spring-boot-cache`'s

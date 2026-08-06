@@ -1,7 +1,39 @@
 # Direct memory still exhausts under sustained multi-threaded churn (H2 `TestMVStore`)
 
 ## Status
-**OPEN**, 2026-08-05. The residual of the now-retired
+**OPEN**, 2026-08-05 — but **both of the code-side leads below have since been
+taken**, and the 30-minute `TestMVStore` re-measurement that would close or
+re-narrow this page has NOT been run. Read *Leads* with that in mind: what is
+left to do here is the measurement, not (necessarily) more code.
+
+Landed since this page was written (`claude/bytebuffer-jdk-contract-e3e6c6`):
+
+* **Lead 2 is done.** `run_cleaner_actions` is now called beside both ordinary
+  allocation-triggered `run_finalizers` calls in `maybe_gc`, not only from
+  `force_gc_from_native`.
+* **A third gap this page did not name is closed, and it is the one the
+  symptom actually points at.** The `OutOfMemoryError` quoted below —
+  `Direct buffer memory: tried …, used …, max …` — is *this module's* message,
+  raised from `try_reserve` inside `dbb_allocate`. It is NOT raised by
+  `bits_reserve_memory`, so the reclaim-and-retry the parent fix added there
+  never ran for it. It cannot: `java/nio/Bits` is not in
+  `force_native_over_real_jdk_bytecode`, so in real-JDK mode the JDK's own
+  `Bits` bytecode wins and our native is dead code — our accounting is only
+  consulted from the `Unsafe.allocateMemory0` that the real
+  `DirectByteBuffer(int)` constructor calls, and that path had no retry at all.
+  `dbb_allocate_collecting` now gives it the same bounded reclaim-and-retry.
+
+  This also explains why the failure is specific to *sustained* churn: the two
+  budgets are separate counters that drift, because ours also counts every
+  other `Unsafe.allocateMemory` caller. Ours saturates first, while the JDK's
+  `Bits` still believes there is room — so the JDK's own `System.gc()`-and-retry
+  is never even reached.
+
+Lead 1 (the JIT-borrow bail in `run_cleaner_actions`) is untouched and remains
+the best next thing to instrument if the re-measurement still shows the cap
+being hit.
+
+The residual of the now-retired
 `direct-bytebuffers-are-never-reclaimed-20260805` write-up: transient direct
 buffers ARE reclaimed now (that page's reproducer matches HotSpot exactly), but
 H2's `org.h2.test.store.TestMVStore` still reaches `MaxDirectMemorySize` and
