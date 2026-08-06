@@ -68,7 +68,15 @@ use std::path::{Path, PathBuf};
 /// Frozen upper bound on raw lock constructions in `native-builtins/src`.
 ///
 /// Measured 2026-08-04. Zero slack, matching `stub_ratchet`'s contract.
-const BASELINE_RAW_LOCKS: usize = 438;
+///
+/// Lowered 438 → 432 on 2026-08-05. The six conversions are NOT from the change
+/// that lowered it: they arrived on `dev` without the same-change re-freeze this
+/// ratchet asks for, so the test was already red on `dev`. Verified by re-running
+/// the scan with that change's own source edits checked out — it also counts 432,
+/// and the change removes no lock construction at all. Recorded here rather than
+/// silently adjusted, because a baseline moved by someone other than the author
+/// of the improvement is the bookkeeping this ratchet exists to keep honest.
+const BASELINE_RAW_LOCKS: usize = 432;
 
 /// Minimum number of source lines the scan must see before its count means
 /// anything.

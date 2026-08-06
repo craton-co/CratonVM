@@ -64,6 +64,27 @@ And the **three-argument** `wrap(CharSequence, int, int)` was never intercepted
 at all, so it already built a real `StringCharBuffer` and already matched
 HotSpot exactly, `capacity` and null message included.
 
+## A concurrent session found the same thing and stopped one step earlier
+
+While this was in progress, `dev` landed `86090abee` — *"CharBuffer.wrap
+stamped the abstract class, so slice() had no body"* — from a different repro
+(`CBSLICE.java`, an `AbstractMethodError` out of `wrap(a).slice()`). It reached
+the same diagnosis and changed the stamp to the concrete
+`java/nio/HeapCharBuffer`.
+
+That closes the `AbstractMethodError` half and, because
+`HeapCharBuffer.subSequence` bounds-checks in bytecode, the out-of-range read
+this record is about. The merge keeps the **stronger** resolution — not
+registering the natives at all in real-JDK mode — because stamping a concrete
+class still answers `wrap(String)` with a `HeapCharBuffer` over a *copy* of the
+sequence, so `getClass()`, `isReadOnly()`, `hasArray()` and `put` all stay
+wrong, and `subSequence`'s message stays `HeapCharBuffer`'s rather than
+`StringCharBuffer`'s. Synthetic-JDK mode, which keeps the natives, takes
+`dev`'s concrete stamp.
+
+The other commit in that range, `e02262b15` (the `mark` write clobbering
+`Buffer.address`), is untouched and preserved.
+
 ## The fix
 
 **Delete the two two-argument `wrap` natives in real-JDK mode.** Their bytecode

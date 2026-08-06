@@ -1326,7 +1326,9 @@ fn handle_job(job: Job) -> Result<(), String> {
             };
             let res = {
                 let l = listener.lock();
-                l.accept()
+                // EINTR on a parked accept is a transient interruption, not a
+                // failed accept — see `crate::eintr`.
+                crate::eintr::retry_eintr(|| l.accept())
             };
             match res {
                 Ok((stream, _peer)) => {
@@ -1378,8 +1380,10 @@ fn handle_job(job: Job) -> Result<(), String> {
             let blocked_from = aio_inline_dbg_enabled().then(std::time::Instant::now);
             let read_res = {
                 let s = stream.lock();
-                let mut r = &*s;
-                r.read(&mut buf)
+                // `EintrIo`: this worker thread is signalled like any other by
+                // the cross-thread JIT root scan, and a bare EINTR here reaches
+                // the application's `CompletionHandler.failed`.
+                crate::eintr::EintrIo::new(&mut &*s).read(&mut buf)
             };
             let ready_at = blocked_from.map(|started| {
                 let now = std::time::Instant::now();
@@ -1425,8 +1429,8 @@ fn handle_job(job: Job) -> Result<(), String> {
             let mut buf = vec![0u8; len.max(1)];
             let read_res = {
                 let s = stream.lock();
-                let mut r = &*s;
-                r.read(&mut buf)
+                // Same as the handler-form arm above.
+                crate::eintr::EintrIo::new(&mut &*s).read(&mut buf)
             };
             dbg_aio!(
                 "READ  worker result future_gref={future_gref} result={:?} thread={:?}",

@@ -50,16 +50,30 @@
 //!    short-circuit `try_resolve_string_intrinsic` (`jit/src/lib.rs:3931`) on
 //!    `narrow_oops_enabled()`; the real fix is a narrow arm in that emitter,
 //!    mirroring `emit_narrow_ref_aload_regs` (`x64.rs:17132`).
-//! 2. **`gc/src/gen_heap.rs:8261` `mark_young_to_old_refs` and `:8369`
-//!    `rewrite_stretch_conservatively`.** Both scan an unparseable heap stretch
-//!    in aligned 8-byte words looking for old-gen object bases. A pair of
-//!    adjacent narrow oops never matches, so marks are missed (premature
-//!    reclamation) and refs to moved objects are left unrewritten (dangling).
+//! 2. **`gen_heap.rs` `mark_young_to_old_refs` and
+//!    `rewrite_stretch_conservatively`.** Both scanned an unparseable heap
+//!    stretch in aligned 8-byte words looking for old-gen object bases. A pair
+//!    of adjacent narrow oops never matches, so marks were missed (premature
+//!    reclamation) and refs to moved objects were left unrewritten (dangling).
 //!    Fallback paths — but they are the paths that run when the parseable walk
 //!    has already failed, which is exactly when correctness matters most.
 //!
-//! Because of these, `enable_for_live_heap` prints an explicit unsoundness
-//! warning on success. **Do not flip the default until both are closed.**
+//!    **CLOSED 2026-08-06.** Both now go through
+//!    `gen_heap::for_each_conservative_ref_slot`, which visits each aligned
+//!    32-bit half decoded as a narrow oop *in addition to* the 64-bit word.
+//!    Both widths, not one or the other: only reference fields and reference
+//!    array elements are narrowed, so such a stretch can still hold full-width
+//!    pointers. Sharing one helper is what keeps the mark walk and the rewrite
+//!    walk agreeing about width — marking at one width and rewriting at
+//!    another would itself leave a dangling reference.
+//!
+//! Hole 1 is covered by refusal rather than by a fix, hole 2 by a fix. So there
+//! is no longer a *known* unsoundness — but `enable_for_live_heap` still warns
+//! and the default stays OFF, because **nothing has yet run a corpus with the
+//! gate on**. "No known hole" is a weaker claim than "measured sound", and the
+//! sweep that found these two holes found them by reading, not by running.
+//! The next step for this feature is a corpus run with
+//! `-XX:+UseCompressedOops`, not another audit.
 //!
 //! ## Verified NOT needed (contrary to the older remaining-work list)
 //!

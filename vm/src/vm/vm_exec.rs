@@ -7481,6 +7481,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|bytes| bytes.to_vec())
     }
 
+    fn class_bytes_match_base(&self, class_id: ClassId, bytes: &[u8]) -> Option<bool> {
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_bytes_match_base(class_id, bytes)
+    }
+
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
         self.shared
             .classes
@@ -15194,6 +15199,58 @@ pub fn invoke_or_native(
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             note_annotation_proxy_cid(shared.mem.heap.class_id_of(recv).as_u32());
             return annotation_proxy_invoke_shared(shared, thread, recv, method_name, &args[1..]);
+        }
+    }
+
+    // Dynamic proxy dispatch (WP2.5): this is the JIT's cache-miss resolver
+    // for `invokevirtual`/`invokeinterface` (see `virtual_dispatch_target_for_receiver`
+    // in `vm/src/jit/helpers.rs`, which passes the RECEIVER's own runtime
+    // class as `class_name` here — not the constant-pool-declared class). A
+    // `java.lang.reflect.Proxy.newProxyInstance` receiver's runtime class is
+    // always the synthetic `java/lang/reflect/Proxy$Instance` (every proxy,
+    // regardless of interface set, currently lands on this single class —
+    // see `PROXY_INSTANCE_CLASS`'s doc comment in `vm/src/runtime/proxy.rs`),
+    // and that synthetic class has no real vtable/itable entries for the
+    // interfaces it implements. Without this check, normal resolution falls
+    // through and — for an interface method target — resolves straight to
+    // the interface's own ABSTRACT declaration, raising AbstractMethodError
+    // instead of forwarding to the `InvocationHandler`. Observed face:
+    // `net.bytebuddy.utility.dispatcher.JavaDispatcher$Dispatcher$ForNonStaticMethod.invoke`
+    // throwing `AbstractMethodError: method net/bytebuddy/utility/Invoker.invoke(...)
+    // has no Code attribute` once `JavaDispatcher`'s `invoke` tiers up to JIT
+    // (interpreted calls never hit this function — they route through
+    // `is_proxy_dispatch` in `execute_invoke_kind`,
+    // `vm/src/runtime/interpreter/invoke.rs`, which this mirrors).
+    //
+    // Keyed on the DISPATCH class (`effective_class`) exactly like the
+    // `AnnotationProxy` check above — a literal string compare, zero
+    // additional cost on every non-proxy dispatch — so a *static* call that
+    // merely takes a proxy instance as an ordinary argument is unaffected:
+    // its dispatch class is the static method's declaring class (resolved
+    // from the constant pool), never the receiver's runtime class, so it can
+    // never equal `Proxy$Instance` here.
+    if effective_class == crate::runtime::proxy::PROXY_INSTANCE_CLASS {
+        if let Some(Value::Object(Some(proxy_ref))) = args.first().copied() {
+            // Handle getClass() directly, like the interpreter's
+            // `is_proxy_dispatch` block — return the proxy's own class
+            // mirror rather than routing it through the handler.
+            if method_name == "getClass" && descriptor == "()Ljava/lang/Class;" {
+                let class_id = shared.mem.heap.class_id_of(proxy_ref);
+                let mirror = super::get_or_create_class_mirror(shared, class_id);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            return proxy_unbox_primitive_return(
+                shared,
+                descriptor,
+                proxy_invoke_handler_shared(
+                    shared,
+                    thread,
+                    proxy_ref,
+                    method_name,
+                    descriptor,
+                    &args[1..],
+                ),
+            );
         }
     }
 

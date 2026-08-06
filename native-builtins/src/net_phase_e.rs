@@ -165,6 +165,8 @@ use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMe
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
+use cratonvm_native_io::eintr::{is_eintr, retry_eintr, EintrIo, EintrStream};
+
 use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -6154,7 +6156,7 @@ fn http_read_response<R: Read>(mut r: R, head_response: bool) -> std::io::Result
                 ));
             }
             Ok(n) => all.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if is_eintr(&e) => continue,
             Err(e) => return Err(e),
         }
     };
@@ -6216,7 +6218,7 @@ fn http_read_response<R: Read>(mut r: R, head_response: bool) -> std::io::Result
                         ));
                     }
                     Ok(n) => all.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if is_eintr(&e) => continue,
                     Err(e) => return Err(e),
                 },
             }
@@ -6229,7 +6231,7 @@ fn http_read_response<R: Read>(mut r: R, head_response: bool) -> std::io::Result
                 // short response instead of erroring.
                 Ok(0) => break,
                 Ok(read) => all.extend_from_slice(&buf[..read]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if is_eintr(&e) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -6245,7 +6247,7 @@ fn http_read_response<R: Read>(mut r: R, head_response: bool) -> std::io::Result
             match r.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => all.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if is_eintr(&e) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -6348,9 +6350,9 @@ impl HttpDeadlineSocket for TcpStream {
     }
 }
 
-impl HttpDeadlineSocket for native_tls::TlsStream<TcpStream> {
+impl HttpDeadlineSocket for native_tls::TlsStream<EintrStream<TcpStream>> {
     fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.get_ref().set_read_timeout(timeout)
+        self.get_ref().get_ref().set_read_timeout(timeout)
     }
 }
 
@@ -6371,6 +6373,12 @@ impl<S: HttpDeadlineSocket> Read for HttpDeadlineReader<S> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.stream
             .set_http_read_timeout(Some(http_timeout_remaining(self.deadline)?))?;
+        // EINTR is deliberately NOT absorbed here. It is passed up to
+        // `http_read_response`, whose loop calls back into this method, which
+        // re-arms `SO_RCVTIMEO` from the deadline above. Retrying in place
+        // would skip that re-arm, and Linux restarts the receive timer after
+        // every interrupted `recv` — so a signal storm could stretch the
+        // caller's deadline without bound.
         match self.stream.read(buffer) {
             Err(error)
                 if matches!(
@@ -6464,12 +6472,15 @@ fn http_exchange_tls(
     let tcp = http_connect_with_deadline(host, port, deadline)?;
     tcp.set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
     tcp.set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
-    let mut tls = connector.connect(host, tcp).map_err(|e| {
+    // `native_tls` runs the handshake inside `connect`, so the only place an
+    // EINTR can be absorbed is underneath the socket it is handed. Same
+    // rationale as the rustls sibling below.
+    let mut tls = connector.connect(host, EintrStream::new(tcp)).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}"))
     })?;
     let req = http_build_request(method, host, port, path, headers, body, 443);
     tls.write_all(&req)?;
-    tls.flush()?;
+    retry_eintr(|| tls.flush())?;
     http_read_response(
         HttpDeadlineReader {
             stream: tls,
@@ -6504,26 +6515,40 @@ fn http_exchange_rustls(
     let conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS init: {e}")))?;
     let mut tls: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
+    // Every socket op below goes through `EintrIo`. A blocking `recv` on a
+    // socket that carries `SO_RCVTIMEO` — which the two `set_*_timeout` calls
+    // in this loop install on purpose, to keep the caller's deadline honest —
+    // is NOT restarted by `SA_RESTART`, so CratonVM's own cross-thread JIT
+    // root-scan `SIGUSR2` surfaced here as
+    // `IOException: TLS handshake read: Interrupted system call (os error 4)`.
+    // See `cratonvm_native_io::eintr` and
+    // `fixed-suite-bugs/springboot/`
+    // `jdk-httpclient-sslbundle-tls-handshake-eintr-FIXED-20260806.md`.
     while tls.conn.is_handshaking() {
         if tls.conn.wants_write() {
             tls.sock
                 .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
-            tls.conn.write_tls(&mut tls.sock).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("TLS handshake write: {e}"),
-                )
-            })?;
+            tls.conn
+                .write_tls(&mut EintrIo::new(&mut tls.sock))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("TLS handshake write: {e}"),
+                    )
+                })?;
         }
         if tls.conn.wants_read() {
             tls.sock
                 .set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
-            let count = tls.conn.read_tls(&mut tls.sock).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("TLS handshake read: {e}"),
-                )
-            })?;
+            let count = tls
+                .conn
+                .read_tls(&mut EintrIo::new(&mut tls.sock))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("TLS handshake read: {e}"),
+                    )
+                })?;
             if count == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -6538,8 +6563,15 @@ fn http_exchange_rustls(
     let request = http_build_request(method, host, port, path, headers, body, 443);
     tls.sock
         .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
+    // `write_all` is left bare on purpose: `std`'s default impl already
+    // reissues on `Interrupted` AND advances past the bytes it did place, which
+    // a `retry_eintr` wrapper around the whole call could not do — it would
+    // restart from offset 0. `flush` has no partial state, so wrapping it is
+    // safe, and it needs the wrapper: `rustls`' `Stream::flush` drives
+    // `complete_io` internally, where the socket's EINTR reaches us from a
+    // method no `EintrIo` above is wrapping.
     tls.write_all(&request)?;
-    tls.flush()?;
+    retry_eintr(|| tls.flush())?;
     http_read_response(
         HttpDeadlineReader {
             stream: tls,

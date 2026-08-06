@@ -200,5 +200,5 @@ the rest parsed is not validation.
 Found while decomposing the deploy wall, and unrelated to it. The same probe's
 timing output is what establishes that the annotation scan's cost is the
 per-byte I/O call chain rather than object construction — see
-`docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md`,
+`../../../known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`,
 which is unaffected and stays open.
