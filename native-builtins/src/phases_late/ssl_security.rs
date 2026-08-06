@@ -2995,7 +2995,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if let Some(b) = crate::servlet::s2_tls_pop_buffered_byte(tls_id) {
             return Ok(Some(Value::Int(b as i32)));
         }
-        // STW-COOPERATION (tomcatservletwebserverfactorytests-stw-takeover-hang):
+        // STW-COOPERATION (tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED):
         // the refill does a genuine OS-level blocking socket operation.
         // Without the blocked-region bracket this thread stays counted as a
         // cooperative mutator that can never reach a safepoint poll, so a

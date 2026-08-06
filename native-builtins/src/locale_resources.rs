@@ -1216,6 +1216,58 @@ fn maybe_prepend_tz_zone_id(
     Value::Object(Some(new_arr))
 }
 
+/// The parent of a **synthetic** bundle, or `None` when it has none — which is
+/// every synthetic bundle today.
+///
+/// `rb_get_bundle` allocates a synthetic bundle as a bare
+/// `java/util/ResourceBundle` with TWO fields under its own convention:
+/// field 0 is the backing map, field 1 the locale. The REAL
+/// `java.util.ResourceBundle` declares `parent` FIRST, so
+/// `get_field_by_name(this, "parent")` resolves to index 0 and hands back the
+/// **backing map**.
+///
+/// Recursing on that re-entered this native with a `java/util/HashMap`
+/// receiver. A HashMap is not `is_synthetic`, so the real-subclass arm probed
+/// it with `getContents()` and then `handleGetObject(String)` — two
+/// `NoSuchMethodError`s per missing key, both swallowed by the `if let Ok(..)`
+/// guards, both logged. Every Tomcat suite log carries the pair, attributed to
+/// `org/apache/tomcat/util/res/StringManager.getString`; that noise is what
+/// `tomcatreactivewebserverfactorytests-graceful-shutdown-timeout-RESOLVED-20260806.md`
+/// flagged. The final answer was never wrong — the map has no `parent` field
+/// either, so the walk ended in the same `MissingResourceException` the caller
+/// catches — which is why it survived this long.
+///
+/// So: refuse a "parent" that is the backing map, and refuse one that is not a
+/// `ResourceBundle` at all. The second half is the load-bearing one — it keeps
+/// this correct if the synthetic layout ever gains a slot, instead of trading
+/// one index coincidence for another.
+///
+/// NOTE for whoever gives synthetic bundles a real parent chain: they cannot
+/// simply start honouring `setParent`. `java.util.ResourceBundle.setParent` has
+/// no native, so real bytecode would write the real layout's field 0 — the
+/// backing map's slot — and silently empty the bundle. Give the synthetic shape
+/// its own parent slot (or move it to a real `PropertyResourceBundle` with a
+/// `lookup` map) before wiring the chain up.
+fn synthetic_bundle_parent(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    backing_map: ObjectRef,
+) -> Option<ObjectRef> {
+    let parent = match ctx.get_field_by_name(this, "parent") {
+        Value::Object(Some(p)) => p,
+        _ => return None,
+    };
+    if parent == backing_map {
+        return None;
+    }
+    let rb = ctx.class_id_by_name("java/util/ResourceBundle")?;
+    if ctx.is_subclass(ctx.class_id_of_object(parent), rb) {
+        Some(parent)
+    } else {
+        None
+    }
+}
+
 fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1360,7 +1412,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // `JksSslStoreBundleTests`'s provider-not-found messages).
     match result {
         Ok(Some(Value::Object(None))) | Ok(None) => {
-            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+            if let Some(parent) = synthetic_bundle_parent(ctx, this, map) {
                 return rb_get_object(
                     ctx,
                     &[Value::Object(Some(parent)), Value::Object(Some(key))],
