@@ -15558,6 +15558,13 @@ pub(crate) fn read_named_attributes(
     let attrs_pin = owner_group.map(|a| ctx.pin_native_root(a));
 
     for name in names {
+        // The key is built and pinned BEFORE the value, and nothing between the
+        // value and the `put` allocates. The other order — value, then
+        // `create_string(name)` — holds a fresh, unrooted attribute object
+        // across an allocation, which is the native stale-local family: a young
+        // collection there relocates it and the map gets a dangling entry.
+        let key = ctx.create_string(name);
+        let key_pin = ctx.pin_native_root(key);
         let value: Value = match name {
             "lastModifiedTime" => {
                 Value::Object(Some(filetime_alloc(ctx, facts.modified_millis)))
@@ -15627,14 +15634,21 @@ pub(crate) fn read_named_attributes(
             }
             _ => continue,
         };
-        let key = ctx.create_string(name);
+        let key = ctx.read_native_pin(key_pin, key);
         let map = ctx.read_native_pin(map_pin, map);
-        ctx.invoke_virtual(
+        let put = ctx.invoke_virtual(
             map,
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(key)), value],
-        )?;
+        );
+        if let Err(e) = put {
+            // Release the pin frame before unwinding: `?` here would leave the
+            // map (and the attribute object) pinned for the rest of the VM's
+            // life.
+            ctx.unpin_native_roots(map_pin);
+            return Err(e);
+        }
     }
 
     let map = ctx.read_native_pin(map_pin, map);
