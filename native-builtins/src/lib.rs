@@ -32116,8 +32116,12 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         // StringCharBuffer. Honor the JDK layout instead of treating the null
         // hb as an error (Netty cookie decoding uses
         // `CharBuffer.wrap(String,start,end).charAt(0)`).
+        // `&mut` rather than `&dyn`: the wrapped `str` is any `CharSequence`,
+        // and reading a non-`String` one needs a virtual `toString()`. See
+        // `charset_buffers::read_wrapped_char_sequence` — without it every
+        // `CharBuffer.wrap(charChunk)` reads back empty.
         fn string_cb_state(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
         ) -> Option<(Vec<u16>, i32, i32, i32)> {
             let cid = ctx.class_id_of_object(this);
@@ -32129,7 +32133,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => return None,
             };
-            let text = ctx.read_string(str_obj)?;
+            let text = crate::phases_late::charset_buffers::read_wrapped_char_sequence(
+                ctx, str_obj,
+            );
             let pos = match ctx.get_field_by_name(this, "position") {
                 Value::Int(v) => v,
                 _ => match ctx.get_field(this, 1) {
@@ -32151,8 +32157,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((text.encode_utf16().collect(), pos, lim, off))
         }
 
+        #[allow(dead_code)]
         fn string_cb_char_at(
-            ctx: &dyn cratonvm_native_api::NativeContext,
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
             absolute_index: i32,
         ) -> Option<Value> {
@@ -32483,7 +32490,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     .ok_or(RuntimeError::IllegalStateException {
                         message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
                     })?;
-                    let _ = lim;
+                    // `ByteBufferAsCharBuffer.subSequence` opens with
+                    // `Objects.checkFromToIndex(start, end, limit() - position())`.
+                    // `lim` was read and then explicitly discarded here, so the
+                    // range was never checked: `subSequence(0, 99)` on a
+                    // six-char view decoded 93 code units from past the end of
+                    // the underlying `byte[]` and handed them back as content.
+                    // Same defect, same day, as `CharBuffer.subSequence` —
+                    // `docs/known-issues/charbuffer-wrap-string-subsequence-does-not-bounds-check.md`.
+                    if start < 0 || start > end || end > lim.saturating_sub(pos) {
+                        return Err(RuntimeError::ioobe(
+                            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                                i64::from(start),
+                                i64::from(end),
+                                i64::from(lim.saturating_sub(pos)),
+                            ),
+                        )
+                        .into());
+                    }
                     let n = (end - start).max(0) as usize;
                     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
                     for i in 0..n {
