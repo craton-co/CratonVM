@@ -2624,7 +2624,7 @@ mod bootstrap_property_fallback_tests {
     /// scope, because every reader here runs on this thread.
     fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = env_lock();
-        let previous = std::env::var_os("JBOSS_HOME");
+        let previous = cratonvm_types::flags::runtime_var_os("JBOSS_HOME");
         match home {
             Some(v) => std::env::set_var("JBOSS_HOME", v),
             None => std::env::remove_var("JBOSS_HOME"),

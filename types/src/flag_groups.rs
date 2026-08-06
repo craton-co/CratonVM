@@ -859,7 +859,6 @@ pub const INVENTORY: &[E] = &[
     // Interpreter-side, but it lives with the execution-engine knobs like
     // `rootsnap-cache`. Default-ON; `0`/`off`/`false`/`no` is the kill switch.
     E { group: Group::JIT, token: "trivial-getter", on_key: Some("CRATONVM_TRIVIAL_GETTER"), off_key: None, off_word: Some("0") },
-    E { group: Group::JIT, token: "unban-junitcore", on_key: Some("CRATONVM_JIT_UNBAN_JUNITCORE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unroll", on_key: Some("CRATONVM_JIT_UNROLL"), off_key: Some("CRATONVM_DISABLE_UNROLL"), off_word: None },
     // Vectorized emission (`x64::vec_emit::VecEmitPolicy::from_flags`).
     // Default-**OFF**: unset answers `Disabled`, so unsetting the key is the off

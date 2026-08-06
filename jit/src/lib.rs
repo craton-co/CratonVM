@@ -10417,7 +10417,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -10509,7 +10509,7 @@ flushed at epoch {barrier}",
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
