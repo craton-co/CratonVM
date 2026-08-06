@@ -650,6 +650,20 @@ fn spawn_and_wrap_with_redirects(
         },
     );
 
+    // `ensure_synthetic_class` gives `cratonvm/synthetic/Process` a real
+    // `java.lang.Process` superclass, but it resolves it with
+    // `get_loaded_class_id` — which answers only for a class that is ALREADY
+    // loaded. Load it here so the fabrication cannot silently fall back to
+    // `java/lang/Object` and reintroduce the supertype inconsistency
+    // (`isAssignableFrom` true while the `getSuperclass()` chain omits it).
+    //
+    // In practice the caller's own bytecode has already resolved
+    // `java.lang.Process` — it is `start()`'s return type — so this is
+    // ordinarily a no-op lookup. It is not free to rely on that: this native is
+    // also reached from paths that never named the type, and a mode without a
+    // real `java.lang.Process` at all must still get the old behaviour rather
+    // than an error, which is why the result is deliberately discarded.
+    let _ = ctx.load_class("java/lang/Process");
     // Allocate the synthetic Process under its own named class (see
     // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
     // ahead of them belong to java.lang.Process's own reader/writer caches and
