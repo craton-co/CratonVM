@@ -220,22 +220,38 @@ Three instrument gaps closed with it, each of which had cost a run:
   the fix.
 * `vm/tests/array_receiver_dispatch.rs` —
   `array_receiver_dispatches_through_object_not_component_class` passes.
-* `cargo test --release -p cratonvm-vm --no-fail-fast`: **4063 passed / 11 failed
-  on BOTH arms** — this tree and a contemporaneous pristine rebuild in the same
-  worktree. Ten failures identical on both:
-  `connection_methods_carry_signatures`,
-  `memory::addr_keyed::tests::the_address_keyed_table_census_is_complete` (its
-  own message names `native-builtins/src/net_phase_e.rs`, untouched here),
+* **End-to-end A/B, contemporaneous and interleaved**, on the merged tree with
+  `CRATONVM_COMPACT_REF_FIELDS=0` (dev tip carries an unrelated OPEN regression,
+  `compact-ref-field-layout-corrupts-filechannel-filelock-20260807`, under which
+  no file-backed H2 database opens at all). Same class, same flags, 4 workers
+  each, the two arms differing only in the header term of
+  `stale_mirror_recovery_applies`:
+
+  | arm | runs | events |
+  |---|---|---|
+  | CTL — `class_id == 0` alone | 10 | **2** |
+  | FIX — `class_id == 0` AND all-zero header | 8 | **0** |
+
+  A CTL witness on the merged tree reads
+  `receiver_class=org/h2/mvstore/FileStore$BackgroundWriterThread`,
+  `pre_refresh_kind=Array`, `pre_mark_now=0x2d000000000000` (quartet bits:
+  `kind=Array`, `element_type=Long`) and `barrier_src=0x0` — the same signature
+  as the pre-shrink witnesses, on the new 16-byte header.
+
+* `cargo test --release -p cratonvm-vm --no-fail-fast` on the merged branch:
+  **4073 passed / 9 failed**. All 9 are a strict subset of the 10 that failed
+  identically on **both** arms of an earlier pristine A/B in the same worktree
+  (`git checkout -- vm/src`, same rebuild): `connection_methods_carry_signatures`,
   `no_new_test_only_public_api`, `probe0_jboss_module_class_reachable`,
   `t14_all_system_natives_registered`, `t14_all_vm_natives_registered`,
   `t15_define_class_not_stub`,
   `test_jit_exception_in_handler_not_recaught_by_same_handler`,
   `test_jit_indy_after_side_effect_no_double_execution`,
-  `test_precise_handler_frame_catches_a_throw_at_the_end_of_its_try`. The
-  eleventh differs in **opposite directions** —
-  `socket_input_stream_timeout_is_typed_and_never_eof` on the fixed arm,
-  `test_pgo02_guarded_virtual_inline` on the pristine one — and both pass in
-  isolation, so both are the known process-global flakes.
+  `test_precise_handler_frame_catches_a_throw_at_the_end_of_its_try`. That
+  earlier run's eleventh failure differed in **opposite directions** between the
+  arms (`socket_input_stream_timeout_is_typed_and_never_eof` on the fixed one,
+  `test_pgo02_guarded_virtual_inline` on the pristine one) and both pass in
+  isolation — the known process-global flakes.
 * `CloneSpinProbe` on the fixed binary: 9.2 M `[J.clone()` dispatches, 6
   threads, `--Xmx 512m`, JIT on — `failed=0`.
 * `H2InsertScaleProbe 25 1000` — this page's own "Possible residual observed
