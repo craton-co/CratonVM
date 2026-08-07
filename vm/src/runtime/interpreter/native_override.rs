@@ -3556,6 +3556,11 @@ pub(super) fn force_native_over_real_jdk_bytecode(
                 | "getDescriptor"
                 | "canUse"
                 | "addUses"
+                // `getResourceAsStream` has no real-JDK-viable body here: it
+                // routes through `BuiltinClassLoader.findResourceAsStream` /
+                // a `ModuleReader`, neither of which CratonVM models. The
+                // native lives in `jboss_jdkspecific::native_module_get_resource_as_stream`.
+                | "getResourceAsStream"
                 | "addExports"
                 | "addOpens"
                 | "implAddExports"

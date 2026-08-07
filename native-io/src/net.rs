@@ -1724,21 +1724,21 @@ fn net_read_close_aware(fd: i32, stream: &TcpStream, buf: &mut [u8]) -> std::io:
         };
         // Ask AFTER the poll, so a close that lands while we are parked is seen
         // on the very next pass, and a close that raced the poll's readiness
-        // still wins — a read completing on a channel Java has closed is the
-        // outcome `AsynchronousCloseException` exists to prevent.
+        // still wins — HotSpot fails a read that a concurrent `close()` beat,
+        // it does not hand back bytes on a socket Java has already closed.
         if !net_stream_still_registered(fd) {
             return Err(net_read_closed_err());
         }
         if !ready {
             continue;
         }
-        match read_retry_eintr(stream, buf) {
-            // Readable, then not: another reader on the same fd took the bytes.
-            // Park again rather than answering `WouldBlock`, which on a
-            // blocking fd would surface as a false `IOStatus.UNAVAILABLE`.
-            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-            other => return other,
-        }
+        // `WouldBlock` is deliberately propagated rather than re-parked: this
+        // arm is only reachable when the OS fd is non-blocking despite the
+        // recorded mode saying otherwise, and `net_read0` turns it into the
+        // JDK's `IOStatus.UNAVAILABLE` (-2) sentinel that `NioSocketImpl`
+        // answers with its own `Net.poll` + retry. Swallowing it here would
+        // take that decision away from the caller's deadline.
+        return read_retry_eintr(stream, buf);
     }
 }
 

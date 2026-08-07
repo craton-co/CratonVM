@@ -30399,40 +30399,20 @@ pub(crate) fn build_synthetic_module_descriptor(
     ctx: &mut dyn NativeContext,
     module_name: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let uses: Vec<String> = ctx
-        .module_uses(module_name)
-        .into_iter()
-        .map(|s| s.replace('/', "."))
-        .collect();
-    let is_open = ctx.module_is_open(module_name);
-    let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
-    let pin = ctx.pin_native_root(desc);
-    let name = ctx.create_string(module_name);
-    let desc = ctx.read_native_pin(pin, desc);
-    let name_val = Value::Object(Some(name));
-    ctx.set_field(desc, 0, name_val);
-    ctx.set_field(desc, 1, Value::Int(0));
-    ctx.set_field_by_name(desc, "name", name_val);
-    ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
-    ctx.set_field_by_name(desc, "automatic", Value::Int(0));
-
-    for field in [
-        "modifiers",
-        "requires",
-        "exports",
-        "opens",
-        "provides",
-        "packages",
-    ] {
-        let empty = module_descriptor_empty_set(ctx)?;
-        let desc = ctx.read_native_pin(pin, desc);
-        ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
-    }
-    let uses_set = crate::phases_late::build_string_set(ctx, uses);
-    let desc = ctx.read_native_pin(pin, desc);
-    ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
-    ctx.unpin_native_roots(pin);
-    Ok(desc)
+    // Was: `requires`/`exports`/`opens`/`provides`/`packages` fabricated as
+    // EMPTY sets unconditionally — for every module, in every mode — even
+    // though the VM had already parsed the real `module-info.class` into
+    // `ClassManager::module_registry` (`classloading::module::parse_module_info`
+    // + `resolve_module_path`). `getDescriptor().exports()` therefore answered
+    // `[]` for a module that declares two exports
+    // (`regression-suite/src/RJdkModule.java:69` vs HotSpot 25).
+    //
+    // The single implementation now lives beside the rest of the
+    // `java.lang.Module` / `ModuleLayer` surface and answers from that
+    // registry. A module the registry does NOT know still gets the all-empty
+    // shape this used to hand everyone, so synthetic-jdk and any embedder with
+    // an unpopulated registry are unchanged.
+    crate::jboss_jdkspecific::build_module_descriptor(ctx, module_name)
 }
 
 // ---------------------------------------------------------------------------

@@ -2462,17 +2462,20 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
     };
-    let id = match read_reg_id(ctx, this) {
-        Some(id) => id,
+    // Bound to a local first so no borrow of `ctx` outlives the lookup: the
+    // closed-channel arm below needs `ctx` mutably.
+    let reg_id = read_reg_id(ctx, this);
+    let Some(id) = reg_id else {
         // `sc_close` wipes the synthetic state, so `F_OPEN` reading back 0 with
         // no registry id means "this channel was closed" — which
         // `java.nio.channels` spells `ClosedChannelException`, not the bare
         // IOException this used to answer. `RJdkNio`'s
         // `catch (ClosedChannelException)` walked straight past that one.
-        None if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 => {
-            return Err(closed_channel_exception(ctx));
-        }
-        None => return Err(ioex("read: channel not connected")),
+        return if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 {
+            Err(closed_channel_exception(ctx))
+        } else {
+            Err(ioex("read: channel not connected"))
+        };
     };
 
     // Determine the writable region. We materialize into a heap buffer here
@@ -2890,13 +2893,14 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("read(scattering): null buffer array")),
     };
-    let id = match read_reg_id(ctx, this) {
-        Some(id) => id,
+    let reg_id = read_reg_id(ctx, this);
+    let Some(id) = reg_id else {
         // See `sc_read`: no registry id + `F_OPEN == 0` is a closed channel.
-        None if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 => {
-            return Err(closed_channel_exception(ctx));
-        }
-        None => return Err(ioex("read(scattering): channel not connected")),
+        return if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 {
+            Err(closed_channel_exception(ctx))
+        } else {
+            Err(ioex("read(scattering): channel not connected"))
+        };
     };
 
     // Sum the writable capacity across the buffer slice; remember each target

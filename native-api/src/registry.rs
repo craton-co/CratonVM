@@ -1459,6 +1459,46 @@ pub trait NativeClassAccess {
         false
     }
 
+    /// True if the VM's `ModuleRegistry` holds a descriptor for `module_name`.
+    ///
+    /// The default is `false` ("I know nothing"), so a `NativeContext` that does
+    /// not model modules can never be read as asserting a module's ABSENCE —
+    /// callers must probe a known-present name (`java.base`) before treating a
+    /// `false` here as evidence.
+    fn module_is_registered(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
+    }
+
+    /// `exports` directives declared by `module_name`, as
+    /// `(package, targets)`. Package names are INTERNAL (slash) form; an empty
+    /// `targets` is an unqualified export.
+    fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `opens` directives declared by `module_name`, same shape as
+    /// [`module_exports`].
+    fn module_opens(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `requires` directives declared by `module_name`, as
+    /// `(module name, is_transitive, is_static)`.
+    fn module_requires(&self, module_name: &str) -> Vec<(String, bool, bool)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `provides` directives declared by `module_name`, as
+    /// `(service, providers)` — binary class names in INTERNAL (slash) form.
+    fn module_provides(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
+    }
+
     /// Return all registered module names.
     fn all_module_names(&self) -> Vec<String> {
         vec![]

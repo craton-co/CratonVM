@@ -7676,6 +7676,80 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .is_some_and(|d| d.is_open)
     }
 
+    fn module_is_registered(&self, module_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .is_some()
+    }
+
+    fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.exports
+                    .iter()
+                    .map(|e| (e.package_name.clone(), e.to_modules.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_opens(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.opens
+                    .iter()
+                    .map(|o| (o.package_name.clone(), o.to_modules.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_requires(&self, module_name: &str) -> Vec<(String, bool, bool)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.requires
+                    .iter()
+                    .map(|r| (r.module_name.clone(), r.is_transitive, r.is_static))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_provides(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.provides
+                    .iter()
+                    .map(|p| (p.service.clone(), p.with.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn all_module_names(&self) -> Vec<String> {
         self.shared
             .classes
