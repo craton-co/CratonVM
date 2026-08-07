@@ -451,6 +451,65 @@ fn header_offset_contract_gc_flags_live_in_the_mark_words_top_byte() {
     );
 }
 
+/// The inline allocator must write the mark word on EVERY path, because that
+/// word is content now and not padding.
+///
+/// This is the regression guard for the defect that broke the Spring Boot suite
+/// on 2026-08-07: the mark-word store was folded into the `zero_elision` branch
+/// during the 24 -> 16 shrink, and `zero_elision` is default-ON. Every
+/// JIT-inline allocation then published an object wearing whatever the TLAB
+/// slot held as its `kind` / `element_type` / `gc_age` / `gc_flags` -- 178 of
+/// the first 184 suite classes died in JUnit discovery with
+/// `gen_heap::read_slot: corrupt Value cell`, which is what a stale
+/// `GC_FLAG_COMPACT` produces when a legacy tagged-`Value` object is read as
+/// bare compact pointers.
+///
+/// The test asserts on the SOURCE rather than on emitted bytes on purpose: what
+/// went wrong was structural (a store moved inside a conditional), and it is
+/// the structure that has to stay pinned. The elision flag is a process-wide
+/// `OnceLock`, so a byte-level test could only ever observe the default arm and
+/// would have passed just as happily with the bug in place.
+#[test]
+fn the_inline_allocator_writes_the_mark_word_unconditionally() {
+    let src = include_str!("objects.rs");
+    let start = src
+        .find("pub(super) fn emit_inline_tlab_new")
+        .expect("the inline TLAB allocator must still exist");
+    let body = &src[start..];
+
+    // Line-based, and deliberately simple: track a stack of open blocks and
+    // whether each was opened by a `zero_elision` test. If the mark-word store
+    // is reached while any such block is still open, the store is conditional.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut found = false;
+    for line in body.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        if code.contains("emit_mov_dword_mem_disp32_imm32")
+            && code.contains("MARK_WORD_OFFSET")
+        {
+            assert!(
+                !stack.iter().any(|gated| *gated),
+                "the mark-word store sits inside an `if !zero_elision` block.                  That flag is default-ON, so the store would not run for any                  inline allocation and the object would publish whatever the                  TLAB slot held as its kind, element_type, gc_age and                  gc_flags. That is the 2026-08-07 Spring Boot regression                  (`read_slot: corrupt Value cell` in 178 of 184 classes); the                  store must stay unconditional."
+            );
+            found = true;
+        }
+        let gated = code.contains("zero_elision");
+        for ch in code.chars() {
+            match ch {
+                '{' => stack.push(gated),
+                '}' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        if found && stack.is_empty() {
+            break;
+        }
+    }
+    assert!(found, "the inline allocator must zero the mark word");
+}
+
 /// The zeroing stores in `emit_inline_tlab_new` must cover exactly the
 /// header words that are not written with a real value, and every one of
 /// them must sit inside the header.
