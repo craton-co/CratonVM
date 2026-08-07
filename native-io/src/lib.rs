@@ -21342,9 +21342,15 @@ mod io_tests {
             .expect("CompletedFuture timed get must be registered");
 
         let mut ctx = MockNativeContext::new();
-        let future = match wrap_completed_future(&mut ctx, Value::Int(123))? {
-            Value::Object(Some(o)) => o,
-            other => panic!("expected future object, got {other:?}"),
+        // `?` here would need the test to return `Result`; it does not, so the
+        // file did not compile under `--all-targets` at all. Unwrap the
+        // `MethodCallFailed` explicitly instead: a failure is a test failure,
+        // and saying so keeps the diagnostic (which `?` would have discarded
+        // into an unused `Err` return anyway).
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123)) {
+            Ok(Value::Object(Some(o))) => o,
+            Ok(other) => panic!("expected future object, got {other:?}"),
+            Err(e) => panic!("wrap_completed_future failed: {e:?}"),
         };
 
         assert_eq!(
