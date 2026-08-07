@@ -4865,7 +4865,7 @@ impl GenerationalHeap {
                         // `< a < end_a`, so a full `ObjectHeader` lies within the arena;
                         // fields are read defensively before trusting the contents.
                         let h = unsafe { &*(h_addr as *const ObjectHeader) };
-                        if ObjectHeader::kind_tag((h.mark_word.load(Ordering::Relaxed))) == 0
+                        if ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                             && h.array_length() == 0
                             && (h.num_slots() as usize) > fld
                             && h.num_slots() <= (1 << 20)
