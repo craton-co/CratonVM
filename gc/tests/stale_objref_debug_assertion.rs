@@ -79,7 +79,7 @@ fn stale_native_objref_is_caught_after_evacuation() {
     // correctly-remapped references.
     assert_eq!(heap.get_field(fresh, 0).as_int(), Some(42));
     assert_eq!(heap.get_field(fresh, 1).as_long(), Some(100));
-    assert_eq!(heap.get_header(fresh).gc_age, 1);
+    assert_eq!(heap.get_header(fresh).gc_age(), 1);
 
     // The OLD `stale` local -- exactly the kind of raw ObjectRef a native
     // function would still be holding if it forgot to pin it -- must be

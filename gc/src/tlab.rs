@@ -1266,8 +1266,8 @@ mod tests {
         // The synthetic header at the old cursor describes an int[] that
         // covers the remaining tail exactly.
         let hdr = unsafe { &*(cursor_before as *const ObjectHeader) };
-        assert_eq!(hdr.kind, ObjectKind::Array);
-        assert_eq!(hdr.element_type, ArrayElementType::Int);
+        assert_eq!(hdr.kind(), ObjectKind::Array);
+        assert_eq!(hdr.element_type(), ArrayElementType::Int);
         assert_eq!(hdr.class_id, TLAB_FILLER_CLASS_ID);
         let total = HEADER_SIZE + (hdr.array_length() as usize) * 4;
         // total should equal tail_before (no padding waste because both ends 8-aligned).
@@ -1527,7 +1527,7 @@ mod tests {
                 // 8-aligned, and holds the filler header retire just wrote.
                 let hdr = unsafe { &*((base as usize + consumed) as *const ObjectHeader) };
                 assert_eq!(hdr.class_id, TLAB_FILLER_CLASS_ID, "consumed={consumed}");
-                assert_eq!(hdr.kind, ObjectKind::Array, "consumed={consumed}");
+                assert_eq!(hdr.kind(), ObjectKind::Array, "consumed={consumed}");
                 assert_eq!(
                     HEADER_SIZE + (hdr.array_length() as usize) * 4,
                     tail_before,

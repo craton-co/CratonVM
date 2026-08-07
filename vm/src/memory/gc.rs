@@ -1197,7 +1197,7 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
             break;
         }
         let hdr = unsafe { &*(ptr as *const ObjectHeader) };
-        if hdr.kind != ObjectKind::Object {
+        if hdr.kind() != ObjectKind::Object {
             continue;
         }
         let cid = hdr.class_id;
@@ -1311,7 +1311,7 @@ pub fn verify_heap_object_fields(
         }
         let hdr = unsafe { &*(ptr as *const ObjectHeader) };
         let r_cid = hdr.class_id;
-        if hdr.kind == ObjectKind::Object {
+        if hdr.kind() == ObjectKind::Object {
             let referrer = unsafe { ObjectRef::from_raw(ptr) };
             let nf = heap.num_fields(referrer);
             for i in 0..nf {
@@ -1331,7 +1331,7 @@ pub fn verify_heap_object_fields(
                     }
                 }
             }
-        } else if hdr.kind == ObjectKind::Array && hdr.element_type == ArrayElementType::Reference {
+        } else if hdr.kind() == ObjectKind::Array && hdr.element_type() == ArrayElementType::Reference {
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length() as usize;
             for i in 0..len {
@@ -1535,7 +1535,7 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, li, frame.pc, addr, h.kind, h.gc_flags,
+                            fi, cname, mname, li, frame.pc, addr, h.kind(), h.gc_flags(),
                         );
                     }
                 }
@@ -1591,7 +1591,7 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, si, frame.pc, addr, h.kind, h.gc_flags,
+                            fi, cname, mname, si, frame.pc, addr, h.kind(), h.gc_flags(),
                         );
                     }
                 }

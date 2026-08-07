@@ -159,8 +159,8 @@ fn make_narrow_string(value_ptr: i64, coder: u8, hash: i32) -> FakeObj {
     let narrow = narrow_oop::encode(value_ptr as u64);
     unsafe {
         std::ptr::copy_nonoverlapping(NARROW_STRING_CLASS_ID.to_le_bytes().as_ptr(), base, 4);
-        *base.add(cratonvm_types::OBJECT_KIND_OFFSET) = ObjectKind::Object as u8;
-        *base.add(cratonvm_types::GC_FLAGS_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+        *base.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET) = ObjectKind::Object as u8;
+        *base.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
         std::ptr::copy_nonoverlapping(
             4u32.to_le_bytes().as_ptr(),
             base.add(cratonvm_types::NUM_SLOTS_OFFSET),

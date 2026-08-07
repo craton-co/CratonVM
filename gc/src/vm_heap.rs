@@ -951,8 +951,8 @@ impl VmHeap {
     /// For non-array objects the returned value is meaningless.
     pub fn array_element_type(&self, obj: ObjectRef) -> Option<ArrayElementType> {
         let header = self.get_header(obj);
-        if header.kind == ObjectKind::Array {
-            Some(header.element_type)
+        if header.kind() == ObjectKind::Array {
+            Some(header.element_type())
         } else {
             None
         }

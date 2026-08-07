@@ -1118,7 +1118,7 @@ pub fn clear_class_layouts() {
 /// Decided per-object via the [`GC_FLAG_COMPACT`] header bit (set at alloc).
 #[inline]
 pub fn is_compact_object(header: &ObjectHeader) -> bool {
-    header.gc_flags & GC_FLAG_COMPACT != 0
+    header.gc_flags() & GC_FLAG_COMPACT != 0
 }
 
 /// The body size [`object_body_size`] returns whenever it cannot establish a
@@ -1280,7 +1280,7 @@ mod tests {
             0,
             4,
         );
-        header.gc_flags |= GC_FLAG_COMPACT;
+        header.add_gc_flags(GC_FLAG_COMPACT);
         assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
         assert_ne!(
             HEADER_SIZE + object_body_size(&header),

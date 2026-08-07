@@ -278,11 +278,27 @@ fn emit_wait_site_frames(thread_id: ThreadId) {
 /// or inflate.
 #[inline]
 pub fn try_thin_lock(header: &ObjectHeader, thread_id: u32) -> Result<(), u64> {
+    // This used to compare against the literal `types::MARK_NEUTRAL`. It cannot
+    // any more: since the `kind` / `element_type` / `gc_age` / `gc_flags`
+    // quartet moved into bits 48..61, an unlocked object's word is only zero
+    // when it is a plain, never-aged, unflagged object. An `int[]` carries kind
+    // and element_type bits, so a literal compare would fail forever and EVERY
+    // array lock would inflate a monitor.
+    //
+    // Masking the quartet out restores the intended test -- "unlocked, and no
+    // identity hash installed" -- and preserves the property the literal was
+    // silently providing: a hashed word has non-zero bits OUTSIDE the quartet,
+    // so it still loses here and the caller still inflates, which is HotSpot's
+    // rule that a hashed object cannot be thin-locked.
+    let cur = header.mark_word.load(Ordering::Relaxed);
+    if cur & !types::MARK_QUARTET_MASK != types::MARK_NEUTRAL {
+        return Err(cur);
+    }
     header
         .mark_word
         .compare_exchange(
-            types::MARK_NEUTRAL,
-            ObjectHeader::make_thin_locked(thread_id, 0),
+            cur,
+            ObjectHeader::make_thin_locked(cur, thread_id, 0),
             Ordering::Acquire,
             Ordering::Relaxed,
         )
@@ -311,7 +327,7 @@ pub fn try_thin_recursive_lock(header: &ObjectHeader, thread_id: u32) -> Result<
         if recursion == u8::MAX {
             return Err(cur); // overflow → must inflate
         }
-        let new = ObjectHeader::make_thin_locked(thread_id, recursion + 1);
+        let new = ObjectHeader::make_thin_locked(cur, thread_id, recursion + 1);
         if header
             .mark_word
             .compare_exchange(cur, new, Ordering::Acquire, Ordering::Relaxed)
@@ -349,7 +365,7 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
             (types::MARK_NEUTRAL, None)
         } else {
             (
-                ObjectHeader::make_thin_locked(thread_id, recursion - 1),
+                ObjectHeader::make_thin_locked(cur, thread_id, recursion - 1),
                 Some(recursion - 1),
             )
         };
@@ -1264,7 +1280,9 @@ impl MonitorTable {
         if displaced != 0 {
             monitor.displace_hash(displaced);
         }
-        let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(monitor) as usize);
+        // `expected` is the word being replaced, so the quartet rides across
+        // inflation the same way the displaced hash does.
+        let new_mark = ObjectHeader::make_inflated(expected, Arc::as_ptr(monitor) as usize);
         if header
             .mark_word
             .compare_exchange(expected, new_mark, Ordering::Release, Ordering::Relaxed)

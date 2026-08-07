@@ -4026,7 +4026,7 @@ impl Compiler {
                         self.emit_mov_r32_mem_disp32(
                             RCX,
                             RAX,
-                            cratonvm_types::GC_FLAGS_OFFSET as i32,
+                            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                         );
                         self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                         let legacy_patch = self.emit_jcc_rel32_patch(0x84); // JZ → legacy
@@ -4227,7 +4227,7 @@ impl Compiler {
                             self.emit_mov_r32_mem_disp32(
                                 RCX,
                                 RAX,
-                                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                             );
                             self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                             slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
@@ -4505,7 +4505,7 @@ impl Compiler {
                                 self.emit_mov_r32_mem_disp32(
                                     RCX,
                                     RAX,
-                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                    cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                                 );
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
@@ -4514,7 +4514,7 @@ impl Compiler {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
-                                        cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                                     );
                                     self.emit_and_r64_imm8(RCX, 1);
                                     bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
@@ -4595,7 +4595,7 @@ impl Compiler {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
-                                        cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                                     );
                                     self.emit_and_r64_imm8(RCX, 1);
                                     bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
@@ -9014,7 +9014,7 @@ impl Compiler {
                                 // two; anything that is not a plain object goes
                                 // to the miss path, which resolves on the real
                                 // receiver.
-                                //   CMP BYTE [recv_reg + OBJECT_KIND_OFFSET], Object
+                                //   CMP BYTE [recv_reg + KIND_TAGS_BYTE_OFFSET], Object
                                 // mod=01 (disp8) / reg=/7 (CMP imm8) / rm=recv.
                                 // `recv_reg & 7 != 4` is already asserted below
                                 // (mod=00 would need a SIB there), and mod=01
@@ -9025,7 +9025,7 @@ impl Compiler {
                                 self.buf.emit(&[
                                     0x80,
                                     0x78 | (recv_reg & 7),
-                                    cratonvm_types::OBJECT_KIND_OFFSET as u8,
+                                    cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
                                     cratonvm_types::ObjectKind::Object as u8,
                                 ]);
                                 //   JNE rel32 → .miss
@@ -9376,11 +9376,11 @@ impl Compiler {
                                 // two; anything that is not a plain object goes
                                 // to the miss path, which resolves on the real
                                 // receiver.
-                                //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], Object
+                                //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], Object
                                 self.buf.emit(&[
                                     0x80,
                                     0x78,
-                                    cratonvm_types::OBJECT_KIND_OFFSET as u8,
+                                    cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
                                     cratonvm_types::ObjectKind::Object as u8,
                                 ]);
                                 //   JNE rel32 → .miss

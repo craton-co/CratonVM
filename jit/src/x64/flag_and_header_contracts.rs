@@ -432,20 +432,20 @@ fn header_size_fits_signed_disp8_and_is_qword_aligned() {
 }
 
 /// `emit_inline_tlab_new` writes `GC_FLAG_COMPACT` by storing a whole dword
-/// at `OBJECT_KIND_OFFSET` with the flag byte shifted into place. That
+/// at `KIND_TAGS_BYTE_OFFSET` with the flag byte shifted into place. That
 /// shift is only correct while `gc_flags` is byte 3 of that dword.
 #[test]
-fn header_offset_contract_gc_flags_is_byte3_of_kind_dword() {
+fn header_offset_contract_gc_flags_live_in_the_mark_words_top_byte() {
     assert_eq!(
-        cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET,
-        3,
+        cratonvm_types::GC_FLAGS_BYTE_OFFSET,
+        cratonvm_types::MARK_WORD_OFFSET + 7,
         "the inline-TLAB compact-flag store shifts GC_FLAG_COMPACT by \
-         8*(GC_FLAGS_OFFSET - OBJECT_KIND_OFFSET); if gc_flags moves out of the top byte of \
+         8*(GC_FLAGS_BYTE_OFFSET - KIND_TAGS_BYTE_OFFSET); if gc_flags moves out of the top byte of \
          that dword the store lands on kind/element_type/gc_age instead"
     );
     assert!(
-        cratonvm_types::GC_FLAGS_OFFSET > cratonvm_types::OBJECT_KIND_OFFSET
-            && cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET < 4,
+        cratonvm_types::GC_FLAGS_BYTE_OFFSET > cratonvm_types::KIND_TAGS_BYTE_OFFSET
+            && cratonvm_types::GC_FLAGS_BYTE_OFFSET - cratonvm_types::KIND_TAGS_BYTE_OFFSET < 4,
         "gc_flags must live inside the dword the emitter overwrites, or the single dword \
          store silently drops the compact bit"
     );
@@ -458,7 +458,7 @@ fn header_offset_contract_gc_flags_is_byte3_of_kind_dword() {
 fn inline_tlab_header_writes_stay_inside_the_header() {
     for (name, off, width) in [
         ("class_id", 0usize, 4usize),
-        ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
+        ("gc_flags byte", cratonvm_types::GC_FLAGS_BYTE_OFFSET, 1),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
         // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
         // the mark word; there is no separate field, and the emitter no longer
@@ -707,11 +707,25 @@ fn locals_past_the_bitset_never_receive_a_register_home() {
 fn header_offset_emission_site_inventory_matches_the_doc() {
     let src = backend_sources();
     // Needles assembled at runtime so this test's own text is not counted.
-    let cases: [(&str, &str, usize); 4] = [
-        ("HEADER_SIZE", " as u8", 35),
+    // `ARRAY_DATA_OFFSET` joined the inventory when array element addressing
+    // was split from the object body base -- the two were the same integer
+    // until `HEADER_SIZE` reached 16, so the split had to be recorded here or
+    // the map would under-count exactly the sites the shrink moves.
+    // The first row fell 35 -> 22: thirteen of those emissions were array
+    // element addressing and now name the array-data constant instead, which is
+    // exactly where the new 13 in the fifth row comes from. The totals moved
+    // between rows rather than shrinking, which is the point of the split.
+    //
+    // (Deliberately phrased without the literal needles -- this test counts its
+    // own source text, so spelling one out here inflates the very number it is
+    // checking. That cost one round.)
+    let cases: [(&str, &str, usize); 6] = [
+        ("HEADER_SIZE", " as u8", 22),
         ("HEADER_SIZE", " as i32", 13),
         ("ARRAY_LENGTH_OFFSET", " as u8", 23),
         ("ARRAY_LENGTH_OFFSET", " as i32", 5),
+        ("ARRAY_DATA_OFFSET", " as u8", 13),
+        ("ARRAY_DATA_OFFSET", " as i32", 0),
     ];
     for (base, suffix, expected) in cases {
         let needle = format!("{base}{suffix}");
@@ -832,11 +846,16 @@ fn inline_tlab_total_size_stays_on_the_eight_byte_grid() {
 fn every_header_field_is_dword_addressable() {
     for (name, off, width) in [
         ("class_id", 0usize, 4usize),
-        ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
-        // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
-        // the mark word; there is no separate field, and the emitter no longer
-        // writes one.
+        // `forwarding_ptr`, `identity_hash_code` and then the whole
+        // kind/element_type/gc_age/gc_flags quartet all folded into the mark
+        // word; none of them is a separately addressed field any more.
+        //
+        // `gc_flags` is deliberately NOT listed: it is a byte inside that word,
+        // and it is reachable because `emit_mov_byte_mem_disp32_imm8` was added
+        // for it. This list is about fields the emitter reaches with its
+        // dword-immediate store, so a byte field does not belong in it -- and
+        // `inline_tlab_header_writes_stay_inside_the_header` covers its bounds.
         ("mark_word", cratonvm_types::MARK_WORD_OFFSET, 8),
     ] {
         assert_eq!(

@@ -51,9 +51,8 @@ use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    ARRAY_ELEMENT_TYPE_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    HEADER_SIZE, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::{class_layout_for_fields, is_compact_object, CompactLayout};
 use std::sync::Arc;
@@ -612,12 +611,12 @@ impl Heap {
 
     /// Get the kind (Object or Array) of a heap allocation.
     pub fn kind_of(&self, obj_ref: ObjectRef) -> ObjectKind {
-        self.get_header(obj_ref).kind
+        self.get_header(obj_ref).kind()
     }
 
     /// Get the element type of an array object.
     pub fn element_type_of(&self, obj_ref: ObjectRef) -> ArrayElementType {
-        self.get_header(obj_ref).element_type
+        self.get_header(obj_ref).element_type()
     }
 
     /// Get the identity hash code of a heap object.
@@ -805,7 +804,7 @@ impl Heap {
     /// Panics if the object is not an array.
     pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
         let header = self.get_header(obj_ref);
-        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         header.array_length() as usize
     }
 
@@ -814,7 +813,7 @@ impl Heap {
     /// Returns `Err` with the index if out of bounds.
     pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
-        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
@@ -825,7 +824,7 @@ impl Heap {
         // allocated data area of size `array_data_size(length, et)`.
         unsafe {
             let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
-            Ok(read_prim_element(base, index, header.element_type))
+            Ok(read_prim_element(base, index, header.element_type()))
         }
     }
 
@@ -843,21 +842,21 @@ impl Heap {
         index: usize,
     ) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
-        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
         let value = unsafe {
             let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
-            read_prim_element(base, index, header.element_type)
+            read_prim_element(base, index, header.element_type())
         };
-        if header.element_type == ArrayElementType::Reference {
+        if header.element_type() == ArrayElementType::Reference {
             if let Value::Object(Some(obj)) = value {
                 // The stored word is treated as an `ObjectRef`, but a stale or
                 // garbage non-zero element could point anywhere. Validate it
                 // against this heap's semi-space arenas before dereferencing
-                // it as an `ObjectHeader`; otherwise a wild read can crash or
+                // it as an `ObjectHeader`); otherwise a wild read can crash or
                 // mis-classify garbage. If the pointer does not look like a
                 // live heap object, skip the unboxing and return the value.
                 if self.is_valid_heap_object(obj) {
@@ -930,7 +929,7 @@ impl Heap {
         value: Value,
     ) -> Result<(), i32> {
         let header = self.get_header(obj_ref);
-        assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
@@ -942,10 +941,10 @@ impl Heap {
             // Compact ref arrays only store 8-byte pointers. If a non-Object
             // value is written (e.g. Value::Int from a native collection),
             // auto-box it into a 1-field wrapper object.
-            if header.element_type == ArrayElementType::Reference {
+            if header.element_type() == ArrayElementType::Reference {
                 match value {
                     Value::Object(_) => {
-                        write_prim_element(base, index, header.element_type, value);
+                        write_prim_element(base, index, header.element_type(), value);
                     }
                     _ => {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
@@ -953,13 +952,13 @@ impl Heap {
                         write_prim_element(
                             base,
                             index,
-                            header.element_type,
+                            header.element_type(),
                             Value::Object(Some(wrapper)),
                         );
                     }
                 }
             } else {
-                write_prim_element(base, index, header.element_type, value);
+                write_prim_element(base, index, header.element_type(), value);
             }
         }
         Ok(())
@@ -1878,7 +1877,7 @@ mod tests {
 
         let header = heap.get_header(obj);
         assert_eq!(header.class_id, class_id);
-        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.kind(), ObjectKind::Object);
         assert_eq!(header.num_slots(), 3);
 
         // The identity hash is installed LAZILY, on first request, into the
@@ -1966,8 +1965,8 @@ mod tests {
 
         let header = heap.get_header(arr);
         assert_eq!(header.class_id, class_id);
-        assert_eq!(header.kind, ObjectKind::Array);
-        assert_eq!(header.element_type, ArrayElementType::Int);
+        assert_eq!(header.kind(), ObjectKind::Array);
+        assert_eq!(header.element_type(), ArrayElementType::Int);
         assert_eq!(header.array_length(), 5);
         assert_eq!(heap.array_length(arr), 5);
     }
@@ -2216,7 +2215,7 @@ mod tests {
         let obj = result.unwrap();
         let header = heap.get_header(obj);
         assert_eq!(header.class_id, ClassId::new(7));
-        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.kind(), ObjectKind::Object);
         assert_eq!(header.num_slots(), 3);
     }
 
@@ -2245,8 +2244,8 @@ mod tests {
         assert_eq!(heap.array_length(arr), 10);
         let header = heap.get_header(arr);
         assert_eq!(header.class_id, ClassId::new(5));
-        assert_eq!(header.kind, ObjectKind::Array);
-        assert_eq!(header.element_type, ArrayElementType::Int);
+        assert_eq!(header.kind(), ObjectKind::Array);
+        assert_eq!(header.element_type(), ArrayElementType::Int);
     }
 
     #[test]

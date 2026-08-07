@@ -3741,7 +3741,7 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         None
     };
     let shape = if compact_body.is_some() {
-        *(raw_ptr.add(cratonvm_types::GC_FLAGS_OFFSET) as *mut u8) =
+        *(raw_ptr.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *mut u8) =
             cratonvm_types::GC_FLAG_COMPACT;
         num_fields as u32
     } else {
@@ -5112,7 +5112,7 @@ unsafe fn jit_compact_field_slot(
         return None;
     }
     // GC_FLAG_COMPACT is in the exported gc_flags byte.
-    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_OFFSET));
+    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_BYTE_OFFSET));
     if gc_flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
         return None;
     }
@@ -7280,9 +7280,11 @@ pub unsafe extern "C" fn jit_throw_aioobe(
             let num_slots =
                 std::ptr::read_unaligned(base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
             let gc_age =
-                std::ptr::read_unaligned(base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8);
+                cratonvm_types::ObjectHeader::gc_age_of(std::ptr::read_unaligned(
+                    base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64,
+                ));
             let gc_flags =
-                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8);
+                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
             // Forwarding folded into the mark word (32 -> 24 shrink), so this
             // diagnostic reports the whole word: its 2-bit state distinguishes
             // NEUTRAL / THIN_LOCKED / INFLATED / FORWARDED, which is strictly

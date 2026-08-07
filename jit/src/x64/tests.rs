@@ -4279,11 +4279,11 @@ fn calls_to(compiled: &CompiledMethod, target: usize) -> usize {
 fn fake_compact_young_object() -> Box<[u64; 8]> {
     let mut o = Box::new([0u64; 8]);
     // SAFETY: `o` is 64 bytes and 8-byte aligned (a `[u64; 8]`); both
-    // writes land inside it — `GC_FLAGS_OFFSET` is 7 and
+    // writes land inside it — `GC_FLAGS_BYTE_OFFSET` is 7 and
     // `NUM_SLOTS_OFFSET` is 12, and the reference cell is [32, 40).
     unsafe {
         let p = o.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
-        *p.add(cratonvm_types::GC_FLAGS_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
         std::ptr::write_unaligned(
             p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
             4u32,
@@ -4509,7 +4509,7 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
     // `gc_flags` header byte.
     unsafe {
         let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
-        *p.add(cratonvm_types::GC_FLAGS_OFFSET) =
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
             cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_OLD_GEN;
     }
     CALLS.store(0, Ordering::SeqCst);

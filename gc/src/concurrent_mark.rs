@@ -862,8 +862,8 @@ impl ConcurrentMarker {
         }
         let header = unsafe { &*header_ptr };
 
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 // Reference array: compact 8-byte pointer per element.
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
@@ -1061,14 +1061,20 @@ impl ConcurrentMarkHeaderSnapshot {
                 class_id: std::ptr::addr_of!((*header).class_id)
                     .read_unaligned()
                     .as_u32(),
-                kind_tag: std::ptr::addr_of!((*header).kind)
-                    .cast::<u8>()
-                    .read_unaligned(),
-                element_tag: std::ptr::addr_of!((*header).element_type)
-                    .cast::<u8>()
-                    .read_unaligned(),
+                // Raw tags, still without forming a typed enum: they now
+                // come out of the mark word rather than out of two header
+                // bytes, but the reason for taking them raw is unchanged --
+                // this snapshots possibly-corrupt memory, and an
+                // out-of-range discriminant must survive to be rejected
+                // rather than being UB at the point of the read.
+                kind_tag: ObjectHeader::kind_tag(
+                    (*header).mark_word.load(Ordering::Relaxed),
+                ),
+                element_tag: ObjectHeader::element_type_tag(
+                    (*header).mark_word.load(Ordering::Relaxed),
+                ),
                 shape: std::ptr::addr_of!((*header).shape).read_unaligned(),
-                gc_flags: std::ptr::addr_of!((*header).gc_flags).read_unaligned(),
+                gc_flags: (*header).gc_flags(),
             }
         }
     }
@@ -1140,11 +1146,10 @@ mod tests {
         unsafe {
             let header = &mut *(ptr as *mut ObjectHeader);
             header.class_id = ClassId::new(1);
-            header.kind = ObjectKind::Object;
-            header.element_type = ArrayElementType::Byte;
+            header.set_shape_tags(ObjectKind::Object, ArrayElementType::Byte);
             header.set_num_slots(num_slots);
-            header.gc_age = 0;
-            header.gc_flags = 0x01; // GC_FLAG_OLD_GEN
+            header.set_gc_age(0);
+            header.set_gc_flags(0x01); // GC_FLAG_OLD_GEN
         }
         (og, ptr)
     }
@@ -1199,9 +1204,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(2);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         // Allocate object B (1 slot, no refs)
@@ -1210,9 +1215,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         // A.field[0] = ref to B
@@ -1242,18 +1247,18 @@ mod tests {
         unsafe {
             let h = &mut *(live_ptr as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         let dead_ptr = og.alloc(size, 8).unwrap();
         unsafe {
             let h = &mut *(dead_ptr as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         let used_before = og.used();
@@ -1291,10 +1296,9 @@ mod tests {
             unsafe {
                 let h = &mut *(ptr as *mut ObjectHeader);
                 h.class_id = ClassId::new(cid);
-                h.kind = ObjectKind::Object;
-                h.element_type = ArrayElementType::Byte;
+                h.set_shape_tags(ObjectKind::Object, ArrayElementType::Byte);
                 h.set_num_slots(1);
-                h.gc_flags = 0x01; // GC_FLAG_OLD_GEN
+                h.set_gc_flags(0x01); // GC_FLAG_OLD_GEN
             }
         };
 
@@ -1360,9 +1364,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         // Object B (initially referenced by A)
@@ -1370,9 +1374,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         // A.field[0] = B initially
@@ -1428,9 +1432,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         // Object B — only ever reachable via the SATB log of an overwrite.
@@ -1438,9 +1442,9 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         let marker = ConcurrentMarker::new(og.base_ptr() as usize, og.capacity());
@@ -1506,9 +1510,9 @@ mod tests {
                 unsafe {
                     let h = &mut *(p as *mut ObjectHeader);
                     h.class_id = ClassId::new(i + 1);
-                    h.kind = ObjectKind::Object;
+                    h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
                     h.set_num_slots(1);
-                    h.gc_flags = 0x01;
+                    h.set_gc_flags(0x01);
                 }
                 p
             })
@@ -1704,9 +1708,9 @@ mod tests {
             unsafe {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(i as u32 + 1);
-                h.kind = ObjectKind::Object;
+                h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
                 h.set_num_slots(1);
-                h.gc_flags = 0x01;
+                h.set_gc_flags(0x01);
             }
             ptrs.push(p);
         }
@@ -1744,9 +1748,9 @@ mod tests {
             unsafe {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(id);
-                h.kind = ObjectKind::Object;
+                h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
                 h.set_num_slots(1);
-                h.gc_flags = 0x01;
+                h.set_gc_flags(0x01);
             }
         }
 
@@ -1811,9 +1815,9 @@ mod tests {
             unsafe {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(i + 1);
-                h.kind = ObjectKind::Object;
+                h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
                 h.set_num_slots(1);
-                h.gc_flags = 0x01;
+                h.set_gc_flags(0x01);
             }
         }
 
@@ -1849,18 +1853,18 @@ mod tests {
         unsafe {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
         // Object B — the only legitimate target A's slot can point to.
         let ptr_b = og.alloc(size, 8).unwrap();
         unsafe {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         let marker = Arc::new(ConcurrentMarker::new(og.base_ptr() as usize, og.capacity()));
@@ -1928,9 +1932,9 @@ mod tests {
         unsafe {
             let h = &mut *(live as *mut ObjectHeader);
             h.class_id = ClassId::new(7);
-            h.kind = ObjectKind::Object;
+            h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
             h.set_num_slots(1);
-            h.gc_flags = 0x01;
+            h.set_gc_flags(0x01);
         }
 
         let satb = Arc::new(SatbQueue::new());

@@ -5404,7 +5404,7 @@ mod root_snapshot_screen_tests {
         // SAFETY: `addr` is a live object header in a mapped arena; the kind
         // tag is a single byte at a fixed in-bounds header offset.
         unsafe {
-            *((addr + cratonvm_types::OBJECT_KIND_OFFSET) as *mut u8) = 0xEE;
+            *((addr + cratonvm_types::KIND_TAGS_BYTE_OFFSET) as *mut u8) = 0xEE;
         }
         assert!(
             heap.is_object_address(addr).is_none(),

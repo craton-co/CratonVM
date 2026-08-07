@@ -765,11 +765,12 @@ impl RegionHeap {
                             // Manually mirror non-atomic header fields to
                             // avoid bulk-copying the AtomicU64 mark_word.
                             (*dst_hdr).class_id = (*src_hdr).class_id;
-                            (*dst_hdr).kind = (*src_hdr).kind;
-                            (*dst_hdr).element_type = (*src_hdr).element_type;
                             (*dst_hdr).shape = (*src_hdr).shape;
-                            (*dst_hdr).gc_age = (*src_hdr).gc_age;
-                            (*dst_hdr).gc_flags = (*src_hdr).gc_flags;
+                            // `kind`, `element_type`, `gc_age` and `gc_flags`
+                            // are no longer separate fields -- they live in the
+                            // mark word, so the store below carries all four.
+                            // Mirroring them here would be dead work that the
+                            // mark-word store immediately overwrites.
                             // Forwarding rides in `mark_word` since the 32 -> 24
                             // header shrink, so re-publishing that word below
                             // carries it too — there is no separate field left.
@@ -982,8 +983,8 @@ impl RegionHeap {
 /// This does not mask genuine bugs silently — the corruption is logged — but it
 /// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length() as usize, header.element_type) {
+    if header.kind() == ObjectKind::Array {
+        match array_data_size(header.array_length() as usize, header.element_type()) {
             Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
@@ -993,7 +994,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
                     "region: implausible array_length {} (element_type={:?}) in object header — \
                      treating as corrupt; caller will skip/stop the walk",
                     header.array_length(),
-                    header.element_type,
+                    header.element_type(),
                 );
                 0
             }
@@ -1023,7 +1024,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 /// per-region iteration when they observe this.
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
-    matches!(header.kind, ObjectKind::HumongousFiller)
+    matches!(header.kind(), ObjectKind::HumongousFiller)
 }
 
 /// Scan an object's reference fields, returning addresses of referenced objects.
@@ -1031,8 +1032,8 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
     let mut refs = Vec::new();
     let data_start = obj_addr + HEADER_SIZE;
 
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
             let len = header.array_length() as usize;
             for i in 0..len {
                 let slot_addr = data_start + i * 8;
@@ -1067,8 +1068,8 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
 fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashMap<usize, usize>) {
     let data_start = obj_addr + HEADER_SIZE;
 
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
             let len = header.array_length() as usize;
             for i in 0..len {
                 let slot_addr = data_start + i * 8;
@@ -1295,7 +1296,7 @@ mod tests {
         unsafe {
             let header = &mut *(ptr as *mut ObjectHeader);
             header.set_num_slots(2);
-            header.kind = ObjectKind::Object;
+            header.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
         }
 
         let eden_region = heap.region_index_for(obj_addr).unwrap();

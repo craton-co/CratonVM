@@ -2134,7 +2134,7 @@ impl GarbageCollector for ZgcRealHeap {
                         // Re-fetch base: alloc_object cannot move existing
                         // objects (non-moving heap), so `base` is still valid,
                         // but reads are clearer with the explicit comment.
-                        write_prim_element(base, index, element_type, Value::Object(Some(wrapper)));
+                        write_prim_element(base, index, element_type, Value::Object(Some(wrapper));
                     }
                 }
             } else {
