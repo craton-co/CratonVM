@@ -13775,11 +13775,50 @@ pub fn register_essential_natives_with_shims(
     // and fail to load standalone (`libjvm.so: cannot open shared object
     // file`) since CratonVM is not that architecture. Try a real load first
     // (some names may resolve, e.g. genuine third-party JNI libs on the
-    // classpath), but never let a failure here be fatal — the callers that
-    // matter get their functionality from CratonVM's own natives regardless
-    // of whether the underlying .so actually loaded, exactly like the
-    // adjacent `findBuiltinLib` stub's "not a built-in, but proceed anyway"
-    // contract.
+    // classpath), then fall back to the SAME allowlist `System.loadLibrary`
+    // uses — and, outside it, report the failure the JDK specifies.
+    //
+    // WAS a fabricated success: this body computed a handle, dropped the error,
+    // and returned `Int(1)` UNCONDITIONALLY. `System.loadLibrary` was fixed to
+    // throw `UnsatisfiedLinkError` for names HotSpot cannot load (`sunec`,
+    // `jvm`, and `jsig` on Windows), but that fix governs only the intercepted
+    // `java/lang/System` native. Any caller reaching library loading through
+    // real `java.lang.ClassLoader` / `jdk.internal.loader.NativeLibraries`
+    // bytecode instead landed here and still got "loaded" for every name in the
+    // universe — the same divergence by another road.
+    //
+    // MEASURED CONTRACT (JDK 25.0.3, `javap -p -c` plus `lib/src.zip`):
+    //
+    //   private static native boolean load(NativeLibraryImpl impl, String name,
+    //                                      boolean isBuiltin,
+    //                                      boolean throwExceptionIfFail);
+    //   "Return true if the given library is successfully loaded. If the given
+    //    library cannot be loaded for any reason, if throwExceptionIfFail is
+    //    false, then this method returns false; otherwise, UnsatisfiedLinkError
+    //    will be thrown."
+    //
+    //   * The ONLY caller is `NativeLibraryImpl.open()`, which returns the
+    //     boolean straight through. `NativeLibraries.loadLibrary(Class, String,
+    //     boolean)` maps `false` to a null `NativeLibrary`, and `findFromPaths`
+    //     then simply tries the NEXT directory of `sun.boot.library.path` /
+    //     `java.library.path`. So `false` means "not in this directory", not
+    //     "broken" — getting `false` and the throw backwards would turn a
+    //     silent wrong answer into a spurious crash.
+    //   * `throwExceptionIfFail` is `NativeLibraryImpl.throwExceptionIfFail()` =
+    //     `loadLibraryOnlyIfPresent || new File(name).exists()`, and
+    //     `ClassLoaderHelper.loadLibraryOnlyIfPresent()` returns `true` on every
+    //     platform except macOS. So in practice the argument arrives `true` and
+    //     a failure is a THROW. It is still read from the argument, never
+    //     assumed: on macOS the `false` return is the live path.
+    //   * `name` is NOT a bare library name. `loadLibrary(Class, File)` passes
+    //     `file.getCanonicalPath()`, so this native sees an absolute path such
+    //     as `<java.home>\bin\zip.dll` or `<java.home>/lib/libzip.so`. Policy
+    //     questions are asked about the bare name, so `bare_native_library_name`
+    //     decodes it back out.
+    //   * The "already loaded in another classloader" `UnsatisfiedLinkError` is
+    //     raised by `NativeLibraries.loadLibrary` BYTECODE (the static
+    //     `loadedLibraryNames` set) before this native is reached, so it is not
+    //     this body's job and must not be duplicated here.
     registry.register_with_kind(
         "jdk/internal/loader/NativeLibraries",
         "load",
@@ -13793,15 +13832,104 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
+            let throw_if_fail = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
             crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            let handle = match ctx.load_native_library(&name) {
-                Ok(lib_index) => lib_index + 1,
-                Err(_) => 0,
-            };
-            if let Some(impl_obj) = impl_obj {
-                ctx.set_field_by_name(impl_obj, "handle", Value::Long(handle));
+            // 1. A genuine load of a genuine library that really is on the
+            //    path — a third-party JNI `.so`/`.dll` shipped beside an app.
+            //    This is the only branch that yields a usable handle for
+            //    `NativeLibrary.findEntry0`, so it is tried first.
+            if let Ok(lib_index) = ctx.load_native_library(&name) {
+                if let Some(impl_obj) = impl_obj {
+                    // +1 offset, the encoding `findEntry0`/`unload` (panama.rs
+                    // and below) decode with `- 1`; 0 is the JDK's own
+                    // "not loaded" sentinel, which `open()` asserts on entry.
+                    ctx.set_field_by_name(impl_obj, "handle", Value::Long(lib_index + 1));
+                }
+                return Ok(Some(Value::Int(1)));
             }
-            Ok(Some(Value::Int(1)))
+            // 2. A JDK-image library whose ENTIRE Java-visible native surface
+            //    this VM supplies from Rust. These never `dlopen` here — they
+            //    are linked against `libjvm`/`jvm.dll`, which this process is
+            //    not — yet a COLD `loadLibrary` of them succeeds on HotSpot, so
+            //    reporting failure would be a fresh divergence in the opposite
+            //    direction. Same allowlist as `System.loadLibrary`
+            //    (`lang_system::is_vm_provided_jdk_library`), deliberately not a
+            //    second copy: two lists would drift.
+            //
+            //    `zip` is added on THIS path only. It is off the
+            //    `System.loadLibrary` list because of the dynamic
+            //    "already loaded by the boot loader" rule, and on this path that
+            //    rule is enforced above us by the JDK's own `loadedLibraryNames`
+            //    bytecode — so the question left for this native is the cold
+            //    one, whose measured answer is LOADS.
+            //
+            //    The handle stays 0: nothing was opened, and `findEntry0`
+            //    decodes 0 to index -1 and answers "symbol not found", which is
+            //    correct — every entry point these libraries exist to provide is
+            //    already registered in this process as a Rust native.
+            let bare = bare_native_library_name(&name);
+            if crate::lang_system::is_vm_provided_jdk_library(&bare) || bare == "zip" {
+                return Ok(Some(Value::Int(1)));
+            }
+            // 3. Everything else: this VM has no implementation of the library
+            //    and no shared object was opened. Report it, in the shape the
+            //    argument asks for. Callers like Netty's `NativeLibraryLoader`
+            //    and Tomcat's `AprLifecycleListener` are WRITTEN to catch this
+            //    and take a pure-Java fallback; the old fabricated success left
+            //    them believing a native backend was armed.
+            //
+            //    REVERT KNOB. This is a behaviour change for every such caller
+            //    in every suite, so it gets one switch back to the old answer:
+            //    `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK=1` restores the
+            //    unconditional success. It is a bisect aid, not a fix — if a
+            //    suite needs it, the real repair is one line in
+            //    `lang_system::is_vm_provided_jdk_library`, which is where the
+            //    "this VM really does supply that library's natives" claim
+            //    belongs and where `System.loadLibrary` reads it too.
+            if std::env::var("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK").as_deref() == Ok("1") {
+                return Ok(Some(Value::Int(1)));
+            }
+            if throw_if_fail {
+                return Err(RuntimeError::UnsatisfiedLinkError {
+                    message: format!("Can't load library: {name}"),
+                }
+                .into());
+            }
+            Ok(Some(Value::Int(0)))
+        },
+        NativeKind::Bridge,
+    );
+    // `NativeLibraries.unload(String name, boolean isBuiltin, long handle)` —
+    // the companion of `load`, reached from `NativeLibraryImpl.close()` through
+    // the `Unloader` that `loadLibrary` registers with the Cleaner for every
+    // library loaded by a NON-system class loader.
+    //
+    // It was registered nowhere. An ACC_NATIVE method with no implementation
+    // throws `UnsatisfiedLinkError`, and this one runs on a Cleaner thread where
+    // that throw is swallowed — so the library was silently never released. That
+    // was harmless only because `load` never really opened anything; now that
+    // branch 1 above can report a REAL load with a real handle, the release path
+    // is live and has to work.
+    //
+    // Logical unload, exactly like `RawNativeLibraries.unload0` (panama.rs): the
+    // VM's library table is an append-only `Vec` whose index IS the handle, so
+    // the entry is tombstoned rather than unmapped — staying mapped is the safe
+    // direction, since cached `findEntry0` addresses would otherwise dangle.
+    // Real `unload` returns void and reports nothing, so a refusal is ignored.
+    registry.register_with_kind(
+        "jdk/internal/loader/NativeLibraries",
+        "unload",
+        "(Ljava/lang/String;ZJ)V",
+        |ctx, args| {
+            let handle = match args.get(2) {
+                Some(Value::Long(n)) => *n,
+                Some(Value::Int(n)) => *n as i64,
+                _ => 0,
+            };
+            // Undo `load`'s +1. Handle 0 — the "allowlisted, but nothing was
+            // really opened" case — decodes to -1, which is refused.
+            let _unloaded = ctx.unload_native_library(handle - 1);
+            Ok(None)
         },
         NativeKind::Bridge,
     );
@@ -24258,6 +24386,73 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
         format!("lib{}.dylib", name)
     } else {
         format!("lib{}.so", name)
+    }
+}
+
+/// The inverse of [`platform_lib_name`]: recover the bare library name from the
+/// absolute path the JDK's own loader hands to `NativeLibraries.load`.
+///
+/// `NativeLibraries.load` never receives `"zip"`. `NativeLibraries.loadLibrary(
+/// Class, File)` passes `file.getCanonicalPath()`, so the native sees
+/// `<java.home>\bin\zip.dll` on Windows and `<java.home>/lib/libzip.so` on
+/// Linux. Every policy question about a library — the
+/// `lang_system::is_vm_provided_jdk_library` allowlist above all — is phrased in
+/// bare names, so the path has to be decoded before it can be asked.
+///
+/// Decoding is by SPELLING, not by host platform: a path can be handed to this
+/// VM from a JDK image for another OS (cross-checked corpora, a copied
+/// `java.library.path`), and the answer must depend only on the string. A file
+/// name with no recognised platform suffix comes back unchanged, which is the
+/// conservative answer — it simply misses the allowlist and is reported as the
+/// failure it is.
+pub(crate) fn bare_native_library_name(path: &str) -> String {
+    let file = path.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(path);
+    // Windows: `zip.dll`. `System.mapLibraryName` applies no `lib` prefix on
+    // this platform, so a leading `lib` there is part of the name and stays.
+    let ext_at = file.rfind('.').unwrap_or(file.len());
+    if file[ext_at..].eq_ignore_ascii_case(".dll") {
+        return file[..ext_at].to_string();
+    }
+    // Unix / macOS: `libzip.so`, `libzip.dylib`.
+    for ext in [".so", ".dylib"] {
+        if let Some(stem) = file.strip_suffix(ext) {
+            return stem.strip_prefix("lib").unwrap_or(stem).to_string();
+        }
+    }
+    file.to_string()
+}
+
+#[cfg(test)]
+mod bare_native_library_name_tests {
+    use super::bare_native_library_name;
+
+    /// The paths `NativeLibraries.load` actually receives, decoded back to the
+    /// bare names the allowlist is written in. Both spellings must decode on
+    /// either host, so no `cfg` here.
+    #[test]
+    fn decodes_the_canonical_paths_the_jdk_loader_passes() {
+        for (path, bare) in [
+            (r"C:\Program Files\jdk-25\bin\zip.dll", "zip"),
+            (r"C:\Program Files\jdk-25\bin\sunmscapi.dll", "sunmscapi"),
+            (r"C:\jdk\bin\SUNEC.DLL", "SUNEC"),
+            ("/opt/jdk-25/lib/libzip.so", "zip"),
+            ("/opt/jdk-25/lib/libmanagement_ext.so", "management_ext"),
+            ("/opt/jdk-25/lib/libjsig.dylib", "jsig"),
+            // Already bare, and a name with no platform suffix: returned as-is
+            // so it misses the allowlist and is reported as a failure.
+            ("net", "net"),
+            ("/opt/app/native/libfoo.so.1", "libfoo.so.1"),
+        ] {
+            assert_eq!(bare_native_library_name(path), bare, "decoding {path}");
+        }
+    }
+
+    /// A leading `lib` is a Unix spelling artefact only. On the Windows
+    /// spelling it is part of the name and must survive.
+    #[test]
+    fn windows_spelling_keeps_a_leading_lib() {
+        assert_eq!(bare_native_library_name(r"C:\app\libcrypto.dll"), "libcrypto");
+        assert_eq!(bare_native_library_name("/app/libcrypto.so"), "crypto");
     }
 }
 

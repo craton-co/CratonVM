@@ -321,7 +321,10 @@ fn descriptor_to_class_name(desc: &str) -> Cow<'static, str> {
 }
 
 /// Read a Class mirror and extract its JVM descriptor character(s).
-fn mirror_to_descriptor(ctx: &dyn NativeContext, mirror: ObjectRef) -> Cow<'static, str> {
+pub(crate) fn mirror_to_descriptor(
+    ctx: &dyn NativeContext,
+    mirror: ObjectRef,
+) -> Cow<'static, str> {
     match resolve_class_name_robust(ctx, mirror) {
         Some(name) => class_name_to_descriptor(&name),
         None => Cow::Borrowed(DESC_OBJECT),

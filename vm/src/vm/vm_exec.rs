@@ -1588,6 +1588,33 @@ pub fn unbox_poly_return_checked(
     descriptor: &str,
     method_name: &str,
 ) -> Result<Option<Value>, MethodCallFailed> {
+    // W6-1 — VARHANDLE WRONG-TYPE ACCESS. The `VarHandle` accessors are
+    // registered with an erased `Object` return and BOX their primitive
+    // result, and `unbox_poly_return` passes `b'L' | b'['` through untouched.
+    // So `String s = (String) intVarHandle.get(h)` yields a live `Integer`
+    // typed as `String` — and javac emits NO `checkcast` for a
+    // signature-polymorphic call (the cast lives in the call site's own
+    // symbolic descriptor), so nothing downstream catches it. HotSpot raises
+    // WrongMethodTypeException from the access-mode type check. Fire set: a
+    // boxed primitive (the same closed eight-class table the invokeExact rule
+    // uses) reaching a NON-`Object` reference return — i.e. exactly the values
+    // that are already a silent wrong answer today.
+    if let Some(actual) = varhandle_reference_return_mismatch(shared, value, descriptor, method_name)
+    {
+        let message = format!(
+            "VarHandle access site {descriptor} requires a reference of its declared return \
+             type, but the access produced {}",
+            actual.replace('/', ".")
+        );
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/invoke/WrongMethodTypeException",
+            Some(&message),
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
     if method_name != "invokeExact" || !mh_strict_invokeexact() {
         return Ok(unbox_poly_return(shared, value, descriptor));
     }
@@ -1630,6 +1657,59 @@ pub fn unbox_poly_return_checked(
         // answer with an uncatchable internal abort.
         Err(_) => Ok(unbox_poly_return(shared, value, descriptor)),
     }
+}
+
+/// The `VarHandle` access modes that RETURN the accessed variable, paired with
+/// a call site whose descriptor names a reference type that the produced box
+/// cannot be. `None` means "no complaint"; `Some(cls)` names what was produced.
+fn varhandle_reference_return_mismatch(
+    shared: &SharedVm,
+    value: Option<Value>,
+    descriptor: &str,
+    method_name: &str,
+) -> Option<String> {
+    if !matches!(
+        method_name,
+        "get"
+            | "getVolatile"
+            | "getOpaque"
+            | "getAcquire"
+            | "getPlain"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+    ) {
+        return None;
+    }
+    if crate::jit::return_type(descriptor) != b'L' {
+        return None;
+    }
+    let want = descriptor.rsplit(')').next()?;
+    let want = want.strip_prefix('L')?.strip_suffix(';')?;
+    // An erased `Object` call site legitimately receives a box.
+    if want == "java/lang/Object" {
+        return None;
+    }
+    let Some(Value::Object(Some(obj))) = value else {
+        return None;
+    };
+    let actual = {
+        let cid = shared.mem.heap.class_id_of(obj);
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cid).map(|c| c.name.to_string())?
+    };
+    // Only a boxed primitive complains — a synthetic stand-in, an un-nameable
+    // fabricated class or a genuine reference value keeps today's behaviour.
+    if actual == want || !PRIMITIVE_WRAPPER_CLASSES.contains(&actual.as_str()) {
+        return None;
+    }
+    Some(actual)
 }
 
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
@@ -22292,6 +22372,21 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // VARHANDLE.VARTYPE/COORDINATETYPES: both are concrete JDK
+                        // bytecode whose body reads `this.vform` and walks a
+                        // `VarForm`/`MethodType` chain CratonVM never builds — on a
+                        // CratonVM VarHandle slot 0 (`vform`) holds an `Int` ClassId,
+                        // so the real body cannot execute at all. The registered
+                        // natives (`register_p59_varhandle`) answer from the two
+                        // `Class` mirrors the factory stamped at slots 4/5, and
+                        // REFUSE with UnsupportedOperationException when a handle
+                        // carries none. regression-suite RJdkHandles:244-245.
+                        || (class_name == "java/lang/invoke/VarHandle"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("varType", "()Ljava/lang/Class;")
+                                    | ("coordinateTypes", "()Ljava/util/List;")
+                            ))
                         // METHODHANDLE.ASCOLLECTOR/ASSPREADER: unimplemented (real
                         // bytecode → species); Groovy's dispatch chains use
                         // `asCollector(Object[].class, n)` / `asSpreader(...)`. Pin
