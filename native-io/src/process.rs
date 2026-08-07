@@ -1704,20 +1704,84 @@ fn handle_for_pid(pid: i64) -> Option<i64> {
 /// Is a pid we did not spawn still alive?
 ///
 /// `/proc/<pid>` is present for a zombie too, which is the answer we want: a
-/// process that has exited but not been reaped is still a process. Only
-/// meaningful on Linux; elsewhere there is no portable probe, and answering a
-/// confident `false` would make `ProcessHandle.of(pid).isAlive()` claim a
-/// running process had exited, so the optimistic answer stands.
+/// process that has exited but not been reaped is still a process.
+#[cfg(target_os = "linux")]
 fn foreign_pid_is_alive(pid: i64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    if pid <= 0 {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Is a pid we did not spawn still alive? — Win32.
+///
+/// The unconditional `true` this replaces was a fabricated success: it made
+/// `ProcessHandleImpl.isAlive0` answer "alive, start time unknown" (0) for
+/// EVERY pid, so `ProcessHandle.of(anything)` was always present. The JDK
+/// specifies an empty `Optional` for a pid that names no process, and
+/// `regression-suite/src/RJdkProcess.java:155`
+/// (`ProcessHandle.of(Long.MAX_VALUE).isEmpty()`) measures exactly that —
+/// HotSpot 25 passes it, the unconditional `true` could not.
+///
+/// `OpenProcess` + `GetExitCodeProcess` is what HotSpot's own
+/// `ProcessHandleImpl_md.c` does on Windows. Two documented edges are handled
+/// deliberately rather than left to chance:
+///   * `ERROR_ACCESS_DENIED` from `OpenProcess` means the process EXISTS and we
+///     merely lack rights to it (a service, or another user's session), so it is
+///     reported alive — the opposite answer would be the same fabrication in the
+///     other direction.
+///   * A process whose real exit code happens to be `STILL_ACTIVE` (259) reads
+///     as alive until its handle is closed. That is a Win32 API-level ambiguity
+///     with no cheaper resolution, and it is the same one HotSpot inherits.
+#[cfg(windows)]
+fn foreign_pid_is_alive(pid: i64) -> bool {
+    use std::ffi::c_void;
+    // Signatures are IDENTICAL to `pipe.rs`'s `CloseHandle` declaration so the
+    // `clashing_extern_declarations` deny-lint does not fire.
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut u32) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
     }
+
+    // A Windows process id is a DWORD. A value outside that range cannot name a
+    // process, and answering that without a syscall keeps the `Long.MAX_VALUE`
+    // probe cheap.
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return false;
+    }
+    // SAFETY: `OpenProcess` takes only scalars; `GetExitCodeProcess` writes one
+    // `u32` through a pointer to a live local; the handle is closed on every
+    // path out. A null handle is the documented failure return and is never
+    // passed on.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+        }
+        let mut code: u32 = 0;
+        let queried = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        queried && code == STILL_ACTIVE
+    }
+}
+
+/// Is a pid we did not spawn still alive? — platforms with no probe wired up.
+///
+/// There is no portable liveness primitive here, and answering a confident
+/// `false` would make `ProcessHandle.of(pid).isAlive()` claim a running process
+/// had exited, so the optimistic answer stands for any pid that could name a
+/// process at all. Values outside the `pid_t` range cannot, and are refused.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn foreign_pid_is_alive(pid: i64) -> bool {
+    pid > 0 && pid <= i32::MAX as i64
 }
 
 /// `java.lang.ProcessHandleImpl.getCurrentPid0() -> long`
