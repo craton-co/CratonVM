@@ -1878,7 +1878,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         "()Ljava/util/List;",
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
-            let mk_provider = |ctx: &mut dyn NativeContext, scheme: &str| {
+            let mk_provider = |ctx: &mut dyn NativeContext,
+                               scheme: &str|
+             -> Result<ObjectRef, MethodCallFailed> {
                 let p = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
                 // Pin across the create_string below — a moving young GC there
                 // would relocate the fresh provider (native stale-local family).

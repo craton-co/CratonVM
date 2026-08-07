@@ -794,7 +794,9 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// it), the innermost captured Java frame is the caller.
 fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let frames = ctx.capture_stack_trace(0);
-    let cid = frames.last()?.class_id?;
+    let Some(cid) = frames.last()?.class_id else {
+        return Ok(None);
+    };
     let mirror = ctx.get_class_mirror(cid);
     let loader = match crate::lang_class::native_class_get_class_loader(
         ctx,

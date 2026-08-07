@@ -9004,7 +9004,9 @@ pub fn build_method_type_from_descriptor(
         return Ok(None);
     }
 
-    let close = desc.find(')')?;
+    let Some(close) = desc.find(')') else {
+        return Ok(None);
+    };
     let params_str = &desc[1..close];
     let ret_str = &desc[close + 1..];
 

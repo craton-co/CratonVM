@@ -917,7 +917,7 @@ fn cl_real_load_class(
     if let Some(result) =
         crate::classloader::invoke_single_load_class_override(ctx, this, class_name_obj)
     {
-        return Ok(result);
+        return result;
     }
 
     // Honor a `loadClass(String,boolean)` override (override-first loaders).
@@ -1291,7 +1291,7 @@ fn cl_real_load_class_base_rooted(
         && !bootstrap_appended
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-            return Ok(result);
+            return result;
         }
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
@@ -1419,7 +1419,7 @@ fn cl_real_load_class_base_rooted(
     // not always expose their inherited URLClassLoader identity here.
     if !bootstrap_appended {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-            return Ok(result);
+            return result;
         }
     }
 

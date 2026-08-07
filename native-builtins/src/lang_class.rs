@@ -9234,7 +9234,9 @@ fn wf_shim_synth_main_method(
     if name != "main" {
         return Ok(None);
     }
-    let pt_arr = param_types_arr?;
+    let Some(pt_arr) = param_types_arr else {
+        return Ok(None);
+    };
     if ctx.array_length(pt_arr) != 1 {
         return Ok(None);
     }

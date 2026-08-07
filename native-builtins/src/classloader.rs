@@ -7187,7 +7187,7 @@ pub(crate) fn ucl_try_define_local_class(
         cvar: &'a std::sync::Condvar,
     }
     impl<'a> Drop for DefineInProgressGuard<'a> {
-        fn drop(&mut self) -> Result<(), MethodCallFailed> {
+        fn drop(&mut self) {
             let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *in_progress = false;
             self.cvar.notify_all();
@@ -7229,7 +7229,7 @@ pub(crate) fn ucl_try_define_local_class(
     Ok(());
     Ok(());
     Ok(());
-    Ok(())
+    ()
 }
     }
     let _define_in_progress_guard = DefineInProgressGuard {

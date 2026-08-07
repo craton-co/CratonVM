@@ -2711,7 +2711,9 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectR
     // `gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
     // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
     // allocates ~76 MB buffers until the heap is gone.
-    let arr = ctx.try_new_array(ArrayElementType::Byte, cap)?;
+    let Some(arr) = ctx.try_new_array(ArrayElementType::Byte, cap) else {
+        return Ok(None);
+    };
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.

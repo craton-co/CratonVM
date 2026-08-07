@@ -301,13 +301,13 @@ pub(crate) fn selected_context_trust_root_ders() -> Vec<Vec<u8>> {
 pub(crate) fn context_trust_root_ders(
     ctx: &mut dyn NativeContext,
     context: ObjectRef,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     let key = ctx_obj_key(ctx, context);
-    ctx_trust_roots_table()
+    Ok(ctx_trust_roots_table()
         .lock()
-        .get(&key)
+        .get(&key?)
         .map(|roots| roots.root_ders.clone())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 #[cfg(unix)]
@@ -350,8 +350,8 @@ fn ctx_trust_managers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u64 {
-    crate::gc_stable_lock_key(ctx, obj) as u64
+fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, MethodCallFailed> {
+    Ok(crate::gc_stable_lock_key(ctx, obj)? as u64)
 }
 
 /// `SSLContext.init(km, tms, random)` calls this with the raw `tms` array
@@ -364,8 +364,8 @@ pub(crate) fn attach_trust_managers_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     tms_array: Option<ObjectRef>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let mut list = Vec::new();
     if let Some(arr) = tms_array {
         let len = ctx.array_length(arr);
@@ -428,13 +428,13 @@ pub(crate) fn attach_trust_managers_to_ctx(
         ctx.unpin_native_roots(base);
     }
     let mut table = ctx_trust_managers_table().lock();
-    if list.is_empty() {
+    if list.is_empty() Ok({
         table.remove(&key);
         ctx_accepted_issuers_table().lock().remove(&key);
-    } else {
+    }) else Ok({
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
-    }
+    })
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -544,12 +544,12 @@ fn capture_accepted_issuer_dns(
 pub(crate) fn ctx_trust_managers_key_if_attached(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
-) -> Option<u64> {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<Option<u64>, MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     if ctx_trust_managers_table().lock().contains_key(&key) {
-        Some(key)
+        Ok(Some(key))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -576,8 +576,8 @@ pub(crate) fn attach_key_managers_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     kms_array: Option<ObjectRef>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let mut list = Vec::new();
     if let Some(arr) = kms_array {
         let len = ctx.array_length(arr);
@@ -596,11 +596,11 @@ pub(crate) fn attach_key_managers_to_ctx(
         );
     }
     let mut table = ctx_key_managers_table().lock();
-    if list.is_empty() {
+    if list.is_empty() Ok({
         table.remove(&key);
-    } else {
+    }) else Ok({
         table.insert(key, list);
-    }
+    })
 }
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
@@ -626,8 +626,8 @@ pub(crate) fn attach_pending_identity_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     resolved_km_identity: Option<(String, String)>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let pending = take_pending_km_identity();
     if let Some(ident) = resolved_km_identity.or(pending) {
         if crate::nbflags().dbg_tls_auth {
@@ -645,7 +645,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
             key
         );
     }
-    if let Some(roots) = take_pending_tm_trust_roots() {
+    if let Some(roots) = take_pending_tm_trust_roots() Ok({
         if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
@@ -654,20 +654,20 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_trust_roots_table().lock().insert(key, roots);
-    } else if crate::nbflags().dbg_tls_auth_ok {
+    }) else if crate::nbflags().dbg_tls_auth_ok Ok({
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
             key
         );
-    }
+    })
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
 pub(crate) fn ctx_identity(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
-) -> Option<(String, String)> {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<Option<(String, String)>, MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
@@ -677,7 +677,7 @@ pub(crate) fn ctx_identity(
         );
     }
     set_selected_context_trust_roots(trust_roots);
-    ctx_identity_table().lock().get(&key).cloned()
+    Ok(ctx_identity_table().lock().get(&key).cloned())
 }
 
 /// Convert a private-key DER (PKCS#8, PKCS#1, or SEC1) + DER cert chain (leaf
@@ -797,7 +797,7 @@ pub(crate) fn client_config_for_ssl_context_with_ciphers(
     ctx_obj: ObjectRef,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
-    let key = ctx_obj_key(ctx, ctx_obj);
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let identity = ctx_identity(ctx, ctx_obj);
     build_engine_client_config_with_identity_ciphers(
         &["http/1.1"],
@@ -961,8 +961,8 @@ pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
     *huc_default_km_ctx_key_slot().lock()
 }
 
-fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_managers = ctx_trust_managers_table()
         .lock()
         .get(&key)
@@ -982,8 +982,8 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 /// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
 /// back to `client_identity`/no-client-auth instead of spuriously trying (and
 /// failing) to consult an empty resolver.
-pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
@@ -998,8 +998,8 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
 /// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
 /// roots even when it returns no client certificate, and every context needs a
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
-pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let ident = ctx_identity(ctx, ctx_obj);
+pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+    let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
     capture_huc_key_managers_ctx_key(ctx, ctx_obj);
     capture_huc_trust_managers_ctx_key(ctx, ctx_obj);
@@ -3781,13 +3781,13 @@ pub(crate) fn stash_pending_layered_socket(
     // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
     // narrowing is known too.
     let use_java_trust_manager = java_tm_key.is_some();
-    let client_identity = ctx_identity(ctx, ssl_context);
+    let client_identity = ctx_identity(ctx, ssl_context)?;
     // Server identity: same resolution `rustls_server_handshake_over_stream`'s
     // former caller used (this SSLContext's own identity, else the
     // process-wide runtime-configured one) — resolved here too so SERVER mode
     // never needs to touch `ssl_context` again.
     let server_identity = ctx_identity(ctx, ssl_context)
-        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)));
+        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)))?;
     let mut pending = pending_layered_sockets().lock();
     let mut id = 1i32;
     while pending.contains_key(&id) {
@@ -4412,7 +4412,7 @@ fn create_ssl_server_socket(
         .and_then(|value| match value {
             Value::Object(Some(factory)) if ctx.object_num_fields(*factory) > 0 => {
                 match ctx.get_field(*factory, 0) {
-                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context),
+                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context)?,
                     _ => None,
                 }
             }
@@ -10799,8 +10799,8 @@ pub(crate) fn set_engine_trust_ctx_key(
     ctx: &mut dyn NativeContext,
     engine_obj: ObjectRef,
     ctx_obj: ObjectRef,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Ok(Result<(), MethodCallFailed>) {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let id = engine_id_or_alloc(ctx, engine_obj);
     if crate::nbflags().dbg_tls_auth_ok {
         let has_entry = ctx_trust_managers_table().lock().contains_key(&key);

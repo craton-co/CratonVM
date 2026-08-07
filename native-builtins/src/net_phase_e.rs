@@ -4708,7 +4708,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
         }
         let avail = re1_with_raw_stream(sid, |stream| {
             if !re1_socket_read_ready(stream) {
-                return Ok(0i32);
+                return 0i32;
             }
             // The kernel says readable, so this `peek` returns immediately
             // and does not consume the bytes. Capped at the scratch buffer:
@@ -4716,13 +4716,13 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
             // over-reporting is not.
             let mut buf = [0u8; 8192];
             match stream.peek(&mut buf) {
-                Ok(n) => Ok(n as i32),
+                Ok(n) => n as i32,
                 // Readiness raced away (a concurrent reader drained the
                 // queue). A snapshot estimate of 0 is correct again.
-                Err(_) => Ok(0),
+                Err(_) => 0,
             }
         })
-        .unwrap_or(Ok(0))?;
+        .unwrap_or(0);
         Ok(Some(Value::Int(avail)))
     });
 
@@ -5280,7 +5280,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) -> Result<(), Method
                 cratonvm_native_api::plain_server_socket::channel_backed_accept()
             {
                 if let Some(result) = accept_on_channel(ctx, this, s.so_timeout) {
-                    return Ok(result);
+                    return result;
                 }
             }
         }
@@ -11971,7 +11971,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // its roots before the next context creation can replace the
                 // thread-local selection used by the rustls engine.
                 crate::t27_tls::set_engine_trust_roots_override(ctx, eng);
-                if let Some((cert, key)) = identity {
+                if let Ok(Some((cert, key))) = identity {
                     crate::t27_tls::set_engine_identity_override(ctx, eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
@@ -12151,7 +12151,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // object ends up at field 0.
             let client_ident = match ctx.get_field(this_factory, 0) {
                 Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx),
-                _ => None,
+                _ => Ok(None),
             }
             .or_else(crate::t27_tls::huc_default_client_identity);
             #[cfg(unix)]
@@ -14208,7 +14208,9 @@ fn re8_find_interface(
             Ok(None)
         };
     }
-    let host = hosts.into_iter().find(select)?;
+    let Some(host) = hosts.into_iter().find(select) else {
+        return Ok(None);
+    };
     Ok(re8_make_interface(ctx, &host)?)
 }
 

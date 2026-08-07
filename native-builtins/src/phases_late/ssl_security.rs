@@ -735,7 +735,7 @@ pub(crate) fn p68_factory_max_protocol(
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Vec<u8>> {
+pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
@@ -745,16 +745,16 @@ pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value
                 .cloned()
                 .unwrap_or_default();
             if !direct.is_empty() {
-                return direct;
+                return Ok(direct);
             }
             if ctx.object_num_fields(*this) > 0 {
                 if let Value::Object(Some(sslctx)) = ctx.get_field(*this, 0) {
-                    return crate::t27_tls::context_trust_root_ders(ctx, sslctx);
+                    return Ok(crate::t27_tls::context_trust_root_ders(ctx, sslctx)?);
                 }
             }
-            Vec::new()
+            Ok(Vec::new())
         }
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -771,17 +771,17 @@ pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value
 /// field 0 (user-defined factory subclass — see `net_phase_e`'s
 /// `createSocket` comment) simply misses the table → `None` → unchanged
 /// default verification.
-pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<u64> {
+pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<u64>, MethodCallFailed> {
     let Some(Value::Object(Some(factory))) = args.first() else {
-        return None;
+        return Ok(None);
     };
     if ctx.object_num_fields(*factory) == 0 {
-        return None;
+        return Ok(None);
     }
     let Value::Object(Some(sslctx)) = ctx.get_field(*factory, 0) else {
-        return None;
+        return Ok(None);
     };
-    crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
+    Ok(crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)?)
 }
 
 /// FIX (h2-testnetutils-cipherfactory-createsocket-cast): staging table for
@@ -2073,10 +2073,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         // socket, which would deadlock on a held non-reentrant mutex.
         let handles: Vec<usize> = match handshake_listeners().lock().get(&socket_key) {
             Some(entry) => entry.iter().map(|(_, handle)| *handle).collect(),
-            None => return,
+            None => return Ok(()),
         };
         if handles.is_empty() {
-            return;
+            return Ok(());
         }
         let pin = ctx.pin_native_root(socket);
         let socket = ctx.read_native_pin(pin, socket);
@@ -2107,7 +2107,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
             Ok(Some(Value::Object(Some(event)))) => event,
             _ => {
                 ctx.unpin_native_roots(pin);
-                return;
+                return Ok(());
             }
         };
         let event_pin = ctx.pin_native_root(event);
@@ -2138,7 +2138,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
         let handles = match handshake_listeners().lock().remove(&socket_key) {
             Some(entry) => entry,
-            None => return,
+            None => return Ok(()),
         };
         for (_, handle) in handles {
             ctx.remove_global_root(handle);

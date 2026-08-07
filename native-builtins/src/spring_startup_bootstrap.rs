@@ -2275,7 +2275,7 @@ fn walk_imports_recursive(
             }
             match ctx.class_id_by_name(class_name) {
                 Some(c) => c,
-                None => return,
+                None => return Ok(()),
             }
         }
     };
@@ -2283,13 +2283,13 @@ fn walk_imports_recursive(
     let anns = ctx.class_annotations(cid);
     let import_ann = match anns.iter().find(|a| a.type_descriptor == IMPORT_DESC) {
         Some(a) => a.clone(),
-        None => return,
+        None => return Ok(()),
     };
 
     // @Import.value() is a Class[] — find the "value" element.
     let value_array = match import_ann.elements.iter().find(|(name, _)| name == "value") {
         Some((_, v)) => v.clone(),
-        None => return,
+        None => return Ok(()),
     };
 
     let entries = match value_array {

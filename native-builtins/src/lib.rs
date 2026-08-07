@@ -11276,7 +11276,7 @@ pub fn register_essential_natives_with_shims(
         fn write_bytes(ctx: &mut dyn NativeContext, args: &[Value], bytes: &[u8]) -> Result<(), MethodCallFailed> {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
-                _ => return,
+                _ => return Ok(()),
             };
             let off = match args.get(1) {
                 Some(Value::Int(i)) => *i as usize,
