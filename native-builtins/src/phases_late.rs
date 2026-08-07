@@ -3238,9 +3238,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
                 ctx.set_field(url_obj, 5, Value::Object(Some(full)));
                 ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
             }
-            let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-            ctx.set_field(enm, 0, Value::Object(Some(arr)));
-            ctx.set_field(enm, 1, Value::Int(0));
+            let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
             Ok(Some(Value::Object(Some(enm))))
         },
     );

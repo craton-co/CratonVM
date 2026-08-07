@@ -2702,10 +2702,8 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    let itr = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     if crate::nbflags().dbg_sbload {
@@ -2828,10 +2826,8 @@ pub(crate) fn p59_jar_file_entries(
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
-    let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
-    ctx.set_field(enumeration, 1, Value::Int(0));
+    let enumeration = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     Ok(Some(Value::Object(Some(enumeration))))
 }
