@@ -1322,6 +1322,29 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let pb = "java/lang/ProcessBuilder";
     let proc = "java/lang/Process";
 
+    // `SyntheticStub`, stated for the whole `java.lang.ProcessBuilder` block
+    // that follows — constructors, accessors, `redirectErrorStream`,
+    // `inheritIO`, `environment` and `start`.
+    //
+    // Every one of them shadows ordinary bytecode: the image adjudication reads
+    // `acc_native: false, has_code: true` for all eleven, so §1.4 gives the real
+    // method precedence and none of them is a bridge by §1.5's definition. They
+    // are here because synthetic-JDK mode fabricates `ProcessBuilder` outright
+    // and needs a body for each.
+    //
+    // The tag is what makes `--jdk-only` coherent, and the cluster has to move
+    // together. Restating `start()` alone leaves `<init>([Ljava/lang/String;)V`
+    // in place, which writes the raw `String[]` into the `command` field; the
+    // JDK's own `start()` then reaches `command.toArray(...)` on an array and
+    // dies with `AbstractMethodError: java/util/List.toArray has no Code
+    // attribute`. Measured, not predicted — that is precisely what the first
+    // build with only `start` restated did.
+    //
+    // Compatible mode is unchanged: these registrations survive there and the
+    // VM keeps answering ProcessBuilder itself.
+    let __pb_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+
     // --- ProcessBuilder constructors ---
     // Write to BOTH the indexed slot (synthetic-mode `PB_FIELD_COMMAND`)
     // and the real-JDK `command` field by name, so any JDK bytecode that
@@ -1381,6 +1404,13 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     });
 
     // ProcessBuilder.start() — real process execution via std::process::Command
+    //
+    // `SyntheticStub`, stated, for the same reason as the `native-io` copy that
+    // supersedes this one: `start()` is ordinary bytecode on the image, so §1.4
+    // gives the real method precedence and a shadow of it is not a bridge.
+    // Stating it here matters even though this registration loses the slot —
+    // strict mode drops registrations as they are made, so if only the winner
+    // were restated this one would simply inherit the slot and keep fabricating.
     r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // FIX (finding 5): this was an UNCONDITIONAL stderr print on every
@@ -1677,6 +1707,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(map))))
     });
 
+    r.set_category(__pb_cat);
+
     // redirectInput/Output/Error(File) are DELIBERATELY NOT REGISTERED.
     //
     // Each real overload is a one-liner that delegates to the `Redirect`
@@ -1872,6 +1904,15 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // registry with that receiver class, not `java/lang/Process`, so mirror the
     // Process surface needed by WildFly's launcher checks.
     let synthetic_proc = "cratonvm/synthetic/Process";
+    // `SyntheticStub`, stated for the whole block below. This class is minted
+    // by the VM and appears on no image, so §1.5's "what an `ACC_NATIVE` method
+    // binds to" cannot describe these registrations — there is no image method
+    // to bind to. `--jdk-only` must not reach a fabricated class (§5), and the
+    // `Bridge` tag these used to carry was precisely what kept them reachable
+    // there. `native-io::process` supersedes most of them and is restated the
+    // same way.
+    let __synthetic_proc_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(synthetic_proc, "waitFor", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
@@ -1973,6 +2014,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(os))))
         },
     );
+    r.set_category(__synthetic_proc_cat);
 
     // ProcessHandle stub
     r.register(

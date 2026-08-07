@@ -13292,13 +13292,48 @@ fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     let _bis_dropped_overrides = "java/io/BufferedInputStream";
 
     // BufferedOutputStream
+    //
+    // The two constructors are `SyntheticStub`, stated; the read/write/flush
+    // natives below stay on the ambient category. The note above about BIS
+    // ends "if a future regression appears for those streams we should drop
+    // them too rather than adding more layout-coupled hacks" — this is that
+    // regression, and this is that drop, scoped to the constructors.
+    //
+    // `java.lang.ProcessImpl` builds the child's stdin as
+    // `new ProcessPipeOutputStream(fd)` -> `super(new FileOutputStream(...))`
+    // -> `BufferedOutputStream(OutputStream)`. These shims set `out` and stop;
+    // the real constructor also runs `super(out)`, and `FilterOutputStream`'s
+    // constructor is where `private final Object closeLock = new Object()`
+    // lives. Skipping it leaves `closeLock` null, and `FilterOutputStream
+    // .close()` opens with `synchronized (closeLock)` — so the FIRST
+    // `Process.destroy()` in `--jdk-only` died with
+    //
+    //   NullPointerException: Cannot enter synchronized block because
+    //                         "this.closeLock" is null
+    //
+    // out of `ProcessImpl.destroy`, whose own `try { stdin.close(); } catch
+    // (IOException ignored)` cannot catch an NPE. Measured on the first build
+    // that let the real `ProcessImpl` run.
+    //
+    // Restated, strict mode drops both and the real constructor chain runs:
+    // `out`, `buf`, `maxBufSize`, `closed` and `closeLock` all get their real
+    // values, and the surviving write/flush natives resolve `out`/`buf`/`count`
+    // by NAME (see `bos_slots`), so they read the real layout unchanged.
+    // Compatible mode keeps the shims and is untouched.
     let bos = "java/io/BufferedOutputStream";
-    registry.register(bos, "<init>", "(Ljava/io/OutputStream;)V", native_bos_init);
-    registry.register(
+    registry.register_with_kind(
+        bos,
+        "<init>",
+        "(Ljava/io/OutputStream;)V",
+        native_bos_init,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
+    registry.register_with_kind(
         bos,
         "<init>",
         "(Ljava/io/OutputStream;I)V",
         native_bos_init_size,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register(bos, "write", "(I)V", native_bos_write);
     registry.register(bos, "write", "([BII)V", native_bos_write_bulk);
