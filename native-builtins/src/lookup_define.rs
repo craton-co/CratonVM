@@ -414,10 +414,17 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // class's NEST (JEP 371). The correct nest-host name is the lookup
     // class's *own* nest-host attribute when the lookup is itself a
     // nested class, OR the lookup class's name when the lookup IS its
-    // own nest host. Without NESTMATE, leave `nest_host_class_name`
-    // unset so the class file's NestHost attribute (if any) — or
-    // self-nest — applies via the resolution chain in
-    // `class_manager.rs:1675-1678`.
+    // own nest host.
+    //
+    // W3-2: without NESTMATE we leave `nest_host_class_name` unset, and
+    // `None` here means SELF-NEST, not "fall back to the class file's
+    // NestHost attribute". Those bytes routinely carry one — javac emits
+    // `NestHost` for every nested class, and re-defining an
+    // already-compiled nested class as a hidden class is the normal way to
+    // reach this path — but the caller did not ask to join that nest.
+    // `class_manager::hidden_class_drops_class_file_nest_host` enforces the
+    // distinction for every producer of `hidden: true`, so this stays a
+    // plain `None`.
     let lookup_name = lookup_class_name(ctx, this_lookup);
     let nest_host_class_name = if nestmate {
         resolve_lookup_nest_host(ctx, this_lookup, lookup_name.clone())
@@ -486,10 +493,69 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // WP8.11.5 helpers — ClassOption[] parsing and nest-host resolution.
 // ---------------------------------------------------------------------------
 
+/// `MethodHandles.Lookup.ClassOption.NESTMATE.flag` — JEP 371's
+/// `NESTMATE_CLASS`. Kept in sync with `classloader.rs`'s
+/// `DEFINE_CLASS0_FLAG_NESTMATE` (that one is private to its module).
+const CLASS_OPTION_FLAG_NESTMATE: i32 = 0x01;
+
+/// Is this `MethodHandles$Lookup$ClassOption` the `NESTMATE` constant?
+///
+/// # Two layouts, and why reading slot 0 is not enough
+///
+/// Under `synthetic-jdk` a `ClassOption` is a bare synthetic mirror whose
+/// field 0 holds the enum ORDINAL directly (`NESTMATE = 0`, `STRONG = 1`) —
+/// the convention `classloader.rs::lk_define_hidden_class` documents.
+///
+/// Under `--real-jdk` the array elements are REAL JDK enum constants, and
+/// this native is deliberately registered for that mode too
+/// (`reflect_annotations.rs`, so the real `Lookup.defineClass` bytecode does
+/// not descend into `defineClass1` with a 0-length byte view). A real
+/// constant is a `java.lang.Enum` subclass instance, so its slot 0 is
+/// `Enum.name` — a `String` reference — with `ordinal` at 1, `hash` at 2 and
+/// `ClassOption.flag` only at 3 (`javap -p java.lang.Enum` on JDK 25).
+/// Reading slot 0 as an `i32` therefore never matched, `nestmate` was always
+/// `false`, and `nest_host_class_name` was left `None` for BOTH arms.
+///
+/// That silence was invisible because it cancelled out: with no explicit nest
+/// host, `class_manager` fell back to the class file's own `NestHost`
+/// attribute, which for the `RJdkHidden$Payload` bytes happens to be exactly
+/// the answer the NESTMATE arm wanted. `RJdkHidden.java:101` passed for the
+/// wrong reason and `:151` failed for the right one — the two are one bug,
+/// and fixing only the `class_manager` half would have moved the failure
+/// backwards onto `:101`.
+///
+/// Each step below decides only on POSITIVE evidence and otherwise falls
+/// through, so an unrecognised shape degrades to the historical behaviour
+/// rather than guessing. In particular a by-name read of an ABSENT field
+/// answers `Int(0)`, which is why the flag step requires a non-zero value:
+/// both real constants have one (`NESTMATE = 0x1`, `STRONG = 0x4`).
+fn class_option_is_nestmate(ctx: &mut dyn NativeContext, opt: ObjectRef) -> bool {
+    // 1. Real-JDK layout, primary witness: the enum constant's own name.
+    if let Value::Object(Some(name_ref)) = ctx.get_field_by_name(opt, "name") {
+        if let Some(name) = ctx.read_string(name_ref) {
+            if name == "NESTMATE" {
+                return true;
+            }
+            if name == "STRONG" {
+                return false;
+            }
+        }
+    }
+    // 2. Real-JDK layout, second witness: `ClassOption.flag` is the JEP 371
+    //    bit itself, so this also survives a rename of the constant.
+    if let Value::Int(flag) = ctx.get_field_by_name(opt, "flag") {
+        if flag != 0 {
+            return (flag & CLASS_OPTION_FLAG_NESTMATE) != 0;
+        }
+    }
+    // 3. Synthetic layout: field 0 IS the ordinal, and NESTMATE is 0.
+    matches!(ctx.get_field(opt, 0), Value::Int(0))
+}
+
 /// Walk a `MethodHandles$Lookup$ClassOption[]` array and return `true`
-/// if any element is the `NESTMATE` constant (ordinal 0). Field 0 of
-/// each synthetic ClassOption mirror holds its ordinal — same encoding
-/// used by `classloader.rs::lk_define_hidden_class`.
+/// if any element is the `NESTMATE` constant. See
+/// [`class_option_is_nestmate`] for the two element layouts this must cope
+/// with.
 ///
 /// Returns `false` when the argument is null, missing, or not an array,
 /// matching the JDK's behaviour for an empty `ClassOption...` varargs.
@@ -501,10 +567,8 @@ fn parse_nestmate_option(ctx: &mut dyn NativeContext, opts_arg: Option<&Value>) 
     let opt_count = ctx.array_length(options_arr);
     for i in 0..opt_count {
         if let Value::Object(Some(opt)) = ctx.get_array_element(options_arr, i) {
-            if let Value::Int(ord) = ctx.get_field(opt, 0) {
-                if ord == 0 {
-                    return true;
-                }
+            if class_option_is_nestmate(ctx, opt) {
+                return true;
             }
         }
     }
@@ -1070,6 +1134,109 @@ mod tests {
             "NESTMATE + STRONG (Weld's exact ClassOption[] pattern) must \
              propagate the outer nest host"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // W3-2 — the REAL-JDK ClassOption layout
+    // -----------------------------------------------------------------
+    //
+    // Every test above builds a SYNTHETIC ClassOption whose field 0 holds the
+    // ordinal. Under `--real-jdk` the varargs array carries genuine JDK enum
+    // constants instead, and `java.lang.Enum` declares `name` before
+    // `ordinal`, so field 0 is a String. Reading it as an `i32` silently
+    // answered "not a nestmate" for NESTMATE too — see
+    // `class_option_is_nestmate` for why that stayed invisible.
+
+    /// Build a `ClassOption` shaped like a REAL JDK enum constant: slot 0
+    /// carries `Enum.name` (a String), NOT the ordinal. `set_field_by_name`
+    /// additionally places the name wherever the mock's field model says
+    /// `name` lives, and slot 0 is deliberately a String so the synthetic
+    /// ordinal fallback CANNOT be what answers.
+    fn make_real_enum_class_option(ctx: &mut MockNativeContext, const_name: &str) -> ObjectRef {
+        let opt_cid = ctx
+            .ensure_class_initialized("java/lang/invoke/MethodHandles$Lookup$ClassOption")
+            .expect("alloc class option cid");
+        let opt = ctx.alloc_object(opt_cid, 4);
+        let name_obj = ctx.create_string(const_name);
+        ctx.set_field(opt, 0, Value::Object(Some(name_obj)));
+        ctx.set_field_by_name(opt, "name", Value::Object(Some(name_obj)));
+        opt
+    }
+
+    /// As `drive_hidden_define`, but the ClassOption[] elements use the
+    /// real-JDK enum layout. Returns the captured `nest_host_class_name`.
+    fn drive_hidden_define_real_enum_options(
+        lookup_class_name: &str,
+        const_names: &[&str],
+    ) -> Option<String> {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, _lookup_cid) = make_lookup_for(&mut ctx, lookup_class_name);
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+
+        let opts_arr = ctx.new_array(
+            cratonvm_types::ArrayElementType::Reference,
+            const_names.len(),
+        );
+        for (i, n) in const_names.iter().enumerate() {
+            let opt = make_real_enum_class_option(&mut ctx, n);
+            ctx.set_array_element(opts_arr, i, Value::Object(Some(opt)));
+        }
+
+        let r = lk_define_hidden_class_full(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Int(0), // initialize = false
+                Value::Object(Some(opts_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClass must succeed: {:?}", r.err());
+        ctx.last_define_full_opts()
+            .expect("define_class_full was not invoked")
+            .nest_host_class_name
+    }
+
+    /// THE REAL-JDK NESTMATE ARM. FAILS BEFORE THE W3-2 FIX.
+    ///
+    /// `RJdkHidden.java:101` appeared to pass only because the *class file's*
+    /// `NestHost` attribute happened to name the same class the NESTMATE
+    /// option would have selected. Assert the option itself is decoded, so
+    /// the answer no longer depends on that coincidence.
+    #[test]
+    fn real_jdk_enum_class_option_is_decoded_as_nestmate() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["NESTMATE"]);
+        assert_eq!(
+            nh.as_deref(),
+            Some("RJdkHidden"),
+            "a real-JDK ClassOption enum constant stores its NAME in slot 0; \
+             NESTMATE must still be recognised"
+        );
+    }
+
+    /// Control: the real-JDK layout must not turn STRONG into a nestmate.
+    /// `Enum.ordinal` for STRONG is 1 and its `flag` is 0x4 — neither may be
+    /// mistaken for the NESTMATE bit.
+    #[test]
+    fn real_jdk_enum_strong_only_is_not_a_nestmate() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["STRONG"]);
+        assert_eq!(
+            nh, None,
+            "STRONG alone must leave the hidden class in its own nest"
+        );
+    }
+
+    /// The Weld/LambdaMetafactory pattern under the real-JDK layout: order
+    /// must not matter, and STRONG must not veto NESTMATE.
+    #[test]
+    fn real_jdk_enum_strong_then_nestmate_still_propagates() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["STRONG", "NESTMATE"]);
+        assert_eq!(nh.as_deref(), Some("RJdkHidden"));
     }
 
     /// Defence-in-depth: the WithClassData variant (used by

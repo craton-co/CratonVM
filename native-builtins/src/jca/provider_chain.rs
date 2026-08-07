@@ -1427,7 +1427,46 @@ fn seed_sunjsse_services() {
         "Default",
         "sun.security.ssl.SSLContextImpl$DefaultSSLContext",
     );
+    // W3-7: the four entries above were the whole `SSLContext` table, so the
+    // chain claimed the platform could not service `TLSv1`, `TLSv1.1`,
+    // `SSLv3`, or any DTLS protocol — every one of which SunJSSE really does
+    // register on JDK 25. Verified by enumerating
+    // `Security.getProvider("SunJSSE").getServices()` on the platform JDK
+    // (jdk-25.0.3.9-hotspot): the nine primaries below plus the two
+    // `Alg.Alias.SSLContext` entries are exactly what it advertises.
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1",
+        "sun.security.ssl.SSLContextImpl$TLS10Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1.1",
+        "sun.security.ssl.SSLContextImpl$TLS11Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLS",
+        "sun.security.ssl.SSLContextImpl$DTLSContext",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLSv1.0",
+        "sun.security.ssl.SSLContextImpl$DTLS10Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLSv1.2",
+        "sun.security.ssl.SSLContextImpl$DTLS12Context",
+    );
     put_alias(J, "SSLContext", "SSL", "TLS");
+    // `Alg.Alias.SSLContext.SSLv3 -> TLSv1` on the platform JDK — NOT to TLS.
+    put_alias(J, "SSLContext", "SSLv3", "TLSv1");
     // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
     const S: &str = "SUN";
     put_service(
@@ -2372,6 +2411,61 @@ pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String
         .into_iter()
         .find(|(name, _, _)| get_service_entry(name, type_str, algo).is_some())
         .map(|(name, _, _)| name)
+}
+
+/// Every `SSLContext` protocol name SunJSSE registers on JDK 25, ASCII-
+/// uppercased.
+///
+/// Measured, not guessed: enumerating
+/// `Security.getProvider("SunJSSE").getServices()` on jdk-25.0.3.9-hotspot
+/// yields primaries {TLS, TLSv1, TLSv1.1, TLSv1.2, TLSv1.3, Default, DTLS,
+/// DTLSv1.0, DTLSv1.2} plus aliases {SSL -> TLS, SSLv3 -> TLSv1}. Anything
+/// outside that set raises `NoSuchAlgorithmException` on HotSpot — confirmed
+/// for `SSLv2`, `TLSv1.4` and `NO-SUCH-TLS`.
+const SSL_CONTEXT_PROTOCOLS: &[&str] = &[
+    "TLS", "TLSV1", "TLSV1.1", "TLSV1.2", "TLSV1.3", "SSL", "SSLV3", "DEFAULT", "DTLS", "DTLSV1.0",
+    "DTLSV1.2",
+];
+
+/// Can `SSLContext.getInstance(protocol)` be serviced?
+///
+/// W3-7 (`RJdkSecurity.tls`): the two real-JDK-mode `SSLContext.getInstance`
+/// registrations each carried their OWN hand-rolled protocol list, and both
+/// were narrower than the platform's — `net_phase_e::register_re6_ssl_context`
+/// accepted five names, `phases_late::ssl_security::register_p68_ssl` seven,
+/// and neither knew about DTLS. A too-narrow list is the dangerous direction
+/// here: it turns a valid `getInstance("TLSv1")` into a refusal and takes
+/// every HTTPS-using suite down with it. So this answers YES on two grounds
+/// and NO only when both fail:
+///
+///   1. the name is in the measured JDK-25 SunJSSE set above; or
+///   2. some provider in the live chain actually registered an `SSLContext`
+///      service under that name — a caller-installed provider (Conscrypt,
+///      BC-JSSE, Elytron) legitimately adds protocols we have never heard of,
+///      and refusing those would be the same defect one layer up.
+///
+/// It is NOT the place to decide whether a protocol is *safe*; `SSLv3` and
+/// `TLSv1` resolve here exactly as they do on HotSpot, and the enabled-
+/// protocol policy that actually keeps them off the wire lives in the
+/// connector (`new13_build_connector` pins a TLS 1.2 floor).
+pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
+    // Do NOT copy `message_digest::algorithm_supported`'s alphanumeric-strip
+    // normalise here. Measured on jdk-25.0.3.9-hotspot: `TLSV1.2`, `tlsv1.3`,
+    // `SSLV3` and `dtls` all resolve, while `TLSv12`, `TLS `, ` TLS` and
+    // `T-L-S` all raise `NoSuchAlgorithmException`. JCA lookup is case-
+    // insensitive and nothing else. Digest names get the cruder normalise
+    // because the JDK's own tables carry `SHA256`/`SHA-256` aliases; the
+    // SSLContext table carries none, so stripping punctuation would fabricate
+    // `getInstance("TLSv12")` into a working context — the exact defect
+    // species this predicate exists to close.
+    if protocol != protocol.trim() {
+        return false;
+    }
+    let upper = protocol.to_ascii_uppercase();
+    if SSL_CONTEXT_PROTOCOLS.contains(&upper.as_str()) {
+        return true;
+    }
+    find_service_provider("SSLContext", protocol).is_some()
 }
 
 /// Resolve `name` to the best available `Provider` object: the REAL
@@ -3566,6 +3660,94 @@ mod tests {
         assert!(get_service_entry("SunJCE", "Cipher", "AES").is_some());
         assert!(get_service_entry("SUN", "Cipher", "AES").is_none());
         assert!(get_service_entry("SunJCE", "Cipher", "AESWrap").is_some());
+    }
+
+    /// W3-7. Every name the platform JDK 25 SunJSSE provider registers must be
+    /// accepted, in the spellings a caller actually writes. `RJdkSecurity.tls`
+    /// only probes the negative half; the positive half is what breaks every
+    /// HTTPS suite if an accept list is drawn too narrow, so pin it here.
+    #[test]
+    fn ssl_context_protocol_supported_accepts_every_jdk25_name() {
+        for p in [
+            "TLS", "tls", "TLSv1", "TLSv1.1", "TLSv1.2", "tlsv1.2", "TLSV1.2", "TLSv1.3", "SSL",
+            "ssl", "SSLv3", "SSLV3", "Default", "default", "DEFAULT", "DTLS", "dtls", "DTLSv1.0",
+            "DTLSv1.2",
+        ] {
+            assert!(
+                ssl_context_protocol_supported(p),
+                "{p:?} is a real JDK 25 SSLContext protocol and must not be refused"
+            );
+        }
+    }
+
+    /// MUST RAISE. Every one of these was probed on jdk-25.0.3.9-hotspot and
+    /// answered `NoSuchAlgorithmException: <name> SSLContext not available`.
+    /// The last four pin the normalisation: JCA lookup folds case and NOTHING
+    /// else, so a punctuation-stripping or space-trimming accept would
+    /// fabricate a context HotSpot refuses.
+    #[test]
+    fn ssl_context_protocol_supported_rejects_names_hotspot_rejects() {
+        let _lock = reset_service_state_for_tests();
+        for p in [
+            "NO-SUCH-TLS",
+            "SSLv2",
+            "TLSv1.4",
+            "NoSuchThing",
+            "",
+            "TLSv12",
+            "T-L-S",
+            "TLS ",
+            " TLS",
+        ] {
+            assert!(
+                !ssl_context_protocol_supported(p),
+                "{p:?} is not a JDK SSLContext protocol and must be refused"
+            );
+        }
+    }
+
+    /// A protocol a caller's own provider registered must resolve even though
+    /// it is absent from the built-in list — the second accept ground.
+    #[test]
+    fn ssl_context_protocol_supported_honours_a_caller_registered_service() {
+        let _lock = reset_service_state_for_tests();
+        assert!(!ssl_context_protocol_supported("Conscrypt-TLS"));
+        apply_legacy_put(
+            "SUN",
+            "SSLContext.Conscrypt-TLS",
+            "org.conscrypt.OpenSSLContextImpl",
+        );
+        assert!(ssl_context_protocol_supported("Conscrypt-TLS"));
+    }
+
+    #[test]
+    fn sunjsse_seed_registers_the_full_jdk25_sslcontext_table() {
+        let _lock = reset_service_state_for_tests();
+        seed_sunjsse_services();
+        for algo in [
+            "TLS", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3", "Default", "DTLS", "DTLSv1.0",
+            "DTLSv1.2",
+        ] {
+            assert!(
+                get_service_entry("SunJSSE", "SSLContext", algo).is_some(),
+                "SunJSSE must service SSLContext.{algo}"
+            );
+        }
+        // Aliases, with the platform's own targets.
+        assert_eq!(
+            get_service_entry("SunJSSE", "SSLContext", "SSL")
+                .unwrap()
+                .algorithm,
+            "TLS"
+        );
+        assert_eq!(
+            get_service_entry("SunJSSE", "SSLContext", "SSLv3")
+                .unwrap()
+                .algorithm,
+            "TLSv1"
+        );
+        // And the negative half: no fabricated entry for a bogus name.
+        assert!(get_service_entry("SunJSSE", "SSLContext", "NO-SUCH-TLS").is_none());
     }
 
     #[test]

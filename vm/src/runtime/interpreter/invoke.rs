@@ -3308,8 +3308,14 @@ pub(super) fn try_stackless_invoke(
             let value = if class_name == "java/lang/invoke/MethodHandle"
                 && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
             {
-                crate::vm::unbox_poly_return(shared, Some(value), descriptor)
-                    .unwrap_or(Value::Object(None))
+                crate::vm::unbox_poly_return_checked(
+                    shared,
+                    thread,
+                    Some(value),
+                    descriptor,
+                    method_name,
+                )?
+                .unwrap_or(Value::Object(None))
             } else {
                 value
             };

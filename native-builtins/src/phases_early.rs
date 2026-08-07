@@ -9092,6 +9092,18 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let threw = fjp_state_thrown(this).is_some();
         Ok(Some(Value::Int(i32::from(done && !cancelled && !threw))))
     });
+    // The exact complement of `isCompletedNormally` over a DONE task, and NOT
+    // `!isCompletedNormally()`: the real `isCompletedAbnormally()` is
+    // `(status & ABNORMAL) != 0`, and `ABNORMAL` is only ever set together with
+    // `DONE` (`trySetCancelled` -> DONE|ABNORMAL|CANCELLED, `trySetThrown` ->
+    // DONE|ABNORMAL|THROWN). A task that has not run yet is therefore neither
+    // normally nor abnormally completed, which the naive negation gets wrong.
+    r.register(fjt, "isCompletedAbnormally", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (done, cancelled) = fjp_state_flags(this);
+        let threw = fjp_state_thrown(this).is_some();
+        Ok(Some(Value::Int(i32::from(done && (cancelled || threw)))))
+    });
     r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
@@ -9531,6 +9543,31 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (done, cancelled) = fjp_state_flags(this);
         let threw = fjp_state_thrown(this).is_some();
         Ok(Some(Value::Int(i32::from(done && !cancelled && !threw))))
+    });
+    // `isCompletedAbnormally()` — was registered NOWHERE and named in NEITHER
+    // allow-list, so it ran real bytecode: `(status & ABNORMAL) != 0` over the
+    // real `status` field, which no Bridge here ever writes. Every task this VM
+    // completes is completed in the `fjp_state` side table instead, so the real
+    // field stays 0 and the method answered `false` for a task that had just
+    // handed its caller an `ExecutionException`
+    // (`RJdkForkJoin.java:259`/`:294`).
+    //
+    // `ABNORMAL` is only ever set together with `DONE` in the real status word
+    // (`trySetCancelled` -> DONE|ABNORMAL|CANCELLED, `trySetThrown` ->
+    // DONE|ABNORMAL|THROWN), which is why this is the complement of
+    // `isCompletedNormally` *over a done task* rather than its plain negation:
+    // a task that has not run yet is neither.
+    //
+    // Registered on `ForkJoinTask` only, exactly like the sibling
+    // `isCompletedNormally`/`isCancelled` above: all three are `public final`
+    // in the real `ForkJoinTask`, so an `invokevirtual` on a `RecursiveTask` /
+    // `RecursiveAction` / user receiver still resolves its declaring class to
+    // `java/util/concurrent/ForkJoinTask`.
+    r.register(fjt, "isCompletedAbnormally", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (done, cancelled) = fjp_state_flags(this);
+        let threw = fjp_state_thrown(this).is_some();
+        Ok(Some(Value::Int(i32::from(done && (cancelled || threw)))))
     });
     r.register(fjt, "isCancelled", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;

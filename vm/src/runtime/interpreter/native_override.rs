@@ -1698,6 +1698,11 @@ pub(crate) fn is_forkjoin_native_override(
             | ("setRawResult", "(Ljava/lang/Object;)V")
             | ("isDone", "()Z")
             | ("isCompletedNormally", "()Z")
+            // Reads the same side-table done/cancelled/thrown bits as
+            // isCompletedNormally and getException, so the three cannot
+            // disagree. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("isCompletedAbnormally", "()Z")
             | ("isCancelled", "()Z")
             | ("cancel", "(Z)Z")
             | ("complete", "(Ljava/lang/Object;)V")

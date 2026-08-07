@@ -176,6 +176,7 @@ export inherited from a parent shell.
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
 | `forname-trace` | `CRATONVM_FORNAME_TRACE` |
+| `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
 | `frame-trace` | `CRATONVM_FRAME_TRACE` |
 | `fsp` | `CRATONVM_DBG_FSP` |
 | `fullstack-scan` | `CRATONVM_DBG_FULLSTACK_SCAN` |
@@ -771,7 +772,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-15 tokens.
+16 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -811,7 +812,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-11 tokens.
+12 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -823,6 +824,7 @@ export inherited from a parent shell.
 | `jboss-logger-level-filter` | `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER` |
 | `jboss-mp-root` | `CRATONVM_JBOSS_MP_ROOT` |
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
+| `mh-strict-invokeexact` | `CRATONVM_MH_STRICT_INVOKEEXACT` |
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |

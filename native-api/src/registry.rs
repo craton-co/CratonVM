@@ -5622,6 +5622,13 @@ impl NativeMethodRegistry {
                     | ("setRawResult", "(Ljava/lang/Object;)V")
                     | ("isDone", "()Z")
                     | ("isCompletedNormally", "()Z")
+                    // `(status & ABNORMAL) != 0` over the real `status` field,
+                    // which no Bridge here ever writes — completions live in
+                    // the `fjp_state` side table. Real bytecode therefore
+                    // answered `false` for a task that had just raised
+                    // ExecutionException (RJdkForkJoin.java:259). Must stay in
+                    // step with `is_forkjoin_native_override`.
+                    | ("isCompletedAbnormally", "()Z")
                     | ("isCancelled", "()Z")
                     | ("cancel", "(Z)Z")
                     | ("complete", "(Ljava/lang/Object;)V")

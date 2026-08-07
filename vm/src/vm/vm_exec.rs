@@ -1439,6 +1439,166 @@ pub fn unbox_poly_return(
     }
 }
 
+/// The eight classes a primitive boxes to, in the order
+/// [`primitive_wrapper_for_ret_char`] names them.
+///
+/// The membership test — "is the thing the handle produced a boxed primitive at
+/// all?" — is the whole safety margin of the strict check below, so it is a
+/// closed list rather than a `starts_with("java/lang/")` guess: a synthetic
+/// stand-in, an un-nameable fabricated class, a `MethodHandle` that failed to
+/// dispatch and a Groovy `Closure` all fall outside it and keep today's
+/// behaviour exactly.
+const PRIMITIVE_WRAPPER_CLASSES: [&str; 8] = [
+    "java/lang/Long",
+    "java/lang/Integer",
+    "java/lang/Byte",
+    "java/lang/Short",
+    "java/lang/Character",
+    "java/lang/Boolean",
+    "java/lang/Float",
+    "java/lang/Double",
+];
+
+/// The wrapper class `ret_char`'s primitive boxes to; `None` for `V`, for a
+/// reference/array return, and for any byte that is not a primitive field
+/// descriptor.
+///
+/// This is the same eight-way table [`coerce_value_against_ret_char`] applies
+/// inline. Named here so the strict `invokeExact` check and the coercion it
+/// guards cannot drift apart — they must agree on "which wrapper did the call
+/// site want", or the check would fire on a value the coercion would have
+/// unboxed correctly.
+fn primitive_wrapper_for_ret_char(ret_char: u8) -> Option<&'static str> {
+    Some(match ret_char {
+        b'J' => "java/lang/Long",
+        b'I' => "java/lang/Integer",
+        b'B' => "java/lang/Byte",
+        b'S' => "java/lang/Short",
+        b'C' => "java/lang/Character",
+        b'Z' => "java/lang/Boolean",
+        b'F' => "java/lang/Float",
+        b'D' => "java/lang/Double",
+        _ => return None,
+    })
+}
+
+/// `CRATONVM_MH_STRICT_INVOKEEXACT` — opt-in strict **return-type** check for
+/// `MethodHandle.invokeExact`. Declared as `CRATONVM_COMPAT=mh-strict-invokeexact`
+/// in `types/src/flag_groups.rs`.
+///
+/// **Default off.** Unset, every path below is byte-identical to what it was.
+///
+/// Read once through the declared-flag boundary
+/// (`cratonvm_types::flags::runtime_var_os`), which serves declared
+/// `CRATONVM_*` names from the one immutable `VmFlags` snapshot. So it
+/// **latches twice over** — once when the snapshot is built at VM start, and
+/// again in the `OnceLock` here. Exporting the variable before launching the
+/// process is the only way to set it; an in-process `set_var` after any flag
+/// has been read is invisible.
+#[inline]
+fn mh_strict_invokeexact() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MH_STRICT_INVOKEEXACT").is_some()
+    })
+}
+
+/// [`unbox_poly_return`], plus the one JDK rule the coercion cannot express:
+/// **`invokeExact` does not convert.**
+///
+/// # The rule
+///
+/// JLS §15.12.3 / `java.lang.invoke.MethodHandle`: `invokeExact` requires the
+/// call site's symbolic descriptor to be *identical* to the handle's
+/// `type()` — no widening, no boxing, no `asType`. A mismatch is a
+/// `WrongMethodTypeException`. `invoke` is the opposite: it is specified to
+/// apply `asType` conversions, and `invokeBasic` / the `VarHandle` accessors
+/// are likewise permissive here. **Only `invokeExact` is gated below.** Making
+/// `invoke` strict is the mistake that would break Groovy's `IndyInterface`,
+/// whose call sites depend on the conversion.
+///
+/// # Why this is a *return-type-only* check, and why it is narrow
+///
+/// `register_t4_method_handle_invoke`'s `invokeExact` registration carries an
+/// in-tree warning that a strict **arity** check there once aborted the VM and
+/// killed every Groovy `IndyInterface` call site: CratonVM's `MH_KIND_*`
+/// adapters (insertArguments / asCollector / asSpreader / dropArguments /
+/// guardWithTest) keep their inner target's descriptor, so apparent arity
+/// routinely disagrees with the real call site. That objection does not
+/// transfer to the *return* type, which those adapters preserve.
+///
+/// This fires on one shape and one only: the native produced a **boxed
+/// primitive of a different wrapper class** than the call-site return char
+/// names. That is precisely the branch where
+/// [`coerce_value_against_ret_char`] gives up and fabricates a zero
+/// (`cls_name != expected_wrapper` → `Long(0)`/`Int(0)`/…), i.e. every value
+/// reaching it is *already* a silent wrong answer today. There is no case
+/// where this check replaces a correct result with an exception.
+///
+/// Deliberately NOT covered, each keeping today's behaviour:
+///
+/// * reference/array/void returns — [`unbox_poly_return`] returns those
+///   untouched, and a strict check there would need the handle's full
+///   `MethodType`, not a value shape;
+/// * a `null` result, or any non-wrapper object (a failed dispatch, a
+///   synthetic stand-in, an un-nameable fabricated class) — these are the
+///   modelling gaps a caller may be tolerating, and turning one into a throw
+///   is the broad gate this is written to avoid;
+/// * argument count and argument types.
+///
+/// So it is strictly less strict than HotSpot. That is intentional: the defect
+/// being fixed is the *silent wrong answer*, not full spec conformance.
+pub fn unbox_poly_return_checked(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: Option<Value>,
+    descriptor: &str,
+    method_name: &str,
+) -> Result<Option<Value>, MethodCallFailed> {
+    if method_name != "invokeExact" || !mh_strict_invokeexact() {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    }
+    let ret = crate::jit::return_type(descriptor);
+    let (Some(expected), Some(Value::Object(Some(obj)))) =
+        (primitive_wrapper_for_ret_char(ret), value)
+    else {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    };
+    // Scoped so the `class_manager` read guard is released before
+    // `create_exception_object` takes the write lock to load the throwable.
+    let actual = {
+        let cid = shared.mem.heap.class_id_of(obj);
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cid).map(|c| c.name.to_string())
+    };
+    let Some(actual) = actual else {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    };
+    if actual == expected || !PRIMITIVE_WRAPPER_CLASSES.contains(&actual.as_str()) {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    }
+    // Not HotSpot's wording (its message renders both `MethodType`s, which we
+    // do not have here — only the produced value's class). It names the two
+    // facts that identify the site.
+    let message = format!(
+        "invokeExact call site {descriptor} requires {}, but the handle produced {}",
+        expected.replace('/', "."),
+        actual.replace('/', ".")
+    );
+    match crate::runtime::exceptions::create_exception_object(
+        shared,
+        thread,
+        "java/lang/invoke/WrongMethodTypeException",
+        Some(&message),
+    ) {
+        Ok(exc) => Err(MethodCallFailed::ExceptionThrown(exc)),
+        // The throwable would not load — a `synthetic-jdk` build need not model
+        // it. Degrade to today's fabricated zero rather than replace a wrong
+        // answer with an uncatchable internal abort.
+        Err(_) => Ok(unbox_poly_return(shared, value, descriptor)),
+    }
+}
+
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
@@ -22730,7 +22890,13 @@ fn invoke_on_class_shared_inner(
                                     poly_desc,
                                 ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                    return unbox_poly_return_checked(
+                                        shared,
+                                        thread,
+                                        r,
+                                        descriptor,
+                                        method_name,
+                                    );
                                 }
                             }
                         }
@@ -22742,7 +22908,13 @@ fn invoke_on_class_shared_inner(
                                     .find(base, method_name, poly_desc)
                             {
                                 let r = safe_native_call(shared, thread, cb, args)?;
-                                return Ok(unbox_poly_return(shared, r, descriptor));
+                                return unbox_poly_return_checked(
+                                    shared,
+                                    thread,
+                                    r,
+                                    descriptor,
+                                    method_name,
+                                );
                             }
                         }
                         if !prefer_exact {
@@ -22754,7 +22926,13 @@ fn invoke_on_class_shared_inner(
                                     poly_desc,
                                 ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                    return unbox_poly_return_checked(
+                                        shared,
+                                        thread,
+                                        r,
+                                        descriptor,
+                                        method_name,
+                                    );
                                 }
                             }
                         }
@@ -25933,6 +26111,61 @@ mod tests {
         let shared = test_shared();
         let r = unbox_poly_return(&shared, Some(Value::Object(None)), "()Ljava/lang/String;");
         assert_eq!(r, Some(Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // W3-1 — the strict `invokeExact` return check's two lookup tables
+    //
+    // `unbox_poly_return_checked` fires only where
+    // `coerce_value_against_ret_char` would otherwise fabricate a zero. That
+    // equivalence holds only while the two functions agree on which wrapper
+    // each return char names — and `coerce_value_against_ret_char` spells its
+    // table inline. These tests are what keep the copy honest; a drift would
+    // make the check fire on a value the coercion unboxes correctly, which is
+    // the one way it could turn a right answer into an exception.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn primitive_wrapper_table_covers_exactly_the_eight_primitives() {
+        for ch in *b"JIBSCZFD" {
+            let wrapper =
+                primitive_wrapper_for_ret_char(ch).expect("every primitive ret char has a wrapper");
+            assert!(
+                PRIMITIVE_WRAPPER_CLASSES.contains(&wrapper),
+                "{wrapper} is named by ret char {} but is not in PRIMITIVE_WRAPPER_CLASSES",
+                ch as char
+            );
+        }
+        // Void, reference, array, and a non-descriptor byte must all decline —
+        // otherwise the check would reach shapes `unbox_poly_return` returns
+        // untouched.
+        for ch in *b"VL[Q\0" {
+            assert!(
+                primitive_wrapper_for_ret_char(ch).is_none(),
+                "ret char {:?} must not name a primitive wrapper",
+                ch as char
+            );
+        }
+        assert_eq!(PRIMITIVE_WRAPPER_CLASSES.len(), 8);
+    }
+
+    /// The mismatch predicate must be *symmetric with the fabrication branch*:
+    /// for each primitive return char, the wrapper it names is the only one of
+    /// the eight that `coerce_value_against_ret_char` would NOT zero out.
+    #[test]
+    fn each_ret_char_names_exactly_one_wrapper() {
+        for ch in *b"JIBSCZFD" {
+            let expected = primitive_wrapper_for_ret_char(ch).expect("primitive");
+            let matches = PRIMITIVE_WRAPPER_CLASSES
+                .iter()
+                .filter(|w| **w == expected)
+                .count();
+            assert_eq!(
+                matches, 1,
+                "ret char {} maps to {expected}, which appears {matches} times in the table",
+                ch as char
+            );
+        }
     }
 
     #[test]

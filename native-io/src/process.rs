@@ -1028,11 +1028,68 @@ fn signal_pid(pid: i64, force: bool) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
 }
 
-#[cfg(not(unix))]
+/// Send a termination signal straight to a pid — Win32.
+///
+/// The flat `false` this replaces gave as its reason that "the case that needs
+/// it — the real `ProcessImpl` reaper holding the child — is Linux-only, since
+/// `forkAndExec` is". That stopped being true the moment `--jdk-only` started
+/// running the real Windows `ProcessImpl`: its constructor ends in
+/// `ProcessHandleImpl.completion(pid, true)`, which parks a reaper thread inside
+/// `Child::wait()` for EVERY child, so [`destroy_handle`]'s `try_lock` always
+/// fails on this platform and the pid route is the only one left. `destroy()` /
+/// `destroyForcibly()` therefore terminated nothing at all, and
+/// `RJdkProcess.java:206` (`destroyForcibly did not terminate the child`) is
+/// what measures it.
+///
+/// `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess` is what HotSpot's own
+/// `ProcessImpl_md.c` and `ProcessHandleImpl_md.c` do. `force` is not a
+/// distinction Windows offers — there is no catchable termination — so both
+/// spellings terminate, which is precisely what
+/// `ProcessHandle.supportsNormalTermination()` already reports (`false` off
+/// POSIX) rather than a shortfall this hides.
+///
+/// Exit code 1 is the value HotSpot passes, so a killed child reads back the
+/// same status it would there.
+#[cfg(windows)]
+fn signal_pid(pid: i64, _force: bool) -> bool {
+    use std::ffi::c_void;
+    // Signatures are IDENTICAL to `foreign_pid_is_alive`'s and `pipe.rs`'s
+    // declarations so the `clashing_extern_declarations` deny-lint does not fire.
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
+        fn TerminateProcess(h_process: Handle, u_exit_code: u32) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+
+    // A Windows process id is a DWORD; anything outside that range names no
+    // process. pid 0 is the System Idle Process and must never be signalled.
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return false;
+    }
+    // SAFETY: `OpenProcess` takes only scalars and `TerminateProcess` only a
+    // handle plus a scalar; neither touches caller memory. The handle is closed
+    // on every path out, and a null handle is the documented failure return and
+    // is never passed on.
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if h.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(h, 1) != 0;
+        CloseHandle(h);
+        ok
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn signal_pid(_pid: i64, _force: bool) -> bool {
-    // No portable equivalent without a Win32 OpenProcess/TerminateProcess pair,
-    // and the case that needs it — the real `ProcessImpl` reaper holding the
-    // child — is Linux-only, since `forkAndExec` is.
+    // No termination primitive is wired up for this target. `false` is a legal
+    // answer ("could not be destroyed") and is the honest one here.
     false
 }
 
@@ -1376,21 +1433,61 @@ fn time_unit_to_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<Obj
 // Native method implementations
 // ---------------------------------------------------------------------------
 
-/// `java.lang.ProcessImpl.create(cmdarray, envblock, dir, stdHandles, redirectErrorStream) -> long`
+/// `java.lang.ProcessImpl.create(String cmdstr, String envblock, String dir,
+/// long[] stdHandles, boolean redirectErrorStream) -> long`
 ///
-/// Windows-oriented JDK native that the bytecode invokes from the
-/// ProcessImpl constructor.  We treat the cmdarray + env + dir pieces
-/// just like `ProcessBuilder.start` and return our process-table
-/// handle as the "native process handle" long (the JDK stores it in the
-/// private `ProcessImpl.handle` field).
+/// The spawn entry point of the REAL JDK's **Windows** `ProcessImpl`, and
+/// therefore of every `ProcessBuilder.start()` / `Runtime.exec` on this platform
+/// once the VM stops shadowing `start()` — the exact counterpart of
+/// [`native_process_impl_fork_and_exec`] on Linux.
 ///
-/// Signature: `(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;[JZ)J`
-/// — we accept whatever the caller sends and do a best-effort match.
+/// # The descriptor
+///
+/// This was registered as
+/// `(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;[JZ)J` — a
+/// `String[]` envblock. JDK 25's image declares
+///
+/// ```text
+/// private static synchronized native long create(
+///     java.lang.String, java.lang.String, java.lang.String, long[], boolean);
+///   descriptor: (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[JZ)J
+/// ```
+///
+/// so the registration could never bind, and the `--jdk-only` census recorded
+/// `ProcessImpl.create` as "dead or shadowing" for exactly that reason. `arg1`
+/// is a single **environment block** String, not an array: NUL-separated
+/// `KEY=VALUE` entries, `null` when the child inherits this process's
+/// environment (`ProcessEnvironment.toEnvironmentBlock(null)` is `null`).
+///
+/// Entries whose key begins with `=` are Windows' per-drive current-directory
+/// pseudo-variables (`=C:=C:\some\dir`). They are dropped rather than forwarded:
+/// they are not environment variables any program reads by name, and
+/// `Command::env` has no way to express one. The observable cost is that a child
+/// does not inherit a per-drive CWD it was never given explicitly.
+///
+/// # The `stdHandles` in/out contract
+///
+/// Identical in shape to the Linux `int[] fds` contract documented on
+/// [`native_process_impl_fork_and_exec`], and load-bearing for the same reason.
+/// HotSpot's `processCreate` sets `handles[i] = -1` when the caller supplied its
+/// own handle and to the parent-side pipe end when it created one, and the
+/// constructor then reads each slot back: `-1` builds a
+/// `ProcessBuilder.Null{Input,Output}Stream`, anything else is wrapped in a
+/// `FileDescriptor` via `fdAccess.setHandle`. Ignoring the array — which this
+/// native did, always piping all three streams and never writing back — hands
+/// the caller a live child whose streams are attached to nothing it asked for.
+///
+/// The values are **`FdTable` ids, not OS handles**: the JDK obtains them with
+/// `fdAccess.getHandle(fd)`, which reads `FileDescriptor.handle`, and in this VM
+/// that slot holds an `FdTable` id (`FileDescriptor.getHandle(int)` answers
+/// `0`/`1`/`2` for the standard streams, which is what `Redirect.INHERIT`
+/// encodes, and `fis_get_fd`/`fos_get_fd` resolve the rest).
+#[cfg(windows)]
 fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args[0] = cmd string (pipe-joined on Windows, or a single arg),
-    // args[1] = envblock (String[] of KEY=VALUE),
+    // args[0] = cmdstr (the pre-built, quoted Windows command line),
+    // args[1] = envblock (String of NUL-separated KEY=VALUE, nullable),
     // args[2] = working dir (String, nullable),
-    // args[3] = stdHandles (long[], can be null),
+    // args[3] = stdHandles (long[], in/out),
     // args[4] = redirectErrorStream (boolean).
     let cmd_line = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1409,17 +1506,7 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let rest = &parts[1..];
 
     let env_vars: Option<Vec<(String, String)>> = match args.get(1) {
-        Some(Value::Object(Some(arr))) => {
-            let raw = read_string_array(ctx, *arr);
-            Some(
-                raw.iter()
-                    .filter_map(|s| {
-                        s.split_once('=')
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                    })
-                    .collect(),
-            )
-        }
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).map(|block| parse_env_block(&block)),
         _ => None,
     };
     let work_dir = match args.get(2) {
@@ -1429,7 +1516,28 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     // args[4] = redirectErrorStream (boolean, passed as Int by the JDK ProcessImpl).
     let redirect_err = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
-    let result = spawn_and_wrap(
+
+    // --- Decode the requested stdio shape from `stdHandles` ----------------
+    let handles_array = match args.get(3) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let mut requested = [-1i64; 3];
+    if let Some(arr) = handles_array {
+        let len = ctx.array_length(arr).min(3);
+        for (slot, want) in requested.iter_mut().enumerate().take(len) {
+            if let Value::Long(v) = ctx.get_array_element(arr, slot) {
+                *want = v;
+            }
+        }
+    }
+    let redirects = ProcessRedirects {
+        stdin: redirect_from_requested_fd(0, requested[0]),
+        stdout: redirect_from_requested_fd(1, requested[1]),
+        stderr: redirect_from_requested_fd(2, requested[2]),
+    };
+
+    let spawned = spawn_child(
         ctx,
         program,
         rest,
@@ -1437,16 +1545,324 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         env_vars.as_deref(),
         env_vars.is_some(),
         redirect_err,
+        &redirects,
     )?;
-    // The native returns the native handle (our internal handle id) so
-    // the JDK can later dispatch into native_wait_for0 etc.
-    match result {
-        Some(Value::Object(Some(proc_ref))) => {
-            let handle = handle_of(ctx, proc_ref);
-            Ok(Some(Value::Long(handle)))
+
+    // --- Write the parent-side pipe ids back -------------------------------
+    //
+    // `spawn_child` reports -1 for any slot it did not pipe, which is exactly
+    // the `-1` the constructor reads as "no pipe, use the null stream" — so a
+    // slot the caller supplied a handle for satisfies the "-1 on output iff not
+    // -1 on input" half of the contract for free. The `redirectErrorStream`
+    // departure documented on the Linux arm applies here identically: slot 2 is
+    // -1 on both sides and `getErrorStream()` is a `NullInputStream`, which is
+    // what a merged stream means.
+    if let Some(arr) = handles_array {
+        let parent_side = [
+            spawned.fds.stdin_fd,
+            spawned.fds.stdout_fd,
+            spawned.fds.stderr_fd,
+        ];
+        let len = ctx.array_length(arr).min(3);
+        for (slot, value) in parent_side.iter().enumerate().take(len) {
+            ctx.set_array_element(arr, slot, Value::Long(*value as i64));
         }
-        _ => Ok(Some(Value::Long(0))),
     }
+
+    if pb_debug_enabled() {
+        eprintln!(
+            "[PB-CREATE] pid={} handle={} requested={:?} returned={:?}",
+            spawned.pid,
+            spawned.handle,
+            requested,
+            [
+                spawned.fds.stdin_fd,
+                spawned.fds.stdout_fd,
+                spawned.fds.stderr_fd
+            ]
+        );
+    }
+
+    // The native returns the "native process handle" the JDK stores in the
+    // private `ProcessImpl.handle` field — our process-table key. Every other
+    // `ProcessImpl` native is handed that same value back.
+    Ok(Some(Value::Long(spawned.handle)))
+}
+
+/// Split a Windows `ProcessEnvironment.toEnvironmentBlock` string.
+///
+/// NUL-separated `KEY=VALUE` entries (the block is also NUL-terminated, so the
+/// final split piece is empty). See the note on
+/// [`native_process_impl_create`] for why `=`-prefixed keys are dropped.
+#[cfg(windows)]
+fn parse_env_block(block: &str) -> Vec<(String, String)> {
+    block
+        .split('\0')
+        .filter(|entry| !entry.is_empty() && !entry.starts_with('='))
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the Windows `java.lang.ProcessImpl` native surface
+//
+// Everything below is reached only once `--jdk-only` stops shadowing
+// `ProcessBuilder.start()` and the image's own `ProcessImpl` runs. Each is
+// `ACC_NATIVE` on the JDK 25 Windows image — verified with
+// `javap -p -s java.lang.ProcessImpl` — so each is a §1.5 `Bridge`, and there is
+// no bytecode behind any of them to fall back to: an unregistered one is an
+// `UnsatisfiedLinkError`, which is how `ProcessImpl.<clinit>` failed before this
+// (`getStillActive`, from `STILL_ACTIVE = getStillActive()`).
+//
+// The `long handle` every one of them takes is whatever [`native_process_impl_create`]
+// returned, i.e. this VM's process-table key — NOT an OS handle. That is the
+// same substitution the Linux arm makes with the pid, and it is why none of
+// these need a Win32 call: the table already knows the child.
+// ---------------------------------------------------------------------------
+
+/// Win32's `STILL_ACTIVE` (`0x103`) — the value `GetExitCodeProcess` reports for
+/// a process that has not exited, and the sentinel
+/// `ProcessImpl.exitValue`/`waitFor` compare against.
+///
+/// The literal matters even though we own both sides of the comparison: the JDK
+/// caches it in the `static final int STILL_ACTIVE` field at class-init time and
+/// compares raw exit codes against it, so a child that genuinely exits with 259
+/// would be read as running. HotSpot has that exact ambiguity and resolves it
+/// the same way we do — `exitValue()` re-checks `isProcessAlive(handle)` before
+/// throwing, and asks again if the process is really gone.
+#[cfg(windows)]
+const WINDOWS_STILL_ACTIVE: i32 = 259;
+
+/// Read a `long` argument, defaulting to 0 when absent or not a long.
+#[cfg(windows)]
+fn long_arg(args: &[Value], index: usize) -> i64 {
+    match args.get(index) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+/// Is `handle` a row this VM's process table owns?
+///
+/// The guard that keeps every native below from fabricating an answer for a
+/// handle it has never seen. `try_exit_handle` alone cannot be that guard: it
+/// answers `None` both for "still running" and for "no such child", and taking
+/// the second as the first makes `isProcessAlive` report a permanently live
+/// process and `waitFor` never return.
+///
+/// `exit_cache` rather than `process_table` because its rows outlive the child —
+/// a reaped child must still resolve, which is exactly the case `exitValue()`
+/// asks about.
+#[cfg(windows)]
+fn known_handle(handle: i64) -> bool {
+    exit_cache().lock().contains_key(&handle)
+}
+
+/// `java.lang.ProcessImpl.getStillActive()I`
+#[cfg(windows)]
+fn native_process_impl_get_still_active(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(WINDOWS_STILL_ACTIVE)))
+}
+
+/// `java.lang.ProcessImpl.getExitCodeProcess(J)I`
+///
+/// The whole of `exitValue()` and half of `waitFor()`:
+///
+/// ```text
+/// int code = getExitCodeProcess(handle);
+/// if (code == STILL_ACTIVE) {
+///     if (isProcessAlive(handle)) throw new IllegalThreadStateException(...);
+///     return getExitCodeProcess(handle);
+/// }
+/// return code;
+/// ```
+///
+/// A handle this VM does not own answers -1 rather than `STILL_ACTIVE`: the
+/// latter would make `waitFor()` throw `IllegalThreadStateException` from a
+/// method the JDK specifies as never throwing it, and `isAlive()` claim a
+/// process that does not exist is running.
+#[cfg(windows)]
+fn native_process_impl_get_exit_code(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let handle = long_arg(args, 0);
+    if !known_handle(handle) {
+        return Ok(Some(Value::Int(-1)));
+    }
+    Ok(Some(Value::Int(match try_exit_handle(handle) {
+        Some(code) => code,
+        None => WINDOWS_STILL_ACTIVE,
+    })))
+}
+
+/// `java.lang.ProcessImpl.isProcessAlive(J)Z`
+#[cfg(windows)]
+fn native_process_impl_is_process_alive(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let handle = long_arg(args, 0);
+    // `try_exit_handle` reports `None` while a reaper thread holds the child's
+    // mutex inside `Child::wait()`, which is the real `ProcessImpl`'s normal
+    // state for every child it spawns — and "someone is blocked waiting for this
+    // child to exit" means it has not exited. That is the answer we want.
+    let alive = known_handle(handle) && try_exit_handle(handle).is_none();
+    Ok(Some(Value::Int(i32::from(alive))))
+}
+
+/// `java.lang.ProcessImpl.terminateProcess(J)V`
+///
+/// Both `destroy()` and `destroyForcibly()` land here — Windows has no
+/// catchable termination, so `ProcessImpl.destroyForcibly()` is literally
+/// `destroy(); return this;`. Hence the unconditional `force`.
+#[cfg(windows)]
+fn native_process_impl_terminate(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let handle = long_arg(args, 0);
+    if known_handle(handle) {
+        destroy_handle(handle, true);
+    }
+    Ok(None)
+}
+
+/// `java.lang.ProcessImpl.waitForInterruptibly(J)V`
+///
+/// `ProcessImpl.waitFor()` is `waitForInterruptibly(handle)` followed by an
+/// interrupt check and `exitValue()`, so this must not return while the child
+/// runs — returning early makes `exitValue()` throw
+/// `IllegalThreadStateException` out of `waitFor()`.
+#[cfg(windows)]
+fn native_process_impl_wait_for_interruptibly(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let handle = long_arg(args, 0);
+    if !known_handle(handle) {
+        return Ok(None);
+    }
+    ctx.begin_blocking_region();
+    let _ = wait_for_handle(handle);
+    ctx.end_blocking_region();
+    Ok(None)
+}
+
+/// `java.lang.ProcessImpl.waitForTimeoutInterruptibly(JJ)V`
+///
+/// Bounded wait, `void`: the caller re-reads `isProcessAlive(handle)` after every
+/// call and loops until its own deadline, so this only has to not overshoot
+/// `timeout_ms` and to return promptly once the child is gone. The JDK passes
+/// `Integer.MAX_VALUE` for a timeout whose millisecond conversion overflows, so
+/// the clamp reproduces its own ceiling rather than inventing one.
+#[cfg(windows)]
+fn native_process_impl_wait_for_timeout(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let handle = long_arg(args, 0);
+    if !known_handle(handle) {
+        return Ok(None);
+    }
+    let timeout_ms = long_arg(args, 1).clamp(0, i32::MAX as i64) as u64;
+    ctx.begin_blocking_region();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while try_exit_handle(handle).is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(10)));
+    }
+    ctx.end_blocking_region();
+    Ok(None)
+}
+
+/// `java.lang.ProcessImpl.getProcessId0(J)I`
+///
+/// Called once, from the constructor, and everything the JDK later says about
+/// the child's identity hangs off it:
+/// `processHandle = ProcessHandleImpl.getInternal(getProcessId0(handle))`. So
+/// this must be the real OS pid, not the table key — `Process.pid()`,
+/// `toHandle()`, `parent()`, `children()` and the reaper's
+/// `completion(pid, true)` all read it.
+///
+/// `0` for an unknown handle is HotSpot's own failure value (`GetProcessId`
+/// returns 0 on error), not a placeholder.
+#[cfg(windows)]
+fn native_process_impl_get_process_id0(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let pid = pid_for_handle(long_arg(args, 0));
+    Ok(Some(Value::Int(if pid > 0 { pid as i32 } else { 0 })))
+}
+
+/// `java.lang.ProcessImpl.closeHandle(J)Z`
+///
+/// Invoked from the `Cleaner` the constructor registers, once the `ProcessImpl`
+/// becomes unreachable, to release the Win32 process handle.
+///
+/// There is nothing to release here and the `true` is not a fabricated success:
+/// the value handed to us is a process-table key, and the OS handle it stands
+/// for is owned by the `std::process::Child` in `PROCESS_TABLE`, whose `Drop`
+/// closes it. Dropping the row on this call would be actively wrong — the tables
+/// are keyed by pid for `ProcessHandleImpl`'s natives as well, and those outlive
+/// the `ProcessImpl` object by design.
+#[cfg(windows)]
+fn native_process_impl_close_handle(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+/// `java.lang.ProcessImpl.openForAtomicAppend(Ljava/lang/String;)J`
+///
+/// `ProcessImpl.newFileOutputStream(f, append=true)` — i.e. the
+/// `Redirect.appendTo(file)` path — opens the file here and wraps the result
+/// with `fdAccess.setHandle(fd, handle)`. So the `long` must be a value
+/// `FileDescriptor.handle` can carry, which in this VM is an `FdTable` id: the
+/// same convention `create`'s `stdHandles` uses, and the same one
+/// `fos_get_fd`/`fis_get_fd` resolve.
+///
+/// The path goes through the sandbox validator and the write capability before
+/// the file is opened, exactly as the redirect route in `spawn_child` does —
+/// this is a second door onto the same operation and must not be a cheaper one.
+/// Declared `throws IOException`, and a refusal or an open failure is reported
+/// as one.
+#[cfg(windows)]
+fn native_process_impl_open_for_atomic_append(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: "ProcessImpl.openForAtomicAppend: null path".to_string(),
+            }
+            .into())
+        }
+    };
+    let validated = validate_redirect_path(&path, "redirectOutput").map_err(MethodCallFailed::from)?;
+    ctx.check_capability_or_throw(Capability::file_write(&validated))?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&validated, true)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("ProcessImpl.openForAtomicAppend({path:?}): {e}"),
+        })?;
+    Ok(Some(Value::Long(fd as i64)))
 }
 
 /// `java.lang.ProcessImpl.forkAndExec(int mode, byte[] helperpath, byte[] prog,
@@ -1574,9 +1990,9 @@ fn native_process_impl_fork_and_exec(
         }
     }
     let redirects = ProcessRedirects {
-        stdin: redirect_from_requested_fd(0, requested[0]),
-        stdout: redirect_from_requested_fd(1, requested[1]),
-        stderr: redirect_from_requested_fd(2, requested[2]),
+        stdin: redirect_from_requested_fd(0, requested[0] as i64),
+        stdout: redirect_from_requested_fd(1, requested[1] as i64),
+        stderr: redirect_from_requested_fd(2, requested[2] as i64),
     };
 
     let spawned = spawn_child(
@@ -1633,20 +2049,25 @@ fn native_process_impl_fork_and_exec(
     Ok(Some(Value::Int(spawned.pid as i32)))
 }
 
-/// Map one `fds[slot]` input value to the redirect it asks for.
+/// Map one `fds[slot]` / `stdHandles[slot]` input value to the redirect it asks
+/// for.
 ///
-/// See the contract note on [`native_process_impl_fork_and_exec`]: -1 asks for
-/// a pipe, the slot's own index names the VM's corresponding standard stream
-/// (which is what `Redirect.INHERIT` encodes), and anything else is an
-/// `FdTable` id the caller opened.
-#[cfg(target_os = "linux")]
-fn redirect_from_requested_fd(slot: usize, requested: i32) -> StdioRedirect {
+/// See the contract notes on [`native_process_impl_fork_and_exec`] (Linux
+/// `int[]`) and [`native_process_impl_create`] (Windows `long[]`): -1 asks for a
+/// pipe, the slot's own index names the VM's corresponding standard stream
+/// (which is what `Redirect.INHERIT` encodes, on both platforms — Windows
+/// arrives here through `FileDescriptor.getHandle(int)`, which answers 0/1/2 for
+/// the standard streams), and anything else is an `FdTable` id the caller
+/// opened. Widened to `i64` so both arms decode through one function and cannot
+/// drift apart.
+#[cfg(any(target_os = "linux", windows))]
+fn redirect_from_requested_fd(slot: usize, requested: i64) -> StdioRedirect {
     if requested == -1 {
         StdioRedirect::Pipe
-    } else if requested == slot as i32 {
+    } else if requested == slot as i64 {
         StdioRedirect::Inherit
     } else {
-        StdioRedirect::ExistingFd(requested)
+        StdioRedirect::ExistingFd(requested as i32)
     }
 }
 
@@ -2594,7 +3015,18 @@ fn direct_child_pids(pid: i64) -> Vec<i64> {
     children
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Direct child pids of `pid` — Win32. Derived from the same Toolhelp snapshot
+/// [`os_list_processes`] reads, so `Process.descendants()` and
+/// `ProcessHandle.descendants()` cannot report different trees.
+#[cfg(windows)]
+fn direct_child_pids(pid: i64) -> Vec<i64> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    os_list_processes(pid).into_iter().map(|(p, _)| p).collect()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn direct_child_pids(_pid: i64) -> Vec<i64> {
     Vec::new()
 }
@@ -3097,7 +3529,97 @@ fn os_parent_pid(pid: i64) -> i64 {
     -1
 }
 
-#[cfg(not(target_os = "linux"))]
+/// One `(pid, ppid)` row per visible process — Win32 Toolhelp snapshot.
+///
+/// The single source both [`os_parent_pid`] and [`os_list_processes`] read on
+/// this platform, so the two can never disagree about the shape of the process
+/// tree. `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` is the same call
+/// HotSpot's `ProcessHandleImpl_md.c` makes on Windows.
+///
+/// Both of those functions used to be `-1` / empty off Linux, and that is a
+/// fabricated answer in the shape this wave is hunting: "this process has no
+/// parent" and "the machine is running no processes" are indistinguishable from
+/// true empty answers, so `ProcessHandle.parent()` was permanently
+/// `Optional.empty()` and `children()` / `descendants()` / `allProcesses()`
+/// permanently empty streams. `RJdkProcess.java:185` (`a live forked child must
+/// report a parent`) is what measures the first, `:188`/`:189` the second.
+///
+/// The System Idle Process (pid 0) is dropped: it is not a process a handle can
+/// name, and Linux's `/proc` has no `0` entry either, so both arms report the
+/// same universe.
+#[cfg(windows)]
+fn os_snapshot_processes() -> Vec<(i64, i64)> {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    /// `PROCESSENTRY32W`. `th32DefaultHeapID` is a `ULONG_PTR`, which is what
+    /// makes the struct 8-aligned on x86_64 and inserts the 4 padding bytes
+    /// after `th32ProcessID` that MSVC also emits — `#[repr(C)]` reproduces that
+    /// layout exactly, and `dwSize` must equal it or `Process32FirstW` fails.
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> Handle;
+        fn Process32FirstW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn Process32NextW(h_snapshot: Handle, lppe: *mut ProcessEntry32W) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+
+    let mut out = Vec::new();
+    // SAFETY: `entry` is a live, fully-zeroed local of exactly the layout the
+    // API documents, with `dwSize` set before every call as required; the
+    // enumeration functions write only into it. The snapshot handle is closed on
+    // every path out, and both the null and `INVALID_HANDLE_VALUE` failure
+    // returns are refused before use.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap as isize == -1 {
+            return out;
+        }
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut entry) != 0;
+        while more {
+            let pid = entry.th32_process_id as i64;
+            if pid > 0 {
+                out.push((pid, entry.th32_parent_process_id as i64));
+            }
+            entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            more = Process32NextW(snap, &mut entry) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn os_parent_pid(pid: i64) -> i64 {
+    if pid <= 0 {
+        return -1;
+    }
+    os_snapshot_processes()
+        .into_iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, ppid)| if ppid > 0 { ppid } else { -1 })
+        .unwrap_or(-1)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn os_parent_pid(_pid: i64) -> i64 {
     -1
 }
@@ -3125,7 +3647,16 @@ fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
+    os_snapshot_processes()
+        .into_iter()
+        .filter(|(_, ppid)| of_pid == 0 || *ppid == of_pid)
+        .map(|(pid, ppid)| (pid, ppid.max(0)))
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn os_list_processes(_of_pid: i64) -> Vec<(i64, i64)> {
     Vec::new()
 }

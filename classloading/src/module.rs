@@ -505,13 +505,61 @@ impl ModuleRegistry {
     /// The unnamed module reads everything.  Every module reads `java.base`
     /// and itself.  If the graph has not been built yet this falls back to
     /// checking only direct `requires` edges.
+    ///
+    /// # The unnamed-module rule is DIRECTIONAL
+    ///
+    /// The classpath-compatibility escape hatch is the `reader ==
+    /// UNNAMED_MODULE` arm below, and only that arm. This function used to
+    /// carry a second, symmetric arm — `provider == UNNAMED_MODULE` — so a
+    /// NAMED module implicitly read the unnamed module too. JPMS says it does
+    /// not, and the JDK agrees; measured on HotSpot 25:
+    ///
+    /// ```text
+    ///   unnamed.canRead(java.logging)      = true
+    ///   java.logging.canRead(unnamed)      = false
+    ///   java.logging.canRead(java.base)    = true
+    ///   java.base.canRead(java.logging)    = false
+    ///   // and with --add-reads java.logging=ALL-UNNAMED:
+    ///   java.logging.canRead(unnamed)      = true
+    /// ```
+    ///
+    /// (`regression-suite/src/RJdkModule.java:114`,
+    /// `check(!svc.canRead(unnamed), "a named module must NOT implicitly read
+    /// the unnamed module")`, failed in BOTH `--real-jdk` and `--jdk-only` on
+    /// the symmetric rule.)
+    ///
+    /// Dropping the symmetry does not weaken the escape hatch, because no
+    /// access check ever reaches this arm:
+    ///
+    /// * [`Self::check_module_access`] returns `Ok(())` for `accessor_module ==
+    ///   UNNAMED_MODULE || target_module == UNNAMED_MODULE` *before* it calls
+    ///   `reads`.
+    /// * [`Self::check_deep_reflection_access`] returns `Ok(())` for
+    ///   `target_module == UNNAMED_MODULE` *before* it calls `reads`.
+    /// * A classpath jar carrying a `module-info.class` is registered
+    ///   `automatic`, and the automatic arm further down returns `true` for
+    ///   every provider including the unnamed one — so `org.jboss.logging` and
+    ///   friends are unaffected.
+    /// * A module with no registered descriptor still gets the open-world
+    ///   `true`.
+    /// * An explicit grant still works: `--add-reads m=ALL-UNNAMED` and the
+    ///   `Module.addReads0` VM-sync hook (Mockito's
+    ///   `InlineBytecodeGenerator.assureCanReadMockito` makes `java.base` read
+    ///   the unnamed module this way) both land in `extra_reads` keyed on the
+    ///   empty-string sentinel and are honoured on both the built-graph and the
+    ///   un-built-fallback paths below.
+    ///
+    /// What is left is the JPMS query surface — `NativeContext::reads_module`,
+    /// i.e. `java.lang.Module.canRead` — which is exactly where the directional
+    /// answer is the correct one.
     pub fn reads(&self, reader: &str, provider: &str) -> bool {
-        // Unnamed module reads all named modules (classpath compat).
+        // Unnamed module reads all named modules (classpath compat). This is
+        // the escape hatch, and it is one-way — see the doc comment.
         if reader == UNNAMED_MODULE {
             return true;
         }
         // Every module reads itself and java.base.
-        if reader == provider || provider == JAVA_BASE || provider == UNNAMED_MODULE {
+        if reader == provider || provider == JAVA_BASE {
             return true;
         }
 
@@ -1550,6 +1598,63 @@ mod tests {
         assert!(reg.reads(UNNAMED_MODULE, "java.base"));
         assert!(reg.reads(UNNAMED_MODULE, "java.logging"));
         assert!(reg.reads(UNNAMED_MODULE, "com.example.mymod"));
+    }
+
+    /// The other direction of `unnamed_reads_everything` — and the half that
+    /// was wrong. `reads` used to return `true` whenever `provider ==
+    /// UNNAMED_MODULE`, making the rule symmetric where JPMS makes it
+    /// directional. Measured on HotSpot 25: `unnamed.canRead(java.logging)` is
+    /// `true`, `java.logging.canRead(unnamed)` is `false`.
+    /// `regression-suite/src/RJdkModule.java:114` asserts exactly that and
+    /// failed in both `--real-jdk` and `--jdk-only`.
+    #[test]
+    fn named_module_does_not_implicitly_read_the_unnamed_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("com.example"), vec![]);
+        reg.build_readability_graph();
+
+        assert!(
+            reg.reads(UNNAMED_MODULE, "com.example"),
+            "the unnamed module reads every resolved module"
+        );
+        assert!(
+            !reg.reads("com.example", UNNAMED_MODULE),
+            "a named module must NOT implicitly read the unnamed module"
+        );
+        // ...but the explicit grant (`--add-reads m=ALL-UNNAMED`, or the
+        // `Module.addReads0` VM-sync hook) still works, on both the built-graph
+        // and un-built-fallback paths.
+        reg.add_reads("com.example", UNNAMED_MODULE);
+        assert!(reg.reads("com.example", UNNAMED_MODULE));
+        reg.register(sample_desc("mod.late"), vec![]); // invalidates the closure
+        assert!(reg.reads("com.example", UNNAMED_MODULE));
+    }
+
+    /// The classpath-compatibility escape hatch the symmetric rule was there
+    /// for. None of its users go through the deleted arm: an automatic module
+    /// reads everything by its own arm, an unregistered module gets the
+    /// open-world `true`, and both access checks short-circuit on an unnamed
+    /// participant before `reads` is ever consulted.
+    #[test]
+    fn classpath_escape_hatch_survives_the_directional_rule() {
+        let mut automatic = sample_desc("org.jboss.logging");
+        automatic.automatic = true;
+        let mut reg = ModuleRegistry::new();
+        reg.register(automatic, vec![]);
+        reg.register(sample_desc("com.example"), vec![]);
+        reg.build_readability_graph();
+
+        // Automatic (classpath jar carrying a module-info) reads everything.
+        assert!(reg.reads("org.jboss.logging", UNNAMED_MODULE));
+        // A module the registry never saw keeps the open-world answer.
+        assert!(reg.reads("mod.unregistered", UNNAMED_MODULE));
+        // Neither access check consults `reads` when either side is unnamed.
+        assert!(reg
+            .check_module_access("com.example", UNNAMED_MODULE, "com/whatever")
+            .is_ok());
+        assert!(reg
+            .check_deep_reflection_access("com.example", UNNAMED_MODULE, "com/whatever")
+            .is_ok());
     }
 
     #[test]

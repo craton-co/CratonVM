@@ -2218,11 +2218,55 @@ pub(crate) fn dynamic_edge_target(
     }
 }
 
+/// Read a `java.lang.Module`'s name. `""` is the unnamed-module sentinel, the
+/// same one `ModuleRegistry` uses.
+///
+/// # Slot 0 is NOT the name on a real `java.lang.Module`
+///
+/// `javap -p java.lang.Module` (JDK 25) declares, in order:
+///
+/// ```text
+///   private final java.lang.ModuleLayer layer;      // slot 0
+///   private final java.lang.String name;            // slot 1
+///   private final java.lang.ClassLoader loader;     // slot 2
+///   private final java.lang.module.ModuleDescriptor descriptor;
+/// ```
+///
+/// This helper read slot 0 unconditionally, so on every real-JDK `Module` it
+/// read the `layer` field, `read_string` failed on a `ModuleLayer`, and it
+/// answered `""` — i.e. *every named module looked like the unnamed module* to
+/// every native that routes through here. `native_module_can_read` then asked
+/// `ModuleRegistry::reads("", "")`, hit the unnamed-reader escape hatch and
+/// returned `true`; `regression-suite/src/RJdkModule.java:114`
+/// (`check(!svc.canRead(unnamed), ...)`) died on that, in both `--real-jdk`
+/// and `--jdk-only`, with HotSpot answering `false`.
+///
+/// Prefer the declared `name` field and keep slot 0 only as the fallback, which
+/// is where the synthetic 2-field `java/lang/Module` built by
+/// `register_p59_module`'s `ModuleLayer.modules()` / `findModule` parks it (and
+/// where `get_field_by_name` finds no such field, so the fallback is the one
+/// that fires). This is the same two-step `jboss_jdkspecific::
+/// module_registry_name` already uses — `build_module` there writes both `name`
+/// and `layer` BY NAME for exactly this reason.
 pub(crate) fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -> String {
-    match ctx.get_field(module_obj, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(), // unnamed module
+    // Real-JDK layout: the declared `name` field. On a synthetic stand-in the
+    // field does not exist and `get_field_by_name` answers `Object(None)`,
+    // which is also what a genuinely unnamed module's null `name` answers — so
+    // the slot-0 fallback below is tried in both cases, and is harmless in the
+    // second (slot 0 is `layer`, and `read_string` refuses any object whose
+    // class is known and is not `java/lang/String`).
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(module_obj, "name") {
+        if let Some(name) = ctx.read_string(s) {
+            return name;
+        }
     }
+    // Synthetic layout: slot 0 holds the name.
+    if let Value::Object(Some(s)) = ctx.get_field(module_obj, 0) {
+        if let Some(name) = ctx.read_string(s) {
+            return name;
+        }
+    }
+    String::new() // unnamed module
 }
 
 /// Helper: build a `HashSet<String>` Java object from a Vec of Rust strings.

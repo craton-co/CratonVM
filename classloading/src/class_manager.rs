@@ -1761,6 +1761,11 @@ pub struct DefineClassOptions {
     /// the new class joins the named class's nest (i.e. its
     /// `nest_host` is set to the lookup class's nest host, NOT to its
     /// own name). Mirrors `Lookup.defineHiddenClass(... NESTMATE ...)`.
+    ///
+    /// W3-2: when this is `None` **and** `hidden` is set, the new class is in
+    /// a nest of its own and any `NestHost` attribute in the supplied bytes is
+    /// discarded — see `hidden_class_drops_class_file_nest_host`. `None` on
+    /// a non-hidden define still means "use the class file's attribute".
     pub nest_host_class_name: Option<String>,
     /// BUG-10: Privileged define from a trusted JVM-internal code-generation
     /// path (`sun.misc.Unsafe.defineClass`). On HotSpot, `Unsafe.defineClass`
@@ -5777,19 +5782,38 @@ impl ClassManager {
         // NESTMATE ...)` path passes `options.nest_host_class_name =
         // Some(<lookup_class>)`. We apply it AFTER the class-file's
         // own NestHost attribute parsing so the explicit option wins.
-        let nest_host = options.nest_host_class_name.clone().or(nest_host);
+        let declared_nest_host = options.nest_host_class_name.clone().or(nest_host);
+
+        // W3-2 (JEP 371 / JVMS §5.4.4): a hidden class defined WITHOUT
+        // `ClassOption.NESTMATE` is in a nest of its OWN — even when the
+        // supplied bytes carry a `NestHost` attribute. See
+        // `hidden_class_drops_class_file_nest_host` for the full reasoning.
+        let nest_host = if hidden_class_drops_class_file_nest_host(
+            options.hidden,
+            options.nest_host_class_name.as_deref(),
+        ) {
+            None
+        } else {
+            declared_nest_host.clone()
+        };
 
         // JDK-only mode (contract §5): record where these bytes came from
         // BEFORE they are moved into the `Class` literal. Real bytes reached
         // this point, so no branch below can produce a `CompatibilityStub` —
         // this path is never a compatibility substitution.
+        //
+        // Origin classification deliberately reads the DECLARED nest host, not
+        // the effective one: `ClassOrigin::GeneratedLambda { host }` is a
+        // provenance label ("who asked for these bytes"), and the W3-2 drop
+        // above is a nest-membership decision. Passing `declared_nest_host`
+        // keeps every existing origin verdict byte-identical.
         let defined_origin = self.classify_defined_origin(
             &stored_name,
             loader_id,
             &options,
             module_name.as_deref(),
             code_source.as_ref().and_then(|cs| cs.url.as_deref()),
-            nest_host.as_deref(),
+            declared_nest_host.as_deref(),
             &interface_ids,
         );
 
@@ -10690,6 +10714,64 @@ fn simple_name_of(internal_name: &str) -> &str {
         Some(slash) => &internal_name[slash + 1..],
         None => internal_name,
     }
+}
+
+/// W3-2 — must a class-file `NestHost` attribute be discarded at definition
+/// time because the class is hidden and no defining `Lookup` claimed it?
+///
+/// # The rule
+///
+/// `Lookup.defineHiddenClass(bytes, initialize)` **without**
+/// `ClassOption.NESTMATE` produces a hidden class in its **own** nest:
+/// `hc.getNestHost() == hc`. With `NESTMATE`, the hidden class joins the
+/// lookup class's nest and the defining `Lookup` supplies the host name in
+/// [`DefineClassOptions::nest_host_class_name`].
+///
+/// # Why the class file's own attribute must not be honoured
+///
+/// The `NestHost` attribute is emitted by javac for **every** nested class,
+/// so re-defining an already-compiled nested class as a hidden class hands
+/// this code a `NestHost` that the caller never asked for. That is exactly
+/// what `regression-suite/src/RJdkHidden.java:147` does: it reads
+/// `RJdkHidden$Payload.class` back off the class path (attribute
+/// `NestHost: RJdkHidden`, confirmed with `javap -v`) and defines those bytes
+/// a second time with no `ClassOption`. Adopting the attribute made
+/// `Class.getNestHost()` answer `RJdkHidden`, failing `RJdkHidden.java:151`
+/// on both `--real-jdk` and `--jdk-only` while HotSpot passes.
+///
+/// HotSpot reaches "itself" by a route this VM cannot reproduce verbatim:
+/// `InstanceKlass::nest_host()` resolves the `NestHost` attribute and then
+/// requires the resolved host to list the claimant in its own `NestMembers`.
+/// A hidden class is registered under a mangled, per-definition name
+/// (`RJdkHidden$Payload/0x1f`) that no compile-time `NestMembers` attribute
+/// can ever spell, so the round-trip fails and HotSpot silently falls back to
+/// self-nest. That failure is unconditional *by construction*, not incidental
+/// — which is why evaluating the predicate once here, at definition, is
+/// equivalent to evaluating it on every query. It is the mirror image of the
+/// exemption `access_control::confirmed_nest_host` already records: there, a
+/// hidden class's *supplied* host is trusted precisely because the
+/// `NestMembers` round-trip is unsatisfiable for a mangled name.
+///
+/// # What is deliberately NOT touched
+///
+/// * `options.nest_host_class_name = Some(..)` (the NESTMATE arm, and
+///   `Unsafe.defineAnonymousClass`'s host) stays authoritative: only the
+///   defining call could have made that claim, and the caller must already
+///   have had nest-level access to mint the `Lookup`.
+/// * Non-hidden classes are untouched — an ordinary nested class keeps its
+///   `NestHost` attribute and still goes through the full bidirectional
+///   confirmation in `access_control::confirmed_nest_host`.
+///
+/// All four producers of `hidden: true` agree on the discriminator: they set
+/// `nest_host_class_name` if and only if NESTMATE was requested — see
+/// `native-builtins/src/lookup_define.rs` (both variants),
+/// `native-builtins/src/classloader.rs::lk_define_hidden_class`, and
+/// `native-builtins/src/lang_system.rs::native_classloader_define_class0`.
+pub(crate) fn hidden_class_drops_class_file_nest_host(
+    hidden: bool,
+    explicit_nest_host: Option<&str>,
+) -> bool {
+    hidden && explicit_nest_host.is_none()
 }
 
 /// A lambda / method-reference implementation class spun by
@@ -16026,6 +16108,49 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // W3-2 — hidden-class nest attribution (JEP 371 / JVMS §5.4.4)
+    // -----------------------------------------------------------------------
+
+    /// THE `RJdkHidden.defineNonNestmate` SHAPE. FAILS BEFORE THE W3-2 FIX.
+    ///
+    /// `defineHiddenClass(bytes, false)` with no `ClassOption` leaves
+    /// `nest_host_class_name` unset, and the bytes are those of an ordinary
+    /// javac-compiled nested class, so they carry `NestHost: RJdkHidden`.
+    /// Adopting that attribute made `Class.getNestHost()` answer the outer
+    /// class; HotSpot answers the hidden class itself.
+    #[test]
+    fn non_nestmate_hidden_class_discards_its_class_file_nest_host() {
+        assert!(
+            hidden_class_drops_class_file_nest_host(true, None),
+            "a hidden class with no Lookup-supplied host is its OWN nest host, \
+             whatever its class file's NestHost attribute claims"
+        );
+    }
+
+    /// The NESTMATE arm is authoritative and must survive untouched — this is
+    /// the half `RJdkHidden.java:101` already passes, and every lambda body's
+    /// private `invokestatic` into its capturing class depends on it.
+    #[test]
+    fn nestmate_hidden_class_keeps_the_lookup_supplied_nest_host() {
+        assert!(
+            !hidden_class_drops_class_file_nest_host(true, Some("RJdkHidden")),
+            "a Lookup-supplied nest host is authoritative for a hidden class"
+        );
+    }
+
+    /// Negative control: the drop is scoped to hidden classes. An ordinary
+    /// nested class keeps its `NestHost` attribute and is still subject to the
+    /// bidirectional `NestMembers` confirmation in `access_control`.
+    #[test]
+    fn ordinary_class_keeps_its_class_file_nest_host() {
+        assert!(!hidden_class_drops_class_file_nest_host(false, None));
+        assert!(!hidden_class_drops_class_file_nest_host(
+            false,
+            Some("SomeHost")
+        ));
     }
 
     // -----------------------------------------------------------------------

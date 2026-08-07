@@ -417,26 +417,35 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
                 }
             };
             let requested = requested.unwrap_or_default();
+            // W3-7: the accept DECISION is now
+            // `jca::provider_chain::ssl_context_protocol_supported`, shared with
+            // the two real-JDK-mode registrations, so the three cannot drift
+            // into three different answers for the same protocol string again.
+            // The index match below only decides which name `getProtocol()`
+            // echoes back; a supported-but-unindexed name (DTLS, or a protocol
+            // a caller's own Provider registered) lands on index 0.
+            if !crate::jca::provider_chain::ssl_context_protocol_supported(&requested) {
+                return Err(throw_tls_algorithm_exc(
+                    ctx,
+                    &format!(
+                        "{requested} SSLContext not available: refusing to substitute a \
+                         different protocol — an SSLContext for a protocol you did not \
+                         ask for is not the protection you asked for."
+                    ),
+                ));
+            }
             let protocol_idx = match requested.to_ascii_uppercase().as_str() {
-                "TLS" | "DEFAULT" => 0,
                 "TLSV1.2" => 1,
                 "TLSV1.3" => 2,
                 "SSL" => 3,
                 "TLSV1" => 4,
                 "TLSV1.1" => 5,
                 "SSLV3" => 6,
-                _ => {
-                    return Err(throw_tls_algorithm_exc(
-                        ctx,
-                        &format!(
-                            "{requested} SSLContext not available: this VM implements \
-                             TLS, TLSv1, TLSv1.1, TLSv1.2, TLSv1.3, SSL, SSLv3 and Default. \
-                             Refusing to substitute a different protocol — an SSLContext \
-                             for a protocol you did not ask for is not the protection you \
-                             asked for."
-                        ),
-                    ));
-                }
+                "DTLS" => 7,
+                "DTLSV1.0" => 8,
+                "DTLSV1.2" => 9,
+                // "TLS", "Default", and anything a caller's Provider added.
+                _ => 0,
             };
             let obj = alloc_ssl_context(ctx, protocol_idx);
             Ok(Some(Value::Object(Some(obj))))
@@ -591,6 +600,11 @@ fn ctx_protocol_name(idx: i32) -> &'static str {
         4 => "TLSv1",
         5 => "TLSv1.1",
         6 => "SSLv3",
+        // W3-7: DTLS is three more SunJSSE `SSLContext` services (measured on
+        // jdk-25.0.3.9-hotspot). They were previously refused outright.
+        7 => "DTLS",
+        8 => "DTLSv1.0",
+        9 => "DTLSv1.2",
         _ => "TLS",
     }
 }
@@ -2538,14 +2552,37 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
-            let protocol_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
-                    Some("TLS") => 0,
-                    Some("TLSv1.2") => 1,
-                    Some("TLSv1.3") => 2,
-                    Some("SSL") => 3,
-                    _ => 0,
-                },
+            // W3-7: this alias of `SSLContext.getInstance` had the same
+            // fabrication its sibling did — a `_ => 0` arm that answered a
+            // bogus protocol with an ordinary "TLS" context whose
+            // `getProtocol()` then reported a protocol nobody asked for. It
+            // now asks the SAME question the other three registrations ask,
+            // and refuses with the same catchable `NoSuchAlgorithmException`.
+            let requested = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some("SSLContextImpl.getInstance: protocol is null".into()),
+                    }
+                    .into());
+                }
+            };
+            if !crate::jca::provider_chain::ssl_context_protocol_supported(&requested) {
+                return Err(throw_tls_algorithm_exc(
+                    ctx,
+                    &format!("{requested} SSLContext not available"),
+                ));
+            }
+            let protocol_idx = match requested.to_ascii_uppercase().as_str() {
+                "TLSV1.2" => 1,
+                "TLSV1.3" => 2,
+                "SSL" => 3,
+                "TLSV1" => 4,
+                "TLSV1.1" => 5,
+                "SSLV3" => 6,
+                "DTLS" => 7,
+                "DTLSV1.0" => 8,
+                "DTLSV1.2" => 9,
                 _ => 0,
             };
             let obj = alloc_ssl_context(ctx, protocol_idx);
@@ -2591,13 +2628,10 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
             Value::Int(i) => i,
             _ => 0,
         };
-        let proto = match idx {
-            1 => "TLSv1.2",
-            2 => "TLSv1.3",
-            3 => "SSL",
-            _ => "TLS",
-        };
-        let s = ctx.create_string(proto);
+        // W3-7: share `ctx_protocol_name` with the `javax.net.ssl.SSLContext`
+        // registration. This copy knew only indices 1/2/3, so a context
+        // created as TLSv1 / TLSv1.1 / SSLv3 / DTLS* reported itself as "TLS".
+        let s = ctx.create_string(ctx_protocol_name(idx));
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
@@ -3184,6 +3218,11 @@ mod tls_tests {
             ("TLSv1", "TLSv1"),
             ("TLSv1.1", "TLSv1.1"),
             ("SSLv3", "SSLv3"),
+            // W3-7: SunJSSE registers three DTLS SSLContext services on JDK
+            // 25 (measured). This registration refused all three.
+            ("DTLS", "DTLS"),
+            ("DTLSv1.0", "DTLSv1.0"),
+            ("DTLSv1.2", "DTLSv1.2"),
         ] {
             let context = match get_instance(&r, &mut ctx, requested) {
                 Ok(Some(Value::Object(Some(o)))) => o,
