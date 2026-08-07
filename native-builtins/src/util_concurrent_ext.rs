@@ -847,8 +847,18 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
     }) {
         return;
     }
-    static SEEN: OnceLock<parking_lot::Mutex<HashSet<(String, usize, &'static str, u32)>>> =
-        OnceLock::new();
+    // `OrderedPlMutex`, not a raw `parking_lot::Mutex`: `native-builtins` runs
+    // a lock-discipline ratchet over this crate and a raw construction fails
+    // it. `LockLevel::Scratch` (L0, "acquires nothing") is the honest level —
+    // the guard below lives for exactly one `insert` and nothing is taken while
+    // it is held, which is what makes a future violation a checker failure
+    // rather than a hang. This census re-enters the VM through `tracing::warn!`
+    // right after, so that property is worth stating rather than assuming.
+    static SEEN: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<
+            HashSet<(String, usize, &'static str, u32)>,
+        >,
+    > = OnceLock::new();
     let site = std::panic::Location::caller();
     let key = (
         class_name.to_string(),
@@ -856,7 +866,12 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
         site.file(),
         site.line(),
     );
-    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(HashSet::new()));
+    let seen = SEEN.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    });
     if !seen.lock().insert(key) {
         return;
     }
