@@ -20095,17 +20095,6 @@ fn invoke_on_class_shared_inner(
                                 | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
                                 | ("java/lang/reflect/Method", "getReturnType", "()Ljava/lang/Class;")
                         )
-                        || ((class_name == "javax/net/ssl/SSLSocketFactory"
-                                || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
-                            && method_name == "createSocket"
-                            && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
-                            ))
                         || ((class_name == "javax/net/ssl/SSLSocket"
                                 || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
                             && matches!(
@@ -21553,14 +21542,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/io/FilterInputStream"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
-                            ))
-                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
-                            && method_name == "iterator"
-                            && descriptor == "()Ljava/util/Iterator;")
                         || (class_name == "java/util/Iterator"
                             && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
@@ -21594,18 +21575,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // Spring CacheAdviceNamespaceTests: keep Spring XML
-                        // namespace validation active but force our
-                        // DefaultDocumentLoader factory bridge so it can attach
-                        // a shared Xerces grammar pool. Without this gate the
-                        // protected concrete Java method wins over the native
-                        // and every GenericXmlApplicationContext reparses the
-                        // same Spring XSDs from scratch.
-                        || (class_name
-                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
-                            && method_name == "createDocumentBuilderFactory"
-                            && descriptor
-                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
@@ -21824,13 +21793,6 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "write" | "toByteArray" | "size" | "reset" | "toString"
                             ))
-                        // ES provider loading closes InputStreamReader wrappers
-                        // created by the lightweight resource-reader bridge. The
-                        // real close() body dereferences StreamDecoder state we do
-                        // not initialize; force the registered no-op native.
-                        || (class_name == "java/io/InputStreamReader"
-                            && method_name == "close"
-                            && descriptor == "()V")
                         || ((class_name == "java/lang/Runtime"
                             && method_name == "version"
                             && descriptor == "()Ljava/lang/Runtime$Version;")
