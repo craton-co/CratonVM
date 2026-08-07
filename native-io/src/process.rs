@@ -231,6 +231,14 @@ const PROC_FIELD_HANDLE: usize = JAVA_PROCESS_FIELD_COUNT + 5;
 /// Sentinel "not yet exited" value stored in the exit-code field.
 const EXIT_NOT_YET: i32 = i32::MIN;
 
+/// `ProcessHandleImpl.NOT_A_CHILD` — what `waitForProcessExit0` answers for a
+/// pid that is not a child of this process.
+///
+/// `@Native`-annotated on the JDK side, which makes it part of the native
+/// contract rather than an implementation detail: `ProcessHandleImpl.completion`
+/// compares against it by name and branches.
+const PROCESS_NOT_A_CHILD: i32 = -2;
+
 /// Total number of fields on the synthetic Process.
 const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
 
@@ -1791,9 +1799,38 @@ fn native_proc_handle_wait_for_process_exit0(
         _ => return Ok(Some(Value::Int(-1))),
     };
     // A pid we did not spawn cannot be waited for: `wait(2)` only works on
-    // one's own children. -1 is what the JDK's own native reports there.
+    // one's own children. That is not an error, and it is not an exit status —
+    // it is a specific answer the JDK asks for by name:
+    //
+    //     int exitValue = waitForProcessExit0(pid, shouldReap);
+    //     if (exitValue == NOT_A_CHILD) {
+    //         // pid not alive or not a child of this process
+    //         // If it is alive wait for it to terminate
+    //         long startTime = isAlive0(pid);
+    //         while (startTime >= 0) { Thread.sleep(..); startTime = isAlive0(pid); }
+    //         exitValue = 0;
+    //     }
+    //     newCompletion.complete(exitValue);
+    //
+    // Anything else is taken at face value, so the -1 that used to stand here
+    // completed `ProcessHandle.of(pid).onExit()` IMMEDIATELY, with a fabricated
+    // exit status of -1, for a process that was still running. HotSpot's own
+    // native returns `NOT_A_CHILD` on `ECHILD` for exactly this case.
+    //
+    // Measured with `probes/ForeignHandleProbe.java`, whose subject is a
+    // grandchild (`sh` forks it and exits, so it is reparented and `waitpid`
+    // gives ECHILD). Bounding the wait at 400ms against a process that lives 30s:
+    //
+    //   HotSpot 25   onExitWaitsWhileAlive=still-waiting
+    //   before       onExitWaitsWhileAlive=completed-while-alive
+    //   after        onExitWaitsWhileAlive=still-waiting
+    //
+    // The fallback then depends on `isAlive0` answering for a pid we did not
+    // spawn, which `foreign_pid_is_alive` does; without that this would trade a
+    // wrong answer for a hang, so the probe waits on the future after the
+    // process really dies rather than only checking that it does not complete.
     let Some(handle) = handle_for_pid(pid) else {
-        return Ok(Some(Value::Int(-1)));
+        return Ok(Some(Value::Int(PROCESS_NOT_A_CHILD)));
     };
     ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
@@ -3786,6 +3823,11 @@ mod tests {
 
     /// A pid we never spawned resolves to nothing, and the bridge says so
     /// rather than reaching into the table with it.
+    ///
+    /// The literal -2 is written out on purpose: it is the value
+    /// `ProcessHandleImpl.completion` compares against, so a test that spelled
+    /// it `PROCESS_NOT_A_CHILD` on both sides would pass no matter what the
+    /// constant was changed to.
     #[test]
     fn an_unspawned_pid_resolves_to_no_handle() {
         let foreign = 0x7fff_0000i64; // far above any pid this host will mint
@@ -3793,7 +3835,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let rc =
             native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(foreign)]).unwrap();
-        assert_eq!(rc, Some(Value::Int(-1)), "cannot wait on a non-child");
+        assert_eq!(rc, Some(Value::Int(-2)), "NOT_A_CHILD, not an exit status");
         assert_eq!(
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(foreign), Value::Int(1)])
                 .unwrap(),
@@ -4055,14 +4097,19 @@ mod tests {
         let (handle, pid) = install_child_for_test(child);
         let mut ctx = MockNativeContext::new();
 
-        // A pid we never spawned cannot be waited for.
+        // A pid we never spawned cannot be waited for, and the way to say so
+        // is `NOT_A_CHILD` (-2), not -1. This assertion read -1 when it was
+        // written; -1 is a value `ProcessHandleImpl.completion` hands the
+        // caller as the process's exit status, so it completed
+        // `ProcessHandle.of(pid).onExit()` immediately for a live process.
+        // See `probes/ForeignHandleProbe.java`.
         let unknown = native_proc_handle_wait_for_process_exit0(
             &mut ctx,
             &[Value::Long(pid + 4_000_000), Value::Int(0)],
         )
         .unwrap()
         .unwrap();
-        assert_eq!(unknown, Value::Int(-1));
+        assert_eq!(unknown, Value::Int(-2));
 
         let killed =
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(pid), Value::Int(1)])
@@ -4077,7 +4124,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(code, Value::Int(c) if c != -1),
+            matches!(code, Value::Int(c) if c != -1 && c != -2),
             "waitForProcessExit0 must find the child by pid, got {code:?}"
         );
 
